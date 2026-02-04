@@ -15,7 +15,9 @@ This repo is intentionally notebook‑first (marimo). Keep the workflow tight, r
 - Set `MAPBOX_ACCESS_TOKEN` in the shell before Mapbox downloads.
 
 ## Project Structure (Current)
-- `notebooks/train.mo.py`: single source of truth for data prep, training, and eval.
+- `notebooks/classifier.mo.py`: Stage 1 RESISC45 classifier training.
+- `notebooks/regression.mo.py`: Stage 2/3 heuristic labels + multitask regression/classification.
+- `notebooks/train.mo.py`: lightweight hub/entry point.
 - `data/raw/images/`: imagery tiles.
 - `data/raw/labels.csv`: `image_path, scenic_score, lat, lon, class_id`.
 - `data/processed/`: run logs, sample grids, caches.
@@ -23,8 +25,10 @@ This repo is intentionally notebook‑first (marimo). Keep the workflow tight, r
 - `scripts/download_bbox_tiles.py`: bbox downloader (supports `mapbox.satellite` + `mapbox.terrain-rgb`).
 
 ## Commands (Primary)
-- `marimo edit notebooks/train.mo.py`
-- `marimo run notebooks/train.mo.py`
+- `marimo edit notebooks/classifier.mo.py`
+- `marimo run notebooks/classifier.mo.py`
+- `marimo edit notebooks/regression.mo.py`
+- `marimo run notebooks/regression.mo.py`
 - `uv sync`
 - `python3 scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.satellite --output data/raw/images/satellite`
 - `python3 scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.terrain-rgb --output data/raw/images/terrain`

@@ -24,8 +24,9 @@ classifiers = [
 ]
 dependencies = [
     "timm>=1.0.24",
-    "torch>=2.10.0",
-    "torchvision>=0.25.0",
+    "torch>=2.0.0,<3",
+    "torchvision>=0.15.0,<1",
+    "numpy<2",
 ]
 
 [project.urls]
