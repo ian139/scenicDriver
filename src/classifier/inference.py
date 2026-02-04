@@ -91,7 +91,7 @@ def get_training_transform(
             brightness=0.2,
             contrast=0.2,
             saturation=0.2,
-            hue=0.1
+            hue=0.0,  # avoid PIL hue overflow issues on some setups
         ),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
