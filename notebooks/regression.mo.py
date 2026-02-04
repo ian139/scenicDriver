@@ -140,6 +140,7 @@ def _(Path, cfg, np, pd):
 
         _classifier = None
         _clf_transform = None
+        _clf_device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
         if cfg.heuristic_use_classifier:
             _ckpt = Path(cfg.classifier_best_ckpt)
             if _ckpt.exists():
@@ -153,8 +154,9 @@ def _(Path, cfg, np, pd):
                 _classifier = LandscapeClassifier(
                     pretrained=False,
                     pretrained_path=_ckpt,
-                    device="cuda" if __import__("torch").cuda.is_available() else "cpu",
+                    device=_clf_device,
                 )
+                _classifier.to(_clf_device)
                 _classifier.eval()
                 _clf_transform = _tv.Compose([
                     _tv.Resize((224, 224)),
@@ -209,7 +211,7 @@ def _(Path, cfg, np, pd):
             if _classifier is not None and _clf_transform is not None:
                 import torch as _torch
 
-                _input = _clf_transform(_sat_img).unsqueeze(0).to(_classifier.device)
+                _input = _clf_transform(_sat_img).unsqueeze(0).to(_clf_device)
                 with _torch.no_grad():
                     _logits = _classifier(_input)
                     _probs = _torch.softmax(_logits, dim=-1).cpu().numpy()[0]
