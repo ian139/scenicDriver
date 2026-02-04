@@ -35,6 +35,9 @@ ENV/
 # Jupyter
 .ipynb_checkpoints/
 
+# Marimo
+notebooks/__marimo__/
+
 # Testing
 .pytest_cache/
 .coverage
@@ -51,13 +54,15 @@ data/raw/
 data/tiles/
 data/processed/*.tif
 data/processed/*.npy
+data/processed/heuristic_runs/*/report/thumbs/
+data/processed/heuristic_runs/*/labels.csv
 *.tif
 *.geotiff
 
 # Models (large files)
-models/*.pt
-models/*.pth
-models/*.onnx
+models/**/*.pt
+models/**/*.pth
+models/**/*.onnx
 !models/.gitkeep
 
 # Environment

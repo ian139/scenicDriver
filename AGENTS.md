@@ -14,6 +14,9 @@ This repo is intentionally notebook‑first (marimo). Keep the workflow tight, r
 - Use marimo notebooks (not Jupyter) for all workflows.
 - Set `MAPBOX_ACCESS_TOKEN` in the shell before Mapbox downloads.
 
+## Data
+See [`data/README.md`](data/README.md) for tile regions, download commands, and labeling details.
+
 ## Project Structure (Current)
 - `notebooks/classifier.mo.py`: Stage 1 RESISC45 classifier training.
 - `notebooks/regression.mo.py`: Stage 2/3 heuristic labels + multitask regression/classification.

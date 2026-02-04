@@ -16,6 +16,7 @@ def _():
         - Trains multitask regression/classification model.
         """
     )
+    return
 
 
 @app.cell
@@ -36,7 +37,7 @@ def _():
         classifier_use_resisc45_stats: bool = True
 
         # Heuristic labels
-        heuristic_labels: bool = False
+        heuristic_labels: bool = True
         heuristic_max_tiles: int = 2000
         heuristic_use_classifier: bool = True
         heuristic_default_lat: float = 0.0
@@ -91,12 +92,10 @@ def _():
         Path,
         datetime,
         json,
-        make_grid,
         nn,
         np,
         pd,
         timm,
-        to_pil_image,
         torch,
         tqdm,
         transforms,
@@ -110,151 +109,37 @@ def _(Path, cfg, np, pd):
         "Heuristic label generation disabled. Set cfg.heuristic_labels = True to run."
     else:
         import sys as _sys
-        from PIL import Image as _Image
 
         _project_root = Path.cwd()
         if str(_project_root) not in _sys.path:
             _sys.path.insert(0, str(_project_root))
 
-        _sat_dir = Path(cfg.satellite_dir)
-        _terrain_dir = Path(cfg.terrain_dir)
-        if not _sat_dir.exists():
-            raise FileNotFoundError(f"Satellite dir not found: {_sat_dir}")
-        if not _terrain_dir.exists():
-            raise FileNotFoundError(f"Terrain dir not found: {_terrain_dir}")
+        from src.heuristics.labeler import run_heuristic_labeling
 
-        _sat_files = sorted(
-            [p for p in _sat_dir.glob("**/*") if p.suffix.lower() in {".jpg", ".jpeg", ".png"}]
+        _labels_df, _tiles, _run_info = run_heuristic_labeling(
+            satellite_dir=cfg.satellite_dir,
+            terrain_dir=cfg.terrain_dir,
+            raw_dir=cfg.raw_dir,
+            max_tiles=cfg.heuristic_max_tiles,
+            use_classifier=cfg.heuristic_use_classifier,
+            classifier_best_ckpt=cfg.classifier_best_ckpt,
+            classifier_use_resisc45_stats=cfg.classifier_use_resisc45_stats,
+            default_lat=cfg.heuristic_default_lat,
+            default_lon=cfg.heuristic_default_lon,
+            seed=cfg.seed,
+            device="auto",
         )
-        _terrain_index = {
-            p.stem: p
-            for p in _terrain_dir.glob("**/*")
-            if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
-        }
-
-        if not _sat_files:
-            raise ValueError(f"No satellite images found in: {_sat_dir}")
-
-        _rows: list[dict] = []
-        _max_tiles = max(1, cfg.heuristic_max_tiles)
-
-        _classifier = None
-        _clf_transform = None
-        _clf_device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-        if cfg.heuristic_use_classifier:
-            _ckpt = Path(cfg.classifier_best_ckpt)
-            if _ckpt.exists():
-                from torchvision import transforms as _tv
-                from src.classifier.model import LandscapeClassifier, TERRAIN_CLASSES, get_scenic_weight
-                from src.classifier.inference import RESISC45_MEAN, RESISC45_STD, IMAGENET_MEAN, IMAGENET_STD
-
-                _mean = RESISC45_MEAN if cfg.classifier_use_resisc45_stats else IMAGENET_MEAN
-                _std = RESISC45_STD if cfg.classifier_use_resisc45_stats else IMAGENET_STD
-
-                _classifier = LandscapeClassifier(
-                    pretrained=False,
-                    pretrained_path=_ckpt,
-                    device=_clf_device,
-                )
-                _classifier.to(_clf_device)
-                _classifier.eval()
-                _clf_transform = _tv.Compose([
-                    _tv.Resize((224, 224)),
-                    _tv.ToTensor(),
-                    _tv.Normalize(mean=_mean, std=_std),
-                ])
-            else:
-                print(f"Classifier checkpoint not found: {_ckpt}")
-
-        def _decode_terrain_rgb(_terrain_img: _Image.Image) -> np.ndarray:
-            _arr = np.array(_terrain_img).astype(np.float32)
-            _r = _arr[..., 0]
-            _g = _arr[..., 1]
-            _b = _arr[..., 2]
-            return -10000.0 + (_r * 256.0 * 256.0 + _g * 256.0 + _b) * 0.1
-
-        def _safe_div(_num: np.ndarray, _den: np.ndarray) -> np.ndarray:
-            return _num / (np.maximum(_den, 1e-6))
-
-        _processed = 0
-        for _sat_path in _sat_files:
-            if _processed >= _max_tiles:
-                break
-
-            _terrain_path = _terrain_index.get(_sat_path.stem)
-            if _terrain_path is None:
-                continue
-
-            _sat_img = _Image.open(_sat_path).convert("RGB")
-            _terrain_img = _Image.open(_terrain_path).convert("RGB")
-
-            _elev = _decode_terrain_rgb(_terrain_img)
-            _gy, _gx = np.gradient(_elev)
-            _slope = np.sqrt(_gx ** 2 + _gy ** 2)
-
-            _relief = float(_elev.max() - _elev.min())
-            _roughness = float(_elev.std())
-            _slope_mean = float(_slope.mean())
-
-            _low_elev = _elev < np.percentile(_elev, 10)
-            _flat = _slope < np.percentile(_slope, 10)
-            _water_proxy = float((_low_elev & _flat).mean())
-
-            _sat_arr = np.array(_sat_img).astype(np.float32)
-            _r = _sat_arr[..., 0]
-            _g = _sat_arr[..., 1]
-            _b = _sat_arr[..., 2]
-            _veg_proxy = float(_safe_div(_g, _r + _g + _b).mean())
-
-            _class_score = 0.0
-            _class_id = 0
-            if _classifier is not None and _clf_transform is not None:
-                import torch as _torch
-
-                _input = _clf_transform(_sat_img).unsqueeze(0).to(_clf_device)
-                with _torch.no_grad():
-                    _logits = _classifier(_input)
-                    _probs = _torch.softmax(_logits, dim=-1).cpu().numpy()[0]
-                _class_id = int(_probs.argmax())
-                _class_name = TERRAIN_CLASSES[_class_id]
-                _class_score = float(get_scenic_weight(_class_name))
-            else:
-                _class_id = 0
-                _class_score = 0.3
-
-            _score = (
-                2.5 * _class_score
-                + 2.0 * np.tanh(_relief / 500.0)
-                + 1.5 * np.tanh(_roughness / 200.0)
-                + 1.5 * np.tanh(_slope_mean / 15.0)
-                + 1.5 * _water_proxy
-                + 1.0 * _veg_proxy
-            )
-            _score = float(np.clip(_score, 0.0, 10.0))
-
-            _rows.append(
-                {
-                    "image_path": str(_sat_path.relative_to(Path(cfg.raw_dir))),
-                    "scenic_score": _score,
-                    "lat": cfg.heuristic_default_lat,
-                    "lon": cfg.heuristic_default_lon,
-                    "class_id": _class_id,
-                }
-            )
-            _processed += 1
-
-        if not _rows:
-            raise ValueError("No paired satellite/terrain tiles found to label.")
 
         _out_path = Path(cfg.labels_csv)
         _out_path.parent.mkdir(parents=True, exist_ok=True)
-        _df = pd.DataFrame(_rows)
-        _df.to_csv(_out_path, index=False)
+        _labels_df.to_csv(_out_path, index=False)
         {
             "labels_written": str(_out_path),
-            "rows": len(_df),
-            "used_classifier": _classifier is not None,
+            "rows": len(_labels_df),
+            "used_classifier": _run_info["used_classifier"],
+            "warnings": _run_info["warnings"],
         }
+    return
 
 
 @app.cell
@@ -351,7 +236,7 @@ def _(DataLoader, Dataset, Image, Path, cfg, np, pd, torch, transforms):
 
 
 @app.cell
-def _(Path, cfg, nn, timm, torch):
+def _(cfg, nn, timm, torch):
     """Model scaffold (ViT backbone + regression + classification)."""
     class ScenicMultiTask(nn.Module):
         def __init__(self, num_classes: int):
@@ -386,7 +271,18 @@ def _(Path, cfg, nn, timm, torch):
 
 
 @app.cell
-def _(Path, cfg, datetime, json, model, nn, torch, tqdm, train_loader, val_loader):
+def _(
+    Path,
+    cfg,
+    datetime,
+    json,
+    model,
+    nn,
+    torch,
+    tqdm,
+    train_loader,
+    val_loader,
+):
     """Training loop placeholder."""
     if train_loader is None or val_loader is None:
         print("No data loaders available.")
@@ -504,6 +400,7 @@ def _(Path, cfg, datetime, json, model, nn, torch, tqdm, train_loader, val_loade
             json.dump(_run_summary, f, indent=2)
 
         _run_summary
+    return
 
 
 if __name__ == "__main__":
