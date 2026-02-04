@@ -87,12 +87,8 @@ def get_training_transform(
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
         transforms.RandomRotation(degrees=15),
-        transforms.ColorJitter(
-            brightness=0.2,
-            contrast=0.2,
-            saturation=0.2,
-            hue=0.0,  # avoid PIL hue overflow issues on some setups
-        ),
+        # NOTE: Avoid ColorJitter hue on some PIL/torchvision stacks where
+        # negative hue factors can underflow uint8.
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])
