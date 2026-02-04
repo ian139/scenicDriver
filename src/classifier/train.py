@@ -92,6 +92,17 @@ def create_dataloaders(
 
     # Create transforms
     train_transform = get_training_transform(use_resisc45_stats=use_resisc45_stats)
+    # Defensive: strip any ColorJitter to avoid PIL hue overflow issues on some stacks.
+    try:
+        from torchvision import transforms as _tv
+
+        if isinstance(train_transform, _tv.Compose):
+            train_transform.transforms = [
+                t for t in train_transform.transforms
+                if not isinstance(t, _tv.ColorJitter)
+            ]
+    except Exception:
+        pass
     val_transform = get_inference_transform(use_resisc45_stats=use_resisc45_stats)
 
     # Load full dataset with train transform (we'll override for val)
