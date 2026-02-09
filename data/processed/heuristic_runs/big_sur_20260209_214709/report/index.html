@@ -1,139 +1,4 @@
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Any
-import json
-
-import numpy as np
-from PIL import Image
-
-
-def build_report(
-    *,
-    tiles: list[dict[str, Any]],
-    report_dir: str | Path,
-    raw_dir: str | Path,
-    run_info: dict[str, Any],
-    histogram_bins: int = 20,
-    thumb_size: int = 128,
-) -> dict[str, Any]:
-    report_path = Path(report_dir)
-    report_path.mkdir(parents=True, exist_ok=True)
-
-    thumbs_dir = report_path / "thumbs"
-    thumbs_dir.mkdir(parents=True, exist_ok=True)
-
-    _attach_thumbnails(tiles, raw_dir, thumbs_dir, thumb_size)
-
-    scores = np.array([float(t["scenic_score"]) for t in tiles], dtype=np.float32)
-    hist_counts, hist_edges = np.histogram(scores, bins=histogram_bins, range=(0.0, 10.0))
-
-    summary = {
-        "total_tiles": int(len(tiles)),
-        "mean": float(scores.mean()),
-        "median": float(np.median(scores)),
-        "std": float(scores.std()),
-        "min": float(scores.min()),
-        "max": float(scores.max()),
-    }
-
-    grid = _build_grid_mapping(tiles)
-    feature_summary = _build_feature_summary(tiles)
-
-    report_json = {
-        "summary": summary,
-        "feature_summary": feature_summary,
-        "histogram": {
-            "counts": [int(c) for c in hist_counts.tolist()],
-            "edges": [float(e) for e in hist_edges.tolist()],
-        },
-        "tiles": tiles,
-        "grid": grid,
-        "run_info": run_info,
-    }
-
-    with open(report_path / "report.json", "w", encoding="utf-8") as f:
-        json.dump(report_json, f, indent=2)
-
-    with open(report_path / "index.html", "w", encoding="utf-8") as f:
-        f.write(_render_index_html())
-
-    return report_json
-
-
-def _attach_thumbnails(
-    tiles: list[dict[str, Any]],
-    raw_dir: str | Path,
-    thumbs_dir: Path,
-    thumb_size: int,
-) -> None:
-    raw_root = Path(raw_dir)
-    for idx, tile in enumerate(tiles):
-        image_path = raw_root / tile["image_path"]
-        thumb_name = f"{idx:05d}.jpg"
-        thumb_path = thumbs_dir / thumb_name
-
-        image = Image.open(image_path).convert("RGB")
-        image.thumbnail((thumb_size, thumb_size))
-        image.save(thumb_path, format="JPEG", quality=85)
-
-        tile["index"] = idx
-        tile["thumb"] = f"thumbs/{thumb_name}"
-
-
-def _build_grid_mapping(tiles: list[dict[str, Any]]) -> dict[str, Any]:
-    coords = [(t.get("x"), t.get("y"), t.get("z")) for t in tiles]
-    has_coords = all(x is not None and y is not None and z is not None for x, y, z in coords)
-    if not has_coords:
-        return {"has_coords": False, "index_by_coord": {}}
-
-    xs = [int(t["x"]) for t in tiles]
-    ys = [int(t["y"]) for t in tiles]
-    zs = [int(t["z"]) for t in tiles]
-    zoom = zs[0] if len(set(zs)) == 1 else None
-
-    index_by_coord = {f"{t['x']},{t['y']}": int(t["index"]) for t in tiles}
-
-    return {
-        "has_coords": True,
-        "zoom": zoom,
-        "min_x": int(min(xs)),
-        "max_x": int(max(xs)),
-        "min_y": int(min(ys)),
-        "max_y": int(max(ys)),
-        "index_by_coord": index_by_coord,
-    }
-
-
-def _build_feature_summary(tiles: list[dict[str, Any]]) -> dict[str, Any]:
-    fields = [
-        ("relief", "Relief (m)"),
-        ("roughness", "Roughness"),
-        ("slope_mean", "Slope Mean"),
-        ("water_proxy", "Water Proxy"),
-        ("veg_proxy", "Veg Proxy"),
-    ]
-    summary: dict[str, Any] = {"fields": []}
-    for key, label in fields:
-        values = [float(t[key]) for t in tiles if key in t]
-        if not values:
-            continue
-        arr = np.array(values, dtype=np.float32)
-        summary["fields"].append(
-            {
-                "key": key,
-                "label": label,
-                "mean": float(arr.mean()),
-                "median": float(np.median(arr)),
-                "min": float(arr.min()),
-                "max": float(arr.max()),
-            }
-        )
-    return summary
-
-
-def _render_index_html() -> str:
-    return """<!doctype html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -282,8 +147,6 @@ def _render_index_html() -> str:
       <div class="card">
         <h1>Heuristic Scoring Report</h1>
         <div class="summary-grid" id="summary"></div>
-        <h3>Terrain Feature Summary</h3>
-        <div class="summary-grid" id="feature-summary"></div>
         <h3>Score Histogram</h3>
         <canvas id="histogram"></canvas>
         <h3>Spatial Heatmap</h3>
@@ -312,7 +175,6 @@ def _render_index_html() -> str:
     </div>
     <script>
       const summaryEl = document.getElementById("summary");
-      const featureSummaryEl = document.getElementById("feature-summary");
       const histogramCanvas = document.getElementById("histogram");
       const heatmapCanvas = document.getElementById("heatmap");
       const heatmapTooltip = document.getElementById("heatmap-tooltip");
@@ -364,7 +226,6 @@ def _render_index_html() -> str:
         .then((resp) => resp.json())
         .then((data) => {
           renderSummary(data.summary, data.run_info);
-          renderFeatureSummary(data.feature_summary);
           renderHistogram(data.histogram);
           tiles = data.tiles || [];
           regionName = inferRegionName(tiles);
@@ -394,26 +255,6 @@ def _render_index_html() -> str:
           ["Missing Pairs", runInfo.counts.missing_pairs],
         ];
         summaryEl.innerHTML = items
-          .map(([label, value]) => {
-            return `<div class="summary-item"><span>${label}</span><strong>${value}</strong></div>`;
-          })
-          .join("");
-      }
-
-      function renderFeatureSummary(featureSummary) {
-        if (!featureSummary || !featureSummary.fields || featureSummary.fields.length === 0) {
-          featureSummaryEl.innerHTML = `<div class="summary-item"><span>Terrain</span><strong>n/a</strong></div>`;
-          return;
-        }
-        const items = featureSummary.fields.flatMap((field) => {
-          return [
-            [`${field.label} Mean`, Number(field.mean).toFixed(2)],
-            [`${field.label} Median`, Number(field.median).toFixed(2)],
-            [`${field.label} Min`, Number(field.min).toFixed(2)],
-            [`${field.label} Max`, Number(field.max).toFixed(2)],
-          ];
-        });
-        featureSummaryEl.innerHTML = items
           .map(([label, value]) => {
             return `<div class="summary-item"><span>${label}</span><strong>${value}</strong></div>`;
           })
@@ -689,4 +530,3 @@ def _render_index_html() -> str:
     </script>
   </body>
 </html>
-"""

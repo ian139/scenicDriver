@@ -3,6 +3,11 @@
 
 from .analyzer import TerrainAnalyzer
 from .elevation import ElevationProcessor
-from .features import extract_terrain_features
+from .features import extract_terrain_features, extract_terrain_features_from_tile
 
-__all__ = ["TerrainAnalyzer", "ElevationProcessor", "extract_terrain_features"]
+__all__ = [
+    "TerrainAnalyzer",
+    "ElevationProcessor",
+    "extract_terrain_features",
+    "extract_terrain_features_from_tile",
+]

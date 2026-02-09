@@ -6,8 +6,10 @@ Extracts features needed for scenic score calculation.
 """
 
 from dataclasses import dataclass
-from typing import Tuple
+from pathlib import Path
+from typing import Optional, Tuple
 import numpy as np
+from PIL import Image
 
 from .analyzer import TerrainAnalyzer, BoundingBox
 
@@ -139,3 +141,62 @@ def calculate_vegetation_density(bbox: BoundingBox) -> float:
     # 3. Calculate NDVI
     # 4. Return mean value
     return 0.5  # Default middle value
+
+
+def extract_terrain_features_from_tile(
+    terrain_path: Path,
+    satellite_path: Optional[Path] = None,
+) -> TerrainFeatures:
+    """
+    Extract terrain features from a Mapbox terrain-rgb tile (and optional satellite tile).
+
+    Args:
+        terrain_path: Path to terrain-rgb PNG tile
+        satellite_path: Optional satellite tile for vegetation proxy
+
+    Returns:
+        TerrainFeatures for the tile
+    """
+    terrain_img = Image.open(terrain_path).convert("RGB")
+    elev = _decode_terrain_rgb(terrain_img)
+
+    gy, gx = np.gradient(elev)
+    slope = np.sqrt(gx ** 2 + gy ** 2)
+
+    relief = float(elev.max() - elev.min())
+    slope_variation = float(min(slope.std() / 15.0, 1.0))
+
+    low_elev = elev < np.percentile(elev, 10)
+    flat = slope < np.percentile(slope, 10)
+    water_proximity = float((low_elev & flat).mean())
+
+    vegetation_density = 0.5
+    if satellite_path is not None and Path(satellite_path).exists():
+        sat_img = Image.open(satellite_path).convert("RGB")
+        sat_arr = np.array(sat_img).astype(np.float32)
+        r = sat_arr[..., 0]
+        g = sat_arr[..., 1]
+        b = sat_arr[..., 2]
+        vegetation_density = float(_safe_div(g, r + g + b).mean())
+
+    return TerrainFeatures(
+        slope_variation=slope_variation,
+        elevation_change=relief,
+        water_proximity=water_proximity,
+        vegetation_density=vegetation_density,
+        coastal=False,
+        has_lake=False,
+        has_river=False,
+    )
+
+
+def _decode_terrain_rgb(terrain_img: Image.Image) -> np.ndarray:
+    arr = np.array(terrain_img).astype(np.float32)
+    r = arr[..., 0]
+    g = arr[..., 1]
+    b = arr[..., 2]
+    return -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1
+
+
+def _safe_div(num: np.ndarray, den: np.ndarray) -> np.ndarray:
+    return num / (np.maximum(den, 1e-6))

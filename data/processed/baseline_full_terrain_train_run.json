@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-02-09T22:10:28.094981Z",
+  "timestamp": "2026-02-09T22:23:51.917483Z",
   "config": {
     "batch_size": 32,
     "lr": 0.0001,
@@ -13,10 +13,10 @@
       1.0,
       1.0
     ],
-    "run_name": "baseline",
+    "run_name": "baseline_full_terrain",
     "resume_from": "",
     "use_terrain_features": true,
-    "terrain_features_csv": "data/processed/rocky_mountains_terrain_features.csv"
+    "terrain_features_csv": "data/processed/terrain_features_all.csv"
   },
   "best_val_loss": 1.079476569380079,
   "metrics": {

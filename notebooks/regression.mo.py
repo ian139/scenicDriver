@@ -35,6 +35,8 @@ def _():
         model_dir: str = "models"
         classifier_best_ckpt: str = "models/classifier/best_model.pt"
         classifier_use_resisc45_stats: bool = True
+        terrain_features_csv: str = ""
+        use_terrain_features: bool = False
 
         # Heuristic labels
         heuristic_labels: bool = True
@@ -61,7 +63,23 @@ def _():
         # Repro
         seed: int = 42
 
+    import os as _os
+
     cfg = Config()
+    cfg.use_terrain_features = True
+    cfg.terrain_features_csv = "data/processed/terrain_features_all.csv"
+
+    _env_use_terrain = _os.getenv("SCENIC_USE_TERRAIN")
+    if _env_use_terrain is not None:
+        cfg.use_terrain_features = _env_use_terrain.strip().lower() in {"1", "true", "yes"}
+
+    _env_features_csv = _os.getenv("SCENIC_TERRAIN_FEATURES_CSV")
+    if _env_features_csv:
+        cfg.terrain_features_csv = _env_features_csv
+
+    _env_run_name = _os.getenv("SCENIC_RUN_NAME")
+    if _env_run_name:
+        cfg.run_name = _env_run_name
     cfg
     return (cfg,)
 
@@ -157,6 +175,49 @@ def _(DataLoader, Dataset, Image, Path, cfg, np, pd, torch, transforms):
         if _df.empty:
             raise ValueError("labels.csv is empty.")
 
+    if cfg.use_terrain_features and cfg.terrain_features_csv:
+        _feat_path = Path(cfg.terrain_features_csv)
+        if not _feat_path.exists():
+            print(f"Terrain features CSV not found: {_feat_path}")
+        else:
+            _feat_df = pd.read_csv(_feat_path)
+            if "image_path" not in _feat_df.columns:
+                if "satellite_path" in _feat_df.columns:
+                    _base = Path(cfg.satellite_dir)
+                    _raw = Path(cfg.raw_dir)
+                    _rel_base = _base.resolve().relative_to(_raw.resolve()).as_posix()
+                    _feat_df["image_path"] = _feat_df["satellite_path"].apply(
+                        lambda p: f"{_rel_base}/{p}" if isinstance(p, str) and p else ""
+                    )
+            _feat_cols = [
+                "slope_variation",
+                "elevation_change",
+                "water_proximity",
+                "vegetation_density",
+                "coastal",
+                "has_lake",
+                "has_river",
+            ]
+            _feat_df = _feat_df[["image_path"] + _feat_cols].copy()
+            _df = _df.merge(_feat_df, on="image_path", how="left")
+            _missing_feats = _df["slope_variation"].isna().sum()
+            if _missing_feats:
+                print(f"Missing terrain features for {int(_missing_feats)} rows; filling defaults.")
+            for _col in _feat_cols:
+                if _col in _df.columns:
+                    _df[_col] = _df[_col].fillna(0.0)
+
+        if cfg.use_terrain_features:
+            _feat_summary_cols = [
+                "slope_variation",
+                "elevation_change",
+                "water_proximity",
+                "vegetation_density",
+            ]
+            if all(c in _df.columns for c in _feat_summary_cols):
+                print("Terrain feature summary:")
+                print(_df[_feat_summary_cols].describe().round(4))
+
         _missing_paths = []
         _image_root = Path(cfg.raw_dir)
         for _p in _df["image_path"].head(2000):
@@ -181,10 +242,17 @@ def _(DataLoader, Dataset, Image, Path, cfg, np, pd, torch, transforms):
         _test_idx = _indices[_n_train + _n_val:]
 
         class ScenicDataset(Dataset):
-            def __init__(self, frame: pd.DataFrame, image_root: Path, transform):
+            def __init__(
+                self,
+                frame: pd.DataFrame,
+                image_root: Path,
+                transform,
+                use_terrain_features: bool,
+            ):
                 self.frame = frame.reset_index(drop=True)
                 self.image_root = image_root
                 self.transform = transform
+                self.use_terrain_features = use_terrain_features
 
             def __len__(self):
                 return len(self.frame)
@@ -201,7 +269,22 @@ def _(DataLoader, Dataset, Image, Path, cfg, np, pd, torch, transforms):
                 scenic_score = torch.tensor(float(row["scenic_score"]), dtype=torch.float32)
                 class_id = torch.tensor(int(row["class_id"]), dtype=torch.long)
 
-                return image, scenic_score, class_id
+                if not self.use_terrain_features:
+                    return image, scenic_score, class_id
+
+                terrain = np.array(
+                    [
+                        float(row.get("slope_variation", 0.0)),
+                        float(row.get("elevation_change", 0.0)) / 1000.0,
+                        float(row.get("water_proximity", 0.0)),
+                        float(row.get("vegetation_density", 0.0)),
+                        float(row.get("coastal", 0.0)),
+                        float(row.get("has_lake", 0.0)) or float(row.get("has_river", 0.0)),
+                    ],
+                    dtype=np.float32,
+                )
+                terrain = torch.tensor(terrain, dtype=torch.float32)
+                return image, scenic_score, class_id, terrain
 
         _train_tf = transforms.Compose([
             transforms.RandomResizedCrop(cfg.image_size, scale=(0.8, 1.0)),
@@ -218,9 +301,24 @@ def _(DataLoader, Dataset, Image, Path, cfg, np, pd, torch, transforms):
         ])
 
         _image_root = Path(cfg.raw_dir)
-        _train_ds = ScenicDataset(_df.iloc[_train_idx], _image_root, _train_tf)
-        _val_ds = ScenicDataset(_df.iloc[_val_idx], _image_root, _eval_tf)
-        _test_ds = ScenicDataset(_df.iloc[_test_idx], _image_root, _eval_tf)
+        _train_ds = ScenicDataset(
+            _df.iloc[_train_idx],
+            _image_root,
+            _train_tf,
+            cfg.use_terrain_features,
+        )
+        _val_ds = ScenicDataset(
+            _df.iloc[_val_idx],
+            _image_root,
+            _eval_tf,
+            cfg.use_terrain_features,
+        )
+        _test_ds = ScenicDataset(
+            _df.iloc[_test_idx],
+            _image_root,
+            _eval_tf,
+            cfg.use_terrain_features,
+        )
 
         _loader_kwargs = dict(
             batch_size=cfg.batch_size,
@@ -239,7 +337,7 @@ def _(DataLoader, Dataset, Image, Path, cfg, np, pd, torch, transforms):
 def _(cfg, nn, timm, torch):
     """Model scaffold (ViT backbone + regression + classification)."""
     class ScenicMultiTask(nn.Module):
-        def __init__(self, num_classes: int):
+        def __init__(self, num_classes: int, terrain_dim: int = 0):
             super().__init__()
             self.backbone = timm.create_model(
                 "vit_base_patch16_224",
@@ -247,6 +345,15 @@ def _(cfg, nn, timm, torch):
                 num_classes=0,
             )
             feat_dim = self.backbone.num_features
+            self.terrain_dim = terrain_dim
+            if terrain_dim > 0:
+                self.fuse = nn.Sequential(
+                    nn.LayerNorm(feat_dim + terrain_dim),
+                    nn.Linear(feat_dim + terrain_dim, feat_dim),
+                    nn.GELU(),
+                )
+            else:
+                self.fuse = None
             self.reg_head = nn.Sequential(
                 nn.LayerNorm(feat_dim),
                 nn.Linear(feat_dim, 1),
@@ -256,14 +363,17 @@ def _(cfg, nn, timm, torch):
                 nn.Linear(feat_dim, num_classes),
             )
 
-        def forward(self, x):
+        def forward(self, x, terrain=None):
             feats = self.backbone(x)
+            if self.fuse is not None and terrain is not None:
+                feats = self.fuse(torch.cat([feats, terrain], dim=-1))
             scenic = self.reg_head(feats).squeeze(-1)
             logits = self.cls_head(feats)
             return scenic, logits
 
     _device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = ScenicMultiTask(cfg.num_classes).to(_device)
+    _terrain_dim = 6 if cfg.use_terrain_features else 0
+    model = ScenicMultiTask(cfg.num_classes, terrain_dim=_terrain_dim).to(_device)
     if cfg.resume_from:
         model.load_state_dict(torch.load(cfg.resume_from, map_location=_device))
     model
@@ -315,12 +425,18 @@ def _(
             for batch in tqdm(
                 train_loader, desc=f"Epoch {_epoch+1}/{cfg.epochs} [train]"
             ):
-                _images, _scenic_scores, _class_ids = batch
+                if len(batch) == 4:
+                    _images, _scenic_scores, _class_ids, _terrain = batch
+                else:
+                    _images, _scenic_scores, _class_ids = batch
+                    _terrain = None
                 _images = _images.to(device)
                 _scenic_scores = _scenic_scores.to(device)
                 _class_ids = _class_ids.to(device)
+                if _terrain is not None:
+                    _terrain = _terrain.to(device)
 
-                _pred_scores, _logits = model(_images)
+                _pred_scores, _logits = model(_images, _terrain)
                 _reg_loss = nn.functional.mse_loss(_pred_scores, _scenic_scores)
                 _cls_loss = nn.functional.cross_entropy(_logits, _class_ids)
                 loss = cfg.loss_weights[0] * _reg_loss + cfg.loss_weights[1] * _cls_loss
@@ -342,12 +458,18 @@ def _(
                 for _batch in tqdm(
                     val_loader, desc=f"Epoch {_epoch+1}/{cfg.epochs} [val]"
                 ):
-                    _images, _scenic_scores, _class_ids = _batch
+                    if len(_batch) == 4:
+                        _images, _scenic_scores, _class_ids, _terrain = _batch
+                    else:
+                        _images, _scenic_scores, _class_ids = _batch
+                        _terrain = None
                     _images = _images.to(device)
                     _scenic_scores = _scenic_scores.to(device)
                     _class_ids = _class_ids.to(device)
+                    if _terrain is not None:
+                        _terrain = _terrain.to(device)
 
-                    _pred_scores, _logits = model(_images)
+                    _pred_scores, _logits = model(_images, _terrain)
                     _reg_loss = nn.functional.mse_loss(_pred_scores, _scenic_scores)
                     _cls_loss = nn.functional.cross_entropy(_logits, _class_ids)
                     loss = cfg.loss_weights[0] * _reg_loss + cfg.loss_weights[1] * _cls_loss
@@ -390,6 +512,8 @@ def _(
                 "loss_weights": cfg.loss_weights,
                 "run_name": cfg.run_name,
                 "resume_from": cfg.resume_from,
+                "use_terrain_features": cfg.use_terrain_features,
+                "terrain_features_csv": cfg.terrain_features_csv,
             },
             "best_val_loss": _best_val,
             "metrics": _metrics,
