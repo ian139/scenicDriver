@@ -1,0 +1,93 @@
+{
+  "run_name": "philadelphia_20260205_042104",
+  "timestamp": "2026-02-05T04:21:16.175745Z",
+  "labels_path": null,
+  "raw_labels_path": null,
+  "report_dir": "data/processed/heuristic_runs/philadelphia_20260205_042104/report",
+  "summary": {
+    "total_tiles": 112,
+    "mean": 1.6858583688735962,
+    "median": 1.413533091545105,
+    "std": 0.8540132641792297,
+    "min": 0.6207044124603271,
+    "max": 3.1095993518829346
+  },
+  "histogram": {
+    "counts": [
+      0,
+      36,
+      21,
+      22,
+      1,
+      26,
+      6,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "edges": [
+      0.0,
+      0.5,
+      1.0,
+      1.5,
+      2.0,
+      2.5,
+      3.0,
+      3.5,
+      4.0,
+      4.5,
+      5.0,
+      5.5,
+      6.0,
+      6.5,
+      7.0,
+      7.5,
+      8.0,
+      8.5,
+      9.0,
+      9.5,
+      10.0
+    ]
+  },
+  "run_info": {
+    "counts": {
+      "satellite_total": 112,
+      "terrain_total": 112,
+      "paired": 112,
+      "missing_pairs": 0
+    },
+    "used_classifier": true,
+    "device": "cpu",
+    "coords_available": true,
+    "warnings": [],
+    "seed": 42,
+    "config": {
+      "satellite_dir": "data/raw/images/satellite/z16/philadelphia",
+      "terrain_dir": "data/raw/images/terrain/z16/philadelphia",
+      "raw_dir": "data/raw",
+      "max_tiles": 256,
+      "use_classifier": true,
+      "classifier_best_ckpt": "models/classifier/best_model.pt",
+      "classifier_use_resisc45_stats": true,
+      "default_lat": 0.0,
+      "default_lon": 0.0
+    }
+  },
+  "config": {
+    "preview": true,
+    "max_tiles": 256,
+    "use_classifier": true,
+    "device": "auto",
+    "seed": 42
+  }
+}

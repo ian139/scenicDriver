@@ -28,6 +28,7 @@ dependencies = [
     "torchvision>=0.15.0,<1",
     "numpy<2",
     "pandas>=2.3.3",
+    "marimo>=0.19.7",
 ]
 
 [project.urls]

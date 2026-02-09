@@ -1,110 +1,4 @@
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Any
-import json
-
-import numpy as np
-from PIL import Image
-
-
-def build_report(
-    *,
-    tiles: list[dict[str, Any]],
-    report_dir: str | Path,
-    raw_dir: str | Path,
-    run_info: dict[str, Any],
-    histogram_bins: int = 20,
-    thumb_size: int = 128,
-) -> dict[str, Any]:
-    report_path = Path(report_dir)
-    report_path.mkdir(parents=True, exist_ok=True)
-
-    thumbs_dir = report_path / "thumbs"
-    thumbs_dir.mkdir(parents=True, exist_ok=True)
-
-    _attach_thumbnails(tiles, raw_dir, thumbs_dir, thumb_size)
-
-    scores = np.array([float(t["scenic_score"]) for t in tiles], dtype=np.float32)
-    hist_counts, hist_edges = np.histogram(scores, bins=histogram_bins, range=(0.0, 10.0))
-
-    summary = {
-        "total_tiles": int(len(tiles)),
-        "mean": float(scores.mean()),
-        "median": float(np.median(scores)),
-        "std": float(scores.std()),
-        "min": float(scores.min()),
-        "max": float(scores.max()),
-    }
-
-    grid = _build_grid_mapping(tiles)
-
-    report_json = {
-        "summary": summary,
-        "histogram": {
-            "counts": [int(c) for c in hist_counts.tolist()],
-            "edges": [float(e) for e in hist_edges.tolist()],
-        },
-        "tiles": tiles,
-        "grid": grid,
-        "run_info": run_info,
-    }
-
-    with open(report_path / "report.json", "w", encoding="utf-8") as f:
-        json.dump(report_json, f, indent=2)
-
-    with open(report_path / "index.html", "w", encoding="utf-8") as f:
-        f.write(_render_index_html())
-
-    return report_json
-
-
-def _attach_thumbnails(
-    tiles: list[dict[str, Any]],
-    raw_dir: str | Path,
-    thumbs_dir: Path,
-    thumb_size: int,
-) -> None:
-    raw_root = Path(raw_dir)
-    for idx, tile in enumerate(tiles):
-        image_path = raw_root / tile["image_path"]
-        thumb_name = f"{idx:05d}.jpg"
-        thumb_path = thumbs_dir / thumb_name
-
-        image = Image.open(image_path).convert("RGB")
-        image.thumbnail((thumb_size, thumb_size))
-        image.save(thumb_path, format="JPEG", quality=85)
-
-        tile["index"] = idx
-        tile["thumb"] = f"thumbs/{thumb_name}"
-
-
-def _build_grid_mapping(tiles: list[dict[str, Any]]) -> dict[str, Any]:
-    coords = [(t.get("x"), t.get("y"), t.get("z")) for t in tiles]
-    has_coords = all(x is not None and y is not None and z is not None for x, y, z in coords)
-    if not has_coords:
-        return {"has_coords": False, "index_by_coord": {}}
-
-    xs = [int(t["x"]) for t in tiles]
-    ys = [int(t["y"]) for t in tiles]
-    zs = [int(t["z"]) for t in tiles]
-    zoom = zs[0] if len(set(zs)) == 1 else None
-
-    index_by_coord = {f"{t['x']},{t['y']}": int(t["index"]) for t in tiles}
-
-    return {
-        "has_coords": True,
-        "zoom": zoom,
-        "min_x": int(min(xs)),
-        "max_x": int(max(xs)),
-        "min_y": int(min(ys)),
-        "max_y": int(max(ys)),
-        "index_by_coord": index_by_coord,
-    }
-
-
-def _render_index_html() -> str:
-    return """<!doctype html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -328,19 +222,13 @@ def _render_index_html() -> str:
       let regionName = "unknown";
       let regionThumbCache = new Map();
 
-      fetch(`report.json?ts=${Date.now()}`)
+      fetch("report.json")
         .then((resp) => resp.json())
         .then((data) => {
           renderSummary(data.summary, data.run_info);
           renderHistogram(data.histogram);
           tiles = data.tiles || [];
           regionName = inferRegionName(tiles);
-          const cacheBust = data.run_info && data.run_info.timestamp ? data.run_info.timestamp : Date.now();
-          tiles.forEach((tile) => {
-            if (tile.thumb) {
-              tile.thumb_url = `${tile.thumb}?v=${cacheBust}`;
-            }
-          });
           renderHeatmap(data);
           renderRegionMap();
           if (tiles.length > 0) {
@@ -536,7 +424,7 @@ def _render_index_html() -> str:
         tiles.forEach((tile) => {
           const px = Math.floor((tile.x - gridBounds.minX) / scale) * cell;
           const py = Math.floor((tile.y - gridBounds.minY) / scale) * cell;
-          const thumbSrc = tile.thumb_url || tile.thumb || "";
+          const thumbSrc = tile.thumb || "";
           if (!thumbSrc) {
             return;
           }
@@ -587,7 +475,7 @@ def _render_index_html() -> str:
       function setTile(tile) {
         currentIndex = tile.index;
         tileIdEl.textContent = `Tile ${tile.index + 1} / ${tiles.length}`;
-        tileThumbEl.src = tile.thumb_url || tile.thumb || "";
+        tileThumbEl.src = tile.thumb || "";
         tileScoreEl.innerHTML = `<strong>Score:</strong> ${tile.scenic_score.toFixed(
           2
         )} <span class="muted">(class: ${
@@ -636,4 +524,3 @@ def _render_index_html() -> str:
     </script>
   </body>
 </html>
-"""
