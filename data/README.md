@@ -100,8 +100,7 @@ score = 2.5 * class_score      # From RESISC-45 classifier
       + 1.5 * tanh(slope_mean/15)  # Average slope
       + 1.5 * water_proxy       # Low+flat regions
       + 1.0 * veg_proxy         # Green channel ratio
-      + 1.0 * water_fraction    # Ocean/large water boost
-      - 1.5 * cloud_fraction    # Cloud penalty
+      - 1.2 * water_fraction    # Ocean/large water penalty
 ```
 
 ## Troubleshooting

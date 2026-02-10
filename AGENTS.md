@@ -33,8 +33,8 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - `marimo edit notebooks/regression.mo.py`
 - `marimo run notebooks/regression.mo.py`
 - `uv sync`
-- `python3 scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.satellite --output data/raw/images/satellite`
-- `python3 scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.terrain-rgb --output data/raw/images/terrain`
+- `uv run python scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.satellite --output data/raw/images/satellite`
+- `uv run python scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.terrain-rgb --output data/raw/images/terrain`
 
 ## Principles
 - One notebook, one workflow: keep `notebooks/train.mo.py` authoritative.
