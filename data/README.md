@@ -124,3 +124,12 @@ score = 2.5 * class_score      # From RESISC-45 classifier
 - The heuristic labeler scans recursively and supports region subfolders under `z16/`.
 - Tile naming: `{x}_{y}.png` inside `.../z16/<region>/` is supported for heatmap rendering.
 - Keep large tile datasets out of git (already in `.gitignore`).
+
+## S3 Sync (Optional)
+
+```bash
+export SCENIC_S3_BUCKET=scenicdriver-data
+./scripts/s3_sync.sh
+```
+
+Lifecycle policy template: `scripts/s3_lifecycle.json`

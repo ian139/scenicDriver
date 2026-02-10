@@ -43,6 +43,11 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - Reproducibility first: seed all RNGs and log runs to `data/processed/`.
 - Clean surfaces: small helpers, no duplicate pipelines.
 
+## Git Workflow
+- Default to working on `main` for quick fixes.
+- If a change is more than a quick fix (new feature, refactor, multi-file edits), create a short-lived branch first.
+- Name branches by intent, e.g. `feat/terrain-features`, `fix/report-viewer`, `chore/docs-cleanup`.
+
 ## Craftsmanship Rubric (Any Change)
 - Intent: does this improve correctness, reproducibility, or throughput?
 - Uniqueness: are we creating a second way to do the same task?

@@ -78,6 +78,23 @@ See [`data/README.md`](data/README.md) for detailed tile regions, bboxes, and da
 - [`AGENTS.md`](AGENTS.md) - Development workflow and principles
 - [`data/README.md`](data/README.md) - Data structure and tile regions
 
+## S3 Storage (Optional)
+
+Set a bucket and sync local data:
+
+```bash
+export SCENIC_S3_BUCKET=scenicdriver-data
+./scripts/s3_sync.sh
+```
+
+Apply lifecycle rules (raw/processed → colder storage):
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --lifecycle-configuration file://scripts/s3_lifecycle.json
+```
+
 ## Requirements
 
 - Python 3.11+
