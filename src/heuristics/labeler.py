@@ -152,10 +152,25 @@ def run_heuristic_labeling(
         water_proxy = float((low_elev & flat).mean())
 
         sat_arr = np.array(sat_img).astype(np.float32)
-        r = sat_arr[..., 0]
-        g = sat_arr[..., 1]
-        b = sat_arr[..., 2]
+        r = sat_arr[..., 0] / 255.0
+        g = sat_arr[..., 1] / 255.0
+        b = sat_arr[..., 2] / 255.0
         veg_proxy = float(_safe_div(g, r + g + b).mean())
+        brightness = (r + g + b) / 3.0
+        maxc = np.maximum(r, np.maximum(g, b))
+        minc = np.minimum(r, np.minimum(g, b))
+        saturation = _safe_div(maxc - minc, maxc + 1e-6)
+        gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
+        texture = float(gray.std())
+
+        water_mask = (
+            (b > r * 1.2)
+            & (b > g * 1.15)
+            & (brightness < 0.65)
+            & (saturation > 0.18)
+            & (texture < 0.12)
+        )
+        water_fraction = float(water_mask.mean())
 
         class_id, class_name, class_score = _infer_class(
             sat_img=sat_img,
@@ -165,13 +180,15 @@ def run_heuristic_labeling(
             class_names=class_names,
         )
 
+        class_weight = 2.5 * max(0.3, 1.0 - 0.9 * water_fraction)
         score = (
-            2.5 * class_score
+            class_weight * class_score
             + 2.0 * np.tanh(relief / 500.0)
             + 1.5 * np.tanh(roughness / 200.0)
             + 1.5 * np.tanh(slope_mean / 15.0)
             + 1.5 * water_proxy
             + 1.0 * veg_proxy
+            - 1.2 * water_fraction
         )
         score = float(np.clip(score, 0.0, 10.0))
 
@@ -197,6 +214,8 @@ def run_heuristic_labeling(
             "slope_mean": slope_mean,
             "water_proxy": water_proxy,
             "veg_proxy": veg_proxy,
+            "water_fraction": water_fraction,
+            "texture": texture,
         }
         if coords_ok and coords is not None:
             tile_info.update({"z": coords[0], "x": coords[1], "y": coords[2]})

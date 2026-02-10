@@ -115,6 +115,8 @@ def _build_feature_summary(tiles: list[dict[str, Any]]) -> dict[str, Any]:
         ("slope_mean", "Slope Mean"),
         ("water_proxy", "Water Proxy"),
         ("veg_proxy", "Veg Proxy"),
+        ("water_fraction", "Water Fraction"),
+        ("texture", "Texture"),
     ]
     summary: dict[str, Any] = {"fields": []}
     for key, label in fields:
@@ -698,6 +700,8 @@ def _render_index_html() -> str:
           ["Slope Mean", tile.slope_mean],
           ["Water Proxy", tile.water_proxy],
           ["Veg Proxy", tile.veg_proxy],
+          ["Water Fraction", tile.water_fraction],
+          ["Texture", tile.texture],
           ["Class Score", tile.class_score],
         ];
         tileBreakdownEl.innerHTML = breakdown

@@ -20,20 +20,20 @@ uv sync
 export MAPBOX_ACCESS_TOKEN=<your-token>
 
 # Download tiles for a region
-uv run python3 scripts/download_bbox_tiles.py \
+uv run python scripts/download_bbox_tiles.py \
   --min-lat 40.28 --min-lon -105.70 \
   --max-lat 40.35 --max-lon -105.58 \
   --zoom 16 --style mapbox.satellite \
   --output data/raw/images/satellite
 
-uv run python3 scripts/download_bbox_tiles.py \
+uv run python scripts/download_bbox_tiles.py \
   --min-lat 40.28 --min-lon -105.70 \
   --max-lat 40.35 --max-lon -105.58 \
   --zoom 16 --style mapbox.terrain-rgb \
   --output data/raw/images/terrain
 
 # Run heuristic labeling
-uv run python3 scripts/heuristic_report.py --max-tiles 2000 --write-raw-labels
+uv run python scripts/heuristic_report.py --max-tiles 2000 --write-raw-labels
 
 # Train the model
 uv run marimo run notebooks/regression.mo.py

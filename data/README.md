@@ -42,14 +42,14 @@ Requires `MAPBOX_ACCESS_TOKEN` environment variable.
 
 ```bash
 # Example: Download a new region
-python3 scripts/download_bbox_tiles.py \
+uv run python scripts/download_bbox_tiles.py \
   --min-lat 40.28 --min-lon -105.70 \
   --max-lat 40.35 --max-lon -105.58 \
   --zoom 16 \
   --style mapbox.satellite \
   --output data/raw/images/satellite
 
-python3 scripts/download_bbox_tiles.py \
+uv run python scripts/download_bbox_tiles.py \
   --min-lat 40.28 --min-lon -105.70 \
   --max-lat 40.35 --max-lon -105.58 \
   --zoom 16 \
@@ -100,7 +100,17 @@ score = 2.5 * class_score      # From RESISC-45 classifier
       + 1.5 * tanh(slope_mean/15)  # Average slope
       + 1.5 * water_proxy       # Low+flat regions
       + 1.0 * veg_proxy         # Green channel ratio
+      + 1.0 * water_fraction    # Ocean/large water boost
+      - 1.5 * cloud_fraction    # Cloud penalty
 ```
+
+## Troubleshooting
+
+- `uv run` fails with `ModuleNotFoundError`: run `uv sync` first.
+- Classifier weights missing: ensure `models/classifier/best_model.pt` exists.
+- Map tiles missing: set `MAPBOX_ACCESS_TOKEN` before downloads.
+- Viewer map blank: allow `https://unpkg.com/` (MapLibre) and set `data/processed/report_config.json` with `{"mapbox_token": "..."}` for satellite layer.
+- `timm`/`pandas` import errors: re-run `uv sync` to refresh the environment.
 
 ## Adding New Regions
 

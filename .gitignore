@@ -54,8 +54,9 @@ data/raw/
 data/tiles/
 data/processed/*.tif
 data/processed/*.npy
-data/processed/heuristic_runs/*/report/thumbs/
-data/processed/heuristic_runs/*/labels.csv
+data/processed/heuristic_runs/**/report/
+data/processed/heuristic_runs/**/labels.csv
+data/processed/heuristic_runs/**/run.json
 *.tif
 *.geotiff
 
