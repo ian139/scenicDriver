@@ -1,0 +1,26 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "total_distance_km": 6.640593131913128,
+        "average_scenic_score": 8.5,
+        "estimated_duration_minutes": 6.640593131913128
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            -72.69,
+            42.45
+          ],
+          [
+            -72.62,
+            42.48
+          ]
+        ]
+      }
+    }
+  ]
+}

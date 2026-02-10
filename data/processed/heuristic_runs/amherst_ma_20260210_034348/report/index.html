@@ -1,149 +1,11 @@
-from __future__ import annotations
-
-from pathlib import Path
-import shutil
-from typing import Any
-import json
-
-import numpy as np
-from PIL import Image
-
-
-def build_report(
-    *,
-    tiles: list[dict[str, Any]],
-    report_dir: str | Path,
-    raw_dir: str | Path,
-    run_info: dict[str, Any],
-    histogram_bins: int = 20,
-    thumb_size: int = 128,
-) -> dict[str, Any]:
-    report_path = Path(report_dir)
-    report_path.mkdir(parents=True, exist_ok=True)
-
-    thumbs_dir = report_path / "thumbs"
-    thumbs_dir.mkdir(parents=True, exist_ok=True)
-
-    _attach_thumbnails(tiles, raw_dir, thumbs_dir, thumb_size)
-
-    scores = np.array([float(t["scenic_score"]) for t in tiles], dtype=np.float32)
-    hist_counts, hist_edges = np.histogram(scores, bins=histogram_bins, range=(0.0, 10.0))
-
-    summary = {
-        "total_tiles": int(len(tiles)),
-        "mean": float(scores.mean()),
-        "median": float(np.median(scores)),
-        "std": float(scores.std()),
-        "min": float(scores.min()),
-        "max": float(scores.max()),
-    }
-
-    grid = _build_grid_mapping(tiles)
-    feature_summary = _build_feature_summary(tiles)
-
-    report_json = {
-        "summary": summary,
-        "feature_summary": feature_summary,
-        "histogram": {
-            "counts": [int(c) for c in hist_counts.tolist()],
-            "edges": [float(e) for e in hist_edges.tolist()],
-        },
-        "tiles": tiles,
-        "grid": grid,
-        "run_info": run_info,
-    }
-
-    with open(report_path / "report.json", "w", encoding="utf-8") as f:
-        json.dump(report_json, f, indent=2)
-
-    with open(report_path / "index.html", "w", encoding="utf-8") as f:
-        f.write(_render_index_html())
-
-    _copy_report_config(report_path)
-
-    return report_json
-
-
-def _attach_thumbnails(
-    tiles: list[dict[str, Any]],
-    raw_dir: str | Path,
-    thumbs_dir: Path,
-    thumb_size: int,
-) -> None:
-    raw_root = Path(raw_dir)
-    for idx, tile in enumerate(tiles):
-        image_path = raw_root / tile["image_path"]
-        thumb_name = f"{idx:05d}.jpg"
-        thumb_path = thumbs_dir / thumb_name
-
-        image = Image.open(image_path).convert("RGB")
-        image.thumbnail((thumb_size, thumb_size))
-        image.save(thumb_path, format="JPEG", quality=85)
-
-        tile["index"] = idx
-        tile["thumb"] = f"thumbs/{thumb_name}"
-
-
-def _build_grid_mapping(tiles: list[dict[str, Any]]) -> dict[str, Any]:
-    coords = [(t.get("x"), t.get("y"), t.get("z")) for t in tiles]
-    has_coords = all(x is not None and y is not None and z is not None for x, y, z in coords)
-    if not has_coords:
-        return {"has_coords": False, "index_by_coord": {}}
-
-    xs = [int(t["x"]) for t in tiles]
-    ys = [int(t["y"]) for t in tiles]
-    zs = [int(t["z"]) for t in tiles]
-    zoom = zs[0] if len(set(zs)) == 1 else None
-
-    index_by_coord = {f"{t['x']},{t['y']}": int(t["index"]) for t in tiles}
-
-    return {
-        "has_coords": True,
-        "zoom": zoom,
-        "min_x": int(min(xs)),
-        "max_x": int(max(xs)),
-        "min_y": int(min(ys)),
-        "max_y": int(max(ys)),
-        "index_by_coord": index_by_coord,
-    }
-
-
-def _build_feature_summary(tiles: list[dict[str, Any]]) -> dict[str, Any]:
-    fields = [
-        ("relief", "Relief (m)"),
-        ("roughness", "Roughness"),
-        ("slope_mean", "Slope Mean"),
-        ("water_proxy", "Water Proxy"),
-        ("veg_proxy", "Veg Proxy"),
-    ]
-    summary: dict[str, Any] = {"fields": []}
-    for key, label in fields:
-        values = [float(t[key]) for t in tiles if key in t]
-        if not values:
-            continue
-        arr = np.array(values, dtype=np.float32)
-        summary["fields"].append(
-            {
-                "key": key,
-                "label": label,
-                "mean": float(arr.mean()),
-                "median": float(np.median(arr)),
-                "min": float(arr.min()),
-                "max": float(arr.max()),
-            }
-        )
-    return summary
-
-
-def _render_index_html() -> str:
-    return """<!doctype html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Heuristic Scoring Report</title>
     <link
-      href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css"
+      href="https://api.mapbox.com/mapbox-gl-js/v2.16.1/mapbox-gl.css"
       rel="stylesheet"
     />
     <style>
@@ -198,30 +60,44 @@ def _render_index_html() -> str:
       .summary-item strong {
         font-size: 18px;
       }
+      #heatmap {
+        width: 100%;
+        height: 420px;
+        background: #0a1112;
+        border-radius: 8px;
+      }
+      #region-map {
+        width: 100%;
+        height: 180px;
+        background: #0a1112;
+        border-radius: 8px;
+        margin-top: 8px;
+      }
+      #heatmap-wrap {
+        position: relative;
+      }
+      #heatmap-tooltip {
+        position: absolute;
+        pointer-events: none;
+        background: rgba(15, 26, 28, 0.9);
+        color: var(--text);
+        padding: 6px 10px;
+        border-radius: 6px;
+        font-size: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        display: none;
+        z-index: 10;
+      }
       #histogram {
         width: 100%;
         height: 200px;
       }
       #mapbox-map {
         width: 100%;
-        height: 520px;
+        height: 420px;
         border-radius: 8px;
         overflow: hidden;
         border: 1px solid rgba(255, 255, 255, 0.08);
-      }
-      #map-controls {
-        display: flex;
-        gap: 10px;
-        flex-wrap: wrap;
-        align-items: center;
-        margin-bottom: 8px;
-      }
-      #map-controls label {
-        font-size: 12px;
-        color: var(--muted);
-      }
-      #heatmap-opacity {
-        width: 160px;
       }
       .panel {
         display: flex;
@@ -286,23 +162,20 @@ def _render_index_html() -> str:
         <div class="summary-grid" id="feature-summary"></div>
         <h3>Score Histogram</h3>
         <canvas id="histogram"></canvas>
-        <h3>Interactive Map</h3>
-        <div id="map-controls">
-          <label>Base:
-            <select id="base-layer">
-              <option value="osm">Map</option>
-              <option value="sat">Satellite</option>
-              <option value="none">Heatmap only</option>
-            </select>
-          </label>
-          <label>Heatmap Opacity:
-            <input id="heatmap-opacity" type="range" min="0" max="1" step="0.05" value="0.6" />
-          </label>
+        <h3>Spatial Heatmap</h3>
+        <div id="heatmap-wrap">
+          <canvas id="heatmap"></canvas>
+          <div id="heatmap-tooltip"></div>
         </div>
+        <div class="muted" id="heatmap-note"></div>
+        <h3>Region Map</h3>
+        <canvas id="region-map"></canvas>
+        <div class="muted" id="region-info"></div>
+        <h3>Interactive Map</h3>
         <div id="mapbox-map"></div>
-      <div class="muted" id="mapbox-note">
+        <div class="muted" id="mapbox-note">
           Map overlay requires a Mapbox token (set in report_config.json or window.MAPBOX_TOKEN).
-      </div>
+        </div>
       </div>
       <div class="card panel">
         <h2>Tile Details</h2>
@@ -318,13 +191,16 @@ def _render_index_html() -> str:
         <div class="muted">Use heatmap clicks or arrow keys to navigate.</div>
       </div>
     </div>
+    <script src="https://api.mapbox.com/mapbox-gl-js/v2.16.1/mapbox-gl.js"></script>
     <script>
       const summaryEl = document.getElementById("summary");
       const featureSummaryEl = document.getElementById("feature-summary");
       const histogramCanvas = document.getElementById("histogram");
-      const heatmapCanvas = document.createElement("canvas");
-      const baseLayerSelect = document.getElementById("base-layer");
-      const heatmapOpacityInput = document.getElementById("heatmap-opacity");
+      const heatmapCanvas = document.getElementById("heatmap");
+      const heatmapTooltip = document.getElementById("heatmap-tooltip");
+      const heatmapNote = document.getElementById("heatmap-note");
+      const regionMapCanvas = document.getElementById("region-map");
+      const regionInfo = document.getElementById("region-info");
       const mapboxNote = document.getElementById("mapbox-note");
       const tileIdEl = document.getElementById("tile-id");
       const tileThumbEl = document.getElementById("tile-thumb");
@@ -360,18 +236,22 @@ def _render_index_html() -> str:
 
       let tiles = [];
       let currentIndex = 0;
+      let pixelIndex = {};
+      let view = null;
+      let zoomed = false;
+      let gridBounds = null;
+      let regionName = "unknown";
+      let regionThumbCache = new Map();
       let mapboxToken = null;
-      let mapboxReady = false;
-      let mapInstance = null;
-      let heatmapLayerId = "scenic-heatmap-layer";
 
-      fetch(`report.json?ts=${Date.now()}`)
-        .then((r) => r.json())
-        .then((data) => {
+      Promise.all([loadToken(), fetch(`report.json?ts=${Date.now()}`).then((r) => r.json())])
+        .then(([token, data]) => {
+          mapboxToken = token;
           renderSummary(data.summary, data.run_info);
           renderFeatureSummary(data.feature_summary);
           renderHistogram(data.histogram);
           tiles = data.tiles || [];
+          regionName = inferRegionName(tiles);
           const cacheBust =
             data.run_info && data.run_info.timestamp ? data.run_info.timestamp : Date.now();
           tiles.forEach((tile) => {
@@ -380,40 +260,12 @@ def _render_index_html() -> str:
             }
           });
           renderHeatmap(data);
+          renderRegionMap();
+          initMapbox(data);
           if (tiles.length > 0) {
             setTile(tiles[0]);
           }
-
-          Promise.all([loadToken(), loadMapboxGL()]).then(([token]) => {
-            mapboxToken = token;
-            initMapbox(data);
-          });
         });
-
-      function loadMapboxGL() {
-        if (window.maplibregl) {
-          mapboxReady = true;
-          return Promise.resolve();
-        }
-        const candidates = [
-          "https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js",
-        ];
-        return new Promise((resolve) => {
-          const script = document.createElement("script");
-          let idx = 0;
-          const tryNext = () => {
-            if (idx >= candidates.length) return resolve();
-            script.src = candidates[idx++];
-            script.onload = () => {
-              mapboxReady = true;
-              resolve();
-            };
-            script.onerror = () => tryNext();
-          };
-          tryNext();
-          document.head.appendChild(script);
-        });
-      }
 
       function loadToken() {
         if (window.MAPBOX_TOKEN) {
@@ -495,63 +347,22 @@ def _render_index_html() -> str:
       }
 
       function initMapbox(data) {
-        if (!mapboxReady || !window.maplibregl) {
+        if (!mapboxToken) {
           mapboxNote.textContent =
-            "MapLibre failed to load. Check network access or allow https://unpkg.com.";
+            "Map overlay requires a Mapbox token. Create report_config.json with { mapbox_token: '...' } or set window.MAPBOX_TOKEN.";
           return;
         }
         if (!data.grid || !data.grid.has_coords) {
           mapboxNote.textContent = "No tile coordinates available for map overlay.";
           return;
         }
-        const sources = {
-          "osm": {
-            "type": "raster",
-            "tiles": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-            "tileSize": 256,
-          },
-        };
-        const layers = [
-          {
-            "id": "osm",
-            "type": "raster",
-            "source": "osm",
-          },
-        ];
-        if (mapboxToken) {
-          sources["satellite"] = {
-            "type": "raster",
-            "tiles": [
-              `https://api.mapbox.com/styles/v1/mapbox/satellite-v9/tiles/{z}/{x}/{y}?access_token=${mapboxToken}`,
-            ],
-            "tileSize": 256,
-          };
-          layers.push({
-            "id": "satellite",
-            "type": "raster",
-            "source": "satellite",
-            "layout": { "visibility": "none" },
-          });
-          mapboxNote.style.display = "none";
-        } else {
-          mapboxNote.textContent =
-            "Satellite layer requires a Mapbox token (set in report_config.json or window.MAPBOX_TOKEN).";
-          mapboxNote.style.display = "block";
-          const satOption = baseLayerSelect.querySelector('option[value="sat"]');
-          if (satOption) satOption.disabled = true;
-        }
-
-        const map = new maplibregl.Map({
+        mapboxgl.accessToken = mapboxToken;
+        const map = new mapboxgl.Map({
           container: "mapbox-map",
-          style: {
-            "version": 8,
-            "sources": sources,
-            "layers": layers
-          },
+          style: "mapbox://styles/mapbox/satellite-streets-v12",
           center: [-72.5, 42.4],
           zoom: data.grid.zoom || 12,
         });
-        mapInstance = map;
 
         map.on("load", () => {
           const grid = data.grid;
@@ -577,68 +388,14 @@ def _render_index_html() -> str:
             paint: { "raster-opacity": 0.6 },
           });
           map.fitBounds([ [nwLon, seLat], [seLon, nwLat] ], { padding: 20, duration: 0 });
-
-          fetch(`route.geojson?ts=${Date.now()}`)
-            .then((resp) => (resp.ok ? resp.json() : null))
-            .then((routeGeo) => {
-              if (!routeGeo) return;
-              map.addSource("scenic-route", { type: "geojson", data: routeGeo });
-              map.addLayer({
-                id: "scenic-route-line",
-                type: "line",
-                source: "scenic-route",
-                paint: {
-                  "line-color": "#ffb347",
-                  "line-width": 4,
-                  "line-opacity": 0.9,
-                },
-              });
-            })
-            .catch(() => null);
-          applyMapControls();
         });
-
-        map.on("click", (event) => {
-          if (!data.grid || !data.grid.has_coords) return;
-          const z = data.grid.zoom;
-          const lat = event.lngLat.lat;
-          const lon = event.lngLat.lng;
-          const n = Math.pow(2, z);
-          const x = Math.floor(((lon + 180) / 360) * n);
-          const y = Math.floor(
-            (1 - Math.log(Math.tan((lat * Math.PI) / 180) + 1 / Math.cos((lat * Math.PI) / 180)) / Math.PI) / 2 * n
-          );
-          const key = `${x},${y}`;
-          const idx = data.grid.index_by_coord[key];
-          if (idx !== undefined) {
-            setTile(tiles[idx]);
-          }
-        });
-        baseLayerSelect.addEventListener("change", applyMapControls);
-        heatmapOpacityInput.addEventListener("input", applyMapControls);
-      }
-
-      function applyMapControls() {
-        if (!mapInstance) return;
-        const opacity = parseFloat(heatmapOpacityInput.value || "0.6");
-        if (mapInstance.getLayer(heatmapLayerId)) {
-          mapInstance.setPaintProperty(heatmapLayerId, "raster-opacity", opacity);
-        }
-        const base = baseLayerSelect.value;
-        const showOsm = base === "osm";
-        const showSat = base === "sat";
-        const showNone = base === "none";
-        if (mapInstance.getLayer("osm")) {
-          mapInstance.setLayoutProperty("osm", "visibility", showOsm && !showNone ? "visible" : "none");
-        }
-        if (mapInstance.getLayer("satellite")) {
-          mapInstance.setLayoutProperty("satellite", "visibility", showSat && !showNone ? "visible" : "none");
-        }
       }
 
       function renderHeatmap(data) {
         const grid = data.grid;
         if (!grid.has_coords) {
+          heatmapNote.textContent =
+            "Spatial coordinates unavailable; heatmap disabled. Check tile naming conventions.";
           return;
         }
 
@@ -648,16 +405,83 @@ def _render_index_html() -> str:
         const maxDim = 512;
         const baseScale = Math.max(1, Math.ceil(Math.max(gridW, gridH) / maxDim));
 
-        const ctx = heatmapCanvas.getContext("2d");
-        drawHeatmap(ctx, baseScale, {
+        gridBounds = {
           minX: grid.min_x,
           maxX: grid.max_x,
           minY: grid.min_y,
           maxY: grid.max_y,
+          baseScale,
+        };
+
+        const ctx = heatmapCanvas.getContext("2d");
+        view = {
+          minX: grid.min_x,
+          maxX: grid.max_x,
+          minY: grid.min_y,
+          maxY: grid.max_y,
+        };
+
+        drawHeatmap(ctx, baseScale);
+        renderRegionMap();
+
+        heatmapCanvas.addEventListener("click", (event) => {
+          const hit = pickTile(event);
+          if (hit !== null) {
+            setTile(tiles[hit]);
+          }
+        });
+
+        heatmapCanvas.addEventListener("dblclick", (event) => {
+          if (!gridBounds) return;
+          const hit = pickTile(event);
+          if (hit === null) {
+            return;
+          }
+
+          if (!zoomed) {
+            const tile = tiles[hit];
+            const viewW = Math.max(4, Math.floor((gridBounds.maxX - gridBounds.minX + 1) / 2));
+            const viewH = Math.max(4, Math.floor((gridBounds.maxY - gridBounds.minY + 1) / 2));
+            view = {
+              minX: Math.max(gridBounds.minX, tile.x - Math.floor(viewW / 2)),
+              maxX: Math.min(gridBounds.maxX, tile.x + Math.floor(viewW / 2)),
+              minY: Math.max(gridBounds.minY, tile.y - Math.floor(viewH / 2)),
+              maxY: Math.min(gridBounds.maxY, tile.y + Math.floor(viewH / 2)),
+            };
+            zoomed = true;
+          } else {
+            view = {
+              minX: gridBounds.minX,
+              maxX: gridBounds.maxX,
+              minY: gridBounds.minY,
+              maxY: gridBounds.maxY,
+            };
+            zoomed = false;
+          }
+          drawHeatmap(ctx, gridBounds.baseScale);
+        });
+
+        heatmapCanvas.addEventListener("mousemove", (event) => {
+          const hit = pickTile(event);
+          if (hit === null) {
+            heatmapTooltip.style.display = "none";
+            return;
+          }
+          const tile = tiles[hit];
+          const rect = heatmapCanvas.getBoundingClientRect();
+          heatmapTooltip.style.left = `${event.clientX - rect.left + 12}px`;
+          heatmapTooltip.style.top = `${event.clientY - rect.top + 12}px`;
+          heatmapTooltip.textContent = `${tile.class_name || "unknown"} · ${tile.scenic_score.toFixed(
+            2
+          )}`;
+          heatmapTooltip.style.display = "block";
+        });
+        heatmapCanvas.addEventListener("mouseleave", () => {
+          heatmapTooltip.style.display = "none";
         });
       }
 
-      function drawHeatmap(ctx, baseScale, view) {
+      function drawHeatmap(ctx, baseScale) {
         const viewW = view.maxX - view.minX + 1;
         const viewH = view.maxY - view.minY + 1;
         const scale = Math.max(1, Math.ceil(Math.max(viewW, viewH) / 512));
@@ -665,6 +489,7 @@ def _render_index_html() -> str:
         heatmapCanvas.height = Math.ceil(viewH / scale);
         ctx.clearRect(0, 0, heatmapCanvas.width, heatmapCanvas.height);
 
+        pixelIndex = {};
         tiles.forEach((tile) => {
           if (
             tile.x < view.minX ||
@@ -677,9 +502,91 @@ def _render_index_html() -> str:
 
           const px = Math.floor((tile.x - view.minX) / scale);
           const py = Math.floor((tile.y - view.minY) / scale);
+          const key = `${px},${py}`;
+          if (!(key in pixelIndex)) {
+            pixelIndex[key] = tile.index;
+          } else if (tile.scenic_score > tiles[pixelIndex[key]].scenic_score) {
+            pixelIndex[key] = tile.index;
+          }
           ctx.fillStyle = colorForScore(tile.scenic_score);
           ctx.fillRect(px, py, 1, 1);
         });
+      }
+
+      function pickTile(event) {
+          const rect = heatmapCanvas.getBoundingClientRect();
+          const scaleX = heatmapCanvas.width / rect.width;
+          const scaleY = heatmapCanvas.height / rect.height;
+          const x = Math.floor((event.clientX - rect.left) * scaleX);
+          const y = Math.floor((event.clientY - rect.top) * scaleY);
+          const key = `${x},${y}`;
+          const idx = pixelIndex[key];
+          return idx === undefined ? null : idx;
+      }
+
+      function renderRegionMap() {
+        if (!gridBounds || tiles.length === 0) {
+          regionInfo.textContent = "Region info unavailable.";
+          return;
+        }
+        const ctx = regionMapCanvas.getContext("2d");
+        const gridW = gridBounds.maxX - gridBounds.minX + 1;
+        const gridH = gridBounds.maxY - gridBounds.minY + 1;
+        const scale = Math.max(1, Math.ceil(Math.max(gridW, gridH) / 128));
+        const cell = Math.max(2, Math.floor(128 / Math.max(gridW / scale, gridH / scale)));
+        regionMapCanvas.width = Math.ceil(gridW / scale) * cell;
+        regionMapCanvas.height = Math.ceil(gridH / scale) * cell;
+        ctx.clearRect(0, 0, regionMapCanvas.width, regionMapCanvas.height);
+
+        tiles.forEach((tile) => {
+          const px = Math.floor((tile.x - gridBounds.minX) / scale) * cell;
+          const py = Math.floor((tile.y - gridBounds.minY) / scale) * cell;
+          const thumbSrc = tile.thumb_url || tile.thumb || "";
+          if (!thumbSrc) {
+            return;
+          }
+          let img = regionThumbCache.get(thumbSrc);
+          if (!img) {
+            img = new Image();
+            img.src = thumbSrc;
+            regionThumbCache.set(thumbSrc, img);
+            img.onload = () => {
+              ctx.drawImage(img, px, py, cell, cell);
+              if (tile.index === currentIndex) {
+                drawRegionHighlight(ctx, px, py, cell);
+              }
+            };
+            return;
+          }
+          if (img.complete) {
+            ctx.drawImage(img, px, py, cell, cell);
+          }
+        });
+
+        if (tiles[currentIndex]) {
+          const tile = tiles[currentIndex];
+          const px = Math.floor((tile.x - gridBounds.minX) / scale) * cell;
+          const py = Math.floor((tile.y - gridBounds.minY) / scale) * cell;
+          drawRegionHighlight(ctx, px, py, cell);
+        }
+
+        regionInfo.textContent = `Region: ${regionName} · z${tiles[0].z} · x ${gridBounds.minX}-${gridBounds.maxX} · y ${gridBounds.minY}-${gridBounds.maxY}`;
+      }
+
+      function drawRegionHighlight(ctx, px, py, cell) {
+        ctx.strokeStyle = "rgba(255, 179, 71, 0.95)";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(px - 1, py - 1, cell + 2, cell + 2);
+      }
+
+      function inferRegionName(tileList) {
+        if (!tileList || tileList.length === 0) return "unknown";
+        const parts = (tileList[0].image_path || "").split("/");
+        const zIndex = parts.findIndex((p) => p.startsWith("z"));
+        if (zIndex !== -1 && parts.length > zIndex + 1) {
+          return parts[zIndex + 1].replace(/_/g, " ");
+        }
+        return "unknown";
       }
 
       function setTile(tile) {
@@ -713,6 +620,7 @@ def _render_index_html() -> str:
         tilePathEl.textContent = tile.image_path;
         prevBtn.disabled = currentIndex <= 0;
         nextBtn.disabled = currentIndex >= tiles.length - 1;
+        renderRegionMap();
       }
 
       prevBtn.addEventListener("click", () => {
@@ -736,13 +644,3 @@ def _render_index_html() -> str:
     </script>
   </body>
 </html>
-"""
-
-
-def _copy_report_config(report_path: Path) -> None:
-    global_config = Path("data/processed/report_config.json")
-    if global_config.exists():
-        try:
-            shutil.copy(global_config, report_path / "report_config.json")
-        except OSError:
-            pass

@@ -164,48 +164,49 @@ def _(Path, cfg, np, pd):
 def _(DataLoader, Dataset, Image, Path, cfg, np, pd, torch, transforms):
     """Data loaders (multi-task)."""
     _labels_path = Path(cfg.labels_csv)
+    train_loader = None
+    val_loader = None
+    test_loader = None
     if not _labels_path.exists():
         print(f"Missing labels file: {_labels_path}")
-        train_loader = None
-        val_loader = None
-        test_loader = None
-        train_loader, val_loader, test_loader
     else:
         _df = pd.read_csv(_labels_path)
         if _df.empty:
             raise ValueError("labels.csv is empty.")
 
-    if cfg.use_terrain_features and cfg.terrain_features_csv:
-        _feat_path = Path(cfg.terrain_features_csv)
-        if not _feat_path.exists():
-            print(f"Terrain features CSV not found: {_feat_path}")
-        else:
-            _feat_df = pd.read_csv(_feat_path)
-            if "image_path" not in _feat_df.columns:
-                if "satellite_path" in _feat_df.columns:
-                    _base = Path(cfg.satellite_dir)
-                    _raw = Path(cfg.raw_dir)
-                    _rel_base = _base.resolve().relative_to(_raw.resolve()).as_posix()
-                    _feat_df["image_path"] = _feat_df["satellite_path"].apply(
-                        lambda p: f"{_rel_base}/{p}" if isinstance(p, str) and p else ""
+        if cfg.use_terrain_features and cfg.terrain_features_csv:
+            _feat_path = Path(cfg.terrain_features_csv)
+            if not _feat_path.exists():
+                print(f"Terrain features CSV not found: {_feat_path}")
+            else:
+                _feat_df = pd.read_csv(_feat_path)
+                if "image_path" not in _feat_df.columns:
+                    if "satellite_path" in _feat_df.columns:
+                        _base = Path(cfg.satellite_dir)
+                        _raw = Path(cfg.raw_dir)
+                        _rel_base = _base.resolve().relative_to(_raw.resolve()).as_posix()
+                        _feat_df["image_path"] = _feat_df["satellite_path"].apply(
+                            lambda p: f"{_rel_base}/{p}" if isinstance(p, str) and p else ""
+                        )
+                _feat_cols = [
+                    "slope_variation",
+                    "elevation_change",
+                    "water_proximity",
+                    "vegetation_density",
+                    "coastal",
+                    "has_lake",
+                    "has_river",
+                ]
+                _feat_df = _feat_df[["image_path"] + _feat_cols].copy()
+                _df = _df.merge(_feat_df, on="image_path", how="left")
+                _missing_feats = _df["slope_variation"].isna().sum()
+                if _missing_feats:
+                    print(
+                        f"Missing terrain features for {int(_missing_feats)} rows; filling defaults."
                     )
-            _feat_cols = [
-                "slope_variation",
-                "elevation_change",
-                "water_proximity",
-                "vegetation_density",
-                "coastal",
-                "has_lake",
-                "has_river",
-            ]
-            _feat_df = _feat_df[["image_path"] + _feat_cols].copy()
-            _df = _df.merge(_feat_df, on="image_path", how="left")
-            _missing_feats = _df["slope_variation"].isna().sum()
-            if _missing_feats:
-                print(f"Missing terrain features for {int(_missing_feats)} rows; filling defaults.")
-            for _col in _feat_cols:
-                if _col in _df.columns:
-                    _df[_col] = _df[_col].fillna(0.0)
+                for _col in _feat_cols:
+                    if _col in _df.columns:
+                        _df[_col] = _df[_col].fillna(0.0)
 
         if cfg.use_terrain_features:
             _feat_summary_cols = [
@@ -330,7 +331,7 @@ def _(DataLoader, Dataset, Image, Path, cfg, np, pd, torch, transforms):
         test_loader = DataLoader(_test_ds, shuffle=False, **_loader_kwargs)
 
         train_loader, val_loader, test_loader
-    return train_loader, val_loader
+    train_loader, val_loader
 
 
 @app.cell

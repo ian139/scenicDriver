@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import json
 from pathlib import Path
+import math
 
 
 @dataclass
@@ -210,9 +211,143 @@ class RoadGraph:
         Returns:
             RoadGraph instance
         """
-        # TODO: Implement OSM parsing
-        # Options:
-        # 1. Use osmnx library
-        # 2. Parse OSM XML directly
-        # 3. Use osmium for .pbf files
-        raise NotImplementedError("Implement OSM graph building")
+        try:
+            import osmnx as ox
+        except ImportError as exc:
+            raise ImportError(
+                "osmnx is required for OSM import. Install with: uv sync --extra geo"
+            ) from exc
+
+        scenic_scores = scenic_scores or {}
+        osm_path = Path(osm_file)
+
+        if osm_path.suffix == ".graphml":
+            G = ox.load_graphml(osm_path)
+        else:
+            # Supports .osm/.pbf if pyosmium is available
+            G = ox.graph_from_xml(osm_path)
+
+        return _graph_from_osmnx(G, scenic_scores)
+
+    @classmethod
+    def from_geojson(cls, path: Path) -> "RoadGraph":
+        """
+        Build graph from a GeoJSON FeatureCollection of LineStrings.
+
+        Expected feature properties (optional):
+            - id: edge id
+            - road_name
+            - road_type
+            - scenic_score (0-10)
+            - speed_limit_kmh
+        """
+        with open(path) as f:
+            data = json.load(f)
+
+        if data.get("type") != "FeatureCollection":
+            raise ValueError("GeoJSON must be a FeatureCollection")
+
+        graph = cls()
+        node_index: Dict[Tuple[float, float], str] = {}
+
+        def node_id(lat: float, lon: float) -> str:
+            key = (round(lat, 6), round(lon, 6))
+            if key in node_index:
+                return node_index[key]
+            nid = f"n{len(node_index)}"
+            node_index[key] = nid
+            graph.add_node(Node(id=nid, lat=lat, lon=lon))
+            return nid
+
+        for feat in data.get("features", []):
+            geom = feat.get("geometry", {})
+            if geom.get("type") != "LineString":
+                continue
+            coords = geom.get("coordinates", [])
+            if len(coords) < 2:
+                continue
+
+            props = feat.get("properties", {}) or {}
+            road_name = props.get("road_name")
+            road_type = props.get("road_type", "secondary")
+            scenic_score = float(props.get("scenic_score", 5.0))
+            speed_limit = int(props.get("speed_limit_kmh", 50))
+
+            for i in range(len(coords) - 1):
+                lon1, lat1 = coords[i]
+                lon2, lat2 = coords[i + 1]
+                start_id = node_id(lat1, lon1)
+                end_id = node_id(lat2, lon2)
+                dist_km = _haversine_km(lat1, lon1, lat2, lon2)
+                edge_id = props.get("id", f"e{len(graph.edges)}_{i}")
+                graph.add_edge(
+                    Edge(
+                        id=edge_id,
+                        start_node_id=start_id,
+                        end_node_id=end_id,
+                        distance_km=dist_km,
+                        scenic_score=scenic_score,
+                        road_name=road_name,
+                        road_type=road_type,
+                        speed_limit_kmh=speed_limit,
+                    )
+                )
+
+        return graph
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two points in km."""
+    r = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
+    )
+    c = 2 * math.asin(math.sqrt(a))
+    return r * c
+
+
+def _graph_from_osmnx(G, scenic_scores: Dict[str, float]) -> RoadGraph:
+    graph = RoadGraph()
+
+    for node_id, data in G.nodes(data=True):
+        graph.add_node(
+            Node(
+                id=str(node_id),
+                lat=float(data.get("y")),
+                lon=float(data.get("x")),
+            )
+        )
+
+    for u, v, key, data in G.edges(keys=True, data=True):
+        edge_id = f"{u}-{v}-{key}"
+        length_m = float(data.get("length", 0.0))
+        scenic_score = float(scenic_scores.get(str(data.get("osmid", edge_id)), 5.0))
+        road_name = data.get("name")
+        road_type = data.get("highway", "secondary")
+        speed = data.get("maxspeed", 50)
+        if isinstance(speed, list):
+            speed = speed[0]
+        try:
+            speed_kmh = int(str(speed).split()[0])
+        except (ValueError, TypeError):
+            speed_kmh = 50
+
+        graph.add_edge(
+            Edge(
+                id=edge_id,
+                start_node_id=str(u),
+                end_node_id=str(v),
+                distance_km=length_m / 1000.0,
+                scenic_score=scenic_score,
+                road_name=road_name,
+                road_type=road_type if isinstance(road_type, str) else road_type[0],
+                speed_limit_kmh=speed_kmh,
+            )
+        )
+
+    return graph

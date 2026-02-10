@@ -15,3 +15,4 @@
 - [ ] Verify classifier loads with `uv run` and checkpoint `models/classifier/best_model.pt`.
 - [ ] Optionally add "cluster view" for multi-region heatmap (group by region).
 - [ ] Add small troubleshooting section to `data/README.md` (timm/pandas, uv run).
+- [ ] Add new region pipeline (download → label → terrain features → train).

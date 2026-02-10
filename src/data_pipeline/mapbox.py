@@ -334,9 +334,14 @@ class MapboxTileSource:
 
         if cache_path.exists() and not force_download:
             logger.debug(f"Loading from cache: {cache_path}")
-            image = np.array(Image.open(cache_path).convert("RGB"))
-            self._stats.tiles_cached += 1
-        else:
+            try:
+                image = np.array(Image.open(cache_path).convert("RGB"))
+                self._stats.tiles_cached += 1
+            except Exception as exc:
+                logger.warning(f"Corrupt cache file {cache_path}, re-downloading. Error: {exc}")
+                force_download = True
+
+        if not cache_path.exists() or force_download:
             logger.info(f"Downloading tile: z{zoom}/{x}/{y}")
             try:
                 image = self._download_tile(x, y, zoom)
