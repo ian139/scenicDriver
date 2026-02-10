@@ -40,15 +40,15 @@ SCENIC_WEIGHTS = {
     "mountain": 0.95,
     "beach": 0.9,
     "lake": 0.9,
-    "island": 0.9,
+    "island": 0.7,
     "forest": 0.85,
     "river": 0.85,
     "meadow": 0.8,
     "snowberg": 0.8,
     "wetland": 0.7,
     "sea_ice": 0.7,
-    "desert": 0.65,
-    "chaparral": 0.6,
+    "desert": 0.45,
+    "chaparral": 0.45,
     "cloud": 0.5,
 
     # Agricultural - moderate scenic value
@@ -59,10 +59,10 @@ SCENIC_WEIGHTS = {
     # Built environment with some character
     "bridge": 0.4,
     "harbor": 0.45,
-    "palace": 0.5,
+    "palace": 0.35,
     "church": 0.45,
     "stadium": 0.3,
-    "golf_course": 0.4,
+    "golf_course": 0.25,
 
     # Residential - lower scenic value
     "sparse_residential": 0.25,
