@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import sys
 import webbrowser
+import os
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--satellite-dir", type=str, default=None)
     parser.add_argument("--terrain-dir", type=str, default=None)
     parser.add_argument("--raw-dir", type=str, default=None)
+    parser.add_argument("--s3-only", action="store_true", default=False)
     return parser.parse_args()
 
 
@@ -46,6 +48,10 @@ def main() -> None:
         cfg.terrain_dir = args.terrain_dir
     if args.raw_dir:
         cfg.raw_dir = args.raw_dir
+    elif os.getenv("SCENIC_S3_BUCKET"):
+        cfg.raw_dir = f"s3://{os.getenv('SCENIC_S3_BUCKET')}/raw"
+        if args.s3_only:
+            os.environ["SCENIC_S3_ONLY"] = "1"
 
     run_name = args.run_name or f"heuristic_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
     if args.preview and args.max_tiles is None:

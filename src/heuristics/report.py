@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 from typing import Any
 import json
+import os
 
 import numpy as np
 from PIL import Image
@@ -17,14 +18,18 @@ def build_report(
     run_info: dict[str, Any],
     histogram_bins: int = 20,
     thumb_size: int = 128,
+    include_thumbs: bool = True,
 ) -> dict[str, Any]:
     report_path = Path(report_dir)
     report_path.mkdir(parents=True, exist_ok=True)
 
     thumbs_dir = report_path / "thumbs"
-    thumbs_dir.mkdir(parents=True, exist_ok=True)
-
-    _attach_thumbnails(tiles, raw_dir, thumbs_dir, thumb_size)
+    if include_thumbs:
+        thumbs_dir.mkdir(parents=True, exist_ok=True)
+        _attach_thumbnails(tiles, raw_dir, thumbs_dir, thumb_size)
+    else:
+        for idx, tile in enumerate(tiles):
+            tile["index"] = idx
 
     scores = np.array([float(t["scenic_score"]) for t in tiles], dtype=np.float32)
     hist_counts, hist_edges = np.histogram(scores, bins=histogram_bins, range=(0.0, 10.0))
@@ -70,13 +75,37 @@ def _attach_thumbnails(
     thumbs_dir: Path,
     thumb_size: int,
 ) -> None:
-    raw_root = Path(raw_dir)
+    raw_dir_str = str(raw_dir)
+    raw_root = Path(raw_dir_str)
+
+    s3_bucket = os.getenv("SCENIC_S3_BUCKET")
+    s3_prefix = None
+    s3_only = False
+    if raw_dir_str.startswith("s3://"):
+        s3_parts = raw_dir_str.replace("s3://", "", 1).split("/", 1)
+        parsed_bucket = s3_parts[0] if s3_parts else None
+        parsed_prefix = s3_parts[1] if len(s3_parts) > 1 else ""
+        # Treat s3:// raw_dir as authoritative; env flag can explicitly disable.
+        s3_only = os.getenv("SCENIC_S3_ONLY", "1").lower() not in ("0", "false", "no")
+        s3_bucket = s3_bucket or parsed_bucket
+        s3_prefix = parsed_prefix
     for idx, tile in enumerate(tiles):
         image_path = raw_root / tile["image_path"]
         thumb_name = f"{idx:05d}.jpg"
         thumb_path = thumbs_dir / thumb_name
 
-        image = Image.open(image_path).convert("RGB")
+        if s3_only:
+            if not s3_bucket:
+                raise ValueError("SCENIC_S3_BUCKET and s3:// raw_dir required for S3-only mode.")
+            import boto3
+            from io import BytesIO
+
+            s3 = boto3.client("s3")
+            key = f"{s3_prefix}/{tile['image_path']}" if s3_prefix else tile["image_path"]
+            resp = s3.get_object(Bucket=s3_bucket, Key=key)
+            image = Image.open(BytesIO(resp["Body"].read())).convert("RGB")
+        else:
+            image = Image.open(image_path).convert("RGB")
         image.thumbnail((thumb_size, thumb_size))
         image.save(thumb_path, format="JPEG", quality=85)
 

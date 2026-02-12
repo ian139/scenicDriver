@@ -21,6 +21,7 @@ from scripts.heuristic_report import parse_args as _parse_base_args
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate heuristic report for a region")
     parser.add_argument("--region", type=str, required=True)
+    parser.add_argument("--zoom", type=int, default=16)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--preview", action="store_true", default=False)
     parser.add_argument("--max-tiles", type=int, default=None)
@@ -41,8 +42,8 @@ def main() -> None:
 
     # Delegate to the main report script by rebuilding sys.argv
     run_name = args.run_name or f"{region}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-    sat_dir = f"data/raw/images/satellite/z16/{region}"
-    terr_dir = f"data/raw/images/terrain/z16/{region}"
+    sat_dir = f"data/raw/images/satellite/z{args.zoom}/{region}"
+    terr_dir = f"data/raw/images/terrain/z{args.zoom}/{region}"
 
     sys.argv = [
         sys.argv[0],

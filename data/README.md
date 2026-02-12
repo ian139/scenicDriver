@@ -57,6 +57,32 @@ uv run python scripts/download_bbox_tiles.py \
   --output data/raw/images/terrain
 ```
 
+Direct-to-S3 (optional, low-local-storage workflow):
+
+```bash
+export SCENIC_S3_BUCKET=scenicdriver-data
+
+uv run python scripts/download_bbox_tiles.py \
+  --min-lat 41.2 --min-lon -73.5 \
+  --max-lat 44.5 --max-lon -70.8 \
+  --zoom 14 \
+  --style mapbox.satellite \
+  --output data/raw/images/satellite/z14/masswhites \
+  --s3-bucket "$SCENIC_S3_BUCKET" \
+  --s3-prefix raw/images/satellite \
+  --delete-local
+
+uv run python scripts/download_bbox_tiles.py \
+  --min-lat 41.2 --min-lon -73.5 \
+  --max-lat 44.5 --max-lon -70.8 \
+  --zoom 14 \
+  --style mapbox.terrain-rgb \
+  --output data/raw/images/terrain/z14/masswhites \
+  --s3-bucket "$SCENIC_S3_BUCKET" \
+  --s3-prefix raw/images/terrain \
+  --delete-local
+```
+
 ## Heuristic Reports
 
 Generate a report for a single region (example uses the Rocky Mountains tiles):
@@ -74,6 +100,19 @@ uv run python scripts/heuristic_report.py --run-name heuristic_all
 Reports are written to `data/processed/heuristic_runs/{run_name}/report/`.
 
 If you want to also update the training labels at `data/raw/labels.csv`, add `--write-raw-labels`.
+
+S3-only report mode (reads tiles from S3, avoids local tile copy):
+
+```bash
+export SCENIC_S3_BUCKET=scenicdriver-data
+export SCENIC_S3_ONLY=1
+
+uv run python scripts/heuristic_report.py \
+  --run-name masswhites_z14 \
+  --satellite-dir data/raw/images/satellite/z14 \
+  --terrain-dir data/raw/images/terrain/z14 \
+  --max-tiles 5000
+```
 
 ## Terrain-RGB Decoding
 
@@ -129,7 +168,10 @@ score = 2.5 * class_score      # From RESISC-45 classifier
 
 ```bash
 export SCENIC_S3_BUCKET=scenicdriver-data
-./scripts/s3_sync.sh
+bash scripts/s3_sync.sh
 ```
 
 Lifecycle policy template: `scripts/s3_lifecycle.json`
+
+Key-prefix convention for compatibility:
+- Keep S3 tiles under `raw/images/...` so label/report tooling can auto-resolve paths in S3-only mode.

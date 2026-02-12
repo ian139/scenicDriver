@@ -57,6 +57,7 @@ data/processed/*.npy
 data/processed/heuristic_runs/**/report/
 data/processed/heuristic_runs/**/labels.csv
 data/processed/heuristic_runs/**/run.json
+data/processed/report_config.json
 *.tif
 *.geotiff
 
@@ -65,6 +66,12 @@ models/**/*.pt
 models/**/*.pth
 models/**/*.onnx
 !models/.gitkeep
+
+# Archive (keep manifest/scripts, ignore large artifacts)
+archive/data/
+archive/models/**/*.pt
+archive/models/**/*.pth
+archive/models/**/*.onnx
 
 # Environment
 .env

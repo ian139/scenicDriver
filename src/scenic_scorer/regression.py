@@ -84,15 +84,35 @@ class ScenicScoreDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, data_path: Path):
-        # TODO: Load preprocessed dataset
-        # Expected format: .npz or .pt file with arrays/tensors
-        raise NotImplementedError("Implement dataset loading")
+        data_path = Path(data_path)
+        if not data_path.exists():
+            raise FileNotFoundError(f"Dataset not found: {data_path}")
+
+        data = np.load(data_path, allow_pickle=False)
+        required = ["vit_embeddings", "terrain_features", "class_logits", "scenic_scores"]
+        missing = [k for k in required if k not in data]
+        if missing:
+            raise ValueError(f"Dataset missing required arrays: {missing}")
+
+        self.vit_embeddings = torch.from_numpy(data["vit_embeddings"]).float()
+        self.terrain_features = torch.from_numpy(data["terrain_features"]).float()
+        self.class_logits = torch.from_numpy(data["class_logits"]).float()
+        self.scenic_scores = torch.from_numpy(data["scenic_scores"]).float().unsqueeze(-1)
+
+        n = len(self.scenic_scores)
+        if not (len(self.vit_embeddings) == len(self.terrain_features) == len(self.class_logits) == n):
+            raise ValueError("Dataset arrays have inconsistent lengths")
 
     def __len__(self) -> int:
-        raise NotImplementedError()
+        return len(self.scenic_scores)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
-        raise NotImplementedError()
+        return (
+            self.vit_embeddings[idx],
+            self.terrain_features[idx],
+            self.class_logits[idx],
+            self.scenic_scores[idx],
+        )
 
 
 def train_regression_model(
@@ -100,7 +120,11 @@ def train_regression_model(
     output_path: Path,
     epochs: int = 100,
     batch_size: int = 64,
-    learning_rate: float = 1e-3
+    learning_rate: float = 1e-3,
+    val_split: float = 0.15,
+    seed: int = 42,
+    device: Optional[str] = None,
+    weight_decay: float = 1e-4,
 ) -> float:
     """
     Train the scenic score regression model.
@@ -108,13 +132,117 @@ def train_regression_model(
     Returns:
         Final validation correlation coefficient
     """
-    # TODO: Implement training loop
-    # - Load dataset
-    # - Split train/val
-    # - Train with MSE loss
-    # - Evaluate with Pearson correlation
-    # - Save best model
-    raise NotImplementedError("Implement regression training")
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    dataset = ScenicScoreDataset(Path(data_path))
+    n = len(dataset)
+    if n < 16:
+        raise ValueError("Dataset too small for regression training.")
+
+    indices = np.arange(n)
+    np.random.shuffle(indices)
+    split = max(1, int(n * (1 - val_split)))
+    train_idx = indices[:split].tolist()
+    val_idx = indices[split:].tolist()
+    if len(val_idx) == 0:
+        val_idx = train_idx[-1:]
+        train_idx = train_idx[:-1]
+
+    train_ds = torch.utils.data.Subset(dataset, train_idx)
+    val_ds = torch.utils.data.Subset(dataset, val_idx)
+
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=0
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=0
+    )
+
+    sample_v, sample_t, sample_c, _ = dataset[0]
+    model = ScenicRegressionModel(
+        vit_dim=int(sample_v.shape[0]),
+        terrain_dim=int(sample_t.shape[0]),
+        num_classes=int(sample_c.shape[0]),
+    ).to(device)
+
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    best_val = float("inf")
+    best_corr = -1.0
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_corr": [],
+    }
+
+    for _ in range(epochs):
+        model.train()
+        train_losses = []
+        for vit_emb, terrain, logits, score in train_loader:
+            vit_emb = vit_emb.to(device)
+            terrain = terrain.to(device)
+            logits = logits.to(device)
+            score = score.to(device)
+
+            optimizer.zero_grad()
+            pred = model(vit_emb, terrain, logits)
+            loss = criterion(pred, score)
+            loss.backward()
+            optimizer.step()
+            train_losses.append(loss.item())
+
+        model.eval()
+        val_losses = []
+        preds = []
+        targets = []
+        with torch.no_grad():
+            for vit_emb, terrain, logits, score in val_loader:
+                vit_emb = vit_emb.to(device)
+                terrain = terrain.to(device)
+                logits = logits.to(device)
+                score = score.to(device)
+                pred = model(vit_emb, terrain, logits)
+                loss = criterion(pred, score)
+                val_losses.append(loss.item())
+                preds.append(pred.detach().cpu().numpy().reshape(-1))
+                targets.append(score.detach().cpu().numpy().reshape(-1))
+
+        val_loss = float(np.mean(val_losses)) if val_losses else 0.0
+        all_preds = np.concatenate(preds) if preds else np.array([0.0], dtype=np.float32)
+        all_targets = np.concatenate(targets) if targets else np.array([0.0], dtype=np.float32)
+        corr = float(np.corrcoef(all_preds, all_targets)[0, 1]) if len(all_preds) > 1 else 0.0
+        if not np.isfinite(corr):
+            corr = 0.0
+
+        history["train_loss"].append(float(np.mean(train_losses)) if train_losses else 0.0)
+        history["val_loss"].append(val_loss)
+        history["val_corr"].append(corr)
+
+        if val_loss < best_val:
+            best_val = val_loss
+            best_corr = corr
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "best_val_loss": best_val,
+                    "best_val_corr": best_corr,
+                    "vit_dim": int(sample_v.shape[0]),
+                    "terrain_dim": int(sample_t.shape[0]),
+                    "num_classes": int(sample_c.shape[0]),
+                    "history": history,
+                },
+                output_path,
+            )
+
+    return best_corr
 
 
 def evaluate_correlation(
@@ -135,7 +263,9 @@ def evaluate_correlation(
             vit_emb, terrain, logits, score = batch
             pred = model(vit_emb, terrain, logits)
             predictions.extend(pred.squeeze().cpu().numpy())
-            targets.extend(score.cpu().numpy())
+            targets.extend(score.squeeze().cpu().numpy())
 
     correlation = np.corrcoef(predictions, targets)[0, 1]
-    return correlation
+    if not np.isfinite(correlation):
+        return 0.0
+    return float(correlation)

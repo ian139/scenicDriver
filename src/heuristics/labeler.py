@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 import re
+import os
 
 import numpy as np
 import pandas as pd
@@ -30,19 +31,20 @@ class HeuristicLabelerConfig:
     seed: int = 42
 
 
-def parse_tile_coords(path: Path) -> Optional[tuple[int, int, int]]:
-    match = _COORD_RE.search(path.as_posix())
+def parse_tile_coords(path: Path | PurePosixPath | str) -> Optional[tuple[int, int, int]]:
+    posix_path = PurePosixPath(path) if isinstance(path, str) else path
+    match = _COORD_RE.search(posix_path.as_posix())
     if match:
         return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
     # Handle layout: .../z16/19073_24793.png (x_y in filename, zoom in parent dir)
     try:
         zoom = None
-        if path.parent.name.lower().startswith("z"):
-            zoom = int(path.parent.name[1:])
-        elif path.parent.parent.name.lower().startswith("z"):
-            zoom = int(path.parent.parent.name[1:])
-        stem_parts = path.stem.split("_")
+        if posix_path.parent.name.lower().startswith("z"):
+            zoom = int(posix_path.parent.name[1:])
+        elif posix_path.parent.parent.name.lower().startswith("z"):
+            zoom = int(posix_path.parent.parent.name[1:])
+        stem_parts = posix_path.stem.split("_")
         if zoom is not None and len(stem_parts) == 2:
             x, y = int(stem_parts[0]), int(stem_parts[1])
             return zoom, x, y
@@ -80,21 +82,37 @@ def run_heuristic_labeling(
     terrain_dir = Path(terrain_dir)
     raw_root = Path(raw_dir)
 
-    if not sat_dir.exists():
-        raise FileNotFoundError(f"Satellite dir not found: {sat_dir}")
-    if not terrain_dir.exists():
-        raise FileNotFoundError(f"Terrain dir not found: {terrain_dir}")
+    s3_bucket = os.getenv("SCENIC_S3_BUCKET")
+    s3_only = bool(s3_bucket) and os.getenv("SCENIC_S3_ONLY", "1").lower() not in ("0", "false", "no")
 
-    sat_files = _list_images(sat_dir)
-    terrain_files = _list_images(terrain_dir)
+    sat_files: list[Path | S3ImageRef]
+    terrain_files: list[Path | S3ImageRef]
+
+    if s3_only:
+        sat_files = _list_images_s3(s3_bucket, _s3_prefix_from_local_dir(sat_dir))
+        terrain_files = _list_images_s3(s3_bucket, _s3_prefix_from_local_dir(terrain_dir))
+    else:
+        if not sat_dir.exists():
+            raise FileNotFoundError(f"Satellite dir not found: {sat_dir}")
+        if not terrain_dir.exists():
+            raise FileNotFoundError(f"Terrain dir not found: {terrain_dir}")
+
+        sat_files = _list_images(sat_dir)
+        terrain_files = _list_images(terrain_dir)
+
+        if (not sat_files or not terrain_files) and s3_bucket:
+            if not sat_files:
+                sat_files = _list_images_s3(s3_bucket, _s3_prefix_from_local_dir(sat_dir))
+            if not terrain_files:
+                terrain_files = _list_images_s3(s3_bucket, _s3_prefix_from_local_dir(terrain_dir))
 
     if not sat_files:
         raise ValueError(f"No satellite images found in: {sat_dir}")
     if not terrain_files:
         raise ValueError(f"No terrain images found in: {terrain_dir}")
 
-    sat_coords = [parse_tile_coords(p) for p in sat_files]
-    terrain_coords = [parse_tile_coords(p) for p in terrain_files]
+    sat_coords = [parse_tile_coords(_path_for_coords(p)) for p in sat_files]
+    terrain_coords = [parse_tile_coords(_path_for_coords(p)) for p in terrain_files]
     coords_ok = all(c is not None for c in sat_coords) and all(c is not None for c in terrain_coords)
 
     warnings: list[str] = []
@@ -104,11 +122,11 @@ def run_heuristic_labeling(
         )
 
     if coords_ok:
-        terrain_index: dict[tuple[int, int, int], Path] = {
+        terrain_index: dict[tuple[int, int, int], Path | S3ImageRef] = {
             coords: path for coords, path in zip(terrain_coords, terrain_files)
         }
     else:
-        terrain_index = {path.stem: path for path in terrain_files}
+        terrain_index = {Path(_path_for_coords(path)).stem: path for path in terrain_files}
 
     classifier, clf_transform, clf_device, class_names = _load_classifier(
         use_classifier=use_classifier,
@@ -134,10 +152,16 @@ def run_heuristic_labeling(
             missing_pairs += 1
             continue
 
-        sat_rel, terrain_rel = _relative_paths_or_raise(sat_path, terrain_path, raw_root)
+        sat_rel, terrain_rel = _relative_paths_or_raise(
+            sat_path,
+            terrain_path,
+            raw_root,
+            s3_bucket=s3_bucket,
+            s3_only=s3_only,
+        )
 
-        sat_img = Image.open(sat_path).convert("RGB")
-        terrain_img = Image.open(terrain_path).convert("RGB")
+        sat_img = _open_image(sat_path, s3_bucket).convert("RGB")
+        terrain_img = _open_image(terrain_path, s3_bucket).convert("RGB")
 
         elev = _decode_terrain_rgb(terrain_img)
         gy, gx = np.gradient(elev)
@@ -243,6 +267,8 @@ def run_heuristic_labeling(
             "satellite_dir": str(sat_dir),
             "terrain_dir": str(terrain_dir),
             "raw_dir": str(raw_root),
+            "s3_bucket": s3_bucket,
+            "s3_only": s3_only,
             "max_tiles": max_tiles,
             "use_classifier": use_classifier,
             "classifier_best_ckpt": str(classifier_best_ckpt),
@@ -271,18 +297,82 @@ def _safe_div(num: np.ndarray, den: np.ndarray) -> np.ndarray:
     return num / (np.maximum(den, 1e-6))
 
 
+@dataclass(frozen=True)
+class S3ImageRef:
+    key: str
+
+
+def _path_for_coords(path: Path | S3ImageRef) -> PurePosixPath:
+    if isinstance(path, S3ImageRef):
+        return PurePosixPath(path.key)
+    return path
+
+
+def _s3_prefix_from_local_dir(path: Path) -> str:
+    try:
+        rel = path.resolve().relative_to(Path("data/raw").resolve())
+        return f"raw/{rel.as_posix()}"
+    except ValueError:
+        return path.as_posix().lstrip("/")
+
+
+def _list_images_s3(bucket: str, prefix: str) -> list[S3ImageRef]:
+    import boto3
+
+    s3 = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+    images: list[S3ImageRef] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            suffix = Path(key).suffix.lower()
+            if suffix in IMAGE_EXTENSIONS:
+                images.append(S3ImageRef(key=key))
+    return sorted(images, key=lambda ref: ref.key)
+
+
+def _open_image(path: Path | S3ImageRef, bucket: str | None) -> Image.Image:
+    if isinstance(path, S3ImageRef):
+        if not bucket:
+            raise ValueError("SCENIC_S3_BUCKET is required to load S3 tiles.")
+        import boto3
+        from io import BytesIO
+
+        s3 = boto3.client("s3")
+        resp = s3.get_object(Bucket=bucket, Key=path.key)
+        return Image.open(BytesIO(resp["Body"].read()))
+    return Image.open(path)
+
+
 def _relative_paths_or_raise(
-    sat_path: Path, terrain_path: Path, raw_root: Path
+    sat_path: Path | S3ImageRef,
+    terrain_path: Path | S3ImageRef,
+    raw_root: Path,
+    *,
+    s3_bucket: str | None,
+    s3_only: bool,
 ) -> tuple[str, str]:
+    if s3_only:
+        if not s3_bucket:
+            raise ValueError("SCENIC_S3_BUCKET is required for S3-only mode.")
+        raw_prefix = "raw/"
+        sat_key = sat_path.key if isinstance(sat_path, S3ImageRef) else sat_path.as_posix()
+        terr_key = (
+            terrain_path.key if isinstance(terrain_path, S3ImageRef) else terrain_path.as_posix()
+        )
+        if not sat_key.startswith(raw_prefix) or not terr_key.startswith(raw_prefix):
+            raise ValueError("S3 tile keys must live under raw/ in the bucket.")
+        return sat_key[len(raw_prefix):], terr_key[len(raw_prefix):]
+
     raw_root = raw_root.resolve()
     try:
-        sat_rel = sat_path.resolve().relative_to(raw_root).as_posix()
+        sat_rel = Path(sat_path).resolve().relative_to(raw_root).as_posix()
     except ValueError as exc:
         raise ValueError(
             f"Satellite path {sat_path} is not under raw_dir {raw_root}"
         ) from exc
     try:
-        terrain_rel = terrain_path.resolve().relative_to(raw_root).as_posix()
+        terrain_rel = Path(terrain_path).resolve().relative_to(raw_root).as_posix()
     except ValueError as exc:
         raise ValueError(
             f"Terrain path {terrain_path} is not under raw_dir {raw_root}"

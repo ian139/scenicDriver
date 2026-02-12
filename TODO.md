@@ -4,7 +4,7 @@
 - [x] Extract heuristic labeling into shared module (`src/heuristics/labeler.py`).
 - [x] Add report generator with histogram + heatmap + side panel (`src/heuristics/report.py`).
 - [x] Add CLI to run heuristic labeling + report (`scripts/heuristic_report.py`).
-- [x] Add local report server (`scripts/heuristic_report_server.py`).
+- [x] Add local report server (`scripts/heuristic_report_server.py`, now archived at `archive/scripts/heuristic_report_server.py`).
 - [x] Update regression notebook to use shared labeler (`notebooks/regression.mo.py`).
 - [x] Add tests for labeler (pairing, determinism, parsing) (`tests/test_heuristics_labeler.py`).
 - [x] Add region helper CLI (`scripts/heuristic_report_region.py`).
@@ -12,10 +12,19 @@
 - [x] Add troubleshooting section to `data/README.md` (timm/pandas, uv run).
 
 ## Next Steps
-- [ ] Run per-region reports for: `rocky_mountains`, `olympic_peninsula`, `philadelphia` (Big Sur done).
+
+### Phase 1: Model Quality (Priority)
+- [ ] Retrain classifier on a larger/higher-quality dataset (or expanded labels) to improve domain fit and reduce class mislabeling in Northeast regions.
+- [ ] Keep classifier signal but shift it to model features/auxiliary loss instead of fixed manual class weights.
+- [ ] Replace heuristic class-weight scoring with a learned scenic regressor that uses satellite embeddings + terrain features (and optional class probabilities) as inputs.
 - [ ] Verify classifier loads with `uv run` and checkpoint `models/classifier/best_model.pt`.
-- [ ] Optionally add "cluster view" for multi-region heatmap (group by region).
+
+### Phase 2: Data + Reporting
 - [ ] Add new region pipeline (download → label → terrain features → train).
+- [ ] Run per-region reports for: `rocky_mountains`, `olympic_peninsula`, `philadelphia` (Big Sur done).
+- [ ] Optionally add "cluster view" for multi-region heatmap (group by region).
+
+### Phase 3: Routing
 - [ ] Routing: stabilize OSM ingest (osmnx version compatibility, bbox validation, smaller demo).
 - [ ] Routing: add cached graph builder output under `data/processed/` with a deterministic run name.
 - [ ] Routing: implement scenic edge scoring (tile score → edge score aggregation).

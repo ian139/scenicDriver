@@ -10,6 +10,11 @@ This project combines:
 - **RESISC-45 classifier** for land-use classification
 - **Heuristic scoring** that combines all features into a scenic score (0-10)
 
+Current direction:
+- Keep classifier signal, but move away from fixed manual class weights.
+- Train a learned scenic regressor using satellite embeddings + terrain features.
+- Retrain/expand classifier data to improve domain fit (especially Northeast).
+
 ## Quick Start
 
 ```bash
@@ -77,6 +82,7 @@ See [`data/README.md`](data/README.md) for detailed tile regions, bboxes, and da
 
 - [`AGENTS.md`](AGENTS.md) - Development workflow and principles
 - [`data/README.md`](data/README.md) - Data structure and tile regions
+- [`archive/archive.md`](archive/archive.md) - Archived scripts/models and restore commands
 
 ## S3 Storage (Optional)
 
@@ -84,7 +90,7 @@ Set a bucket and sync local data:
 
 ```bash
 export SCENIC_S3_BUCKET=scenicdriver-data
-./scripts/s3_sync.sh
+bash scripts/s3_sync.sh
 ```
 
 Apply lifecycle rules (raw/processed → colder storage):
@@ -93,6 +99,18 @@ Apply lifecycle rules (raw/processed → colder storage):
 aws s3api put-bucket-lifecycle-configuration \
   --bucket "$SCENIC_S3_BUCKET" \
   --lifecycle-configuration file://scripts/s3_lifecycle.json
+```
+
+S3-only report generation (no large local tile copy):
+
+```bash
+export SCENIC_S3_BUCKET=scenicdriver-data
+export SCENIC_S3_ONLY=1
+uv run python scripts/heuristic_report.py \
+  --run-name masswhites_z14 \
+  --satellite-dir data/raw/images/satellite/z14 \
+  --terrain-dir data/raw/images/terrain/z14 \
+  --max-tiles 5000
 ```
 
 ## Requirements
