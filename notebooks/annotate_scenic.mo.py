@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.19.7"
+__generated_with = "0.19.11"
 app = marimo.App(width="medium")
 
 
@@ -14,6 +14,7 @@ def _():
 
     import pandas as pd
     from PIL import Image
+
     return Image, Path, dataclass, datetime, mo, os, pd, timezone
 
 
@@ -30,7 +31,7 @@ def _(mo):
 def _(Path, dataclass, os):
     @dataclass
     class AnnotatorConfig:
-        labels_csv: str = "data/raw/labels.csv"
+        labels_csv: str = "data/processed/annotation_batches/masswhites_z14_flat_5k_seamfix_batch500/labels_batch.csv"
         raw_dir: str = "data/raw"
         annotations_csv: str = "data/raw/labels_human.csv"
         batch_size: int = 500
@@ -165,112 +166,188 @@ def _(batch_df, done_paths, mo):
     if batch_df.empty:
         mo.callout("No unlabeled samples found for this config.", kind="warn")
 
-    ui_index = mo.ui.number(label="Tile Index", value=0, step=1, start=0, stop=max(0, len(batch_df) - 1))
+    max_index = max(0, len(batch_df) - 1)
+    current_index, set_current_index = mo.state(0, allow_self_loops=True)
+    if current_index() < 0:
+        set_current_index(0)
+    if current_index() > max_index:
+        set_current_index(max_index)
+
+    def _read_value(widget):
+        return widget.value() if callable(widget.value) else widget.value
+
+    ui_index = mo.ui.number(
+        label="Tile Index",
+        value=int(current_index()),
+        step=1,
+        start=0,
+        stop=max_index,
+    )
+    prev_btn = mo.ui.button(
+        label="Previous",
+        on_click=lambda _value: set_current_index(max(0, int(current_index()) - 1)),
+        disabled=bool(current_index() <= 0),
+    )
+    next_btn = mo.ui.button(
+        label="Next",
+        on_click=lambda _value: set_current_index(min(max_index, int(current_index()) + 1)),
+        disabled=bool(current_index() >= max_index),
+    )
+    go_btn = mo.ui.button(
+        label="Go",
+        on_click=lambda _value: set_current_index(min(max_index, max(0, int(_read_value(ui_index))))),
+    )
+
+    nav = mo.hstack([prev_btn, next_btn, ui_index, go_btn], widths="equal")
+
     ui_score = mo.ui.number(label="Scenic Score (0-10)", value=5.0, step=0.1, start=0, stop=10)
     ui_conf = mo.ui.dropdown(label="Confidence", options=["high", "medium", "low"], value="medium")
     ui_skip = mo.ui.checkbox(label="Skip", value=False)
     ui_notes = mo.ui.text_area(label="Notes", value="", rows=3)
 
-    save_inputs = mo.ui.dictionary(
-        {
-            "tile_index": ui_index,
-            "scenic_human": ui_score,
-            "confidence": ui_conf,
-            "skip": ui_skip,
-            "notes": ui_notes,
-        }
+    ui_save_click = mo.ui.run_button(label="Save Annotation", kind="success")
+    controls = mo.vstack(
+        [
+            mo.md("### Navigation"),
+            nav,
+            mo.md("### Annotation"),
+            ui_score,
+            ui_conf,
+            ui_skip,
+            ui_notes,
+            ui_save_click,
+        ]
     )
-    ui_save_form = mo.ui.form(save_inputs, label="Save Annotation")
-    mo.vstack([ui_save_form])
-    return ui_conf, ui_index, ui_notes, ui_save_form, ui_score, ui_skip
+    controls
+    return current_index, ui_conf, ui_notes, ui_save_click, ui_score, ui_skip
 
 
 @app.cell
-def _(Image, Path, batch_df, config, mo, ui_index):
+def _(Image, Path, batch_df, config, current_index, mo):
+    image_path = ""
     if batch_df.empty:
-        raise RuntimeError("No samples to annotate.")
-
-    i = int(ui_index.value() if callable(ui_index.value) else ui_index.value)
-    i = min(max(0, i), len(batch_df) - 1)
-    row = batch_df.iloc[i]
-    image_path = str(row["image_path"])
-    image_abs = Path(config["raw_dir"]) / image_path
-
-    meta = [f"Index: {i}/{len(batch_df)-1}", f"image_path: {image_path}"]
-    for k in ["scenic_score", "class_id", "lat", "lon"]:
-        if k in row:
-            meta.append(f"{k}: {row[k]}")
-    mo.md("### Current Tile\n" + "\n".join([f"- {m}" for m in meta]))
-
-    if image_abs.exists():
-        mo.image(Image.open(image_abs).convert("RGB"))
+        _panel_current = mo.callout("No samples to annotate.", kind="warn")
     else:
-        mo.callout(f"Image not found: {image_abs}", kind="warn")
+        i = int(current_index())
+        i = min(max(0, i), len(batch_df) - 1)
+        row = batch_df.iloc[i]
+        image_path = str(row["image_path"])
+        image_abs = Path(config["raw_dir"]) / image_path
+
+        meta = [f"Index: {i}/{len(batch_df)-1}", f"image_path: {image_path}"]
+        for k in ["scenic_score", "class_id", "lat", "lon"]:
+            if k in row:
+                meta.append(f"{k}: {row[k]}")
+        header = mo.md("### Current Tile\n" + "\n".join([f"- {m}" for m in meta]))
+
+        if image_abs.exists():
+            body = mo.image(Image.open(image_abs).convert("RGB"))
+        else:
+            body = mo.callout(f"Image not found: {image_abs}", kind="warn")
+
+        _panel_current = mo.vstack([header, body])
+    _panel_current
     return (image_path,)
 
 
 @app.cell
-def _(Path, ann_df, config, datetime, image_path, pd, timezone, ui_conf, ui_notes, ui_save_form, ui_score, ui_skip):
-    if ui_save_form.value is None:
-        print("Submit 'Save Annotation' to write a row.")
-        return
-
-    out_path = Path(config["annotations_csv"])
-    record = {
-        "image_path": image_path,
-        "scenic_human": float(ui_score.value() if callable(ui_score.value) else ui_score.value),
-        "confidence": str(ui_conf.value() if callable(ui_conf.value) else ui_conf.value),
-        "skip": bool(ui_skip.value() if callable(ui_skip.value) else ui_skip.value),
-        "annotator_id": str(config["annotator_id"]),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "notes": str(ui_notes.value() if callable(ui_notes.value) else ui_notes.value),
-    }
-
-    updated = ann_df.copy()
-    if not updated.empty:
-        mask = (updated["image_path"].astype(str) == record["image_path"]) & (
-            updated["annotator_id"].astype(str) == record["annotator_id"]
-        )
-        updated = updated.loc[~mask].copy()
-    updated = pd.concat([updated, pd.DataFrame([record])], ignore_index=True)
-    updated.to_csv(out_path, index=False)
-    print(f"Saved annotation to {out_path} (rows={len(updated)})")
+def _(
+    Path,
+    config,
+    datetime,
+    image_path,
+    pd,
+    timezone,
+    ui_conf,
+    ui_notes,
+    ui_save_click,
+    ui_score,
+    ui_skip,
+):
+    save_clicked = ui_save_click.value() if callable(ui_save_click.value) else ui_save_click.value
+    if bool(save_clicked) and image_path:
+        out_path = Path(config["annotations_csv"])
+        if out_path.exists():
+            updated = pd.read_csv(out_path)
+        else:
+            updated = pd.DataFrame(
+                columns=[
+                    "image_path",
+                    "scenic_human",
+                    "confidence",
+                    "skip",
+                    "annotator_id",
+                    "timestamp",
+                    "notes",
+                ]
+            )
+        record = {
+            "image_path": image_path,
+            "scenic_human": float(ui_score.value() if callable(ui_score.value) else ui_score.value),
+            "confidence": str(ui_conf.value() if callable(ui_conf.value) else ui_conf.value),
+            "skip": bool(ui_skip.value() if callable(ui_skip.value) else ui_skip.value),
+            "annotator_id": str(config["annotator_id"]),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "notes": str(ui_notes.value() if callable(ui_notes.value) else ui_notes.value),
+        }
+        if not updated.empty:
+            mask = (updated["image_path"].astype(str) == record["image_path"]) & (
+                updated["annotator_id"].astype(str) == record["annotator_id"]
+            )
+            updated = updated.loc[~mask].copy()
+        updated = pd.concat([updated, pd.DataFrame([record])], ignore_index=True)
+        updated.to_csv(out_path, index=False)
+        print(f"Saved annotation to {out_path} (rows={len(updated)})")
     return
 
 
 @app.cell
 def _(Path, config, mo, pd):
-    mo.md("## Annotation Summary")
-    ann_path = Path(config["annotations_csv"])
-    if not ann_path.exists():
-        mo.callout(f"No annotations file yet: {ann_path}", kind="warn")
-        return
+    _ann_path = Path(config["annotations_csv"])
+    if not _ann_path.exists():
+        _panel_summary = mo.callout(f"No annotations file yet: {_ann_path}", kind="warn")
+    else:
+        ann = pd.read_csv(_ann_path)
+        if ann.empty:
+            _panel_summary = mo.callout("Annotation file exists but has no rows yet.", kind="warn")
+        else:
+            summary = pd.DataFrame(
+                [
+                    {"metric": "total_rows", "value": int(len(ann))},
+                    {"metric": "unique_tiles", "value": int(ann["image_path"].nunique())},
+                    {
+                        "metric": "annotators",
+                        "value": int(ann["annotator_id"].nunique()) if "annotator_id" in ann.columns else 0,
+                    },
+                ]
+            )
+            by_annotator = (
+                ann.groupby("annotator_id", dropna=False)
+                .size()
+                .reset_index(name="count")
+                .sort_values("count", ascending=False)
+                if "annotator_id" in ann.columns
+                else pd.DataFrame()
+            )
+            recent = ann.tail(20)
 
-    ann = pd.read_csv(ann_path)
-    if ann.empty:
-        mo.callout("Annotation file exists but has no rows yet.", kind="warn")
-        return
+            _panel_summary = mo.vstack(
+                [
+                    mo.md("## Annotation Summary"),
+                    mo.md("### Totals"),
+                    summary,
+                    mo.md("### By Annotator"),
+                    by_annotator,
+                    mo.md("### Recent (last 20 rows)"),
+                    recent,
+                ]
+            )
+    _panel_summary
+    return
 
-    summary = pd.DataFrame(
-        [
-            {"metric": "total_rows", "value": int(len(ann))},
-            {"metric": "unique_tiles", "value": int(ann["image_path"].nunique())},
-            {"metric": "annotators", "value": int(ann["annotator_id"].nunique()) if "annotator_id" in ann.columns else 0},
-        ]
-    )
-    by_annotator = (
-        ann.groupby("annotator_id", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
-        if "annotator_id" in ann.columns
-        else pd.DataFrame()
-    )
-    recent = ann.tail(20)
 
-    mo.md("### Totals")
-    summary
-    mo.md("### By Annotator")
-    by_annotator
-    mo.md("### Recent (last 20 rows)")
-    recent
+@app.cell
+def _():
     return
 
 
