@@ -5,7 +5,7 @@ Run heuristic scoring, write labels/run metadata, and generate a local report.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
@@ -39,8 +39,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def run_report(args: argparse.Namespace) -> Path:
     cfg = HeuristicLabelerConfig()
     if args.satellite_dir:
         cfg.satellite_dir = args.satellite_dir
@@ -53,7 +52,7 @@ def main() -> None:
         if args.s3_only:
             os.environ["SCENIC_S3_ONLY"] = "1"
 
-    run_name = args.run_name or f"heuristic_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    run_name = args.run_name or f"heuristic_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
     if args.preview and args.max_tiles is None:
         max_tiles = min(256, cfg.heuristic_max_tiles)
     else:
@@ -99,7 +98,7 @@ def main() -> None:
 
     run_record = {
         "run_name": run_name,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "labels_path": str(labels_path) if labels_path else None,
         "raw_labels_path": str(raw_labels_path) if raw_labels_path else None,
         "report_dir": str(report_dir),
@@ -126,6 +125,11 @@ def main() -> None:
         print(f"Labels written to {labels_path}")
     if raw_labels_path:
         print(f"Raw labels written to {raw_labels_path}")
+    return run_dir
+
+
+def main() -> None:
+    run_report(parse_args())
 
 
 if __name__ == "__main__":

@@ -122,12 +122,19 @@ def main() -> None:
 
 def _default_s3_prefix(style: str) -> str:
     if "terrain" in style:
-        return "terrain"
-    return "satellite"
+        return "raw/images/terrain"
+    return "raw/images/satellite"
 
 
 def _resolve_s3_prefix(*, prefix: str | None, style: str, output_dir: Path, zoom: int) -> str:
-    base_prefix = (prefix or _default_s3_prefix(style)).strip("/")
+    # Normalize common shorthand prefixes to canonical keys under raw/images.
+    raw_prefix = (prefix or _default_s3_prefix(style)).strip("/")
+    if raw_prefix in {"satellite", "terrain"}:
+        raw_prefix = f"raw/images/{raw_prefix}"
+    elif raw_prefix.startswith("images/"):
+        raw_prefix = f"raw/{raw_prefix}"
+
+    base_prefix = raw_prefix
     region = None
     zoom_dir = f"z{zoom}"
     # Detect layout .../z14/<region> from local output path and preserve it in S3 keys.

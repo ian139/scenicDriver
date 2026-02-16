@@ -16,7 +16,6 @@ import argparse
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-import os
 
 import numpy as np
 import pandas as pd
@@ -31,7 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.classifier.inference import get_inference_transform
 from src.classifier.model import LandscapeClassifier
-from src.terrain.features import TerrainFeatures
+from src.terrain.features import TerrainFeatures, repair_terrain_zero_seam
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,8 +41,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--classifier-ckpt", type=Path, default=Path("models/classifier/best_model.pt"))
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--use-resisc45-stats", action="store_true", default=True)
+    parser.add_argument(
+        "--use-resisc45-stats",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use RESISC45 normalization stats for classifier transforms",
+    )
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--skip-missing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip rows whose satellite/terrain files are missing instead of failing fast",
+    )
     return parser.parse_args()
 
 
@@ -78,7 +88,7 @@ def _decode_terrain_rgb(terrain_img: Image.Image) -> np.ndarray:
 
 
 def _terrain_features_from_images(terrain_img: Image.Image, sat_img: Image.Image) -> np.ndarray:
-    elev = _decode_terrain_rgb(terrain_img)
+    elev = repair_terrain_zero_seam(_decode_terrain_rgb(terrain_img))
     gy, gx = np.gradient(elev)
     slope = np.sqrt(gx ** 2 + gy ** 2)
 
@@ -155,14 +165,25 @@ def main() -> None:
 
     batch_imgs = []
     batch_meta = []
+    missing_rows = 0
 
     with torch.no_grad():
         for _, row in df.iterrows():
             sat_rel = str(row["image_path"])
             terr_rel = _terrain_path_from_sat(sat_rel)
-
-            sat_img = _open_image(sat_rel, args.raw_dir, s3_client)
-            terr_img = _open_image(terr_rel, args.raw_dir, s3_client)
+            try:
+                sat_img = _open_image(sat_rel, args.raw_dir, s3_client)
+                terr_img = _open_image(terr_rel, args.raw_dir, s3_client)
+            except FileNotFoundError as exc:
+                if not args.skip_missing:
+                    raise FileNotFoundError(
+                        f"Missing tile for labels row: sat='{sat_rel}', terrain='{terr_rel}', raw_dir='{args.raw_dir}'. "
+                        "Use --skip-missing to continue or point --raw-dir to the correct local/S3 root."
+                    ) from exc
+                missing_rows += 1
+                if missing_rows <= 5:
+                    print(f"[skip-missing] {exc}")
+                continue
 
             tensor = transform(sat_img)
             batch_imgs.append(tensor)
@@ -220,6 +241,10 @@ def main() -> None:
     )
     print(f"Wrote dataset: {args.output}")
     print(f"Samples: {len(vit_embeddings)}")
+    if missing_rows:
+        print(f"Skipped rows with missing files: {missing_rows}")
+    if len(vit_embeddings) == 0:
+        raise ValueError("No samples exported. Check labels paths and --raw-dir.")
 
 
 if __name__ == "__main__":

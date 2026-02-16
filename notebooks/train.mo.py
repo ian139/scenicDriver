@@ -15,10 +15,14 @@ def _():
         This repo now uses two separate notebooks for training:
         - `notebooks/classifier.mo.py` (Stage 1: RESISC45 classifier)
         - `notebooks/regression.mo.py` (Stage 2/3: heuristic labels + multitask)
+        - `notebooks/learned_scoring.mo.py` (Step 3: feature export + baseline regressor)
+        - `notebooks/annotate_scenic.mo.py` (manual scenic labeling set)
 
         Quick start:
         - `uv run marimo edit notebooks/classifier.mo.py`
         - `uv run marimo edit notebooks/regression.mo.py`
+        - `uv run marimo edit notebooks/learned_scoring.mo.py`
+        - `uv run marimo edit notebooks/annotate_scenic.mo.py`
         """
     )
 

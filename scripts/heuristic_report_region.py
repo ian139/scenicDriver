@@ -5,17 +5,16 @@ Run heuristic report for a named region subfolder.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
+import types
 from pathlib import Path
 import sys
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.heuristic_report import main as _report_main
-from scripts.heuristic_report import parse_args as _parse_base_args
+from scripts.heuristic_report import run_report
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,38 +39,26 @@ def main() -> None:
     if not region:
         raise ValueError("Region must be a non-empty string.")
 
-    # Delegate to the main report script by rebuilding sys.argv
-    run_name = args.run_name or f"{region}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+    run_name = args.run_name or f"{region}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
     sat_dir = f"data/raw/images/satellite/z{args.zoom}/{region}"
     terr_dir = f"data/raw/images/terrain/z{args.zoom}/{region}"
 
-    sys.argv = [
-        sys.argv[0],
-        "--run-name",
-        run_name,
-        "--satellite-dir",
-        sat_dir,
-        "--terrain-dir",
-        terr_dir,
-    ]
-    if args.preview:
-        sys.argv.append("--preview")
-    if args.max_tiles is not None:
-        sys.argv.extend(["--max-tiles", str(args.max_tiles)])
-    if args.write_labels:
-        sys.argv.append("--write-labels")
-    if args.write_raw_labels:
-        sys.argv.append("--write-raw-labels")
-    if args.no_classifier:
-        sys.argv.append("--no-classifier")
-    if args.device:
-        sys.argv.extend(["--device", args.device])
-    if args.seed is not None:
-        sys.argv.extend(["--seed", str(args.seed)])
-    if args.open:
-        sys.argv.append("--open")
-
-    _report_main()
+    delegated = types.SimpleNamespace(
+        run_name=run_name,
+        preview=args.preview,
+        max_tiles=args.max_tiles,
+        write_labels=args.write_labels,
+        write_raw_labels=args.write_raw_labels,
+        no_classifier=args.no_classifier,
+        device=args.device,
+        seed=args.seed,
+        open=args.open,
+        satellite_dir=sat_dir,
+        terrain_dir=terr_dir,
+        raw_dir=None,
+        s3_only=False,
+    )
+    run_report(delegated)
 
 
 if __name__ == "__main__":

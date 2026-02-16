@@ -5,10 +5,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 import re
 import os
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
 from PIL import Image
+
+from src.terrain.features import repair_terrain_zero_seam
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -84,13 +87,16 @@ def run_heuristic_labeling(
 
     s3_bucket = os.getenv("SCENIC_S3_BUCKET")
     s3_only = bool(s3_bucket) and os.getenv("SCENIC_S3_ONLY", "1").lower() not in ("0", "false", "no")
+    s3_client = _make_s3_client(s3_bucket)
 
     sat_files: list[Path | S3ImageRef]
     terrain_files: list[Path | S3ImageRef]
 
     if s3_only:
-        sat_files = _list_images_s3(s3_bucket, _s3_prefix_from_local_dir(sat_dir))
-        terrain_files = _list_images_s3(s3_bucket, _s3_prefix_from_local_dir(terrain_dir))
+        sat_files = _list_images_s3(s3_bucket, _s3_prefix_from_local_dir(sat_dir), s3_client=s3_client)
+        terrain_files = _list_images_s3(
+            s3_bucket, _s3_prefix_from_local_dir(terrain_dir), s3_client=s3_client
+        )
     else:
         if not sat_dir.exists():
             raise FileNotFoundError(f"Satellite dir not found: {sat_dir}")
@@ -102,9 +108,13 @@ def run_heuristic_labeling(
 
         if (not sat_files or not terrain_files) and s3_bucket:
             if not sat_files:
-                sat_files = _list_images_s3(s3_bucket, _s3_prefix_from_local_dir(sat_dir))
+                sat_files = _list_images_s3(
+                    s3_bucket, _s3_prefix_from_local_dir(sat_dir), s3_client=s3_client
+                )
             if not terrain_files:
-                terrain_files = _list_images_s3(s3_bucket, _s3_prefix_from_local_dir(terrain_dir))
+                terrain_files = _list_images_s3(
+                    s3_bucket, _s3_prefix_from_local_dir(terrain_dir), s3_client=s3_client
+                )
 
     if not sat_files:
         raise ValueError(f"No satellite images found in: {sat_dir}")
@@ -146,7 +156,7 @@ def run_heuristic_labeling(
         if processed >= max_tiles:
             break
 
-        key = coords if coords_ok else sat_path.stem
+        key = coords if coords_ok else Path(_path_for_coords(sat_path)).stem
         terrain_path = terrain_index.get(key)
         if terrain_path is None:
             missing_pairs += 1
@@ -160,10 +170,10 @@ def run_heuristic_labeling(
             s3_only=s3_only,
         )
 
-        sat_img = _open_image(sat_path, s3_bucket).convert("RGB")
-        terrain_img = _open_image(terrain_path, s3_bucket).convert("RGB")
+        sat_img = _open_image(sat_path, s3_bucket, s3_client=s3_client).convert("RGB")
+        terrain_img = _open_image(terrain_path, s3_bucket, s3_client=s3_client).convert("RGB")
 
-        elev = _decode_terrain_rgb(terrain_img)
+        elev = repair_terrain_zero_seam(_decode_terrain_rgb(terrain_img))
         gy, gx = np.gradient(elev)
         slope = np.sqrt(gx ** 2 + gy ** 2)
 
@@ -316,10 +326,18 @@ def _s3_prefix_from_local_dir(path: Path) -> str:
         return path.as_posix().lstrip("/")
 
 
-def _list_images_s3(bucket: str, prefix: str) -> list[S3ImageRef]:
+def _make_s3_client(bucket: str | None) -> Any | None:
+    if not bucket:
+        return None
     import boto3
 
-    s3 = boto3.client("s3")
+    return boto3.client("s3")
+
+
+def _list_images_s3(bucket: str, prefix: str, *, s3_client: Any | None = None) -> list[S3ImageRef]:
+    s3 = s3_client if s3_client is not None else _make_s3_client(bucket)
+    if s3 is None:
+        return []
     paginator = s3.get_paginator("list_objects_v2")
     images: list[S3ImageRef] = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
@@ -331,14 +349,14 @@ def _list_images_s3(bucket: str, prefix: str) -> list[S3ImageRef]:
     return sorted(images, key=lambda ref: ref.key)
 
 
-def _open_image(path: Path | S3ImageRef, bucket: str | None) -> Image.Image:
+def _open_image(path: Path | S3ImageRef, bucket: str | None, *, s3_client: Any | None = None) -> Image.Image:
     if isinstance(path, S3ImageRef):
         if not bucket:
             raise ValueError("SCENIC_S3_BUCKET is required to load S3 tiles.")
-        import boto3
-        from io import BytesIO
 
-        s3 = boto3.client("s3")
+        s3 = s3_client if s3_client is not None else _make_s3_client(bucket)
+        if s3 is None:
+            raise ValueError("Failed to create S3 client.")
         resp = s3.get_object(Bucket=bucket, Key=path.key)
         return Image.open(BytesIO(resp["Body"].read()))
     return Image.open(path)

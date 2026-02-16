@@ -16,7 +16,7 @@ try:
     import timm
 except ImportError:
     raise ImportError(
-        "timm library required. Install with: pip install timm"
+        "timm library required. Install with: uv sync"
     )
 
 

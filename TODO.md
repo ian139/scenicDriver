@@ -18,6 +18,11 @@
 - [ ] Keep classifier signal but shift it to model features/auxiliary loss instead of fixed manual class weights.
 - [ ] Replace heuristic class-weight scoring with a learned scenic regressor that uses satellite embeddings + terrain features (and optional class probabilities) as inputs.
 - [ ] Verify classifier loads with `uv run` and checkpoint `models/classifier/best_model.pt`.
+- [x] Learned-scoring scaffold: feature export script (`scripts/export_regression_dataset.py`) + baseline trainer (`scripts/train_regression_baseline.py`) + evaluator (`scripts/evaluate_regression_baseline.py`).
+- [ ] Build manual scenic annotation MVP (`notebooks/annotate_scenic.mo.py`) with 0-10 scoring, skip, confidence, and CSV output.
+- [ ] Add stratified tile sampler for annotation batches (cross-region and class-balanced).
+- [ ] Create human-labeled benchmark split and report agreement stats (tile overlap, annotator variance).
+- [ ] Train with mixed supervision: human scenic labels (primary, higher weight) + heuristic labels (weak, lower weight).
 
 ### Phase 2: Data + Reporting
 - [ ] Add new region pipeline (download → label → terrain features → train).

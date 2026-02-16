@@ -13,6 +13,10 @@ from PIL import Image
 
 from .analyzer import TerrainAnalyzer, BoundingBox
 
+_SEAM_ZERO_ELEVATION = 0.0
+_SEAM_ZERO_ATOL = 0.05
+_SEAM_MAX_FRACTION = 0.02
+
 
 @dataclass
 class TerrainFeatures:
@@ -158,7 +162,7 @@ def extract_terrain_features_from_tile(
         TerrainFeatures for the tile
     """
     terrain_img = Image.open(terrain_path).convert("RGB")
-    elev = _decode_terrain_rgb(terrain_img)
+    elev = repair_terrain_zero_seam(_decode_terrain_rgb(terrain_img))
 
     gy, gx = np.gradient(elev)
     slope = np.sqrt(gx ** 2 + gy ** 2)
@@ -196,6 +200,41 @@ def _decode_terrain_rgb(terrain_img: Image.Image) -> np.ndarray:
     g = arr[..., 1]
     b = arr[..., 2]
     return -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1
+
+
+def repair_terrain_zero_seam(elev: np.ndarray) -> np.ndarray:
+    """
+    Repair thin zero-elevation seams that appear on tile borders.
+
+    Some terrain-rgb tiles contain a 1-pixel border with elevation==0 due to
+    source seam artifacts. That can inflate relief/slope metrics. This repair
+    only applies when zero pixels are sparse and strictly on the border.
+    """
+    zero_mask = np.isclose(elev, _SEAM_ZERO_ELEVATION, atol=_SEAM_ZERO_ATOL)
+    zero_fraction = float(zero_mask.mean())
+    if zero_fraction <= 0.0 or zero_fraction > _SEAM_MAX_FRACTION:
+        return elev
+
+    border_mask = np.zeros_like(zero_mask, dtype=bool)
+    border_mask[0, :] = True
+    border_mask[-1, :] = True
+    border_mask[:, 0] = True
+    border_mask[:, -1] = True
+    if not np.all((~zero_mask) | border_mask):
+        return elev
+
+    fixed = elev.copy()
+    h, w = fixed.shape
+    if w > 1 and np.all(zero_mask[:, 0]):
+        fixed[:, 0] = fixed[:, 1]
+    if w > 1 and np.all(zero_mask[:, -1]):
+        fixed[:, -1] = fixed[:, -2]
+    if h > 1 and np.all(zero_mask[0, :]):
+        fixed[0, :] = fixed[1, :]
+    if h > 1 and np.all(zero_mask[-1, :]):
+        fixed[-1, :] = fixed[-2, :]
+
+    return fixed
 
 
 def _safe_div(num: np.ndarray, den: np.ndarray) -> np.ndarray:

@@ -17,7 +17,7 @@ try:
     from torchvision import transforms
 except ImportError:
     raise ImportError(
-        "torchvision required. Install with: pip install torchvision"
+        "torchvision required. Install with: uv sync"
     )
 
 from .model import LandscapeClassifier, TERRAIN_CLASSES, get_scenic_weight

@@ -12,7 +12,7 @@ Scenic Route Planner is an ML-driven system that scores scenic beauty from satel
 - RESISC45 classifier: available and integrated.
 - Heuristic labeling + report viewer: working.
 - Terrain feature extraction: working.
-- In progress: regression training, NAIP ingestion, routing prototype.
+- In progress: regression training, manual scenic annotation workflow, routing prototype.
 
 ## Tech Stack (Current)
 - ML: PyTorch, timm, numpy, pandas
@@ -23,9 +23,10 @@ Scenic Route Planner is an ML-driven system that scores scenic beauty from satel
 ## High-Level Pipeline
 1. Download tiles (Mapbox) for a bbox at fixed zoom.
 2. Generate heuristic labels + report.
-3. Extract terrain features.
-4. Train multitask regression/classification model.
-5. Build a road graph and score edges with scenic tiles.
+3. Add manual scenic labels for a stratified subset (benchmark + calibration).
+4. Extract terrain features.
+5. Train multitask regression/classification model.
+6. Build a road graph and score edges with scenic tiles.
 
 ## Repo Conventions
 - Keep ML workflows in marimo notebooks (`notebooks/`).

@@ -14,6 +14,7 @@ Current direction:
 - Keep classifier signal, but move away from fixed manual class weights.
 - Train a learned scenic regressor using satellite embeddings + terrain features.
 - Retrain/expand classifier data to improve domain fit (especially Northeast).
+- Add a manual scenic annotation set and use it as the primary quality benchmark.
 
 ## Quick Start
 
@@ -42,6 +43,40 @@ uv run python scripts/heuristic_report.py --max-tiles 2000 --write-raw-labels
 
 # Train the model
 uv run marimo run notebooks/regression.mo.py
+```
+
+## Learned Scoring Scaffold (Step 3)
+
+Notebook-first option:
+
+```bash
+uv run marimo edit notebooks/learned_scoring.mo.py
+```
+
+Planned next notebook:
+- `notebooks/annotate_scenic.mo.py` (manual 0-10 tile scoring + confidence flags)
+
+```bash
+uv run marimo edit notebooks/annotate_scenic.mo.py
+```
+
+```bash
+# 1) Export feature dataset for learned scenic regression
+uv run python scripts/export_regression_dataset.py \
+  --labels-csv data/raw/labels.csv \
+  --raw-dir data/raw \
+  --output data/processed/regression/features_v1.npz
+
+# 2) Train baseline regressor
+uv run python scripts/train_regression_baseline.py \
+  --dataset data/processed/regression/features_v1.npz \
+  --output models/scenic_regression_baseline.pt
+
+# 3) Evaluate baseline on validation split
+uv run python scripts/evaluate_regression_baseline.py \
+  --dataset data/processed/regression/features_v1.npz \
+  --checkpoint models/scenic_regression_baseline.pt \
+  --metrics-json data/processed/regression/baseline_metrics.json
 ```
 
 ## Current Dataset

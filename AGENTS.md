@@ -32,6 +32,10 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - `marimo run notebooks/classifier.mo.py`
 - `marimo edit notebooks/regression.mo.py`
 - `marimo run notebooks/regression.mo.py`
+- `marimo edit notebooks/learned_scoring.mo.py`
+- `marimo run notebooks/learned_scoring.mo.py`
+- `marimo edit notebooks/annotate_scenic.mo.py`
+- `marimo run notebooks/annotate_scenic.mo.py`
 - `uv sync`
 - `uv run python scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.satellite --output data/raw/images/satellite`
 - `uv run python scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.terrain-rgb --output data/raw/images/terrain`
@@ -48,6 +52,7 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - Retrain the RESISC45 classifier on larger/higher-quality data to reduce regional mislabeling.
 - Keep classifier signal, but shift from fixed manual class weights to model features/auxiliary loss.
 - Replace heuristic class-weight scoring with a learned scenic regressor using satellite embeddings + terrain features (optional class probabilities).
+- Add a manual scenic annotation workflow and treat human labels as primary supervision for model calibration/evaluation.
 - Keep heuristic scoring as fallback/baseline for sanity checks and quick previews.
 
 ## Git Workflow
@@ -69,15 +74,20 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 
 ## Research Workflow
 1. Download tiles (Mapbox) for a bbox at a fixed zoom.
-2. Prepare `labels.csv` with `image_path` + targets.
-3. Run `notebooks/train.mo.py` for multi‑task training.
-4. Save best checkpoint + run summary JSON.
-5. Iterate on model + scoring features.
+2. Generate heuristic labels (`labels.csv`) for broad weak supervision.
+3. Collect manual scenic labels on a stratified tile subset (human benchmark set).
+4. Run `notebooks/train.mo.py` / `notebooks/learned_scoring.mo.py` with mixed supervision.
+5. Save best checkpoint + run summary JSON + benchmark metrics.
+6. Iterate on model + scoring features.
 
 ## S3 Workflow Notes
 - When using S3-first mode, keep tile keys under `raw/images/...` so report tooling can resolve prefixes.
 - For S3-only report generation, set `SCENIC_S3_BUCKET` and `SCENIC_S3_ONLY=1`.
 - Prefer `bash scripts/s3_sync.sh` (script may not be executable on all machines).
+- Upload Step 3 artifacts after runs:
+  - `aws s3 cp data/processed/regression/features_v1.npz s3://$SCENIC_S3_BUCKET/processed/regression/features_v1.npz`
+  - `aws s3 cp models/scenic_regression_baseline.pt s3://$SCENIC_S3_BUCKET/models/scenic_regression_baseline.pt`
+  - `aws s3 cp data/processed/regression/baseline_metrics.json s3://$SCENIC_S3_BUCKET/processed/regression/baseline_metrics.json`
 
 ## Training Contract
 - Multi‑task output: regression (scenic score 0–10) + classification (45 classes).

@@ -5,6 +5,7 @@ import shutil
 from typing import Any
 import json
 import os
+from io import BytesIO
 
 import numpy as np
 from PIL import Image
@@ -89,18 +90,22 @@ def _attach_thumbnails(
         s3_only = os.getenv("SCENIC_S3_ONLY", "1").lower() not in ("0", "false", "no")
         s3_bucket = s3_bucket or parsed_bucket
         s3_prefix = parsed_prefix
+
+    s3 = None
+    if s3_only:
+        if not s3_bucket:
+            raise ValueError("SCENIC_S3_BUCKET and s3:// raw_dir required for S3-only mode.")
+        import boto3
+
+        # Reuse a single client for all thumbnail fetches.
+        s3 = boto3.client("s3")
+
     for idx, tile in enumerate(tiles):
         image_path = raw_root / tile["image_path"]
         thumb_name = f"{idx:05d}.jpg"
         thumb_path = thumbs_dir / thumb_name
 
         if s3_only:
-            if not s3_bucket:
-                raise ValueError("SCENIC_S3_BUCKET and s3:// raw_dir required for S3-only mode.")
-            import boto3
-            from io import BytesIO
-
-            s3 = boto3.client("s3")
             key = f"{s3_prefix}/{tile['image_path']}" if s3_prefix else tile["image_path"]
             resp = s3.get_object(Bucket=s3_bucket, Key=key)
             image = Image.open(BytesIO(resp["Body"].read())).convert("RGB")

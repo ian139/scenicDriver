@@ -1,93 +1,43 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
-venv/
-ENV/
-.venv/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Marimo
-notebooks/__marimo__/
-
-# Testing
 .pytest_cache/
-.coverage
-htmlcov/
-.tox/
-.nox/
-
-# Type checking
 .mypy_cache/
-.dmypy.json
+.ruff_cache/
 
-# Data (large files - add to .gitignore)
+# Virtual env
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Data (generated / large)
 data/raw/
-data/tiles/
-data/processed/*.tif
-data/processed/*.npy
-data/processed/heuristic_runs/**/report/
-data/processed/heuristic_runs/**/labels.csv
-data/processed/heuristic_runs/**/run.json
-data/processed/report_config.json
-*.tif
-*.geotiff
+data/processed/
+data/NWPU-RESISC45/
 
-# Models (large files)
-models/**/*.pt
-models/**/*.pth
-models/**/*.onnx
+# Models (keep only placeholders in git)
+models/**
 !models/.gitkeep
 
-# Archive (keep manifest/scripts, ignore large artifacts)
-archive/data/
-archive/models/**/*.pt
-archive/models/**/*.pth
-archive/models/**/*.onnx
-
-# Environment
-.env
-.env.local
-*.env
-
-# Logs
-*.log
-logs/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Temporary
-tmp/
-temp/
-*.tmp
+# Caches / local runtime state
 cache/
+notebooks/__marimo__/
+
+# Archive working snapshots (keep docs only)
+archive/*
+!archive/archive.md
+!archive/archive_scan_summary.json
+
+# Misc local files
+*.log
+.DS_Store
