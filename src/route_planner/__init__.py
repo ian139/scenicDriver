@@ -1,6 +1,7 @@
 from .cost import ScenicCostFunction
 from .graph import Edge, Node, RoadGraph
 from .planner import Route, RouteSegment, ScenicRoutePlanner
+from .service import RouteRequest, plan_routes
 
 __all__ = [
     "Node",
@@ -10,4 +11,6 @@ __all__ = [
     "RouteSegment",
     "Route",
     "ScenicRoutePlanner",
+    "RouteRequest",
+    "plan_routes",
 ]
