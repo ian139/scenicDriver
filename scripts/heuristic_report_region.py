@@ -30,6 +30,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--open", action="store_true", default=False)
+    parser.add_argument(
+        "--scoring",
+        choices=["heuristic", "learned"],
+        default="heuristic",
+        help="Scoring mode for scenic scores in labels/report",
+    )
+    parser.add_argument(
+        "--regression-ckpt",
+        type=str,
+        default="models/scenic_regression_baseline_masswhites_z14_mixed5000_weighted_h4.pt",
+        help="Learned regression checkpoint used when --scoring learned",
+    )
+    parser.add_argument("--raw-dir", type=str, default=None)
+    parser.add_argument("--s3-only", action="store_true", default=False)
     return parser.parse_args()
 
 
@@ -55,8 +69,10 @@ def main() -> None:
         open=args.open,
         satellite_dir=sat_dir,
         terrain_dir=terr_dir,
-        raw_dir=None,
-        s3_only=False,
+        raw_dir=args.raw_dir,
+        s3_only=args.s3_only,
+        scoring=args.scoring,
+        regression_ckpt=args.regression_ckpt,
     )
     run_report(delegated)
 

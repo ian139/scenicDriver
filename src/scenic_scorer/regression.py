@@ -81,6 +81,7 @@ class ScenicScoreDataset(torch.utils.data.Dataset):
         - terrain_features: [slope_var, elev_change, water_prox, veg_density, coastal, has_water]
         - class_logits: Pre-extracted classification logits
         - scenic_score: Target score (formula-based or human-rated)
+        - sample_weight: Training weight per sample (optional; defaults to 1.0)
     """
 
     def __init__(self, data_path: Path):
@@ -98,8 +99,21 @@ class ScenicScoreDataset(torch.utils.data.Dataset):
         self.terrain_features = torch.from_numpy(data["terrain_features"]).float()
         self.class_logits = torch.from_numpy(data["class_logits"]).float()
         self.scenic_scores = torch.from_numpy(data["scenic_scores"]).float().unsqueeze(-1)
+        raw_weights = data["sample_weights"] if "sample_weights" in data else None
 
         n = len(self.scenic_scores)
+        if raw_weights is None:
+            weights = np.ones((n,), dtype=np.float32)
+        else:
+            weights = np.asarray(raw_weights, dtype=np.float32).reshape(-1)
+            if len(weights) != n:
+                raise ValueError("sample_weights length does not match scenic_scores length")
+            if not np.all(np.isfinite(weights)):
+                raise ValueError("sample_weights contains non-finite values")
+            if np.any(weights <= 0):
+                raise ValueError("sample_weights must be strictly positive")
+        self.sample_weights = torch.from_numpy(weights).float().unsqueeze(-1)
+
         if not (len(self.vit_embeddings) == len(self.terrain_features) == len(self.class_logits) == n):
             raise ValueError("Dataset arrays have inconsistent lengths")
 
@@ -112,6 +126,7 @@ class ScenicScoreDataset(torch.utils.data.Dataset):
             self.terrain_features[idx],
             self.class_logits[idx],
             self.scenic_scores[idx],
+            self.sample_weights[idx],
         )
 
 
@@ -125,6 +140,7 @@ def train_regression_model(
     seed: int = 42,
     device: Optional[str] = None,
     weight_decay: float = 1e-4,
+    use_sample_weights: bool = True,
 ) -> float:
     """
     Train the scenic score regression model.
@@ -162,14 +178,14 @@ def train_regression_model(
         val_ds, batch_size=batch_size, shuffle=False, num_workers=0
     )
 
-    sample_v, sample_t, sample_c, _ = dataset[0]
+    sample_v, sample_t, sample_c, _, _ = dataset[0]
     model = ScenicRegressionModel(
         vit_dim=int(sample_v.shape[0]),
         terrain_dim=int(sample_t.shape[0]),
         num_classes=int(sample_c.shape[0]),
     ).to(device)
 
-    criterion = nn.MSELoss()
+    criterion = nn.MSELoss(reduction="none")
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     best_val = float("inf")
@@ -186,15 +202,21 @@ def train_regression_model(
     for _ in range(epochs):
         model.train()
         train_losses = []
-        for vit_emb, terrain, logits, score in train_loader:
+        for vit_emb, terrain, logits, score, sample_weight in train_loader:
             vit_emb = vit_emb.to(device)
             terrain = terrain.to(device)
             logits = logits.to(device)
             score = score.to(device)
+            sample_weight = sample_weight.to(device)
 
             optimizer.zero_grad()
             pred = model(vit_emb, terrain, logits)
-            loss = criterion(pred, score)
+            per_sample_loss = criterion(pred, score)
+            if use_sample_weights:
+                denom = torch.clamp(sample_weight.sum(), min=1e-8)
+                loss = (per_sample_loss * sample_weight).sum() / denom
+            else:
+                loss = per_sample_loss.mean()
             loss.backward()
             optimizer.step()
             train_losses.append(loss.item())
@@ -204,13 +226,19 @@ def train_regression_model(
         preds = []
         targets = []
         with torch.no_grad():
-            for vit_emb, terrain, logits, score in val_loader:
+            for vit_emb, terrain, logits, score, sample_weight in val_loader:
                 vit_emb = vit_emb.to(device)
                 terrain = terrain.to(device)
                 logits = logits.to(device)
                 score = score.to(device)
+                sample_weight = sample_weight.to(device)
                 pred = model(vit_emb, terrain, logits)
-                loss = criterion(pred, score)
+                per_sample_loss = criterion(pred, score)
+                if use_sample_weights:
+                    denom = torch.clamp(sample_weight.sum(), min=1e-8)
+                    loss = (per_sample_loss * sample_weight).sum() / denom
+                else:
+                    loss = per_sample_loss.mean()
                 val_losses.append(loss.item())
                 preds.append(pred.detach().cpu().numpy().reshape(-1))
                 targets.append(score.detach().cpu().numpy().reshape(-1))
@@ -237,6 +265,7 @@ def train_regression_model(
                     "vit_dim": int(sample_v.shape[0]),
                     "terrain_dim": int(sample_t.shape[0]),
                     "num_classes": int(sample_c.shape[0]),
+                    "used_sample_weights": bool(use_sample_weights),
                     "history": history,
                 },
                 output_path,
@@ -260,7 +289,7 @@ def evaluate_correlation(
 
     with torch.no_grad():
         for batch in torch.utils.data.DataLoader(dataset, batch_size=64):
-            vit_emb, terrain, logits, score = batch
+            vit_emb, terrain, logits, score, _ = batch
             pred = model(vit_emb, terrain, logits)
             predictions.extend(pred.squeeze().cpu().numpy())
             targets.extend(score.squeeze().cpu().numpy())

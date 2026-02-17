@@ -213,8 +213,31 @@ def _render_index_html() -> str:
         margin: 0 0 12px 0;
         font-weight: 600;
       }
+      .title-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 8px;
+        flex-wrap: wrap;
+      }
       h1 {
         font-size: 24px;
+      }
+      .mode-badge {
+        border-radius: 999px;
+        padding: 4px 10px;
+        font-size: 12px;
+        font-weight: 600;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+      }
+      .mode-badge.learned {
+        background: rgba(123, 223, 242, 0.16);
+        color: #bdefff;
+      }
+      .mode-badge.heuristic {
+        background: rgba(255, 179, 71, 0.16);
+        color: #ffd8a1;
       }
       .summary-grid {
         display: grid;
@@ -316,7 +339,10 @@ def _render_index_html() -> str:
   <body>
     <div class="container">
       <div class="card">
-        <h1>Heuristic Scoring Report</h1>
+        <div class="title-row">
+          <h1 id="report-title">Scenic Scoring Report</h1>
+          <div class="mode-badge heuristic" id="scoring-mode-badge">Mode: heuristic</div>
+        </div>
         <div class="summary-grid" id="summary"></div>
         <h3>Terrain Feature Summary</h3>
         <div class="summary-grid" id="feature-summary"></div>
@@ -357,6 +383,8 @@ def _render_index_html() -> str:
     <script>
       const summaryEl = document.getElementById("summary");
       const featureSummaryEl = document.getElementById("feature-summary");
+      const reportTitleEl = document.getElementById("report-title");
+      const scoringModeBadgeEl = document.getElementById("scoring-mode-badge");
       const histogramCanvas = document.getElementById("histogram");
       const heatmapCanvas = document.createElement("canvas");
       const baseLayerSelect = document.getElementById("base-layer");
@@ -404,6 +432,7 @@ def _render_index_html() -> str:
       fetch(`report.json?ts=${Date.now()}`)
         .then((r) => r.json())
         .then((data) => {
+          renderHeader(data.run_info);
           renderSummary(data.summary, data.run_info);
           renderFeatureSummary(data.feature_summary);
           renderHistogram(data.histogram);
@@ -425,6 +454,21 @@ def _render_index_html() -> str:
             initMapbox(data);
           });
         });
+
+      function inferScoringMode(runInfo) {
+        if (!runInfo) return "heuristic";
+        const mode = String(runInfo.scoring_mode || "").trim().toLowerCase();
+        if (mode === "learned") return "learned";
+        return "heuristic";
+      }
+
+      function renderHeader(runInfo) {
+        const mode = inferScoringMode(runInfo);
+        reportTitleEl.textContent = mode === "learned" ? "Learned Scenic Scoring Report" : "Heuristic Scenic Scoring Report";
+        scoringModeBadgeEl.textContent = `Mode: ${mode}`;
+        scoringModeBadgeEl.classList.remove("learned", "heuristic");
+        scoringModeBadgeEl.classList.add("mode-badge", mode);
+      }
 
       function loadMapboxGL() {
         if (window.maplibregl) {
@@ -465,6 +509,7 @@ def _render_index_html() -> str:
       }
 
       function renderSummary(summary, runInfo) {
+        const scoringMode = inferScoringMode(runInfo);
         const items = [
           ["Total Tiles", summary.total_tiles],
           ["Mean Score", summary.mean.toFixed(2)],
@@ -472,6 +517,7 @@ def _render_index_html() -> str:
           ["Std Dev", summary.std.toFixed(2)],
           ["Min Score", summary.min.toFixed(2)],
           ["Max Score", summary.max.toFixed(2)],
+          ["Scoring Mode", scoringMode],
           ["Classifier", runInfo.used_classifier ? "on" : "off"],
           ["Device", runInfo.device],
           ["Missing Pairs", runInfo.counts.missing_pairs],

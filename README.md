@@ -53,41 +53,60 @@ Notebook-first option:
 uv run marimo edit notebooks/learned_scoring.mo.py
 ```
 
-Planned next notebook:
-- `notebooks/annotate_scenic.mo.py` (manual 0-10 tile scoring + confidence flags)
+Annotation workflows:
+- `notebooks/annotate_scenic.mo.py` (marimo)
+- `scripts/annotate_scenic_web.py` (browser UI)
 
 ```bash
 uv run marimo edit notebooks/annotate_scenic.mo.py
 ```
 
+Web UI alternative (procedural annotation in browser):
+
+```bash
+uv run python scripts/annotate_scenic_web.py \
+  --labels-csv data/processed/heuristic_runs/masswhites_z14_flat_5k_seamfix/labels.csv \
+  --raw-dir s3://scenicdriver-data/raw \
+  --annotations-csv data/raw/labels_human.csv \
+  --sample-size 500 \
+  --stratify-by-class
+```
+
+Then open `http://localhost:8765`.
+
 ```bash
 # 1) Export feature dataset for learned scenic regression
 uv run python scripts/export_regression_dataset.py \
-  --labels-csv data/raw/labels.csv \
-  --raw-dir data/raw \
-  --output data/processed/regression/features_v1.npz
+  --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv \
+  --raw-dir s3://scenicdriver-data/raw \
+  --output data/processed/regression/features_masswhites_z14_mixed5000.npz \
+  --label-source-column label_source \
+  --human-weight 4.0 \
+  --heuristic-weight 1.0
 
 # 2) Train baseline regressor
 uv run python scripts/train_regression_baseline.py \
-  --dataset data/processed/regression/features_v1.npz \
-  --output models/scenic_regression_baseline.pt
+  --dataset data/processed/regression/features_masswhites_z14_mixed5000.npz \
+  --output models/scenic_regression_baseline_masswhites_z14_mixed5000.pt \
+  --use-sample-weights
 
 # 3) Evaluate baseline on validation split
 uv run python scripts/evaluate_regression_baseline.py \
-  --dataset data/processed/regression/features_v1.npz \
-  --checkpoint models/scenic_regression_baseline.pt \
-  --metrics-json data/processed/regression/baseline_metrics.json
+  --dataset data/processed/regression/features_masswhites_z14_mixed5000.npz \
+  --checkpoint models/scenic_regression_baseline_masswhites_z14_mixed5000.pt \
+  --metrics-json data/processed/regression/baseline_metrics_masswhites_z14_mixed5000.json
 ```
 
-## Current Dataset
+Current recommendation from weight sweep (`data/processed/regression/weight_sweep_masswhites_z14.json`):
+- Use `human_weight=4.0`, `heuristic_weight=1.0` for mixed-supervision training.
+
+## Current Working Sets
 
 | Region | Type | Tiles |
 |--------|------|-------|
-| Olympic Peninsula, WA | Dense forest | 575 |
-| Big Sur, CA | Coastal cliffs | 361 |
-| Rocky Mountains, CO | Alpine/mountains | 391 |
-| Philadelphia suburbs, PA | Flat suburban | 112 |
-| **Total** | | **1,439** |
+| masswhites (z14) | Northeast regional coverage | 25,544 per layer |
+| amherst_ma (z16) | Local validation area | 5,544 per layer |
+| Human annotations | Scenic manual labels | 500 rows (`labels_human.csv`) |
 
 See [`data/README.md`](data/README.md) for detailed tile regions, bboxes, and data structure.
 
@@ -100,7 +119,9 @@ See [`data/README.md`](data/README.md) for detailed tile regions, bboxes, and da
 │   └── train.mo.py         # Entry point
 ├── scripts/
 │   ├── download_bbox_tiles.py   # Mapbox tile downloader
-│   └── heuristic_report.py      # Generate labels + reports
+│   ├── heuristic_report.py      # Generate labels + reports
+│   ├── annotate_scenic_web.py   # Browser annotation UI
+│   └── train/eval/export scripts for learned scoring
 ├── src/
 │   ├── classifier/         # Land-use classification model
 │   ├── heuristics/         # Scenic scoring logic
@@ -143,9 +164,23 @@ export SCENIC_S3_BUCKET=scenicdriver-data
 export SCENIC_S3_ONLY=1
 uv run python scripts/heuristic_report.py \
   --run-name masswhites_z14 \
-  --satellite-dir data/raw/images/satellite/z14 \
-  --terrain-dir data/raw/images/terrain/z14 \
+  --satellite-dir data/raw/images/satellite/z14/masswhites \
+  --terrain-dir data/raw/images/terrain/z14/masswhites \
   --max-tiles 5000
+```
+
+Learned-scoring report generation (uses trained regression checkpoint):
+
+```bash
+export SCENIC_S3_BUCKET=scenicdriver-data
+uv run python scripts/heuristic_report.py \
+  --run-name masswhites_z14_learned_h4 \
+  --scoring learned \
+  --regression-ckpt models/scenic_regression_baseline_masswhites_z14_mixed5000_weighted_h4.pt \
+  --satellite-dir data/raw/images/satellite/z14/masswhites \
+  --terrain-dir data/raw/images/terrain/z14/masswhites \
+  --max-tiles 5000 \
+  --s3-only
 ```
 
 ## Requirements

@@ -11,7 +11,8 @@ This repo is intentionally notebook‑first (marimo). Keep the workflow tight, r
 
 ## Execution Environment
 - Use `uv` as the Python package manager (not `pip`).
-- Use marimo notebooks (not Jupyter) for all workflows.
+- Use marimo notebooks (not Jupyter) for training/research workflows.
+- Manual tile annotation may run in either marimo (`notebooks/annotate_scenic.mo.py`) or the web UI (`scripts/annotate_scenic_web.py`).
 - Set `MAPBOX_ACCESS_TOKEN` in the shell before Mapbox downloads.
 
 ## Data
@@ -23,9 +24,11 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - `notebooks/train.mo.py`: lightweight hub/entry point.
 - `data/raw/images/`: imagery tiles.
 - `data/raw/labels.csv`: `image_path, scenic_score, lat, lon, class_id`.
+- `data/raw/labels_human.csv`: manual scenic labels (`scenic_human`, confidence, notes).
 - `data/processed/`: run logs, sample grids, caches.
 - `models/`: checkpoints (do not commit).
 - `scripts/download_bbox_tiles.py`: bbox downloader (supports `mapbox.satellite` + `mapbox.terrain-rgb`).
+- `scripts/annotate_scenic_web.py`: browser-based procedural annotation UI.
 
 ## Commands (Primary)
 - `marimo edit notebooks/classifier.mo.py`
@@ -36,6 +39,9 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - `marimo run notebooks/learned_scoring.mo.py`
 - `marimo edit notebooks/annotate_scenic.mo.py`
 - `marimo run notebooks/annotate_scenic.mo.py`
+- `uv run python scripts/annotate_scenic_web.py`
+- `uv run python scripts/annotate_scenic_web.py --labels-csv data/processed/heuristic_runs/masswhites_z14_flat_5k_seamfix/labels.csv --raw-dir s3://$SCENIC_S3_BUCKET/raw --annotations-csv data/raw/labels_human.csv --sample-size 500 --stratify-by-class`
+- `uv run python scripts/heuristic_report.py --run-name masswhites_z14_learned_h4 --scoring learned --regression-ckpt models/scenic_regression_baseline_masswhites_z14_mixed5000_weighted_h4.pt --satellite-dir data/raw/images/satellite/z14/masswhites --terrain-dir data/raw/images/terrain/z14/masswhites --max-tiles 5000 --s3-only`
 - `uv sync`
 - `uv run python scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.satellite --output data/raw/images/satellite`
 - `uv run python scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.terrain-rgb --output data/raw/images/terrain`
@@ -52,6 +58,7 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - Retrain the RESISC45 classifier on larger/higher-quality data to reduce regional mislabeling.
 - Keep classifier signal, but shift from fixed manual class weights to model features/auxiliary loss.
 - Replace heuristic class-weight scoring with a learned scenic regressor using satellite embeddings + terrain features (optional class probabilities).
+- During mixed supervision runs, weight human labels higher than heuristic labels (via `label_source` -> `sample_weights`; current default human weight: `4.0`).
 - Add a manual scenic annotation workflow and treat human labels as primary supervision for model calibration/evaluation.
 - Keep heuristic scoring as fallback/baseline for sanity checks and quick previews.
 
@@ -82,12 +89,13 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 
 ## S3 Workflow Notes
 - When using S3-first mode, keep tile keys under `raw/images/...` so report tooling can resolve prefixes.
+- Canonical tile key layout: `raw/images/{satellite|terrain}/z{zoom}/{region}/{x}_{y}.png` (no extra nested zoom folder).
 - For S3-only report generation, set `SCENIC_S3_BUCKET` and `SCENIC_S3_ONLY=1`.
 - Prefer `bash scripts/s3_sync.sh` (script may not be executable on all machines).
-- Upload Step 3 artifacts after runs:
-  - `aws s3 cp data/processed/regression/features_v1.npz s3://$SCENIC_S3_BUCKET/processed/regression/features_v1.npz`
-  - `aws s3 cp models/scenic_regression_baseline.pt s3://$SCENIC_S3_BUCKET/models/scenic_regression_baseline.pt`
-  - `aws s3 cp data/processed/regression/baseline_metrics.json s3://$SCENIC_S3_BUCKET/processed/regression/baseline_metrics.json`
+- Upload Step 3 artifacts after runs (use run-specific names, not only `features_v1`):
+  - `aws s3 cp data/processed/regression/<features>.npz s3://$SCENIC_S3_BUCKET/processed/regression/<features>.npz`
+  - `aws s3 cp models/<checkpoint>.pt s3://$SCENIC_S3_BUCKET/models/<checkpoint>.pt`
+  - `aws s3 cp data/processed/regression/<metrics>.json s3://$SCENIC_S3_BUCKET/processed/regression/<metrics>.json`
 
 ## Training Contract
 - Multi‑task output: regression (scenic score 0–10) + classification (45 classes).

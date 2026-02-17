@@ -46,6 +46,11 @@ def _(Path, dataclass, os):
 
         skip_missing: bool = True
         max_samples: int | None = None
+        sample_weight_column: str | None = None
+        label_source_column: str = "label_source"
+        human_weight: float = 4.0
+        heuristic_weight: float = 1.0
+        default_weight: float = 1.0
 
         epochs: int = 40
         batch_size: int = 128
@@ -53,6 +58,7 @@ def _(Path, dataclass, os):
         val_split: float = 0.15
         seed: int = 42
         device: str = "auto"
+        use_sample_weights: bool = True
 
         run_export: bool = True
         run_train: bool = True
@@ -94,6 +100,21 @@ def _(Path, cfg, shlex, subprocess, sys):
         export_cmd.append("--skip-missing")
     if cfg.max_samples is not None:
         export_cmd.extend(["--max-samples", str(cfg.max_samples)])
+    if cfg.sample_weight_column:
+        export_cmd.extend(["--sample-weight-column", cfg.sample_weight_column])
+    else:
+        export_cmd.extend(
+            [
+                "--label-source-column",
+                cfg.label_source_column,
+                "--human-weight",
+                str(cfg.human_weight),
+                "--heuristic-weight",
+                str(cfg.heuristic_weight),
+                "--default-weight",
+                str(cfg.default_weight),
+            ]
+        )
 
     train_cmd = [
         sys.executable,
@@ -115,6 +136,10 @@ def _(Path, cfg, shlex, subprocess, sys):
         "--device",
         cfg.device,
     ]
+    if cfg.use_sample_weights:
+        train_cmd.append("--use-sample-weights")
+    else:
+        train_cmd.append("--no-use-sample-weights")
 
     eval_cmd = [
         sys.executable,

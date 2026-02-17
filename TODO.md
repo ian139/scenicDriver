@@ -10,6 +10,12 @@
 - [x] Add region helper CLI (`scripts/heuristic_report_region.py`).
 - [x] Update data docs (`data/README.md`).
 - [x] Add troubleshooting section to `data/README.md` (timm/pandas, uv run).
+- [x] Add browser-based annotation UI (`scripts/annotate_scenic_web.py`) with procedural navigation + CSV persistence.
+- [x] Fix terrain seam artifact handling (zero-elevation border) to avoid inflated relief in `4863_*` tiles.
+- [x] Verify classifier loads with `uv run` and checkpoint `models/classifier/best_model.pt`.
+- [x] Train/evaluate baseline on human-only (`~500`) and mixed (`5000`, with human overrides) datasets.
+- [x] Run human-weight sweep for mixed supervision (`h2/h3/h4`) and record recommendation (`h4`) in `data/processed/regression/weight_sweep_masswhites_z14.json`.
+- [x] Wire learned-scoring report mode (`--scoring learned`) into `scripts/heuristic_report.py` and `scripts/heuristic_report_region.py`.
 
 ## Next Steps
 
@@ -17,12 +23,12 @@
 - [ ] Retrain classifier on a larger/higher-quality dataset (or expanded labels) to improve domain fit and reduce class mislabeling in Northeast regions.
 - [ ] Keep classifier signal but shift it to model features/auxiliary loss instead of fixed manual class weights.
 - [ ] Replace heuristic class-weight scoring with a learned scenic regressor that uses satellite embeddings + terrain features (and optional class probabilities) as inputs.
-- [ ] Verify classifier loads with `uv run` and checkpoint `models/classifier/best_model.pt`.
 - [x] Learned-scoring scaffold: feature export script (`scripts/export_regression_dataset.py`) + baseline trainer (`scripts/train_regression_baseline.py`) + evaluator (`scripts/evaluate_regression_baseline.py`).
-- [ ] Build manual scenic annotation MVP (`notebooks/annotate_scenic.mo.py`) with 0-10 scoring, skip, confidence, and CSV output.
-- [ ] Add stratified tile sampler for annotation batches (cross-region and class-balanced).
+- [x] Build manual scenic annotation MVP (`notebooks/annotate_scenic.mo.py`) with 0-10 scoring, skip, confidence, and CSV output.
+- [x] Add stratified tile sampler for annotation batches (cross-region and class-balanced).
 - [ ] Create human-labeled benchmark split and report agreement stats (tile overlap, annotator variance).
-- [ ] Train with mixed supervision: human scenic labels (primary, higher weight) + heuristic labels (weak, lower weight).
+- [x] Train with weighted mixed supervision: human scenic labels (primary, higher weight) + heuristic labels (weak, lower weight).
+- [ ] Expand manual labels from 500 -> 1000-1500 and rerun mixed training/eval.
 
 ### Phase 2: Data + Reporting
 - [ ] Add new region pipeline (download → label → terrain features → train).

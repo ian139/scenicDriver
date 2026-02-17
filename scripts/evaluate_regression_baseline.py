@@ -73,7 +73,7 @@ def main() -> None:
     preds = []
     targets = []
     with torch.no_grad():
-        for vit_emb, terrain, logits, score in val_loader:
+        for vit_emb, terrain, logits, score, _ in val_loader:
             vit_emb = vit_emb.to(device)
             terrain = terrain.to(device)
             logits = logits.to(device)

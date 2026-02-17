@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-from src.terrain.features import repair_terrain_zero_seam
+from src.terrain.features import TerrainFeatures, repair_terrain_zero_seam
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -70,6 +70,7 @@ def run_heuristic_labeling(
     default_lon: float,
     seed: int,
     device: str = "auto",
+    learned_regression_ckpt: str | Path | None = None,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]], dict[str, Any]]:
     from math import ceil
 
@@ -145,6 +146,17 @@ def run_heuristic_labeling(
         device=device,
         warnings=warnings,
     )
+    use_learned_scoring = learned_regression_ckpt is not None
+    if use_learned_scoring and classifier is None:
+        raise ValueError(
+            "Learned scoring requires classifier outputs. "
+            "Ensure classifier checkpoint is available and do not disable classifier."
+        )
+    learned_model = _load_learned_regressor(
+        learned_regression_ckpt=learned_regression_ckpt,
+        device=clf_device,
+        warnings=warnings,
+    )
 
     rows: list[dict[str, Any]] = []
     tiles: list[dict[str, Any]] = []
@@ -206,25 +218,48 @@ def run_heuristic_labeling(
         )
         water_fraction = float(water_mask.mean())
 
-        class_id, class_name, class_score = _infer_class(
-            sat_img=sat_img,
-            classifier=classifier,
-            clf_transform=clf_transform,
-            device=clf_device,
-            class_names=class_names,
+        terrain_features = _build_regression_terrain_features(
+            slope=slope,
+            relief=relief,
+            water_proxy=water_proxy,
+            veg_proxy=veg_proxy,
         )
+        slope_variation = float(terrain_features[0])
 
-        class_weight = 2.5 * max(0.3, 1.0 - 0.9 * water_fraction)
-        score = (
-            class_weight * class_score
-            + 2.0 * np.tanh(relief / 500.0)
-            + 1.5 * np.tanh(roughness / 200.0)
-            + 1.5 * np.tanh(slope_mean / 15.0)
-            + 1.5 * water_proxy
-            + 1.0 * veg_proxy
-            - 1.2 * water_fraction
-        )
-        score = float(np.clip(score, 0.0, 10.0))
+        if learned_model is not None:
+            class_id, class_name, class_score, class_logits, vit_embedding = _infer_classifier_outputs(
+                sat_img=sat_img,
+                classifier=classifier,
+                clf_transform=clf_transform,
+                device=clf_device,
+                class_names=class_names,
+            )
+            score = _predict_learned_score(
+                model=learned_model,
+                vit_embedding=vit_embedding,
+                terrain_features=terrain_features,
+                class_logits=class_logits,
+                device=clf_device,
+            )
+        else:
+            class_id, class_name, class_score = _infer_class(
+                sat_img=sat_img,
+                classifier=classifier,
+                clf_transform=clf_transform,
+                device=clf_device,
+                class_names=class_names,
+            )
+            class_weight = 2.5 * max(0.3, 1.0 - 0.9 * water_fraction)
+            score = (
+                class_weight * class_score
+                + 2.0 * np.tanh(relief / 500.0)
+                + 1.5 * np.tanh(roughness / 200.0)
+                + 1.5 * np.tanh(slope_mean / 15.0)
+                + 1.5 * water_proxy
+                + 1.0 * veg_proxy
+                - 1.2 * water_fraction
+            )
+            score = float(np.clip(score, 0.0, 10.0))
 
         rows.append(
             {
@@ -245,6 +280,7 @@ def run_heuristic_labeling(
             "class_score": class_score,
             "relief": relief,
             "roughness": roughness,
+            "slope_variation": slope_variation,
             "slope_mean": slope_mean,
             "water_proxy": water_proxy,
             "veg_proxy": veg_proxy,
@@ -273,6 +309,7 @@ def run_heuristic_labeling(
         "coords_available": coords_ok,
         "warnings": warnings,
         "seed": seed,
+        "scoring_mode": "learned" if learned_model is not None else "heuristic",
         "config": {
             "satellite_dir": str(sat_dir),
             "terrain_dir": str(terrain_dir),
@@ -283,6 +320,7 @@ def run_heuristic_labeling(
             "use_classifier": use_classifier,
             "classifier_best_ckpt": str(classifier_best_ckpt),
             "classifier_use_resisc45_stats": classifier_use_resisc45_stats,
+            "learned_regression_ckpt": str(learned_regression_ckpt) if learned_regression_ckpt else None,
             "default_lat": default_lat,
             "default_lon": default_lon,
         },
@@ -458,6 +496,112 @@ def _load_classifier(
     class_names = list(TERRAIN_CLASSES)
     _ = get_scenic_weight  # keep for type reference
     return classifier, transform, device, class_names
+
+
+def _load_learned_regressor(
+    *,
+    learned_regression_ckpt: str | Path | None,
+    device: str,
+    warnings: list[str],
+) -> Any | None:
+    if learned_regression_ckpt is None:
+        return None
+
+    ckpt_path = Path(learned_regression_ckpt)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Learned regression checkpoint not found: {ckpt_path}")
+
+    try:
+        import torch
+        from src.scenic_scorer.regression import ScenicRegressionModel
+    except ImportError as exc:
+        raise ImportError("Learned scoring requires scenic regression dependencies.") from exc
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    required = {"model_state_dict", "vit_dim", "terrain_dim", "num_classes"}
+    missing = required - set(ckpt.keys())
+    if missing:
+        raise ValueError(
+            f"Invalid learned regression checkpoint '{ckpt_path}': missing keys {sorted(missing)}"
+        )
+
+    model = ScenicRegressionModel(
+        vit_dim=int(ckpt["vit_dim"]),
+        terrain_dim=int(ckpt["terrain_dim"]),
+        num_classes=int(ckpt["num_classes"]),
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    warnings.append(f"Using learned regression checkpoint: {ckpt_path}")
+    return model
+
+
+def _build_regression_terrain_features(
+    *,
+    slope: np.ndarray,
+    relief: float,
+    water_proxy: float,
+    veg_proxy: float,
+) -> np.ndarray:
+    slope_variation = float(min(slope.std() / 15.0, 1.0))
+    terrain = TerrainFeatures(
+        slope_variation=slope_variation,
+        elevation_change=float(relief),
+        water_proximity=float(water_proxy),
+        vegetation_density=float(veg_proxy),
+        coastal=False,
+        has_lake=False,
+        has_river=False,
+    )
+    return terrain.to_array().astype(np.float32)
+
+
+def _infer_classifier_outputs(
+    *,
+    sat_img: Image.Image,
+    classifier: Any,
+    clf_transform: Any,
+    device: str,
+    class_names: Optional[list[str]],
+) -> tuple[int, str, float, np.ndarray, np.ndarray]:
+    if classifier is None or clf_transform is None or class_names is None:
+        raise ValueError("Classifier is required for learned scoring outputs.")
+
+    import torch
+    from src.classifier.model import get_scenic_weight
+
+    input_tensor = clf_transform(sat_img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        logits_t = classifier(input_tensor)
+        features_t = classifier.get_features(input_tensor)
+        probs = torch.softmax(logits_t, dim=-1).cpu().numpy()[0]
+
+    class_id = int(np.argmax(probs))
+    class_name = class_names[class_id]
+    class_score = float(get_scenic_weight(class_name))
+
+    class_logits = logits_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    vit_embedding = features_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    return class_id, class_name, class_score, class_logits, vit_embedding
+
+
+def _predict_learned_score(
+    *,
+    model: Any,
+    vit_embedding: np.ndarray,
+    terrain_features: np.ndarray,
+    class_logits: np.ndarray,
+    device: str,
+) -> float:
+    import torch
+
+    vit_t = torch.from_numpy(vit_embedding).float().unsqueeze(0).to(device)
+    terrain_t = torch.from_numpy(terrain_features).float().unsqueeze(0).to(device)
+    logits_t = torch.from_numpy(class_logits).float().unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        pred = model(vit_t, terrain_t, logits_t).squeeze().item()
+    return float(np.clip(pred, 0.0, 10.0))
 
 
 def _infer_class(

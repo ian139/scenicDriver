@@ -34,6 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--use-sample-weights",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use sample_weights array from dataset during optimization",
+    )
     return parser.parse_args()
 
 
@@ -51,6 +57,7 @@ def main() -> None:
         seed=args.seed,
         device=device,
         weight_decay=args.weight_decay,
+        use_sample_weights=args.use_sample_weights,
     )
 
     print(f"Best validation correlation: {best_corr:.4f}")

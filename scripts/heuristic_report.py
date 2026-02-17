@@ -36,6 +36,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--terrain-dir", type=str, default=None)
     parser.add_argument("--raw-dir", type=str, default=None)
     parser.add_argument("--s3-only", action="store_true", default=False)
+    parser.add_argument(
+        "--scoring",
+        choices=["heuristic", "learned"],
+        default="heuristic",
+        help="Scoring mode for scenic scores in labels/report",
+    )
+    parser.add_argument(
+        "--regression-ckpt",
+        type=str,
+        default="models/scenic_regression_baseline_masswhites_z14_mixed5000_weighted_h4.pt",
+        help="Learned regression checkpoint used when --scoring learned",
+    )
     return parser.parse_args()
 
 
@@ -58,8 +70,12 @@ def run_report(args: argparse.Namespace) -> Path:
     else:
         max_tiles = args.max_tiles or cfg.heuristic_max_tiles
 
+    if args.scoring == "learned" and args.no_classifier:
+        raise ValueError("--no-classifier cannot be used with --scoring learned")
+
     use_classifier = cfg.heuristic_use_classifier and not args.no_classifier
     seed = args.seed if args.seed is not None else cfg.seed
+    learned_regression_ckpt = args.regression_ckpt if args.scoring == "learned" else None
 
     labels_df, tiles, run_info = run_heuristic_labeling(
         satellite_dir=cfg.satellite_dir,
@@ -73,6 +89,7 @@ def run_report(args: argparse.Namespace) -> Path:
         default_lon=cfg.heuristic_default_lon,
         seed=seed,
         device=args.device,
+        learned_regression_ckpt=learned_regression_ckpt,
     )
 
     run_dir = Path(cfg.processed_dir) / "heuristic_runs" / run_name
@@ -109,6 +126,8 @@ def run_report(args: argparse.Namespace) -> Path:
             "preview": args.preview,
             "max_tiles": max_tiles,
             "use_classifier": use_classifier,
+            "scoring": args.scoring,
+            "regression_ckpt": learned_regression_ckpt,
             "device": args.device,
             "seed": seed,
         },

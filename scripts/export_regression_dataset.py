@@ -54,6 +54,36 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Skip rows whose satellite/terrain files are missing instead of failing fast",
     )
+    parser.add_argument(
+        "--sample-weight-column",
+        type=str,
+        default=None,
+        help="Optional labels.csv numeric column to use as sample_weight",
+    )
+    parser.add_argument(
+        "--label-source-column",
+        type=str,
+        default="label_source",
+        help="Optional labels.csv column indicating source (human/heuristic)",
+    )
+    parser.add_argument(
+        "--human-weight",
+        type=float,
+        default=4.0,
+        help="Sample weight for human/manual labels when using source-based weighting",
+    )
+    parser.add_argument(
+        "--heuristic-weight",
+        type=float,
+        default=1.0,
+        help="Sample weight for heuristic labels when using source-based weighting",
+    )
+    parser.add_argument(
+        "--default-weight",
+        type=float,
+        default=1.0,
+        help="Fallback sample weight when source is unknown/missing",
+    )
     return parser.parse_args()
 
 
@@ -120,6 +150,46 @@ def _terrain_path_from_sat(image_path: str) -> str:
     return image_path.replace("images/satellite/", "images/terrain/")
 
 
+def _validate_positive_weight(value: float, name: str) -> float:
+    weight = float(value)
+    if not np.isfinite(weight) or weight <= 0:
+        raise ValueError(f"{name} must be a positive finite float, got: {value}")
+    return weight
+
+
+def _sample_weight_for_row(
+    row: pd.Series,
+    *,
+    sample_weight_column: str | None,
+    label_source_column: str,
+    has_label_source: bool,
+    has_scenic_human: bool,
+    human_weight: float,
+    heuristic_weight: float,
+    default_weight: float,
+) -> float:
+    if sample_weight_column is not None:
+        raw_weight = row.get(sample_weight_column)
+        return _validate_positive_weight(raw_weight, f"labels column '{sample_weight_column}'")
+
+    if has_label_source:
+        source_raw = row.get(label_source_column)
+        source = "" if pd.isna(source_raw) else str(source_raw).strip().lower()
+        if source in {"human", "manual", "human_override", "annotated"}:
+            return human_weight
+        if source in {"heuristic", "weak", "auto"}:
+            return heuristic_weight
+        return default_weight
+
+    if has_scenic_human:
+        scenic_human = row.get("scenic_human")
+        if not pd.isna(scenic_human):
+            return human_weight
+        return heuristic_weight
+
+    return default_weight
+
+
 def main() -> None:
     args = parse_args()
     if not args.labels_csv.exists():
@@ -140,6 +210,16 @@ def main() -> None:
         df = df.head(args.max_samples)
     if df.empty:
         raise ValueError("No rows found in labels.csv")
+    if args.sample_weight_column is not None and args.sample_weight_column not in df.columns:
+        raise ValueError(
+            f"Requested --sample-weight-column '{args.sample_weight_column}' not found in labels.csv"
+        )
+
+    human_weight = _validate_positive_weight(args.human_weight, "--human-weight")
+    heuristic_weight = _validate_positive_weight(args.heuristic_weight, "--heuristic-weight")
+    default_weight = _validate_positive_weight(args.default_weight, "--default-weight")
+    has_label_source = args.label_source_column in df.columns
+    has_scenic_human = "scenic_human" in df.columns
 
     s3_info = _parse_s3_raw(args.raw_dir)
     s3_client = None
@@ -162,6 +242,8 @@ def main() -> None:
     class_probs = []
     scenic_scores = []
     class_ids = []
+    sample_weights = []
+    image_paths = []
 
     batch_imgs = []
     batch_meta = []
@@ -192,6 +274,17 @@ def main() -> None:
                     _terrain_features_from_images(terr_img, sat_img),
                     float(row["scenic_score"]),
                     int(row["class_id"]) if "class_id" in df.columns else -1,
+                    _sample_weight_for_row(
+                        row,
+                        sample_weight_column=args.sample_weight_column,
+                        label_source_column=args.label_source_column,
+                        has_label_source=has_label_source,
+                        has_scenic_human=has_scenic_human,
+                        human_weight=human_weight,
+                        heuristic_weight=heuristic_weight,
+                        default_weight=default_weight,
+                    ),
+                    sat_rel,
                 )
             )
 
@@ -204,13 +297,15 @@ def main() -> None:
             probs = torch.softmax(logits, dim=1)
 
             for i in range(x.shape[0]):
-                terrain, score, class_id = batch_meta[i]
+                terrain, score, class_id, sample_weight, image_path = batch_meta[i]
                 vit_embeddings.append(feats[i].detach().cpu().numpy().astype(np.float32))
                 terrain_features.append(terrain)
                 class_logits.append(logits[i].detach().cpu().numpy().astype(np.float32))
                 class_probs.append(probs[i].detach().cpu().numpy().astype(np.float32))
                 scenic_scores.append(np.float32(score))
                 class_ids.append(np.int64(class_id))
+                sample_weights.append(np.float32(sample_weight))
+                image_paths.append(str(image_path))
 
             batch_imgs = []
             batch_meta = []
@@ -221,13 +316,15 @@ def main() -> None:
             feats = model.get_features(x)
             probs = torch.softmax(logits, dim=1)
             for i in range(x.shape[0]):
-                terrain, score, class_id = batch_meta[i]
+                terrain, score, class_id, sample_weight, image_path = batch_meta[i]
                 vit_embeddings.append(feats[i].detach().cpu().numpy().astype(np.float32))
                 terrain_features.append(terrain)
                 class_logits.append(logits[i].detach().cpu().numpy().astype(np.float32))
                 class_probs.append(probs[i].detach().cpu().numpy().astype(np.float32))
                 scenic_scores.append(np.float32(score))
                 class_ids.append(np.int64(class_id))
+                sample_weights.append(np.float32(sample_weight))
+                image_paths.append(str(image_path))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -238,9 +335,21 @@ def main() -> None:
         class_probs=np.array(class_probs, dtype=np.float32),
         scenic_scores=np.array(scenic_scores, dtype=np.float32),
         class_ids=np.array(class_ids, dtype=np.int64),
+        sample_weights=np.array(sample_weights, dtype=np.float32),
+        image_paths=np.array(image_paths, dtype=str),
     )
     print(f"Wrote dataset: {args.output}")
     print(f"Samples: {len(vit_embeddings)}")
+    if sample_weights:
+        weights_arr = np.asarray(sample_weights, dtype=np.float32)
+        unique_weights = np.unique(np.round(weights_arr, 6))
+        if len(unique_weights) <= 10:
+            printable = ", ".join(str(float(w)) for w in unique_weights.tolist())
+            print(f"Sample weights used: [{printable}]")
+        print(
+            "Weight stats: "
+            f"min={weights_arr.min():.3f}, max={weights_arr.max():.3f}, mean={weights_arr.mean():.3f}"
+        )
     if missing_rows:
         print(f"Skipped rows with missing files: {missing_rows}")
     if len(vit_embeddings) == 0:
