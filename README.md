@@ -183,6 +183,32 @@ uv run python scripts/heuristic_report.py \
   --s3-only
 ```
 
+## Routing MVP
+
+Build a road graph from OSM bbox (requires geo extras):
+
+```bash
+uv sync --extra geo
+uv run python scripts/build_graph_from_osm.py \
+  --min-lat 42.35 --min-lon -72.57 \
+  --max-lat 42.39 --max-lon -72.52 \
+  --output data/processed/amherst_road_graph.json
+```
+
+Plan a scenic route from a LineString GeoJSON graph and write route overlay:
+
+```bash
+uv run python scripts/route_demo_geojson.py \
+  --geojson data/processed/sample_road_graph.geojson \
+  --start 42.40 -72.70 \
+  --end 42.48 -72.62 \
+  --scenic-weight 0.6 \
+  --output-geojson data/processed/sample_route.geojson \
+  --report-dir data/processed/heuristic_runs/masswhites_z14_learned_h4_5k/report
+```
+
+The report viewer auto-loads `route.geojson` when present in the report directory.
+
 ## Requirements
 
 - Python 3.11+

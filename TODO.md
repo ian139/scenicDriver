@@ -36,8 +36,8 @@
 - [ ] Optionally add "cluster view" for multi-region heatmap (group by region).
 
 ### Phase 3: Routing
-- [ ] Routing: stabilize OSM ingest (osmnx version compatibility, bbox validation, smaller demo).
+- [x] Routing: stabilize OSM ingest (osmnx version compatibility, bbox validation, smaller demo).
 - [ ] Routing: add cached graph builder output under `data/processed/` with a deterministic run name.
-- [ ] Routing: implement scenic edge scoring (tile score → edge score aggregation).
-- [ ] Routing: add CLI for best-route (start/end, scenic weight, output GeoJSON).
-- [ ] Routing: wire route overlay into heuristic viewer (auto-load `route.geojson` if present).
+- [x] Routing: implement scenic edge scoring (tile score → edge score aggregation).
+- [x] Routing: add CLI for best-route (start/end, scenic weight, output GeoJSON).
+- [x] Routing: wire route overlay into heuristic viewer (auto-load `route.geojson` if present).

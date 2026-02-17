@@ -42,6 +42,8 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - `uv run python scripts/annotate_scenic_web.py`
 - `uv run python scripts/annotate_scenic_web.py --labels-csv data/processed/heuristic_runs/masswhites_z14_flat_5k_seamfix/labels.csv --raw-dir s3://$SCENIC_S3_BUCKET/raw --annotations-csv data/raw/labels_human.csv --sample-size 500 --stratify-by-class`
 - `uv run python scripts/heuristic_report.py --run-name masswhites_z14_learned_h4 --scoring learned --regression-ckpt models/scenic_regression_baseline_masswhites_z14_mixed5000_weighted_h4.pt --satellite-dir data/raw/images/satellite/z14/masswhites --terrain-dir data/raw/images/terrain/z14/masswhites --max-tiles 5000 --s3-only`
+- `uv run python scripts/build_graph_from_osm.py --min-lat 42.35 --min-lon -72.57 --max-lat 42.39 --max-lon -72.52 --output data/processed/amherst_road_graph.json`
+- `uv run python scripts/route_demo_geojson.py --geojson data/processed/sample_road_graph.geojson --start 42.40 -72.70 --end 42.48 -72.62 --scenic-weight 0.6 --output-geojson data/processed/sample_route.geojson`
 - `uv sync`
 - `uv run python scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.satellite --output data/raw/images/satellite`
 - `uv run python scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.terrain-rgb --output data/raw/images/terrain`

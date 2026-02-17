@@ -16,7 +16,8 @@ Scenic Route Planner is an ML-driven system that scores scenic beauty from satel
 - Manual scenic annotations: 500 rows collected (`data/raw/labels_human.csv`).
 - Weighted mixed-supervision baseline: implemented and trained (`heuristic_weight=1.0`, configurable human weight).
 - Human-weight sweep complete (`h2/h3/h4`); current recommendation is `human_weight=4.0`.
-- In progress: classifier quality improvements and routing prototype.
+- Routing MVP restored: road graph loader + scenic route planner + GeoJSON route CLI.
+- In progress: classifier quality improvements and edge-level scenic data integration.
 
 ## Tech Stack (Current)
 - ML: PyTorch, timm, numpy, pandas
