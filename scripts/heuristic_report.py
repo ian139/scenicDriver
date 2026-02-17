@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_REGRESSION_CKPT,
         help="Learned regression checkpoint used when --scoring learned",
     )
+    parser.add_argument(
+        "--classifier-ckpt",
+        type=str,
+        default=None,
+        help="Classifier checkpoint path (required for --scoring learned)",
+    )
     return parser.parse_args()
 
 
@@ -63,6 +69,8 @@ def run_report(args: argparse.Namespace) -> Path:
     os.environ.setdefault("SCENIC_S3_ONLY", DEFAULT_S3_ONLY)
 
     cfg = HeuristicLabelerConfig()
+    if args.classifier_ckpt:
+        cfg.classifier_best_ckpt = args.classifier_ckpt
     if args.satellite_dir:
         cfg.satellite_dir = args.satellite_dir
     if args.terrain_dir:
@@ -82,6 +90,11 @@ def run_report(args: argparse.Namespace) -> Path:
 
     if args.scoring == "learned" and args.no_classifier:
         raise ValueError("--no-classifier cannot be used with --scoring learned")
+    if args.scoring == "learned" and not Path(cfg.classifier_best_ckpt).exists():
+        raise FileNotFoundError(
+            "Learned scoring requires a classifier checkpoint for embeddings, but it was not found at "
+            f"'{cfg.classifier_best_ckpt}'. Pass --classifier-ckpt <path> or place the checkpoint at the default path."
+        )
 
     use_classifier = cfg.heuristic_use_classifier and not args.no_classifier
     seed = args.seed if args.seed is not None else cfg.seed

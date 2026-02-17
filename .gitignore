@@ -41,3 +41,4 @@ archive/*
 # Misc local files
 *.log
 .DS_Store
+scenic_artifacts/

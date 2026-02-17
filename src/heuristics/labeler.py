@@ -297,6 +297,8 @@ def run_heuristic_labeling(
 
     labels_df = pd.DataFrame(rows)
 
+    raw_dir_config = raw_dir if isinstance(raw_dir, str) and raw_dir.startswith("s3://") else str(raw_root)
+
     run_info = {
         "counts": {
             "satellite_total": len(sat_files),
@@ -313,7 +315,7 @@ def run_heuristic_labeling(
         "config": {
             "satellite_dir": str(sat_dir),
             "terrain_dir": str(terrain_dir),
-            "raw_dir": str(raw_root),
+            "raw_dir": raw_dir_config,
             "s3_bucket": s3_bucket,
             "s3_only": s3_only,
             "max_tiles": max_tiles,
