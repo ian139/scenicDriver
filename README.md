@@ -74,7 +74,41 @@ uv run python scripts/annotate_scenic_web.py \
 
 Then open `http://localhost:8765`.
 
+Overlap pass (same tiles labeled by two annotators):
+
 ```bash
+# Build overlap batch for second annotator
+uv run python scripts/build_overlap_batch.py \
+  --annotations-csv data/raw/labels_human.csv \
+  --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv \
+  --source-annotator ian \
+  --target-annotator paperspace \
+  --sample-size 200 \
+  --seed 42 \
+  --output-csv data/processed/regression/overlap_batch_ian_to_paperspace_200.csv
+
+# Annotate exactly that overlap batch
+uv run python scripts/annotate_scenic_web.py \
+  --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv \
+  --batch-csv data/processed/regression/overlap_batch_ian_to_paperspace_200.csv \
+  --raw-dir s3://scenicdriver-data/raw \
+  --annotations-csv data/raw/labels_human.csv \
+  --annotator-id paperspace \
+  --sample-size 200 \
+  --stratify-by-class
+```
+
+```bash
+# 0) Build human benchmark split + agreement report
+uv run python scripts/build_human_benchmark.py \
+  --annotations-csv data/raw/labels_human.csv \
+  --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv \
+  --output-dir data/processed/regression \
+  --run-name masswhites_human_benchmark_v1 \
+  --val-frac 0.2 \
+  --test-frac 0.2 \
+  --seed 42
+
 # 1) Export feature dataset for learned scenic regression
 uv run python scripts/export_regression_dataset.py \
   --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv \
@@ -99,6 +133,7 @@ uv run python scripts/evaluate_regression_baseline.py \
 
 Current recommendation from weight sweep (`data/processed/regression/weight_sweep_masswhites_z14.json`):
 - Use `human_weight=4.0`, `heuristic_weight=1.0` for mixed-supervision training.
+- Current benchmark split/agreement output: `data/processed/regression/masswhites_human_benchmark_v1/summary.json`.
 
 ## Current Working Sets
 
@@ -208,6 +243,7 @@ uv run python scripts/route_demo_geojson.py \
 ```
 
 The report viewer auto-loads `route.geojson` when present in the report directory.
+Routing now uses per-edge travel times from OSM `maxspeed` (with road-type fallbacks) and honors one-way directionality.
 
 ## Requirements
 

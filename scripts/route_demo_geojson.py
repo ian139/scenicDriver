@@ -35,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scenic-weight", type=float, default=0.6)
     parser.add_argument("--avoid-highways", action="store_true")
     parser.add_argument("--max-detour-factor", type=float, default=1.8)
+    parser.add_argument(
+        "--include-baseline",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also compute a non-scenic baseline route (scenic_weight=0.0) for comparison",
+    )
     parser.add_argument("--output-geojson", type=Path, default=Path("data/processed/sample_route.geojson"))
     parser.add_argument(
         "--report-dir",
@@ -45,22 +51,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _to_geojson(route) -> dict:
+def _route_feature(route, route_kind: str) -> dict:
     coords = [[lon, lat] for lat, lon in route.waypoints]
     return {
-        "type": "FeatureCollection",
-        "features": [
-            {
-                "type": "Feature",
-                "properties": {
-                    "segments": len(route.segments),
-                    "total_distance_km": route.total_distance_km,
-                    "average_scenic_score": route.average_scenic_score,
-                    "estimated_duration_minutes": route.estimated_duration_minutes,
-                },
-                "geometry": {"type": "LineString", "coordinates": coords},
-            }
-        ],
+        "type": "Feature",
+        "properties": {
+            "route_kind": route_kind,
+            "segments": len(route.segments),
+            "total_distance_km": route.total_distance_km,
+            "average_scenic_score": route.average_scenic_score,
+            "estimated_duration_minutes": route.estimated_duration_minutes,
+        },
+        "geometry": {"type": "LineString", "coordinates": coords},
     }
 
 
@@ -76,12 +78,30 @@ def main() -> None:
         max_detour_factor=args.max_detour_factor,
     )
 
+    print("[Scenic Route]")
     print(f"Segments: {len(route.segments)}")
     print(f"Total distance (km): {route.total_distance_km:.2f}")
     print(f"Avg scenic score: {route.average_scenic_score:.2f}")
     print(f"Estimated duration (min): {route.estimated_duration_minutes:.1f}")
 
-    geojson = _to_geojson(route)
+    features = [_route_feature(route, "scenic")]
+
+    if args.include_baseline:
+        baseline = planner.find_scenic_route(
+            start=(args.start[0], args.start[1]),
+            end=(args.end[0], args.end[1]),
+            scenic_weight=0.0,
+            avoid_highways=False,
+            max_detour_factor=max(args.max_detour_factor, 1.2),
+        )
+        features.append(_route_feature(baseline, "baseline"))
+        print("[Baseline Route]")
+        print(f"Segments: {len(baseline.segments)}")
+        print(f"Total distance (km): {baseline.total_distance_km:.2f}")
+        print(f"Avg scenic score: {baseline.average_scenic_score:.2f}")
+        print(f"Estimated duration (min): {baseline.estimated_duration_minutes:.1f}")
+
+    geojson = {"type": "FeatureCollection", "features": features}
     args.output_geojson.parent.mkdir(parents=True, exist_ok=True)
     args.output_geojson.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
     print(f"Wrote {args.output_geojson}")

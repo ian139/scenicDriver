@@ -3,7 +3,7 @@
 Purpose: preserve non-primary files while keeping the active workspace focused on the current training + S3 ingestion path.
 
 ## Archive Policy
-- Active path lives in `notebooks/train.mo.py`, `notebooks/regression.mo.py`, `scripts/download_bbox_tiles.py`, `scripts/heuristic_report.py`, and `scripts/rebuild_report_from_labels.py`.
+- Active path lives in `notebooks/train.mo.py`, `notebooks/regression.mo.py`, `scripts/download_bbox_tiles.py`, `scripts/heuristic_report.py`, `scripts/rebuild_report_from_labels.py`, and `scripts/annotate_scenic_web.py`.
 - Non-primary scripts/models are moved to `archive/` instead of deleted.
 - Archived files are restorable with `mv` commands listed below.
 

@@ -42,7 +42,8 @@ def _graph_from_bbox_compat(ox, north: float, south: float, east: float, west: f
     fn = ox.graph_from_bbox
     sig = inspect.signature(fn)
     params = set(sig.parameters.keys())
-    bbox = (north, south, east, west)
+    # osmnx>=2 expects bbox in (left, bottom, right, top) = (west, south, east, north).
+    bbox = (west, south, east, north)
 
     # osmnx>=2 style: graph_from_bbox(bbox=(north, south, east, west), *, network_type=...)
     if "bbox" in params:

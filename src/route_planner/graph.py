@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -28,6 +29,7 @@ class Edge:
     road_name: Optional[str] = None
     road_type: str = "secondary"
     speed_limit_kmh: int = 50
+    one_way: bool = False
 
     @property
     def travel_time_minutes(self) -> float:
@@ -56,7 +58,8 @@ class RoadGraph:
 
         self.edges[edge.id] = edge
         self.adjacency.setdefault(edge.start_node_id, []).append((edge.id, False))
-        self.adjacency.setdefault(edge.end_node_id, []).append((edge.id, True))
+        if not edge.one_way:
+            self.adjacency.setdefault(edge.end_node_id, []).append((edge.id, True))
 
     def get_node(self, node_id: str) -> Node:
         return self.nodes[node_id]
@@ -78,6 +81,7 @@ class RoadGraph:
                     road_name=edge.road_name,
                     road_type=edge.road_type,
                     speed_limit_kmh=edge.speed_limit_kmh,
+                    one_way=False,
                 )
             )
         return out
@@ -111,6 +115,7 @@ class RoadGraph:
                     "road_name": e.road_name,
                     "road_type": e.road_type,
                     "speed_limit_kmh": e.speed_limit_kmh,
+                    "one_way": e.one_way,
                 }
                 for e in self.edges.values()
             ],
@@ -134,7 +139,13 @@ class RoadGraph:
                     scenic_score=float(row.get("scenic_score", 5.0)),
                     road_name=row.get("road_name"),
                     road_type=str(row.get("road_type", "secondary")),
-                    speed_limit_kmh=int(row.get("speed_limit_kmh", 50)),
+                    speed_limit_kmh=_parse_speed_limit_kmh(
+                        row.get("speed_limit_kmh"),
+                        str(row.get("road_type", "secondary")),
+                    ),
+                    # Historical graph JSONs often omitted one_way.
+                    # Default to True to preserve OSM directed-edge semantics.
+                    one_way=_parse_one_way(row.get("one_way"), default=True),
                 )
             )
         return graph
@@ -169,9 +180,12 @@ class RoadGraph:
             props = feat.get("properties", {}) or {}
             base_edge_id = props.get("id")
             road_name = props.get("road_name")
-            road_type = str(props.get("road_type", "secondary"))
+            road_type = _normalize_road_type(props.get("road_type", "secondary"))
             scenic_score = float(props.get("scenic_score", 5.0))
-            speed_limit = int(props.get("speed_limit_kmh", 50))
+            speed_limit = _parse_speed_limit_kmh(props.get("speed_limit_kmh"), road_type)
+            one_way = _parse_one_way(props.get("one_way", props.get("oneway")), default=True)
+            if "bidirectional" in props:
+                one_way = not _parse_bool(props.get("bidirectional"), default=False)
 
             for idx in range(len(coords) - 1):
                 lon1, lat1 = coords[idx]
@@ -191,6 +205,7 @@ class RoadGraph:
                         road_name=road_name,
                         road_type=road_type,
                         speed_limit_kmh=speed_limit,
+                        one_way=one_way,
                     )
                 )
 
@@ -245,17 +260,13 @@ def _graph_from_osmnx(G: Any, scenic_scores: Dict[str, float]) -> RoadGraph:
         length_m = float(data.get("length", 0.0))
         scenic_score = float(scenic_scores.get(str(data.get("osmid", edge_id)), 5.0))
         road_name = data.get("name")
-        road_type = data.get("highway", "secondary")
-        if isinstance(road_type, list):
-            road_type = road_type[0]
-
-        speed = data.get("maxspeed", 50)
-        if isinstance(speed, list):
-            speed = speed[0]
-        try:
-            speed_kmh = int(str(speed).split()[0])
-        except (TypeError, ValueError):
-            speed_kmh = 50
+        road_type = _normalize_road_type(data.get("highway", "secondary"))
+        speed_kmh = _parse_speed_limit_kmh(data.get("maxspeed"), road_type)
+        # osmnx graphs are directed. Keep this edge as directed by default
+        # and only synthesize reverse traversal when we are sure it's needed.
+        one_way = _parse_one_way(data.get("oneway"), default=True)
+        if not one_way and G.has_edge(v, u):
+            one_way = True
 
         graph.add_edge(
             Edge(
@@ -265,9 +276,111 @@ def _graph_from_osmnx(G: Any, scenic_scores: Dict[str, float]) -> RoadGraph:
                 distance_km=max(0.0, length_m / 1000.0),
                 scenic_score=float(max(0.0, min(10.0, scenic_score))),
                 road_name=road_name,
-                road_type=str(road_type),
+                road_type=road_type,
                 speed_limit_kmh=speed_kmh,
+                one_way=one_way,
             )
         )
 
     return graph
+
+
+_ROAD_TYPE_SPEED_KMH = {
+    "motorway": 100,
+    "trunk": 90,
+    "primary": 80,
+    "secondary": 60,
+    "tertiary": 50,
+    "residential": 35,
+    "service": 25,
+    "unclassified": 40,
+    "living_street": 20,
+}
+
+
+def _normalize_road_type(raw: Any) -> str:
+    if isinstance(raw, list) and raw:
+        raw = raw[0]
+    value = str(raw).strip().lower() if raw is not None else ""
+    return value if value else "secondary"
+
+
+def _parse_bool(raw: Any, default: bool) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "y", "t", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "f", "off"}:
+        return False
+    return default
+
+
+def _parse_one_way(raw: Any, default: bool) -> bool:
+    """
+    Parse one-way flags from OSM/GeoJSON-style values.
+
+    OSM may encode oneway as yes/no/1/0/-1.
+    """
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if raw is None:
+        return default
+
+    text = str(raw).strip().lower()
+    if text in {"-1", "reverse"}:
+        return True
+    return _parse_bool(raw, default=default)
+
+
+def _parse_speed_limit_kmh(raw_speed: Any, road_type: str) -> int:
+    """
+    Parse OSM maxspeed into km/h.
+
+    Handles values like:
+      - 50
+      - "50"
+      - "35 mph"
+      - "50 km/h"
+      - "50;70"
+      - ["50 mph", ...]
+    Falls back to road-type defaults when missing/unparseable.
+    """
+    fallback = int(_ROAD_TYPE_SPEED_KMH.get(road_type, 50))
+    if raw_speed is None:
+        return fallback
+
+    if isinstance(raw_speed, list):
+        raw_speed = raw_speed[0] if raw_speed else None
+        if raw_speed is None:
+            return fallback
+
+    if isinstance(raw_speed, (int, float)):
+        speed = float(raw_speed)
+        if speed <= 0:
+            return fallback
+        return int(round(min(max(speed, 10.0), 140.0)))
+
+    text = str(raw_speed).strip().lower()
+    if not text:
+        return fallback
+    if ";" in text:
+        text = text.split(";", 1)[0].strip()
+
+    match = re.search(r"\d+(?:\.\d+)?", text)
+    if not match:
+        return fallback
+
+    value = float(match.group(0))
+    if value <= 0:
+        return fallback
+
+    if "mph" in text:
+        value *= 1.60934
+
+    value = min(max(value, 10.0), 140.0)
+    return int(round(value))

@@ -48,8 +48,12 @@ export SCENIC_S3_BUCKET=scenicdriver-data
 ## 5) Sync Local Data to S3
 
 ```bash
-./scripts/s3_sync.sh
+bash scripts/s3_sync.sh
 ```
+
+Notes:
+- Script may not be executable by default; `bash ...` avoids permission issues.
+- Keep tiles under `raw/images/{satellite|terrain}/z{zoom}/{region}/{x}_{y}.png`.
 
 ## 6) Apply Lifecycle Rules (Optional)
 

@@ -30,6 +30,28 @@ def test_graph_bidirectional_edges() -> None:
     assert reverse[0].end_node_id == "a"
 
 
+def test_graph_respects_one_way_edges() -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="a", lat=42.0, lon=-72.0))
+    graph.add_node(Node(id="b", lat=42.1, lon=-72.0))
+    graph.add_edge(
+        Edge(
+            id="ab_one_way",
+            start_node_id="a",
+            end_node_id="b",
+            distance_km=1.0,
+            scenic_score=6.0,
+            one_way=True,
+        )
+    )
+
+    forward = graph.get_edges("a")
+    reverse = graph.get_edges("b")
+    assert len(forward) == 1
+    assert len(reverse) == 0
+    assert forward[0].end_node_id == "b"
+
+
 def test_cost_function_weight_behavior() -> None:
     short_ugly = Edge(
         id="e1",
@@ -114,3 +136,33 @@ def test_geojson_graph_load(tmp_path: Path) -> None:
     graph = RoadGraph.from_geojson(path)
     assert len(graph.nodes) == 2
     assert len(graph.edges) == 1
+    first = next(iter(graph.edges.values()))
+    assert first.one_way is True
+
+
+def test_geojson_bidirectional_override(tmp_path: Path) -> None:
+    geojson = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {
+                    "road_type": "secondary",
+                    "scenic_score": 7.0,
+                    "bidirectional": True,
+                },
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[-72.0, 42.0], [-72.0, 42.1]],
+                },
+            }
+        ],
+    }
+    path = tmp_path / "graph_bi.geojson"
+    path.write_text(json.dumps(geojson), encoding="utf-8")
+
+    graph = RoadGraph.from_geojson(path)
+    start_edges = graph.get_edges("n0")
+    end_edges = graph.get_edges("n1")
+    assert len(start_edges) == 1
+    assert len(end_edges) == 1

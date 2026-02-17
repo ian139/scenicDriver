@@ -365,6 +365,9 @@ def _render_index_html() -> str:
       <div class="muted" id="mapbox-note">
           Map overlay requires a Mapbox token (set in report_config.json or window.MAPBOX_TOKEN).
       </div>
+      <div class="muted" id="route-legend" style="display:none;">
+          Route overlay: <span style="color:#ffb347;">scenic</span> vs <span style="color:#66c2ff;">baseline</span>
+      </div>
       </div>
       <div class="card panel">
         <h2>Tile Details</h2>
@@ -390,6 +393,7 @@ def _render_index_html() -> str:
       const baseLayerSelect = document.getElementById("base-layer");
       const heatmapOpacityInput = document.getElementById("heatmap-opacity");
       const mapboxNote = document.getElementById("mapbox-note");
+      const routeLegend = document.getElementById("route-legend");
       const tileIdEl = document.getElementById("tile-id");
       const tileThumbEl = document.getElementById("tile-thumb");
       const tileScoreEl = document.getElementById("tile-score");
@@ -665,15 +669,28 @@ def _render_index_html() -> str:
             .then((routeGeo) => {
               if (!routeGeo) return;
               map.addSource("scenic-route", { type: "geojson", data: routeGeo });
+              routeLegend.style.display = "block";
+
+              // Baseline (non-scenic) route in blue.
+              map.addLayer({
+                id: "scenic-route-line-baseline",
+                type: "line",
+                source: "scenic-route",
+                filter: ["==", ["coalesce", ["get", "route_kind"], "scenic"], "baseline"],
+                paint: {
+                  "line-color": "#66c2ff",
+                  "line-width": 4,
+                  "line-opacity": 0.92,
+                },
+              });
+
+              // Scenic-optimized route in orange.
               map.addLayer({
                 id: "scenic-route-line",
                 type: "line",
                 source: "scenic-route",
-                paint: {
-                  "line-color": "#ffb347",
-                  "line-width": 4,
-                  "line-opacity": 0.9,
-                },
+                filter: ["!=", ["coalesce", ["get", "route_kind"], "scenic"], "baseline"],
+                paint: { "line-color": "#ffb347", "line-width": 6, "line-opacity": 0.95 },
               });
             })
             .catch(() => null);

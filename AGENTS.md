@@ -41,6 +41,9 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - `marimo run notebooks/annotate_scenic.mo.py`
 - `uv run python scripts/annotate_scenic_web.py`
 - `uv run python scripts/annotate_scenic_web.py --labels-csv data/processed/heuristic_runs/masswhites_z14_flat_5k_seamfix/labels.csv --raw-dir s3://$SCENIC_S3_BUCKET/raw --annotations-csv data/raw/labels_human.csv --sample-size 500 --stratify-by-class`
+- `uv run python scripts/build_overlap_batch.py --annotations-csv data/raw/labels_human.csv --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --source-annotator ian --target-annotator paperspace --sample-size 200 --seed 42 --output-csv data/processed/regression/overlap_batch_ian_to_paperspace_200.csv`
+- `uv run python scripts/annotate_scenic_web.py --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --batch-csv data/processed/regression/overlap_batch_ian_to_paperspace_200.csv --raw-dir s3://$SCENIC_S3_BUCKET/raw --annotations-csv data/raw/labels_human.csv --annotator-id paperspace --sample-size 200 --stratify-by-class`
+- `uv run python scripts/build_human_benchmark.py --annotations-csv data/raw/labels_human.csv --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --output-dir data/processed/regression --run-name masswhites_human_benchmark_v1 --val-frac 0.2 --test-frac 0.2 --seed 42`
 - `uv run python scripts/heuristic_report.py --run-name masswhites_z14_learned_h4 --scoring learned --regression-ckpt models/scenic_regression_baseline_masswhites_z14_mixed5000_weighted_h4.pt --satellite-dir data/raw/images/satellite/z14/masswhites --terrain-dir data/raw/images/terrain/z14/masswhites --max-tiles 5000 --s3-only`
 - `uv run python scripts/build_graph_from_osm.py --min-lat 42.35 --min-lon -72.57 --max-lat 42.39 --max-lon -72.52 --output data/processed/amherst_road_graph.json`
 - `uv run python scripts/route_demo_geojson.py --geojson data/processed/sample_road_graph.geojson --start 42.40 -72.70 --end 42.48 -72.62 --scenic-weight 0.6 --output-geojson data/processed/sample_route.geojson`
@@ -62,6 +65,8 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - Replace heuristic class-weight scoring with a learned scenic regressor using satellite embeddings + terrain features (optional class probabilities).
 - During mixed supervision runs, weight human labels higher than heuristic labels (via `label_source` -> `sample_weights`; current default human weight: `4.0`).
 - Add a manual scenic annotation workflow and treat human labels as primary supervision for model calibration/evaluation.
+- Keep a deterministic human benchmark split + agreement report under `data/processed/regression/<run_name>/` (`benchmark_split.csv`, `agreement_by_annotator.csv`, `agreement_by_pair.csv`, `summary.json`).
+- Run an explicit overlap pass (same tiles annotated by two annotators) before relying on pairwise agreement metrics.
 - Keep heuristic scoring as fallback/baseline for sanity checks and quick previews.
 
 ## Git Workflow
