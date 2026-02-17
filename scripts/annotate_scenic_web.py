@@ -112,7 +112,10 @@ class AnnotatorState:
                 ann_df.loc[ann_df["annotator_id"] == config.annotator_id, "image_path"].tolist()
             )
             done_paths_all = set(ann_df["image_path"].tolist())
-        unlabeled_df = candidate_df.loc[~candidate_df["image_path"].isin(done_paths_for_annotator)].copy()
+        # In normal labels mode, prefer new unique tiles (exclude any already-labeled tile).
+        # In fixed overlap batch mode, only exclude rows already labeled by this annotator.
+        done_paths_active = done_paths_for_annotator if batch_source == "batch_csv" else done_paths_all
+        unlabeled_df = candidate_df.loc[~candidate_df["image_path"].isin(done_paths_active)].copy()
 
         if unlabeled_df.empty:
             batch_df = unlabeled_df

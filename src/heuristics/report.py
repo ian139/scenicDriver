@@ -368,6 +368,10 @@ def _render_index_html() -> str:
       <div class="muted" id="route-legend" style="display:none;">
           Route overlay: <span style="color:#ffb347;">scenic</span> vs <span style="color:#66c2ff;">baseline</span>
       </div>
+      <div id="route-stats-wrap" style="display:none; margin-top:8px;">
+        <div class="summary-grid" id="route-stats"></div>
+      </div>
+      <div class="muted" id="route-stats-note">Route metrics appear when route overlay data is available.</div>
       </div>
       <div class="card panel">
         <h2>Tile Details</h2>
@@ -394,6 +398,9 @@ def _render_index_html() -> str:
       const heatmapOpacityInput = document.getElementById("heatmap-opacity");
       const mapboxNote = document.getElementById("mapbox-note");
       const routeLegend = document.getElementById("route-legend");
+      const routeStatsWrap = document.getElementById("route-stats-wrap");
+      const routeStatsEl = document.getElementById("route-stats");
+      const routeStatsNote = document.getElementById("route-stats-note");
       const tileIdEl = document.getElementById("tile-id");
       const tileThumbEl = document.getElementById("tile-thumb");
       const tileScoreEl = document.getElementById("tile-score");
@@ -510,6 +517,157 @@ def _render_index_html() -> str:
           })
           .then((cfg) => (cfg && cfg.mapbox_token ? cfg.mapbox_token : null))
           .catch(() => null);
+      }
+
+      function normalizeFeatureCollection(routeGeo, fallbackKind) {
+        if (!routeGeo) return null;
+        if (routeGeo.type === "FeatureCollection" && Array.isArray(routeGeo.features)) {
+          const features = routeGeo.features
+            .filter((feature) => feature && feature.type === "Feature")
+            .map((feature) => {
+              const properties = Object.assign({}, feature.properties || {});
+              if (!properties.route_kind) properties.route_kind = fallbackKind;
+              return Object.assign({}, feature, { properties });
+            });
+          return { type: "FeatureCollection", features };
+        }
+        if (routeGeo.type === "Feature") {
+          const properties = Object.assign({}, routeGeo.properties || {});
+          if (!properties.route_kind) properties.route_kind = fallbackKind;
+          return {
+            type: "FeatureCollection",
+            features: [Object.assign({}, routeGeo, { properties })],
+          };
+        }
+        return null;
+      }
+
+      function pickRouteFeature(routeGeo, preferredKind, fallbackKind) {
+        const normalized = normalizeFeatureCollection(routeGeo, fallbackKind);
+        if (!normalized || normalized.features.length === 0) return null;
+        const preferred = normalized.features.find((feature) => {
+          const kind = String((feature.properties || {}).route_kind || "").toLowerCase();
+          return kind === preferredKind;
+        });
+        return preferred || normalized.features[0];
+      }
+
+      function fetchRouteGeojson(path) {
+        return fetch(`${path}?ts=${Date.now()}`)
+          .then((resp) => (resp.ok ? resp.json() : null))
+          .catch(() => null);
+      }
+
+      async function loadRouteOverlay() {
+        const primary = await fetchRouteGeojson("route.geojson");
+        if (primary) {
+          return normalizeFeatureCollection(primary, "scenic");
+        }
+
+        const [scenicGeo, fastGeo] = await Promise.all([
+          fetchRouteGeojson("route_scenic.geojson"),
+          fetchRouteGeojson("route_fast.geojson"),
+        ]);
+        const features = [];
+        const scenicFeature = pickRouteFeature(scenicGeo, "scenic", "scenic");
+        const baselineFeature = pickRouteFeature(fastGeo, "baseline", "baseline");
+
+        if (scenicFeature) {
+          const properties = Object.assign({}, scenicFeature.properties || {}, {
+            route_kind: "scenic",
+          });
+          features.push(Object.assign({}, scenicFeature, { properties }));
+        }
+        if (baselineFeature) {
+          const properties = Object.assign({}, baselineFeature.properties || {}, {
+            route_kind: "baseline",
+          });
+          features.push(Object.assign({}, baselineFeature, { properties }));
+        }
+
+        if (features.length === 0) return null;
+        return { type: "FeatureCollection", features };
+      }
+
+      function _routeFeatureByKind(routeGeo, kind) {
+        if (!routeGeo || !Array.isArray(routeGeo.features)) return null;
+        const target = String(kind || "").toLowerCase();
+        for (const feature of routeGeo.features) {
+          const current = String((feature.properties || {}).route_kind || "scenic").toLowerCase();
+          if (current === target) return feature;
+        }
+        return null;
+      }
+
+      function _toFiniteNumber(value) {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+      }
+
+      function _formatNumber(value, digits) {
+        const n = _toFiniteNumber(value);
+        if (n === null) return "n/a";
+        return n.toFixed(digits);
+      }
+
+      function _formatSigned(value, digits) {
+        const n = _toFiniteNumber(value);
+        if (n === null) return "n/a";
+        const sign = n > 0 ? "+" : "";
+        return `${sign}${n.toFixed(digits)}`;
+      }
+
+      function _routeMetricsFromFeature(feature) {
+        const props = (feature && feature.properties) || {};
+        return {
+          distanceKm: _toFiniteNumber(props.total_distance_km),
+          durationMin: _toFiniteNumber(props.estimated_duration_minutes),
+          scenicScore: _toFiniteNumber(props.average_scenic_score),
+          segments: _toFiniteNumber(props.segments),
+        };
+      }
+
+      function renderRouteStats(routeGeo) {
+        if (!routeStatsWrap || !routeStatsEl || !routeStatsNote) return;
+        if (!routeGeo || !Array.isArray(routeGeo.features) || routeGeo.features.length === 0) {
+          routeStatsWrap.style.display = "none";
+          routeStatsEl.innerHTML = "";
+          routeStatsNote.style.display = "block";
+          return;
+        }
+
+        const baselineFeature = _routeFeatureByKind(routeGeo, "baseline");
+        const scenicFeature = _routeFeatureByKind(routeGeo, "scenic")
+          || routeGeo.features.find((f) => f !== baselineFeature)
+          || null;
+
+        const scenic = _routeMetricsFromFeature(scenicFeature);
+        const baseline = _routeMetricsFromFeature(baselineFeature);
+
+        const items = [];
+        if (scenicFeature) {
+          items.push(["Scenic Dist (km)", _formatNumber(scenic.distanceKm, 2)]);
+          items.push(["Scenic Time (min)", _formatNumber(scenic.durationMin, 1)]);
+          items.push(["Scenic Score", _formatNumber(scenic.scenicScore, 2)]);
+        }
+        if (baselineFeature) {
+          items.push(["Base Dist (km)", _formatNumber(baseline.distanceKm, 2)]);
+          items.push(["Base Time (min)", _formatNumber(baseline.durationMin, 1)]);
+          items.push(["Base Score", _formatNumber(baseline.scenicScore, 2)]);
+        }
+        if (scenicFeature && baselineFeature) {
+          items.push(["Delta Dist (km)", _formatSigned(scenic.distanceKm - baseline.distanceKm, 2)]);
+          items.push(["Delta Time (min)", _formatSigned(scenic.durationMin - baseline.durationMin, 1)]);
+          items.push(["Delta Scenic", _formatSigned(scenic.scenicScore - baseline.scenicScore, 2)]);
+        }
+
+        routeStatsEl.innerHTML = items
+          .map(([label, value]) => {
+            return `<div class="summary-item"><span>${label}</span><strong>${value}</strong></div>`;
+          })
+          .join("");
+        routeStatsWrap.style.display = "block";
+        routeStatsNote.style.display = "none";
       }
 
       function renderSummary(summary, runInfo) {
@@ -664,12 +822,12 @@ def _render_index_html() -> str:
           });
           map.fitBounds([ [nwLon, seLat], [seLon, nwLat] ], { padding: 20, duration: 0 });
 
-          fetch(`route.geojson?ts=${Date.now()}`)
-            .then((resp) => (resp.ok ? resp.json() : null))
+          loadRouteOverlay()
             .then((routeGeo) => {
-              if (!routeGeo) return;
+              if (!routeGeo || !routeGeo.features || routeGeo.features.length === 0) return;
               map.addSource("scenic-route", { type: "geojson", data: routeGeo });
               routeLegend.style.display = "block";
+              renderRouteStats(routeGeo);
 
               // Baseline (non-scenic) route in blue.
               map.addLayer({

@@ -26,10 +26,11 @@
 - [x] Learned-scoring scaffold: feature export script (`scripts/export_regression_dataset.py`) + baseline trainer (`scripts/train_regression_baseline.py`) + evaluator (`scripts/evaluate_regression_baseline.py`).
 - [x] Build manual scenic annotation MVP (`notebooks/annotate_scenic.mo.py`) with 0-10 scoring, skip, confidence, and CSV output.
 - [x] Add stratified tile sampler for annotation batches (cross-region and class-balanced).
-- [x] Create human-labeled benchmark split and report agreement stats (tile overlap, annotator variance) via `scripts/build_human_benchmark.py` (latest run: `data/processed/regression/masswhites_human_benchmark_v1/summary.json`).
+- [x] Create human-labeled benchmark split and report agreement stats (tile overlap, annotator variance) via `scripts/build_human_benchmark.py` (latest run: `data/processed/regression/masswhites_human_benchmark_v2/summary.json`).
 - [x] Train with weighted mixed supervision: human scenic labels (primary, higher weight) + heuristic labels (weak, lower weight).
 - [x] Add explicit overlap annotation tooling (`scripts/build_overlap_batch.py`) and annotator `--batch-csv` mode for same-tile cross-annotator labeling.
 - [x] Complete overlap annotation pass (label generated overlap batch) so pairwise agreement metrics are non-empty (`data/processed/regression/masswhites_human_benchmark_v2/agreement_by_pair.csv`).
+- [x] Keep `v2` regression checkpoint as active default after v1/v3 parity check (documented in `MLResearch.md`).
 - [ ] Expand manual labels from 500 -> 1000-1500 and rerun mixed training/eval.
 
 ### Phase 2: Data + Reporting
@@ -39,8 +40,15 @@
 
 ### Phase 3: Routing
 - [x] Routing: stabilize OSM ingest (osmnx version compatibility, bbox validation, smaller demo).
-- [ ] Routing: add cached graph builder output under `data/processed/` with a deterministic run name.
+- [x] Routing: add cached graph builder output under `data/processed/` with a deterministic run name (`scripts/build_graph_from_osm.py` auto run folder + `run.json`).
 - [x] Routing: implement scenic edge scoring (tile score → edge score aggregation).
 - [x] Routing: enforce one-way/direction-aware traversal + parsed speed-limit travel times from OSM metadata.
 - [x] Routing: add CLI for best-route (start/end, scenic weight, output GeoJSON).
 - [x] Routing: wire route overlay into heuristic viewer (auto-load `route.geojson` if present).
+- [x] Routing: viewer route overlay fallback for split files (`route_scenic.geojson` + `route_fast.geojson`) when `route.geojson` is absent.
+- [x] Routing: show scenic vs baseline travel-time/distance/scenic deltas directly in viewer route panel.
+- [x] Attempted `v3` rerun and documented results in `MLResearch.md` (`v3` reused v1-equivalent labels and should not be promoted).
+- [ ] Build `v4` mixed labels from overlap-aware source (`labels_masswhites_z14_mixed5000_v2.csv`) plus any new human annotations.
+- [ ] Export `features_masswhites_z14_mixed5000_v4_h4.npz` and verify dataset hash differs from v1/v3 before training.
+- [ ] Train/evaluate `v4` and compare against v2 (`corr=0.9227`, `mae=0.2743`, `rmse=0.3686`); promote only if better.
+- [ ] If no new human labels are added, keep v2 as default and prioritize expanding annotations to 1000+ before next retrain.

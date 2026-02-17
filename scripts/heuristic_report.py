@@ -20,6 +20,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.heuristics.labeler import HeuristicLabelerConfig, run_heuristic_labeling
 from src.heuristics.report import build_report
 
+DEFAULT_S3_BUCKET = "scenicdriver-data"
+DEFAULT_S3_ONLY = "1"
+DEFAULT_REGRESSION_CKPT = (
+    "models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt"
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate heuristic labels + report")
@@ -45,13 +51,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--regression-ckpt",
         type=str,
-        default="models/scenic_regression_baseline_masswhites_z14_mixed5000_weighted_h4.pt",
+        default=DEFAULT_REGRESSION_CKPT,
         help="Learned regression checkpoint used when --scoring learned",
     )
     return parser.parse_args()
 
 
 def run_report(args: argparse.Namespace) -> Path:
+    # Default to S3-first mode unless explicitly overridden in env.
+    os.environ.setdefault("SCENIC_S3_BUCKET", DEFAULT_S3_BUCKET)
+    os.environ.setdefault("SCENIC_S3_ONLY", DEFAULT_S3_ONLY)
+
     cfg = HeuristicLabelerConfig()
     if args.satellite_dir:
         cfg.satellite_dir = args.satellite_dir

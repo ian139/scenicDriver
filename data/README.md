@@ -16,6 +16,10 @@ Keep tile keys under:
 
 No extra nested zoom folder under region.
 
+Report tooling defaults (unless overridden in env):
+- `SCENIC_S3_BUCKET=scenicdriver-data`
+- `SCENIC_S3_ONLY=1`
+
 ## Annotation Workflow Notes
 
 - For local tile loading in annotator: `raw_dir = data/raw`
@@ -47,6 +51,22 @@ No extra nested zoom folder under region.
   - `data/processed/regression/<run_name>/agreement_by_annotator.csv`
   - `data/processed/regression/<run_name>/agreement_by_pair.csv`
   - `data/processed/regression/<run_name>/summary.json`
+
+## Report Overlay Artifacts
+
+Report viewer route overlay supports either layout in `data/processed/heuristic_runs/<run_name>/report/`:
+
+- `route.geojson` (recommended; one file containing scenic + baseline features), or
+- split files: `route_scenic.geojson` and `route_fast.geojson`.
+
+When route overlay is present, the viewer also displays route comparison metrics:
+- scenic vs baseline distance
+- scenic vs baseline travel time
+- scenic score delta
+
+Generate combined overlay directly:
+
+- `uv run python scripts/route_demo_geojson.py --geojson data/processed/sample_road_graph.geojson --start 42.40 -72.70 --end 42.48 -72.62 --scenic-weight 0.8 --output-geojson data/processed/sample_route.geojson --report-dir data/processed/heuristic_runs/<run_name>/report`
 
 ## Git Policy
 

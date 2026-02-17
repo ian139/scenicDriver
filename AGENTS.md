@@ -43,10 +43,11 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - `uv run python scripts/annotate_scenic_web.py --labels-csv data/processed/heuristic_runs/masswhites_z14_flat_5k_seamfix/labels.csv --raw-dir s3://$SCENIC_S3_BUCKET/raw --annotations-csv data/raw/labels_human.csv --sample-size 500 --stratify-by-class`
 - `uv run python scripts/build_overlap_batch.py --annotations-csv data/raw/labels_human.csv --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --source-annotator ian --target-annotator paperspace --sample-size 200 --seed 42 --output-csv data/processed/regression/overlap_batch_ian_to_paperspace_200.csv`
 - `uv run python scripts/annotate_scenic_web.py --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --batch-csv data/processed/regression/overlap_batch_ian_to_paperspace_200.csv --raw-dir s3://$SCENIC_S3_BUCKET/raw --annotations-csv data/raw/labels_human.csv --annotator-id paperspace --sample-size 200 --stratify-by-class`
-- `uv run python scripts/build_human_benchmark.py --annotations-csv data/raw/labels_human.csv --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --output-dir data/processed/regression --run-name masswhites_human_benchmark_v1 --val-frac 0.2 --test-frac 0.2 --seed 42`
-- `uv run python scripts/heuristic_report.py --run-name masswhites_z14_learned_h4 --scoring learned --regression-ckpt models/scenic_regression_baseline_masswhites_z14_mixed5000_weighted_h4.pt --satellite-dir data/raw/images/satellite/z14/masswhites --terrain-dir data/raw/images/terrain/z14/masswhites --max-tiles 5000 --s3-only`
-- `uv run python scripts/build_graph_from_osm.py --min-lat 42.35 --min-lon -72.57 --max-lat 42.39 --max-lon -72.52 --output data/processed/amherst_road_graph.json`
+- `uv run python scripts/build_human_benchmark.py --annotations-csv data/raw/labels_human.csv --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --output-dir data/processed/regression --run-name masswhites_human_benchmark_v2 --val-frac 0.2 --test-frac 0.2 --seed 42`
+- `uv run python scripts/heuristic_report.py --run-name masswhites_z14_learned_h4_v2 --scoring learned --regression-ckpt models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt --satellite-dir data/raw/images/satellite/z14/masswhites --terrain-dir data/raw/images/terrain/z14/masswhites --max-tiles 5000 --s3-only`
+- `uv run python scripts/build_graph_from_osm.py --min-lat 42.35 --min-lon -72.57 --max-lat 42.39 --max-lon -72.52 --run-name amherst_core`
 - `uv run python scripts/route_demo_geojson.py --geojson data/processed/sample_road_graph.geojson --start 42.40 -72.70 --end 42.48 -72.62 --scenic-weight 0.6 --output-geojson data/processed/sample_route.geojson`
+- `uv run python scripts/route_demo_geojson.py --geojson data/processed/sample_road_graph.geojson --start 42.40 -72.70 --end 42.48 -72.62 --scenic-weight 0.8 --output-geojson data/processed/sample_route.geojson --report-dir data/processed/heuristic_runs/masswhites_z14_learned_h4_v2/report`
 - `uv sync`
 - `uv run python scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.satellite --output data/raw/images/satellite`
 - `uv run python scripts/download_bbox_tiles.py --min-lat 40.018 --min-lon -75.2284 --max-lat 40.0734 --max-lon -75.185 --zoom 16 --style mapbox.terrain-rgb --output data/raw/images/terrain`
@@ -68,6 +69,8 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - Keep a deterministic human benchmark split + agreement report under `data/processed/regression/<run_name>/` (`benchmark_split.csv`, `agreement_by_annotator.csv`, `agreement_by_pair.csv`, `summary.json`).
 - Run an explicit overlap pass (same tiles annotated by two annotators) before relying on pairwise agreement metrics.
 - Keep heuristic scoring as fallback/baseline for sanity checks and quick previews.
+- Active default checkpoint: `models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt` (`v3` reproduced v1-equivalent data; see `MLResearch.md`).
+- Current execution focus: routing hardening (deterministic graph cache + route comparison in viewer + travel-time aware routing outputs).
 
 ## Git Workflow
 - Default to working on `main` for quick fixes.
@@ -97,12 +100,19 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 ## S3 Workflow Notes
 - When using S3-first mode, keep tile keys under `raw/images/...` so report tooling can resolve prefixes.
 - Canonical tile key layout: `raw/images/{satellite|terrain}/z{zoom}/{region}/{x}_{y}.png` (no extra nested zoom folder).
-- For S3-only report generation, set `SCENIC_S3_BUCKET` and `SCENIC_S3_ONLY=1`.
+- Report scripts default to `SCENIC_S3_BUCKET=scenicdriver-data` and `SCENIC_S3_ONLY=1` unless already set in env.
+- Override defaults when needed via explicit exports (for other buckets/modes):
+  - `export SCENIC_S3_BUCKET=<your-bucket>`
+  - `export SCENIC_S3_ONLY=0|1`
 - Prefer `bash scripts/s3_sync.sh` (script may not be executable on all machines).
 - Upload Step 3 artifacts after runs (use run-specific names, not only `features_v1`):
   - `aws s3 cp data/processed/regression/<features>.npz s3://$SCENIC_S3_BUCKET/processed/regression/<features>.npz`
   - `aws s3 cp models/<checkpoint>.pt s3://$SCENIC_S3_BUCKET/models/<checkpoint>.pt`
   - `aws s3 cp data/processed/regression/<metrics>.json s3://$SCENIC_S3_BUCKET/processed/regression/<metrics>.json`
+- Viewer route overlays:
+  - Preferred: write a combined `route.geojson` (scenic + baseline features).
+  - Supported fallback: `route_scenic.geojson` + `route_fast.geojson`.
+  - Viewer now renders route comparison metrics (distance/time/scenic deltas) when route overlay is present.
 
 ## Training Contract
 - Multi‑task output: regression (scenic score 0–10) + classification (45 classes).

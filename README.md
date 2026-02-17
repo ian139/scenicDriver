@@ -16,6 +16,31 @@ Current direction:
 - Retrain/expand classifier data to improve domain fit (especially Northeast).
 - Add a manual scenic annotation set and use it as the primary quality benchmark.
 
+## Next Step (Current)
+
+`v2` is the active learned checkpoint for Northeast runs:
+
+- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt`
+
+Current focus is routing/system hardening:
+
+```bash
+# 1) Deterministic graph cache build (writes road_graph.json + run.json)
+uv run python scripts/build_graph_from_osm.py \
+  --min-lat 42.35 --min-lon -72.57 \
+  --max-lat 42.39 --max-lon -72.52 \
+  --run-name amherst_core
+
+# 2) Scenic vs baseline route overlay (single combined route.geojson)
+uv run python scripts/route_demo_geojson.py \
+  --geojson data/processed/sample_road_graph.geojson \
+  --start 42.40 -72.70 \
+  --end 42.48 -72.62 \
+  --scenic-weight 0.8 \
+  --output-geojson data/processed/sample_route.geojson \
+  --report-dir data/processed/heuristic_runs/masswhites_z14_learned_h4_v2/report
+```
+
 ## Quick Start
 
 ```bash
@@ -194,6 +219,12 @@ aws s3api put-bucket-lifecycle-configuration \
 
 S3-only report generation (no large local tile copy):
 
+`scripts/heuristic_report.py` now defaults to:
+- `SCENIC_S3_BUCKET=scenicdriver-data`
+- `SCENIC_S3_ONLY=1`
+
+Override these env vars explicitly if you want a different bucket or local-first mode.
+
 ```bash
 export SCENIC_S3_BUCKET=scenicdriver-data
 export SCENIC_S3_ONLY=1
@@ -209,9 +240,9 @@ Learned-scoring report generation (uses trained regression checkpoint):
 ```bash
 export SCENIC_S3_BUCKET=scenicdriver-data
 uv run python scripts/heuristic_report.py \
-  --run-name masswhites_z14_learned_h4 \
+  --run-name masswhites_z14_learned_h4_v2 \
   --scoring learned \
-  --regression-ckpt models/scenic_regression_baseline_masswhites_z14_mixed5000_weighted_h4.pt \
+  --regression-ckpt models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt \
   --satellite-dir data/raw/images/satellite/z14/masswhites \
   --terrain-dir data/raw/images/terrain/z14/masswhites \
   --max-tiles 5000 \
@@ -227,8 +258,12 @@ uv sync --extra geo
 uv run python scripts/build_graph_from_osm.py \
   --min-lat 42.35 --min-lon -72.57 \
   --max-lat 42.39 --max-lon -72.52 \
-  --output data/processed/amherst_road_graph.json
+  --run-name amherst_core
 ```
+
+This writes:
+- `data/processed/road_graphs/amherst_core/road_graph.json`
+- `data/processed/road_graphs/amherst_core/run.json`
 
 Plan a scenic route from a LineString GeoJSON graph and write route overlay:
 
@@ -237,12 +272,16 @@ uv run python scripts/route_demo_geojson.py \
   --geojson data/processed/sample_road_graph.geojson \
   --start 42.40 -72.70 \
   --end 42.48 -72.62 \
-  --scenic-weight 0.6 \
+  --scenic-weight 0.8 \
   --output-geojson data/processed/sample_route.geojson \
-  --report-dir data/processed/heuristic_runs/masswhites_z14_learned_h4_5k/report
+  --report-dir data/processed/heuristic_runs/masswhites_z14_learned_h4_v2/report
 ```
 
-The report viewer auto-loads `route.geojson` when present in the report directory.
+The report viewer auto-loads:
+- `route.geojson` (single file with scenic + baseline features), or
+- fallback pair `route_scenic.geojson` and `route_fast.geojson`.
+- Route comparison metrics (distance/time/scenic deltas) are rendered in-map when route overlay data is present.
+
 Routing now uses per-edge travel times from OSM `maxspeed` (with road-type fallbacks) and honors one-way directionality.
 
 ## Requirements
