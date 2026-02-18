@@ -18,9 +18,10 @@ Current direction:
 
 ## Next Step (Current)
 
-`v2` is the active learned checkpoint for Northeast runs:
+`v4` is the active learned checkpoint for Northeast runs:
 
-- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt`
+- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt`
+- Source of truth: `data/processed/regression/model_registry.json`
 
 Current focus is routing/system hardening:
 
@@ -31,14 +32,13 @@ uv run python scripts/build_graph_from_osm.py \
   --max-lat 42.39 --max-lon -72.52 \
   --run-name amherst_core
 
-# 2) Scenic vs baseline route overlay (single combined route.geojson)
-uv run python scripts/route_demo_geojson.py \
-  --geojson data/processed/sample_road_graph.geojson \
+# 2) Scenic vs baseline route overlay (single call)
+uv run python scripts/route_compare_service.py \
   --start 42.40 -72.70 \
   --end 42.48 -72.62 \
   --scenic-weight 0.8 \
-  --output-geojson data/processed/sample_route.geojson \
-  --report-dir data/processed/heuristic_runs/masswhites_z14_learned_h4_v2/report
+  --run-name masswhites_z14_learned_h4_v2 \
+  --graph-geojson data/processed/sample_road_graph.geojson
 ```
 
 ## Quick Start
@@ -160,6 +160,28 @@ Current recommendation from weight sweep (`data/processed/regression/weight_swee
 - Use `human_weight=4.0`, `heuristic_weight=1.0` for mixed-supervision training.
 - Current benchmark split/agreement output: `data/processed/regression/masswhites_human_benchmark_v1/summary.json`.
 
+Promotion gate:
+
+```bash
+uv run python scripts/promote_regression_model.py \
+  --candidate-metrics data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v4_weighted_h4.json \
+  --baseline-metrics data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v2_weighted_h4.json \
+  --candidate-checkpoint models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt \
+  --run-name masswhites_z14_mixed5000_v4_weighted_h4
+```
+
+Held-out benchmark compare (v4 vs v2):
+
+```bash
+uv run python scripts/compare_regression_on_benchmark.py \
+  --dataset data/processed/regression/features_masswhites_z14_mixed5000_v4_h4.npz \
+  --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000_v4.csv \
+  --benchmark-split-csv data/processed/regression/masswhites_human_benchmark_v4/benchmark_split.csv \
+  --baseline-checkpoint models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt \
+  --candidate-checkpoint models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt \
+  --output-json data/processed/regression/benchmark_compare_masswhites_v4_vs_v2.json
+```
+
 ## Current Working Sets
 
 | Region | Type | Tiles |
@@ -242,7 +264,7 @@ export SCENIC_S3_BUCKET=scenicdriver-data
 uv run python scripts/heuristic_report.py \
   --run-name masswhites_z14_learned_h4_v2 \
   --scoring learned \
-  --regression-ckpt models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt \
+  --regression-ckpt models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt \
   --satellite-dir data/raw/images/satellite/z14/masswhites \
   --terrain-dir data/raw/images/terrain/z14/masswhites \
   --max-tiles 5000 \
@@ -268,13 +290,12 @@ This writes:
 Plan a scenic route from a LineString GeoJSON graph and write route overlay:
 
 ```bash
-uv run python scripts/route_demo_geojson.py \
-  --geojson data/processed/sample_road_graph.geojson \
+uv run python scripts/route_compare_service.py \
   --start 42.40 -72.70 \
   --end 42.48 -72.62 \
   --scenic-weight 0.8 \
-  --output-geojson data/processed/sample_route.geojson \
-  --report-dir data/processed/heuristic_runs/masswhites_z14_learned_h4_v2/report
+  --run-name masswhites_z14_learned_h4_v2 \
+  --graph-geojson data/processed/sample_road_graph.geojson
 ```
 
 The report viewer auto-loads:

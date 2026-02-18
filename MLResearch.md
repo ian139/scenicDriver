@@ -1,6 +1,6 @@
-# ML Research Log: Learned Scoring v1 vs v2 vs v3
+# ML Research Log: Learned Scoring v1 vs v2 vs v3 vs v4
 
-This file tracks what changed across the `masswhites` learned-scoring checkpoint iterations and why `v2` is the current best.
+This file tracks what changed across the `masswhites` learned-scoring checkpoint iterations and why `v4` is now the promoted model.
 
 ## Scope
 
@@ -18,12 +18,14 @@ All three versions below use:
 | v1 | `data/processed/regression/features_masswhites_z14_mixed5000_weighted_h4.npz` | `models/scenic_regression_baseline_masswhites_z14_mixed5000_weighted_h4.pt` | `0.4820` | `0.6426` | `0.7472` |
 | v2 | `data/processed/regression/features_masswhites_z14_mixed5000_v2_weighted_h4.npz` | `models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt` | `0.2743` | `0.3686` | `0.9227` |
 | v3 | `data/processed/regression/features_masswhites_z14_mixed5000_v3_h4.npz` | `models/scenic_regression_baseline_masswhites_z14_mixed5000_v3_h4.pt` | `0.4820` | `0.6426` | `0.7472` |
+| v4 | `data/processed/regression/features_masswhites_z14_mixed5000_v4_h4.npz` | `models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt` | `0.1879` | `0.2646` | `0.9609` |
 
 Metrics source files:
 
 - `data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_weighted_h4.json`
 - `data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v2_weighted_h4.json`
 - `data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v3_h4.json`
+- `data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v4_weighted_h4.json`
 
 ## What Changed
 
@@ -71,11 +73,12 @@ Metrics source files:
 
 ## Decision
 
-Use `v2` as the active model:
+Use `v4` as the active model:
 
-- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt`
+- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt`
+- Registry source of truth: `data/processed/regression/model_registry.json`
 
-Treat `v1` and `v3` as baselines/controls.
+Treat `v1`, `v2`, and `v3` as baselines/controls.
 
 ## Guardrail for Next Iteration
 
