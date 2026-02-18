@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import torch
+
 import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -32,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val-split", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument(
         "--use-sample-weights",
@@ -45,7 +47,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    device = None if args.device == "auto" else args.device
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    else:
+        device = args.device
 
     best_corr = train_regression_model(
         data_path=args.dataset,

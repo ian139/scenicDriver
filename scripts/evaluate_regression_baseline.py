@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-split", type=float, default=0.15, help="Validation split used during training")
     parser.add_argument("--seed", type=int, default=42, help="Split seed")
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument("--metrics-json", type=Path, default=None, help="Optional output metrics json path")
     return parser.parse_args()
 
@@ -52,9 +52,15 @@ def _safe_corr(preds: np.ndarray, targets: np.ndarray) -> float:
 
 def main() -> None:
     args = parse_args()
-    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
-    if device == "auto":
-        device = "cpu"
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    else:
+        device = args.device
 
     ds = ScenicScoreDataset(args.dataset)
     val_idx = _build_val_indices(len(ds), args.val_split, args.seed)

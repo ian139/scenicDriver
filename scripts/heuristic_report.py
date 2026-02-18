@@ -23,7 +23,7 @@ from src.heuristics.report import build_report
 DEFAULT_S3_BUCKET = "scenicdriver-data"
 DEFAULT_S3_ONLY = "1"
 DEFAULT_REGRESSION_CKPT = (
-    "models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt"
+    "models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt"
 )
 
 
@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write-labels", action="store_true", default=False)
     parser.add_argument("--write-raw-labels", action="store_true", default=False)
     parser.add_argument("--no-classifier", action="store_true", default=False)
-    parser.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--device", type=str, choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--open", action="store_true", default=False)
     parser.add_argument("--satellite-dir", type=str, default=None)

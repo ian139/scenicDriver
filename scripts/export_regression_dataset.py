@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--classifier-ckpt", type=Path, default=Path("models/classifier/best_model.pt"))
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument(
         "--use-resisc45-stats",
         action=argparse.BooleanOptionalAction,
@@ -199,7 +199,12 @@ def main() -> None:
 
     device = args.device
     if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
     df = pd.read_csv(args.labels_csv)
     required = {"image_path", "scenic_score"}

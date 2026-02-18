@@ -455,9 +455,21 @@ def _load_classifier(
         if torch is None:
             device = "cpu"
         else:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
     elif device == "cuda" and torch is not None and not torch.cuda.is_available():
         warnings.append("CUDA requested but unavailable; falling back to CPU.")
+        device = "cpu"
+    elif (
+        device == "mps"
+        and torch is not None
+        and (not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available())
+    ):
+        warnings.append("MPS requested but unavailable; falling back to CPU.")
         device = "cpu"
 
     if not use_classifier:
