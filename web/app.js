@@ -1,4 +1,5 @@
 const el = {
+  controls: document.querySelector(".controls"),
   apiBase: document.getElementById("apiBase"),
   region: document.getElementById("region"),
   modeAddressBtn: document.getElementById("modeAddressBtn"),
@@ -14,6 +15,7 @@ const el = {
   startSuggestBox: document.getElementById("startSuggestBox"),
   endSuggestBox: document.getElementById("endSuggestBox"),
   loadingOverlay: document.getElementById("loadingOverlay"),
+  menuBtn: document.getElementById("menuBtn"),
   scenicWeight: document.getElementById("scenicWeight"),
   weightValue: document.getElementById("weightValue"),
   maxDetour: document.getElementById("maxDetour"),
@@ -49,7 +51,7 @@ function requireElement(name, node) {
 }
 
 function setStatus(msg) {
-  el.status.textContent = msg;
+  el.status.textContent = String(msg || "").replace(/\n+/g, " • ");
 }
 
 function setBusy(next) {
@@ -57,6 +59,10 @@ function setBusy(next) {
   el.planBtn.disabled = busy;
   el.planBtn.textContent = busy ? "Planning..." : "Plan Route";
   el.loadingOverlay.classList.toggle("hidden", !busy);
+}
+
+function toggleMenu() {
+  el.controls?.classList.toggle("menu-collapsed");
 }
 
 function api(path) {
@@ -122,8 +128,13 @@ function applyRegionDefaults() {
   el.startLon.value = startLon.toFixed(6);
   el.endLat.value = endLat.toFixed(6);
   el.endLon.value = endLon.toFixed(6);
-  el.startAddress.value = `${el.startLat.value},${el.startLon.value}`;
-  el.endAddress.value = `${el.endLat.value},${el.endLon.value}`;
+  const looksLikePoint = (v) => /^-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?$/.test(String(v || "").trim());
+  if (!el.startAddress.value || looksLikePoint(el.startAddress.value)) {
+    el.startAddress.value = `${el.startLat.value},${el.startLon.value}`;
+  }
+  if (!el.endAddress.value || looksLikePoint(el.endAddress.value)) {
+    el.endAddress.value = `${el.endLat.value},${el.endLon.value}`;
+  }
   suggestState.start.selected = null;
   suggestState.end.selected = null;
 }
@@ -582,6 +593,7 @@ async function main() {
   });
   el.swapBtn.addEventListener("click", swapPoints);
   el.clearBtn.addEventListener("click", clearRoute);
+  el.menuBtn.addEventListener("click", toggleMenu);
   el.showHeatmap.addEventListener("change", () => {
     if (!map.loaded()) return;
     if (el.showHeatmap.checked) loadHeatmap().catch(() => setStatus("Heatmap unavailable for this region."));
