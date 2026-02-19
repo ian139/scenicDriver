@@ -257,6 +257,24 @@ def _render_index_html() -> str:
       .summary-item strong {
         font-size: 18px;
       }
+      .cluster-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 10px;
+      }
+      .cluster-card {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 8px;
+        padding: 10px;
+      }
+      .cluster-card h4 {
+        margin: 0 0 8px 0;
+        font-size: 14px;
+      }
+      .cluster-card .muted {
+        font-size: 11px;
+      }
       #histogram {
         width: 100%;
         height: 200px;
@@ -346,6 +364,8 @@ def _render_index_html() -> str:
         <div class="summary-grid" id="summary"></div>
         <h3>Terrain Feature Summary</h3>
         <div class="summary-grid" id="feature-summary"></div>
+        <h3>Cluster View</h3>
+        <div class="cluster-grid" id="cluster-summary"></div>
         <h3>Score Histogram</h3>
         <canvas id="histogram"></canvas>
         <h3>Interactive Map</h3>
@@ -393,6 +413,7 @@ def _render_index_html() -> str:
       const reportTitleEl = document.getElementById("report-title");
       const scoringModeBadgeEl = document.getElementById("scoring-mode-badge");
       const histogramCanvas = document.getElementById("histogram");
+      const clusterSummaryEl = document.getElementById("cluster-summary");
       const heatmapCanvas = document.createElement("canvas");
       const baseLayerSelect = document.getElementById("base-layer");
       const heatmapOpacityInput = document.getElementById("heatmap-opacity");
@@ -446,6 +467,7 @@ def _render_index_html() -> str:
           renderHeader(data.run_info);
           renderSummary(data.summary, data.run_info);
           renderFeatureSummary(data.feature_summary);
+          renderClusterSummary(data.tiles || []);
           renderHistogram(data.histogram);
           tiles = data.tiles || [];
           const cacheBust =
@@ -707,6 +729,131 @@ def _render_index_html() -> str:
         featureSummaryEl.innerHTML = items
           .map(([label, value]) => {
             return `<div class="summary-item"><span>${label}</span><strong>${value}</strong></div>`;
+          })
+          .join("");
+      }
+
+      function _safeNum(value, fallback = 0) {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : fallback;
+      }
+
+      function _minMax(values) {
+        if (!values.length) return [0, 1];
+        let lo = values[0];
+        let hi = values[0];
+        for (const v of values) {
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+        if (lo === hi) return [lo, lo + 1];
+        return [lo, hi];
+      }
+
+      function _normalize(v, lo, hi) {
+        return (v - lo) / Math.max(hi - lo, 1e-6);
+      }
+
+      function _kmeans(vectors, k, iters = 10) {
+        if (!vectors.length) return [];
+        const dim = vectors[0].length;
+        const centers = [];
+        const n = vectors.length;
+        const step = Math.max(1, Math.floor(n / k));
+        for (let i = 0; i < k; i++) {
+          centers.push(vectors[Math.min(i * step, n - 1)].slice());
+        }
+        const assign = new Array(n).fill(0);
+
+        for (let iter = 0; iter < iters; iter++) {
+          for (let i = 0; i < n; i++) {
+            let best = 0;
+            let bestDist = Infinity;
+            for (let c = 0; c < k; c++) {
+              let dist = 0;
+              for (let d = 0; d < dim; d++) {
+                const diff = vectors[i][d] - centers[c][d];
+                dist += diff * diff;
+              }
+              if (dist < bestDist) {
+                bestDist = dist;
+                best = c;
+              }
+            }
+            assign[i] = best;
+          }
+
+          const sums = Array.from({ length: k }, () => new Array(dim).fill(0));
+          const counts = new Array(k).fill(0);
+          for (let i = 0; i < n; i++) {
+            const c = assign[i];
+            counts[c] += 1;
+            for (let d = 0; d < dim; d++) sums[c][d] += vectors[i][d];
+          }
+          for (let c = 0; c < k; c++) {
+            if (counts[c] === 0) continue;
+            for (let d = 0; d < dim; d++) centers[c][d] = sums[c][d] / counts[c];
+          }
+        }
+        return assign;
+      }
+
+      function renderClusterSummary(tileRows) {
+        if (!clusterSummaryEl) return;
+        if (!Array.isArray(tileRows) || tileRows.length < 8) {
+          clusterSummaryEl.innerHTML = `<div class="summary-item"><span>Clusters</span><strong>n/a</strong></div>`;
+          return;
+        }
+
+        const reliefs = tileRows.map((t) => _safeNum(t.relief));
+        const slopes = tileRows.map((t) => _safeNum(t.slope_mean));
+        const vegs = tileRows.map((t) => _safeNum(t.veg_proxy));
+        const [relLo, relHi] = _minMax(reliefs);
+        const [sloLo, sloHi] = _minMax(slopes);
+        const [vegLo, vegHi] = _minMax(vegs);
+
+        const vectors = tileRows.map((t) => [
+          _safeNum(t.scenic_score) / 10.0,
+          _normalize(_safeNum(t.relief), relLo, relHi),
+          _normalize(_safeNum(t.slope_mean), sloLo, sloHi),
+          _normalize(_safeNum(t.veg_proxy), vegLo, vegHi),
+        ]);
+        const k = Math.max(3, Math.min(6, Math.floor(Math.sqrt(tileRows.length / 80))));
+        const assign = _kmeans(vectors, k, 12);
+        const groups = Array.from({ length: k }, () => []);
+        tileRows.forEach((tile, i) => groups[assign[i]].push(tile));
+
+        const cards = groups
+          .map((rows, i) => {
+            if (!rows.length) return null;
+            const meanScore = rows.reduce((a, t) => a + _safeNum(t.scenic_score), 0) / rows.length;
+            const meanRelief = rows.reduce((a, t) => a + _safeNum(t.relief), 0) / rows.length;
+            const classCounts = {};
+            for (const row of rows) {
+              const name = String(row.class_name || "unknown");
+              classCounts[name] = (classCounts[name] || 0) + 1;
+            }
+            const topClass = Object.entries(classCounts).sort((a, b) => b[1] - a[1])[0];
+            return {
+              idx: i + 1,
+              rows: rows.length,
+              meanScore,
+              meanRelief,
+              topClass: topClass ? `${topClass[0]} (${topClass[1]})` : "n/a",
+            };
+          })
+          .filter(Boolean)
+          .sort((a, b) => b.meanScore - a.meanScore);
+
+        clusterSummaryEl.innerHTML = cards
+          .map((c) => {
+            return `<div class="cluster-card">
+              <h4>Cluster ${c.idx}</h4>
+              <div class="summary-item"><span>Tiles</span><strong>${c.rows}</strong></div>
+              <div class="summary-item"><span>Mean Score</span><strong>${c.meanScore.toFixed(2)}</strong></div>
+              <div class="summary-item"><span>Mean Relief</span><strong>${c.meanRelief.toFixed(1)}</strong></div>
+              <div class="muted">Top Class: ${c.topClass}</div>
+            </div>`;
           })
           .join("");
       }
