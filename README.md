@@ -15,15 +15,16 @@ Current direction:
 - Train a learned scenic regressor using satellite embeddings + terrain features.
 - Retrain/expand classifier data to improve domain fit (especially Northeast).
 - Add a manual scenic annotation set and use it as the primary quality benchmark.
+- Prioritize shipping a usable MVP trip-planning app first; continue model improvements in parallel.
 
 ## Next Step (Current)
 
-`v4` is the active learned checkpoint for Northeast runs:
+`v5` is the active learned checkpoint for Northeast runs:
 
-- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt`
+- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v5_weighted_h4.pt`
 - Source of truth: `data/processed/regression/model_registry.json`
 
-Current focus is routing/system hardening:
+Current focus is MVP app build-out (hosted route compare + web/mobile UX), with routing/system hardening underneath:
 
 ```bash
 # 1) Deterministic graph cache build (writes road_graph.json + run.json)

@@ -19,6 +19,12 @@
 
 ## Next Steps
 
+### Phase 0: MVP App (Priority)
+- [ ] Ship hosted route-compare API wrapper for app integration (stable request/response contract).
+- [ ] Build responsive web MVP for road-trip planning (start/end, scenic weight, route compare, map overlay).
+- [ ] Add optional signed-in contributor annotation mode with credits + shadow QA queue.
+- [ ] Add region selector/data registry in app and validate at least: `pittsfield`, `philadelphia`.
+
 ### Phase 1: Model Quality (Priority)
 - [ ] Retrain classifier on a larger/higher-quality dataset (or expanded labels) to improve domain fit and reduce class mislabeling in Northeast regions.
 - [ ] Keep classifier signal but shift it to model features/auxiliary loss instead of fixed manual class weights.
@@ -36,7 +42,7 @@
 
 ### Phase 2: Data + Reporting
 - [ ] Add new region pipeline (download → label → terrain features → train).
-- [ ] Run per-region reports for: `rocky_mountains`, `olympic_peninsula`, `philadelphia` (Big Sur done).
+- [ ] Run per-region reports for: `rocky_mountains`, `olympic_peninsula` (`philadelphia` done, Big Sur done).
 - [ ] Optionally add "cluster view" for multi-region heatmap (group by region).
 
 ### Phase 3: Routing
