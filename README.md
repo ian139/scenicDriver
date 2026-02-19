@@ -281,6 +281,21 @@ uv sync --extra geo
 uv run python scripts/build_graph_from_osm.py \
   --min-lat 42.35 --min-lon -72.57 \
   --max-lat 42.39 --max-lon -72.52 \
+
+## MVP API (New)
+
+Hosted route compare + contributor endpoints:
+
+```bash
+uv run uvicorn src.app_api.main:app --host 0.0.0.0 --port 8080 --reload
+```
+
+Quick checks:
+
+```bash
+curl http://localhost:8080/v1/healthz
+curl http://localhost:8080/v1/regions
+```
   --run-name amherst_core
 ```
 
