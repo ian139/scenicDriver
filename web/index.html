@@ -8,60 +8,88 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <main class="layout">
-      <section class="card controls">
-        <h1>ScenicDrive MVP</h1>
-        <p class="muted">Plan scenic vs baseline routes by region.</p>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand">ScenicDrive</div>
+        <div class="muted">Navigation Preview</div>
+      </header>
 
-        <label>API Base URL
-          <input id="apiBase" value="http://localhost:8080" />
-        </label>
-
-        <label>Region
-          <select id="region"></select>
-        </label>
-
-        <label>Input Mode
-          <select id="inputMode">
-            <option value="coords">Coordinates</option>
-            <option value="address">Street Addresses</option>
-          </select>
-        </label>
-
-        <div class="grid2">
-          <label class="coords-only">Start Lat
-            <input id="startLat" value="40.03" />
-          </label>
-          <label class="coords-only">Start Lon
-            <input id="startLon" value="-75.22" />
-          </label>
-          <label class="coords-only">End Lat
-            <input id="endLat" value="40.065" />
-          </label>
-          <label class="coords-only">End Lon
-            <input id="endLon" value="-75.19" />
-          </label>
-          <label class="addr-only hidden">Start Address
-            <input id="startAddress" list="startSuggestions" value="30th Street Station, Philadelphia, PA" />
-            <datalist id="startSuggestions"></datalist>
-          </label>
-          <label class="addr-only hidden">End Address
-            <input id="endAddress" list="endSuggestions" value="Philadelphia International Airport, Philadelphia, PA" />
-            <datalist id="endSuggestions"></datalist>
-          </label>
+      <section class="map-stage">
+        <div id="map"></div>
+        <div id="loadingOverlay" class="loading-overlay hidden">
+          <div class="loading-spinner"></div>
+          <div class="loading-text">Planning route...</div>
         </div>
 
-        <label>Scenic Weight: <span id="weightValue">0.8</span>
-          <input id="scenicWeight" type="range" min="0" max="1" step="0.05" value="0.8" />
-        </label>
+        <section class="card controls">
+          <h1>Route Planner</h1>
+          <p class="muted">Find scenic and baseline routes with live address search.</p>
 
-        <button id="planBtn">Plan Route</button>
-        <pre id="status"></pre>
-      </section>
+          <label>API Base URL
+            <input id="apiBase" value="http://localhost:8080" />
+          </label>
 
-      <section class="card map-card">
-        <div id="map"></div>
-        <div class="metrics" id="metrics"></div>
+          <label>Region
+            <select id="region"></select>
+          </label>
+          <div class="inline-actions">
+            <button id="refreshRegionsBtn" type="button" class="secondary">Refresh Regions</button>
+            <span id="apiHealth" class="pill">API: checking...</span>
+          </div>
+
+          <div class="mode-switch" role="tablist" aria-label="Input mode">
+            <button id="modeAddressBtn" type="button" class="active">Addresses</button>
+            <button id="modeCoordsBtn" type="button" class="secondary">Coordinates</button>
+          </div>
+
+          <div class="search-stack addr-only">
+            <div class="search-field">
+              <span class="search-label">From</span>
+              <input id="startAddress" placeholder="Search start address" autocomplete="off" />
+              <div id="startSuggestBox" class="suggest-box hidden"></div>
+            </div>
+            <div class="search-field">
+              <span class="search-label">To</span>
+              <input id="endAddress" placeholder="Search destination" autocomplete="off" />
+              <div id="endSuggestBox" class="suggest-box hidden"></div>
+            </div>
+          </div>
+
+          <div class="grid2 coords-only">
+            <label class="coords-only">Start Lat
+              <input id="startLat" value="40.03" />
+            </label>
+            <label class="coords-only">Start Lon
+              <input id="startLon" value="-75.22" />
+            </label>
+            <label class="coords-only">End Lat
+              <input id="endLat" value="40.065" />
+            </label>
+            <label class="coords-only">End Lon
+              <input id="endLon" value="-75.19" />
+            </label>
+          </div>
+
+          <label>Scenic Weight: <span id="weightValue">0.8</span>
+            <input id="scenicWeight" type="range" min="0" max="1" step="0.05" value="0.8" />
+          </label>
+          <label>Max Detour Factor: <span id="detourValue">1.8</span>
+            <input id="maxDetour" type="range" min="1.0" max="3.0" step="0.1" value="1.8" />
+          </label>
+          <label>
+            <input id="showHeatmap" type="checkbox" />
+            Show Scenic Heatmap
+          </label>
+
+          <div class="inline-actions">
+            <button id="swapBtn" type="button" class="secondary">Swap Start/End</button>
+            <button id="planBtn" type="button">Plan Route</button>
+          </div>
+          <button id="clearBtn" type="button" class="secondary">Clear Route</button>
+          <pre id="status"></pre>
+        </section>
+
+        <div class="metrics card" id="metrics"></div>
       </section>
     </main>
 
