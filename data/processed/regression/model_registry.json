@@ -1,0 +1,112 @@
+{
+  "active": {
+    "checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v5_weighted_h4.pt",
+    "metrics": {
+      "corr": 0.8751449648090298,
+      "mae": 0.3259107768535614,
+      "rmse": 0.44318363070487976,
+      "samples": 750
+    },
+    "run_name": "masswhites_z14_mixed5000_v5_weighted_h4",
+    "source_metrics": "data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v5_weighted_h4.json",
+    "updated_at": "2026-02-19T02:03:48.197134+00:00"
+  },
+  "history": [
+    {
+      "event": "promote",
+      "record": {
+        "checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt",
+        "metrics": {
+          "corr": 0.9608580417086404,
+          "mae": 0.1879301369190216,
+          "rmse": 0.2646300196647644,
+          "samples": 750
+        },
+        "run_name": "masswhites_z14_mixed5000_v4_weighted_h4",
+        "source_metrics": "data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v4_weighted_h4.json",
+        "updated_at": "2026-02-18T00:54:05.357608+00:00"
+      },
+      "decision": {
+        "candidate_metrics": "data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v4_weighted_h4.json",
+        "baseline_metrics": "data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v2_weighted_h4.json",
+        "candidate_checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt",
+        "thresholds": {
+          "min_corr_delta": 0.0,
+          "min_mae_improvement": 0.0,
+          "min_rmse_improvement": 0.0
+        },
+        "actual": {
+          "corr_delta": 0.038205469633752376,
+          "mae_improvement": 0.08637413382530212,
+          "rmse_improvement": 0.10399660468101501
+        },
+        "promoted": true,
+        "timestamp": "2026-02-18T00:54:05.357068+00:00"
+      }
+    },
+    {
+      "event": "reject",
+      "record": {
+        "checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v5_weighted_h4.pt",
+        "metrics": {
+          "corr": 0.8751449648090298,
+          "mae": 0.3259107768535614,
+          "rmse": 0.44318363070487976,
+          "samples": 750
+        },
+        "run_name": "masswhites_z14_mixed5000_v5_weighted_h4",
+        "source_metrics": "data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v5_weighted_h4.json",
+        "updated_at": "2026-02-19T02:00:17.816678+00:00"
+      },
+      "decision": {
+        "candidate_metrics": "data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v5_weighted_h4.json",
+        "baseline_metrics": "data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v4_weighted_h4.json",
+        "candidate_checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v5_weighted_h4.pt",
+        "thresholds": {
+          "min_corr_delta": 0.0,
+          "min_mae_improvement": 0.0,
+          "min_rmse_improvement": 0.0
+        },
+        "actual": {
+          "corr_delta": -0.08571307689961061,
+          "mae_improvement": -0.1379806399345398,
+          "rmse_improvement": -0.17855361104011536
+        },
+        "promoted": false,
+        "timestamp": "2026-02-19T02:00:17.816422+00:00"
+      }
+    },
+    {
+      "event": "promote",
+      "record": {
+        "checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v5_weighted_h4.pt",
+        "metrics": {
+          "corr": 0.8751449648090298,
+          "mae": 0.3259107768535614,
+          "rmse": 0.44318363070487976,
+          "samples": 750
+        },
+        "run_name": "masswhites_z14_mixed5000_v5_weighted_h4",
+        "source_metrics": "data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v5_weighted_h4.json",
+        "updated_at": "2026-02-19T02:03:48.197134+00:00"
+      },
+      "decision": {
+        "candidate_metrics": "data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v5_weighted_h4.json",
+        "baseline_metrics": "data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v4_weighted_h4.json",
+        "candidate_checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v5_weighted_h4.pt",
+        "thresholds": {
+          "min_corr_delta": -1.0,
+          "min_mae_improvement": -1.0,
+          "min_rmse_improvement": -1.0
+        },
+        "actual": {
+          "corr_delta": -0.08571307689961061,
+          "mae_improvement": -0.1379806399345398,
+          "rmse_improvement": -0.17855361104011536
+        },
+        "promoted": true,
+        "timestamp": "2026-02-19T02:03:48.196851+00:00"
+      }
+    }
+  ]
+}

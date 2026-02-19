@@ -23,7 +23,7 @@ from src.heuristics.report import build_report
 DEFAULT_S3_BUCKET = "scenicdriver-data"
 DEFAULT_S3_ONLY = "1"
 DEFAULT_REGRESSION_CKPT = (
-    "models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt"
+    "models/scenic_regression_baseline_masswhites_z14_mixed5000_v5_weighted_h4.pt"
 )
 
 
