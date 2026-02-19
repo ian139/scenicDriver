@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import re
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+import os
+import requests
 
 from src.route_planner.service import RouteRequest, plan_routes
 
@@ -20,6 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROAD_GRAPHS_DIR = PROJECT_ROOT / "data/processed/road_graphs"
 RUNS_DIR = PROJECT_ROOT / "data/processed/heuristic_runs"
 MODEL_REGISTRY_PATH = PROJECT_ROOT / "data/processed/regression/model_registry.json"
+POINT_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)\s*$")
 
 
 def _region_to_graph(region: str) -> Path:
@@ -55,15 +59,51 @@ def _list_regions() -> list[dict[str, Any]]:
             continue
         region = d.name.replace("_core", "")
         latest_run = _latest_run_for_region(region)
+        bbox = None
+        run_json = d / "run.json"
+        if run_json.exists():
+            try:
+                payload = __import__("json").loads(run_json.read_text(encoding="utf-8"))
+                bbox = payload.get("bbox")
+            except Exception:
+                bbox = None
         regions.append(
             {
                 "region": region,
                 "graph_geojson": str(graph),
                 "latest_run_name": latest_run,
                 "report_json": str(RUNS_DIR / latest_run / "report/report.json") if latest_run else None,
+                "bbox": bbox,
             }
         )
     return regions
+
+
+def _canonical_point(lat: float, lon: float) -> dict[str, Any]:
+    lat_f = float(lat)
+    lon_f = float(lon)
+    return {
+        "lat": lat_f,
+        "lon": lon_f,
+        "latlon": f"{lat_f:.6f},{lon_f:.6f}",
+        "wkt": f"POINT({lon_f:.6f} {lat_f:.6f})",
+    }
+
+
+def _parse_coordinate_query(query: str) -> dict[str, Any] | None:
+    m = POINT_RE.match(query)
+    if not m:
+        return None
+    lat = float(m.group(1))
+    lon = float(m.group(2))
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    pt = _canonical_point(lat, lon)
+    return {
+        "label": pt["latlon"],
+        "match_type": "parsed_point",
+        **pt,
+    }
 
 
 def create_app() -> FastAPI:
@@ -99,6 +139,86 @@ def create_app() -> FastAPI:
     def regions() -> dict[str, Any]:
         return {"regions": _list_regions()}
 
+    @app.get("/v1/geocode")
+    def geocode(q: str, region: str | None = None) -> dict[str, Any]:
+        query = q.strip()
+        if not query:
+            raise HTTPException(status_code=400, detail="Query must be non-empty")
+
+        parsed = _parse_coordinate_query(query)
+        if parsed is not None:
+            return {"provider": "parser", "results": [parsed]}
+
+        region_bbox = None
+        if region:
+            region_key = region.strip().lower()
+            for item in _list_regions():
+                if str(item.get("region", "")).lower() == region_key:
+                    region_bbox = item.get("bbox")
+                    break
+
+        mapbox_token = os.getenv("MAPBOX_ACCESS_TOKEN")
+        if mapbox_token:
+            url = "https://api.mapbox.com/geocoding/v5/mapbox.places/" + requests.utils.quote(query) + ".json"
+            params = {"access_token": mapbox_token, "limit": 5}
+            if region_bbox:
+                params["bbox"] = (
+                    f"{region_bbox['min_lon']},{region_bbox['min_lat']},"
+                    f"{region_bbox['max_lon']},{region_bbox['max_lat']}"
+                )
+            resp = requests.get(
+                url,
+                params=params,
+                timeout=15,
+            )
+            if resp.ok:
+                payload = resp.json()
+                features = payload.get("features", [])
+                items = []
+                for feat in features:
+                    center = feat.get("center") or [None, None]
+                    lon, lat = center[0], center[1]
+                    if lat is None or lon is None:
+                        continue
+                    items.append(
+                        {
+                            "label": feat.get("place_name"),
+                            "match_type": "mapbox",
+                            **_canonical_point(float(lat), float(lon)),
+                        }
+                    )
+                return {"provider": "mapbox", "results": items}
+
+        # Fallback provider: OpenStreetMap Nominatim
+        nom_params: dict[str, Any] = {"q": query, "format": "json", "limit": 5}
+        if region_bbox:
+            nom_params["viewbox"] = (
+                f"{region_bbox['min_lon']},{region_bbox['max_lat']},"
+                f"{region_bbox['max_lon']},{region_bbox['min_lat']}"
+            )
+            nom_params["bounded"] = 1
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params=nom_params,
+            headers={"User-Agent": "scenicdrive-api/0.1.0"},
+            timeout=15,
+        )
+        if not resp.ok:
+            raise HTTPException(status_code=502, detail=f"Geocoding request failed: {resp.status_code}")
+        rows = resp.json()
+        results = []
+        for row in rows:
+            if "lat" not in row or "lon" not in row:
+                continue
+            results.append(
+                {
+                    "label": row.get("display_name", query),
+                    "match_type": "nominatim",
+                    **_canonical_point(float(row["lat"]), float(row["lon"])),
+                }
+            )
+        return {"provider": "nominatim", "results": results}
+
     @app.post("/v1/route/compare")
     def route_compare(payload: RouteCompareRequest) -> dict[str, Any]:
         try:
@@ -121,7 +241,18 @@ def create_app() -> FastAPI:
             include_baseline=bool(payload.include_baseline),
             tile_scores_json=str(report_json) if report_json.exists() else None,
         )
-        result = plan_routes(req)
+        try:
+            result = plan_routes(req)
+        except ValueError as exc:
+            # Most common case: points geocode outside the selected graph/connected component.
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "no_route_found",
+                    "message": str(exc),
+                    "hint": f"Try different points in region '{payload.region}' or use /v1/geocode with region bias.",
+                },
+            ) from exc
         routes = {r["route_kind"]: r["metrics"] for r in result.get("routes", [])}
         scenic = routes.get("scenic")
         baseline = routes.get("baseline")

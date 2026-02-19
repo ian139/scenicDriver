@@ -296,6 +296,24 @@ Quick checks:
 curl http://localhost:8080/v1/healthz
 curl http://localhost:8080/v1/regions
 ```
+
+Web MVP shell (separate terminal):
+
+```bash
+cd web
+python3 -m http.server 3000
+```
+
+Open `http://localhost:3000` (ensure API is running on `:8080`).
+
+Address support:
+- In the web UI, switch `Input Mode` to `Street Addresses`.
+- The app calls `GET /v1/geocode?q=...` and uses the top result.
+- Address fields now support live autocomplete suggestions from geocoding results.
+- Coordinates mode remains available for direct lat/lon input.
+- Auto-matching now normalizes points to canonical syntax:
+  - `latlon`: `40.123456,-75.123456`
+  - `wkt`: `POINT(-75.123456 40.123456)`
   --run-name amherst_core
 ```
 
