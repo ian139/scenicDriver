@@ -1,7 +1,7 @@
 # CODEX
 
 ## Project
-Scenic Route Planner is an ML-driven system that scores scenic beauty from satellite imagery + terrain data, then uses those scores for route planning. Current focus is regression training and NAIP/Mapbox ingestion (not deployment).
+Scenic Route Planner is an ML-driven system that scores scenic beauty from satellite imagery + terrain data, then uses those scores for route planning. Current focus is shipping an MVP planner app (web/mobile-friendly) backed by hosted route-compare services, while improving models in parallel.
 
 ## Goals
 - Score scenic beauty from satellite/terrain tiles (0-10).
@@ -17,7 +17,7 @@ Scenic Route Planner is an ML-driven system that scores scenic beauty from satel
 - Weighted mixed-supervision baseline: implemented and trained (`heuristic_weight=1.0`, configurable human weight).
 - Human-weight sweep complete (`h2/h3/h4`); current recommendation is `human_weight=4.0`.
 - Routing MVP restored: road graph loader + scenic route planner + GeoJSON route CLI.
-- In progress: classifier quality improvements and edge-level scenic data integration.
+- In progress: MVP app/API build-out, classifier quality improvements, and edge-level scenic data integration.
 
 ## Tech Stack (Current)
 - ML: PyTorch, timm, numpy, pandas
@@ -40,6 +40,6 @@ Scenic Route Planner is an ML-driven system that scores scenic beauty from satel
 - Store run artifacts under `data/processed/` (ignored).
 
 ## Non-Goals (For Now)
-- No production API deployment.
-- No mobile app implementation.
+- No full native mobile app implementation (responsive web first).
+- No full production-scale platform hardening/SRE rollout yet.
 - No full-US NAIP processing pipeline.

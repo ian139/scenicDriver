@@ -1,6 +1,6 @@
 # Scenic Route Planner: What We're Building
 
-We are building an ML‑driven system that scores scenic beauty from imagery + terrain, then uses those scores for route planning. The current focus is regression training and NAIP/Mapbox data ingestion.
+We are building an ML‑driven system that scores scenic beauty from imagery + terrain, then uses those scores for route planning. The current focus is shipping a web/mobile-friendly MVP trip planner while continuing model improvements in parallel.
 
 This repo is intentionally notebook‑first (marimo). Keep the workflow tight, reproducible, and data‑centric.
 
@@ -60,7 +60,8 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - Clean surfaces: small helpers, no duplicate pipelines.
 
 ## Current Technology Plan
-- Phase 1 (priority): improve model quality before routing.
+- Phase 0 (priority): ship MVP planner UX + hosted route-compare API using current promoted model.
+- Phase 1 (parallel): continue model-quality improvements without blocking MVP delivery.
 - Retrain the RESISC45 classifier on larger/higher-quality data to reduce regional mislabeling.
 - Keep classifier signal, but shift from fixed manual class weights to model features/auxiliary loss.
 - Replace heuristic class-weight scoring with a learned scenic regressor using satellite embeddings + terrain features (optional class probabilities).
@@ -69,8 +70,8 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - Keep a deterministic human benchmark split + agreement report under `data/processed/regression/<run_name>/` (`benchmark_split.csv`, `agreement_by_annotator.csv`, `agreement_by_pair.csv`, `summary.json`).
 - Run an explicit overlap pass (same tiles annotated by two annotators) before relying on pairwise agreement metrics.
 - Keep heuristic scoring as fallback/baseline for sanity checks and quick previews.
-- Active default checkpoint: `models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt` (`v3` reproduced v1-equivalent data; see `MLResearch.md`).
-- Current execution focus: routing hardening (deterministic graph cache + route comparison in viewer + travel-time aware routing outputs).
+- Active default checkpoint: `models/scenic_regression_baseline_masswhites_z14_mixed5000_v5_weighted_h4.pt` (see `data/processed/regression/model_registry.json`).
+- Current execution focus: MVP app surface (route compare API + web/mobile UX), with routing hardening and model iteration continuing behind it.
 
 ## Git Workflow
 - Default to working on `main` for quick fixes.
@@ -120,6 +121,6 @@ See [`data/README.md`](data/README.md) for tile regions, download commands, and 
 - Save best checkpoint and `data/processed/{run_name}_train_run.json`.
 
 ## Non‑Goals (For Now)
-- No mobile app implementation.
-- No production API deployment.
+- No full native mobile app implementation (responsive web first).
+- No full production-scale platform hardening/SRE rollout yet.
 - No full‑US NAIP processing pipeline.

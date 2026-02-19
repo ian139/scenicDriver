@@ -148,7 +148,11 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
     if not graph_path.exists():
         raise FileNotFoundError(f"Graph GeoJSON not found: {graph_path}")
 
-    graph = RoadGraph.from_geojson(graph_path)
+    # Support both FeatureCollection road graphs (.geojson) and serialized RoadGraph JSONs.
+    if graph_path.suffix.lower() == ".geojson":
+        graph = RoadGraph.from_geojson(graph_path)
+    else:
+        graph = RoadGraph.load(graph_path)
     score_mapping = {
         "enabled": False,
         "source": None,
@@ -206,4 +210,3 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
         "routes": routes,
         "geojson": {"type": "FeatureCollection", "features": features},
     }
-

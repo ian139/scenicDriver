@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ScenicDrive MVP</title>
+    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="map-stage">
+        <div id="map"></div>
+        <button id="menuBtn" class="map-menu map-menu-right" type="button">Settings</button>
+        <div id="loadingOverlay" class="loading-overlay hidden">
+          <div class="loading-spinner"></div>
+          <div class="loading-text">Planning route...</div>
+        </div>
+
+        <section class="card search-panel">
+          <div class="search-stack addr-only">
+            <div class="search-field">
+              <span class="search-label">From</span>
+              <input id="startAddress" placeholder="Search start address" autocomplete="off" value="Pittsfield, Massachusetts" />
+              <div id="startSuggestBox" class="suggest-box hidden"></div>
+            </div>
+            <div class="search-field">
+              <span class="search-label">To</span>
+              <input id="endAddress" placeholder="Search destination" autocomplete="off" value="Great Barrington, Massachusetts" />
+              <div id="endSuggestBox" class="suggest-box hidden"></div>
+            </div>
+          </div>
+
+          <div class="grid2 coords-only">
+            <label class="coords-only">Start Lat
+              <input id="startLat" value="40.03" />
+            </label>
+            <label class="coords-only">Start Lon
+              <input id="startLon" value="-75.22" />
+            </label>
+            <label class="coords-only">End Lat
+              <input id="endLat" value="40.065" />
+            </label>
+            <label class="coords-only">End Lon
+              <input id="endLon" value="-75.19" />
+            </label>
+          </div>
+
+          <div class="inline-actions">
+            <button id="swapBtn" type="button" class="secondary">Swap</button>
+            <button id="planBtn" type="button">Plan Route</button>
+          </div>
+          <button id="clearBtn" type="button" class="secondary">Clear Route</button>
+          <div id="status" class="status-pill"></div>
+        </section>
+
+        <section class="card controls settings-panel menu-collapsed">
+          <div class="control-group">
+            <div class="group-title">Region</div>
+            <label>Region
+              <select id="region"></select>
+            </label>
+            <div class="inline-actions">
+              <button id="refreshRegionsBtn" type="button" class="secondary">Refresh Regions</button>
+              <span id="apiHealth" class="pill">API: checking...</span>
+            </div>
+          </div>
+
+          <div class="control-group">
+            <div class="group-title">Input Mode</div>
+            <div class="mode-switch" role="tablist" aria-label="Input mode">
+              <button id="modeAddressBtn" type="button" class="active">Addresses</button>
+              <button id="modeCoordsBtn" type="button" class="secondary">Coordinates</button>
+            </div>
+          </div>
+
+          <div class="control-group">
+            <div class="group-title">Routing</div>
+            <label>Scenic Weight: <span id="weightValue">0.8</span>
+              <input id="scenicWeight" type="range" min="0" max="1" step="0.05" value="0.8" />
+            </label>
+            <label>Max Detour Factor: <span id="detourValue">1.8</span>
+              <input id="maxDetour" type="range" min="1.0" max="3.0" step="0.1" value="1.8" />
+            </label>
+            <label class="toggle-row">
+              <input id="showHeatmap" type="checkbox" />
+              <span>Show Scenic Heatmap</span>
+            </label>
+          </div>
+
+          <div class="control-group">
+            <div class="group-title">Connection</div>
+            <label>API Base URL
+              <input id="apiBase" value="http://localhost:8080" />
+            </label>
+          </div>
+        </section>
+
+        <div class="metrics card" id="metrics"></div>
+      </section>
+    </main>
+
+    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

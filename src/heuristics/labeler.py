@@ -297,6 +297,8 @@ def run_heuristic_labeling(
 
     labels_df = pd.DataFrame(rows)
 
+    raw_dir_config = raw_dir if isinstance(raw_dir, str) and raw_dir.startswith("s3://") else str(raw_root)
+
     run_info = {
         "counts": {
             "satellite_total": len(sat_files),
@@ -313,7 +315,7 @@ def run_heuristic_labeling(
         "config": {
             "satellite_dir": str(sat_dir),
             "terrain_dir": str(terrain_dir),
-            "raw_dir": str(raw_root),
+            "raw_dir": raw_dir_config,
             "s3_bucket": s3_bucket,
             "s3_only": s3_only,
             "max_tiles": max_tiles,
@@ -453,9 +455,21 @@ def _load_classifier(
         if torch is None:
             device = "cpu"
         else:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
     elif device == "cuda" and torch is not None and not torch.cuda.is_available():
         warnings.append("CUDA requested but unavailable; falling back to CPU.")
+        device = "cpu"
+    elif (
+        device == "mps"
+        and torch is not None
+        and (not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available())
+    ):
+        warnings.append("MPS requested but unavailable; falling back to CPU.")
         device = "cpu"
 
     if not use_classifier:

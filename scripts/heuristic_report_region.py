@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write-labels", action="store_true", default=False)
     parser.add_argument("--write-raw-labels", action="store_true", default=False)
     parser.add_argument("--no-classifier", action="store_true", default=False)
-    parser.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--device", type=str, choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--open", action="store_true", default=False)
     parser.add_argument(
@@ -41,6 +41,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_REGRESSION_CKPT,
         help="Learned regression checkpoint used when --scoring learned",
+    )
+    parser.add_argument(
+        "--classifier-ckpt",
+        type=str,
+        default=None,
+        help="Classifier checkpoint path (required for --scoring learned)",
     )
     parser.add_argument("--raw-dir", type=str, default=None)
     parser.add_argument("--s3-only", action="store_true", default=False)
@@ -73,6 +79,7 @@ def main() -> None:
         s3_only=args.s3_only,
         scoring=args.scoring,
         regression_ckpt=args.regression_ckpt,
+        classifier_ckpt=args.classifier_ckpt,
     )
     run_report(delegated)
 
