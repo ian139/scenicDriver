@@ -333,7 +333,12 @@ def train(
     seed_everything(seed)
 
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
     print("=" * 60)
     print("Landscape Classifier Training")
@@ -556,6 +561,10 @@ if __name__ == "__main__":
         "--gradient_clip", type=float, default=1.0,
         help="Max gradient norm for clipping"
     )
+    parser.add_argument(
+        "--device", choices=["auto", "cpu", "cuda", "mps"], default="auto",
+        help="Training device"
+    )
 
     args = parser.parse_args()
 
@@ -567,7 +576,7 @@ if __name__ == "__main__":
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         warmup_epochs=args.warmup_epochs,
-        device=None,  # Auto-detect
+        device=None if args.device == "auto" else args.device,
         resume=args.resume,
         seed=args.seed,
         freeze_backbone_epochs=args.freeze_backbone,

@@ -31,6 +31,7 @@
 - [x] Add explicit overlap annotation tooling (`scripts/build_overlap_batch.py`) and annotator `--batch-csv` mode for same-tile cross-annotator labeling.
 - [x] Complete overlap annotation pass (label generated overlap batch) so pairwise agreement metrics are non-empty (`data/processed/regression/masswhites_human_benchmark_v2/agreement_by_pair.csv`).
 - [x] Keep `v2` regression checkpoint as active default after v1/v3 parity check (documented in `MLResearch.md`).
+- [x] Promote `v4` as active checkpoint after passing regression + held-out benchmark gates (`data/processed/regression/model_registry.json`, `data/processed/regression/benchmark_compare_masswhites_v4_vs_v2.json`).
 - [ ] Expand manual labels from 500 -> 1000-1500 and rerun mixed training/eval.
 
 ### Phase 2: Data + Reporting
@@ -48,7 +49,7 @@
 - [x] Routing: viewer route overlay fallback for split files (`route_scenic.geojson` + `route_fast.geojson`) when `route.geojson` is absent.
 - [x] Routing: show scenic vs baseline travel-time/distance/scenic deltas directly in viewer route panel.
 - [x] Attempted `v3` rerun and documented results in `MLResearch.md` (`v3` reused v1-equivalent labels and should not be promoted).
-- [ ] Build `v4` mixed labels from overlap-aware source (`labels_masswhites_z14_mixed5000_v2.csv`) plus any new human annotations.
-- [ ] Export `features_masswhites_z14_mixed5000_v4_h4.npz` and verify dataset hash differs from v1/v3 before training.
-- [ ] Train/evaluate `v4` and compare against v2 (`corr=0.9227`, `mae=0.2743`, `rmse=0.3686`); promote only if better.
-- [ ] If no new human labels are added, keep v2 as default and prioritize expanding annotations to 1000+ before next retrain.
+- [x] Build `v4` mixed labels from overlap-aware source (`data/processed/heuristic_runs/masswhites_z14_learned_h4_v2/labels.csv`) plus latest human annotations.
+- [x] Export `features_masswhites_z14_mixed5000_v4_h4.npz` and verify it is a new dataset artifact.
+- [x] Train/evaluate `v4` and compare against v2; promoted via gate + registry update.
+- [ ] Expand annotations to 1000+ and rerun benchmark + mixed training for `v5`.
