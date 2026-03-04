@@ -1,6 +1,9 @@
 const el = {
   controls: document.querySelector(".controls"),
   apiBase: document.getElementById("apiBase"),
+  basemapProvider: document.getElementById("basemapProvider"),
+  maptilerKey: document.getElementById("maptilerKey"),
+  basemapStatus: document.getElementById("basemapStatus"),
   region: document.getElementById("region"),
   modeAddressBtn: document.getElementById("modeAddressBtn"),
   modeCoordsBtn: document.getElementById("modeCoordsBtn"),
@@ -23,28 +26,50 @@ const el = {
   showHeatmap: document.getElementById("showHeatmap"),
   swapBtn: document.getElementById("swapBtn"),
   planBtn: document.getElementById("planBtn"),
+  saveRouteBtn: document.getElementById("saveRouteBtn"),
+  shareRouteBtn: document.getElementById("shareRouteBtn"),
   clearBtn: document.getElementById("clearBtn"),
   status: document.getElementById("status"),
-  metrics: document.getElementById("metrics"),
+  savedTrips: document.getElementById("savedTrips"),
+  routeList: document.getElementById("routeList"),
+  routePanel: document.getElementById("routePanel"),
+  routeCollapseBtn: document.getElementById("routeCollapseBtn"),
+  sheetToggleBtn: document.getElementById("sheetToggleBtn"),
 };
 
 let map;
+let lastRouteGeojson = null;
+let activeRouteKind = null;
+let lastPlan = null;
 const routeSourceId = "route-data";
 const heatmapSourceId = "scenic-heatmap";
 const heatmapLayerId = "scenic-heatmap-layer";
-const heatmapCircleLayerId = "scenic-heatmap-circle";
 const heatmapTilesSourceId = "scenic-heatmap-tiles";
 const heatmapTilesLayerId = "scenic-heatmap-tiles-layer";
 let heatmapZoomMode = "z16";
 let regionsMeta = [];
 let busy = false;
 let inputMode = "address";
+let basemapApplying = false;
+let planSeq = 0;
+let pendingRouteGeojson = null;
+let lastRoutePayload = null;
 const suggestTimer = { start: null, end: null };
 const suggestState = {
   start: { items: [], active: -1, selected: null },
   end: { items: [], active: -1, selected: null },
 };
 const suggestSeq = { start: 0, end: 0 };
+
+const MAPTILER_STYLE = "streets-v2";
+const STORAGE_KEYS = {
+  maptilerKey: "scenicdrive.maptilerKey",
+  basemapProvider: "scenicdrive.basemapProvider",
+  savedTrips: "scenicdrive.savedTrips",
+  routePanelCollapsed: "scenicdrive.routePanelCollapsed",
+  activeTab: "scenicdrive.activeTab",
+  settingsSheetOpen: "scenicdrive.settingsSheetOpen",
+};
 
 function requireElement(name, node) {
   if (!node) throw new Error(`Missing required UI element: ${name}`);
@@ -77,6 +102,77 @@ function syncInputMode() {
   el.modeAddressBtn.classList.toggle("secondary", !addr);
   el.modeCoordsBtn.classList.toggle("active", !addr);
   el.modeCoordsBtn.classList.toggle("secondary", addr);
+}
+
+function normalizeBasemapProvider(provider, key) {
+  const p = String(provider || "").toLowerCase();
+  if (p === "maptiler" && !key) return "osm";
+  if (p === "maptiler" || p === "osm") return p;
+  return key ? "maptiler" : "osm";
+}
+
+function basemapTileSource(provider, key) {
+  if (provider === "maptiler") {
+    const encoded = encodeURIComponent(key);
+    return {
+      type: "raster",
+      tiles: [`https://api.maptiler.com/maps/${MAPTILER_STYLE}/{z}/{x}/{y}.png?key=${encoded}`],
+      tileSize: 256,
+      attribution: "© MapTiler © OpenStreetMap contributors",
+    };
+  }
+  return {
+    type: "raster",
+    tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+    tileSize: 256,
+    attribution: "© OpenStreetMap contributors",
+  };
+}
+
+function buildBasemapStyle(provider, key) {
+  const source = basemapTileSource(provider, key);
+  return {
+    version: 8,
+    sources: {
+      basemap: source,
+    },
+    layers: [{ id: "basemap", type: "raster", source: "basemap" }],
+  };
+}
+
+function applyBasemapStatus(provider, hasKey) {
+  const name = provider === "maptiler" ? "MapTiler" : "OpenStreetMap";
+  const note = provider === "maptiler" ? "" : hasKey ? "" : " (no key)";
+  el.basemapStatus.textContent = `Basemap: ${name}${note}`;
+}
+
+function applyBasemap() {
+  if (!map || basemapApplying) return;
+  basemapApplying = true;
+  const key = String(el.maptilerKey.value || "").trim();
+  const provider = normalizeBasemapProvider(el.basemapProvider.value, key);
+  const hasKey = Boolean(key);
+  applyBasemapStatus(provider, hasKey);
+  if (provider !== el.basemapProvider.value) {
+    el.basemapProvider.value = provider;
+  }
+  const center = map.getCenter();
+  const zoom = map.getZoom();
+  map.setStyle(buildBasemapStyle(provider, key));
+  map.once("style.load", () => {
+    if (center) map.setCenter(center);
+    if (Number.isFinite(zoom)) map.setZoom(zoom);
+    if (el.showHeatmap.checked) {
+      loadHeatmap()
+        .catch(() => setStatus("Heatmap unavailable for this region."))
+        .finally(() => {
+          if (lastRouteGeojson) scheduleRouteRender(lastRouteGeojson);
+        });
+    } else if (lastRouteGeojson) {
+      scheduleRouteRender(lastRouteGeojson);
+    }
+    basemapApplying = false;
+  });
 }
 
 async function checkHealth() {
@@ -140,19 +236,15 @@ function applyRegionDefaults() {
 }
 
 function initMap() {
+  const storedKey = localStorage.getItem(STORAGE_KEYS.maptilerKey) || "";
+  const storedProvider = localStorage.getItem(STORAGE_KEYS.basemapProvider) || "";
+  if (storedKey) el.maptilerKey.value = storedKey;
+  const provider = normalizeBasemapProvider(storedProvider, storedKey);
+  el.basemapProvider.value = provider;
+  applyBasemapStatus(provider, Boolean(storedKey));
   map = new maplibregl.Map({
     container: "map",
-    style: {
-      version: 8,
-      sources: {
-        osm: {
-          type: "raster",
-          tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-          tileSize: 256,
-        },
-      },
-      layers: [{ id: "osm", type: "raster", source: "osm" }],
-    },
+    style: buildBasemapStyle(provider, storedKey),
     center: [-75.2, 40.045],
     zoom: 12,
   });
@@ -162,7 +254,17 @@ async function geocodeMany(query) {
   const resp = await fetch(
     `${api("/v1/geocode")}?q=${encodeURIComponent(query)}&region=${encodeURIComponent(el.region.value)}`
   );
-  if (!resp.ok) return [];
+  if (!resp.ok) {
+    let detail = "";
+    try {
+      const payload = await resp.json();
+      detail = payload?.detail ? ` (${payload.detail})` : "";
+    } catch {
+      detail = "";
+    }
+    setStatus(`Geocoding failed${detail}. Check API base and MAPBOX_ACCESS_TOKEN.`);
+    return [];
+  }
   const payload = await resp.json();
   return payload.results || [];
 }
@@ -239,7 +341,12 @@ function onAddressInput(which) {
       return;
     }
     setSuggestLoading(which);
-    const rows = await geocodeMany(query);
+    let rows = [];
+    try {
+      rows = await geocodeMany(query);
+    } catch {
+      rows = [];
+    }
     if (seq !== suggestSeq[which]) return;
     suggestState[which].items = rows.slice(0, 6);
     suggestState[which].active = rows.length ? 0 : -1;
@@ -301,27 +408,30 @@ function swapPoints() {
 }
 
 function clearRoute() {
+  lastRouteGeojson = null;
+  activeRouteKind = null;
   if (map?.getSource(routeSourceId)) {
     map.getSource(routeSourceId).setData({ type: "FeatureCollection", features: [] });
   }
-  el.metrics.innerHTML = "";
+  el.routeList.innerHTML = '<div class="route-empty">Plan a route to compare options.</div>';
   setStatus("Route cleared.");
 }
 
 async function loadHeatmap() {
-  const resp = await fetch(`${api("/v1/heatmap")}?region=${encodeURIComponent(el.region.value)}&max_points=3000`);
+  const resp = await fetch(
+    `${api("/v1/heatmap")}?region=${encodeURIComponent(el.region.value)}&max_points=3000&max_tiles=12000`
+  );
   if (!resp.ok) return;
   const payload = await resp.json();
   const geojson = payload.geojson || { type: "FeatureCollection", features: [] };
   const geojsonTiles = payload.geojson_tiles || { type: "FeatureCollection", features: [] };
   const tileZoom = Number(payload.tile_zoom || 16);
   heatmapZoomMode = tileZoom <= 14 ? "z14" : "z16";
-  const tileMinZoom = heatmapZoomMode === "z14" ? 9.8 : 11.2;
   const tileFadeMid = heatmapZoomMode === "z14" ? 10.8 : 12.2;
   const tileFadeEnd = heatmapZoomMode === "z14" ? 11.8 : 13.2;
-  const circleFadeStart = heatmapZoomMode === "z14" ? 9.0 : 10.8;
-  const circleFadeMid = heatmapZoomMode === "z14" ? 10.4 : 12.4;
-  const circleFadeEnd = heatmapZoomMode === "z14" ? 12.2 : 13.8;
+  const blurFadeStart = heatmapZoomMode === "z14" ? 7.8 : 9.2;
+  const blurFadeMid = heatmapZoomMode === "z14" ? 9.4 : 11.4;
+  const blurFadeEnd = heatmapZoomMode === "z14" ? 10.8 : 12.6;
   if (!map.getSource(heatmapSourceId)) {
     map.addSource(heatmapSourceId, { type: "geojson", data: geojson });
     map.addSource(heatmapTilesSourceId, { type: "geojson", data: geojsonTiles });
@@ -329,57 +439,42 @@ async function loadHeatmap() {
       id: heatmapLayerId,
       type: "heatmap",
       source: heatmapSourceId,
-      maxzoom: 0.1,
+      maxzoom: blurFadeEnd,
       paint: {
         "heatmap-weight": ["interpolate", ["linear"], ["get", "score_norm"], 0, 0, 1, 0.75],
-        "heatmap-intensity": 0.35,
+        "heatmap-intensity": 0.22,
         "heatmap-color": [
           "interpolate",
           ["linear"],
           ["heatmap-density"],
           0,
-          "rgba(33,102,172,0)",
-          0.30,
-          "#4aa3ff",
-          0.60,
-          "#7fd34e",
+          "rgba(30,70,110,0)",
+          0.28,
+          "#5aa7ff",
+          0.62,
+          "#8bd17a",
           1.0,
-          "#ffd24a",
+          "#ffd26f",
         ],
-        "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 5, 14, 8, 18, 10, 24],
-        "heatmap-opacity": 0.45,
-      },
-    });
-    map.addLayer({
-      id: heatmapCircleLayerId,
-      type: "circle",
-      source: heatmapSourceId,
-      minzoom: 0,
-      maxzoom: 13.6,
-      paint: {
-        "circle-radius": ["interpolate", ["linear"], ["zoom"], 4, 14, 8, 16, 12, 18, 13.6, 20],
-        "circle-color": [
+        "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 5, 16, 8, 22, 10, 30],
+        "heatmap-opacity": [
           "interpolate",
           ["linear"],
-          ["get", "score_norm"],
-          0,
-          "#4aa3ff",
-          0.5,
-          "#7fd34e",
-          0.8,
-          "#ffd24a",
-          1,
-          "#ff4f3d",
+          ["zoom"],
+          blurFadeStart,
+          0.18,
+          blurFadeMid,
+          0.28,
+          blurFadeEnd,
+          0.0,
         ],
-        "circle-opacity": ["interpolate", ["linear"], ["zoom"], circleFadeStart, 0.42, circleFadeMid, 0.28, circleFadeEnd, 0.0],
-        "circle-blur": 0.82,
       },
     });
     map.addLayer({
       id: heatmapTilesLayerId,
       type: "fill",
       source: heatmapTilesSourceId,
-      minzoom: tileMinZoom,
+      minzoom: 0,
       paint: {
         "fill-color": [
           "interpolate",
@@ -394,34 +489,36 @@ async function loadHeatmap() {
           1,
           "#ff4f3d",
         ],
-        "fill-opacity": ["interpolate", ["linear"], ["zoom"], tileMinZoom, 0.0, tileFadeMid, 0.32, tileFadeEnd, 0.56],
+        "fill-opacity": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          6,
+          0.4,
+          tileFadeMid,
+          0.36,
+          tileFadeEnd,
+          0.58,
+        ],
         "fill-outline-color": "rgba(0,0,0,0)",
         "fill-antialias": false,
       },
     });
+    if (map.getLayer("baseline-line")) map.moveLayer("baseline-line");
+    if (map.getLayer("scenic-line")) map.moveLayer("scenic-line");
   } else {
     map.getSource(heatmapSourceId).setData(geojson);
     if (map.getSource(heatmapTilesSourceId)) {
       map.getSource(heatmapTilesSourceId).setData(geojsonTiles);
     }
-    if (map.getLayer(heatmapCircleLayerId)) {
-      map.setPaintProperty(
-        heatmapCircleLayerId,
-        "circle-opacity",
-        ["interpolate", ["linear"], ["zoom"], circleFadeStart, 0.42, circleFadeMid, 0.28, circleFadeEnd, 0.0]
-      );
-    }
     if (map.getLayer(heatmapTilesLayerId)) {
       map.setPaintProperty(
         heatmapTilesLayerId,
         "fill-opacity",
-        ["interpolate", ["linear"], ["zoom"], tileMinZoom, 0.0, tileFadeMid, 0.32, tileFadeEnd, 0.56]
+        ["interpolate", ["linear"], ["zoom"], 6, 0.4, tileFadeMid, 0.36, tileFadeEnd, 0.58]
       );
     }
     map.setLayoutProperty(heatmapLayerId, "visibility", "visible");
-    if (map.getLayer(heatmapCircleLayerId)) {
-      map.setLayoutProperty(heatmapCircleLayerId, "visibility", "visible");
-    }
     if (map.getLayer(heatmapTilesLayerId)) {
       map.setLayoutProperty(heatmapTilesLayerId, "visibility", "visible");
     }
@@ -432,51 +529,362 @@ function hideHeatmap() {
   if (map.getLayer(heatmapLayerId)) {
     map.setLayoutProperty(heatmapLayerId, "visibility", "none");
   }
-  if (map.getLayer(heatmapCircleLayerId)) {
-    map.setLayoutProperty(heatmapCircleLayerId, "visibility", "none");
-  }
   if (map.getLayer(heatmapTilesLayerId)) {
     map.setLayoutProperty(heatmapTilesLayerId, "visibility", "none");
   }
 }
 
-function renderMetrics(payload) {
-  const scenic = payload.routes?.scenic;
-  const baseline = payload.routes?.baseline;
-  const d = payload.deltas || {};
-  const items = [
-    ["Scenic Score", scenic ? Number(scenic.average_scenic_score).toFixed(2) : "n/a"],
-    ["Baseline Score", baseline ? Number(baseline.average_scenic_score).toFixed(2) : "n/a"],
-    ["Delta Scenic", Number(d.scenic_score || 0).toFixed(2)],
-    ["Scenic Time (min)", scenic ? Number(scenic.estimated_duration_minutes).toFixed(1) : "n/a"],
-    ["Baseline Time (min)", baseline ? Number(baseline.estimated_duration_minutes).toFixed(1) : "n/a"],
-    ["Delta Time (min)", Number(d.duration_min || 0).toFixed(1)],
-  ];
-  el.metrics.innerHTML = items
-    .map(([k, v]) => `<div class="metric"><div class="k">${k}</div><div class="v">${v}</div></div>`)
+function formatDistance(km) {
+  const miles = Number(km) * 0.621371;
+  if (!Number.isFinite(miles)) return "n/a";
+  return `${miles.toFixed(1)} mi`;
+}
+
+function formatMinutes(minutes) {
+  if (!Number.isFinite(minutes)) return "n/a";
+  return `${Number(minutes).toFixed(1)} min`;
+}
+
+function formatScore(score) {
+  if (!Number.isFinite(score)) return "n/a";
+  return Number(score).toFixed(2);
+}
+
+function formatDelta(value, suffix) {
+  if (!Number.isFinite(value)) return "n/a";
+  const sign = value > 0 ? "+" : value < 0 ? "-" : "±";
+  const abs = Math.abs(Number(value)).toFixed(1);
+  return `${sign}${abs}${suffix}`;
+}
+
+function setRouteHighlight(kind) {
+  if (!map) return;
+  const scenicLayer = "scenic-line";
+  const baselineLayer = "baseline-line";
+  if (!map.getLayer(scenicLayer) || !map.getLayer(baselineLayer)) return;
+  const scenicActive = kind === "scenic";
+  const baselineActive = kind === "baseline";
+  map.setPaintProperty(scenicLayer, "line-opacity", scenicActive ? 0.95 : 0.45);
+  map.setPaintProperty(baselineLayer, "line-opacity", baselineActive ? 0.9 : 0.35);
+  map.setPaintProperty(scenicLayer, "line-width", scenicActive ? 7 : 4);
+  map.setPaintProperty(baselineLayer, "line-width", baselineActive ? 6 : 3);
+}
+
+function setActiveRoute(kind) {
+  activeRouteKind = kind;
+  document.querySelectorAll(".route-card").forEach((node) => {
+    node.classList.toggle("active", node.dataset.kind === kind);
+  });
+  setRouteHighlight(kind);
+}
+
+function renderRouteList(payload) {
+  const routes = payload.routes || {};
+  const scenic = routes.scenic;
+  const baseline = routes.baseline;
+  const deltas = payload.deltas || {};
+  const cards = [];
+  if (scenic) {
+    const deltaTime = Number(deltas.duration_min || 0);
+    const badge = Number.isFinite(deltaTime) && deltaTime !== 0 ? formatDelta(deltaTime, " min") : "Scenic";
+    cards.push({
+      kind: "scenic",
+      title: "Scenic",
+      badge,
+      deltaTime,
+      deltaScore: Number(deltas.scenic_score || 0),
+      time: scenic.estimated_duration_minutes,
+      distance: scenic.total_distance_km,
+      score: scenic.average_scenic_score,
+    });
+  }
+  if (baseline) {
+    cards.push({
+      kind: "baseline",
+      title: "Fastest",
+      badge: "Baseline",
+      deltaTime: 0,
+      deltaScore: 0,
+      time: baseline.estimated_duration_minutes,
+      distance: baseline.total_distance_km,
+      score: baseline.average_scenic_score,
+    });
+  }
+  if (!cards.length) {
+    el.routeList.innerHTML = '<div class="route-empty">Plan a route to compare options.</div>';
+    return;
+  }
+  el.routeList.innerHTML = cards
+    .map(
+      (card) => `
+        <div class="route-card" data-kind="${card.kind}">
+          <div class="row">
+            <div class="title">${card.title}</div>
+            <span class="badge ${card.kind === "scenic" ? "badge-warm" : "badge-cool"}">${card.badge}</span>
+          </div>
+          <div class="meta">
+            <div class="metric">
+              <div class="k">Time</div>
+              <div class="v">${formatMinutes(card.time)}</div>
+            </div>
+            <div class="metric">
+              <div class="k">Distance</div>
+              <div class="v">${formatDistance(card.distance)}</div>
+            </div>
+            <div class="metric">
+              <div class="k">Scenic</div>
+              <div class="v">${formatScore(card.score)}</div>
+            </div>
+          </div>
+          ${
+            card.kind === "scenic"
+              ? `
+            <div class="delta-row">
+              <span class="delta-chip">${formatDelta(card.deltaTime, " min")}</span>
+              <span class="delta-chip">${formatDelta(card.deltaScore, " scenic")}</span>
+            </div>
+          `
+              : ""
+          }
+        </div>
+      `
+    )
     .join("");
+  document.querySelectorAll(".route-card").forEach((node) => {
+    node.addEventListener("click", () => setActiveRoute(node.dataset.kind));
+  });
+  if (!activeRouteKind && scenic) {
+    setActiveRoute("scenic");
+  } else if (!activeRouteKind && baseline) {
+    setActiveRoute("baseline");
+  } else if (activeRouteKind) {
+    setActiveRoute(activeRouteKind);
+  }
+}
+
+function syncRoutePanelState() {
+  const collapsed = localStorage.getItem(STORAGE_KEYS.routePanelCollapsed) === "1";
+  el.routePanel.classList.toggle("collapsed", collapsed);
+  el.routeCollapseBtn.textContent = collapsed ? "Expand" : "Minimize";
+}
+
+function isMobileLayout() {
+  return window.matchMedia("(max-width: 980px)").matches;
+}
+
+function setSheetOpen(open) {
+  el.controls.classList.toggle("sheet-open", open);
+  localStorage.setItem(STORAGE_KEYS.settingsSheetOpen, open ? "1" : "0");
+  if (el.sheetToggleBtn) {
+    el.sheetToggleBtn.textContent = open ? "Collapse" : "Expand";
+  }
+}
+
+function setActiveTab(tab, { persist = true } = {}) {
+  const next = ["search", "routes", "settings", "none"].includes(tab) ? tab : "search";
+  document.body.dataset.activeTab = next;
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.tab === next);
+  });
+  if (persist) localStorage.setItem(STORAGE_KEYS.activeTab, next);
+  if (next === "settings") {
+    const stored = localStorage.getItem(STORAGE_KEYS.settingsSheetOpen);
+    const open = stored ? stored === "1" : true;
+    setSheetOpen(open);
+  } else {
+    setSheetOpen(false);
+  }
+}
+
+function syncTabState() {
+  const stored = localStorage.getItem(STORAGE_KEYS.activeTab) || "search";
+  setActiveTab(["search", "routes", "settings", "none"].includes(stored) ? stored : "search", {
+    persist: false,
+  });
+}
+
+function readSavedTrips() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.savedTrips);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeSavedTrips(trips) {
+  localStorage.setItem(STORAGE_KEYS.savedTrips, JSON.stringify(trips));
+}
+
+function renderSavedTrips() {
+  const trips = readSavedTrips();
+  if (!trips.length) {
+    el.savedTrips.innerHTML = '<div class="route-empty">No saved trips yet.</div>';
+    return;
+  }
+  el.savedTrips.innerHTML = trips
+    .map(
+      (trip) => `
+        <div class="saved-item" data-id="${trip.id}">
+          <div class="title">${trip.title}</div>
+          <div class="meta">${trip.region} • ${new Date(trip.timestamp).toLocaleDateString()}</div>
+          ${
+            trip.summary
+              ? `<div class="summary">${trip.summary}</div>`
+              : ""
+          }
+          <div class="saved-actions">
+            <button class="ghost-btn" data-action="rename">Rename</button>
+            <button class="ghost-btn" data-action="delete">Delete</button>
+          </div>
+        </div>
+      `
+    )
+    .join("");
+  el.savedTrips.querySelectorAll(".saved-item").forEach((node) => {
+    node.addEventListener("click", () => {
+      const trip = trips.find((t) => t.id === node.dataset.id);
+      if (!trip) return;
+      el.region.value = trip.region;
+      el.scenicWeight.value = String(trip.scenic_weight);
+      el.weightValue.textContent = String(trip.scenic_weight);
+      el.maxDetour.value = String(trip.max_detour_factor);
+      el.detourValue.textContent = String(trip.max_detour_factor);
+      el.startLat.value = trip.start.lat;
+      el.startLon.value = trip.start.lon;
+      el.endLat.value = trip.end.lat;
+      el.endLon.value = trip.end.lon;
+      el.startAddress.value = trip.start_label || `${trip.start.lat},${trip.start.lon}`;
+      el.endAddress.value = trip.end_label || `${trip.end.lat},${trip.end.lon}`;
+      inputMode = "address";
+      syncInputMode();
+      planRoute().catch((err) => setStatus(String(err)));
+    });
+    node.querySelectorAll(".ghost-btn").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const action = btn.dataset.action;
+        const trip = trips.find((t) => t.id === node.dataset.id);
+        if (!trip) return;
+        if (action === "delete") {
+          const next = trips.filter((t) => t.id !== trip.id);
+          writeSavedTrips(next);
+          renderSavedTrips();
+          setStatus("Saved trip deleted.");
+          return;
+        }
+        if (action === "rename") {
+          const name = prompt("Rename saved trip:", trip.title);
+          if (!name) return;
+          trip.title = name.trim();
+          writeSavedTrips(trips);
+          renderSavedTrips();
+          setStatus("Saved trip renamed.");
+        }
+      });
+    });
+  });
+}
+
+function buildShareUrl(plan) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("region", plan.region);
+  url.searchParams.set("scenic_weight", String(plan.scenic_weight));
+  url.searchParams.set("max_detour", String(plan.max_detour_factor));
+  url.searchParams.set("start", `${plan.start.lat},${plan.start.lon}`);
+  url.searchParams.set("end", `${plan.end.lat},${plan.end.lon}`);
+  if (plan.start_label) url.searchParams.set("start_label", plan.start_label);
+  if (plan.end_label) url.searchParams.set("end_label", plan.end_label);
+  return url.toString();
+}
+
+function updateShareUrl(plan) {
+  const url = buildShareUrl(plan);
+  window.history.replaceState({}, "", url);
+}
+
+function applyUrlParams() {
+  const params = new URLSearchParams(window.location.search);
+  if (!params.size) return;
+  let shouldPlan = false;
+  const region = params.get("region");
+  if (region && Array.from(el.region.options).some((opt) => opt.value === region)) {
+    el.region.value = region;
+  }
+  const scenicWeight = params.get("scenic_weight");
+  if (scenicWeight) {
+    el.scenicWeight.value = scenicWeight;
+    el.weightValue.textContent = scenicWeight;
+  }
+  const maxDetour = params.get("max_detour");
+  if (maxDetour) {
+    el.maxDetour.value = maxDetour;
+    el.detourValue.textContent = maxDetour;
+  }
+  const start = params.get("start");
+  const end = params.get("end");
+  const startLabel = params.get("start_label");
+  const endLabel = params.get("end_label");
+  const parsePair = (value) => {
+    if (!value) return null;
+    const parts = value.split(",").map((v) => Number(v.trim()));
+    if (parts.length !== 2 || parts.some((v) => !Number.isFinite(v))) return null;
+    return { lat: parts[0], lon: parts[1] };
+  };
+  const startPair = parsePair(start);
+  const endPair = parsePair(end);
+  if (startPair) {
+    el.startLat.value = startPair.lat;
+    el.startLon.value = startPair.lon;
+    shouldPlan = true;
+  }
+  if (endPair) {
+    el.endLat.value = endPair.lat;
+    el.endLon.value = endPair.lon;
+    shouldPlan = true;
+  }
+  if (startLabel) el.startAddress.value = startLabel;
+  if (endLabel) el.endAddress.value = endLabel;
+  if (startLabel || endLabel) {
+    inputMode = "address";
+    shouldPlan = true;
+  } else if (startPair || endPair) {
+    inputMode = "coords";
+  }
+  syncInputMode();
+  return shouldPlan;
 }
 
 function renderRouteGeojson(geojson) {
-  if (!map.getSource(routeSourceId)) {
-    map.addSource(routeSourceId, { type: "geojson", data: geojson });
-    map.addLayer({
-      id: "baseline-line",
-      type: "line",
-      source: routeSourceId,
-      filter: ["==", ["get", "route_kind"], "baseline"],
-      paint: { "line-color": "#4ca8ff", "line-width": 5, "line-opacity": 0.85 },
-    });
-    map.addLayer({
-      id: "scenic-line",
-      type: "line",
-      source: routeSourceId,
-      filter: ["!=", ["get", "route_kind"], "baseline"],
-      paint: { "line-color": "#ff7d3b", "line-width": 6, "line-opacity": 0.95 },
-    });
-  } else {
-    map.getSource(routeSourceId).setData(geojson);
+  lastRouteGeojson = geojson;
+  const featureCount = geojson?.features?.length || 0;
+  if (!featureCount) {
+    setStatus("Route returned no geometry.");
+    return;
   }
+  if (map.getLayer("scenic-line")) map.removeLayer("scenic-line");
+  if (map.getLayer("baseline-line")) map.removeLayer("baseline-line");
+  if (map.getSource(routeSourceId)) map.removeSource(routeSourceId);
+
+  map.addSource(routeSourceId, { type: "geojson", data: geojson });
+  map.addLayer({
+    id: "baseline-line",
+    type: "line",
+    source: routeSourceId,
+    filter: ["==", ["get", "route_kind"], "baseline"],
+    paint: { "line-color": "#4ca8ff", "line-width": 5, "line-opacity": 0.85 },
+  });
+  map.addLayer({
+    id: "scenic-line",
+    type: "line",
+    source: routeSourceId,
+    filter: ["!=", ["get", "route_kind"], "baseline"],
+    paint: { "line-color": "#ff7d3b", "line-width": 6, "line-opacity": 0.95 },
+  });
+  if (map.getLayer("baseline-line")) map.moveLayer("baseline-line");
+  if (map.getLayer("scenic-line")) map.moveLayer("scenic-line");
+  if (activeRouteKind) setRouteHighlight(activeRouteKind);
 
   const bounds = new maplibregl.LngLatBounds();
   for (const feature of geojson.features || []) {
@@ -486,19 +894,42 @@ function renderRouteGeojson(geojson) {
   if (!bounds.isEmpty()) map.fitBounds(bounds, { padding: 36, duration: 0 });
 }
 
+function scheduleRouteRender(geojson) {
+  pendingRouteGeojson = geojson;
+  if (!map) return;
+  if (map.isStyleLoaded()) {
+    renderRouteGeojson(pendingRouteGeojson);
+    pendingRouteGeojson = null;
+    return;
+  }
+  map.once("style.load", () => {
+    if (!pendingRouteGeojson) return;
+    renderRouteGeojson(pendingRouteGeojson);
+    pendingRouteGeojson = null;
+  });
+}
+
 async function planRoute() {
-  if (busy) return;
+  const seq = ++planSeq;
   setBusy(true);
+  if (map?.getSource(routeSourceId)) {
+    map.getSource(routeSourceId).setData({ type: "FeatureCollection", features: [] });
+  }
+  el.routeList.innerHTML = '<div class="route-empty">Planning new route...</div>';
   hideSuggestions("start");
   hideSuggestions("end");
   try {
     let start;
     let end;
+    let startLabel;
+    let endLabel;
     if (inputMode === "address") {
       setStatus("Finding locations...");
       const [s, e] = await Promise.all([resolvePoint("start"), resolvePoint("end")]);
       start = { lat: s.lat, lon: s.lon };
       end = { lat: e.lat, lon: e.lon };
+      startLabel = s.label || `${s.lat},${s.lon}`;
+      endLabel = e.label || `${e.lat},${e.lon}`;
       el.startLat.value = String(s.lat);
       el.startLon.value = String(s.lon);
       el.endLat.value = String(e.lat);
@@ -506,21 +937,39 @@ async function planRoute() {
     } else {
       start = { lat: Number(el.startLat.value), lon: Number(el.startLon.value) };
       end = { lat: Number(el.endLat.value), lon: Number(el.endLon.value) };
+      startLabel = `${start.lat},${start.lon}`;
+      endLabel = `${end.lat},${end.lon}`;
     }
+    lastPlan = {
+      start,
+      end,
+      region: el.region.value,
+      scenic_weight: Number(el.scenicWeight.value),
+      max_detour_factor: Number(el.maxDetour.value),
+      start_label: startLabel,
+      end_label: endLabel,
+    };
     setStatus("Building routes...");
-    const resp = await fetch(api("/v1/route/compare"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        start,
-        end,
-        scenic_weight: Number(el.scenicWeight.value),
-        region: el.region.value,
-        max_detour_factor: Number(el.maxDetour.value),
-        avoid_highways: false,
-        include_baseline: true,
-      }),
-    });
+    let resp;
+    try {
+      resp = await fetch(api("/v1/route/compare"), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          start,
+          end,
+          scenic_weight: Number(el.scenicWeight.value),
+          region: el.region.value,
+          max_detour_factor: Number(el.maxDetour.value),
+          avoid_highways: false,
+          include_baseline: true,
+        }),
+      });
+    } catch (err) {
+      throw new Error(
+        "API request failed. Check API Base URL, server status, and HTTPS/mixed-content blocking."
+      );
+    }
     let payload = null;
     try {
       payload = await resp.json();
@@ -529,17 +978,29 @@ async function planRoute() {
     }
     if (!resp.ok) {
       if (resp.status === 422 && payload?.detail?.error === "no_route_found") {
-        throw new Error("No route found between these points in this region.");
+        const hint = payload?.detail?.hint ? ` ${payload.detail.hint}` : "";
+        throw new Error(`No route found between these points in this region.${hint}`);
+      }
+      if (payload?.detail) {
+        const detail = typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail);
+        throw new Error(`Route request failed (${resp.status}): ${detail}`);
       }
       throw new Error(`Route request failed (${resp.status}).`);
     }
 
-    renderMetrics(payload);
-    if (map.loaded()) renderRouteGeojson(payload.geojson);
-    else map.once("load", () => renderRouteGeojson(payload.geojson));
-    setStatus("Route ready.");
+    if (seq !== planSeq) return;
+    renderRouteList(payload);
+    if (isMobileLayout()) setActiveTab("routes");
+    lastRoutePayload = payload;
+    if (seq === planSeq) scheduleRouteRender(payload.geojson);
+    updateShareUrl(lastPlan);
+    if (payload.retry_used && payload.retry_max_detour_factor) {
+      setStatus(`Route ready (auto-bumped detour to ${payload.retry_max_detour_factor.toFixed(1)}).`);
+    } else {
+      setStatus("Route ready.");
+    }
   } finally {
-    setBusy(false);
+    if (seq === planSeq) setBusy(false);
   }
 }
 
@@ -561,8 +1022,15 @@ async function main() {
   await loadRegions();
   applyRegionDefaults();
   syncInputMode();
+  syncTabState();
+  const autoPlan = applyUrlParams();
   el.weightValue.textContent = el.scenicWeight.value;
   el.detourValue.textContent = el.maxDetour.value;
+  renderSavedTrips();
+  el.routeList.innerHTML = '<div class="route-empty">Plan a route to compare options.</div>';
+  if (autoPlan) {
+    planRoute().catch((err) => setStatus(String(err)));
+  }
 
   el.refreshRegionsBtn.addEventListener("click", async () => {
     await checkHealth();
@@ -602,9 +1070,95 @@ async function main() {
   el.planBtn.addEventListener("click", () => {
     planRoute().catch((err) => setStatus(String(err)));
   });
+  el.saveRouteBtn.addEventListener("click", () => {
+    if (!lastPlan) {
+      setStatus("Plan a route before saving.");
+      return;
+    }
+    const trips = readSavedTrips();
+    const title = `${lastPlan.start_label} → ${lastPlan.end_label}`;
+    const scenic = lastRoutePayload?.routes?.scenic;
+    const summary = scenic
+      ? `${formatScore(scenic.average_scenic_score)} scenic • ${formatDistance(
+          scenic.total_distance_km
+        )} • ${formatMinutes(scenic.estimated_duration_minutes)}`
+      : "";
+    trips.unshift({
+      id: String(Date.now()),
+      title,
+      start: lastPlan.start,
+      end: lastPlan.end,
+      region: lastPlan.region,
+      scenic_weight: lastPlan.scenic_weight,
+      max_detour_factor: lastPlan.max_detour_factor,
+      start_label: lastPlan.start_label,
+      end_label: lastPlan.end_label,
+      summary,
+      timestamp: Date.now(),
+    });
+    writeSavedTrips(trips.slice(0, 10));
+    renderSavedTrips();
+    setStatus("Route saved.");
+  });
+  el.shareRouteBtn.addEventListener("click", async () => {
+    if (!lastPlan) {
+      setStatus("Plan a route before sharing.");
+      return;
+    }
+    const url = buildShareUrl(lastPlan);
+    const original = el.shareRouteBtn.textContent;
+    try {
+      await navigator.clipboard.writeText(url);
+      el.shareRouteBtn.textContent = "Copied";
+      setStatus("Share link copied to clipboard.");
+      setTimeout(() => {
+        el.shareRouteBtn.textContent = original;
+      }, 1200);
+    } catch {
+      el.shareRouteBtn.textContent = "Copied";
+      setStatus(`Share link ready: ${url}`);
+      setTimeout(() => {
+        el.shareRouteBtn.textContent = original;
+      }, 1800);
+    }
+  });
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const current = document.body.dataset.activeTab || "search";
+      if (btn.dataset.tab === current) {
+        setActiveTab("none");
+      } else {
+        setActiveTab(btn.dataset.tab);
+      }
+    });
+  });
+  if (el.sheetToggleBtn) {
+    el.sheetToggleBtn.addEventListener("click", () => {
+      const open = !el.controls.classList.contains("sheet-open");
+      setSheetOpen(open);
+    });
+  }
+  el.routeCollapseBtn.addEventListener("click", () => {
+    const collapsed = el.routePanel.classList.toggle("collapsed");
+    localStorage.setItem(STORAGE_KEYS.routePanelCollapsed, collapsed ? "1" : "0");
+    el.routeCollapseBtn.textContent = collapsed ? "Expand" : "Minimize";
+  });
+  el.basemapProvider.addEventListener("change", () => {
+    localStorage.setItem(STORAGE_KEYS.basemapProvider, el.basemapProvider.value);
+    applyBasemap();
+  });
+  el.maptilerKey.addEventListener("input", () => {
+    const value = String(el.maptilerKey.value || "").trim();
+    if (value) localStorage.setItem(STORAGE_KEYS.maptilerKey, value);
+    else localStorage.removeItem(STORAGE_KEYS.maptilerKey);
+  });
+  el.maptilerKey.addEventListener("blur", () => {
+    applyBasemap();
+  });
 
   installAddressInput("start");
   installAddressInput("end");
+  syncRoutePanelState();
   setStatus("Ready");
 }
 

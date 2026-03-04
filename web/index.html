@@ -17,7 +17,14 @@
           <div class="loading-text">Planning route...</div>
         </div>
 
-        <section class="card search-panel">
+        <section class="card search-panel" data-panel="search">
+          <div class="brand-row">
+            <div>
+              <div class="brand-title">ScenicDrive</div>
+              <div class="brand-sub">Route compare navigator</div>
+            </div>
+            <span class="brand-pill">MVP</span>
+          </div>
           <div class="search-stack addr-only">
             <div class="search-field">
               <span class="search-label">From</span>
@@ -50,11 +57,24 @@
             <button id="swapBtn" type="button" class="secondary">Swap</button>
             <button id="planBtn" type="button">Plan Route</button>
           </div>
+          <div class="inline-actions">
+            <button id="saveRouteBtn" type="button" class="secondary">Save Route</button>
+            <button id="shareRouteBtn" type="button" class="secondary">Share Link</button>
+          </div>
           <button id="clearBtn" type="button" class="secondary">Clear Route</button>
           <div id="status" class="status-pill"></div>
+          <div class="saved-trips">
+            <div class="saved-title">Saved Trips</div>
+            <div id="savedTrips" class="saved-list"></div>
+          </div>
         </section>
 
-        <section class="card controls settings-panel menu-collapsed">
+        <section class="card controls settings-panel menu-collapsed" data-panel="settings">
+          <div class="sheet-header">
+            <div class="sheet-grip" aria-hidden="true"></div>
+            <div class="sheet-title">Settings</div>
+            <button id="sheetToggleBtn" class="ghost-btn" type="button">Collapse</button>
+          </div>
           <div class="control-group">
             <div class="group-title">Region</div>
             <label>Region
@@ -79,8 +99,9 @@
             <label>Scenic Weight: <span id="weightValue">0.8</span>
               <input id="scenicWeight" type="range" min="0" max="1" step="0.05" value="0.8" />
             </label>
+            <div class="helper-text">Higher weight allows more detour; route maximizes scenic within that cap.</div>
             <label>Max Detour Factor: <span id="detourValue">1.8</span>
-              <input id="maxDetour" type="range" min="1.0" max="3.0" step="0.1" value="1.8" />
+              <input id="maxDetour" type="range" min="1.2" max="3.0" step="0.1" value="1.8" />
             </label>
             <label class="toggle-row">
               <input id="showHeatmap" type="checkbox" />
@@ -93,10 +114,37 @@
             <label>API Base URL
               <input id="apiBase" value="http://localhost:8080" />
             </label>
+            <label>Basemap Provider
+              <select id="basemapProvider">
+                <option value="maptiler">MapTiler</option>
+                <option value="osm">OpenStreetMap</option>
+              </select>
+            </label>
+            <label>MapTiler API Key
+              <input id="maptilerKey" type="password" placeholder="Paste MapTiler key" />
+            </label>
+            <span id="basemapStatus" class="pill">Basemap: loading...</span>
           </div>
         </section>
 
-        <div class="metrics card" id="metrics"></div>
+        <section class="route-panel card" id="routePanel" data-panel="routes">
+          <div class="route-header">
+            <div>
+              <div class="route-title">Routes</div>
+              <div class="route-sub">Tap to focus</div>
+            </div>
+            <div class="route-actions">
+              <span class="route-pill">Compare</span>
+              <button id="routeCollapseBtn" class="ghost-btn" type="button">Minimize</button>
+            </div>
+          </div>
+          <div id="routeList" class="route-list"></div>
+        </section>
+        <nav class="mobile-tabs" aria-label="Primary">
+          <button class="tab-btn active" type="button" data-tab="search">Search</button>
+          <button class="tab-btn" type="button" data-tab="routes">Routes</button>
+          <button class="tab-btn" type="button" data-tab="settings">Settings</button>
+        </nav>
       </section>
     </main>
 

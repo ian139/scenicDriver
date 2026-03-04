@@ -36,6 +36,13 @@ class ScenicRoutePlanner:
         self.graph = graph
         self.cost_function = cost_function or ScenicCostFunction()
 
+    def _make_cost_function(self, scenic_weight: float) -> ScenicCostFunction:
+        return ScenicCostFunction(
+            scenic_weight=scenic_weight,
+            avoid_highways=self.cost_function.avoid_highways,
+            weights=self.cost_function.weights,
+        )
+
     def find_scenic_route(
         self,
         start: Tuple[float, float],
@@ -49,29 +56,77 @@ class ScenicRoutePlanner:
         if max_detour_factor < 1.0:
             raise ValueError("max_detour_factor must be >= 1.0")
 
-        self.cost_function.scenic_weight = float(min(max(scenic_weight, 0.0), 1.0))
+        scenic_weight = float(min(max(scenic_weight, 0.0), 1.0))
         self.cost_function.avoid_highways = bool(avoid_highways)
+
+        if scenic_weight <= 0.0:
+            return self.find_fastest_route(start, end, avoid_highways=avoid_highways)
 
         start_node = self.graph.find_nearest_node(*start)
         end_node = self.graph.find_nearest_node(*end)
 
-        path_edges = self._a_star(start_node, end_node, max_detour_factor=max_detour_factor)
+        shortest_cost = self._make_cost_function(0.0)
+        shortest_edges = self._a_star(
+            start_node,
+            end_node,
+            cost_function=shortest_cost,
+            max_path_km=None,
+        )
+        if shortest_edges is None:
+            raise ValueError("No route found between the given coordinates.")
+
+        shortest_km = self._path_distance_km(shortest_edges)
+        detour_cap = float(max_detour_factor)
+        effective_detour = 1.0 + scenic_weight * (detour_cap - 1.0)
+        effective_detour = max(1.2, effective_detour)
+        max_path_km = max(0.2, shortest_km * effective_detour)
+
+        scenic_cost = self._make_cost_function(1.0)
+        path_edges = self._a_star(
+            start_node,
+            end_node,
+            cost_function=scenic_cost,
+            max_path_km=max_path_km,
+        )
         if path_edges is None:
             raise ValueError("No route found between the given coordinates.")
         return self._path_to_route(path_edges)
+
+    def find_fastest_route(
+        self,
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+        *,
+        avoid_highways: bool = False,
+    ) -> Route:
+        if self.graph is None:
+            raise RuntimeError("Road graph not loaded")
+        self.cost_function.avoid_highways = bool(avoid_highways)
+        start_node = self.graph.find_nearest_node(*start)
+        end_node = self.graph.find_nearest_node(*end)
+        shortest_cost = self._make_cost_function(0.0)
+        shortest_edges = self._a_star(
+            start_node,
+            end_node,
+            cost_function=shortest_cost,
+            max_path_km=None,
+        )
+        if shortest_edges is None:
+            raise ValueError("No route found between the given coordinates.")
+        return self._path_to_route(shortest_edges)
 
     def _a_star(
         self,
         start: Node,
         goal: Node,
         *,
-        max_detour_factor: float,
+        cost_function: ScenicCostFunction,
+        max_path_km: float | None,
     ) -> Optional[List[Edge]]:
-        direct_km = self._haversine(start.lat, start.lon, goal.lat, goal.lon)
-        max_path_km = max(0.2, direct_km * max_detour_factor)
-
         frontier: List[Tuple[float, float, str]] = []
-        heapq.heappush(frontier, (0.0, 0.0, start.id))  # (priority, cost_so_far, node_id)
+        heapq.heappush(
+            frontier, (0.0, 0.0, start.id)
+        )  # (priority, cost_so_far, node_id)
 
         came_from: Dict[str, Tuple[str, Edge]] = {}
         best_cost: Dict[str, float] = {start.id: 0.0}
@@ -88,10 +143,10 @@ class ScenicRoutePlanner:
             for edge in self.graph.get_edges(current_id):
                 neighbor_id = edge.end_node_id
                 next_distance = best_distance_km[current_id] + edge.distance_km
-                if next_distance > max_path_km:
+                if max_path_km is not None and next_distance > max_path_km:
                     continue
 
-                edge_cost = self.cost_function.calculate(edge)
+                edge_cost = cost_function.calculate(edge)
                 next_cost = current_cost + edge_cost
                 if next_cost >= best_cost.get(neighbor_id, float("inf")):
                     continue
@@ -103,13 +158,21 @@ class ScenicRoutePlanner:
                 neighbor = self.graph.get_node(neighbor_id)
                 # Mild admissible-ish heuristic: lower-bounded by travel-time-style term.
                 h = self._haversine(neighbor.lat, neighbor.lon, goal.lat, goal.lon)
-                alpha = 1.0 - self.cost_function.scenic_weight
+                alpha = 1.0 - cost_function.scenic_weight
                 heuristic = alpha * h
-                heapq.heappush(frontier, (next_cost + heuristic, next_cost, neighbor_id))
+                heapq.heappush(
+                    frontier, (next_cost + heuristic, next_cost, neighbor_id)
+                )
 
         return None
 
-    def _reconstruct_path(self, came_from: Dict[str, Tuple[str, Edge]], goal_id: str) -> List[Edge]:
+    @staticmethod
+    def _path_distance_km(edges: List[Edge]) -> float:
+        return float(sum(edge.distance_km for edge in edges))
+
+    def _reconstruct_path(
+        self, came_from: Dict[str, Tuple[str, Edge]], goal_id: str
+    ) -> List[Edge]:
         edges: List[Edge] = []
         node_id = goal_id
         while node_id in came_from:
@@ -149,7 +212,9 @@ class ScenicRoutePlanner:
                 waypoints.append((start_node.lat, start_node.lon))
             waypoints.append((end_node.lat, end_node.lon))
 
-        avg_scenic = scenic_distance_sum / total_distance_km if total_distance_km > 0 else 0.0
+        avg_scenic = (
+            scenic_distance_sum / total_distance_km if total_distance_km > 0 else 0.0
+        )
         return Route(
             segments=segments,
             total_distance_km=total_distance_km,

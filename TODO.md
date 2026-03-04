@@ -20,8 +20,10 @@
 ## Next Steps
 
 ### Phase 0: MVP App (Priority)
-- [ ] Ship hosted route-compare API wrapper for app integration (stable request/response contract).
-- [ ] Build responsive web MVP for road-trip planning (start/end, scenic weight, route compare, map overlay).
+- [x] Ship hosted route-compare API wrapper for app integration (stable request/response contract).
+- [x] Build responsive web MVP for road-trip planning (start/end, scenic weight, route compare, map overlay).
+- [x] Add web UI polish (route cards, share links, saved trips, mobile tabs, settings sheet).
+- [x] Add MapTiler basemap support with local key input + OSM fallback.
 - [ ] Add optional signed-in contributor annotation mode with credits + shadow QA queue.
 - [ ] Add region selector/data registry in app and validate at least: `pittsfield`, `philadelphia`.
 

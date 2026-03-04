@@ -40,10 +40,16 @@ class RouteRequest:
             avoid_highways=bool(payload.get("avoid_highways", False)),
             max_detour_factor=float(payload.get("max_detour_factor", 1.8)),
             include_baseline=bool(payload.get("include_baseline", True)),
-            tile_scores_json=str(payload["tile_scores_json"]) if payload.get("tile_scores_json") else None,
-            tile_score_zoom=int(payload["tile_score_zoom"]) if payload.get("tile_score_zoom") is not None else None,
+            tile_scores_json=str(payload["tile_scores_json"])
+            if payload.get("tile_scores_json")
+            else None,
+            tile_score_zoom=int(payload["tile_score_zoom"])
+            if payload.get("tile_score_zoom") is not None
+            else None,
             tile_score_fallback=(
-                float(payload["tile_score_fallback"]) if payload.get("tile_score_fallback") is not None else None
+                float(payload["tile_score_fallback"])
+                if payload.get("tile_score_fallback") is not None
+                else None
             ),
         )
 
@@ -67,7 +73,9 @@ def _parse_point(value: Any, *, field_name: str) -> tuple[float, float]:
         return (float(value[0]), float(value[1]))
     if isinstance(value, dict) and "lat" in value and "lon" in value:
         return (float(value["lat"]), float(value["lon"]))
-    raise ValueError(f"Invalid {field_name} format. Expected [lat, lon] or {{lat, lon}}.")
+    raise ValueError(
+        f"Invalid {field_name} format. Expected [lat, lon] or {{lat, lon}}."
+    )
 
 
 def route_to_feature(route: Route, route_kind: str) -> dict[str, Any]:
@@ -89,7 +97,11 @@ def lat_lon_to_tile(lat: float, lon: float, zoom: int) -> tuple[int, int]:
     n = 2**zoom
     x = int((lon + 180.0) / 360.0 * n)
     lat_rad = math.radians(lat)
-    y = int((1.0 - math.log(math.tan(lat_rad) + (1.0 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
+    y = int(
+        (1.0 - math.log(math.tan(lat_rad) + (1.0 / math.cos(lat_rad))) / math.pi)
+        / 2.0
+        * n
+    )
     return x, y
 
 
@@ -165,7 +177,11 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
     if request.tile_scores_json:
         score_path = Path(request.tile_scores_json)
         score_map, inferred_zoom = load_tile_scores(score_path)
-        zoom = request.tile_score_zoom if request.tile_score_zoom is not None else inferred_zoom
+        zoom = (
+            request.tile_score_zoom
+            if request.tile_score_zoom is not None
+            else inferred_zoom
+        )
         matched, total = apply_tile_scores_to_graph(
             graph,
             score_map,
@@ -193,16 +209,16 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
     routes = [{"route_kind": "scenic", "metrics": features[0]["properties"]}]
 
     if request.include_baseline:
-        baseline_route = planner.find_scenic_route(
+        baseline_route = planner.find_fastest_route(
             start=request.start,
             end=request.end,
-            scenic_weight=0.0,
             avoid_highways=False,
-            max_detour_factor=max(request.max_detour_factor, 1.2),
         )
         baseline_feature = route_to_feature(baseline_route, "baseline")
         features.append(baseline_feature)
-        routes.append({"route_kind": "baseline", "metrics": baseline_feature["properties"]})
+        routes.append(
+            {"route_kind": "baseline", "metrics": baseline_feature["properties"]}
+        )
 
     return {
         "request": request.to_dict(),

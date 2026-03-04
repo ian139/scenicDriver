@@ -19,12 +19,19 @@ Current direction:
 
 ## Next Step (Current)
 
-`v5` is the active learned checkpoint for Northeast runs:
+`v4` is the active learned checkpoint for Northeast runs:
 
-- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v5_weighted_h4.pt`
+- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt`
 - Source of truth: `data/processed/regression/model_registry.json`
 
 Current focus is MVP app build-out (hosted route compare + web/mobile UX), with routing/system hardening underneath:
+
+Web MVP now includes:
+- live geocoding + autocomplete
+- route compare cards (scenic vs baseline)
+- saved trips + share links
+- mobile tab bar + settings bottom sheet
+- MapTiler basemap support with OSM fallback
 
 ```bash
 # 1) Deterministic graph cache build (writes road_graph.json + run.json)
