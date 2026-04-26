@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import json
 import re
 
 from fastapi import FastAPI, HTTPException
@@ -10,7 +11,7 @@ import os
 import requests
 from urllib.parse import quote
 
-from src.route_planner.service import RouteRequest, plan_routes
+from src.route_planner.service import RouteRequest, diagnose_route_request, plan_routes
 
 from .contrib_repo import ContribRepo
 from .schemas import (
@@ -24,10 +25,56 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROAD_GRAPHS_DIR = PROJECT_ROOT / "data/processed/road_graphs"
 RUNS_DIR = PROJECT_ROOT / "data/processed/heuristic_runs"
 MODEL_REGISTRY_PATH = PROJECT_ROOT / "data/processed/regression/model_registry.json"
+APP_REGIONS_PATH = PROJECT_ROOT / "config/app_regions.json"
 POINT_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)\s*$")
 
 
+def _load_app_region_config() -> dict[str, Any]:
+    if not APP_REGIONS_PATH.exists():
+        return {"default_region": None, "regions": []}
+    return json.loads(APP_REGIONS_PATH.read_text(encoding="utf-8"))
+
+
+def _configured_regions() -> list[dict[str, Any]]:
+    payload = _load_app_region_config()
+    rows = payload.get("regions", [])
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("region"):
+            continue
+        item = dict(row)
+        graph = item.get("graph")
+        if graph:
+            item["graph_path"] = PROJECT_ROOT / str(graph)
+        out.append(item)
+    return out
+
+
+def _app_region(region: str) -> dict[str, Any] | None:
+    key = region.strip().lower()
+    for item in _configured_regions():
+        if str(item.get("region", "")).strip().lower() == key:
+            return item
+    return None
+
+
+def _default_region_key() -> str | None:
+    default_region = _load_app_region_config().get("default_region")
+    return str(default_region).strip().lower() if default_region else None
+
+
 def _region_to_graph(region: str) -> Path:
+    configured = _app_region(region)
+    if configured and configured.get("graph_path"):
+        graph_path = Path(configured["graph_path"])
+        if graph_path.exists():
+            return graph_path
+        raise FileNotFoundError(
+            f"Configured road graph for region '{region}' is missing: {graph_path}"
+        )
+
     key = region.strip().lower()
     candidates = [
         ROAD_GRAPHS_DIR / f"{key}_core/road_graph.geojson",
@@ -42,6 +89,10 @@ def _region_to_graph(region: str) -> Path:
 
 
 def _latest_run_for_region(region: str) -> str | None:
+    configured = _app_region(region)
+    if configured and configured.get("run_name"):
+        return str(configured["run_name"])
+
     key = region.strip().lower()
     aliases: dict[str, list[str]] = {
         # Pittsfield runs were historically named with "masswhites".
@@ -117,6 +168,35 @@ def _list_regions() -> list[dict[str, Any]]:
         }
 
     regions: list[dict[str, Any]] = []
+    configured_keys: set[str] = set()
+    configured_graphs: set[Path] = set()
+    default_region = _default_region_key()
+    for item in _configured_regions():
+        region = str(item.get("region"))
+        configured_keys.add(region.lower())
+        graph = Path(item["graph_path"]) if item.get("graph_path") else None
+        if graph:
+            configured_graphs.add(graph.resolve())
+        latest_run = str(item["run_name"]) if item.get("run_name") else _latest_run_for_region(region)
+        regions.append(
+            {
+                "region": region,
+                "display_name": item.get("display_name", region),
+                "description": item.get("description"),
+                "graph_geojson": str(graph) if graph else None,
+                "graph_exists": bool(graph and graph.exists()),
+                "latest_run_name": latest_run,
+                "report_json": str(RUNS_DIR / latest_run / "report/report.json")
+                if latest_run
+                else None,
+                "bbox": item.get("bbox"),
+                "map": item.get("map"),
+                "model_checkpoint": item.get("model_checkpoint"),
+                "is_default": region.lower() == default_region,
+                "source": "config",
+            }
+        )
+
     if not ROAD_GRAPHS_DIR.exists():
         return regions
     for d in sorted([x for x in ROAD_GRAPHS_DIR.iterdir() if x.is_dir()]):
@@ -126,6 +206,10 @@ def _list_regions() -> list[dict[str, Any]]:
         if not graph.exists():
             continue
         region = d.name.replace("_core", "")
+        if region.lower() in configured_keys:
+            continue
+        if graph.resolve() in configured_graphs:
+            continue
         latest_run = _latest_run_for_region(region)
         bbox = None
         run_json = d / "run.json"
@@ -140,12 +224,16 @@ def _list_regions() -> list[dict[str, Any]]:
         regions.append(
             {
                 "region": region,
+                "display_name": region,
                 "graph_geojson": str(graph),
+                "graph_exists": True,
                 "latest_run_name": latest_run,
                 "report_json": str(RUNS_DIR / latest_run / "report/report.json")
                 if latest_run
                 else None,
                 "bbox": bbox,
+                "is_default": region.lower() == default_region,
+                "source": "discovered",
             }
         )
     return regions
@@ -334,6 +422,7 @@ def create_app() -> FastAPI:
     def healthz() -> dict[str, Any]:
         return {
             "ok": True,
+            "default_region": _default_region_key(),
             "model_registry_exists": MODEL_REGISTRY_PATH.exists(),
             "regions_available": len(_list_regions()),
         }
@@ -447,8 +536,14 @@ def create_app() -> FastAPI:
             tile_scores_json=str(report_json) if report_json.exists() else None,
             tile_score_fallback=1.0,
         )
+        diagnostics: dict[str, Any] = {}
+        try:
+            diagnostics = diagnose_route_request(req)
+        except Exception:
+            diagnostics = {}
         try:
             result = plan_routes(req)
+            diagnostics = dict(result.get("diagnostics", {}))
         except ValueError as exc:
             # Most common case: points geocode outside the selected graph/connected component
             # or max detour cap is too tight. Retry with a higher detour cap once.
@@ -467,6 +562,7 @@ def create_app() -> FastAPI:
                 )
                 try:
                     result = plan_routes(retry_req)
+                    diagnostics = dict(result.get("diagnostics", {}))
                     result["retry_used"] = True
                     result["retry_max_detour_factor"] = retry_cap
                 except ValueError:
@@ -476,6 +572,7 @@ def create_app() -> FastAPI:
                             "error": "no_route_found",
                             "message": str(exc),
                             "hint": f"Try different points in region '{payload.region}' or increase max detour.",
+                            "diagnostics": diagnostics,
                         },
                     ) from exc
             else:
@@ -485,6 +582,7 @@ def create_app() -> FastAPI:
                         "error": "no_route_found",
                         "message": str(exc),
                         "hint": f"Try different points in region '{payload.region}' or increase max detour.",
+                        "diagnostics": diagnostics,
                     },
                 ) from exc
         routes = {r["route_kind"]: r["metrics"] for r in result.get("routes", [])}
@@ -503,6 +601,7 @@ def create_app() -> FastAPI:
         return {
             "request": req.to_dict(),
             "run_name": run_name,
+            "diagnostics": diagnostics,
             "routes": routes,
             "deltas": deltas,
             "score_mapping": result.get("score_mapping", {}),

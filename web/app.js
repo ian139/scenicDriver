@@ -5,8 +5,12 @@ const el = {
   maptilerKey: document.getElementById("maptilerKey"),
   basemapStatus: document.getElementById("basemapStatus"),
   region: document.getElementById("region"),
+  regionBadge: document.getElementById("regionBadge"),
   modeAddressBtn: document.getElementById("modeAddressBtn"),
   modeCoordsBtn: document.getElementById("modeCoordsBtn"),
+  prefFastBtn: document.getElementById("prefFastBtn"),
+  prefBalancedBtn: document.getElementById("prefBalancedBtn"),
+  prefScenicBtn: document.getElementById("prefScenicBtn"),
   refreshRegionsBtn: document.getElementById("refreshRegionsBtn"),
   apiHealth: document.getElementById("apiHealth"),
   startLat: document.getElementById("startLat"),
@@ -50,6 +54,7 @@ let heatmapZoomMode = "z16";
 let regionsMeta = [];
 let busy = false;
 let inputMode = "address";
+let routePreference = "balanced";
 let basemapApplying = false;
 let planSeq = 0;
 let pendingRouteGeojson = null;
@@ -69,6 +74,13 @@ const STORAGE_KEYS = {
   routePanelCollapsed: "scenicdrive.routePanelCollapsed",
   activeTab: "scenicdrive.activeTab",
   settingsSheetOpen: "scenicdrive.settingsSheetOpen",
+  routePreference: "scenicdrive.routePreference",
+};
+
+const ROUTE_PRESETS = {
+  fast: { scenic_weight: 0.15, max_detour_factor: 1.25, label: "Fastest" },
+  balanced: { scenic_weight: 0.65, max_detour_factor: 1.65, label: "Balanced" },
+  scenic: { scenic_weight: 0.9, max_detour_factor: 2.4, label: "Scenic" },
 };
 
 function requireElement(name, node) {
@@ -87,6 +99,10 @@ function setBusy(next) {
 }
 
 function toggleMenu() {
+  if (isMobileLayout()) {
+    setActiveTab("settings");
+    return;
+  }
   el.controls?.classList.toggle("menu-collapsed");
 }
 
@@ -106,12 +122,36 @@ function syncInputMode() {
 
 function normalizeBasemapProvider(provider, key) {
   const p = String(provider || "").toLowerCase();
-  if (p === "maptiler" && !key) return "osm";
-  if (p === "maptiler" || p === "osm") return p;
-  return key ? "maptiler" : "osm";
+  if (p === "maptiler" && !key) return "carto_voyager";
+  if (["carto_voyager", "carto_positron", "maptiler", "osm"].includes(p)) return p;
+  return key ? "maptiler" : "carto_voyager";
 }
 
 function basemapTileSource(provider, key) {
+  if (provider === "carto_voyager") {
+    return {
+      type: "raster",
+      tiles: [
+        "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+        "https://b.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+        "https://c.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+      ],
+      tileSize: 256,
+      attribution: "© CARTO © OpenStreetMap contributors",
+    };
+  }
+  if (provider === "carto_positron") {
+    return {
+      type: "raster",
+      tiles: [
+        "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+        "https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+        "https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+      ],
+      tileSize: 256,
+      attribution: "© CARTO © OpenStreetMap contributors",
+    };
+  }
   if (provider === "maptiler") {
     const encoded = encodeURIComponent(key);
     return {
@@ -141,8 +181,14 @@ function buildBasemapStyle(provider, key) {
 }
 
 function applyBasemapStatus(provider, hasKey) {
-  const name = provider === "maptiler" ? "MapTiler" : "OpenStreetMap";
-  const note = provider === "maptiler" ? "" : hasKey ? "" : " (no key)";
+  const names = {
+    carto_voyager: "CARTO Voyager",
+    carto_positron: "CARTO Light",
+    maptiler: "MapTiler",
+    osm: "OpenStreetMap",
+  };
+  const name = names[provider] || "CARTO Voyager";
+  const note = provider === "maptiler" ? "" : " (no key)";
   el.basemapStatus.textContent = `Basemap: ${name}${note}`;
 }
 
@@ -197,9 +243,33 @@ async function loadRegions() {
   for (const r of regions) {
     const opt = document.createElement("option");
     opt.value = r.region;
-    opt.textContent = r.region;
+    opt.textContent = r.display_name || r.region;
     el.region.appendChild(opt);
   }
+  const defaultRegion = regions.find((r) => r.is_default) || regions.find((r) => r.region === "masswhites");
+  if (defaultRegion) el.region.value = defaultRegion.region;
+}
+
+function loadFallbackRegions() {
+  const fallback = {
+    region: "masswhites",
+    display_name: "Masswhites",
+    is_default: true,
+    bbox: {
+      min_lat: 41.19518982948958,
+      min_lon: -73.5205078125,
+      max_lat: 44.512176171071054,
+      max_lon: -72.97119140625,
+    },
+    map: { center: { lat: 42.85, lon: -73.22 }, zoom: 8.2 },
+  };
+  regionsMeta = [fallback];
+  el.region.innerHTML = "";
+  const opt = document.createElement("option");
+  opt.value = fallback.region;
+  opt.textContent = fallback.display_name;
+  el.region.appendChild(opt);
+  el.region.value = fallback.region;
 }
 
 function applyRegionDefaults() {
@@ -220,6 +290,19 @@ function applyRegionDefaults() {
     endLat = minLat + (maxLat - minLat) * 0.75;
     endLon = minLon + (maxLon - minLon) * 0.75;
   }
+  if (region?.map?.center) {
+    const center = region.map.center;
+    if (map) {
+      map.easeTo({
+        center: [Number(center.lon), Number(center.lat)],
+        zoom: Number(region.map.zoom || map.getZoom()),
+        duration: 0,
+      });
+    }
+  }
+  if (el.regionBadge) {
+    el.regionBadge.textContent = region?.is_default ? "Primary" : "Region";
+  }
   el.startLat.value = startLat.toFixed(6);
   el.startLon.value = startLon.toFixed(6);
   el.endLat.value = endLat.toFixed(6);
@@ -235,9 +318,28 @@ function applyRegionDefaults() {
   suggestState.end.selected = null;
 }
 
+function applyRoutePreference(pref) {
+  routePreference = ROUTE_PRESETS[pref] ? pref : "balanced";
+  const preset = ROUTE_PRESETS[routePreference];
+  el.scenicWeight.value = String(preset.scenic_weight);
+  el.maxDetour.value = String(preset.max_detour_factor);
+  el.weightValue.textContent = String(preset.scenic_weight);
+  el.detourValue.textContent = String(preset.max_detour_factor);
+  document.querySelectorAll("[data-pref]").forEach((btn) => {
+    const active = btn.dataset.pref === routePreference;
+    btn.classList.toggle("active", active);
+    btn.classList.toggle("secondary", !active);
+  });
+  localStorage.setItem(STORAGE_KEYS.routePreference, routePreference);
+}
+
 function initMap() {
   const storedKey = localStorage.getItem(STORAGE_KEYS.maptilerKey) || "";
-  const storedProvider = localStorage.getItem(STORAGE_KEYS.basemapProvider) || "";
+  let storedProvider = localStorage.getItem(STORAGE_KEYS.basemapProvider) || "";
+  if (!storedKey && (!storedProvider || storedProvider === "osm")) {
+    storedProvider = "carto_voyager";
+    localStorage.setItem(STORAGE_KEYS.basemapProvider, storedProvider);
+  }
   if (storedKey) el.maptilerKey.value = storedKey;
   const provider = normalizeBasemapProvider(storedProvider, storedKey);
   el.basemapProvider.value = provider;
@@ -419,109 +521,86 @@ function clearRoute() {
 
 async function loadHeatmap() {
   const resp = await fetch(
-    `${api("/v1/heatmap")}?region=${encodeURIComponent(el.region.value)}&max_points=3000&max_tiles=12000`
+    `${api("/v1/heatmap")}?region=${encodeURIComponent(el.region.value)}&max_points=3000&max_tiles=0`
   );
   if (!resp.ok) return;
   const payload = await resp.json();
   const geojson = payload.geojson || { type: "FeatureCollection", features: [] };
-  const geojsonTiles = payload.geojson_tiles || { type: "FeatureCollection", features: [] };
   const tileZoom = Number(payload.tile_zoom || 16);
   heatmapZoomMode = tileZoom <= 14 ? "z14" : "z16";
-  const tileFadeMid = heatmapZoomMode === "z14" ? 10.8 : 12.2;
-  const tileFadeEnd = heatmapZoomMode === "z14" ? 11.8 : 13.2;
-  const blurFadeStart = heatmapZoomMode === "z14" ? 7.8 : 9.2;
-  const blurFadeMid = heatmapZoomMode === "z14" ? 9.4 : 11.4;
-  const blurFadeEnd = heatmapZoomMode === "z14" ? 10.8 : 12.6;
+  const blurStart = heatmapZoomMode === "z14" ? 6.4 : 8.0;
+  const blurMid = heatmapZoomMode === "z14" ? 9.8 : 11.2;
+  const blurEnd = heatmapZoomMode === "z14" ? 13.6 : 14.8;
   if (!map.getSource(heatmapSourceId)) {
     map.addSource(heatmapSourceId, { type: "geojson", data: geojson });
-    map.addSource(heatmapTilesSourceId, { type: "geojson", data: geojsonTiles });
     map.addLayer({
       id: heatmapLayerId,
       type: "heatmap",
       source: heatmapSourceId,
-      maxzoom: blurFadeEnd,
+      maxzoom: blurEnd,
       paint: {
-        "heatmap-weight": ["interpolate", ["linear"], ["get", "score_norm"], 0, 0, 1, 0.75],
-        "heatmap-intensity": 0.22,
+        "heatmap-weight": [
+          "interpolate",
+          ["linear"],
+          ["get", "score_norm"],
+          0,
+          0.04,
+          0.25,
+          0.28,
+          0.55,
+          0.72,
+          1,
+          1,
+        ],
+        "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 6, 0.55, 10, 0.85, 13, 1.1],
         "heatmap-color": [
           "interpolate",
           ["linear"],
           ["heatmap-density"],
           0,
-          "rgba(30,70,110,0)",
-          0.28,
-          "#5aa7ff",
-          0.62,
-          "#8bd17a",
-          1.0,
-          "#ffd26f",
+          "rgba(65, 93, 112, 0)",
+          0.08,
+          "rgba(63, 128, 106, 0.22)",
+          0.22,
+          "rgba(92, 149, 107, 0.38)",
+          0.46,
+          "rgba(207, 158, 76, 0.52)",
+          1,
+          "rgba(190, 96, 62, 0.62)",
         ],
-        "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 5, 16, 8, 22, 10, 30],
+        "heatmap-radius": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          5,
+          26,
+          8,
+          42,
+          10,
+          64,
+          12,
+          86,
+          14,
+          110,
+        ],
         "heatmap-opacity": [
           "interpolate",
           ["linear"],
           ["zoom"],
-          blurFadeStart,
+          blurStart,
           0.18,
-          blurFadeMid,
-          0.28,
-          blurFadeEnd,
-          0.0,
-        ],
-      },
-    });
-    map.addLayer({
-      id: heatmapTilesLayerId,
-      type: "fill",
-      source: heatmapTilesSourceId,
-      minzoom: 0,
-      paint: {
-        "fill-color": [
-          "interpolate",
-          ["linear"],
-          ["get", "score_norm"],
-          0,
-          "#4aa3ff",
-          0.5,
-          "#7fd34e",
-          0.8,
-          "#ffd24a",
-          1,
-          "#ff4f3d",
-        ],
-        "fill-opacity": [
-          "interpolate",
-          ["linear"],
-          ["zoom"],
-          6,
-          0.4,
-          tileFadeMid,
+          blurMid,
+          0.3,
+          blurEnd,
           0.36,
-          tileFadeEnd,
-          0.58,
         ],
-        "fill-outline-color": "rgba(0,0,0,0)",
-        "fill-antialias": false,
       },
     });
     if (map.getLayer("baseline-line")) map.moveLayer("baseline-line");
     if (map.getLayer("scenic-line")) map.moveLayer("scenic-line");
   } else {
     map.getSource(heatmapSourceId).setData(geojson);
-    if (map.getSource(heatmapTilesSourceId)) {
-      map.getSource(heatmapTilesSourceId).setData(geojsonTiles);
-    }
-    if (map.getLayer(heatmapTilesLayerId)) {
-      map.setPaintProperty(
-        heatmapTilesLayerId,
-        "fill-opacity",
-        ["interpolate", ["linear"], ["zoom"], 6, 0.4, tileFadeMid, 0.36, tileFadeEnd, 0.58]
-      );
-    }
     map.setLayoutProperty(heatmapLayerId, "visibility", "visible");
-    if (map.getLayer(heatmapTilesLayerId)) {
-      map.setLayoutProperty(heatmapTilesLayerId, "visibility", "visible");
-    }
   }
 }
 
@@ -583,6 +662,7 @@ function renderRouteList(payload) {
   const scenic = routes.scenic;
   const baseline = routes.baseline;
   const deltas = payload.deltas || {};
+  const diagnostics = payload.diagnostics || {};
   const cards = [];
   if (scenic) {
     const deltaTime = Number(deltas.duration_min || 0);
@@ -649,7 +729,12 @@ function renderRouteList(payload) {
         </div>
       `
     )
-    .join("");
+    .join("") +
+    (diagnostics.start_snap_km || diagnostics.end_snap_km
+      ? `<div class="route-diagnostics">Snapped to road graph: start ${Number(
+          diagnostics.start_snap_km || 0
+        ).toFixed(2)} km, end ${Number(diagnostics.end_snap_km || 0).toFixed(2)} km.</div>`
+      : "");
   document.querySelectorAll(".route-card").forEach((node) => {
     node.addEventListener("click", () => setActiveRoute(node.dataset.kind));
   });
@@ -697,10 +782,7 @@ function setActiveTab(tab, { persist = true } = {}) {
 }
 
 function syncTabState() {
-  const stored = localStorage.getItem(STORAGE_KEYS.activeTab) || "search";
-  setActiveTab(["search", "routes", "settings", "none"].includes(stored) ? stored : "search", {
-    persist: false,
-  });
+  setActiveTab("search", { persist: false });
 }
 
 function readSavedTrips() {
@@ -979,7 +1061,13 @@ async function planRoute() {
     if (!resp.ok) {
       if (resp.status === 422 && payload?.detail?.error === "no_route_found") {
         const hint = payload?.detail?.hint ? ` ${payload.detail.hint}` : "";
-        throw new Error(`No route found between these points in this region.${hint}`);
+        const diag = payload?.detail?.diagnostics || {};
+        const snap = diag.start_snap_km || diag.end_snap_km
+          ? ` Nearest roads: start ${Number(diag.start_snap_km || 0).toFixed(1)} km, end ${Number(
+              diag.end_snap_km || 0
+            ).toFixed(1)} km.`
+          : "";
+        throw new Error(`No route found in ${el.region.value}.${snap}${hint}`);
       }
       if (payload?.detail) {
         const detail = typeof payload.detail === "string" ? payload.detail : JSON.stringify(payload.detail);
@@ -1019,15 +1107,25 @@ async function main() {
 
   initMap();
   await checkHealth();
-  await loadRegions();
+  let usingFallbackRegion = false;
+  try {
+    await loadRegions();
+  } catch {
+    loadFallbackRegions();
+    usingFallbackRegion = true;
+  }
   applyRegionDefaults();
   syncInputMode();
   syncTabState();
+  applyRoutePreference(localStorage.getItem(STORAGE_KEYS.routePreference) || "balanced");
   const autoPlan = applyUrlParams();
-  el.weightValue.textContent = el.scenicWeight.value;
-  el.detourValue.textContent = el.maxDetour.value;
   renderSavedTrips();
   el.routeList.innerHTML = '<div class="route-empty">Plan a route to compare options.</div>';
+  map.once("load", () => {
+    if (el.showHeatmap.checked) {
+      loadHeatmap().catch(() => setStatus("Scenic layer unavailable for this region."));
+    }
+  });
   if (autoPlan) {
     planRoute().catch((err) => setStatus(String(err)));
   }
@@ -1058,6 +1156,9 @@ async function main() {
   });
   el.maxDetour.addEventListener("input", () => {
     el.detourValue.textContent = el.maxDetour.value;
+  });
+  [el.prefFastBtn, el.prefBalancedBtn, el.prefScenicBtn].forEach((btn) => {
+    btn.addEventListener("click", () => applyRoutePreference(btn.dataset.pref));
   });
   el.swapBtn.addEventListener("click", swapPoints);
   el.clearBtn.addEventListener("click", clearRoute);
@@ -1159,7 +1260,7 @@ async function main() {
   installAddressInput("start");
   installAddressInput("end");
   syncRoutePanelState();
-  setStatus("Ready");
+  setStatus(usingFallbackRegion ? "API unavailable. Showing Masswhites shell." : "Ready");
 }
 
 main().catch((err) => setStatus(String(err)));

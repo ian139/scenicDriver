@@ -1,0 +1,66 @@
+{
+  "default_region": "masswhites",
+  "regions": [
+    {
+      "region": "masswhites",
+      "display_name": "Masswhites",
+      "description": "Primary MVP coverage for the Massachusetts / White Mountains scenic corridor.",
+      "graph": "data/processed/road_graphs/masswhites_z14_wide/road_graph.json",
+      "run_name": "masswhites_z14_learned_h4_v2",
+      "model_checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt",
+      "bbox": {
+        "min_lat": 41.19518982948958,
+        "min_lon": -73.5205078125,
+        "max_lat": 44.512176171071054,
+        "max_lon": -72.97119140625
+      },
+      "map": {
+        "center": {
+          "lat": 42.85,
+          "lon": -73.22
+        },
+        "zoom": 8.2
+      }
+    },
+    {
+      "region": "philadelphia",
+      "display_name": "Philadelphia",
+      "description": "Urban validation region.",
+      "graph": "data/processed/road_graphs/philadelphia_core/road_graph.json",
+      "run_name": "philadelphia_z16_learned_v5",
+      "bbox": {
+        "min_lat": 40.018,
+        "min_lon": -75.2284,
+        "max_lat": 40.0734,
+        "max_lon": -75.185
+      },
+      "map": {
+        "center": {
+          "lat": 40.045,
+          "lon": -75.205
+        },
+        "zoom": 12.2
+      }
+    },
+    {
+      "region": "pittsfield",
+      "display_name": "Pittsfield",
+      "description": "Small local routing validation graph.",
+      "graph": "data/processed/road_graphs/pittsfield_core/road_graph.json",
+      "run_name": "masswhites_z14_learned_h4_v2",
+      "bbox": {
+        "min_lat": 42.43,
+        "min_lon": -73.31,
+        "max_lat": 42.57,
+        "max_lon": -73.16
+      },
+      "map": {
+        "center": {
+          "lat": 42.5,
+          "lon": -73.235
+        },
+        "zoom": 11.2
+      }
+    }
+  ]
+}

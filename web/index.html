@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>ScenicDrive MVP</title>
+    <title>Masswhites Scenic Navigator</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
@@ -17,13 +17,16 @@
           <div class="loading-text">Planning route...</div>
         </div>
 
-        <section class="card search-panel" data-panel="search">
+        <aside class="planner-shell" data-panel="search">
           <div class="brand-row">
-            <div>
-              <div class="brand-title">ScenicDrive</div>
-              <div class="brand-sub">Route compare navigator</div>
+            <div class="brand-lockup">
+              <div class="brand-mark" aria-hidden="true">MW</div>
+              <div>
+                <div class="brand-title">Masswhites</div>
+                <div class="brand-sub">Scenic Route System</div>
+              </div>
             </div>
-            <span class="brand-pill">MVP</span>
+            <span id="regionBadge" class="brand-pill">Primary</span>
           </div>
           <div class="search-stack addr-only">
             <div class="search-field">
@@ -53,21 +56,43 @@
             </label>
           </div>
 
-          <div class="inline-actions">
-            <button id="swapBtn" type="button" class="secondary">Swap</button>
+          <div class="preference-group">
+            <div class="preference-switch" role="tablist" aria-label="Route preference">
+              <button id="prefFastBtn" type="button" class="secondary" data-pref="fast">Fastest</button>
+              <button id="prefBalancedBtn" type="button" class="active" data-pref="balanced">Balanced</button>
+              <button id="prefScenicBtn" type="button" class="secondary" data-pref="scenic">Scenic</button>
+            </div>
+          </div>
+
+          <div class="primary-actions">
             <button id="planBtn" type="button">Plan Route</button>
+            <button id="swapBtn" type="button" class="secondary">Swap</button>
           </div>
-          <div class="inline-actions">
-            <button id="saveRouteBtn" type="button" class="secondary">Save Route</button>
-            <button id="shareRouteBtn" type="button" class="secondary">Share Link</button>
-          </div>
-          <button id="clearBtn" type="button" class="secondary">Clear Route</button>
           <div id="status" class="status-pill"></div>
+
+          <section class="route-panel" id="routePanel" data-panel="routes">
+            <div class="route-header">
+              <div>
+                <div class="route-title">Routes</div>
+                <div class="route-sub">Scenic tradeoff</div>
+              </div>
+              <div class="route-actions">
+                <button id="routeCollapseBtn" class="ghost-btn" type="button">Minimize</button>
+              </div>
+            </div>
+            <div id="routeList" class="route-list"></div>
+          </section>
+
+          <div class="secondary-actions">
+            <button id="saveRouteBtn" type="button" class="secondary">Save</button>
+            <button id="shareRouteBtn" type="button" class="secondary">Share</button>
+            <button id="clearBtn" type="button" class="secondary">Clear</button>
+          </div>
           <div class="saved-trips">
             <div class="saved-title">Saved Trips</div>
             <div id="savedTrips" class="saved-list"></div>
           </div>
-        </section>
+        </aside>
 
         <section class="card controls settings-panel menu-collapsed" data-panel="settings">
           <div class="sheet-header">
@@ -99,13 +124,13 @@
             <label>Scenic Weight: <span id="weightValue">0.8</span>
               <input id="scenicWeight" type="range" min="0" max="1" step="0.05" value="0.8" />
             </label>
-            <div class="helper-text">Higher weight allows more detour; route maximizes scenic within that cap.</div>
+            <div class="helper-text">Route preference presets update these advanced values.</div>
             <label>Max Detour Factor: <span id="detourValue">1.8</span>
               <input id="maxDetour" type="range" min="1.2" max="3.0" step="0.1" value="1.8" />
             </label>
             <label class="toggle-row">
               <input id="showHeatmap" type="checkbox" />
-              <span>Show Scenic Heatmap</span>
+              <span>Show Scenic Layer</span>
             </label>
           </div>
 
@@ -116,6 +141,8 @@
             </label>
             <label>Basemap Provider
               <select id="basemapProvider">
+                <option value="carto_voyager">CARTO Voyager</option>
+                <option value="carto_positron">CARTO Light</option>
                 <option value="maptiler">MapTiler</option>
                 <option value="osm">OpenStreetMap</option>
               </select>
@@ -127,19 +154,6 @@
           </div>
         </section>
 
-        <section class="route-panel card" id="routePanel" data-panel="routes">
-          <div class="route-header">
-            <div>
-              <div class="route-title">Routes</div>
-              <div class="route-sub">Tap to focus</div>
-            </div>
-            <div class="route-actions">
-              <span class="route-pill">Compare</span>
-              <button id="routeCollapseBtn" class="ghost-btn" type="button">Minimize</button>
-            </div>
-          </div>
-          <div id="routeList" class="route-list"></div>
-        </section>
         <nav class="mobile-tabs" aria-label="Primary">
           <button class="tab-btn active" type="button" data-tab="search">Search</button>
           <button class="tab-btn" type="button" data-tab="routes">Routes</button>
@@ -149,6 +163,6 @@
     </main>
 
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <script type="module" src="./app.js"></script>
+    <script type="module" src="./app.js?v=masswhites-official-basemap-v2"></script>
   </body>
 </html>

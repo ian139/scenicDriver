@@ -87,6 +87,9 @@ class RoadGraph:
         return out
 
     def find_nearest_node(self, lat: float, lon: float) -> Node:
+        return self.find_nearest_node_with_distance(lat, lon)[0]
+
+    def find_nearest_node_with_distance(self, lat: float, lon: float) -> tuple[Node, float]:
         if not self.nodes:
             raise ValueError("Road graph has no nodes")
         best: Optional[Node] = None
@@ -97,7 +100,7 @@ class RoadGraph:
                 best_dist = d
                 best = node
         assert best is not None
-        return best
+        return best, _haversine_km(float(lat), float(lon), best.lat, best.lon)
 
     def save(self, path: Path) -> None:
         data = {

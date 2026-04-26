@@ -155,16 +155,49 @@ def apply_tile_scores_to_graph(
     return matched, total
 
 
+def _load_graph(path: Path) -> RoadGraph:
+    # Support both FeatureCollection road graphs (.geojson) and serialized RoadGraph JSONs.
+    if path.suffix.lower() == ".geojson":
+        return RoadGraph.from_geojson(path)
+    return RoadGraph.load(path)
+
+
+def diagnose_route_request(request: RouteRequest) -> dict[str, Any]:
+    graph_path = Path(request.graph_geojson)
+    if not graph_path.exists():
+        raise FileNotFoundError(f"Graph GeoJSON not found: {graph_path}")
+
+    graph = _load_graph(graph_path)
+
+    start_node, start_snap_km = graph.find_nearest_node_with_distance(*request.start)
+    end_node, end_snap_km = graph.find_nearest_node_with_distance(*request.end)
+    return {
+        "graph_nodes": int(len(graph.nodes)),
+        "graph_edges": int(len(graph.edges)),
+        "start_snap_km": float(start_snap_km),
+        "end_snap_km": float(end_snap_km),
+        "start_node_id": start_node.id,
+        "end_node_id": end_node.id,
+    }
+
+
 def plan_routes(request: RouteRequest) -> dict[str, Any]:
     graph_path = Path(request.graph_geojson)
     if not graph_path.exists():
         raise FileNotFoundError(f"Graph GeoJSON not found: {graph_path}")
 
-    # Support both FeatureCollection road graphs (.geojson) and serialized RoadGraph JSONs.
-    if graph_path.suffix.lower() == ".geojson":
-        graph = RoadGraph.from_geojson(graph_path)
-    else:
-        graph = RoadGraph.load(graph_path)
+    graph = _load_graph(graph_path)
+
+    start_node, start_snap_km = graph.find_nearest_node_with_distance(*request.start)
+    end_node, end_snap_km = graph.find_nearest_node_with_distance(*request.end)
+    diagnostics = {
+        "graph_nodes": int(len(graph.nodes)),
+        "graph_edges": int(len(graph.edges)),
+        "start_snap_km": float(start_snap_km),
+        "end_snap_km": float(end_snap_km),
+        "start_node_id": start_node.id,
+        "end_node_id": end_node.id,
+    }
     score_mapping = {
         "enabled": False,
         "source": None,
@@ -222,6 +255,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
 
     return {
         "request": request.to_dict(),
+        "diagnostics": diagnostics,
         "score_mapping": score_mapping,
         "routes": routes,
         "geojson": {"type": "FeatureCollection", "features": features},
