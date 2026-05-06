@@ -3,9 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Masswhites Scenic Surface</title>
+    <title>ScenicDriver</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css?v=demo-modules-v2" />
+    <link rel="stylesheet" href="./styles.css?v=surface-story-v7" />
   </head>
   <body>
     <main class="app-shell">
@@ -13,9 +13,16 @@
         <div id="map"></div>
         <canvas id="scenicCanvas" class="scenic-canvas" aria-hidden="true"></canvas>
         <div id="heatmapLegend" class="heatmap-legend hidden" aria-label="Scenic layer legend">
-          <span>Lower</span>
-          <div class="heatmap-legend-scale"></div>
-          <span>Higher</span>
+          <span>0</span>
+          <div class="heatmap-legend-scale"><span>5</span></div>
+          <span>10</span>
+        </div>
+        <div id="surfaceInspector" class="surface-inspector hidden" aria-live="polite">
+          <div>
+            <span id="surfaceInspectorLabel">Surface</span>
+            <strong id="surfaceInspectorScore">--</strong>
+          </div>
+          <span id="surfaceInspectorCoords">Move over the scenic surface</span>
         </div>
         <button id="menuBtn" class="map-menu map-menu-right" type="button">Layers</button>
         <div id="loadingOverlay" class="loading-overlay hidden">
@@ -24,28 +31,25 @@
         </div>
 
         <aside class="planner-shell" data-panel="search">
-          <div class="brand-row">
-            <div class="brand-lockup">
-              <div class="brand-mark" aria-hidden="true">MW</div>
-              <div>
-                <div class="brand-title">Masswhites</div>
-                <div class="brand-sub">Scenic Surface Demo</div>
-              </div>
-            </div>
-            <span id="regionBadge" class="brand-pill">Demo</span>
+          <div class="brand-row simple-brand">
+            <div class="brand-title">ScenicDriver</div>
           </div>
           <div class="demo-readout" aria-label="Demo summary">
             <div>
-              <span>Surface</span>
-              <strong>ML v5</strong>
+              <span>Cells</span>
+              <strong id="surfaceCells">--</strong>
             </div>
             <div>
-              <span>Region</span>
-              <strong>Masswhites</strong>
+              <span>Average</span>
+              <strong id="surfaceAverage">--</strong>
             </div>
             <div>
-              <span>Layer</span>
-              <strong>Static cells</strong>
+              <span>Top</span>
+              <strong id="surfaceTop">--</strong>
+            </div>
+            <div>
+              <span>High share</span>
+              <strong id="surfaceHighShare">--</strong>
             </div>
           </div>
           <div class="search-stack addr-only">
@@ -166,15 +170,10 @@
           </div>
         </section>
 
-        <nav class="mobile-tabs" aria-label="Primary">
-          <button class="tab-btn active" type="button" data-tab="search">Plan</button>
-          <button class="tab-btn" type="button" data-tab="routes">Compare</button>
-          <button class="tab-btn" type="button" data-tab="settings">Layers</button>
-        </nav>
       </section>
     </main>
 
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <script type="module" src="./app.js?v=demo-modules-v2"></script>
+    <script type="module" src="./app.js?v=surface-story-v7"></script>
   </body>
 </html>

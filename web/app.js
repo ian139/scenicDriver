@@ -4,7 +4,6 @@ const el = {
   basemapProvider: document.getElementById("basemapProvider"),
   basemapStatus: document.getElementById("basemapStatus"),
   region: document.getElementById("region"),
-  regionBadge: document.getElementById("regionBadge"),
   modeAddressBtn: document.getElementById("modeAddressBtn"),
   modeCoordsBtn: document.getElementById("modeCoordsBtn"),
   prefFastBtn: document.getElementById("prefFastBtn"),
@@ -25,6 +24,14 @@ const el = {
   loadingOverlay: document.getElementById("loadingOverlay"),
   scenicCanvas: document.getElementById("scenicCanvas"),
   heatmapLegend: document.getElementById("heatmapLegend"),
+  surfaceInspector: document.getElementById("surfaceInspector"),
+  surfaceInspectorLabel: document.getElementById("surfaceInspectorLabel"),
+  surfaceInspectorScore: document.getElementById("surfaceInspectorScore"),
+  surfaceInspectorCoords: document.getElementById("surfaceInspectorCoords"),
+  surfaceCells: document.getElementById("surfaceCells"),
+  surfaceAverage: document.getElementById("surfaceAverage"),
+  surfaceTop: document.getElementById("surfaceTop"),
+  surfaceHighShare: document.getElementById("surfaceHighShare"),
   menuBtn: document.getElementById("menuBtn"),
   scenicWeight: document.getElementById("scenicWeight"),
   weightValue: document.getElementById("weightValue"),
@@ -53,10 +60,20 @@ const heatmapSourceId = "scenic-heatmap";
 const heatmapLayerId = "scenic-heatmap-layer";
 const heatmapSoftSourceId = "scenic-heatmap-soft";
 const heatmapSoftLayerId = "scenic-heatmap-soft-layer";
+const heatmapMaskSourceId = "scenic-surface-mask";
+const heatmapMaskLayerId = "scenic-surface-mask-layer";
+const heatmapBoundsSourceId = "scenic-surface-bounds";
+const heatmapBoundsLayerId = "scenic-surface-bounds-layer";
+const heatmapTopSourceId = "scenic-surface-top";
+const heatmapTopFillLayerId = "scenic-surface-top-fill";
+const heatmapTopLineLayerId = "scenic-surface-top-line";
 const heatmapTilesSourceId = "scenic-heatmap-tiles";
 const heatmapTilesLayerId = "scenic-heatmap-tiles-layer";
 let heatmapZoomMode = "z16";
 let heatmapGeojson = null;
+let heatmapInspectorBound = false;
+let heatmapLoadPromise = null;
+let surfaceScoreBreaks = { moderate: 0.38, high: 0.68, peak: 0.85 };
 let regionsMeta = [];
 let busy = false;
 let inputMode = "address";
@@ -142,7 +159,7 @@ function clamp(value, min, max) {
 
 function toggleMenu() {
   if (isMobileLayout()) {
-    setActiveTab("settings");
+    setSheetOpen(true);
     return;
   }
   el.controls?.classList.toggle("menu-collapsed");
@@ -309,7 +326,7 @@ function applyBasemap() {
     if (seq !== basemapApplySeq) return;
     if (center) map.jumpTo({ center, zoom, bearing, pitch });
     if (el.showHeatmap.checked) {
-      const heatmapReady = heatmapGeojson ? Promise.resolve(renderMapHeatmapLayer(heatmapGeojson)) : loadHeatmap();
+      const heatmapReady = heatmapGeojson ? Promise.resolve(renderMapHeatmapLayer(heatmapGeojson, { fit: false })) : loadHeatmap();
       heatmapReady
         .catch(() => showRouteMessage("Heatmap unavailable for this region."))
         .finally(() => {
@@ -400,9 +417,6 @@ function applyRegionDefaults() {
       });
     }
   }
-  if (el.regionBadge) {
-    el.regionBadge.textContent = region?.is_default ? "Primary" : "Region";
-  }
   el.startLat.value = startLat.toFixed(6);
   el.startLon.value = startLon.toFixed(6);
   el.endLat.value = endLat.toFixed(6);
@@ -448,6 +462,31 @@ function initMap() {
     center: [-75.2, 40.045],
     zoom: 12,
   });
+}
+
+function isMapStyleEditable() {
+  try {
+    return Boolean(map?.getStyle()?.layers?.length);
+  } catch {
+    return false;
+  }
+}
+
+function whenMapStyleReady(callback) {
+  if (!map) return;
+  if (isMapStyleEditable()) {
+    callback();
+    return;
+  }
+  let done = false;
+  const run = () => {
+    if (done || !isMapStyleEditable()) return;
+    done = true;
+    callback();
+  };
+  map.once("load", run);
+  map.once("style.load", run);
+  map.once("idle", run);
 }
 
 async function geocodeMany(query) {
@@ -630,6 +669,14 @@ function clearRoute() {
 }
 
 async function loadHeatmap() {
+  if (heatmapLoadPromise) return heatmapLoadPromise;
+  heatmapLoadPromise = loadHeatmapNow().finally(() => {
+    heatmapLoadPromise = null;
+  });
+  return heatmapLoadPromise;
+}
+
+async function loadHeatmapNow() {
   let payload = null;
   try {
     const resp = await fetch(
@@ -650,11 +697,12 @@ async function loadHeatmap() {
   if (el.heatmapLegend) {
     el.heatmapLegend.dataset.source = heatmapGeojson.features?.[0]?.properties?.source || "unknown";
   }
+  updateSurfaceStats(heatmapGeojson);
   syncHeatmapUi(true);
   const tileZoom = Number(payload.tile_zoom || 16);
   heatmapZoomMode = tileZoom <= 14 ? "z14" : "z16";
   clearScenicCanvas();
-  renderMapHeatmapLayer(heatmapGeojson);
+  renderMapHeatmapLayer(heatmapGeojson, { fit: true });
 }
 
 async function loadStaticHeatmapPayload() {
@@ -707,20 +755,214 @@ function normalizeHeatmapGeojson(geojson) {
   return { type: "FeatureCollection", features };
 }
 
-function renderMapHeatmapLayer(geojson) {
+function renderMapHeatmapLayer(geojson, { fit = false } = {}) {
   if (!map || !geojson) return;
-  if (!map.isStyleLoaded()) {
-    map.once("style.load", () => renderMapHeatmapLayer(geojson));
+  if (!isMapStyleEditable()) {
+    whenMapStyleReady(() => renderMapHeatmapLayer(geojson, { fit }));
     return;
   }
   removeMaplibreHeatmapLayer();
+  const bounds = heatmapBounds(geojson);
+  if (bounds) {
+    const padded = padBounds(bounds, 0.08);
+    renderHeatmapSurfaceMask(padded);
+    constrainMapToHeatmap(bounds);
+    if (fit) focusHeatmapBounds(padded);
+  }
   map.addSource(heatmapSourceId, { type: "geojson", data: geojson });
   const geometryType = geojson.features?.[0]?.geometry?.type;
   if (geometryType === "Polygon" || geometryType === "MultiPolygon") {
     renderFilledHeatmapLayer();
+    renderTopHeatmapLayer(geojson);
+    bindHeatmapInspector();
     return;
   }
   renderPointHeatmapLayer();
+  renderTopHeatmapLayer(geojson);
+  bindHeatmapInspector();
+}
+
+function scoreLabel(scoreNorm) {
+  if (scoreNorm >= surfaceScoreBreaks.peak) return "Peak";
+  if (scoreNorm >= surfaceScoreBreaks.high) return "High";
+  if (scoreNorm >= surfaceScoreBreaks.moderate) return "Moderate";
+  return "Low";
+}
+
+function score10(scoreNorm) {
+  return clamp(Number(scoreNorm) || 0, 0, 1) * 10;
+}
+
+function updateSurfaceStats(geojson) {
+  const scores = (geojson?.features || [])
+    .map((feature) => Number(feature?.properties?.score_norm))
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  const count = scores.length;
+  if (!count) {
+    el.surfaceCells.textContent = "--";
+    el.surfaceAverage.textContent = "--";
+    el.surfaceTop.textContent = "--";
+    el.surfaceHighShare.textContent = "--";
+    return;
+  }
+  const avg = scores.reduce((sum, score) => sum + score, 0) / count;
+  const top = scores[count - 1];
+  surfaceScoreBreaks = {
+    moderate: scores[Math.floor(count * 0.5)],
+    high: scores[Math.floor(count * 0.8)],
+    peak: scores[Math.floor(count * 0.95)],
+  };
+  const highShare = scores.filter((score) => score >= surfaceScoreBreaks.high).length / count;
+  el.surfaceCells.textContent = count.toLocaleString();
+  el.surfaceAverage.textContent = score10(avg).toFixed(1);
+  el.surfaceTop.textContent = score10(top).toFixed(1);
+  el.surfaceHighShare.textContent = `${Math.round(highShare * 100)}%`;
+}
+
+function topScenicFeatures(geojson, percentile = 0.9) {
+  const features = geojson?.features || [];
+  const scores = features
+    .map((feature) => Number(feature?.properties?.score_norm))
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  if (!scores.length) return { type: "FeatureCollection", features: [] };
+  const idx = Math.max(0, Math.min(scores.length - 1, Math.floor(scores.length * percentile)));
+  const threshold = scores[idx];
+  return {
+    type: "FeatureCollection",
+    features: features.filter((feature) => Number(feature?.properties?.score_norm) >= threshold),
+  };
+}
+
+function walkCoordinates(coords, visit) {
+  if (!Array.isArray(coords)) return;
+  if (typeof coords[0] === "number" && typeof coords[1] === "number") {
+    visit(Number(coords[0]), Number(coords[1]));
+    return;
+  }
+  coords.forEach((child) => walkCoordinates(child, visit));
+}
+
+function heatmapBounds(geojson) {
+  let west = Infinity;
+  let south = Infinity;
+  let east = -Infinity;
+  let north = -Infinity;
+  (geojson?.features || []).forEach((feature) => {
+    walkCoordinates(feature?.geometry?.coordinates, (lon, lat) => {
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) return;
+      west = Math.min(west, lon);
+      south = Math.min(south, lat);
+      east = Math.max(east, lon);
+      north = Math.max(north, lat);
+    });
+  });
+  if (![west, south, east, north].every(Number.isFinite)) return null;
+  return { west, south, east, north };
+}
+
+function padBounds(bounds, ratio) {
+  const lonPad = Math.max((bounds.east - bounds.west) * ratio, 0.02);
+  const latPad = Math.max((bounds.north - bounds.south) * ratio, 0.02);
+  return {
+    west: clamp(bounds.west - lonPad, -179.9, 179.9),
+    south: clamp(bounds.south - latPad, -84.9, 84.9),
+    east: clamp(bounds.east + lonPad, -179.9, 179.9),
+    north: clamp(bounds.north + latPad, -84.9, 84.9),
+  };
+}
+
+function rectangleFeature(west, south, east, north) {
+  return {
+    type: "Feature",
+    properties: {},
+    geometry: {
+      type: "Polygon",
+      coordinates: [[
+        [west, south],
+        [east, south],
+        [east, north],
+        [west, north],
+        [west, south],
+      ]],
+    },
+  };
+}
+
+function renderHeatmapSurfaceMask(bounds) {
+  const world = { west: -180, south: -85, east: 180, north: 85 };
+  const features = [
+    rectangleFeature(world.west, world.south, bounds.west, world.north),
+    rectangleFeature(bounds.east, world.south, world.east, world.north),
+    rectangleFeature(bounds.west, world.south, bounds.east, bounds.south),
+    rectangleFeature(bounds.west, bounds.north, bounds.east, world.north),
+  ];
+  map.addSource(heatmapMaskSourceId, {
+    type: "geojson",
+    data: { type: "FeatureCollection", features },
+  });
+  map.addLayer({
+    id: heatmapMaskLayerId,
+    type: "fill",
+    source: heatmapMaskSourceId,
+    paint: {
+      "fill-color": "rgba(246, 248, 246, 0.88)",
+      "fill-opacity": 1,
+    },
+  });
+  map.addSource(heatmapBoundsSourceId, {
+    type: "geojson",
+    data: rectangleFeature(bounds.west, bounds.south, bounds.east, bounds.north),
+  });
+  map.addLayer({
+    id: heatmapBoundsLayerId,
+    type: "line",
+    source: heatmapBoundsSourceId,
+    paint: {
+      "line-color": "rgba(36, 79, 69, 0.34)",
+      "line-width": [
+        "interpolate",
+        ["linear"],
+        ["zoom"],
+        7,
+        0.6,
+        12,
+        0.9,
+        16,
+        1.2,
+      ],
+      "line-opacity": 0.42,
+    },
+  });
+}
+
+function focusHeatmapBounds(bounds) {
+  const compact = window.matchMedia("(max-width: 760px)").matches;
+  map.fitBounds(
+    [
+      [bounds.west, bounds.south],
+      [bounds.east, bounds.north],
+    ],
+    {
+      padding: compact
+        ? { top: 58, right: 28, bottom: Math.round(window.innerHeight * 0.58), left: 28 }
+        : { top: 54, right: 330, bottom: 54, left: 340 },
+      duration: 0,
+    }
+  );
+}
+
+function constrainMapToHeatmap(bounds) {
+  const loose = padBounds(bounds, 1.6);
+  try {
+    map.setMaxBounds([
+      [loose.west, loose.south],
+      [loose.east, loose.north],
+    ]);
+  } catch {
+    // Older MapLibre builds can be picky about maxBounds during style swaps.
+  }
 }
 
 function scenicColorExpression() {
@@ -751,8 +993,8 @@ function renderFilledHeatmapLayer() {
     paint: {
       "fill-color": scenicColorExpression(),
       "fill-opacity": 0.64,
-      "fill-outline-color": scenicColorExpression(),
-      "fill-antialias": false,
+      "fill-outline-color": "rgba(0, 0, 0, 0)",
+      "fill-antialias": true,
     },
   });
   map.addSource(heatmapSoftSourceId, { type: "geojson", data: cellCenterGeojson(heatmapGeojson) });
@@ -800,6 +1042,50 @@ function renderFilledHeatmapLayer() {
       ],
     },
   });
+  if (map.getLayer("baseline-line")) map.moveLayer("baseline-line");
+  if (map.getLayer("scenic-line")) map.moveLayer("scenic-line");
+}
+
+function renderTopHeatmapLayer(geojson) {
+  const topGeojson = topScenicFeatures(geojson, 0.9);
+  if (!topGeojson.features.length) return;
+  map.addSource(heatmapTopSourceId, { type: "geojson", data: topGeojson });
+  const geometryType = topGeojson.features?.[0]?.geometry?.type;
+  if (geometryType === "Polygon" || geometryType === "MultiPolygon") {
+    map.addLayer({
+      id: heatmapTopFillLayerId,
+      type: "fill",
+      source: heatmapTopSourceId,
+      paint: {
+        "fill-color": "rgba(255, 236, 190, 0.16)",
+        "fill-opacity": 1,
+      },
+    });
+  } else {
+    map.addLayer({
+      id: heatmapTopFillLayerId,
+      type: "circle",
+      source: heatmapTopSourceId,
+      paint: {
+        "circle-color": "rgba(139, 58, 48, 0.34)",
+        "circle-radius": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          7,
+          10,
+          12,
+          28,
+          16,
+          74,
+        ],
+        "circle-stroke-color": "rgba(139, 58, 48, 0.72)",
+        "circle-stroke-width": 1.2,
+        "circle-blur": 0.55,
+      },
+    });
+  }
+  if (map.getLayer(heatmapBoundsLayerId)) map.moveLayer(heatmapBoundsLayerId);
   if (map.getLayer("baseline-line")) map.moveLayer("baseline-line");
   if (map.getLayer("scenic-line")) map.moveLayer("scenic-line");
 }
@@ -894,6 +1180,39 @@ function renderPointHeatmapLayer() {
   if (map.getLayer("scenic-line")) map.moveLayer("scenic-line");
 }
 
+function bindHeatmapInspector() {
+  if (heatmapInspectorBound || !map) return;
+  heatmapInspectorBound = true;
+  const inspect = (ev) => {
+    if (!el.showHeatmap?.checked || !map.getLayer(heatmapLayerId)) {
+      hideSurfaceInspector();
+      return;
+    }
+    const features = map.queryRenderedFeatures(ev.point, { layers: [heatmapLayerId] });
+    const feature = features.find((item) => Number.isFinite(Number(item?.properties?.score_norm)));
+    if (!feature) {
+      hideSurfaceInspector();
+      return;
+    }
+    showSurfaceInspector(feature, ev.lngLat);
+  };
+  map.on("mousemove", inspect);
+  map.on("click", inspect);
+  map.on("mouseout", hideSurfaceInspector);
+}
+
+function showSurfaceInspector(feature, lngLat) {
+  const scoreNorm = clamp(Number(feature?.properties?.score_norm) || 0, 0, 1);
+  el.surfaceInspectorLabel.textContent = scoreLabel(scoreNorm);
+  el.surfaceInspectorScore.textContent = score10(scoreNorm).toFixed(1);
+  el.surfaceInspectorCoords.textContent = `${Number(lngLat.lat).toFixed(4)}, ${Number(lngLat.lng).toFixed(4)}`;
+  el.surfaceInspector.classList.remove("hidden");
+}
+
+function hideSurfaceInspector() {
+  el.surfaceInspector?.classList.add("hidden");
+}
+
 function buildDemoHeatmapPayload() {
   const features = [];
   const bounds = DEMO_HEATMAP_BOUNDS;
@@ -933,21 +1252,41 @@ function buildDemoHeatmapPayload() {
 function hideHeatmap() {
   clearScenicCanvas();
   removeMaplibreHeatmapLayer();
+  hideSurfaceInspector();
+  try {
+    map?.setMaxBounds(null);
+  } catch {
+    // Let the existing map extent stand if this MapLibre build rejects null bounds.
+  }
   syncHeatmapUi(false);
 }
 
 function syncHeatmapUi(visible = Boolean(el.showHeatmap?.checked)) {
   el.heatmapLegend?.classList.toggle("hidden", !visible);
+  if (!visible) hideSurfaceInspector();
   document.body.classList.toggle("scenic-layer-active", visible);
+}
+
+function enableDefaultScenicLayer() {
+  el.showHeatmap.checked = true;
+  syncHeatmapUi(true);
+  loadHeatmap().catch(() => showRouteMessage("Heatmap unavailable for this region."));
 }
 
 function removeMaplibreHeatmapLayer() {
   if (!map) return;
+  if (map.getLayer(heatmapTopLineLayerId)) map.removeLayer(heatmapTopLineLayerId);
+  if (map.getLayer(heatmapTopFillLayerId)) map.removeLayer(heatmapTopFillLayerId);
   if (map.getLayer(heatmapSoftLayerId)) map.removeLayer(heatmapSoftLayerId);
   if (map.getLayer(heatmapLayerId)) map.removeLayer(heatmapLayerId);
+  if (map.getLayer(heatmapBoundsLayerId)) map.removeLayer(heatmapBoundsLayerId);
+  if (map.getLayer(heatmapMaskLayerId)) map.removeLayer(heatmapMaskLayerId);
   if (map.getLayer(heatmapTilesLayerId)) map.removeLayer(heatmapTilesLayerId);
+  if (map.getSource(heatmapTopSourceId)) map.removeSource(heatmapTopSourceId);
   if (map.getSource(heatmapSoftSourceId)) map.removeSource(heatmapSoftSourceId);
   if (map.getSource(heatmapSourceId)) map.removeSource(heatmapSourceId);
+  if (map.getSource(heatmapBoundsSourceId)) map.removeSource(heatmapBoundsSourceId);
+  if (map.getSource(heatmapMaskSourceId)) map.removeSource(heatmapMaskSourceId);
   if (map.getSource(heatmapTilesSourceId)) map.removeSource(heatmapTilesSourceId);
 }
 
@@ -1106,9 +1445,7 @@ function setRoutePanelCollapsed(collapsed, { persist = true } = {}) {
 }
 
 function isMobileLayout() {
-  const tabs = document.querySelector(".mobile-tabs");
-  const tabsVisible = tabs ? window.getComputedStyle(tabs).display !== "none" : false;
-  return window.matchMedia("(max-width: 720px)").matches || tabsVisible;
+  return window.matchMedia("(max-width: 760px)").matches;
 }
 
 function setSheetOpen(open) {
@@ -1122,9 +1459,6 @@ function setSheetOpen(open) {
 function setActiveTab(tab, { persist = true } = {}) {
   const next = ["search", "routes", "settings", "none"].includes(tab) ? tab : "search";
   document.body.dataset.activeTab = next;
-  document.querySelectorAll(".tab-btn").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.tab === next);
-  });
   if (persist) localStorage.setItem(STORAGE_KEYS.activeTab, next);
   if (next === "settings") {
     const stored = localStorage.getItem(STORAGE_KEYS.settingsSheetOpen);
@@ -1136,7 +1470,8 @@ function setActiveTab(tab, { persist = true } = {}) {
 }
 
 function syncTabState() {
-  setActiveTab("search", { persist: false });
+  document.body.dataset.activeTab = "search";
+  setSheetOpen(false);
 }
 
 function readSavedTrips() {
@@ -1432,7 +1767,6 @@ async function planRoute() {
 
     if (seq !== planSeq) return;
     renderRouteList(payload);
-    if (isMobileLayout()) setActiveTab("routes");
     lastRoutePayload = payload;
     if (seq === planSeq) scheduleRouteRender(payload.geojson);
     updateShareUrl(lastPlan);
@@ -1473,7 +1807,7 @@ async function main() {
   const autoPlan = applyUrlParams();
   renderSavedTrips();
   el.routeList.innerHTML = '<div class="route-empty">API route output appears here.</div>';
-  if (el.showHeatmap.checked) loadHeatmap();
+  enableDefaultScenicLayer();
   if (autoPlan) {
     planRoute().catch(showRouteError);
   }
@@ -1565,16 +1899,6 @@ async function main() {
         el.shareRouteBtn.textContent = original;
       }, 1800);
     }
-  });
-  document.querySelectorAll(".tab-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const current = document.body.dataset.activeTab || "search";
-      if (btn.dataset.tab === current) {
-        setActiveTab("none");
-      } else {
-        setActiveTab(btn.dataset.tab);
-      }
-    });
   });
   if (el.sheetToggleBtn) {
     el.sheetToggleBtn.addEventListener("click", () => {
