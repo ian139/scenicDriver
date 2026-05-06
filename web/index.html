@@ -3,15 +3,21 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Masswhites Scenic Navigator</title>
+    <title>Masswhites Scenic Surface</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./styles.css?v=demo-modules-v2" />
   </head>
   <body>
     <main class="app-shell">
       <section class="map-stage">
         <div id="map"></div>
-        <button id="menuBtn" class="map-menu map-menu-right" type="button">Settings</button>
+        <canvas id="scenicCanvas" class="scenic-canvas" aria-hidden="true"></canvas>
+        <div id="heatmapLegend" class="heatmap-legend hidden" aria-label="Scenic layer legend">
+          <span>Lower</span>
+          <div class="heatmap-legend-scale"></div>
+          <span>Higher</span>
+        </div>
+        <button id="menuBtn" class="map-menu map-menu-right" type="button">Layers</button>
         <div id="loadingOverlay" class="loading-overlay hidden">
           <div class="loading-spinner"></div>
           <div class="loading-text">Planning route...</div>
@@ -23,10 +29,24 @@
               <div class="brand-mark" aria-hidden="true">MW</div>
               <div>
                 <div class="brand-title">Masswhites</div>
-                <div class="brand-sub">Scenic Route System</div>
+                <div class="brand-sub">Scenic Surface Demo</div>
               </div>
             </div>
-            <span id="regionBadge" class="brand-pill">Primary</span>
+            <span id="regionBadge" class="brand-pill">Demo</span>
+          </div>
+          <div class="demo-readout" aria-label="Demo summary">
+            <div>
+              <span>Surface</span>
+              <strong>ML v5</strong>
+            </div>
+            <div>
+              <span>Region</span>
+              <strong>Masswhites</strong>
+            </div>
+            <div>
+              <span>Layer</span>
+              <strong>Static cells</strong>
+            </div>
           </div>
           <div class="search-stack addr-only">
             <div class="search-field">
@@ -65,7 +85,7 @@
           </div>
 
           <div class="primary-actions">
-            <button id="planBtn" type="button">Plan Route</button>
+            <button id="planBtn" type="button">Compare Route</button>
             <button id="swapBtn" type="button" class="secondary">Swap</button>
           </div>
           <div id="status" class="status-pill"></div>
@@ -73,20 +93,20 @@
           <section class="route-panel" id="routePanel" data-panel="routes">
             <div class="route-header">
               <div>
-                <div class="route-title">Routes</div>
-                <div class="route-sub">Scenic tradeoff</div>
+                <div class="route-title">Compare</div>
+                <div class="route-sub">API output</div>
               </div>
               <div class="route-actions">
-                <button id="routeCollapseBtn" class="ghost-btn" type="button">Minimize</button>
+                <button id="routeCollapseBtn" class="ghost-btn" type="button">Hide</button>
               </div>
             </div>
             <div id="routeList" class="route-list"></div>
           </section>
 
           <div class="secondary-actions">
-            <button id="saveRouteBtn" type="button" class="secondary">Save</button>
             <button id="shareRouteBtn" type="button" class="secondary">Share</button>
             <button id="clearBtn" type="button" class="secondary">Clear</button>
+            <button id="saveRouteBtn" type="button" class="secondary">Save</button>
           </div>
           <div class="saved-trips">
             <div class="saved-title">Saved Trips</div>
@@ -97,72 +117,64 @@
         <section class="card controls settings-panel menu-collapsed" data-panel="settings">
           <div class="sheet-header">
             <div class="sheet-grip" aria-hidden="true"></div>
-            <div class="sheet-title">Settings</div>
+            <div class="sheet-title">Layers</div>
             <button id="sheetToggleBtn" class="ghost-btn" type="button">Collapse</button>
           </div>
           <div class="control-group">
-            <div class="group-title">Region</div>
+            <div class="group-title">Surface</div>
             <label>Region
               <select id="region"></select>
             </label>
-            <div class="inline-actions">
-              <button id="refreshRegionsBtn" type="button" class="secondary">Refresh Regions</button>
-              <span id="apiHealth" class="pill">API: checking...</span>
+            <div class="mode-switch map-style-switch" role="tablist" aria-label="Map style">
+              <button id="mapStyleMapBtn" type="button" class="active" data-basemap="carto_voyager">Map</button>
+              <button id="mapStyleSatelliteBtn" type="button" class="secondary" data-basemap="satellite">Satellite</button>
             </div>
-          </div>
-
-          <div class="control-group">
-            <div class="group-title">Input Mode</div>
-            <div class="mode-switch" role="tablist" aria-label="Input mode">
-              <button id="modeAddressBtn" type="button" class="active">Addresses</button>
-              <button id="modeCoordsBtn" type="button" class="secondary">Coordinates</button>
-            </div>
-          </div>
-
-          <div class="control-group">
-            <div class="group-title">Routing</div>
-            <label>Scenic Weight: <span id="weightValue">0.8</span>
-              <input id="scenicWeight" type="range" min="0" max="1" step="0.05" value="0.8" />
-            </label>
-            <div class="helper-text">Route preference presets update these advanced values.</div>
-            <label>Max Detour Factor: <span id="detourValue">1.8</span>
-              <input id="maxDetour" type="range" min="1.2" max="3.0" step="0.1" value="1.8" />
-            </label>
             <label class="toggle-row">
-              <input id="showHeatmap" type="checkbox" />
+              <input id="showHeatmap" type="checkbox" checked />
               <span>Show Scenic Layer</span>
             </label>
           </div>
 
           <div class="control-group">
-            <div class="group-title">Connection</div>
-            <label>API Base URL
-              <input id="apiBase" value="http://localhost:8080" />
+            <div class="group-title">Route knobs</div>
+            <label>Scenic Weight: <span id="weightValue">0.8</span>
+              <input id="scenicWeight" type="range" min="0" max="1" step="0.05" value="0.8" />
             </label>
-            <label>Basemap Provider
-              <select id="basemapProvider">
-                <option value="carto_voyager">CARTO Voyager</option>
-                <option value="carto_positron">CARTO Light</option>
-                <option value="maptiler">MapTiler</option>
-                <option value="osm">OpenStreetMap</option>
-              </select>
+            <label>Max Detour Factor: <span id="detourValue">1.8</span>
+              <input id="maxDetour" type="range" min="1.2" max="3.0" step="0.1" value="1.8" />
             </label>
-            <label>MapTiler API Key
-              <input id="maptilerKey" type="password" placeholder="Paste MapTiler key" />
-            </label>
-            <span id="basemapStatus" class="pill">Basemap: loading...</span>
+          </div>
+
+          <details class="advanced-settings">
+            <summary>Advanced</summary>
+            <div class="control-group">
+              <div class="inline-actions">
+                <button id="refreshRegionsBtn" type="button" class="secondary">Refresh Regions</button>
+                <span id="apiHealth" class="pill">API: checking...</span>
+              </div>
+              <label>API Base URL
+                <input id="apiBase" value="http://localhost:8080" />
+              </label>
+              <input id="basemapProvider" type="hidden" value="carto_voyager" />
+              <span id="basemapStatus" class="pill">Basemap: loading...</span>
+            </div>
+          </details>
+
+          <div class="hidden" aria-hidden="true">
+            <button id="modeAddressBtn" type="button" class="active">Addresses</button>
+            <button id="modeCoordsBtn" type="button" class="secondary">Coordinates</button>
           </div>
         </section>
 
         <nav class="mobile-tabs" aria-label="Primary">
-          <button class="tab-btn active" type="button" data-tab="search">Search</button>
-          <button class="tab-btn" type="button" data-tab="routes">Routes</button>
-          <button class="tab-btn" type="button" data-tab="settings">Settings</button>
+          <button class="tab-btn active" type="button" data-tab="search">Plan</button>
+          <button class="tab-btn" type="button" data-tab="routes">Compare</button>
+          <button class="tab-btn" type="button" data-tab="settings">Layers</button>
         </nav>
       </section>
     </main>
 
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <script type="module" src="./app.js?v=masswhites-official-basemap-v2"></script>
+    <script type="module" src="./app.js?v=demo-modules-v2"></script>
   </body>
 </html>

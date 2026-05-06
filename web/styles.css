@@ -13,7 +13,7 @@
   --signal: #b9653d;
   --route-blue: #386f9f;
   --wash: rgba(244, 247, 245, 0.86);
-  --shadow: 0 18px 48px rgba(20, 30, 40, 0.16);
+  --shadow: 0 10px 28px rgba(20, 30, 40, 0.11);
 }
 
 * {
@@ -54,23 +54,69 @@ button {
   inset: 0;
 }
 
+.scenic-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: none;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  opacity: 0;
+  mix-blend-mode: multiply;
+  transition: opacity 180ms ease;
+}
+
+body.scenic-layer-active .scenic-canvas {
+  opacity: 0;
+}
+
 .planner-shell {
   position: absolute;
   top: 18px;
   left: 18px;
-  bottom: 18px;
-  width: 380px;
+  width: 306px;
+  max-height: calc(100vh - 36px);
   z-index: 20;
-  display: grid;
-  grid-template-rows: auto auto auto auto auto minmax(0, 1fr) auto auto;
-  gap: 12px;
-  padding: 18px;
-  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 12px;
+  overflow-y: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--paper);
+  background: rgba(252, 253, 252, 0.9);
   box-shadow: var(--shadow);
-  backdrop-filter: blur(18px);
+  backdrop-filter: blur(16px);
+}
+
+.heatmap-legend {
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+  z-index: 19;
+  display: grid;
+  grid-template-columns: auto minmax(150px, 210px) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 11px;
+  border: 1px solid rgba(31, 43, 55, 0.12);
+  border-radius: 8px;
+  background: rgba(252, 253, 252, 0.78);
+  color: var(--muted);
+  box-shadow: 0 12px 28px rgba(20, 30, 40, 0.11);
+  backdrop-filter: blur(16px);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.heatmap-legend-scale {
+  height: 10px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #407d69, #84a467, #e6b056, #d56f3f, #974434);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.38);
 }
 
 .brand-row,
@@ -88,7 +134,7 @@ button {
 }
 
 .brand-row {
-  padding-bottom: 12px;
+  padding-bottom: 8px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -102,8 +148,8 @@ button {
 .brand-mark {
   display: grid;
   place-items: center;
-  width: 38px;
-  height: 38px;
+  width: 34px;
+  height: 34px;
   flex: 0 0 auto;
   border: 1px solid rgba(36, 79, 69, 0.24);
   border-radius: 8px;
@@ -115,7 +161,7 @@ button {
 }
 
 .brand-title {
-  font-size: 24px;
+  font-size: 20px;
   line-height: 1.05;
   font-weight: 800;
   letter-spacing: 0;
@@ -135,7 +181,45 @@ button {
 }
 
 .brand-sub {
-  margin-top: 5px;
+  margin-top: 3px;
+}
+
+.demo-readout {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(31, 43, 55, 0.08);
+}
+
+.demo-readout div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 8px 9px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.demo-readout span {
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.demo-readout strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .brand-pill,
@@ -156,7 +240,7 @@ button {
 
 .search-stack {
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
 .search-field {
@@ -173,12 +257,12 @@ button {
 .controls input,
 .controls select {
   width: 100%;
-  min-height: 42px;
+  min-height: 36px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;
   color: var(--ink);
-  padding: 10px 12px;
+  padding: 8px 10px;
   outline: none;
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
@@ -238,43 +322,49 @@ button {
 .preference-switch {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 6px;
-  padding: 3px;
-  border: 1px solid var(--line);
+  gap: 0;
+  padding: 2px;
+  border: 0;
   border-radius: 8px;
-  background: rgba(232, 237, 234, 0.7);
+  background: rgba(222, 229, 226, 0.74);
 }
 
 .preference-switch button,
 .mode-switch button {
-  min-height: 36px;
+  min-height: 30px;
   border: 0;
   border-radius: 6px;
   background: transparent;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 700;
+  box-shadow: none;
+  transition: background 120ms ease, color 120ms ease, box-shadow 120ms ease;
 }
 
 .preference-switch button.active,
 .mode-switch button.active {
-  background: var(--paper-solid);
+  background: #fff;
   color: var(--ink);
-  box-shadow: 0 1px 3px rgba(24, 33, 43, 0.12);
+  box-shadow: 0 1px 2px rgba(24, 33, 43, 0.12);
 }
 
 .primary-actions {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 82px;
-  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) 62px;
+  gap: 7px;
 }
 
 .secondary-actions {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-  padding-top: 4px;
-  border-top: 1px solid var(--line);
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: -6px;
+}
+
+#saveRouteBtn,
+.saved-trips {
+  display: none;
 }
 
 .inline-actions {
@@ -292,11 +382,11 @@ button {
   background: #fff;
   color: var(--ink);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 750;
 }
 
 #planBtn {
-  min-height: 42px;
+  min-height: 38px;
   border-color: var(--brand);
   background: var(--brand);
   color: #fff;
@@ -308,35 +398,37 @@ button {
 
 .secondary,
 .ghost-btn {
-  background: rgba(247, 249, 247, 0.9) !important;
+  border-color: rgba(31, 43, 55, 0.1) !important;
+  background: rgba(247, 249, 247, 0.62) !important;
   color: var(--muted) !important;
+  box-shadow: none !important;
+}
+
+.secondary-actions .secondary {
+  min-height: 28px;
+  padding: 0 11px;
+  border: 0 !important;
+  background: transparent !important;
 }
 
 .status-pill {
-  min-height: 32px;
-  padding: 8px 10px;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--wash);
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.3;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: none;
 }
 
 .route-panel {
   min-height: 0;
+  flex: 0 1 auto;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  gap: 10px;
-  padding-top: 2px;
+  gap: 8px;
+  max-height: 210px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
   overflow: hidden;
 }
 
 .route-title {
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 800;
 }
 
@@ -350,6 +442,7 @@ button {
 
 .route-list {
   min-height: 0;
+  max-height: 158px;
   display: grid;
   align-content: start;
   gap: 8px;
@@ -457,31 +550,40 @@ button {
 }
 
 .route-empty {
-  padding: 8px 0;
+  padding: 4px 0;
+}
+
+.route-error {
+  color: #8f3428;
+  font-weight: 650;
 }
 
 .saved-trips {
-  display: grid;
-  gap: 8px;
-  max-height: 126px;
+  gap: 10px;
+  margin-top: 2px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  max-height: 142px;
   min-height: 0;
   overflow: hidden;
 }
 
 .saved-title {
-  padding-top: 2px;
+  padding-top: 0;
+  margin-bottom: -2px;
 }
 
 .saved-list {
   display: grid;
-  gap: 6px;
+  gap: 8px;
   overflow-y: auto;
+  padding-right: 3px;
 }
 
 .saved-item {
   display: grid;
-  gap: 3px;
-  padding: 9px;
+  gap: 5px;
+  padding: 10px 11px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.72);
@@ -490,21 +592,27 @@ button {
 .saved-item .title {
   font-size: 12px;
   font-weight: 800;
+  line-height: 1.35;
 }
 
 .saved-item .meta,
 .saved-item .summary {
   color: var(--muted);
   font-size: 11px;
+  line-height: 1.4;
 }
 
 .saved-actions {
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
+  padding-top: 3px;
 }
 
 .saved-actions .ghost-btn {
   min-height: 28px;
-  padding: 3px 7px;
+  min-width: 68px;
+  padding: 4px 9px;
 }
 
 .map-menu {
@@ -520,36 +628,37 @@ button {
   color: var(--ink);
   font-size: 12px;
   font-weight: 800;
-  box-shadow: 0 10px 24px rgba(24, 33, 43, 0.12);
+  box-shadow: 0 8px 20px rgba(24, 33, 43, 0.1);
 }
 
 .controls {
   position: absolute;
-  top: 62px;
-  right: 18px;
+  top: 58px;
+  right: 16px;
   z-index: 23;
-  width: 340px;
-  max-height: calc(100vh - 84px);
+  width: 276px;
+  max-height: calc(100vh - 76px);
   overflow-y: auto;
-  padding: 16px;
+  padding: 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--paper);
+  background: rgba(252, 253, 252, 0.9);
   box-shadow: var(--shadow);
+  backdrop-filter: blur(16px);
   transition: transform 180ms ease, opacity 180ms ease;
 }
 
 .controls.menu-collapsed {
-  transform: translateX(370px);
+  transform: translateX(306px);
   opacity: 0;
   pointer-events: none;
 }
 
 .control-group {
   display: grid;
-  gap: 10px;
-  padding-top: 12px;
-  margin-top: 12px;
+  gap: 8px;
+  padding-top: 10px;
+  margin-top: 10px;
   border-top: 1px solid var(--line);
 }
 
@@ -569,11 +678,56 @@ button {
 .mode-switch {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 6px;
-  padding: 3px;
-  border: 1px solid var(--line);
+  gap: 0;
+  padding: 2px;
+  border: 0;
   border-radius: 8px;
-  background: rgba(232, 237, 234, 0.7);
+  background: rgba(222, 229, 226, 0.74);
+}
+
+.map-style-switch {
+  margin-top: 2px;
+}
+
+.advanced-settings {
+  margin-top: 2px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.advanced-settings summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  list-style: none;
+}
+
+.advanced-settings summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced-settings summary::after {
+  content: "Show";
+  float: right;
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.advanced-settings[open] summary::after {
+  content: "Hide";
+}
+
+.advanced-settings .control-group {
+  margin-top: 10px;
+  padding-top: 10px;
+}
+
+.controls input,
+.controls select {
+  min-height: 36px;
 }
 
 .toggle-row {
@@ -628,7 +782,7 @@ button {
   }
 }
 
-@media (max-width: 980px) {
+@media (max-width: 720px) {
   .planner-shell {
     top: auto;
     left: 0;
@@ -636,12 +790,16 @@ button {
     bottom: calc(58px + env(safe-area-inset-bottom));
     width: auto;
     max-height: 58vh;
-    padding: 14px;
+    padding: 12px;
     border-right: 0;
     border-left: 0;
     border-bottom: 0;
     border-radius: 8px 8px 0 0;
     grid-template-rows: auto auto auto auto auto minmax(0, 1fr) auto;
+  }
+
+  .heatmap-legend {
+    display: none;
   }
 
   .map-menu {
@@ -756,7 +914,7 @@ button {
   }
 
   .brand-title {
-    font-size: 20px;
+    font-size: 19px;
   }
 
   .saved-trips {
@@ -775,7 +933,7 @@ button {
   }
 
   .secondary-actions {
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
   }
 
   .route-card .meta {

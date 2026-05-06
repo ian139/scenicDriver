@@ -2,7 +2,6 @@ const el = {
   controls: document.querySelector(".controls"),
   apiBase: document.getElementById("apiBase"),
   basemapProvider: document.getElementById("basemapProvider"),
-  maptilerKey: document.getElementById("maptilerKey"),
   basemapStatus: document.getElementById("basemapStatus"),
   region: document.getElementById("region"),
   regionBadge: document.getElementById("regionBadge"),
@@ -11,6 +10,8 @@ const el = {
   prefFastBtn: document.getElementById("prefFastBtn"),
   prefBalancedBtn: document.getElementById("prefBalancedBtn"),
   prefScenicBtn: document.getElementById("prefScenicBtn"),
+  mapStyleMapBtn: document.getElementById("mapStyleMapBtn"),
+  mapStyleSatelliteBtn: document.getElementById("mapStyleSatelliteBtn"),
   refreshRegionsBtn: document.getElementById("refreshRegionsBtn"),
   apiHealth: document.getElementById("apiHealth"),
   startLat: document.getElementById("startLat"),
@@ -22,6 +23,8 @@ const el = {
   startSuggestBox: document.getElementById("startSuggestBox"),
   endSuggestBox: document.getElementById("endSuggestBox"),
   loadingOverlay: document.getElementById("loadingOverlay"),
+  scenicCanvas: document.getElementById("scenicCanvas"),
+  heatmapLegend: document.getElementById("heatmapLegend"),
   menuBtn: document.getElementById("menuBtn"),
   scenicWeight: document.getElementById("scenicWeight"),
   weightValue: document.getElementById("weightValue"),
@@ -48,16 +51,20 @@ let lastPlan = null;
 const routeSourceId = "route-data";
 const heatmapSourceId = "scenic-heatmap";
 const heatmapLayerId = "scenic-heatmap-layer";
+const heatmapSoftSourceId = "scenic-heatmap-soft";
+const heatmapSoftLayerId = "scenic-heatmap-soft-layer";
 const heatmapTilesSourceId = "scenic-heatmap-tiles";
 const heatmapTilesLayerId = "scenic-heatmap-tiles-layer";
 let heatmapZoomMode = "z16";
+let heatmapGeojson = null;
 let regionsMeta = [];
 let busy = false;
 let inputMode = "address";
 let routePreference = "balanced";
-let basemapApplying = false;
+let basemapApplySeq = 0;
 let planSeq = 0;
 let pendingRouteGeojson = null;
+let pendingRouteRenderOptions = {};
 let lastRoutePayload = null;
 const suggestTimer = { start: null, end: null };
 const suggestState = {
@@ -66,9 +73,14 @@ const suggestState = {
 };
 const suggestSeq = { start: 0, end: 0 };
 
-const MAPTILER_STYLE = "streets-v2";
+const STATIC_HEATMAP_MODULE = "./data/masswhites_heatmap_cells.js?v=masswhites-v4-cells";
+const DEMO_HEATMAP_BOUNDS = {
+  minLat: 41.88,
+  minLon: -73.72,
+  maxLat: 44.2,
+  maxLon: -72.46,
+};
 const STORAGE_KEYS = {
-  maptilerKey: "scenicdrive.maptilerKey",
   basemapProvider: "scenicdrive.basemapProvider",
   savedTrips: "scenicdrive.savedTrips",
   routePanelCollapsed: "scenicdrive.routePanelCollapsed",
@@ -83,19 +95,49 @@ const ROUTE_PRESETS = {
   scenic: { scenic_weight: 0.9, max_detour_factor: 2.4, label: "Scenic" },
 };
 
+const LOCAL_PLACES = [
+  { label: "Pittsfield, Massachusetts", lat: 42.4501, lon: -73.2454 },
+  { label: "Great Barrington, Massachusetts", lat: 42.1959, lon: -73.3629 },
+  { label: "North Adams, Massachusetts", lat: 42.7009, lon: -73.1087 },
+  { label: "Williamstown, Massachusetts", lat: 42.712, lon: -73.2037 },
+  { label: "Lenox, Massachusetts", lat: 42.3565, lon: -73.2848 },
+  { label: "Adams, Massachusetts", lat: 42.6243, lon: -73.1176 },
+  { label: "Bennington, Vermont", lat: 42.8781, lon: -73.1968 },
+  { label: "Greenfield, Massachusetts", lat: 42.5876, lon: -72.5995 },
+];
+
 function requireElement(name, node) {
   if (!node) throw new Error(`Missing required UI element: ${name}`);
 }
 
 function setStatus(msg) {
+  if (!el.status) return;
   el.status.textContent = String(msg || "").replace(/\n+/g, " • ");
+  el.status.classList.add("hidden");
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function showRouteMessage(msg, className = "route-empty route-error") {
+  el.routeList.innerHTML = `<div class="${className}">${escapeHtml(msg)}</div>`;
 }
 
 function setBusy(next) {
   busy = Boolean(next);
   el.planBtn.disabled = busy;
-  el.planBtn.textContent = busy ? "Planning..." : "Plan Route";
+  el.planBtn.textContent = busy ? "Comparing..." : "Compare Route";
   el.loadingOverlay.classList.toggle("hidden", !busy);
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
 function toggleMenu() {
@@ -110,6 +152,68 @@ function api(path) {
   return `${el.apiBase.value.replace(/\/+$/, "")}${path}`;
 }
 
+function normalizePlaceText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\b(ma|mass|massachusetts|vt|vermont|usa|united states)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function localGeocode(query) {
+  const q = normalizePlaceText(query);
+  if (!q) return [];
+  return LOCAL_PLACES.filter((place) => normalizePlaceText(place.label).includes(q) || q.includes(normalizePlaceText(place.label)))
+    .slice(0, 6)
+    .map((place) => ({
+      label: place.label,
+      match_type: "local_masswhites",
+      lat: place.lat,
+      lon: place.lon,
+      latlon: `${place.lat.toFixed(6)},${place.lon.toFixed(6)}`,
+      wkt: `POINT(${place.lon.toFixed(6)} ${place.lat.toFixed(6)})`,
+    }));
+}
+
+function parseCoordinateInput(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^\s*(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)\s*$/);
+  if (!match) return null;
+  const first = Number(match[1]);
+  const second = Number(match[2]);
+  if (!Number.isFinite(first) || !Number.isFinite(second)) return null;
+  const candidates = [
+    { lat: first, lon: second },
+    { lat: second, lon: first },
+  ].filter((p) => Math.abs(p.lat) <= 90 && Math.abs(p.lon) <= 180);
+  const key = String(el.region?.value || "").toLowerCase();
+  const region = regionsMeta.find((r) => String(r.region || "").toLowerCase() === key);
+  const bbox = region?.bbox;
+  if (bbox) {
+    const minLat = Number(bbox.min_lat);
+    const minLon = Number(bbox.min_lon);
+    const maxLat = Number(bbox.max_lat);
+    const maxLon = Number(bbox.max_lon);
+    const inRegion = candidates.find((p) => p.lat >= minLat && p.lat <= maxLat && p.lon >= minLon && p.lon <= maxLon);
+    if (inRegion) return inRegion;
+  }
+  return candidates[0] || null;
+}
+
+function coordinateRow(value) {
+  const point = parseCoordinateInput(value);
+  if (!point) return null;
+  return {
+    label: `${point.lat.toFixed(6)}, ${point.lon.toFixed(6)}`,
+    match_type: "coordinate",
+    lat: point.lat,
+    lon: point.lon,
+    latlon: `${point.lat.toFixed(6)},${point.lon.toFixed(6)}`,
+    wkt: `POINT(${point.lon.toFixed(6)} ${point.lat.toFixed(6)})`,
+  };
+}
+
 function syncInputMode() {
   const addr = inputMode === "address";
   document.querySelectorAll(".coords-only").forEach((n) => n.classList.toggle("hidden", addr));
@@ -120,14 +224,23 @@ function syncInputMode() {
   el.modeCoordsBtn.classList.toggle("secondary", addr);
 }
 
-function normalizeBasemapProvider(provider, key) {
+function normalizeBasemapProvider(provider) {
   const p = String(provider || "").toLowerCase();
-  if (p === "maptiler" && !key) return "carto_voyager";
-  if (["carto_voyager", "carto_positron", "maptiler", "osm"].includes(p)) return p;
-  return key ? "maptiler" : "carto_voyager";
+  if (p === "satellite") return "satellite";
+  return "carto_voyager";
 }
 
-function basemapTileSource(provider, key) {
+function basemapTileSource(provider) {
+  if (provider === "satellite") {
+    return {
+      type: "raster",
+      tiles: [
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      ],
+      tileSize: 256,
+      attribution: "Tiles © Esri",
+    };
+  }
   if (provider === "carto_voyager") {
     return {
       type: "raster",
@@ -140,37 +253,20 @@ function basemapTileSource(provider, key) {
       attribution: "© CARTO © OpenStreetMap contributors",
     };
   }
-  if (provider === "carto_positron") {
-    return {
-      type: "raster",
-      tiles: [
-        "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
-        "https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
-        "https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
-      ],
-      tileSize: 256,
-      attribution: "© CARTO © OpenStreetMap contributors",
-    };
-  }
-  if (provider === "maptiler") {
-    const encoded = encodeURIComponent(key);
-    return {
-      type: "raster",
-      tiles: [`https://api.maptiler.com/maps/${MAPTILER_STYLE}/{z}/{x}/{y}.png?key=${encoded}`],
-      tileSize: 256,
-      attribution: "© MapTiler © OpenStreetMap contributors",
-    };
-  }
   return {
     type: "raster",
-    tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+    tiles: [
+      "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+      "https://b.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+      "https://c.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+    ],
     tileSize: 256,
-    attribution: "© OpenStreetMap contributors",
+    attribution: "© CARTO © OpenStreetMap contributors",
   };
 }
 
-function buildBasemapStyle(provider, key) {
-  const source = basemapTileSource(provider, key);
+function buildBasemapStyle(provider) {
+  const source = basemapTileSource(provider);
   return {
     version: 8,
     sources: {
@@ -182,42 +278,46 @@ function buildBasemapStyle(provider, key) {
 
 function applyBasemapStatus(provider, hasKey) {
   const names = {
-    carto_voyager: "CARTO Voyager",
-    carto_positron: "CARTO Light",
-    maptiler: "MapTiler",
-    osm: "OpenStreetMap",
+    carto_voyager: "Map",
+    satellite: "Satellite",
   };
-  const name = names[provider] || "CARTO Voyager";
-  const note = provider === "maptiler" ? "" : " (no key)";
-  el.basemapStatus.textContent = `Basemap: ${name}${note}`;
+  const name = names[provider] || "Map";
+  if (el.basemapStatus) el.basemapStatus.textContent = `Basemap: ${name}`;
+  [el.mapStyleMapBtn, el.mapStyleSatelliteBtn].forEach((btn) => {
+    if (!btn) return;
+    const active = btn.dataset.basemap === provider;
+    btn.classList.toggle("active", active);
+    btn.classList.toggle("secondary", !active);
+  });
 }
 
 function applyBasemap() {
-  if (!map || basemapApplying) return;
-  basemapApplying = true;
-  const key = String(el.maptilerKey.value || "").trim();
-  const provider = normalizeBasemapProvider(el.basemapProvider.value, key);
-  const hasKey = Boolean(key);
-  applyBasemapStatus(provider, hasKey);
+  if (!map) return;
+  const seq = ++basemapApplySeq;
+  const provider = normalizeBasemapProvider(el.basemapProvider.value);
+  applyBasemapStatus(provider);
   if (provider !== el.basemapProvider.value) {
     el.basemapProvider.value = provider;
   }
+  localStorage.setItem(STORAGE_KEYS.basemapProvider, provider);
   const center = map.getCenter();
   const zoom = map.getZoom();
-  map.setStyle(buildBasemapStyle(provider, key));
+  const bearing = map.getBearing();
+  const pitch = map.getPitch();
+  map.setStyle(buildBasemapStyle(provider), { diff: false });
   map.once("style.load", () => {
-    if (center) map.setCenter(center);
-    if (Number.isFinite(zoom)) map.setZoom(zoom);
+    if (seq !== basemapApplySeq) return;
+    if (center) map.jumpTo({ center, zoom, bearing, pitch });
     if (el.showHeatmap.checked) {
-      loadHeatmap()
-        .catch(() => setStatus("Heatmap unavailable for this region."))
+      const heatmapReady = heatmapGeojson ? Promise.resolve(renderMapHeatmapLayer(heatmapGeojson)) : loadHeatmap();
+      heatmapReady
+        .catch(() => showRouteMessage("Heatmap unavailable for this region."))
         .finally(() => {
-          if (lastRouteGeojson) scheduleRouteRender(lastRouteGeojson);
+          if (lastRouteGeojson) scheduleRouteRender(lastRouteGeojson, { fit: false });
         });
     } else if (lastRouteGeojson) {
-      scheduleRouteRender(lastRouteGeojson);
+      scheduleRouteRender(lastRouteGeojson, { fit: false });
     }
-    basemapApplying = false;
   });
 }
 
@@ -334,41 +434,39 @@ function applyRoutePreference(pref) {
 }
 
 function initMap() {
-  const storedKey = localStorage.getItem(STORAGE_KEYS.maptilerKey) || "";
   let storedProvider = localStorage.getItem(STORAGE_KEYS.basemapProvider) || "";
-  if (!storedKey && (!storedProvider || storedProvider === "osm")) {
+  if (!storedProvider) {
     storedProvider = "carto_voyager";
     localStorage.setItem(STORAGE_KEYS.basemapProvider, storedProvider);
   }
-  if (storedKey) el.maptilerKey.value = storedKey;
-  const provider = normalizeBasemapProvider(storedProvider, storedKey);
+  const provider = normalizeBasemapProvider(storedProvider);
   el.basemapProvider.value = provider;
-  applyBasemapStatus(provider, Boolean(storedKey));
+  applyBasemapStatus(provider);
   map = new maplibregl.Map({
     container: "map",
-    style: buildBasemapStyle(provider, storedKey),
+    style: buildBasemapStyle(provider),
     center: [-75.2, 40.045],
     zoom: 12,
   });
 }
 
 async function geocodeMany(query) {
+  const coords = coordinateRow(query);
+  if (coords) return [coords];
+  const localRows = localGeocode(query);
+  if (localRows.length && String(el.region.value || "").toLowerCase() === "masswhites") {
+    return localRows;
+  }
   const resp = await fetch(
     `${api("/v1/geocode")}?q=${encodeURIComponent(query)}&region=${encodeURIComponent(el.region.value)}`
-  );
+  ).catch(() => null);
+  if (!resp) return localRows;
   if (!resp.ok) {
-    let detail = "";
-    try {
-      const payload = await resp.json();
-      detail = payload?.detail ? ` (${payload.detail})` : "";
-    } catch {
-      detail = "";
-    }
-    setStatus(`Geocoding failed${detail}. Check API base and MAPBOX_ACCESS_TOKEN.`);
-    return [];
+    return localRows;
   }
   const payload = await resp.json();
-  return payload.results || [];
+  const remoteRows = payload.results || [];
+  return remoteRows.length ? remoteRows : localRows;
 }
 
 async function geocodeOne(query) {
@@ -442,6 +540,13 @@ function onAddressInput(which) {
       hideSuggestions(which);
       return;
     }
+    const coords = coordinateRow(query);
+    if (coords) {
+      suggestState[which].items = [coords];
+      suggestState[which].active = 0;
+      renderSuggestionBox(which);
+      return;
+    }
     setSuggestLoading(which);
     let rows = [];
     try {
@@ -483,7 +588,7 @@ function onAddressKey(which, ev) {
     if (state.items.length && state.active >= 0) {
       chooseSuggestion(which, state.items[state.active]);
     }
-    planRoute().catch((err) => setStatus(String(err)));
+    planRoute().catch(showRouteError);
   }
 }
 
@@ -493,6 +598,12 @@ async function resolvePoint(which) {
   const cached = suggestState[which].selected;
   if (cached && input.value === (cached.label || cached.latlon || `${cached.lat},${cached.lon}`)) {
     return { lat: Number(cached.lat), lon: Number(cached.lon), label: cached.label || cached.latlon };
+  }
+  const coords = coordinateRow(input.value);
+  if (coords) {
+    suggestState[which].selected = coords;
+    input.value = coords.label;
+    return { lat: Number(coords.lat), lon: Number(coords.lon), label: coords.label };
   }
   const best = await geocodeOne(input.value);
   const resolved = { lat: Number(best.lat), lon: Number(best.lon), label: best.label || best.latlon };
@@ -506,7 +617,6 @@ function swapPoints() {
   [el.startLon.value, el.endLon.value] = [el.endLon.value, el.startLon.value];
   [el.startAddress.value, el.endAddress.value] = [el.endAddress.value, el.startAddress.value];
   [suggestState.start.selected, suggestState.end.selected] = [suggestState.end.selected, suggestState.start.selected];
-  setStatus("Swapped start and destination.");
 }
 
 function clearRoute() {
@@ -515,102 +625,337 @@ function clearRoute() {
   if (map?.getSource(routeSourceId)) {
     map.getSource(routeSourceId).setData({ type: "FeatureCollection", features: [] });
   }
-  el.routeList.innerHTML = '<div class="route-empty">Plan a route to compare options.</div>';
-  setStatus("Route cleared.");
+  el.routeList.innerHTML = '<div class="route-empty">API route output appears here.</div>';
+  setRoutePanelCollapsed(true, { persist: true });
 }
 
 async function loadHeatmap() {
-  const resp = await fetch(
-    `${api("/v1/heatmap")}?region=${encodeURIComponent(el.region.value)}&max_points=3000&max_tiles=0`
-  );
-  if (!resp.ok) return;
-  const payload = await resp.json();
-  const geojson = payload.geojson || { type: "FeatureCollection", features: [] };
+  let payload = null;
+  try {
+    const resp = await fetch(
+      `${api("/v1/heatmap")}?region=${encodeURIComponent(el.region.value)}&max_points=3000&max_tiles=0`
+    );
+    if (resp.ok) payload = await resp.json();
+  } catch {
+    payload = null;
+  }
+  if (!payload) payload = await loadStaticHeatmapPayload();
+  if (!payload) payload = buildDemoHeatmapPayload();
+  let geojson = payload.geojson || { type: "FeatureCollection", features: [] };
+  if (!geojson.features?.length) {
+    payload = buildDemoHeatmapPayload();
+    geojson = payload.geojson;
+  }
+  heatmapGeojson = normalizeHeatmapGeojson(geojson);
+  if (el.heatmapLegend) {
+    el.heatmapLegend.dataset.source = heatmapGeojson.features?.[0]?.properties?.source || "unknown";
+  }
+  syncHeatmapUi(true);
   const tileZoom = Number(payload.tile_zoom || 16);
   heatmapZoomMode = tileZoom <= 14 ? "z14" : "z16";
-  const blurStart = heatmapZoomMode === "z14" ? 6.4 : 8.0;
-  const blurMid = heatmapZoomMode === "z14" ? 9.8 : 11.2;
-  const blurEnd = heatmapZoomMode === "z14" ? 13.6 : 14.8;
-  if (!map.getSource(heatmapSourceId)) {
-    map.addSource(heatmapSourceId, { type: "geojson", data: geojson });
-    map.addLayer({
-      id: heatmapLayerId,
-      type: "heatmap",
-      source: heatmapSourceId,
-      maxzoom: blurEnd,
-      paint: {
-        "heatmap-weight": [
-          "interpolate",
-          ["linear"],
-          ["get", "score_norm"],
-          0,
-          0.04,
-          0.25,
-          0.28,
-          0.55,
-          0.72,
-          1,
-          1,
-        ],
-        "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 6, 0.55, 10, 0.85, 13, 1.1],
-        "heatmap-color": [
-          "interpolate",
-          ["linear"],
-          ["heatmap-density"],
-          0,
-          "rgba(65, 93, 112, 0)",
-          0.08,
-          "rgba(63, 128, 106, 0.22)",
-          0.22,
-          "rgba(92, 149, 107, 0.38)",
-          0.46,
-          "rgba(207, 158, 76, 0.52)",
-          1,
-          "rgba(190, 96, 62, 0.62)",
-        ],
-        "heatmap-radius": [
-          "interpolate",
-          ["linear"],
-          ["zoom"],
-          5,
-          26,
-          8,
-          42,
-          10,
-          64,
-          12,
-          86,
-          14,
-          110,
-        ],
-        "heatmap-opacity": [
-          "interpolate",
-          ["linear"],
-          ["zoom"],
-          blurStart,
-          0.18,
-          blurMid,
-          0.3,
-          blurEnd,
-          0.36,
-        ],
+  clearScenicCanvas();
+  renderMapHeatmapLayer(heatmapGeojson);
+}
+
+async function loadStaticHeatmapPayload() {
+  if (String(el.region.value || "").toLowerCase() !== "masswhites") return null;
+  try {
+    const mod = await import(STATIC_HEATMAP_MODULE);
+    const cells = Array.isArray(mod.default) ? mod.default : [];
+    return {
+      tile_zoom: 14,
+      geojson: {
+        type: "FeatureCollection",
+        features: cells.map(([west, south, east, north, score]) => ({
+          type: "Feature",
+          properties: {
+            score_norm: Number(score),
+            score: Number(score) * 10,
+            source: "masswhites_static_cells_v4",
+          },
+          geometry: {
+            type: "Polygon",
+            coordinates: [[
+              [Number(west), Number(south)],
+              [Number(east), Number(south)],
+              [Number(east), Number(north)],
+              [Number(west), Number(north)],
+              [Number(west), Number(south)],
+            ]],
+          },
+        })),
       },
-    });
-    if (map.getLayer("baseline-line")) map.moveLayer("baseline-line");
-    if (map.getLayer("scenic-line")) map.moveLayer("scenic-line");
-  } else {
-    map.getSource(heatmapSourceId).setData(geojson);
-    map.setLayoutProperty(heatmapLayerId, "visibility", "visible");
+    };
+  } catch {
+    return null;
   }
 }
 
+function normalizeHeatmapGeojson(geojson) {
+  const features = (geojson?.features || []).map((feature) => {
+    const props = feature?.properties || {};
+    const raw = Number(props.score_norm ?? props.scenic_norm ?? props.scenic_score ?? props.score ?? 0);
+    const scoreNorm = Number.isFinite(raw) ? (raw > 1 ? clamp(raw / 10, 0, 1) : clamp(raw, 0, 1)) : 0;
+    return {
+      ...feature,
+      properties: {
+        ...props,
+        score_norm: scoreNorm,
+      },
+    };
+  });
+  return { type: "FeatureCollection", features };
+}
+
+function renderMapHeatmapLayer(geojson) {
+  if (!map || !geojson) return;
+  if (!map.isStyleLoaded()) {
+    map.once("style.load", () => renderMapHeatmapLayer(geojson));
+    return;
+  }
+  removeMaplibreHeatmapLayer();
+  map.addSource(heatmapSourceId, { type: "geojson", data: geojson });
+  const geometryType = geojson.features?.[0]?.geometry?.type;
+  if (geometryType === "Polygon" || geometryType === "MultiPolygon") {
+    renderFilledHeatmapLayer();
+    return;
+  }
+  renderPointHeatmapLayer();
+}
+
+function scenicColorExpression() {
+  return [
+    "interpolate",
+    ["linear"],
+    ["get", "score_norm"],
+    0,
+    "rgba(49, 86, 97, 0.9)",
+    0.25,
+    "rgba(62, 124, 101, 0.92)",
+    0.52,
+    "rgba(146, 162, 92, 0.94)",
+    0.72,
+    "rgba(223, 164, 74, 0.96)",
+    0.88,
+    "rgba(203, 102, 58, 0.98)",
+    1,
+    "rgba(139, 58, 48, 1)",
+  ];
+}
+
+function renderFilledHeatmapLayer() {
+  map.addLayer({
+    id: heatmapLayerId,
+    type: "fill",
+    source: heatmapSourceId,
+    paint: {
+      "fill-color": scenicColorExpression(),
+      "fill-opacity": 0.64,
+      "fill-outline-color": scenicColorExpression(),
+      "fill-antialias": false,
+    },
+  });
+  map.addSource(heatmapSoftSourceId, { type: "geojson", data: cellCenterGeojson(heatmapGeojson) });
+  map.addLayer({
+    id: heatmapSoftLayerId,
+    type: "circle",
+    source: heatmapSoftSourceId,
+    layout: {
+      "circle-sort-key": ["get", "score_norm"],
+    },
+    paint: {
+      "circle-color": scenicColorExpression(),
+      "circle-radius": [
+        "interpolate",
+        ["linear"],
+        ["zoom"],
+        5,
+        10,
+        8,
+        20,
+        10,
+        31,
+        12,
+        44,
+        14,
+        76,
+        16,
+        128,
+        18,
+        220,
+      ],
+      "circle-blur": 1.35,
+      "circle-opacity": [
+        "interpolate",
+        ["linear"],
+        ["zoom"],
+        5,
+        0.16,
+        12,
+        0.2,
+        16,
+        0.28,
+        18,
+        0.32,
+      ],
+    },
+  });
+  if (map.getLayer("baseline-line")) map.moveLayer("baseline-line");
+  if (map.getLayer("scenic-line")) map.moveLayer("scenic-line");
+}
+
+function cellCenterGeojson(geojson) {
+  const features = (geojson?.features || [])
+    .map((feature) => {
+      const ring = feature?.geometry?.coordinates?.[0] || [];
+      if (!ring.length) return null;
+      let minLon = Infinity;
+      let minLat = Infinity;
+      let maxLon = -Infinity;
+      let maxLat = -Infinity;
+      for (const [lon, lat] of ring) {
+        minLon = Math.min(minLon, Number(lon));
+        minLat = Math.min(minLat, Number(lat));
+        maxLon = Math.max(maxLon, Number(lon));
+        maxLat = Math.max(maxLat, Number(lat));
+      }
+      if (![minLon, minLat, maxLon, maxLat].every(Number.isFinite)) return null;
+      return {
+        type: "Feature",
+        properties: feature.properties || {},
+        geometry: {
+          type: "Point",
+          coordinates: [(minLon + maxLon) / 2, (minLat + maxLat) / 2],
+        },
+      };
+    })
+    .filter(Boolean);
+  return { type: "FeatureCollection", features };
+}
+
+function renderPointHeatmapLayer() {
+  map.addLayer({
+    id: heatmapLayerId,
+    type: "circle",
+    source: heatmapSourceId,
+    layout: {
+      "circle-sort-key": ["get", "score_norm"],
+    },
+    paint: {
+      "circle-color": scenicColorExpression(),
+      "circle-radius": [
+        "interpolate",
+        ["linear"],
+        ["zoom"],
+        5,
+        heatmapZoomMode === "z14" ? 8 : 6,
+        8,
+        heatmapZoomMode === "z14" ? 17 : 13,
+        10,
+        heatmapZoomMode === "z14" ? 28 : 22,
+        12,
+        heatmapZoomMode === "z14" ? 46 : 36,
+        14,
+        heatmapZoomMode === "z14" ? 88 : 68,
+        16,
+        heatmapZoomMode === "z14" ? 138 : 104,
+        18,
+        heatmapZoomMode === "z14" ? 220 : 166,
+      ],
+      "circle-blur": [
+        "interpolate",
+        ["linear"],
+        ["zoom"],
+        5,
+        1.65,
+        11,
+        1.35,
+        16,
+        1.1,
+        18,
+        1.15,
+      ],
+      "circle-opacity": [
+        "interpolate",
+        ["linear"],
+        ["zoom"],
+        5,
+        0.34,
+        12,
+        0.42,
+        16,
+        0.5,
+        18,
+        0.54,
+      ],
+    },
+  });
+  if (map.getLayer("baseline-line")) map.moveLayer("baseline-line");
+  if (map.getLayer("scenic-line")) map.moveLayer("scenic-line");
+}
+
+function buildDemoHeatmapPayload() {
+  const features = [];
+  const bounds = DEMO_HEATMAP_BOUNDS;
+  const cols = 36;
+  const rows = 66;
+  for (let y = 0; y < rows; y += 1) {
+    const lat = bounds.minLat + ((bounds.maxLat - bounds.minLat) * y) / (rows - 1);
+    for (let x = 0; x < cols; x += 1) {
+      const lon = bounds.minLon + ((bounds.maxLon - bounds.minLon) * x) / (cols - 1);
+      const t = (lat - bounds.minLat) / (bounds.maxLat - bounds.minLat);
+      const ridgeLon = -73.28 + Math.sin(t * Math.PI * 2.4) * 0.1;
+      const ridge = Math.exp(-Math.pow((lon - ridgeLon) / 0.18, 2));
+      const easternRidge = Math.exp(-Math.pow((lon + 72.78) / 0.16, 2)) * (0.55 + 0.2 * Math.sin(lat * 5));
+      const valleyDip = Math.exp(-Math.pow((lon + 73.08) / 0.08, 2)) * 0.22;
+      const texture = (Math.sin(lat * 12.7 + lon * 8.1) + Math.sin(lat * 7.4 - lon * 10.3)) * 0.045;
+      const score = clamp(0.24 + ridge * 0.45 + easternRidge * 0.28 - valleyDip + texture, 0.08, 0.98);
+      features.push({
+        type: "Feature",
+        properties: {
+          score_norm: score,
+          score,
+          source: "demo_surface",
+        },
+        geometry: {
+          type: "Point",
+          coordinates: [lon, lat],
+        },
+      });
+    }
+  }
+  return {
+    tile_zoom: 14,
+    geojson: { type: "FeatureCollection", features },
+  };
+}
+
 function hideHeatmap() {
-  if (map.getLayer(heatmapLayerId)) {
-    map.setLayoutProperty(heatmapLayerId, "visibility", "none");
-  }
-  if (map.getLayer(heatmapTilesLayerId)) {
-    map.setLayoutProperty(heatmapTilesLayerId, "visibility", "none");
-  }
+  clearScenicCanvas();
+  removeMaplibreHeatmapLayer();
+  syncHeatmapUi(false);
+}
+
+function syncHeatmapUi(visible = Boolean(el.showHeatmap?.checked)) {
+  el.heatmapLegend?.classList.toggle("hidden", !visible);
+  document.body.classList.toggle("scenic-layer-active", visible);
+}
+
+function removeMaplibreHeatmapLayer() {
+  if (!map) return;
+  if (map.getLayer(heatmapSoftLayerId)) map.removeLayer(heatmapSoftLayerId);
+  if (map.getLayer(heatmapLayerId)) map.removeLayer(heatmapLayerId);
+  if (map.getLayer(heatmapTilesLayerId)) map.removeLayer(heatmapTilesLayerId);
+  if (map.getSource(heatmapSoftSourceId)) map.removeSource(heatmapSoftSourceId);
+  if (map.getSource(heatmapSourceId)) map.removeSource(heatmapSourceId);
+  if (map.getSource(heatmapTilesSourceId)) map.removeSource(heatmapTilesSourceId);
+}
+
+function clearScenicCanvas() {
+  const canvas = el.scenicCanvas;
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width || 0, canvas.height || 0);
 }
 
 function formatDistance(km) {
@@ -738,6 +1083,7 @@ function renderRouteList(payload) {
   document.querySelectorAll(".route-card").forEach((node) => {
     node.addEventListener("click", () => setActiveRoute(node.dataset.kind));
   });
+  setRoutePanelCollapsed(false, { persist: true });
   if (!activeRouteKind && scenic) {
     setActiveRoute("scenic");
   } else if (!activeRouteKind && baseline) {
@@ -748,13 +1094,21 @@ function renderRouteList(payload) {
 }
 
 function syncRoutePanelState() {
-  const collapsed = localStorage.getItem(STORAGE_KEYS.routePanelCollapsed) === "1";
+  const stored = localStorage.getItem(STORAGE_KEYS.routePanelCollapsed);
+  const collapsed = stored == null ? true : stored === "1";
+  setRoutePanelCollapsed(collapsed, { persist: false });
+}
+
+function setRoutePanelCollapsed(collapsed, { persist = true } = {}) {
   el.routePanel.classList.toggle("collapsed", collapsed);
-  el.routeCollapseBtn.textContent = collapsed ? "Expand" : "Minimize";
+  el.routeCollapseBtn.textContent = collapsed ? "Show" : "Hide";
+  if (persist) localStorage.setItem(STORAGE_KEYS.routePanelCollapsed, collapsed ? "1" : "0");
 }
 
 function isMobileLayout() {
-  return window.matchMedia("(max-width: 980px)").matches;
+  const tabs = document.querySelector(".mobile-tabs");
+  const tabsVisible = tabs ? window.getComputedStyle(tabs).display !== "none" : false;
+  return window.matchMedia("(max-width: 720px)").matches || tabsVisible;
 }
 
 function setSheetOpen(open) {
@@ -841,7 +1195,7 @@ function renderSavedTrips() {
       el.endAddress.value = trip.end_label || `${trip.end.lat},${trip.end.lon}`;
       inputMode = "address";
       syncInputMode();
-      planRoute().catch((err) => setStatus(String(err)));
+      planRoute().catch(showRouteError);
     });
     node.querySelectorAll(".ghost-btn").forEach((btn) => {
       btn.addEventListener("click", (ev) => {
@@ -853,7 +1207,6 @@ function renderSavedTrips() {
           const next = trips.filter((t) => t.id !== trip.id);
           writeSavedTrips(next);
           renderSavedTrips();
-          setStatus("Saved trip deleted.");
           return;
         }
         if (action === "rename") {
@@ -862,7 +1215,6 @@ function renderSavedTrips() {
           trip.title = name.trim();
           writeSavedTrips(trips);
           renderSavedTrips();
-          setStatus("Saved trip renamed.");
         }
       });
     });
@@ -938,11 +1290,12 @@ function applyUrlParams() {
   return shouldPlan;
 }
 
-function renderRouteGeojson(geojson) {
+function renderRouteGeojson(geojson, options = {}) {
+  const fit = options.fit !== false;
   lastRouteGeojson = geojson;
   const featureCount = geojson?.features?.length || 0;
   if (!featureCount) {
-    setStatus("Route returned no geometry.");
+    showRouteMessage("Route returned no geometry.");
     return;
   }
   if (map.getLayer("scenic-line")) map.removeLayer("scenic-line");
@@ -973,21 +1326,24 @@ function renderRouteGeojson(geojson) {
     const coords = feature?.geometry?.coordinates || [];
     for (const [lon, lat] of coords) bounds.extend([lon, lat]);
   }
-  if (!bounds.isEmpty()) map.fitBounds(bounds, { padding: 36, duration: 0 });
+  if (fit && !bounds.isEmpty()) map.fitBounds(bounds, { padding: 36, duration: 0 });
 }
 
-function scheduleRouteRender(geojson) {
+function scheduleRouteRender(geojson, options = {}) {
   pendingRouteGeojson = geojson;
+  pendingRouteRenderOptions = options;
   if (!map) return;
   if (map.isStyleLoaded()) {
-    renderRouteGeojson(pendingRouteGeojson);
+    renderRouteGeojson(pendingRouteGeojson, pendingRouteRenderOptions);
     pendingRouteGeojson = null;
+    pendingRouteRenderOptions = {};
     return;
   }
   map.once("style.load", () => {
     if (!pendingRouteGeojson) return;
-    renderRouteGeojson(pendingRouteGeojson);
+    renderRouteGeojson(pendingRouteGeojson, pendingRouteRenderOptions);
     pendingRouteGeojson = null;
+    pendingRouteRenderOptions = {};
   });
 }
 
@@ -1006,7 +1362,6 @@ async function planRoute() {
     let startLabel;
     let endLabel;
     if (inputMode === "address") {
-      setStatus("Finding locations...");
       const [s, e] = await Promise.all([resolvePoint("start"), resolvePoint("end")]);
       start = { lat: s.lat, lon: s.lon };
       end = { lat: e.lat, lon: e.lon };
@@ -1031,7 +1386,6 @@ async function planRoute() {
       start_label: startLabel,
       end_label: endLabel,
     };
-    setStatus("Building routes...");
     let resp;
     try {
       resp = await fetch(api("/v1/route/compare"), {
@@ -1082,14 +1436,14 @@ async function planRoute() {
     lastRoutePayload = payload;
     if (seq === planSeq) scheduleRouteRender(payload.geojson);
     updateShareUrl(lastPlan);
-    if (payload.retry_used && payload.retry_max_detour_factor) {
-      setStatus(`Route ready (auto-bumped detour to ${payload.retry_max_detour_factor.toFixed(1)}).`);
-    } else {
-      setStatus("Route ready.");
-    }
   } finally {
     if (seq === planSeq) setBusy(false);
   }
+}
+
+function showRouteError(err) {
+  const msg = String(err?.message || err || "Route request failed.");
+  showRouteMessage(msg);
 }
 
 function installAddressInput(which) {
@@ -1107,12 +1461,10 @@ async function main() {
 
   initMap();
   await checkHealth();
-  let usingFallbackRegion = false;
   try {
     await loadRegions();
   } catch {
     loadFallbackRegions();
-    usingFallbackRegion = true;
   }
   applyRegionDefaults();
   syncInputMode();
@@ -1120,28 +1472,22 @@ async function main() {
   applyRoutePreference(localStorage.getItem(STORAGE_KEYS.routePreference) || "balanced");
   const autoPlan = applyUrlParams();
   renderSavedTrips();
-  el.routeList.innerHTML = '<div class="route-empty">Plan a route to compare options.</div>';
-  map.once("load", () => {
-    if (el.showHeatmap.checked) {
-      loadHeatmap().catch(() => setStatus("Scenic layer unavailable for this region."));
-    }
-  });
+  el.routeList.innerHTML = '<div class="route-empty">API route output appears here.</div>';
+  if (el.showHeatmap.checked) loadHeatmap();
   if (autoPlan) {
-    planRoute().catch((err) => setStatus(String(err)));
+    planRoute().catch(showRouteError);
   }
 
   el.refreshRegionsBtn.addEventListener("click", async () => {
     await checkHealth();
     await loadRegions();
     applyRegionDefaults();
-    setStatus("Regions refreshed.");
   });
   el.region.addEventListener("change", () => {
     applyRegionDefaults();
     if (el.showHeatmap.checked && map.loaded()) {
-      loadHeatmap().catch(() => setStatus("Heatmap unavailable for this region."));
+      loadHeatmap();
     }
-    setStatus(`Region set to ${el.region.value}.`);
   });
   el.modeAddressBtn.addEventListener("click", () => {
     inputMode = "address";
@@ -1165,15 +1511,15 @@ async function main() {
   el.menuBtn.addEventListener("click", toggleMenu);
   el.showHeatmap.addEventListener("change", () => {
     if (!map.loaded()) return;
-    if (el.showHeatmap.checked) loadHeatmap().catch(() => setStatus("Heatmap unavailable for this region."));
+    if (el.showHeatmap.checked) loadHeatmap();
     else hideHeatmap();
   });
   el.planBtn.addEventListener("click", () => {
-    planRoute().catch((err) => setStatus(String(err)));
+    planRoute().catch(showRouteError);
   });
   el.saveRouteBtn.addEventListener("click", () => {
     if (!lastPlan) {
-      setStatus("Plan a route before saving.");
+      showRouteMessage("Plan a route before saving.", "route-empty");
       return;
     }
     const trips = readSavedTrips();
@@ -1199,11 +1545,10 @@ async function main() {
     });
     writeSavedTrips(trips.slice(0, 10));
     renderSavedTrips();
-    setStatus("Route saved.");
   });
   el.shareRouteBtn.addEventListener("click", async () => {
     if (!lastPlan) {
-      setStatus("Plan a route before sharing.");
+      showRouteMessage("Plan a route before sharing.", "route-empty");
       return;
     }
     const url = buildShareUrl(lastPlan);
@@ -1211,13 +1556,11 @@ async function main() {
     try {
       await navigator.clipboard.writeText(url);
       el.shareRouteBtn.textContent = "Copied";
-      setStatus("Share link copied to clipboard.");
       setTimeout(() => {
         el.shareRouteBtn.textContent = original;
       }, 1200);
     } catch {
       el.shareRouteBtn.textContent = "Copied";
-      setStatus(`Share link ready: ${url}`);
       setTimeout(() => {
         el.shareRouteBtn.textContent = original;
       }, 1800);
@@ -1240,27 +1583,24 @@ async function main() {
     });
   }
   el.routeCollapseBtn.addEventListener("click", () => {
-    const collapsed = el.routePanel.classList.toggle("collapsed");
-    localStorage.setItem(STORAGE_KEYS.routePanelCollapsed, collapsed ? "1" : "0");
-    el.routeCollapseBtn.textContent = collapsed ? "Expand" : "Minimize";
+    setRoutePanelCollapsed(!el.routePanel.classList.contains("collapsed"), { persist: true });
   });
   el.basemapProvider.addEventListener("change", () => {
-    localStorage.setItem(STORAGE_KEYS.basemapProvider, el.basemapProvider.value);
     applyBasemap();
   });
-  el.maptilerKey.addEventListener("input", () => {
-    const value = String(el.maptilerKey.value || "").trim();
-    if (value) localStorage.setItem(STORAGE_KEYS.maptilerKey, value);
-    else localStorage.removeItem(STORAGE_KEYS.maptilerKey);
-  });
-  el.maptilerKey.addEventListener("blur", () => {
-    applyBasemap();
+  [el.mapStyleMapBtn, el.mapStyleSatelliteBtn].forEach((btn) => {
+    btn.addEventListener("click", () => {
+      el.basemapProvider.value = btn.dataset.basemap || "carto_voyager";
+      applyBasemap();
+    });
   });
 
   installAddressInput("start");
   installAddressInput("end");
   syncRoutePanelState();
-  setStatus(usingFallbackRegion ? "API unavailable. Showing Masswhites shell." : "Ready");
 }
 
-main().catch((err) => setStatus(String(err)));
+main().catch((err) => {
+  setStatus(String(err));
+  if (el.routeList) showRouteMessage(String(err));
+});
