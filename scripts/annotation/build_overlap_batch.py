@@ -5,7 +5,7 @@ This selects tiles that one annotator has already labeled but another annotator
 has not, so the second annotator can create overlap labels for agreement stats.
 
 Example:
-  uv run python scripts/build_overlap_batch.py \
+  uv run python scripts/annotation/build_overlap_batch.py \
     --annotations-csv data/raw/labels_human.csv \
     --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv \
     --source-annotator ian \

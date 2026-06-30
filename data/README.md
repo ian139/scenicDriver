@@ -42,9 +42,9 @@ Report tooling defaults (unless overridden in env):
 ## Human Benchmark Artifacts
 
 - Build benchmark split + agreement stats:
-  - `uv run python scripts/build_human_benchmark.py --annotations-csv data/raw/labels_human.csv --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --output-dir data/processed/regression --run-name masswhites_human_benchmark_v1 --val-frac 0.2 --test-frac 0.2 --seed 42`
+  - `uv run python scripts/annotation/build_human_benchmark.py --annotations-csv data/raw/labels_human.csv --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --output-dir data/processed/regression --run-name masswhites_human_benchmark_v1 --val-frac 0.2 --test-frac 0.2 --seed 42`
 - Build overlap batch for cross-annotator agreement collection:
-  - `uv run python scripts/build_overlap_batch.py --annotations-csv data/raw/labels_human.csv --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --source-annotator ian --target-annotator paperspace --sample-size 200 --seed 42 --output-csv data/processed/regression/overlap_batch_ian_to_paperspace_200.csv`
+  - `uv run python scripts/annotation/build_overlap_batch.py --annotations-csv data/raw/labels_human.csv --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --source-annotator ian --target-annotator paperspace --sample-size 200 --seed 42 --output-csv data/processed/regression/overlap_batch_ian_to_paperspace_200.csv`
 - Output folder layout:
   - `data/processed/regression/<run_name>/benchmark_tiles.csv`
   - `data/processed/regression/<run_name>/benchmark_split.csv`
@@ -66,7 +66,7 @@ When route overlay is present, the viewer also displays route comparison metrics
 
 Generate combined overlay directly:
 
-- `uv run python scripts/route_demo_geojson.py --geojson data/processed/sample_road_graph.geojson --start 42.40 -72.70 --end 42.48 -72.62 --scenic-weight 0.8 --output-geojson data/processed/sample_route.geojson --report-dir data/processed/heuristic_runs/<run_name>/report`
+- `uv run python scripts/routing/route_compare_service.py --start 42.40 -72.70 --end 42.48 -72.62 --scenic-weight 0.8 --run-name <run_name> --graph-geojson <graph>`
 
 ## Git Policy
 

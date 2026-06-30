@@ -2,13 +2,13 @@
 Download Mapbox tiles for a bounding box.
 
 Examples:
-  python scripts/download_bbox_tiles.py \
+  python scripts/ingest/download_bbox_tiles.py \
     --min-lat 40.018 --min-lon -75.2284 \
     --max-lat 40.0734 --max-lon -75.185 \
     --zoom 16 --style mapbox.satellite \
     --output data/raw/images/satellite
 
-  python scripts/download_bbox_tiles.py \
+  python scripts/ingest/download_bbox_tiles.py \
     --min-lat 40.018 --min-lon -75.2284 \
     --max-lat 40.0734 --max-lon -75.185 \
     --zoom 16 --style mapbox.terrain-rgb \
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 

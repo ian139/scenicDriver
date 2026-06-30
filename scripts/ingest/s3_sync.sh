@@ -3,9 +3,9 @@ set -euo pipefail
 
 # Sync local data to S3.
 # Usage:
-#   SCENIC_S3_BUCKET=scenicdriver-data ./scripts/s3_sync.sh
+#   SCENIC_S3_BUCKET=scenicdriver-data bash scripts/ingest/s3_sync.sh
 # Optional:
-#   DRY_RUN=1 SCENIC_S3_BUCKET=... ./scripts/s3_sync.sh
+#   DRY_RUN=1 SCENIC_S3_BUCKET=... bash scripts/ingest/s3_sync.sh
 
 if [[ -z "${SCENIC_S3_BUCKET:-}" ]]; then
   echo "SCENIC_S3_BUCKET is required (e.g., scenicdriver-data)."

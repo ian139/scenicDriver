@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "ScenicDriver",
+    "slug": "scenic-route-planner-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#DFE6E3"
+      }
+    }
+  }
+}

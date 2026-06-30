@@ -20,10 +20,15 @@ dist/
 .env.*
 !.env.example
 
+# Local env / tooling
+.claude/
+
 # Data (generated / large)
 data/raw/
 data/processed/
 data/NWPU-RESISC45/
+data/data/
+data/tiles/
 
 # Models (keep only placeholders in git)
 models/**
@@ -33,10 +38,16 @@ models/**
 cache/
 notebooks/__marimo__/
 
-# Archive working snapshots (keep docs only)
+# Archive working snapshots (keep manifest and curated archive entries)
 archive/*
 !archive/archive.md
 !archive/archive_scan_summary.json
+!archive/scripts/
+!archive/scripts/**/*.py
+!archive/notebooks/
+!archive/notebooks/**/*.py
+!archive/notes/
+!archive/notes/**/*.md
 
 # Misc local files
 *.log

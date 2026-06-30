@@ -48,7 +48,7 @@ export SCENIC_S3_BUCKET=scenicdriver-data
 ## 5) Sync Local Data to S3
 
 ```bash
-bash scripts/s3_sync.sh
+bash scripts/ingest/s3_sync.sh
 ```
 
 Notes:
@@ -62,5 +62,5 @@ Moves older data to cheaper storage.
 ```bash
 aws s3api put-bucket-lifecycle-configuration \
   --bucket "$SCENIC_S3_BUCKET" \
-  --lifecycle-configuration file://scripts/s3_lifecycle.json
+  --lifecycle-configuration file://config/s3_lifecycle.json
 ```

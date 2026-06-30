@@ -3,7 +3,7 @@ Build mixed supervision labels by overlaying aggregated human annotations
 onto a heuristic labels CSV.
 
 Example:
-  uv run python scripts/build_mixed_labels.py \
+  uv run python scripts/modeling/build_mixed_labels.py \
     --heuristic-labels data/processed/regression/labels_masswhites_z14_mixed5000.csv \
     --annotations-csv data/raw/labels_human.csv \
     --output data/processed/regression/labels_masswhites_z14_mixed5000_v2.csv \

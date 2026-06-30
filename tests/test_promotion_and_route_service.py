@@ -21,7 +21,7 @@ def test_promote_regression_model_smoke(tmp_path: Path) -> None:
 
     cmd = [
         sys.executable,
-        str(REPO_ROOT / "scripts/promote_regression_model.py"),
+        str(REPO_ROOT / "scripts/modeling/promote_regression_model.py"),
         "--candidate-metrics",
         str(candidate_metrics),
         "--baseline-metrics",
@@ -77,7 +77,7 @@ def test_route_compare_service_smoke(tmp_path: Path) -> None:
 
     cmd = [
         sys.executable,
-        str(REPO_ROOT / "scripts/route_compare_service.py"),
+        str(REPO_ROOT / "scripts/routing/route_compare_service.py"),
         "--start",
         "42.0",
         "-72.0",
