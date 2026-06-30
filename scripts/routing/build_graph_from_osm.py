@@ -2,8 +2,7 @@
 Build a RoadGraph JSON from OSM data using osmnx.
 
 Example:
-  uv sync --extra geo
-  uv run python scripts/build_graph_from_osm.py \
+  uv run --with osmnx python scripts/routing/build_graph_from_osm.py \
     --min-lat 42.35 --min-lon -72.57 \
     --max-lat 42.39 --max-lon -72.52 \
     --run-name amherst_core \
@@ -19,7 +18,7 @@ import json
 from pathlib import Path
 import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -109,7 +108,7 @@ def main() -> None:
     try:
         import osmnx as ox
     except ImportError as exc:
-        raise ImportError("osmnx is required. Run: uv sync --extra geo") from exc
+        raise ImportError("osmnx is required. Run: uv run --with osmnx") from exc
 
     if args.min_lat >= args.max_lat:
         raise ValueError("Invalid bbox: --min-lat must be < --max-lat")

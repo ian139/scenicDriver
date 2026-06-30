@@ -84,7 +84,7 @@ def main() -> None:
     _run(
         [
             py,
-            "scripts/build_mixed_labels.py",
+            "scripts/modeling/build_mixed_labels.py",
             "--heuristic-labels",
             str(args.heuristic_labels),
             "--annotations-csv",
@@ -99,7 +99,7 @@ def main() -> None:
     _run(
         [
             py,
-            "scripts/export_regression_dataset.py",
+            "scripts/modeling/export_regression_dataset.py",
             "--labels-csv",
             str(args.labels_output),
             "--raw-dir",
@@ -124,7 +124,7 @@ def main() -> None:
     _run(
         [
             py,
-            "scripts/train_regression_baseline.py",
+            "scripts/modeling/train_regression_baseline.py",
             "--dataset",
             str(args.features_output),
             "--output",
@@ -150,7 +150,7 @@ def main() -> None:
     _run(
         [
             py,
-            "scripts/evaluate_regression_baseline.py",
+            "scripts/modeling/evaluate_regression_baseline.py",
             "--dataset",
             str(args.features_output),
             "--checkpoint",

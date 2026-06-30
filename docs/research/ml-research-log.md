@@ -42,7 +42,7 @@ Metrics source files:
 ## v2 (overlap-aware label aggregation)
 
 - Labels file changed to: `data/processed/regression/labels_masswhites_z14_mixed5000_v2.csv`
-- Built via `scripts/build_mixed_labels.py` by merging `labels_human.csv` and aggregating duplicate tile annotations.
+- Built via `scripts/modeling/build_mixed_labels.py` by merging `labels_human.csv` and aggregating duplicate tile annotations.
 - New columns added for auditability:
   - `human_annotation_count`
   - `human_annotator_count`

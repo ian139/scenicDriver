@@ -2,7 +2,7 @@
 Build a deterministic human benchmark split and agreement report.
 
 Example:
-  uv run python scripts/build_human_benchmark.py \
+  uv run python scripts/annotation/build_human_benchmark.py \
     --annotations-csv data/raw/labels_human.csv \
     --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv \
     --output-dir data/processed/regression \

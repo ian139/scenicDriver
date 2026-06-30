@@ -1,47 +1,51 @@
 # Archive Manifest
 
-Purpose: preserve non-primary files while keeping the active workspace focused on the current training + S3 ingestion path.
+Purpose: preserve non-primary files while keeping the active workspace focused on the current Scenic Drive training, reporting, app, and routing paths.
 
 ## Archive Policy
-- Active path lives in `notebooks/train.mo.py`, `notebooks/regression.mo.py`, `scripts/download_bbox_tiles.py`, `scripts/heuristic_report.py`, `scripts/rebuild_report_from_labels.py`, and `scripts/annotate_scenic_web.py`.
-- Non-primary scripts/models are moved to `archive/` instead of deleted.
-- Archived files are restorable with `mv` commands listed below.
+- Active paths live in:
+  - `notebooks/train.mo.py`
+  - `notebooks/classifier.mo.py`
+  - `notebooks/regression.mo.py`
+  - `notebooks/learned_scoring.mo.py`
+  - `notebooks/annotate_scenic.mo.py`
+  - `scripts/ingest/download_bbox_tiles.py`
+  - `scripts/reports/heuristic_report.py`
+  - `scripts/reports/rebuild_report_from_labels.py`
+  - `scripts/annotation/annotate_scenic_web.py`
+  - `scripts/modeling/*` regression pipeline scripts
+  - `scripts/routing/build_graph_from_osm.py`
+  - `scripts/routing/route_compare_service.py`
+  - `apps/web/`
+  - `apps/mobile/`
+- Non-primary scripts, notebooks, and notes are moved to `archive/` instead of deleted.
+- Archived files are records or historical utilities; restore only after confirming they do not create a duplicate active workflow.
 
 ## Archived Scripts
 Moved to `archive/scripts/`:
-- `build_graph_from_osm.py`
-- `classify_demo.py`
-- `download_naip_bbox.py`
-- `download_naip_state.py`
-- `download_resisc45.py`
-- `download_sample_tiles.py`
-- `extract_terrain_features.py`
-- `heuristic_report_server.py`
-- `route_demo_geojson.py`
-- `route_demo_graph_json.py`
+- `archive/scripts/build_graph_from_osm.py` — historical copy; active replacement is `scripts/routing/build_graph_from_osm.py`.
+- `archive/scripts/classify_demo.py`
+- `archive/scripts/download_naip_bbox.py`
+- `archive/scripts/download_naip_state.py`
+- `archive/scripts/download_resisc45.py`
+- `archive/scripts/download_sample_tiles.py`
+- `archive/scripts/extract_terrain_features.py`
+- `archive/scripts/heuristic_report_server.py`
+- `archive/scripts/route_demo_geojson.py`
+- `archive/scripts/route_demo_graph_json.py`
 
-Reason: these are not in the current primary workflow and can be restored when routing/NAIP phases are resumed.
+## Archived Notebooks
+Moved to `archive/notebooks/`:
+- `archive/notebooks/heuristic_ui.mo.py`
 
-## Archived Model Checkpoints
-Moved to `archive/models/`:
-- `checkpoint.pt`
-- `scenic_multitask_best.pt`
-
-Reason: not used by the current default path (`models/classifier/best_model.pt`).
-
-## Restore Commands
-Restore archived scripts:
-
-```bash
-mv archive/scripts/*.py scripts/
-```
-
-Restore archived model checkpoints:
-
-```bash
-mv archive/models/*.pt models/
-```
+## Archived Notes
+Moved to `archive/notes/`:
+- `archive/notes/work-export-2026-04-20.md`
+- `archive/notes/coding-agent-session-mvp.md`
+- `archive/notes/archive-review-rebuild-guide.md`
+- `archive/notes/misplaced-job-application-AGENTS.md`
 
 ## Notes
 - This archive is intended to reduce confusion and operational risk, not to remove project history.
-- Before deleting archived files, confirm corresponding TODO phase is complete and replacement path is stable.
+- Active docs must use the current grouped paths under `apps/`, `docs/`, and `scripts/`.
+- Historical docs under `archive/notes/` may retain old command paths because they are records, not active instructions.

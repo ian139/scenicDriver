@@ -26,9 +26,9 @@ def _():
         # Learned Scenic Scoring (Step 3)
 
         This notebook orchestrates the Step 3 pipeline using the script CLIs:
-        1. Export regression features (`scripts/export_regression_dataset.py`)
-        2. Train baseline regressor (`scripts/train_regression_baseline.py`)
-        3. Evaluate baseline (`scripts/evaluate_regression_baseline.py`)
+        1. Export regression features (`scripts/modeling/export_regression_dataset.py`)
+        2. Train baseline regressor (`scripts/modeling/train_regression_baseline.py`)
+        3. Evaluate baseline (`scripts/modeling/evaluate_regression_baseline.py`)
         """
     )
     return
@@ -86,7 +86,7 @@ def _(Path, cfg, shlex, subprocess, sys):
 
     export_cmd = [
         sys.executable,
-        "scripts/export_regression_dataset.py",
+        "scripts/modeling/export_regression_dataset.py",
         "--labels-csv",
         cfg.labels_csv,
         "--raw-dir",
@@ -118,7 +118,7 @@ def _(Path, cfg, shlex, subprocess, sys):
 
     train_cmd = [
         sys.executable,
-        "scripts/train_regression_baseline.py",
+        "scripts/modeling/train_regression_baseline.py",
         "--dataset",
         cfg.dataset_npz,
         "--output",
@@ -143,7 +143,7 @@ def _(Path, cfg, shlex, subprocess, sys):
 
     eval_cmd = [
         sys.executable,
-        "scripts/evaluate_regression_baseline.py",
+        "scripts/modeling/evaluate_regression_baseline.py",
         "--dataset",
         cfg.dataset_npz,
         "--checkpoint",

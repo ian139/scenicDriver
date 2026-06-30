@@ -1,7 +1,7 @@
 """
 Train baseline scenic regression model from exported .npz features.
 
-Expected input comes from scripts/export_regression_dataset.py.
+Expected input comes from scripts/modeling/export_regression_dataset.py.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import torch
 
 import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
