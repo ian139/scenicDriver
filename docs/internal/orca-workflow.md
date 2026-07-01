@@ -29,6 +29,16 @@ orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 60000 --json
 
 Use `orca-dev` instead of `orca` when operating an Orca development build. The OMP command stays the same unless the dev environment explicitly requires another binary.
 
+## Long-running workstream branches
+
+Keep exactly three long-running Scenic Drive workstream branches beyond `main`:
+
+- `Ian139/RemoteTraining`: remote GPU lifecycle, S3-backed training execution, training CLIs/notebooks, and modeling infrastructure needed to run training remotely.
+- `Ian139/UI-Fixes`: Figma-driven web/mobile UI rebuild, app shell work, and UI/API contract changes needed by the web or mobile interfaces.
+- `Ian139/S3Management`: S3 data movement, bucket layout, lifecycle policy, data acquisition, and S3-aware reporting/download paths.
+
+Create feature-sized child worktrees from the matching parent stream when work begins; do not create additional long-running top-level branches unless the task is truly cross-cutting and temporary.
+
 ## Planning checklist
 
 During `/plan`, the coordinator must record:
