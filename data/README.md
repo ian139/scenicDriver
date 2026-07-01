@@ -16,6 +16,8 @@ Keep tile keys under:
 
 No extra nested zoom folder under region.
 
+Lifecycle rules target the parent `raw/images/` prefix so both satellite and terrain tiles share the same raw image transition policy.
+
 Report tooling defaults (unless overridden in env):
 - `SCENIC_S3_BUCKET=scenicdriver-data`
 - `SCENIC_S3_ONLY=1`

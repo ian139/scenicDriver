@@ -57,10 +57,27 @@ Notes:
 
 ## 6) Apply Lifecycle Rules (Optional)
 
-Moves older data to cheaper storage.
+Moves older data under `raw/images/` and `processed/` to cheaper storage.
 
 ```bash
 aws s3api put-bucket-lifecycle-configuration \
   --bucket "$SCENIC_S3_BUCKET" \
   --lifecycle-configuration file://config/s3_lifecycle.json
 ```
+
+The lifecycle config targets `raw/images/` as the parent prefix for satellite and terrain tiles. It does not define a model retention policy.
+
+## 7) S3 Report Thumbnail Reads
+
+Report generation accepts local raw data or an explicit S3 raw root:
+
+```bash
+uv run python scripts/reports/rebuild_report_from_labels.py \
+  --labels-csv <labels.csv> \
+  --raw-dir s3://$SCENIC_S3_BUCKET/raw \
+  --s3-bucket "$SCENIC_S3_BUCKET" \
+  --s3-only \
+  --report-dir <tmp-report-dir>
+```
+
+When `--raw-dir s3://<bucket>/raw` is provided, that bucket is authoritative for report thumbnail reads and wins over `SCENIC_S3_BUCKET`.

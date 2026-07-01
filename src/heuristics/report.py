@@ -88,7 +88,7 @@ def _attach_thumbnails(
         parsed_prefix = s3_parts[1] if len(s3_parts) > 1 else ""
         # Treat s3:// raw_dir as authoritative; env flag can explicitly disable.
         s3_only = os.getenv("SCENIC_S3_ONLY", "1").lower() not in ("0", "false", "no")
-        s3_bucket = s3_bucket or parsed_bucket
+        s3_bucket = parsed_bucket or s3_bucket
         s3_prefix = parsed_prefix
 
     s3 = None

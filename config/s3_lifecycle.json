@@ -1,9 +1,9 @@
 {
   "Rules": [
     {
-      "ID": "raw-mapbox-transition",
+      "ID": "raw-images-transition",
       "Status": "Enabled",
-      "Filter": { "Prefix": "raw/mapbox/" },
+      "Filter": { "Prefix": "raw/images/" },
       "Transitions": [
         { "Days": 30, "StorageClass": "STANDARD_IA" },
         { "Days": 180, "StorageClass": "GLACIER" }
