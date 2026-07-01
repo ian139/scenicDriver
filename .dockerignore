@@ -1,0 +1,38 @@
+# Git
+.git/
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets / env
+.env
+.env.*
+
+# Generated data
+data/raw/
+data/processed/
+data/NWPU-RESISC45/
+data/data/
+data/tiles/
+
+# Models
+models/**
+
+# Caches
+cache/
+notebooks/__marimo__/
+
+# Archive
+archive/
+
+# Logs / OS
+*.log
+.DS_Store
+
+# Artifacts
+scenic_artifacts/
