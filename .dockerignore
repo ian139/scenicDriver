@@ -1,21 +1,34 @@
-.git
-.venv
-__pycache__
-.pytest_cache
-.ruff_cache
-.mypy_cache
+# Git
+.git/
 
-# Large local/generated artifacts stay out of container build contexts.
-data/raw
-data/processed
-data/NWPU-RESISC45
-models
-cache
-scenic_artifacts
+# Python environments
+.venv/
+venv/
 
-# Local operator secrets and logs.
+# Python/tool caches
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+notebooks/__marimo__/
+
+# Local operator secrets and logs
 .env
 .env.*
 *.pem
 *.key
 *.log
+
+# Large local/generated artifacts stay out of container build contexts
+data/raw/
+data/processed/
+data/NWPU-RESISC45/
+data/data/
+data/tiles/
+models/**
+cache/
+scenic_artifacts/
+
+# Archive and OS noise
+archive/
+.DS_Store
