@@ -209,13 +209,13 @@ stops at a manual gate before any long job. `scripts/remote/vast-train.sh`
 reuses that gate, runs the regression trainer, syncs artifacts, and destroys the
 instance by default.
 
-Head orchestrator and worker model:
+Head orchestrator and subagent model:
 
 ```bash
 # Head orchestrator terminal
 omp --advisor --model "openai-codex/gpt-5.5" --thinking xhigh
 
-# Planning/execution workers
+# Planning/execution subagents
 omp --model "ollama-cloud/deepseek-v4-pro" --thinking high
 ```
 
@@ -375,7 +375,7 @@ docker rm -f scenic-vast-validate || true
 vastai destroy instance <instance-id> --yes
 ```
 
-For Orca-managed Vast worktree hosts, use the repo wrappers:
+For cmux-managed Vast worktree hosts/tasks, use the repo wrappers:
 
 ```bash
 scripts/remote/vast-start-task.sh scenic-vast-smoke 'Validate prebuilt image and S3-backed smoke run.' \
@@ -390,7 +390,7 @@ scripts/remote/vast-down.sh scenic-vast-smoke --copy-artifacts --destroy --yes
 ```
 
 `scripts/remote/vast-down.sh <task-name> --copy-artifacts --destroy --yes`
-remains a fallback for Orca-managed worktree tasks, not the primary training
+remains a fallback for cmux-managed worktree tasks, not the primary training
 cleanup command.
 
 ## Repository layout

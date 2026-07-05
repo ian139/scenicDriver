@@ -35,7 +35,7 @@ Scenic Drive scores scenic beauty from satellite imagery and terrain data, then 
 - Use marimo notebooks, not Jupyter, for training/research workflows.
 - Prefer one canonical workflow path; archive superseded alternatives instead of leaving duplicate active paths.
 - Run focused tests or smoke checks for changed API, script, notebook, or app paths before yielding.
-- Agent/Orca workflow details live in `docs/internal/orca-workflow.md`.
+- Agent/cmux/OMP workflowz details live in `docs/internal/orca-workflow.md`.
 - Keep ML workflows in marimo notebooks (`notebooks/`).
 - Use grouped `scripts/` subdirectories for workflow CLIs only.
 - Keep large datasets and model weights out of git.

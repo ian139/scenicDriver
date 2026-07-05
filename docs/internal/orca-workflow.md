@@ -1,12 +1,12 @@
-# OMP + Orca development workflow
+# OMP + cmux development workflow
 
-Use this workflow for every OMP coordinator, Orca worker, and Orca dev session in this repository. `AGENTS.md` is the source of truth and is auto-loaded for agents launched from this workspace; do not ask the user to restate it.
+Use this workflow for every OMP coordinator, cmux-managed worktree/session, and OMP subagent in this repository. `AGENTS.md` is the source of truth and is auto-loaded for agents launched from this workspace; do not ask the user to restate it.
 
 ## Always-on rules
 
 - Start from the repository root so OMP sees `AGENTS.md` automatically.
-- Treat `AGENTS.md` as mandatory context for every prompt, worker assignment, and review.
-- Start every non-trivial feature, bug fix, refactor, or research task with `/plan`.
+- Treat `AGENTS.md` as mandatory context for every prompt, subagent assignment, and review.
+- Start every non-trivial feature, bug fix, refactor, or research task with `/plan`, then run it through `workflowz`: decompose, dispatch subagents, monitor, integrate, and verify.
 - Use test-first development: write or update the focused failing test before implementation.
 - Prefer functional core, explicit service boundaries, typed data, and side effects at service edges.
 - Keep containers as the default runtime; host execution is developer convenience only.
@@ -15,19 +15,13 @@ Use this workflow for every OMP coordinator, Orca worker, and Orca dev session i
 
 ## Coordinator startup
 
-Create one feature worktree and one advisor-enabled OMP parent for a new feature or risky fix:
+Create one feature worktree/session in cmux and run one advisor-enabled OMP parent for a new feature or risky fix:
 
 ```bash
-orca worktree create --name "<short-feature-name>" --json
-orca terminal create \
-  --worktree "<short-feature-name>" \
-  --title "coordinator" \
-  --command 'omp --advisor --model "openai-codex/gpt-5.5" --thinking xhigh' \
-  --json
-orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 60000 --json
+omp --advisor --model "openai-codex/gpt-5.5" --thinking xhigh
 ```
 
-Use `orca-dev` instead of `orca` when operating an Orca development build. The OMP command stays the same unless the dev environment explicitly requires another binary.
+Use cmux as the viewing and management surface for worktrees, panes, and long-lived sessions. Run the exact OMP command above inside the cmux-managed coordinator context. If a task specifically requires an Orca-managed worktree, the Orca CLI remains a fallback/legacy surface for that task only.
 
 ## Long-running workstream branches
 
@@ -46,13 +40,13 @@ During `/plan`, the coordinator must record:
 1. User goal and acceptance criteria.
 2. Affected files, services, commands, and container targets.
 3. The test to write or update first.
-4. File ownership before any worker edits.
-5. Whether execution is coordinator-only, same-worktree workers, sub-worktree workers, or mixed.
+4. File ownership before any subagent edits.
+5. Whether execution is coordinator-only, same-worktree subagents, sub-worktree subagents, or mixed.
 6. Risks, service contracts, environment variables, and verification commands.
 
-## Worker model default
+## Subagent model default
 
-Use DeepSeek V4 Pro through Ollama Cloud for implementation workers by default:
+Use DeepSeek V4 Pro through Ollama Cloud for implementation subagents by default:
 
 ```bash
 omp --model "ollama-cloud/deepseek-v4-pro" --thinking high
@@ -60,9 +54,15 @@ omp --model "ollama-cloud/deepseek-v4-pro" --thinking high
 
 Use GPT-5.5 only when the task needs advisor-level coordination, unusually deep architecture work, or the DeepSeek/Ollama Cloud path is unavailable.
 
-## Same-worktree workers
+## Same-worktree subagents
 
-Use same-worktree workers only when file ownership is disjoint and conflicts are unlikely:
+Use same-worktree subagents only when file ownership is disjoint and conflicts are unlikely. Open a cmux-managed pane in the active worktree, then run the implementation OMP command inside it:
+
+```bash
+omp --model "ollama-cloud/deepseek-v4-pro" --thinking high
+```
+
+Fallback/legacy Orca-only path, for tasks that specifically require an Orca-managed terminal:
 
 ```bash
 orca terminal create \
@@ -74,9 +74,15 @@ orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 60000 --json
 orca terminal send --terminal <handle> --text '<narrow task prompt>' --enter --json
 ```
 
-## Sub-worktree workers
+## Sub-worktree subagents
 
-Use sub-worktree workers when isolation, competing implementations, risky tests, or independent verification improves quality:
+Use sub-worktree subagents when isolation, competing implementations, risky tests, or independent verification improves quality. Create or open the child worktree through cmux, run the implementation OMP command inside the cmux-managed context, and have the coordinator integrate only the reviewed patch:
+
+```bash
+omp --model "ollama-cloud/deepseek-v4-pro" --thinking high
+```
+
+Fallback/legacy Orca-only path, for tasks that specifically require an Orca-managed child worktree:
 
 ```bash
 orca worktree create --name "<parent-feature>-<specific-subtask>" --parent-worktree active --json
@@ -89,11 +95,11 @@ orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 60000 --json
 orca terminal send --terminal <handle> --text '<narrow task prompt>' --enter --json
 ```
 
-Sub-worktree output is a patch proposal. The coordinator must inspect the worker diff, reject unrelated edits, integrate the useful patch into the parent worktree, and rerun focused verification in the parent before final verification.
+Sub-worktree output is a patch proposal. The coordinator must inspect the subagent diff, reject unrelated edits, integrate the useful patch into the parent worktree, and rerun focused verification in the parent before final verification.
 
-## Worker prompt contract
+## Subagent prompt contract
 
-Every worker prompt must include:
+Every subagent prompt must include:
 
 ```text
 Context:
@@ -131,12 +137,12 @@ Report:
 5. Unresolved risks
 ```
 
-## Vast GPU Orca host workflow
+## Vast GPU cmux host workflow
 
-Publish Docker images before renting runtime GPU hosts. Do image publishing from a local checkout or a child Orca worktree such as `vast-image-publish`; runtime Vast sessions only pull already-published images. `scripts/remote/vast-start-task.sh` performs SSH-gated allocation, repo upload, uv bootstrap, container smoke, and Orca server setup; do not use it to build or push container images.
+Publish Docker images before renting runtime GPU hosts. Do image publishing from a local checkout or a cmux-managed child worktree such as `vast-image-publish`; runtime Vast sessions only pull already-published images. `scripts/remote/vast-start-task.sh` performs SSH-gated allocation, repo upload, uv bootstrap, container smoke, and Orca server setup; do not use it to build or push container images.
 
 ```bash
-orca worktree create --repo path:/Users/ian/Projects/Scenic\ Drive --name vast-image-publish --parent-worktree active --json
+# In a cmux-managed child worktree named vast-image-publish:
 cd /Users/ian/orca/workspaces/Scenic\ Drive/vast-image-publish
 docker buildx build --platform linux/amd64 -f Dockerfile.remote-training -t ian139/scenicdriver-remote-training:latest --push .
 docker buildx build --platform linux/amd64 -f Dockerfile.remote-training -t ian139/scenicdriver-remote-training:smoke --push .
@@ -147,7 +153,7 @@ docker pull ian139/scenicdriver-remote-training:heavy
 ```
 
 For the automatic training lifecycle, start the head orchestrator Goal before
-dispatching planning or execution workers:
+dispatching planning or execution subagents:
 
 ```bash
 /goal vast-auto-training-lifecycle
@@ -156,7 +162,7 @@ dispatching planning or execution workers:
 # Head orchestrator terminal
 omp --advisor --model "openai-codex/gpt-5.5" --thinking xhigh
 
-# Planning/execution workers
+# Planning/execution subagents
 omp --model "ollama-cloud/deepseek-v4-pro" --thinking high
 ```
 
@@ -205,26 +211,26 @@ vastai ssh-url <instance-id>
 ssh -i ~/.ssh/id_ed25519 -p <ssh-port> -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new root@<ssh-host> echo vast-ssh-ok
 ```
 
-If `vastai attach ssh` says the key is already associated but SSH returns `Permission denied (publickey)`, destroy that instance and rerent; the remote image did not accept the key. If SSH returns `Connection reset by peer` or hangs, wait briefly and retry the preflight; if it continues, rerent on another host before starting Orca pairing.
+If `vastai attach ssh` says the key is already associated but SSH returns `Permission denied (publickey)`, destroy that instance and rerent; the remote image did not accept the key. If SSH returns `Connection reset by peer` or hangs, wait briefly and retry the preflight; if it continues, rerent on another host before starting cmux/OMP pairing.
 
-Save artifacts and destroy explicitly for Orca-managed worktree tasks:
+Save artifacts and destroy explicitly for cmux-managed worktree tasks:
 
 ```bash
 scripts/remote/vast-down.sh scenic-orca-prebuilt-smoke --copy-artifacts --destroy --yes
 ```
 
 Run this in the long-lived orchestrator terminal for automatic artifact copy and
-cost control after Orca worktrees close:
+cost control after cmux worktrees close:
 
 ```bash
 scripts/remote/vast-watch.sh --interval-seconds 60 --destroy --yes
 ```
 
 `scripts/remote/vast-down.sh <task-name> --copy-artifacts --destroy --yes`
-remains a fallback for Orca-managed worktree tasks, not the primary training
+remains a fallback for cmux-managed worktree tasks, not the primary training
 cleanup command.
 
-GPU selection defaults to on-demand pricing. Prefer on-demand for agent-backed tasks because Vast interruptible/bid instances can stop before the Orca worktree is completed. Use interruptible only for checkpointed training jobs that can tolerate eviction and resume cleanly.
+GPU selection defaults to on-demand pricing. Prefer on-demand for agent-backed tasks because Vast interruptible/bid instances can stop before the cmux worktree is completed. Use interruptible only for checkpointed training jobs that can tolerate eviction and resume cleanly.
 
 For exact host selection, inspect offers first and pass the selected id while still using the prebuilt image and SSH-gated allocation:
 
@@ -236,7 +242,7 @@ scripts/remote/vast-start-task.sh scenic-orca-prebuilt-smoke 'Infrastructure smo
 Required local and remote credentials:
 
 - Local `vastai` authenticated.
-- Local Orca running (`orca status --json` returns `ok: true`).
+- Local cmux/OMP coordinator available; use `orca status --json` only for fallback/legacy Orca-managed tasks.
 - Docker Hub token with push access for `ian139/scenicdriver-remote-training`.
 - `.secrets/aws.env` containing `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `SCENIC_S3_BUCKET`, and `SCENIC_S3_ONLY`.
 - `~/.ssh/id_ed25519` and `~/.ssh/id_ed25519.pub` attachable to Vast.
