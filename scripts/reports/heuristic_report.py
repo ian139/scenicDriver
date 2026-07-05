@@ -23,7 +23,7 @@ from src.heuristics.report import build_report
 DEFAULT_S3_BUCKET = "scenicdriver-data"
 DEFAULT_S3_ONLY = "1"
 DEFAULT_REGRESSION_CKPT = (
-    "models/scenic_regression_baseline_masswhites_z14_mixed5000_v5_weighted_h4.pt"
+    "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt"
 )
 
 
@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--preview", action="store_true", default=False)
     parser.add_argument("--max-tiles", type=int, default=None)
+    parser.add_argument(
+        "--all-tiles",
+        action="store_true",
+        default=False,
+        help="Process every paired tile instead of applying the default non-preview cap.",
+    )
     parser.add_argument("--write-labels", action="store_true", default=False)
     parser.add_argument("--write-raw-labels", action="store_true", default=False)
     parser.add_argument("--no-classifier", action="store_true", default=False)
@@ -83,7 +89,12 @@ def run_report(args: argparse.Namespace) -> Path:
             os.environ["SCENIC_S3_ONLY"] = "1"
 
     run_name = args.run_name or f"heuristic_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-    if args.preview and args.max_tiles is None:
+    all_tiles = getattr(args, "all_tiles", False)
+    if args.preview and all_tiles:
+        raise ValueError("--all-tiles cannot be used with --preview")
+    if all_tiles:
+        max_tiles = None
+    elif args.preview and args.max_tiles is None:
         max_tiles = min(256, cfg.heuristic_max_tiles)
     else:
         max_tiles = args.max_tiles or cfg.heuristic_max_tiles

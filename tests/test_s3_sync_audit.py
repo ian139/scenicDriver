@@ -199,3 +199,92 @@ def test_report_thumbnails_use_explicit_s3_raw_dir_bucket(
     assert tiles[0]["index"] == 0
     assert tiles[0]["thumb"] == "thumbs/00000.jpg"
     assert (thumbs_dir / "00000.jpg").is_file()
+
+
+
+class _DummyLabelsFrame:
+    def to_csv(self, path: Path, index: bool = False) -> None:
+        path.write_text("image_path,scenic_score,class_id\nraw/images/satellite/z14/new_england_north/1_2.png,5.0,-1\n")
+
+
+def test_heuristic_report_region_all_tiles_delegates_uncapped_s3(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from scripts.reports import heuristic_report, heuristic_report_region
+
+    captured: dict[str, object] = {}
+
+    def fake_labeling(**kwargs: object) -> tuple[_DummyLabelsFrame, list[dict[str, object]], dict[str, object]]:
+        captured.update(kwargs)
+        return _DummyLabelsFrame(), [], {"counts": {}, "config": {"max_tiles": kwargs["max_tiles"]}}
+
+    def fake_report(**kwargs: object) -> dict[str, object]:
+        return {"summary": {}, "histogram": {}}
+
+    cfg = heuristic_report.HeuristicLabelerConfig()
+    cfg.processed_dir = str(tmp_path)
+    monkeypatch.setattr(heuristic_report, "HeuristicLabelerConfig", lambda: cfg)
+    monkeypatch.setattr(heuristic_report, "run_heuristic_labeling", fake_labeling)
+    monkeypatch.setattr(heuristic_report, "build_report", fake_report)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "heuristic_report_region.py",
+            "--region",
+            "new_england_north",
+            "--zoom",
+            "14",
+            "--raw-dir",
+            "s3://scenicdriver-data/raw",
+            "--s3-only",
+            "--write-labels",
+            "--all-tiles",
+            "--no-classifier",
+        ],
+    )
+
+    heuristic_report_region.main()
+
+    assert captured["satellite_dir"] == "data/raw/images/satellite/z14/new_england_north"
+    assert captured["terrain_dir"] == "data/raw/images/terrain/z14/new_england_north"
+    assert captured["raw_dir"] == "s3://scenicdriver-data/raw"
+    assert captured["max_tiles"] is None
+
+
+def test_heuristic_report_preview_preserves_256_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from scripts.reports import heuristic_report, heuristic_report_region
+
+    captured: dict[str, object] = {}
+
+    def fake_labeling(**kwargs: object) -> tuple[_DummyLabelsFrame, list[dict[str, object]], dict[str, object]]:
+        captured.update(kwargs)
+        return _DummyLabelsFrame(), [], {"counts": {}, "config": {"max_tiles": kwargs["max_tiles"]}}
+
+    def fake_report(**kwargs: object) -> dict[str, object]:
+        return {"summary": {}, "histogram": {}}
+
+    cfg = heuristic_report.HeuristicLabelerConfig()
+    cfg.processed_dir = str(tmp_path)
+    monkeypatch.setattr(heuristic_report, "HeuristicLabelerConfig", lambda: cfg)
+    monkeypatch.setattr(heuristic_report, "run_heuristic_labeling", fake_labeling)
+    monkeypatch.setattr(heuristic_report, "build_report", fake_report)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "heuristic_report_region.py",
+            "--region",
+            "new_england_north",
+            "--zoom",
+            "14",
+            "--preview",
+            "--no-classifier",
+        ],
+    )
+
+    heuristic_report_region.main()
+
+    assert captured["max_tiles"] == 256

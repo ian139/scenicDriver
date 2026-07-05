@@ -19,9 +19,11 @@ dist/
 .env
 .env.*
 !.env.example
+.secrets/
 
 # Local env / tooling
 .claude/
+.orca-vast/
 
 # Data (generated / large)
 data/raw/

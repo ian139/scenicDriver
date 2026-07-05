@@ -18,6 +18,8 @@ notebooks/__marimo__/
 *.pem
 *.key
 *.log
+.secrets/
+.orca-vast/
 
 # Large local/generated artifacts stay out of container build contexts
 data/raw/

@@ -41,14 +41,14 @@ def test_vast_init_dry_run_renders_bootstrap_without_secrets() -> None:
     assert "docker run --rm --gpus all" in bootstrap
     assert "SCENIC_S3_BUCKET=scenicdriver-data" in bootstrap
     assert "SCENIC_S3_ONLY=1" in bootstrap
-    assert "uv run python scripts/modeling/train_regression_baseline.py --help" in bootstrap
+    assert "python scripts/modeling/train_regression_baseline.py --help" in bootstrap
     assert "--env-file /root/.scenic/aws.env" in bootstrap
     assert "AWS_SECRET_ACCESS_KEY=" not in bootstrap
     assert "AWS_ACCESS_KEY_ID=" not in bootstrap
     assert str(REPO_ROOT) not in bootstrap
 
 
-def test_vast_init_requires_container_target() -> None:
+def test_vast_init_defaults_to_prebuilt_dockerhub_image() -> None:
     cmd = [
         sys.executable,
         str(REPO_ROOT / "scripts/remote/vast_lifecycle.py"),
@@ -67,5 +67,9 @@ def test_vast_init_requires_container_target() -> None:
 
     result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
 
-    assert result.returncode != 0
-    assert "Provide --image or --containerfile; no tracked container target is available." in result.stderr
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    bootstrap = payload["bootstrap_script"]
+    assert "docker pull ian139/scenicdriver-remote-training:latest" in bootstrap
+    assert "docker run --rm --gpus all" in bootstrap
+    assert "Provide --image or --containerfile; no tracked container target is available." not in result.stderr

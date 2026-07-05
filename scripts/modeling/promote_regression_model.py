@@ -15,14 +15,16 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Promote candidate model based on baseline comparison")
-    parser.add_argument("--candidate-metrics", type=Path, required=True)
-    parser.add_argument("--baseline-metrics", type=Path, required=True)
+    parser.add_argument("--candidate-metrics", type=Path)
+    parser.add_argument("--baseline-metrics", type=Path)
     parser.add_argument("--candidate-checkpoint", type=Path, required=True)
     parser.add_argument(
         "--registry-json",
         type=Path,
         default=Path("data/processed/regression/model_registry.json"),
     )
+    parser.add_argument("--benchmark-comparison", type=Path)
+    parser.add_argument("--required-control-comparison", type=Path)
     parser.add_argument("--min-corr-delta", type=float, default=0.0)
     parser.add_argument("--min-mae-improvement", type=float, default=0.0)
     parser.add_argument("--min-rmse-improvement", type=float, default=0.0)
@@ -57,20 +59,70 @@ def _build_record(
     }
 
 
-def main() -> None:
-    args = parse_args()
-    candidate = _read_json(args.candidate_metrics)
-    baseline = _read_json(args.baseline_metrics)
-
+def _metric_deltas(candidate: dict, baseline: dict) -> tuple[float, float, float]:
     corr_delta = float(candidate["corr"]) - float(baseline["corr"])
     mae_improvement = float(baseline["mae"]) - float(candidate["mae"])
     rmse_improvement = float(baseline["rmse"]) - float(candidate["rmse"])
+    return corr_delta, mae_improvement, rmse_improvement
 
+
+def _passes_gate(
+    *,
+    candidate: dict,
+    baseline: dict,
+    min_corr_delta: float,
+    min_mae_improvement: float,
+    min_rmse_improvement: float,
+) -> tuple[bool, dict]:
+    corr_delta, mae_improvement, rmse_improvement = _metric_deltas(candidate, baseline)
+    actual = {
+        "corr_delta": corr_delta,
+        "mae_improvement": mae_improvement,
+        "rmse_improvement": rmse_improvement,
+    }
     pass_gate = (
-        corr_delta >= args.min_corr_delta
-        and mae_improvement >= args.min_mae_improvement
-        and rmse_improvement >= args.min_rmse_improvement
+        corr_delta >= min_corr_delta
+        and mae_improvement >= min_mae_improvement
+        and rmse_improvement >= min_rmse_improvement
     )
+    return pass_gate, actual
+
+
+def main() -> None:
+    args = parse_args()
+    if args.benchmark_comparison is not None:
+        comparison = _read_json(args.benchmark_comparison)
+        candidate = comparison["candidate"]
+        baseline = comparison["baseline"]
+        source_metrics = str(args.benchmark_comparison)
+        if args.candidate_metrics is not None or args.baseline_metrics is not None:
+            raise ValueError("--benchmark-comparison cannot be combined with flat metrics arguments")
+    else:
+        if args.candidate_metrics is None or args.baseline_metrics is None:
+            raise ValueError("Either --benchmark-comparison or both --candidate-metrics and --baseline-metrics are required")
+        candidate = _read_json(args.candidate_metrics)
+        baseline = _read_json(args.baseline_metrics)
+        source_metrics = str(args.candidate_metrics)
+        comparison = None
+
+    pass_gate, actual = _passes_gate(
+        candidate=candidate,
+        baseline=baseline,
+        min_corr_delta=args.min_corr_delta,
+        min_mae_improvement=args.min_mae_improvement,
+        min_rmse_improvement=args.min_rmse_improvement,
+    )
+    control_actual = None
+    if args.required_control_comparison is not None:
+        control_comparison = _read_json(args.required_control_comparison)
+        control_pass_gate, control_actual = _passes_gate(
+            candidate=control_comparison["candidate"],
+            baseline=control_comparison["baseline"],
+            min_corr_delta=args.min_corr_delta,
+            min_mae_improvement=args.min_mae_improvement,
+            min_rmse_improvement=args.min_rmse_improvement,
+        )
+        pass_gate = pass_gate and control_pass_gate
 
     registry = {"active": None, "history": []}
     if args.registry_json.exists():
@@ -79,19 +131,18 @@ def main() -> None:
             registry["history"] = []
 
     decision = {
-        "candidate_metrics": str(args.candidate_metrics),
-        "baseline_metrics": str(args.baseline_metrics),
+        "candidate_metrics": str(args.candidate_metrics) if args.candidate_metrics else None,
+        "baseline_metrics": str(args.baseline_metrics) if args.baseline_metrics else None,
+        "benchmark_comparison": str(args.benchmark_comparison) if args.benchmark_comparison else None,
+        "required_control_comparison": str(args.required_control_comparison) if args.required_control_comparison else None,
         "candidate_checkpoint": str(args.candidate_checkpoint),
         "thresholds": {
             "min_corr_delta": args.min_corr_delta,
             "min_mae_improvement": args.min_mae_improvement,
             "min_rmse_improvement": args.min_rmse_improvement,
         },
-        "actual": {
-            "corr_delta": corr_delta,
-            "mae_improvement": mae_improvement,
-            "rmse_improvement": rmse_improvement,
-        },
+        "actual": actual,
+        "control_actual": control_actual,
         "promoted": pass_gate,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -101,7 +152,7 @@ def main() -> None:
             checkpoint=args.candidate_checkpoint,
             metrics=candidate,
             run_name=args.run_name,
-            source=str(args.candidate_metrics),
+            source=source_metrics,
         )
         registry["active"] = active
         registry["history"].append(
@@ -119,7 +170,7 @@ def main() -> None:
                     checkpoint=args.candidate_checkpoint,
                     metrics=candidate,
                     run_name=args.run_name,
-                    source=str(args.candidate_metrics),
+                    source=source_metrics,
                 ),
                 "decision": decision,
             }

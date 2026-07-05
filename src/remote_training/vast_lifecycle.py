@@ -10,7 +10,7 @@ import sys
 import time
 
 
-MISSING_CONTAINER_TARGET = "Provide --image or --containerfile; no tracked container target is available."
+DEFAULT_REMOTE_TRAINING_IMAGE = "ian139/scenicdriver-remote-training:latest"
 
 
 @dataclass(frozen=True)
@@ -31,7 +31,7 @@ class VastInitConfig:
     local_secrets_env_file: Path | None = None
     data_root: str = "/workspace/scenic-data"
     models_root: str = "/workspace/scenic-models"
-    smoke_command: str = "uv run python scripts/modeling/train_regression_baseline.py --help"
+    smoke_command: str = "python scripts/modeling/train_regression_baseline.py --help"
     force_reset: bool = False
     require_artifacts: bool = False
     pull_image: bool = True
@@ -55,8 +55,6 @@ def validate_config(config: VastInitConfig) -> None:
         raise ValueError("--repo-url is required")
     if not config.s3_bucket:
         raise ValueError("--s3-bucket or SCENIC_S3_BUCKET is required")
-    if not config.image and not config.containerfile:
-        raise ValueError(MISSING_CONTAINER_TARGET)
     if config.retries < 1:
         raise ValueError("--retries must be at least 1")
     if config.retry_delay_seconds < 0:
@@ -108,11 +106,11 @@ def _artifact_flag(config: VastInitConfig) -> str:
 
 
 def _bootstrap_script(config: VastInitConfig) -> str:
-    image = config.image or "scenicdriver-training:vast"
+    image = config.image or DEFAULT_REMOTE_TRAINING_IMAGE
     s3_only = "1" if config.s3_only else "0"
     artifact_flag = _artifact_flag(config)
     s3_smoke = (
-        "uv run python -c "
+        "python -c "
         + _q(
             "import os, torch, boto3; "
             "bucket=os.environ['SCENIC_S3_BUCKET']; "
@@ -189,22 +187,22 @@ def _bootstrap_script(config: VastInitConfig) -> str:
             _docker_run(
                 config,
                 image,
-                "uv run python -m src.data_pipeline.s3 check-prefix --bucket \"$SCENIC_S3_BUCKET\" --prefix raw/ --required",
+                "python -m src.data_pipeline.s3 check-prefix --bucket \"$SCENIC_S3_BUCKET\" --prefix raw/ --required",
             ),
             _docker_run(
                 config,
                 image,
-                f"uv run python -m src.data_pipeline.s3 download-prefix --bucket \"$SCENIC_S3_BUCKET\" --prefix processed/regression/ --dest data/processed/regression {artifact_flag}",
+                f"python -m src.data_pipeline.s3 download-prefix --bucket \"$SCENIC_S3_BUCKET\" --prefix processed/regression/ --dest data/processed/regression {artifact_flag}",
             ),
             _docker_run(
                 config,
                 image,
-                f"uv run python -m src.data_pipeline.s3 download-prefix --bucket \"$SCENIC_S3_BUCKET\" --prefix models/ --dest models {artifact_flag}",
+                f"python -m src.data_pipeline.s3 download-prefix --bucket \"$SCENIC_S3_BUCKET\" --prefix models/ --dest models {artifact_flag}",
             ),
             _docker_run(
                 config,
                 image,
-                f"uv run python -m src.data_pipeline.s3 download-file --bucket \"$SCENIC_S3_BUCKET\" --key raw/labels_human.csv --dest data/raw/labels_human.csv {artifact_flag}",
+                f"python -m src.data_pipeline.s3 download-file --bucket \"$SCENIC_S3_BUCKET\" --key raw/labels_human.csv --dest data/raw/labels_human.csv {artifact_flag}",
             ),
             "",
             "echo '== smoke =='",

@@ -20,4 +20,4 @@
 
 ## Phase 3: Routing
 
-- [ ] Expand annotations to 1000+ and rerun benchmark + mixed training for `v5`.
+- [ ] Expand annotations to 1000+ and rerun benchmark + mixed training from the active registry model.

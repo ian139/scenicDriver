@@ -1,6 +1,6 @@
-# ML Research Log: Learned Scoring v1 vs v2 vs v3 vs v4
+# ML Research Log: Learned Scoring v1 through v6
 
-This file tracks what changed across the `masswhites` learned-scoring checkpoint iterations and why `v4` is now the promoted model.
+This file tracks what changed across the `masswhites` learned-scoring checkpoint iterations and why `v6` is now the promoted model.
 
 ## Scope
 
@@ -19,6 +19,7 @@ All three versions below use:
 | v2 | `data/processed/regression/features_masswhites_z14_mixed5000_v2_weighted_h4.npz` | `models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt` | `0.2743` | `0.3686` | `0.9227` |
 | v3 | `data/processed/regression/features_masswhites_z14_mixed5000_v3_h4.npz` | `models/scenic_regression_baseline_masswhites_z14_mixed5000_v3_h4.pt` | `0.4820` | `0.6426` | `0.7472` |
 | v4 | `data/processed/regression/features_masswhites_z14_mixed5000_v4_h4.npz` | `models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt` | `0.1879` | `0.2646` | `0.9609` |
+| v6 | `data/processed/regression/features_masswhites_z14_mixed5000_v4_h4.npz` | `models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt` | `0.2197` | `0.4248` | `0.8851` |
 
 Metrics source files:
 
@@ -26,6 +27,8 @@ Metrics source files:
 - `data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v2_weighted_h4.json`
 - `data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v3_h4.json`
 - `data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v4_weighted_h4.json`
+- `data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v6_vast_weighted_h4.json`
+- `data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v4_weighted_h4.local_verify.json`
 
 ## What Changed
 
@@ -73,16 +76,16 @@ Metrics source files:
 
 ## Decision
 
-Use `v4` as the active model:
+Use `v6` as the active model:
 
-- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt`
+- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt`
 - Registry source of truth: `data/processed/regression/model_registry.json`
 
-Treat `v1`, `v2`, and `v3` as baselines/controls.
+Treat `v1`, `v2`, `v3`, `v4`, and `v5` as baselines/controls. The v6 promotion compares against v4 using the corrected training/evaluation validation split in `baseline_metrics_masswhites_z14_mixed5000_v4_weighted_h4.local_verify.json`.
 
 ## Guardrail for Next Iteration
 
-Before training `v4`, verify the labels input and dataset hash:
+Before training the next iteration, verify the labels input and dataset hash:
 
 1. Build labels with overlap-aware aggregation (`build_mixed_labels.py`).
 2. Export NPZ from the intended labels CSV.

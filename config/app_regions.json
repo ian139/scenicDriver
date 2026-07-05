@@ -7,7 +7,7 @@
       "description": "Primary MVP coverage for the Massachusetts / White Mountains scenic corridor.",
       "graph": "data/processed/road_graphs/masswhites_z14_wide/road_graph.json",
       "run_name": "masswhites_z14_learned_h4_v2",
-      "model_checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v4_weighted_h4.pt",
+      "model_checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt",
       "bbox": {
         "min_lat": 41.19518982948958,
         "min_lon": -73.5205078125,

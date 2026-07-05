@@ -62,7 +62,7 @@ def run_heuristic_labeling(
     satellite_dir: str | Path,
     terrain_dir: str | Path,
     raw_dir: str | Path,
-    max_tiles: int,
+    max_tiles: int | None,
     use_classifier: bool,
     classifier_best_ckpt: str | Path,
     classifier_use_resisc45_stats: bool,
@@ -162,10 +162,11 @@ def run_heuristic_labeling(
     tiles: list[dict[str, Any]] = []
     processed = 0
     missing_pairs = 0
-    max_tiles = max(1, int(ceil(max_tiles)))
+    if max_tiles is not None:
+        max_tiles = max(1, int(ceil(max_tiles)))
 
     for sat_path, coords in zip(sat_files, sat_coords):
-        if processed >= max_tiles:
+        if max_tiles is not None and processed >= max_tiles:
             break
 
         key = coords if coords_ok else Path(_path_for_coords(sat_path)).stem

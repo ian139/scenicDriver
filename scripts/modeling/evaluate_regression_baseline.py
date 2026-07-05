@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.scenic_scorer.regression import ScenicRegressionModel, ScenicScoreDataset
+from src.scenic_scorer.regression import ScenicRegressionModel, ScenicScoreDataset  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,9 +33,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def _build_val_indices(n: int, val_split: float, seed: int) -> np.ndarray:
-    rng = np.random.default_rng(seed)
     indices = np.arange(n)
-    rng.shuffle(indices)
+    np.random.seed(seed)
+    np.random.shuffle(indices)
     split = max(1, int(n * (1 - val_split)))
     val_idx = indices[split:]
     if len(val_idx) == 0:

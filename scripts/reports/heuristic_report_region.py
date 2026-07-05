@@ -24,6 +24,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--preview", action="store_true", default=False)
     parser.add_argument("--max-tiles", type=int, default=None)
+    parser.add_argument(
+        "--all-tiles",
+        action="store_true",
+        default=False,
+        help="Process every paired tile instead of applying the default non-preview cap.",
+    )
     parser.add_argument("--write-labels", action="store_true", default=False)
     parser.add_argument("--write-raw-labels", action="store_true", default=False)
     parser.add_argument("--no-classifier", action="store_true", default=False)
@@ -67,6 +73,7 @@ def main() -> None:
         run_name=run_name,
         preview=args.preview,
         max_tiles=args.max_tiles,
+        all_tiles=args.all_tiles,
         write_labels=args.write_labels,
         write_raw_labels=args.write_raw_labels,
         no_classifier=args.no_classifier,

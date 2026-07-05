@@ -25,9 +25,9 @@ Current direction:
 
 ## Current focus
 
-`v5` is the active learned checkpoint for Northeast runs:
+`v6` is the active learned checkpoint for Northeast runs:
 
-- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v5_weighted_h4.pt`
+- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt`
 - Source of truth: `data/processed/regression/model_registry.json`
 
 Current focus is MVP app build-out (hosted route compare + web/mobile UX), with routing/system hardening underneath.
@@ -96,7 +96,7 @@ uv run python scripts/ingest/download_bbox_tiles.py \
 uv run python scripts/reports/heuristic_report.py \
   --run-name masswhites_z14_learned_h4_v2 \
   --scoring learned \
-  --regression-ckpt models/scenic_regression_baseline_masswhites_z14_mixed5000_v5_weighted_h4.pt \
+  --regression-ckpt models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt \
   --satellite-dir data/raw/images/satellite/z14/masswhites \
   --terrain-dir data/raw/images/terrain/z14/masswhites \
   --max-tiles 5000 \
@@ -195,6 +195,203 @@ The report viewer auto-loads:
 - fallback pair `route_scenic.geojson` and `route_fast.geojson`.
 
 Route comparison metrics (distance/time/scenic deltas) are rendered in-map when route overlay data is present.
+
+
+### Vast.ai cloud GPU workflow
+
+The canonical Dockerfile for GPU runs is `Dockerfile.remote-training` (the root
+`Dockerfile` is a convenience symlink). Use `-f Dockerfile.remote-training` in
+scripted Docker/Vast commands. The image is only the reusable environment; S3
+holds data and model weights. Image publishing remains separate from GPU rental:
+training pulls `ian139/scenicdriver-remote-training:latest`. The provisioning
+script prepares a temporary Vast.ai instance for one short validation run, then
+stops at a manual gate before any long job. `scripts/remote/vast-train.sh`
+reuses that gate, runs the regression trainer, syncs artifacts, and destroys the
+instance by default.
+
+Head orchestrator and worker model:
+
+```bash
+# Head orchestrator terminal
+omp --advisor --model "openai-codex/gpt-5.5" --thinking xhigh
+
+# Planning/execution workers
+omp --model "ollama-cloud/deepseek-v4-pro" --thinking high
+```
+
+Start the cost-controlled training lifecycle from the head orchestrator:
+
+```bash
+/goal vast-auto-training-lifecycle
+# Objective: start Vast, validate S3/GPU smoke, train regression model, sync outputs, destroy instance
+```
+
+Local image build and smoke:
+
+```bash
+docker build --platform linux/amd64 \
+  -f Dockerfile.remote-training \
+  -t scenicdriver/remote-training:vast-smoke .
+
+docker run --rm --platform linux/amd64 scenicdriver/remote-training:vast-smoke \
+  python scripts/remote/container_smoke.py --check-imports --device cpu
+
+# On a CUDA host:
+docker run --rm --gpus all scenicdriver/remote-training:vast-smoke \
+  python scripts/remote/container_smoke.py --check-imports --device cuda
+```
+
+Tag, push, and prove the registry pull:
+
+```bash
+docker tag scenicdriver/remote-training:vast-smoke \
+  ian139/scenicdriver-remote-training:latest
+docker push ian139/scenicdriver-remote-training:latest
+docker pull --platform linux/amd64 ian139/scenicdriver-remote-training:latest
+```
+
+Vast.ai launch requirements:
+
+- One NVIDIA GPU with Docker GPU runtime (`--gpus all`) and driver compatible
+  with CUDA 12.4.
+- At least 64 GB disk for the image, downloaded data/model prefixes, and output
+  artifacts.
+- AWS credentials supplied at runtime only, usually via `/root/.scenic/aws.env`
+  containing `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`,
+  and `SCENIC_S3_BUCKET`. The container uses `boto3` for S3 if the AWS CLI is
+  absent, so the Docker image does not need to carry the extra AWS CLI layer.
+- No long job starts until the smoke and minimal inference steps below pass.
+
+For the fast validation run, use tiny S3 smoke prefixes instead of broad
+production prefixes. Example:
+
+```bash
+export SCENIC_S3_BUCKET=scenicdriver-data
+export SCENIC_RUN_ID=vast-smoke-$(date -u +%Y%m%dT%H%M%SZ)
+export SCENIC_S3_DATA_PREFIX=processed/regression/vast-smoke/$SCENIC_RUN_ID/
+export SCENIC_S3_MODELS_PREFIX=models/vast-smoke/$SCENIC_RUN_ID/
+export SCENIC_S3_OUTPUT_PREFIX=outputs/vast/$SCENIC_RUN_ID/
+aws s3 cp /path/to/tiny_features.npz "s3://$SCENIC_S3_BUCKET/$SCENIC_S3_DATA_PREFIX"
+aws s3 cp /path/to/tiny_regression.pt "s3://$SCENIC_S3_BUCKET/$SCENIC_S3_MODELS_PREFIX"
+```
+
+Example Vast search/start and SSH preflight:
+
+```bash
+vastai search offers 'gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true' \
+  -o 'dlperf_usd-' --raw
+vastai create instance <offer-id> \
+  --image nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 \
+  --disk 64 --ssh --direct --raw
+vastai attach ssh <instance-id> "$(ssh-keygen -y -f ~/.ssh/id_ed25519)"
+vastai ssh-url <instance-id>
+ssh -i ~/.ssh/id_ed25519 -p <ssh-port> root@<ssh-host> nvidia-smi
+```
+
+Pull and run the prebuilt image on the Vast host:
+
+```bash
+ssh -i ~/.ssh/id_ed25519 -p <ssh-port> root@<ssh-host>
+docker pull ian139/scenicdriver-remote-training:latest
+mkdir -p /workspace/scenic-data /workspace/scenic-models /workspace/scenic-artifacts /root/.scenic
+# Copy /root/.scenic/aws.env out-of-band; do not bake credentials into the image.
+
+docker run --gpus all --name scenic-vast-validate \
+  --env-file /root/.scenic/aws.env \
+  -e SCENIC_S3_BUCKET=scenicdriver-data \
+  -e SCENIC_S3_DATA_PREFIX="$SCENIC_S3_DATA_PREFIX" \
+  -e SCENIC_S3_MODELS_PREFIX="$SCENIC_S3_MODELS_PREFIX" \
+  -e SCENIC_S3_OUTPUT_PREFIX="$SCENIC_S3_OUTPUT_PREFIX" \
+  -e SCENIC_TIMEOUT_MINUTES=30 \
+  -v /workspace/scenic-data:/workspace/data/processed/regression \
+  -v /workspace/scenic-models:/workspace/models \
+  -v /workspace/scenic-artifacts:/workspace/scenic_artifacts \
+  ian139/scenicdriver-remote-training:latest \
+  bash scripts/remote/provision_vast.sh
+```
+The provisioning script runs these required S3/GPU/inference gates in order
+(shown with AWS CLI syntax; the script falls back to the repo's boto3 S3 helper
+inside the container):
+
+```bash
+aws sts get-caller-identity
+aws s3api head-bucket --bucket "$SCENIC_S3_BUCKET"
+aws s3 sync "s3://$SCENIC_S3_BUCKET/$SCENIC_S3_DATA_PREFIX" data/processed/regression
+aws s3 sync "s3://$SCENIC_S3_BUCKET/$SCENIC_S3_MODELS_PREFIX" models
+nvidia-smi
+python scripts/remote/container_smoke.py --device cuda --check-imports --json
+python scripts/remote/minimal_inference.py \
+  --device cuda \
+  --checkpoint models/<checkpoint>.pt \
+  --dataset data/processed/regression/<features>.npz \
+  --output scenic_artifacts/vast/<run-id>/inference_result.json
+aws s3 sync scenic_artifacts/vast/<run-id>/ "s3://$SCENIC_S3_BUCKET/$SCENIC_S3_OUTPUT_PREFIX"
+```
+
+Validation checklist:
+
+- [ ] Docker image builds with `Dockerfile.remote-training`.
+- [ ] Image pulls from Docker Hub on the Vast host.
+- [ ] `scripts/remote/provision_vast.sh` pulls required data and model prefixes
+      from S3; missing prefixes fail unless `SCENIC_ALLOW_MISSING_ARTIFACTS=1`.
+- [ ] `nvidia-smi` succeeds on the host and inside the container path.
+- [ ] `container_smoke.py --device cuda --check-imports` succeeds.
+- [ ] `minimal_inference.py` writes `inference_result.json` quickly.
+- [ ] `aws s3 sync` uploads the output directory back to S3.
+- [ ] No long training command starts before every item above passes.
+
+Automatic train-and-close path:
+
+```bash
+scripts/remote/vast-train.sh run <task-name> \
+  --train-dataset-key <key> \
+  --epochs 1 \
+  --batch-size 64
+
+scripts/remote/vast-train.sh status <task-name>
+
+scripts/remote/vast-train.sh cleanup <task-name> --copy-artifacts --destroy --yes
+```
+
+Use `--epochs 1 --batch-size 64` for a cost-controlled smoke train. Omit those
+overrides for the real default training path. If the local orchestrator dies,
+rerun the cleanup command; it uses the recorded `.orca-vast/state/<task-name>.json`
+instance id and remote sentinel paths.
+
+Monitoring and cost controls:
+
+```bash
+docker logs -f scenic-vast-validate
+watch -n 30 nvidia-smi
+vastai show instance <instance-id> --raw
+```
+
+If a command stalls or a smoke step fails, capture the exact command and last
+log lines, then stop the instance:
+
+```bash
+docker logs scenic-vast-validate --tail 200
+docker rm -f scenic-vast-validate || true
+vastai destroy instance <instance-id> --yes
+```
+
+For Orca-managed Vast worktree hosts, use the repo wrappers:
+
+```bash
+scripts/remote/vast-start-task.sh scenic-vast-smoke 'Validate prebuilt image and S3-backed smoke run.' \
+  --agent none \
+  --allocation-attempts 3 \
+  --disk-gb 64 \
+  --image ian139/scenicdriver-remote-training:latest \
+  --timeout-seconds 1800
+
+scripts/remote/vast-watch.sh --interval-seconds 60 --destroy --yes
+scripts/remote/vast-down.sh scenic-vast-smoke --copy-artifacts --destroy --yes
+```
+
+`scripts/remote/vast-down.sh <task-name> --copy-artifacts --destroy --yes`
+remains a fallback for Orca-managed worktree tasks, not the primary training
+cleanup command.
 
 ## Repository layout
 
