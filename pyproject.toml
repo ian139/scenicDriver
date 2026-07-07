@@ -20,6 +20,7 @@ dependencies = [
   "boto3>=1.34",
   "requests>=2.31",
   "tqdm>=4.66",
+  "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]

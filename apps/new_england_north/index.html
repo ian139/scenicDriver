@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Scenic Drive · New England North</title>
+    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css?v=scenic-green-solid-v2" />
+  </head>
+  <body>
+    <main class="viewer-shell">
+      <section class="map-stage" aria-label="New England North scenic map viewer">
+        <div id="map" role="application" aria-label="Map with scenic heatmap and route overlays"></div>
+
+        <div id="inspector" class="inspector" aria-live="polite">
+          <span class="eyebrow">Scenic score</span>
+          <strong id="inspectorScore">--</strong>
+          <span id="inspectorCoords">Move over a heatmap cell</span>
+        </div>
+      </section>
+
+      <div class="bottom-overlay">
+        <div id="scaleTab" class="scale-tab" aria-label="Scenic heatmap scale">
+          <button id="scaleToggle" type="button" class="scale-toggle" aria-expanded="true" aria-controls="scalePanel">
+            <span class="scale-toggle-label">Scale</span>
+            <span class="scale-toggle-chevron" aria-hidden="true">▾</span>
+          </button>
+          <div id="scalePanel" class="scale-panel">
+            <span>Low</span>
+            <div class="legend-ramp" aria-hidden="true"></div>
+            <span>High</span>
+          </div>
+        </div>
+        <aside class="control-panel" aria-label="Route controls">
+        <header class="panel-header">
+          <div class="panel-heading">
+            <h1>Scenic heatmap &amp; route planner</h1>
+            <p class="subhead">New England North</p>
+          </div>
+          <span class="status-chip" id="apiStatus">API: checking</span>
+        </header>
+
+        <form id="routeForm" class="route-form">
+          <div class="field-row">
+            <label class="field">
+              <span class="field-label">Start point</span>
+              <input id="startInput" name="start" autocomplete="off" value="42.4501, -73.2454" />
+            </label>
+            <label class="field">
+              <span class="field-label">End point</span>
+              <input id="endInput" name="end" autocomplete="off" value="42.7009, -73.1087" />
+            </label>
+          </div>
+
+          <div class="range-row">
+            <label for="scenicWeight" class="range-label">
+              <span>Scenic weight</span>
+              <span id="weightOut" class="range-value">0.80</span>
+            </label>
+            <input id="scenicWeight" type="range" min="0" max="1" step="0.05" value="0.8" />
+          </div>
+          <div class="range-row">
+            <label for="detourFactor" class="range-label">
+              <span>Max detour</span>
+              <span id="detourOut" class="range-value">1.80×</span>
+            </label>
+            <input id="detourFactor" type="range" min="1.1" max="3" step="0.1" value="1.8" />
+          </div>
+
+          <button id="submitRoute" type="submit" class="btn-primary">Plan route</button>
+        </form>
+
+        <section class="output-card" aria-label="Route output">
+          <div class="output-header">
+            <div>
+              <p class="eyebrow">Route output</p>
+              <h2 id="routeTitle">Waiting for submit</h2>
+            </div>
+            <button id="clearRoute" type="button" class="btn-secondary">Clear</button>
+          </div>
+          <div id="routeOutput" class="route-output">
+            Enter start/end coordinates as <code>lat, lon</code>, then submit.
+          </div>
+        </section>
+      </aside>
+      </div>
+    </main>
+
+    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+    <script type="module" src="./viewer.js?v=nord-minimal-v1"></script>
+  </body>
+</html>

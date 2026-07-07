@@ -44,6 +44,7 @@ Moved to `archive/notes/`:
 - `archive/notes/coding-agent-session-mvp.md`
 - `archive/notes/archive-review-rebuild-guide.md`
 - `archive/notes/misplaced-job-application-AGENTS.md`
+- `archive/notes/orca-workflow.md`
 
 ## Notes
 - This archive is intended to reduce confusion and operational risk, not to remove project history.

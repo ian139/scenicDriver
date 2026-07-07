@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Any
 import json
 import re
+from dotenv import load_dotenv
+
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +21,8 @@ from .schemas import (
     ContributorSessionStartRequest,
     RouteCompareRequest,
 )
+
+load_dotenv()
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]

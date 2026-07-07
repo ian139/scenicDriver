@@ -35,8 +35,16 @@ Scenic Drive scores scenic beauty from satellite imagery and terrain data, then 
 - Use marimo notebooks, not Jupyter, for training/research workflows.
 - Prefer one canonical workflow path; archive superseded alternatives instead of leaving duplicate active paths.
 - Run focused tests or smoke checks for changed API, script, notebook, or app paths before yielding.
-- Agent/cmux/OMP workflowz details live in `docs/internal/orca-workflow.md`.
+- OMP/CMUX workflow details live in `docs/internal/cmux-workflow.md`.
 - Keep ML workflows in marimo notebooks (`notebooks/`).
 - Use grouped `scripts/` subdirectories for workflow CLIs only.
 - Keep large datasets and model weights out of git.
 - Store run artifacts under `data/processed/` (ignored).
+
+## Subagent Model Roles
+
+These roles resolve through the OMP `modelRoles` map. Each inherits the base provider config from that map; only the model and any role-specific flags are listed here.
+
+- `designer`: `openrouter/glm/5.2` — UI/UX design and visual refinement.
+- `commit`: `ollama-cloud/deepseek-v4-flash` — commit-message generation.
+- `task`: `ollama-cloud/deepseek-v4-pro --thinking high` — general subagent implementation work.

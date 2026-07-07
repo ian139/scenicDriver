@@ -1,0 +1,798 @@
+/* =====================================================================
+   New England North viewer — Scenic green overlay theme
+   Green UI chrome palette. Heatmap/route data colors remain
+   in viewer.js and .legend-ramp because they encode model output.
+   ===================================================================== */
+
+:root {
+  /* ---- Scenic green palette documentation ---- */
+  --green-vanilla: #d0db97;   /* Vanilla Custard — text/ink */
+  --green-emerald: #69b578;   /* Emerald — accent */
+  --green-fern: #3a7d44;      /* Fern — reserved (unused in chrome) */
+  --green-spruce: #254d32;    /* Dark Spruce — panel surface */
+  --green-shadow: #181d27;    /* Shadow Grey — bg + pill */
+
+  /* ---- UI chrome palette ---- */
+  --ui-black: #181d27;   /* Shadow Grey — app bg + scale pill */
+  --ui-gray: #254d32;    /* Dark Spruce — panel surfaces */
+  --ui-white: #d0db97;   /* Vanilla Custard — text/ink */
+  --ui-accent: #69b578;  /* Emerald — accent */
+
+  /* ---- Semantic tokens ---- */
+  --bg-0: var(--ui-black);
+  --bg-1: var(--ui-gray);
+  --panel: var(--ui-gray);
+  --panel-2: var(--ui-gray);
+  --inset: var(--ui-black);
+
+  --ink: var(--ui-white);
+  --ink-soft: var(--ui-white);
+  --muted: rgba(208, 219, 151, 0.72);
+  --faint: rgba(208, 219, 151, 0.50);
+
+  --line: transparent;
+  --line-strong: transparent;
+  --line-focus: transparent;
+
+  --primary: var(--ui-accent);
+  --primary-hover: var(--ui-accent);
+  --primary-press: var(--ui-accent);
+  --secondary: var(--ui-accent);
+  --accent: var(--ui-accent);
+
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 18px;
+
+  --shadow-1: 0 10px 30px rgba(0, 0, 0, 0.42);
+  --shadow-2: 0 10px 30px rgba(0, 0, 0, 0.42);
+  --shadow-panel: 0 22px 70px rgba(0, 0, 0, 0.58), 0 2px 18px rgba(0, 0, 0, 0.45);
+  --shadow-float: 0 12px 40px rgba(0, 0, 0, 0.50);
+
+  --state-hover: rgba(208, 219, 151, 0.08);
+  --state-focus: rgba(105, 181, 120, 0.18);
+  --state-press: rgba(0, 0, 0, 0.18);
+
+  --focus-ring: 0 0 0 3px rgba(105, 181, 120, 0.45);
+  --focus-ring-soft: 0 0 0 3px rgba(105, 181, 120, 0.28);
+
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized: cubic-bezier(0.2, 0, 0, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+.viewer-shell,
+.map-stage,
+#map {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  color: var(--ui-white);
+  background: var(--ui-black);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+summary {
+  font: inherit;
+}
+
+/* ---------- Buttons (Material: contained + outlined) ---------- */
+
+button {
+  border: 0;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  transition: background-color 0.12s var(--ease-standard),
+              box-shadow 0.12s var(--ease-standard),
+              border-color 0.12s var(--ease-standard);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  color: var(--faint);
+  /* MUI disabled: remove elevation, dim via state layer */
+  background: rgba(208, 219, 151, 0.06);
+  border-color: transparent;
+  box-shadow: none;
+  opacity: 1;
+}
+
+/* Contained primary action */
+.btn-primary {
+  position: relative;
+  min-height: 46px;
+  padding: 0 18px;
+  border-radius: 12px;
+  background: var(--primary);
+  color: var(--ui-black);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.30);
+  border: 1px solid transparent;
+  overflow: hidden;
+  transition: background-color 0.12s var(--ease-standard),
+              box-shadow 0.14s var(--ease-standard),
+              transform 0.06s var(--ease-standard);
+}
+
+/* MUI state layer: hover lifts elevation + tints surface */
+.btn-primary:not(:disabled):hover {
+  background: var(--primary-hover);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.34);
+}
+
+.btn-primary:not(:disabled):active {
+  background: var(--primary-press);
+  box-shadow: var(--shadow-1);
+  transform: translateY(1px);
+}
+
+.btn-primary:not(:disabled):focus-visible {
+  outline: none;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.30), var(--focus-ring);
+}
+
+/* Secondary action */
+.btn-secondary {
+  position: relative;
+  min-height: 34px;
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(208, 219, 151, 0.06);
+  color: rgba(208, 219, 151, 0.86);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  overflow: hidden;
+  transition: background-color 0.12s var(--ease-standard),
+              border-color 0.12s var(--ease-standard);
+}
+
+.btn-secondary:not(:disabled):hover {
+  background: var(--state-hover);
+}
+
+.btn-secondary:not(:disabled):active {
+  background: var(--state-press);
+}
+
+.btn-secondary:not(:disabled):focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring-soft);
+}
+
+/* ---------- Inputs ---------- */
+
+input {
+  width: 100%;
+  min-width: 0;
+  min-height: 46px;
+  border: 0;
+  border-radius: 12px;
+  padding: 11px 14px;
+  background: rgba(208, 219, 151, 0.075);
+  color: var(--ui-white);
+  box-shadow:
+    inset 0 1px 0 rgba(208, 219, 151, 0.08),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.36),
+    0 8px 24px rgba(0, 0, 0, 0.16);
+  outline: none;
+  transition: background-color 0.14s var(--ease-standard),
+              box-shadow 0.14s var(--ease-standard);
+}
+
+input::placeholder {
+  color: var(--faint);
+}
+
+input:hover:not(:focus) {
+  background: rgba(208, 219, 151, 0.10);
+}
+
+input:focus {
+  background: rgba(208, 219, 151, 0.12);
+  box-shadow:
+    inset 0 1px 0 rgba(208, 219, 151, 0.10),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.36),
+    0 8px 24px rgba(0, 0, 0, 0.16),
+    var(--focus-ring-soft);
+}
+
+input:focus-visible {
+  outline: none;
+}
+
+/* Range slider */
+input[type="range"] {
+  width: 100%;
+  min-height: 5px;
+  height: 5px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(208, 219, 151, 0.18);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.28);
+  accent-color: var(--ui-accent);
+  cursor: pointer;
+}
+
+input[type="range"]:hover {
+  background: rgba(208, 219, 151, 0.26);
+}
+
+input[type="range"]:focus {
+  outline: none;
+  box-shadow: var(--focus-ring-soft);
+}
+
+/* ---------- Shell + map ---------- */
+
+.viewer-shell {
+  position: relative;
+}
+
+.map-stage {
+  position: absolute;
+  inset: 0;
+}
+
+#map {
+  position: absolute;
+  inset: 0;
+}
+
+/* Maplibre controls sit on dark map — keep their default chrome legible */
+.maplibregl-ctrl-top-right {
+  margin-top: 14px;
+  margin-right: 14px;
+}
+
+/* ---------- Control panel (Material elevated surface) ---------- */
+
+.control-panel {
+  position: relative;
+  z-index: 2;
+  left: auto;
+  right: auto;
+  bottom: auto;
+  width: 100%;
+  pointer-events: auto;
+  max-height: min(32vh, 264px);
+  display: grid;
+  grid-template-columns: minmax(210px, 0.68fr) minmax(440px, 1.42fr) minmax(260px, 0.9fr);
+  align-items: stretch;
+  gap: 20px;
+  overflow-y: auto;
+  padding: 18px 20px;
+  border: 0;
+  border-radius: 20px;
+  background: rgba(37, 77, 50, 0.82);
+  backdrop-filter: blur(18px);
+  box-shadow: var(--shadow-panel);
+  color: var(--ui-white);
+}
+
+.control-panel::-webkit-scrollbar {
+  width: 8px;
+}
+.control-panel::-webkit-scrollbar-thumb {
+  background: rgba(208, 219, 151, 0.14);
+  border-radius: 999px;
+}
+.control-panel::-webkit-scrollbar-thumb:hover {
+  background: rgba(208, 219, 151, 0.22);
+}
+
+.panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+  padding: 4px 8px 4px 0;
+  border-right: 0;
+  border-bottom: 0;
+}
+
+.panel-heading {
+  min-width: 0;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+h1 {
+  font-size: clamp(24px, 2.6vw, 32px);
+  line-height: 0.96;
+  letter-spacing: -0.045em;
+  color: var(--ink);
+  font-weight: 780;
+}
+
+.subhead {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+h2 {
+  font-size: 15px;
+  line-height: 1.15;
+  color: var(--ink);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.eyebrow {
+  display: block;
+  color: rgba(208, 219, 151, 0.72);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+/* ---------- Status chip ---------- */
+
+.status-chip {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  border: 0;
+  border-radius: 999px;
+  padding: 6px 12px 6px 10px;
+  background: rgba(24, 29, 39, 0.46);
+  color: rgba(208, 219, 151, 0.72);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+}
+
+.status-chip::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ui-accent);
+  box-shadow: 0 0 0 3px rgba(105, 181, 120, 0.20);
+}
+
+.status-chip.ok,
+.status-chip.warn {
+  color: var(--ui-accent);
+  background: rgba(24, 29, 39, 0.46);
+  border: 0;
+}
+
+.status-chip.ok::before,
+.status-chip.warn::before {
+  background: var(--ui-accent);
+  box-shadow: 0 0 0 3px rgba(105, 181, 120, 0.20);
+}
+
+/* ---------- Controls ---------- */
+
+/* Route form stays flush so its grid fills the dock column */
+.route-form {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+}
+
+/* Output card — Material elevated surface (dp1) */
+.output-card {
+  border: 0;
+  border-radius: var(--radius-md);
+  background: rgba(208, 219, 151, 0.045);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.42);
+  padding: 14px 16px;
+}
+
+/* ---------- Route form ---------- */
+
+.route-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(110px, auto);
+  align-items: end;
+  gap: 12px;
+}
+
+.field-row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.field-label {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.range-row {
+  display: grid;
+  gap: 7px;
+}
+
+.range-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.range-value {
+  color: var(--ui-white);
+  font-variant-numeric: tabular-nums;
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.route-form .btn-primary {
+  grid-column: 3;
+}
+
+/* ---------- Output card ---------- */
+
+.output-card {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+}
+
+.output-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* Output well — sunken Material surface with hairline outline */
+.route-output {
+  min-height: 72px;
+  max-height: 130px;
+  overflow: auto;
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  border: 0;
+  background: rgba(24, 29, 39, 0.36);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.30);
+  color: rgba(208, 219, 151, 0.72);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.route-output strong {
+  color: var(--ink);
+}
+
+.route-output code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--ui-accent);
+  background: rgba(24, 29, 39, 0.42);
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+}
+
+/* Metric list (generated by viewer.js) */
+
+.metric-list {
+  display: grid;
+  gap: 8px;
+}
+
+.metric-list div {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--line);
+}
+
+.metric-list div:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.metric-list span {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.metric-list b {
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- Map overlays: inspector + bottom overlay scale tab ---------- */
+
+.inspector {
+  position: absolute;
+  z-index: 18;
+  top: 12px;
+  left: 12px;
+  min-width: 174px;
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-float);
+  background: rgba(37, 77, 50, 0.82);
+  backdrop-filter: blur(14px);
+  color: var(--ui-white);
+  pointer-events: none;
+}
+
+.inspector .eyebrow {
+  color: var(--ui-accent);
+  font-size: 9px;
+}
+
+.inspector strong {
+  font-size: 24px;
+  line-height: 1;
+  color: var(--ink);
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+#inspectorCoords {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Bottom overlay wraps the scale tab + control panel as a sibling of .map-stage */
+.bottom-overlay {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: 18px;
+  z-index: 20;
+  pointer-events: none;
+}
+
+.scale-tab {
+  position: absolute;
+  right: 20px;
+  bottom: 100%;
+  z-index: 1;
+  display: inline-flex;
+  align-items: flex-end;
+  pointer-events: auto;
+}
+
+.scale-toggle {
+  display: inline-flex;
+  position: relative;
+  z-index: 2;
+  align-items: center;
+  gap: 6px;
+  min-height: 38px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 12px 12px 0 0;
+  background: rgba(37, 77, 50, 0.82);
+  color: var(--ui-white);
+  box-shadow: var(--shadow-panel);
+  backdrop-filter: blur(18px);
+  font-size: 13px;
+  font-weight: 750;
+  letter-spacing: 0.01em;
+}
+
+.scale-toggle[aria-expanded="true"] {
+  color: var(--ui-accent);
+}
+
+.scale-toggle-chevron {
+  transition: transform 0.14s var(--ease-standard);
+}
+
+.scale-toggle[aria-expanded="false"] .scale-toggle-chevron {
+  transform: rotate(-90deg);
+}
+
+.scale-toggle:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-panel), var(--focus-ring);
+}
+
+.scale-panel {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 4px);
+  display: grid;
+  grid-template-columns: auto minmax(140px, 200px) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 250px;
+  max-width: min(360px, calc(100vw - 36px));
+  padding: 9px 12px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: rgba(37, 77, 50, 0.82);
+  color: var(--ui-white);
+  box-shadow: var(--shadow-float);
+  backdrop-filter: blur(14px);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  opacity: 1;
+  transform: translateY(0);
+  transform-origin: bottom right;
+  visibility: visible;
+  transition: opacity 0.18s var(--ease-standard),
+              transform 0.18s var(--ease-standard),
+              visibility 0s linear 0s;
+}
+
+.scale-tab.is-closed .scale-panel {
+  opacity: 0;
+  transform: translateY(100%);
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.18s var(--ease-standard),
+              transform 0.18s var(--ease-standard),
+              visibility 0s linear 0.18s;
+}
+
+/* Heatmap ramp — mirrors viewer.js scenicColorExpression() data colors
+   (kept intact: this is data viz, not UI chrome) */
+.legend-ramp {
+  height: 8px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #2b685f, #87a65d, #e2b75b, #d77642, #913633);
+  box-shadow: inset 0 0 0 1px rgba(208, 219, 151, 0.20);
+}
+
+/* ---------- Utility ---------- */
+
+.hidden {
+  display: none !important;
+}
+
+/* ---------- Responsive ---------- */
+
+@media (max-width: 1180px) {
+  .control-panel {
+    grid-template-columns: minmax(190px, 0.72fr) minmax(0, 1.28fr);
+  }
+
+  .output-card {
+    grid-column: 1 / -1;
+  }
+
+  .route-form {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(110px, auto);
+  }
+}
+
+@media (max-width: 760px) {
+  body {
+    overflow: hidden;
+  }
+
+  .viewer-shell {
+    min-height: 100%;
+  }
+
+  .map-stage {
+    position: absolute;
+    inset: 0;
+    height: auto;
+    min-height: 0;
+  }
+
+  .bottom-overlay {
+    left: 0;
+    right: 0;
+    bottom: 0;
+  }
+
+  .control-panel {
+    max-height: min(46vh, 400px);
+    grid-template-columns: minmax(0, 1fr);
+    border-radius: 22px 22px 0 0;
+    padding: 16px;
+  }
+
+  .panel-header {
+    border-right: 0;
+    border-bottom: 0;
+    padding: 0 0 10px;
+  }
+
+  .scale-tab {
+    right: 22px;
+    bottom: 100%;
+    max-width: calc(100vw - 24px);
+  }
+
+  .scale-panel {
+    min-width: min(250px, calc(100vw - 120px));
+    grid-template-columns: auto minmax(90px, 1fr) auto;
+  }
+
+  .route-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .route-form .btn-primary {
+    grid-column: 1 / -1;
+  }
+  .field-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .btn-primary {
+    min-height: 44px;
+  }
+
+  .inspector {
+    min-width: 0;
+  }
+}
+
+@media (max-width: 420px) {
+  h1 {
+    font-size: 20px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}

@@ -404,7 +404,7 @@ docs/
   architecture/infrastructure.md
   research/ml-research-log.md
   roadmap.md
-  internal/orca-workflow.md
+  internal/cmux-workflow.md
 scripts/
   annotation/
   ingest/
@@ -427,7 +427,7 @@ archive/
 - [`docs/architecture/infrastructure.md`](docs/architecture/infrastructure.md)
 - [`docs/roadmap.md`](docs/roadmap.md)
 - [`archive/archive.md`](archive/archive.md)
-- [`docs/internal/orca-workflow.md`](docs/internal/orca-workflow.md)
+- [`docs/internal/cmux-workflow.md`](docs/internal/cmux-workflow.md)
 
 ## Current boundaries
 
