@@ -30,24 +30,20 @@ Current direction:
 - `models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt`
 - Source of truth: `data/processed/regression/model_registry.json`
 
-Current focus is MVP app build-out (hosted route compare + web/mobile UX), with routing/system hardening underneath.
+Current focus is MVP app build-out around the New England North web UI, with routing/system hardening underneath.
 
-Web MVP now includes:
-- live geocoding + autocomplete
-- route compare cards (scenic vs baseline)
-- saved trips + share links
-- mobile tab bar + settings bottom sheet
-- MapTiler basemap support with OSM fallback
+The web MVP includes:
+- New England North scenic heatmap
+- route comparison and scenic controls
+- active remote-training evaluation
 
 ## Tech stack
 
 - ML: PyTorch, timm, numpy, pandas
 - Geo: rasterio (optional), shapely (optional), osmnx (optional for routing)
 - Tooling: uv, marimo
-- Viewer: MapLibre under `apps/web/` with OSM tiles + optional Mapbox satellite
+- Viewer/Web: static MapLibre app under `apps/new_england_north/`
 - API: FastAPI under `src/app_api/`
-- Web: static MapLibre app under `apps/web/`
-- Mobile: Expo shell under `apps/mobile/`
 
 ## Workflow
 
@@ -66,7 +62,7 @@ Use grouped workflow CLIs under `scripts/annotation/`, `scripts/ingest/`, `scrip
 uv sync
 export MAPBOX_ACCESS_TOKEN=<your-token>
 uv run uvicorn src.app_api.main:app --host 0.0.0.0 --port 8080 --reload
-cd apps/web && python3 -m http.server 3000
+cd apps/new_england_north && python3 -m http.server 3000
 uv run marimo edit notebooks/train.mo.py
 ```
 
@@ -397,8 +393,7 @@ cleanup command.
 
 ```text
 apps/
-  web/                         # moved from web/
-  mobile/                      # moved from mobile/
+  new_england_north/           # canonical web UI
 docs/
   setup/aws-s3.md
   architecture/infrastructure.md
@@ -431,7 +426,7 @@ archive/
 
 ## Current boundaries
 
-- No full native mobile app implementation (responsive web first).
+- No native mobile app implementation (responsive web first).
 - No full production-scale platform hardening/SRE rollout yet.
 - No full-US NAIP processing pipeline.
 

@@ -46,6 +46,7 @@ const el = {
   status: document.getElementById("status"),
   savedTrips: document.getElementById("savedTrips"),
   routeList: document.getElementById("routeList"),
+  trainingResults: document.getElementById("trainingResults"),
   routePanel: document.getElementById("routePanel"),
   routeCollapseBtn: document.getElementById("routeCollapseBtn"),
   sheetToggleBtn: document.getElementById("sheetToggleBtn"),
@@ -365,6 +366,62 @@ async function loadRegions() {
   }
   const defaultRegion = regions.find((r) => r.is_default) || regions.find((r) => r.region === "masswhites");
   if (defaultRegion) el.region.value = defaultRegion.region;
+}
+
+function renderTrainingResults(payload) {
+  const metrics = payload?.metrics;
+  if (
+    typeof payload?.run_name !== "string" ||
+    typeof payload?.checkpoint !== "string" ||
+    typeof payload?.updated_at !== "string" ||
+    !metrics ||
+    !["corr", "mae", "rmse", "samples"].every((key) => Number.isFinite(Number(metrics[key])))
+  ) {
+    throw new Error("invalid training result");
+  }
+
+  const card = document.createElement("article");
+  card.className = "route-card";
+  const title = document.createElement("h3");
+  title.textContent = payload.run_name;
+  const timestamp = document.createElement("div");
+  timestamp.className = "route-sub";
+  timestamp.textContent = payload.updated_at;
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const values = [
+    ["Correlation", Number(metrics.corr).toFixed(3)],
+    ["MAE", Number(metrics.mae).toFixed(3)],
+    ["RMSE", Number(metrics.rmse).toFixed(3)],
+    ["Samples", String(Math.trunc(Number(metrics.samples)))],
+  ];
+  for (const [labelText, valueText] of values) {
+    const item = document.createElement("div");
+    const label = document.createElement("strong");
+    label.textContent = labelText;
+    const value = document.createElement("span");
+    value.textContent = valueText;
+    item.append(label, value);
+    meta.appendChild(item);
+  }
+  const checkpoint = document.createElement("div");
+  checkpoint.className = "route-sub";
+  checkpoint.textContent = `Checkpoint: ${payload.checkpoint.split(/[\\/]/).pop()}`;
+  card.append(title, timestamp, meta, checkpoint);
+  el.trainingResults.replaceChildren(card);
+}
+
+async function loadTrainingResults() {
+  try {
+    const resp = await fetch(api("/v1/training-results"));
+    if (!resp.ok) throw new Error(String(resp.status));
+    renderTrainingResults(await resp.json());
+  } catch {
+    const unavailable = document.createElement("div");
+    unavailable.className = "route-empty route-error";
+    unavailable.textContent = "Remote training results are unavailable.";
+    el.trainingResults.replaceChildren(unavailable);
+  }
 }
 
 function loadFallbackRegions() {
@@ -1801,6 +1858,7 @@ async function main() {
     loadFallbackRegions();
   }
   applyRegionDefaults();
+  await loadTrainingResults();
   syncInputMode();
   syncTabState();
   applyRoutePreference(localStorage.getItem(STORAGE_KEYS.routePreference) || "balanced");
@@ -1815,6 +1873,7 @@ async function main() {
   el.refreshRegionsBtn.addEventListener("click", async () => {
     await checkHealth();
     await loadRegions();
+    await loadTrainingResults();
     applyRegionDefaults();
   });
   el.region.addEventListener("change", () => {

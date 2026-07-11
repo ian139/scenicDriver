@@ -259,6 +259,7 @@ input[type="range"]:focus {
   inset: 0;
 }
 
+
 /* Maplibre controls sit on dark map — keep their default chrome legible */
 .maplibregl-ctrl-top-right {
   margin-top: 14px;
@@ -435,6 +436,45 @@ h2 {
   display: grid;
   gap: 6px;
   min-width: 0;
+  position: relative;
+}
+
+.address-suggestions {
+  position: absolute;
+  z-index: 5;
+  top: 100%;
+  right: 0;
+  left: 0;
+  display: none;
+  max-height: 190px;
+  overflow-y: auto;
+  border-radius: var(--radius-sm);
+  background: rgba(24, 52, 34, 0.98);
+  box-shadow: var(--shadow-float);
+}
+
+.address-suggestions.open {
+  display: grid;
+}
+
+.address-suggestion {
+  padding: 9px 11px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+}
+
+.address-suggestion:hover,
+.address-suggestion:focus {
+  background: rgba(105, 181, 120, 0.2);
+}
+
+.address-suggestion small {
+  display: block;
+  color: var(--muted);
 }
 
 .field-label {
@@ -475,6 +515,13 @@ h2 {
 
 /* ---------- Output card ---------- */
 
+.output-stack {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  overflow-y: auto;
+}
+
 .output-card {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -487,6 +534,32 @@ h2 {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.route-legend {
+  display: flex;
+  gap: 10px;
+  margin-top: 5px;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.route-key::before {
+  content: "";
+  display: inline-block;
+  width: 14px;
+  height: 3px;
+  margin-right: 5px;
+  vertical-align: middle;
+  border-radius: 999px;
+}
+
+.route-key.scenic::before {
+  background: #b9653d;
+}
+
+.route-key.baseline::before {
+  background: #386f9f;
 }
 
 /* Output well — sunken Material surface with hairline outline */
@@ -503,6 +576,32 @@ h2 {
   font-size: 12px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.training-results {
+  display: grid;
+  gap: 8px;
+}
+
+.training-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.training-metrics div {
+  display: grid;
+  gap: 2px;
+}
+
+.training-metrics span {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.training-metrics strong {
+  font-variant-numeric: tabular-nums;
 }
 
 .route-output strong {
@@ -710,8 +809,9 @@ h2 {
     grid-template-columns: minmax(190px, 0.72fr) minmax(0, 1.28fr);
   }
 
-  .output-card {
+  .output-stack {
     grid-column: 1 / -1;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .route-form {
@@ -782,6 +882,14 @@ h2 {
 
   .inspector {
     min-width: 0;
+  }
+
+  .output-stack {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .training-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 

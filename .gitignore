@@ -48,6 +48,13 @@ archive/*
 !archive/scripts/**/*.py
 !archive/notebooks/
 !archive/notebooks/**/*.py
+!archive/apps/
+!archive/apps/**/*.html
+!archive/apps/**/*.css
+!archive/apps/**/*.js
+!archive/apps/**/*.ts
+!archive/apps/**/*.tsx
+!archive/apps/**/*.json
 !archive/notes/
 !archive/notes/**/*.md
 

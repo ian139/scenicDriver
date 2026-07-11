@@ -1,11 +1,10 @@
 # Scenic Drive Agent Guide
 
 ## Project
-Scenic Drive scores scenic beauty from satellite imagery and terrain data, then uses those scores for route planning. Current work prioritizes the MVP route-planning API and web/mobile app while model improvements continue in parallel.
+Scenic Drive scores scenic beauty from satellite imagery and terrain data, then uses those scores for route planning. Current work prioritizes the MVP route-planning API and New England North web app while model improvements continue in parallel.
 
 ## Active Surfaces
-- `apps/web/`: static MapLibre web MVP.
-- `apps/mobile/`: Expo React Native shell.
+- `apps/new_england_north/`: canonical static MapLibre web MVP.
 - `src/app_api/`: FastAPI route-compare and contributor endpoints.
 - `src/route_planner/`: graph, cost, planner, and route service logic.
 - `src/classifier/`, `src/scenic_scorer/`, `src/terrain/`, `src/heuristics/`, `src/data_pipeline/`: ML/data pipeline code.
@@ -15,7 +14,7 @@ Scenic Drive scores scenic beauty from satellite imagery and terrain data, then 
 ## Commands
 - `uv sync`
 - `uv run uvicorn src.app_api.main:app --host 0.0.0.0 --port 8080 --reload`
-- `cd apps/web && python3 -m http.server 3000`
+- `cd apps/new_england_north && python3 -m http.server 3000`
 - `uv run marimo edit notebooks/train.mo.py`
 - `uv run marimo edit notebooks/regression.mo.py`
 - `uv run marimo edit notebooks/learned_scoring.mo.py`

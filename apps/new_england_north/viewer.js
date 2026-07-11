@@ -1,12 +1,12 @@
 const DEFAULTS = Object.freeze({
   displayRange: "new_england_north",
-  sourceRegion: "masswhites",
-  workingRun: "masswhites_z14_learned_h4_v2",
-  sourceModel: "models/scenic_regression_baseline_masswhites_z14_mixed5000_v2_weighted_h4.pt",
+  sourceRegion: "new_england_north",
+  workingRun: "new_england_north_z14_v6_learned",
+  sourceModel: "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt",
   activeRegistryModel: "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt",
   apiBase: "http://localhost:8080",
-  center: [-73.22, 42.85],
-  zoom: 8.2,
+  center: [-70.15869140625, 44.99533046578542],
+  zoom: 6.2,
 });
 
 const params = new URLSearchParams(window.location.search);
@@ -23,10 +23,8 @@ const CONFIG = Object.freeze({
 // the user editing that field. Removed DOM must not break fetch paths.
 let apiBase = params.get("api") || DEFAULTS.apiBase;
 
-const STATIC_HEATMAP_MODULE = "./data/new_england_north_heatmap_cells.js";
 const HEATMAP_SOURCE = "scenic-heatmap-source";
 const HEATMAP_FILL = "scenic-heatmap-fill";
-const HEATMAP_LINE = "scenic-heatmap-line";
 const ROUTE_SOURCE = "route-source";
 const ROUTE_BASELINE = "route-baseline";
 const ROUTE_SCENIC = "route-scenic";
@@ -45,6 +43,8 @@ const el = {
   routeForm: document.getElementById("routeForm"),
   startInput: document.getElementById("startInput"),
   endInput: document.getElementById("endInput"),
+  startSuggestions: document.getElementById("startSuggestions"),
+  endSuggestions: document.getElementById("endSuggestions"),
   scenicWeight: document.getElementById("scenicWeight"),
   weightOut: document.getElementById("weightOut"),
   detourFactor: document.getElementById("detourFactor"),
@@ -52,6 +52,7 @@ const el = {
   submitRoute: document.getElementById("submitRoute"),
   routeTitle: document.getElementById("routeTitle"),
   routeOutput: document.getElementById("routeOutput"),
+  trainingResults: document.getElementById("trainingResults"),
   clearRoute: document.getElementById("clearRoute"),
   scaleTab: document.getElementById("scaleTab"),
   scaleToggle: document.getElementById("scaleToggle"),
@@ -63,6 +64,7 @@ const el = {
 
 let map;
 let latestHeatmap = null;
+const selectedRoutePoints = { start: null, end: null };
 
 function api(path) {
   return `${apiBase.replace(/\/+$/, "")}${path}`;
@@ -98,6 +100,60 @@ function formatNumber(value, digits = 1) {
   return Number.isFinite(n) ? n.toFixed(digits) : "--";
 }
 
+function renderTrainingResults(payload) {
+  const metrics = payload?.metrics;
+  const valid =
+    typeof payload?.run_name === "string" &&
+    payload.run_name.length > 0 &&
+    typeof payload?.checkpoint === "string" &&
+    payload.checkpoint.length > 0 &&
+    typeof payload?.updated_at === "string" &&
+    payload.updated_at.length > 0 &&
+    metrics &&
+    ["corr", "mae", "rmse"].every(
+      (key) => typeof metrics[key] === "number" && Number.isFinite(metrics[key])
+    ) &&
+    Number.isInteger(metrics.samples);
+  if (!valid) throw new Error("invalid training result");
+
+  const title = document.createElement("strong");
+  title.textContent = payload.run_name;
+  const timestamp = document.createElement("span");
+  timestamp.textContent = payload.updated_at;
+  const metricGrid = document.createElement("div");
+  metricGrid.className = "training-metrics";
+  const metricValues = [
+    ["Correlation", metrics.corr.toFixed(3)],
+    ["MAE", metrics.mae.toFixed(3)],
+    ["RMSE", metrics.rmse.toFixed(3)],
+    ["Samples", String(metrics.samples)],
+  ];
+  for (const [labelText, valueText] of metricValues) {
+    const metric = document.createElement("div");
+    const label = document.createElement("span");
+    label.textContent = labelText;
+    const value = document.createElement("strong");
+    value.textContent = valueText;
+    metric.append(label, value);
+    metricGrid.appendChild(metric);
+  }
+  const checkpoint = document.createElement("span");
+  checkpoint.textContent = `Checkpoint: ${payload.checkpoint.split(/[\\/]/).pop()}`;
+  el.trainingResults.className = "route-output training-results";
+  el.trainingResults.replaceChildren(title, timestamp, metricGrid, checkpoint);
+}
+
+async function loadTrainingResults() {
+  try {
+    const response = await fetch(api("/v1/training-results"));
+    if (!response.ok) throw new Error(String(response.status));
+    renderTrainingResults(await response.json());
+  } catch {
+    el.trainingResults.className = "route-output route-error";
+    el.trainingResults.textContent = "Remote training results are unavailable.";
+  }
+}
+
 function parsePoint(value) {
   const match = String(value || "").trim().match(/^\s*(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)\s*$/);
   if (!match) return null;
@@ -108,23 +164,18 @@ function parsePoint(value) {
   return { lat, lon };
 }
 
-function scenicColorExpression() {
-  return [
-    "interpolate",
-    ["linear"],
-    ["get", "score_norm"],
-    0,
-    "#2b685f",
-    0.35,
-    "#87a65d",
-    0.6,
-    "#e2b75b",
-    0.78,
-    "#d77642",
-    1,
-    "#913633",
-  ];
+function lngLatToTile(lng, lat, zoom) {
+  const scale = 2 ** zoom;
+  const latitude = Math.max(-85.05112878, Math.min(85.05112878, lat));
+  return {
+    x: Math.floor(((lng + 180) / 360) * scale),
+    y: Math.floor(
+      ((1 - Math.asinh(Math.tan((latitude * Math.PI) / 180)) / Math.PI) / 2) *
+        scale
+    ),
+  };
 }
+
 
 function cartoVoyagerStyle() {
   return {
@@ -145,59 +196,6 @@ function cartoVoyagerStyle() {
   };
 }
 
-function normalizeScore(rawScore, rawNorm) {
-  const norm = Number(rawNorm);
-  if (Number.isFinite(norm)) return Math.max(0, Math.min(1, norm));
-  const score = Number(rawScore);
-  if (!Number.isFinite(score)) return 0;
-  return Math.max(0, Math.min(1, score <= 1 ? score : score / 10));
-}
-
-function normalizeHeatmapFeatureCollection(collection) {
-  const features = Array.isArray(collection?.features) ? collection.features : [];
-  return {
-    type: "FeatureCollection",
-    features: features
-      .filter((feature) => feature?.geometry)
-      .map((feature) => {
-        const score = Number(feature.properties?.score);
-        const scoreNorm = normalizeScore(score, feature.properties?.score_norm);
-        return {
-          ...feature,
-          properties: {
-            ...(feature.properties || {}),
-            score: Number.isFinite(score) ? score : scoreNorm * 10,
-            score_norm: scoreNorm,
-          },
-        };
-      }),
-  };
-}
-
-function cellsToFeatureCollection(cells) {
-  return {
-    type: "FeatureCollection",
-    features: cells.map(([west, south, east, north, score], index) => {
-      const scoreNorm = normalizeScore(score, score);
-      return {
-        type: "Feature",
-        properties: { index, score: scoreNorm * 10, score_norm: scoreNorm },
-        geometry: {
-          type: "Polygon",
-          coordinates: [
-            [
-              [west, south],
-              [east, south],
-              [east, north],
-              [west, north],
-              [west, south],
-            ],
-          ],
-        },
-      };
-    }),
-  };
-}
 
 function removeLayer(id) {
   if (map.getLayer(id)) map.removeLayer(id);
@@ -207,49 +205,6 @@ function removeSource(id) {
   if (map.getSource(id)) map.removeSource(id);
 }
 
-function renderHeatmap(geojson) {
-  removeLayer(HEATMAP_LINE);
-  removeLayer(HEATMAP_FILL);
-  removeSource(HEATMAP_SOURCE);
-
-  map.addSource(HEATMAP_SOURCE, { type: "geojson", data: geojson });
-  map.addLayer({
-    id: HEATMAP_FILL,
-    type: "fill",
-    source: HEATMAP_SOURCE,
-    paint: {
-      "fill-color": scenicColorExpression(),
-      "fill-opacity": ["interpolate", ["linear"], ["get", "score_norm"], 0, 0.2, 0.55, 0.46, 1, 0.74],
-    },
-  });
-  map.addLayer({
-    id: HEATMAP_LINE,
-    type: "line",
-    source: HEATMAP_SOURCE,
-    paint: {
-      "line-color": "rgba(255,255,255,0.34)",
-      "line-width": ["interpolate", ["linear"], ["zoom"], 7, 0, 10, 0.35, 13, 0.8],
-      "line-opacity": 0.42,
-    },
-  });
-
-  updateHeatmapStats(geojson);
-  bindHeatmapInspector();
-  fitToGeojson(geojson, { maxZoom: 9.5 });
-}
-
-function updateHeatmapStats(geojson) {
-  // Stats cards are removed from the minimal viewer; keep the computation
-  // null-safe so re-adding the IDs later needs no JS change.
-  if (!el.cellCount && !el.avgScore && !el.peakScore) return;
-  const scores = geojson.features.map((feature) => Number(feature.properties?.score)).filter(Number.isFinite);
-  const count = scores.length;
-  const avg = count ? scores.reduce((sum, score) => sum + score, 0) / count : NaN;
-  const peak = count ? Math.max(...scores) : NaN;
-  setText(el.cellCount, count ? count.toLocaleString() : "--");
-  setText(el.avgScore, Number.isFinite(avg) ? avg.toFixed(1) : "--");
-  setText(el.peakScore, Number.isFinite(peak) ? peak.toFixed(1) : "--");
-}
 
 function collectCoordinates(geometry, out) {
   if (!geometry) return;
@@ -284,47 +239,77 @@ function fitToGeojson(geojson, options = {}) {
   });
 }
 
-function bindHeatmapInspector() {
-  if (map.__scenicInspectorBound) return;
-  map.__scenicInspectorBound = true;
-  map.on("mousemove", HEATMAP_FILL, (event) => {
-    const feature = event.features?.[0];
-    if (!feature) return;
-    const score = Number(feature.properties?.score);
-    const lngLat = event.lngLat;
-    setText(el.inspectorScore, Number.isFinite(score) ? score.toFixed(2) : "--");
-    setText(el.inspectorCoords, `${lngLat.lat.toFixed(4)}, ${lngLat.lng.toFixed(4)}`);
-    map.getCanvas().style.cursor = "crosshair";
-  });
-  map.on("mouseleave", HEATMAP_FILL, () => {
-    setText(el.inspectorScore, "--");
-    setText(el.inspectorCoords, "Move over a heatmap cell");
-    map.getCanvas().style.cursor = "";
-  });
-}
-
 async function loadHeatmap() {
   const url = new URL(api("/v1/heatmap"));
   url.searchParams.set("region", CONFIG.sourceRegion);
   url.searchParams.set("run_name", CONFIG.workingRun);
   url.searchParams.set("max_points", "1");
-  url.searchParams.set("max_tiles", "6000");
+  url.searchParams.set("max_tiles", "1");
 
   try {
     const response = await fetch(url);
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     const payload = await response.json();
-    const geojson = normalizeHeatmapFeatureCollection(payload.geojson_tiles || payload.geojson);
-    if (!geojson.features.length) throw new Error("API returned no heatmap features");
-    latestHeatmap = { source: "api", geojson, runName: payload.run_name };
+    const bounds = payload.bounds;
+    if (
+      payload.tile_zoom !== 14 ||
+      !bounds ||
+      !["min_lon", "min_lat", "max_lon", "max_lat"].every(
+        (key) => Number.isFinite(Number(bounds[key]))
+      )
+    ) {
+      throw new Error("API returned invalid learned heatmap metadata");
+    }
+    const imageUrl = new URL(api("/v1/heatmap-image"));
+    imageUrl.searchParams.set("region", CONFIG.sourceRegion);
+    imageUrl.searchParams.set("run_name", CONFIG.workingRun);
+    const imageResponse = await fetch(imageUrl);
+    if (!imageResponse.ok) {
+      throw new Error(`${imageResponse.status} ${imageResponse.statusText}`);
+    }
+    const imageBlob = await imageResponse.blob();
+    const imageObjectUrl = URL.createObjectURL(imageBlob);
+    const scoreGridUrl = new URL(api("/v1/heatmap-scores.bin"));
+    scoreGridUrl.searchParams.set("region", CONFIG.sourceRegion);
+    scoreGridUrl.searchParams.set("run_name", CONFIG.workingRun);
+    const scoreGridResponse = await fetch(scoreGridUrl);
+    if (!scoreGridResponse.ok) {
+      throw new Error(`${scoreGridResponse.status} ${scoreGridResponse.statusText}`);
+    }
+    const scoreGrid = {
+      zoom: Number(scoreGridResponse.headers.get("X-Scenic-Tile-Zoom")),
+      minX: Number(scoreGridResponse.headers.get("X-Scenic-Min-X")),
+      minY: Number(scoreGridResponse.headers.get("X-Scenic-Min-Y")),
+      width: Number(scoreGridResponse.headers.get("X-Scenic-Grid-Width")),
+      height: Number(scoreGridResponse.headers.get("X-Scenic-Grid-Height")),
+      values: new DataView(await scoreGridResponse.arrayBuffer()),
+    };
+    if (
+      scoreGrid.zoom !== payload.tile_zoom ||
+      !Number.isInteger(scoreGrid.minX) ||
+      !Number.isInteger(scoreGrid.minY) ||
+      !Number.isInteger(scoreGrid.width) ||
+      !Number.isInteger(scoreGrid.height) ||
+      scoreGrid.values.byteLength !== scoreGrid.width * scoreGrid.height * 4
+    ) {
+      throw new Error("API returned invalid learned score grid");
+    }
+    latestHeatmap = {
+      source: "api",
+      imageUrl: imageObjectUrl,
+      bounds,
+      runName: payload.run_name,
+      tileZoom: payload.tile_zoom,
+      normalization: payload.normalization,
+      summary: payload.summary,
+      scoreGrid,
+    };
     setApiStatus("API: online", "ok");
     return latestHeatmap;
   } catch (error) {
-    const module = await import(STATIC_HEATMAP_MODULE);
-    const geojson = normalizeHeatmapFeatureCollection(cellsToFeatureCollection(module.default));
-    latestHeatmap = { source: "static", geojson, error };
-    setApiStatus("API: static fallback", "warn");
-    return latestHeatmap;
+    latestHeatmap = null;
+    setApiStatus("API: heatmap unavailable", "warn");
+    throw new Error(`Learned heatmap unavailable: ${error.message || error}`);
   }
 }
 
@@ -384,12 +369,182 @@ function metricsMarkup(result) {
   `;
 }
 
+function validatedMetricsMarkup(result) {
+  const scenic = result.routes.scenic;
+  const baseline = result.routes.baseline;
+  const mapping = result.score_mapping;
+  return `
+    <div class="metric-list">
+      <div><span>Scenic distance</span><b>${formatNumber(scenic.total_distance_km, 1)} km</b></div>
+      <div><span>Baseline distance</span><b>${formatNumber(baseline.total_distance_km, 1)} km</b></div>
+      <div><span>Scenic duration</span><b>${formatNumber(scenic.estimated_duration_minutes, 0)} min</b></div>
+      <div><span>Baseline duration</span><b>${formatNumber(baseline.estimated_duration_minutes, 0)} min</b></div>
+      <div><span>Scenic score</span><b>${formatNumber(scenic.average_scenic_score, 2)} / 10</b></div>
+      <div><span>Baseline score</span><b>${formatNumber(baseline.average_scenic_score, 2)} / 10</b></div>
+      <div><span>Score mapping</span><b>${formatNumber(Number(mapping.matched_ratio) * 100, 1)}%</b></div>
+      <div><span>Mapped edges</span><b>${Number(mapping.matched_edges).toLocaleString()} / ${Number(mapping.total_edges).toLocaleString()}</b></div>
+    </div>
+  `;
+}
+
+async function fetchValidatedRoute() {
+  const url = new URL(api("/v1/validated-route"));
+  url.searchParams.set("region", CONFIG.sourceRegion);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  const result = await response.json();
+  const kinds = new Set(
+    result.geojson?.features?.map((feature) => feature.properties?.route_kind)
+  );
+  if (
+    !kinds.has("scenic") ||
+    !kinds.has("baseline") ||
+    !result.routes?.scenic ||
+    !result.routes?.baseline ||
+    !result.score_mapping
+  ) {
+    throw new Error("API returned invalid validated route artifacts");
+  }
+  return result;
+}
+
+function newSearchSessionToken() {
+  return crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function installAddressSearch(which) {
+  const input = which === "start" ? el.startInput : el.endInput;
+  const suggestions =
+    which === "start" ? el.startSuggestions : el.endSuggestions;
+  let sessionToken = newSearchSessionToken();
+  let currentSuggestions = [];
+  let activeSuggestion = -1;
+  let timer = null;
+  let request = null;
+
+  const closeSuggestions = () => {
+    currentSuggestions = [];
+    activeSuggestion = -1;
+    input.removeAttribute("aria-activedescendant");
+    suggestions.replaceChildren();
+    suggestions.classList.remove("open");
+  };
+  const selectSuggestion = async (suggestion) => {
+    request?.abort();
+    request = new AbortController();
+    const url = new URL(api("/v1/search/retrieve"));
+    url.searchParams.set("mapbox_id", suggestion.mapbox_id);
+    url.searchParams.set("session_token", sessionToken);
+    try {
+      const response = await fetch(url, { signal: request.signal });
+      if (!response.ok) throw new Error(String(response.status));
+      const result = (await response.json()).result;
+      if (!Number.isFinite(result?.lat) || !Number.isFinite(result?.lon)) {
+        throw new Error("invalid address result");
+      }
+      selectedRoutePoints[which] = { lat: result.lat, lon: result.lon };
+      input.value = result.full_address || result.name || suggestion.full_address;
+      sessionToken = newSearchSessionToken();
+      closeSuggestions();
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        setRouteOutput("Address unavailable", "Choose another address result.");
+      }
+    }
+  };
+  const renderSuggestions = (rows) => {
+    currentSuggestions = rows;
+    activeSuggestion = -1;
+    input.removeAttribute("aria-activedescendant");
+    suggestions.replaceChildren();
+    rows.forEach((row, index) => {
+      const option = document.createElement("div");
+      option.id = `${which}-suggestion-${index}`;
+      option.className = "address-suggestion";
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", "false");
+      const name = document.createElement("strong");
+      name.textContent = row.name;
+      const address = document.createElement("small");
+      address.textContent = row.full_address || row.name;
+      option.append(name, address);
+      option.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        void selectSuggestion(row);
+      });
+      suggestions.appendChild(option);
+    });
+    suggestions.classList.toggle("open", rows.length > 0);
+  };
+
+  input.addEventListener("input", () => {
+    selectedRoutePoints[which] = null;
+    clearTimeout(timer);
+    request?.abort();
+    const query = input.value.trim();
+    if (parsePoint(query) || query.length < 3) {
+      closeSuggestions();
+      return;
+    }
+    timer = setTimeout(async () => {
+      request = new AbortController();
+      const url = new URL(api("/v1/search/suggest"));
+      url.searchParams.set("q", query);
+      url.searchParams.set("session_token", sessionToken);
+      url.searchParams.set("region", CONFIG.sourceRegion);
+      try {
+        const response = await fetch(url, { signal: request.signal });
+        if (!response.ok) throw new Error(String(response.status));
+        renderSuggestions((await response.json()).suggestions || []);
+      } catch (error) {
+        if (error.name !== "AbortError") closeSuggestions();
+      }
+    }, 200);
+  });
+  input.addEventListener("keydown", (event) => {
+    if (!currentSuggestions.length) return;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const delta = event.key === "ArrowDown" ? 1 : -1;
+      activeSuggestion =
+        (activeSuggestion + delta + currentSuggestions.length) %
+        currentSuggestions.length;
+      suggestions.querySelectorAll(".address-suggestion").forEach(
+        (option, index) => {
+          option.setAttribute(
+            "aria-selected",
+            String(index === activeSuggestion)
+          );
+        }
+      );
+      input.setAttribute(
+        "aria-activedescendant",
+        `${which}-suggestion-${activeSuggestion}`
+      );
+    } else if (event.key === "Enter" && activeSuggestion >= 0) {
+      event.preventDefault();
+      void selectSuggestion(currentSuggestions[activeSuggestion]);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeSuggestions();
+    }
+  });
+  input.addEventListener("blur", (event) => {
+    if (!suggestions.contains(event.relatedTarget)) {
+      setTimeout(closeSuggestions, 120);
+    }
+  });
+}
+
+
 async function planRoute(event) {
   event.preventDefault();
-  const start = parsePoint(el.startInput.value);
-  const end = parsePoint(el.endInput.value);
+  const start = parsePoint(el.startInput.value) || selectedRoutePoints.start;
+  const end = parsePoint(el.endInput.value) || selectedRoutePoints.end;
   if (!start || !end) {
-    setRouteOutput("Invalid input", "Use decimal coordinates formatted as <code>lat, lon</code>.");
+    setRouteOutput("Invalid input", "Enter coordinates or choose an address suggestion.");
     return;
   }
 
@@ -439,7 +594,7 @@ function initBindings() {
   setText(el.runName, CONFIG.workingRun);
   if (el.apiBase) el.apiBase.value = apiBase;
   if (el.modelNote) {
-    el.modelNote.textContent = `Scoring provenance: ${CONFIG.workingRun} report (${CONFIG.sourceModel}) feeds both heatmap and route edge costs. Active registry candidate ${CONFIG.activeRegistryModel} was discovered, but no local v6-scored report is present in this checkout.`;
+    el.modelNote.textContent = `Scoring provenance: ${CONFIG.workingRun} at z14 using ${CONFIG.sourceModel}.`;
   }
 
   if (el.scenicWeight) {
@@ -453,6 +608,8 @@ function initBindings() {
     });
   }
   if (el.routeForm) el.routeForm.addEventListener("submit", planRoute);
+  installAddressSearch("start");
+  installAddressSearch("end");
   if (el.clearRoute) el.clearRoute.addEventListener("click", clearRoute);
   if (el.scaleToggle && el.scaleTab) {
     el.scaleToggle.addEventListener("click", () => {
@@ -460,41 +617,119 @@ function initBindings() {
       el.scaleToggle.setAttribute("aria-expanded", String(!isClosed));
     });
   }
-  // If an #apiBase input is ever re-added, keep it in sync with the runtime
-  // variable and reload heatmap on change. Removed by default → no-op.
-  if (el.apiBase) {
-    el.apiBase.addEventListener("change", async () => {
-      apiBase = el.apiBase.value || DEFAULTS.apiBase;
-      await checkApiHealth();
-      const heatmap = await loadHeatmap();
-      renderHeatmap(heatmap.geojson);
-    });
-  }
 }
 
 async function main() {
   initBindings();
-  void checkApiHealth();
+  void loadTrainingResults();
+  await checkApiHealth();
+
+  let heatmap = null;
+  let validatedRoute = null;
+  const artifactErrors = [];
+  try {
+    heatmap = await loadHeatmap();
+  } catch (error) {
+    artifactErrors.push(error.message || String(error));
+  }
+  try {
+    validatedRoute = await fetchValidatedRoute();
+  } catch (error) {
+    artifactErrors.push(`Validated route unavailable: ${error.message || error}`);
+  }
+
+  const style = cartoVoyagerStyle();
+
+  if (validatedRoute) {
+    style.sources[ROUTE_SOURCE] = { type: "geojson", data: validatedRoute.geojson };
+    style.layers.push(
+      routeLayer("baseline", "#386f9f", 4, 0.62),
+      routeLayer("scenic", "#b9653d", 5.5, 0.92)
+    );
+  }
+
   map = new maplibregl.Map({
     container: "map",
-    style: cartoVoyagerStyle(),
+    style,
     center: DEFAULTS.center,
     zoom: DEFAULTS.zoom,
     attributionControl: true,
+    dragRotate: false,
+    pitchWithRotate: false,
   });
   map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), "top-right");
-
-  map.on("load", async () => {
-    await checkApiHealth();
-    const heatmap = await loadHeatmap();
-    renderHeatmap(heatmap.geojson);
-    if (heatmap.source === "static") {
-      setRouteOutput(
-        "Heatmap fallback loaded",
-        "Static Masswhites heatmap cells are visible. Start the FastAPI service on port 8080 before submitting routes."
+  if (heatmap) {
+    map.once("load", () => {
+      map.addSource(HEATMAP_SOURCE, {
+        type: "image",
+        url: heatmap.imageUrl,
+        coordinates: [
+          [heatmap.bounds.min_lon, heatmap.bounds.max_lat],
+          [heatmap.bounds.max_lon, heatmap.bounds.max_lat],
+          [heatmap.bounds.max_lon, heatmap.bounds.min_lat],
+          [heatmap.bounds.min_lon, heatmap.bounds.min_lat],
+        ],
+      });
+      map.addLayer(
+        {
+          id: HEATMAP_FILL,
+          type: "raster",
+          source: HEATMAP_SOURCE,
+          paint: {
+            "raster-opacity": 0.78,
+            "raster-resampling": "nearest",
+          },
+        },
+        validatedRoute ? ROUTE_BASELINE : undefined
       );
+    });
+
+    const mapCanvas = map.getCanvas();
+    mapCanvas.addEventListener("pointermove", (event) => {
+      const lngLat = map.unproject([event.offsetX, event.offsetY]);
+      const tile = lngLatToTile(lngLat.lng, lngLat.lat, heatmap.tileZoom);
+      const gridX = tile.x - heatmap.scoreGrid.minX;
+      const gridY = tile.y - heatmap.scoreGrid.minY;
+      const inGrid =
+        gridX >= 0 &&
+        gridY >= 0 &&
+        gridX < heatmap.scoreGrid.width &&
+        gridY < heatmap.scoreGrid.height;
+      const score = inGrid
+        ? heatmap.scoreGrid.values.getFloat32(
+            (gridY * heatmap.scoreGrid.width + gridX) * 4,
+            true
+          )
+        : Number.NaN;
+      if (Number.isFinite(score)) {
+        setText(el.inspectorScore, score.toFixed(2));
+        setText(
+          el.inspectorCoords,
+          `${lngLat.lat.toFixed(4)}, ${lngLat.lng.toFixed(4)} · z${heatmap.tileZoom}/${tile.x}/${tile.y}`
+        );
+      } else {
+        setText(el.inspectorScore, "--");
+        setText(el.inspectorCoords, "No learned score for this tile");
+      }
+    });
+    mapCanvas.addEventListener("pointerleave", () => {
+      setText(el.inspectorScore, "--");
+      setText(el.inspectorCoords, "Move over a heatmap cell");
+    });
+  }
+  if (heatmap) {
+    setText(el.inspectorScore, `${heatmap.summary.total_tiles.toLocaleString()} tiles`);
+    setText(el.inspectorCoords, `Learned scores · z${heatmap.tileZoom}`);
+  }
+  if (validatedRoute) {
+    setRouteOutput("Burlington → Bangor", validatedMetricsMarkup(validatedRoute));
+  }
+  if (artifactErrors.length) {
+    setApiStatus("API: artifacts unavailable", "warn");
+    if (!validatedRoute) {
+      setRouteOutput("Canonical artifacts unavailable", escapeHtml(artifactErrors.join(" ")));
     }
-  });
+  }
 }
 
 main().catch((error) => {

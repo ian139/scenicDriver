@@ -16,10 +16,14 @@ Purpose: preserve non-primary files while keeping the active workspace focused o
   - `scripts/modeling/*` regression pipeline scripts
   - `scripts/routing/build_graph_from_osm.py`
   - `scripts/routing/route_compare_service.py`
-  - `apps/web/`
-  - `apps/mobile/`
+  - `apps/new_england_north/`
 - Non-primary scripts, notebooks, and notes are moved to `archive/` instead of deleted.
 - Archived files are records or historical utilities; restore only after confirming they do not create a duplicate active workflow.
+
+## Archived Apps
+Moved to `archive/apps/`:
+- `archive/apps/web/` — superseded browser planner; New England North is canonical.
+- `archive/apps/mobile/` — superseded Expo shell; responsive web is canonical.
 
 ## Archived Scripts
 Moved to `archive/scripts/`:

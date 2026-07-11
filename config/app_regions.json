@@ -1,6 +1,27 @@
 {
-  "default_region": "masswhites",
+  "default_region": "new_england_north",
   "regions": [
+    {
+      "region": "new_england_north",
+      "display_name": "New England North",
+      "description": "Canonical learned coverage and Burlington-to-Bangor validated corridor.",
+      "graph": "data/processed/road_graphs/new_england_north_burlington_bangor_corridor35/road_graph.json",
+      "run_name": "new_england_north_z14_v6_learned",
+      "model_checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt",
+      "bbox": {
+        "min_lat": 42.488301979602255,
+        "min_lon": -73.5205078125,
+        "max_lat": 47.50235895196859,
+        "max_lon": -66.796875
+      },
+      "map": {
+        "center": {
+          "lat": 44.99533046578542,
+          "lon": -70.15869140625
+        },
+        "zoom": 6.2
+      }
+    },
     {
       "region": "masswhites",
       "display_name": "Masswhites",

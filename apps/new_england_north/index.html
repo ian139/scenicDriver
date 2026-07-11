@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Scenic Drive · New England North</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css?v=scenic-green-solid-v2" />
+    <link rel="stylesheet" href="./styles.css?v=address-search-v1" />
   </head>
   <body>
     <main class="viewer-shell">
@@ -44,11 +44,13 @@
           <div class="field-row">
             <label class="field">
               <span class="field-label">Start point</span>
-              <input id="startInput" name="start" autocomplete="off" value="42.4501, -73.2454" />
+              <input id="startInput" name="start" autocomplete="off" value="44.475884, -73.214003" />
+              <div id="startSuggestions" class="address-suggestions" role="listbox"></div>
             </label>
             <label class="field">
               <span class="field-label">End point</span>
-              <input id="endInput" name="end" autocomplete="off" value="42.7009, -73.1087" />
+              <input id="endInput" name="end" autocomplete="off" value="44.801616, -68.771305" />
+              <div id="endSuggestions" class="address-suggestions" role="listbox"></div>
             </label>
           </div>
 
@@ -70,11 +72,28 @@
           <button id="submitRoute" type="submit" class="btn-primary">Plan route</button>
         </form>
 
+        <div class="output-stack">
+        <section class="output-card" aria-label="Remote training">
+          <div class="output-header">
+            <div>
+              <p class="eyebrow">Remote training</p>
+              <h2>Active model evaluation</h2>
+            </div>
+          </div>
+          <div id="trainingResults" class="route-output" aria-live="polite">
+            Loading remote training results…
+          </div>
+        </section>
+
         <section class="output-card" aria-label="Route output">
           <div class="output-header">
             <div>
               <p class="eyebrow">Route output</p>
               <h2 id="routeTitle">Waiting for submit</h2>
+              <div class="route-legend" aria-label="Route legend">
+                <span class="route-key scenic">Scenic</span>
+                <span class="route-key baseline">Baseline</span>
+              </div>
             </div>
             <button id="clearRoute" type="button" class="btn-secondary">Clear</button>
           </div>
@@ -82,11 +101,12 @@
             Enter start/end coordinates as <code>lat, lon</code>, then submit.
           </div>
         </section>
+        </div>
       </aside>
       </div>
     </main>
 
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <script type="module" src="./viewer.js?v=nord-minimal-v1"></script>
+    <script type="module" src="./viewer.js?v=address-search-v2"></script>
   </body>
 </html>

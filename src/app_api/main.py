@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from array import array
+from functools import lru_cache
+import io
 import json
-import re
+import math
+import sys
 from dotenv import load_dotenv
 
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import requests
@@ -30,13 +35,99 @@ ROAD_GRAPHS_DIR = PROJECT_ROOT / "data/processed/road_graphs"
 RUNS_DIR = PROJECT_ROOT / "data/processed/heuristic_runs"
 MODEL_REGISTRY_PATH = PROJECT_ROOT / "data/processed/regression/model_registry.json"
 APP_REGIONS_PATH = PROJECT_ROOT / "config/app_regions.json"
-POINT_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)\s*$")
 
 
 def _load_app_region_config() -> dict[str, Any]:
     if not APP_REGIONS_PATH.exists():
         return {"default_region": None, "regions": []}
     return json.loads(APP_REGIONS_PATH.read_text(encoding="utf-8"))
+
+def _load_active_training_result() -> dict[str, Any]:
+    try:
+        payload = json.loads(MODEL_REGISTRY_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise HTTPException(
+            status_code=404, detail="Active training result is unavailable"
+        ) from None
+
+    active = payload.get("active") if isinstance(payload, dict) else None
+    if not isinstance(active, dict):
+        raise HTTPException(
+            status_code=404, detail="Active training result is unavailable"
+        )
+
+    run_name = active.get("run_name")
+    checkpoint = active.get("checkpoint")
+    metrics = active.get("metrics")
+    updated_at = active.get("updated_at")
+    metric_values = (
+        metrics.get("corr"),
+        metrics.get("mae"),
+        metrics.get("rmse"),
+    ) if isinstance(metrics, dict) else ()
+    valid_metrics = (
+        len(metric_values) == 3
+        and all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            for value in metric_values
+        )
+        and isinstance(metrics.get("samples"), int)
+        and not isinstance(metrics.get("samples"), bool)
+    )
+    if (
+        not isinstance(run_name, str)
+        or not run_name
+        or not isinstance(checkpoint, str)
+        or not checkpoint
+        or not valid_metrics
+        or not isinstance(updated_at, str)
+        or not updated_at
+    ):
+        raise HTTPException(
+            status_code=404, detail="Active training result is unavailable"
+        )
+
+    return {
+        "run_name": run_name,
+        "checkpoint": checkpoint,
+        "metrics": {
+            "corr": metrics["corr"],
+            "mae": metrics["mae"],
+            "rmse": metrics["rmse"],
+            "samples": metrics["samples"],
+        },
+        "updated_at": updated_at,
+    }
+
+
+@lru_cache(maxsize=4)
+def _load_tile_score_grid(
+    report_path: str, modified_ns: int
+) -> tuple[bytes, int, int, int, int, int]:
+    del modified_ns
+    payload = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    tiles = payload["tiles"]
+    zooms = {int(tile["z"]) for tile in tiles}
+    if len(zooms) != 1:
+        raise ValueError("mixed tile zooms")
+    xs = [int(tile["x"]) for tile in tiles]
+    ys = [int(tile["y"]) for tile in tiles]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    width = max_x - min_x + 1
+    height = max_y - min_y + 1
+    scores = array("f", [math.nan]) * (width * height)
+    for tile in tiles:
+        x = int(tile["x"])
+        y = int(tile["y"])
+        scores[(y - min_y) * width + (x - min_x)] = float(
+            tile["scenic_score"]
+        )
+    if sys.byteorder != "little":
+        scores.byteswap()
+    return scores.tobytes(), next(iter(zooms)), min_x, min_y, width, height
 
 
 def _configured_regions() -> list[dict[str, Any]]:
@@ -243,130 +334,7 @@ def _list_regions() -> list[dict[str, Any]]:
     return regions
 
 
-def _canonical_point(lat: float, lon: float) -> dict[str, Any]:
-    lat_f = float(lat)
-    lon_f = float(lon)
-    return {
-        "lat": lat_f,
-        "lon": lon_f,
-        "latlon": f"{lat_f:.6f},{lon_f:.6f}",
-        "wkt": f"POINT({lon_f:.6f} {lat_f:.6f})",
-    }
 
-
-def _parse_coordinate_query(query: str) -> dict[str, Any] | None:
-    m = POINT_RE.match(query)
-    if not m:
-        return None
-    lat = float(m.group(1))
-    lon = float(m.group(2))
-    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
-        return None
-    pt = _canonical_point(lat, lon)
-    return {
-        "label": pt["latlon"],
-        "match_type": "parsed_point",
-        **pt,
-    }
-
-
-def _expand_geocode_query_variants(query: str, region: str | None) -> list[str]:
-    base = query.strip()
-    if not base:
-        return []
-    variants: list[str] = [base]
-    q = base.lower()
-
-    # Common local shorthand expansions.
-    rewrites = [
-        ("south philly", "south philadelphia"),
-        ("philly", "philadelphia"),
-        (" center city ", " center city philadelphia "),
-    ]
-    for src, dst in rewrites:
-        if src in q:
-            variants.append(re.sub(re.escape(src), dst, base, flags=re.IGNORECASE))
-
-    if region:
-        variants.append(f"{base}, {region}")
-        variants.append(f"{base} in {region}")
-    if "usa" not in q and "united states" not in q:
-        variants.append(f"{base}, USA")
-
-    # Add a POI hint form for brand-like queries.
-    if any(
-        tok in q
-        for tok in ["target", "walmart", "costco", "airport", "station", "mall"]
-    ):
-        variants.append(f"{base} near {region}" if region else f"{base} near me")
-        for tok in _intent_tokens(base):
-            variants.append(tok)
-            if region:
-                variants.append(f"{tok} {region}")
-                variants.append(f"{tok} near {region}")
-
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for v in variants:
-        k = v.strip().lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        deduped.append(v)
-    return deduped
-
-
-def _tokenize_query(text: str) -> list[str]:
-    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
-
-
-def _score_candidate(query: str, label: str) -> float:
-    q_tokens = _tokenize_query(query)
-    if not q_tokens:
-        return 0.0
-    label_l = label.lower()
-    matched = sum(1 for tok in q_tokens if tok in label_l)
-    score = matched / len(q_tokens)
-    if "target" in q_tokens and "target" in label_l:
-        score += 0.5
-    if "airport" in q_tokens and "airport" in label_l:
-        score += 0.4
-    if "philadelphia" in q_tokens and "philadelphia" in label_l:
-        score += 0.25
-    return score
-
-
-def _intent_tokens(query: str) -> list[str]:
-    q = query.lower()
-    tokens: list[str] = []
-    for tok in ["target", "walmart", "costco", "airport", "station", "mall"]:
-        if tok in q:
-            tokens.append(tok)
-    return tokens
-
-
-def _filter_by_intent_tokens(
-    query: str, items: list[dict[str, Any]], *, strict: bool
-) -> list[dict[str, Any]]:
-    intents = _intent_tokens(query)
-    if not intents:
-        return items
-    filtered = []
-    for row in items:
-        label = str(row.get("label", "")).lower()
-        if all(tok in label for tok in intents):
-            filtered.append(row)
-    if filtered:
-        return filtered
-    return [] if strict else items
-
-
-def _in_bbox(lat: float, lon: float, bbox: dict[str, Any] | None) -> bool:
-    if not bbox:
-        return True
-    return float(bbox["min_lat"]) <= float(lat) <= float(bbox["max_lat"]) and float(
-        bbox["min_lon"]
-    ) <= float(lon) <= float(bbox["max_lon"])
 
 
 def _normalize_bbox(bbox: Any) -> dict[str, float] | None:
@@ -418,6 +386,13 @@ def create_app() -> FastAPI:
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=[
+            "X-Scenic-Tile-Zoom",
+            "X-Scenic-Min-X",
+            "X-Scenic-Min-Y",
+            "X-Scenic-Grid-Width",
+            "X-Scenic-Grid-Height",
+        ],
     )
 
     repo = ContribRepo()
@@ -445,74 +420,110 @@ def create_app() -> FastAPI:
     def regions() -> dict[str, Any]:
         return {"regions": _list_regions()}
 
-    @app.get("/v1/geocode")
-    def geocode(q: str, region: str | None = None) -> dict[str, Any]:
+    @app.get("/v1/training-results")
+    def training_results() -> dict[str, Any]:
+        return _load_active_training_result()
+
+
+    @app.get("/v1/search/suggest")
+    def search_suggest(
+        q: str, session_token: str, region: str = "new_england_north"
+    ) -> dict[str, Any]:
         query = q.strip()
         if not query:
-            raise HTTPException(status_code=400, detail="Query must be non-empty")
-
-        parsed = _parse_coordinate_query(query)
-        if parsed is not None:
-            return {"provider": "parser", "results": [parsed]}
-
-        region_bbox = None
-        if region:
-            region_key = region.strip().lower()
-            for item in _list_regions():
-                if str(item.get("region", "")).lower() == region_key:
-                    region_bbox = _normalize_bbox(item.get("bbox"))
-                    break
-
-        mapbox_token = os.getenv("MAPBOX_ACCESS_TOKEN")
-        if not mapbox_token:
+            return {"suggestions": []}
+        token = os.getenv("MAPBOX_ACCESS_TOKEN")
+        if not token:
             raise HTTPException(
-                status_code=500, detail="MAPBOX_ACCESS_TOKEN is not configured"
+                status_code=503, detail="Address search is unavailable"
             )
-
-        url = (
-            "https://api.mapbox.com/geocoding/v5/mapbox.places/"
-            + quote(query)
-            + ".json"
-        )
         params: dict[str, Any] = {
-            "access_token": mapbox_token,
+            "q": query,
+            "access_token": token,
+            "session_token": session_token,
             "limit": 5,
-            "autocomplete": "true",
             "country": "us",
             "language": "en",
-            "types": "poi,address,place,locality,neighborhood",
+            "types": "address,street,place,locality,neighborhood,poi",
         }
-        if region_bbox:
+        configured = _app_region(region)
+        bbox = _normalize_bbox(configured.get("bbox")) if configured else None
+        if bbox:
             params["bbox"] = (
-                f"{region_bbox['min_lon']},{region_bbox['min_lat']},"
-                f"{region_bbox['max_lon']},{region_bbox['max_lat']}"
+                f"{bbox['min_lon']},{bbox['min_lat']},"
+                f"{bbox['max_lon']},{bbox['max_lat']}"
             )
-
-        resp = requests.get(url, params=params, timeout=15)
-        if not resp.ok:
-            return {"provider": "mapbox", "results": []}
-        payload = resp.json()
-        features = payload.get("features", [])
-        if not features and region_bbox:
-            params.pop("bbox", None)
-            resp = requests.get(url, params=params, timeout=15)
-            if resp.ok:
-                payload = resp.json()
-                features = payload.get("features", [])
-        results = []
-        for feat in features:
-            center = feat.get("center") or [None, None]
-            lon, lat = center[0], center[1]
-            if lat is None or lon is None:
-                continue
-            results.append(
+        response = requests.get(
+            "https://api.mapbox.com/search/searchbox/v1/suggest",
+            params=params,
+            timeout=15,
+        )
+        if not response.ok:
+            raise HTTPException(
+                status_code=502, detail="Address search provider failed"
+            )
+        rows = response.json().get("suggestions", [])
+        return {
+            "suggestions": [
                 {
-                    "label": feat.get("place_name", query),
-                    "match_type": "mapbox_geocoding",
-                    **_canonical_point(float(lat), float(lon)),
+                    "mapbox_id": row.get("mapbox_id"),
+                    "name": row.get("name"),
+                    "full_address": row.get("full_address")
+                    or row.get("place_formatted")
+                    or row.get("name"),
+                    "feature_type": row.get("feature_type"),
                 }
+                for row in rows
+                if isinstance(row, dict)
+                and isinstance(row.get("mapbox_id"), str)
+                and isinstance(row.get("name"), str)
+            ]
+        }
+
+    @app.get("/v1/search/retrieve")
+    def search_retrieve(mapbox_id: str, session_token: str) -> dict[str, Any]:
+        token = os.getenv("MAPBOX_ACCESS_TOKEN")
+        if not token:
+            raise HTTPException(
+                status_code=503, detail="Address search is unavailable"
             )
-        return {"provider": "mapbox", "results": results}
+        response = requests.get(
+            "https://api.mapbox.com/search/searchbox/v1/retrieve/"
+            + quote(mapbox_id, safe=""),
+            params={
+                "access_token": token,
+                "session_token": session_token,
+            },
+            timeout=15,
+        )
+        if not response.ok:
+            raise HTTPException(
+                status_code=502, detail="Address search provider failed"
+            )
+        features = response.json().get("features", [])
+        feature = features[0] if features else None
+        coordinates = (
+            feature.get("geometry", {}).get("coordinates")
+            if isinstance(feature, dict)
+            else None
+        )
+        properties = feature.get("properties", {}) if isinstance(feature, dict) else {}
+        if (
+            not isinstance(coordinates, list)
+            or len(coordinates) < 2
+            or not all(isinstance(value, (int, float)) for value in coordinates[:2])
+        ):
+            raise HTTPException(status_code=404, detail="Address result is unavailable")
+        return {
+            "result": {
+                "name": properties.get("name"),
+                "full_address": properties.get("full_address")
+                or properties.get("place_formatted")
+                or properties.get("name"),
+                "lat": float(coordinates[1]),
+                "lon": float(coordinates[0]),
+            }
+        }
 
     @app.post("/v1/route/compare")
     def route_compare(payload: RouteCompareRequest) -> dict[str, Any]:
@@ -612,12 +623,79 @@ def create_app() -> FastAPI:
             "geojson": result.get("geojson", {}),
         }
 
+    @app.get("/v1/validated-route")
+    def validated_route(region: str) -> dict[str, Any]:
+        configured = _app_region(region)
+        run_name = str(configured.get("run_name", "")) if configured else ""
+        report_dir = RUNS_DIR / run_name / "report"
+        route_path = report_dir / "route.geojson"
+        metrics_path = report_dir / "route_metrics.json"
+        try:
+            route_geojson = json.loads(route_path.read_text(encoding="utf-8"))
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise HTTPException(
+                status_code=404, detail="Validated route artifacts are unavailable"
+            ) from None
+
+        features = route_geojson.get("features") if isinstance(route_geojson, dict) else None
+        request = metrics.get("request") if isinstance(metrics, dict) else None
+        score_mapping = metrics.get("score_mapping") if isinstance(metrics, dict) else None
+        scenic = metrics.get("scenic") if isinstance(metrics, dict) else None
+        baseline = metrics.get("baseline") if isinstance(metrics, dict) else None
+        valid_route_features = (
+            isinstance(route_geojson, dict)
+            and route_geojson.get("type") == "FeatureCollection"
+            and isinstance(features, list)
+            and all(isinstance(feature, dict) for feature in features)
+            and {
+                feature.get("properties", {}).get("route_kind")
+                for feature in features
+                if isinstance(feature.get("properties"), dict)
+            }
+            == {"scenic", "baseline"}
+        )
+        if (
+            not valid_route_features
+            or not isinstance(request, dict)
+            or not isinstance(score_mapping, dict)
+            or not isinstance(scenic, dict)
+            or not isinstance(baseline, dict)
+        ):
+            raise HTTPException(
+                status_code=404, detail="Validated route artifacts are unavailable"
+            )
+
+        public_mapping_fields = (
+            "enabled",
+            "zoom",
+            "matched_edges",
+            "total_edges",
+            "matched_ratio",
+        )
+        return {
+            "region": region,
+            "run_name": run_name,
+            "request": {
+                "start": request.get("start"),
+                "end": request.get("end"),
+                "scenic_weight": request.get("scenic_weight"),
+                "max_detour_factor": request.get("max_detour_factor"),
+            },
+            "score_mapping": {
+                key: score_mapping.get(key) for key in public_mapping_fields
+            },
+            "routes": {"scenic": scenic, "baseline": baseline},
+            "geojson": route_geojson,
+        }
+
     @app.get("/v1/heatmap")
     def heatmap(
         region: str,
         run_name: str | None = None,
         max_points: int = 3000,
         max_tiles: int = 12000,
+        tile_offset: int | None = None,
     ) -> dict[str, Any]:
         selected_run = run_name or _latest_run_for_region(region)
         if not selected_run:
@@ -646,29 +724,20 @@ def create_app() -> FastAPI:
         min_y = min(ys) if ys else None
         max_y = max(ys) if ys else None
 
-        # Build robust normalization stats from interior tiles (ignore border ring).
-        interior_scores: list[float] = []
-        for tile in tiles:
-            x = tile.get("x")
-            y = tile.get("y")
-            scenic = tile.get("scenic_score")
-            if x is None or y is None or scenic is None:
-                continue
-            x_i = int(x)
-            y_i = int(y)
-            if (
-                min_x is not None
-                and max_x is not None
-                and min_y is not None
-                and max_y is not None
-                and (x_i == min_x or x_i == max_x or y_i == min_y or y_i == max_y)
-            ):
-                continue
-            interior_scores.append(float(scenic))
-
-        # Absolute scale for map coloring: scenic score is defined on [0, 10].
-        norm_min = 0.0
-        norm_max = 10.0
+        summary = payload.get("summary", {})
+        scores = [
+            float(tile["scenic_score"])
+            for tile in tiles
+            if tile.get("scenic_score") is not None
+        ]
+        try:
+            norm_min = float(summary["min"])
+            norm_max = float(summary["max"])
+        except (KeyError, TypeError, ValueError):
+            norm_min = min(scores) if scores else 0.0
+            norm_max = max(scores) if scores else 10.0
+        if not math.isfinite(norm_min) or not math.isfinite(norm_max) or norm_max <= norm_min:
+            raise HTTPException(status_code=404, detail=f"Invalid report for run '{selected_run}'")
 
         feats = []
         tile_feats = []
@@ -682,9 +751,14 @@ def create_app() -> FastAPI:
             point_tiles = [tiles[int(i * step)] for i in range(point_limit)]
 
         tile_limit = max(1, int(max_tiles))
-        if len(tiles) <= tile_limit:
+        if tile_offset is not None:
+            offset = max(0, int(tile_offset))
+            polygon_tiles = tiles[offset : offset + tile_limit]
+        elif len(tiles) <= tile_limit:
+            offset = 0
             polygon_tiles = tiles
         else:
+            offset = 0
             step = len(tiles) / float(tile_limit)
             polygon_tiles = [tiles[int(i * step)] for i in range(tile_limit)]
 
@@ -741,14 +815,125 @@ def create_app() -> FastAPI:
             "region": region,
             "run_name": selected_run,
             "tile_zoom": tile_zoom,
+            "total_tiles": len(tiles),
+            "tile_offset": offset,
+            "bounds": {
+                "min_lon": _tile_to_bounds(min_x, min_y, tile_zoom)[1],
+                "min_lat": _tile_to_bounds(max_x, max_y, tile_zoom)[0],
+                "max_lon": _tile_to_bounds(max_x, max_y, tile_zoom)[3],
+                "max_lat": _tile_to_bounds(min_x, min_y, tile_zoom)[2],
+            } if None not in (min_x, min_y, max_x, max_y, tile_zoom) else None,
             "normalization": {
                 "min": norm_min,
                 "max": norm_max,
-                "source": "absolute_0_10",
+                "source": "report_score_range",
+            },
+            "summary": {
+                key: summary.get(key)
+                for key in ("total_tiles", "mean", "median", "std", "min", "max")
             },
             "geojson": {"type": "FeatureCollection", "features": feats},
             "geojson_tiles": {"type": "FeatureCollection", "features": tile_feats},
         }
+
+    @app.get("/v1/heatmap-image")
+    def heatmap_image(region: str, run_name: str | None = None) -> Response:
+        from PIL import Image
+
+        selected_run = run_name or _latest_run_for_region(region)
+        report_json = RUNS_DIR / str(selected_run) / "report/report.json"
+        try:
+            payload = json.loads(report_json.read_text(encoding="utf-8"))
+            tiles = payload["tiles"]
+            summary = payload["summary"]
+            norm_min = float(summary["min"])
+            norm_max = float(summary["max"])
+            zooms = {int(tile["z"]) for tile in tiles}
+            xs = [int(tile["x"]) for tile in tiles]
+            ys = [int(tile["y"]) for tile in tiles]
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            raise HTTPException(
+                status_code=404, detail="Learned heatmap artifact is unavailable"
+            ) from None
+        if len(zooms) != 1 or norm_max <= norm_min:
+            raise HTTPException(
+                status_code=404, detail="Learned heatmap artifact is unavailable"
+            )
+
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        image = Image.new("RGBA", (max_x - min_x + 1, max_y - min_y + 1))
+        pixels = image.load()
+        stops = (
+            (0.0, (43, 104, 95)),
+            (0.35, (135, 166, 93)),
+            (0.6, (226, 183, 91)),
+            (0.78, (215, 118, 66)),
+            (1.0, (145, 54, 51)),
+        )
+
+        def score_color(score: float) -> tuple[int, int, int, int]:
+            value = max(0.0, min(1.0, (score - norm_min) / (norm_max - norm_min)))
+            for index in range(1, len(stops)):
+                lower_value, lower_color = stops[index - 1]
+                upper_value, upper_color = stops[index]
+                if value <= upper_value:
+                    ratio = (value - lower_value) / (upper_value - lower_value)
+                    return (
+                        *(
+                            round(lower + (upper - lower) * ratio)
+                            for lower, upper in zip(lower_color, upper_color)
+                        ),
+                        210,
+                    )
+            return (*stops[-1][1], 210)
+
+        for tile in tiles:
+            pixels[int(tile["x"]) - min_x, int(tile["y"]) - min_y] = score_color(
+                float(tile["scenic_score"])
+            )
+        output = io.BytesIO()
+        image.save(output, format="PNG", optimize=True)
+        return Response(
+            output.getvalue(),
+            media_type="image/png",
+            headers={
+                "X-Scenic-Tile-Zoom": str(next(iter(zooms))),
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
+
+    @app.get("/v1/heatmap-scores.bin")
+    def heatmap_scores(region: str, run_name: str | None = None) -> Response:
+        selected_run = run_name or _latest_run_for_region(region)
+        report_json = RUNS_DIR / str(selected_run) / "report/report.json"
+        try:
+            data, zoom, min_x, min_y, width, height = _load_tile_score_grid(
+                str(report_json), report_json.stat().st_mtime_ns
+            )
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
+            raise HTTPException(
+                status_code=404, detail="Learned heatmap scores are unavailable"
+            ) from None
+        return Response(
+            data,
+            media_type="application/octet-stream",
+            headers={
+                "X-Scenic-Tile-Zoom": str(zoom),
+                "X-Scenic-Min-X": str(min_x),
+                "X-Scenic-Min-Y": str(min_y),
+                "X-Scenic-Grid-Width": str(width),
+                "X-Scenic-Grid-Height": str(height),
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
 
     @app.post("/v1/contrib/session/start")
     def contrib_session_start(
