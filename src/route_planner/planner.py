@@ -39,6 +39,7 @@ class _PathLabel:
     label_id: int
     node_id: str
     cumulative_distance_km: float
+    cumulative_duration_minutes: float
     cumulative_cost: float
     predecessor_label_id: Optional[int]
     incoming_edge: Optional[Edge]
@@ -49,7 +50,7 @@ class _ReversePredecessorSnapshot:
     graph: RoadGraph
     stamp: object
     predecessors: Dict[
-        str, List[Tuple[str, float, Optional[float]]]
+        str, List[Tuple[str, float, float, Optional[float]]]
     ]
 
 
@@ -89,6 +90,19 @@ class ScenicRoutePlanner:
             weights=self.cost_function.weights,
         )
 
+    def _make_fastest_cost_function(self) -> ScenicCostFunction:
+        weights = self.cost_function.weights
+        return ScenicCostFunction(
+            scenic_weight=0.0,
+            avoid_highways=self.cost_function.avoid_highways,
+            weights=CostWeights(
+                travel_time=weights.travel_time,
+                scenic_reward=0.0,
+                highway_penalty=weights.highway_penalty,
+                scenic_byway_bonus=0.0,
+            ),
+        )
+
     def find_scenic_route(
         self,
         start: Tuple[float, float],
@@ -111,7 +125,7 @@ class ScenicRoutePlanner:
         start_node = self.graph.find_nearest_node(*start)
         end_node = self.graph.find_nearest_node(*end)
 
-        shortest_cost = self._make_cost_function(0.0)
+        shortest_cost = self._make_fastest_cost_function()
         shortest_edges = self._a_star(
             start_node,
             end_node,
@@ -120,12 +134,10 @@ class ScenicRoutePlanner:
         )
         if shortest_edges is None:
             raise ValueError("No route found between the given coordinates.")
-
-        shortest_km = self._path_distance_km(shortest_edges)
-        detour_cap = float(max_detour_factor)
-        effective_detour = 1.0 + scenic_weight * (detour_cap - 1.0)
-        effective_detour = max(1.2, effective_detour)
-        max_path_km = max(0.2, shortest_km * effective_detour)
+        fastest_duration_minutes = self._path_duration_minutes(shortest_edges)
+        duration_cap_minutes = fastest_duration_minutes * float(max_detour_factor)
+        if not math.isfinite(duration_cap_minutes):
+            raise ValueError("max_detour_factor must produce a finite duration cap")
 
         scenic_cost = self._make_cost_function(scenic_weight)
         scenic_upper_bound = sum(
@@ -137,9 +149,9 @@ class ScenicRoutePlanner:
             start_node,
             end_node,
             cost_function=scenic_cost,
-            max_path_km=max_path_km,
+            max_path_minutes=duration_cap_minutes,
             max_feasible_cost=scenic_upper_bound,
-            shortest_distance_km=shortest_km,
+            shortest_duration_minutes=fastest_duration_minutes,
         )
         if path_edges is None:
             raise ValueError("No route found between the given coordinates.")
@@ -157,7 +169,7 @@ class ScenicRoutePlanner:
         self.cost_function.avoid_highways = bool(avoid_highways)
         start_node = self.graph.find_nearest_node(*start)
         end_node = self.graph.find_nearest_node(*end)
-        shortest_cost = self._make_cost_function(0.0)
+        shortest_cost = self._make_fastest_cost_function()
         shortest_edges = self._a_star(
             start_node,
             end_node,
@@ -174,10 +186,26 @@ class ScenicRoutePlanner:
         goal: Node,
         *,
         cost_function: ScenicCostFunction,
-        max_path_km: float | None,
+        max_path_km: float | None = None,
         max_feasible_cost: float | None = None,
         shortest_distance_km: float | None = None,
+        max_path_minutes: float | None = None,
+        shortest_duration_minutes: float | None = None,
     ) -> Optional[List[Edge]]:
+        # Keep the historical distance arguments for private callers.  Scenic
+        # routing uses the explicit duration resource.
+        if max_path_km is not None and max_path_minutes is not None:
+            raise ValueError("only one constrained resource may be supplied")
+        if max_path_minutes is not None:
+            return self._resource_constrained_path(
+                start,
+                goal,
+                cost_function=cost_function,
+                max_path_minutes=max_path_minutes,
+                max_feasible_cost=max_feasible_cost,
+                shortest_duration_minutes=shortest_duration_minutes,
+                resource_kind="duration",
+            )
         if max_path_km is not None:
             return self._resource_constrained_path(
                 start,
@@ -186,6 +214,11 @@ class ScenicRoutePlanner:
                 max_path_km=max_path_km,
                 max_feasible_cost=max_feasible_cost,
                 shortest_distance_km=shortest_distance_km,
+                resource_kind="distance",
+            )
+        if shortest_duration_minutes is not None:
+            raise ValueError(
+                "shortest_duration_minutes requires max_path_minutes"
             )
 
         minimum_cost_per_km = self._minimum_cost_per_km(cost_function)
@@ -245,13 +278,27 @@ class ScenicRoutePlanner:
                 )
 
     @staticmethod
-    def _label_dominates(first: _PathLabel, second: _PathLabel) -> bool:
-        """Return whether ``first`` is strictly better in at least one resource."""
+    def _label_dominates(
+        first: _PathLabel,
+        second: _PathLabel,
+        resource_kind: str = "distance",
+    ) -> bool:
+        """Return whether ``first`` is strictly better in cost and resource."""
+        first_resource = (
+            first.cumulative_duration_minutes
+            if resource_kind == "duration"
+            else first.cumulative_distance_km
+        )
+        second_resource = (
+            second.cumulative_duration_minutes
+            if resource_kind == "duration"
+            else second.cumulative_distance_km
+        )
         return (
-            first.cumulative_distance_km <= second.cumulative_distance_km
+            first_resource <= second_resource
             and first.cumulative_cost <= second.cumulative_cost
             and (
-                first.cumulative_distance_km < second.cumulative_distance_km
+                first_resource < second_resource
                 or first.cumulative_cost < second.cumulative_cost
             )
         )
@@ -427,7 +474,7 @@ class ScenicRoutePlanner:
             and self._reverse_cost_eligible(cost_function)
         )
         predecessors: Dict[
-            str, List[Tuple[str, float, Optional[float]]]
+            str, List[Tuple[str, float, float, Optional[float]]]
         ] = {}
         # Materialize node IDs before enumeration.  The final stamp check
         # rejects a concurrent mapping/edge mutation rather than mixing epochs.
@@ -440,13 +487,14 @@ class ScenicRoutePlanner:
                 distance_km = self._validated_nonnegative(
                     edge.distance_km, "edge distance_km"
                 )
+                duration_minutes = self._edge_duration_minutes(edge)
                 edge_cost: Optional[float] = None
                 if include_costs:
                     edge_cost = self._validated_nonnegative(
                         cost_function.calculate(edge), "edge calculated cost"
                     )
                 predecessors.setdefault(edge.end_node_id, []).append(
-                    (node_id, distance_km, edge_cost)
+                    (node_id, distance_km, duration_minutes, edge_cost)
                 )
         if graph is not self.graph or graph._heuristic_cache_stamp() != stamp:
             return None
@@ -467,7 +515,7 @@ class ScenicRoutePlanner:
                 ) or all(
                     edge_cost is not None
                     for entries in snapshot.predecessors.values()
-                    for _, _, edge_cost in entries
+                    for _, _, _, edge_cost in entries
                 ):
                     return snapshot
             return None
@@ -492,6 +540,7 @@ class ScenicRoutePlanner:
             for (
                 predecessor_id,
                 edge_distance_km,
+                _edge_duration_minutes,
                 _edge_cost,
             ) in snapshot.predecessors.get(node_id, ()):
                 next_distance_km = distance_km + edge_distance_km
@@ -506,6 +555,52 @@ class ScenicRoutePlanner:
                     lower_bounds[predecessor_id] = next_distance_km
                     heapq.heappush(
                         frontier, (next_distance_km, predecessor_id)
+                    )
+        if (
+            snapshot.graph is not self.graph
+            or snapshot.graph._heuristic_cache_stamp() != snapshot.stamp
+        ):
+            return None
+        return lower_bounds
+
+    def _reverse_duration_lower_bounds(
+        self,
+        goal: Node,
+        max_path_minutes: float,
+    ) -> Optional[Dict[str, float]]:
+        """Return exact travel-duration-to-goal bounds in minutes."""
+        cap = self._validated_nonnegative(
+            max_path_minutes, "max_path_minutes"
+        )
+        snapshot = self._active_or_build_reverse_snapshot()
+        if snapshot is None:
+            return None
+        lower_bounds: Dict[str, float] = {goal.id: 0.0}
+        frontier: List[Tuple[float, str]] = [(0.0, goal.id)]
+        while frontier:
+            duration_minutes, node_id = heapq.heappop(frontier)
+            if lower_bounds.get(node_id) != duration_minutes:
+                continue
+            for (
+                predecessor_id,
+                _edge_distance_km,
+                edge_duration_minutes,
+                _edge_cost,
+            ) in snapshot.predecessors.get(node_id, ()):
+                next_duration_minutes = (
+                    duration_minutes + edge_duration_minutes
+                )
+                if not math.isfinite(next_duration_minutes):
+                    return None
+                if next_duration_minutes > cap:
+                    continue
+                previous_duration_minutes = lower_bounds.get(predecessor_id)
+                if previous_duration_minutes is None or (
+                    next_duration_minutes < previous_duration_minutes
+                ):
+                    lower_bounds[predecessor_id] = next_duration_minutes
+                    heapq.heappush(
+                        frontier, (next_duration_minutes, predecessor_id)
                     )
         if (
             snapshot.graph is not self.graph
@@ -531,9 +626,12 @@ class ScenicRoutePlanner:
             cost, node_id = heapq.heappop(frontier)
             if lower_bounds.get(node_id) != cost:
                 continue
-            for predecessor_id, _distance, edge_cost in snapshot.predecessors.get(
-                node_id, ()
-            ):
+            for (
+                predecessor_id,
+                _distance,
+                _duration_minutes,
+                edge_cost,
+            ) in snapshot.predecessors.get(node_id, ()):
                 if edge_cost is None:
                     return None
                 next_cost = cost + edge_cost
@@ -557,8 +655,9 @@ class ScenicRoutePlanner:
         goal: Node,
         cost_function: ScenicCostFunction,
         lambda_value: float,
+        resource_kind: str = "distance",
     ) -> Optional[Dict[str, float]]:
-        """Return a local reverse potential for ``cost + lambda * distance``."""
+        """Return a local reverse potential for ``cost + lambda * resource``."""
         if not self._reverse_cost_eligible(cost_function):
             return None
         lagrangian_lambda = self._validated_nonnegative(
@@ -573,13 +672,21 @@ class ScenicRoutePlanner:
             augmented_cost, node_id = heapq.heappop(frontier)
             if lower_bounds.get(node_id) != augmented_cost:
                 continue
-            for predecessor_id, edge_distance_km, edge_cost in (
-                snapshot.predecessors.get(node_id, ())
-            ):
+            for (
+                predecessor_id,
+                edge_distance_km,
+                edge_duration_minutes,
+                edge_cost,
+            ) in snapshot.predecessors.get(node_id, ()):
                 if edge_cost is None:
                     return None
+                edge_resource = (
+                    edge_duration_minutes
+                    if resource_kind == "duration"
+                    else edge_distance_km
+                )
                 augmented_edge_cost = (
-                    edge_cost + lagrangian_lambda * edge_distance_km
+                    edge_cost + lagrangian_lambda * edge_resource
                 )
                 if (
                     not math.isfinite(augmented_edge_cost)
@@ -699,21 +806,45 @@ class ScenicRoutePlanner:
         goal: Node,
         *,
         cost_function: ScenicCostFunction,
-        max_path_km: float,
+        max_path_km: float | None = None,
         max_feasible_cost: float | None = None,
         shortest_distance_km: float | None = None,
+        max_path_minutes: float | None = None,
+        shortest_duration_minutes: float | None = None,
+        resource_kind: str = "distance",
     ) -> Optional[List[Edge]]:
-        """Find the least-cost path subject to an additive distance resource."""
-        cap = self._validated_nonnegative(max_path_km, "max_path_km")
+        """Find the least-cost path under a nonnegative additive resource.
+
+        Scenic calls use travel duration in minutes.  Distance remains a
+        compatibility resource for direct callers of the historical private
+        helper.
+        """
+        if resource_kind not in {"distance", "duration"}:
+            raise ValueError("resource_kind must be distance or duration")
+        if resource_kind == "duration":
+            if max_path_minutes is None:
+                raise ValueError("max_path_minutes is required")
+            cap = self._validated_nonnegative(
+                max_path_minutes, "max_path_minutes"
+            )
+            shortest_for_lagrangian = None
+            if shortest_duration_minutes is not None:
+                shortest_for_lagrangian = self._validated_nonnegative(
+                    shortest_duration_minutes, "shortest_duration_minutes"
+                )
+        else:
+            if max_path_km is None:
+                raise ValueError("max_path_km is required")
+            cap = self._validated_nonnegative(max_path_km, "max_path_km")
+            shortest_for_lagrangian = None
+            if shortest_distance_km is not None:
+                shortest_for_lagrangian = self._validated_nonnegative(
+                    shortest_distance_km, "shortest_distance_km"
+                )
         incumbent_cost: float | None = None
         if max_feasible_cost is not None:
             incumbent_cost = self._validated_nonnegative(
                 max_feasible_cost, "max_feasible_cost"
-            )
-        shortest_for_lagrangian: float | None = None
-        if shortest_distance_km is not None:
-            shortest_for_lagrangian = self._validated_nonnegative(
-                shortest_distance_km, "shortest_distance_km"
             )
         reverse_cost_lower_bounds: Optional[Dict[str, float]] = None
         reverse_lower_bounds: Optional[Dict[str, float]] = None
@@ -723,7 +854,11 @@ class ScenicRoutePlanner:
         reverse_snapshot: Optional[_ReversePredecessorSnapshot] = None
         preprocess_reverse = not (
             len(self.graph.edges) > self._REVERSE_PREPROCESS_EDGE_THRESHOLD
-            and cap <= self._SHORT_ROUTE_CAP_KM
+            and cap <= (
+                self._SHORT_ROUTE_CAP_KM
+                if resource_kind == "distance"
+                else 5.0
+            )
         )
         if preprocess_reverse:
             reverse_snapshot = self._build_reverse_predecessor_snapshot(
@@ -760,6 +895,7 @@ class ScenicRoutePlanner:
                                             goal,
                                             cost_function,
                                             lambda_value,
+                                            resource_kind=resource_kind,
                                         )
                                     )
                                     if potential is not None:
@@ -770,8 +906,10 @@ class ScenicRoutePlanner:
                                                 reverse_snapshot.stamp,
                                             )
                                         )
-                    reverse_lower_bounds = self._reverse_distance_lower_bounds(
-                        goal, cap
+                    reverse_lower_bounds = (
+                        self._reverse_duration_lower_bounds(goal, cap)
+                        if resource_kind == "duration"
+                        else self._reverse_distance_lower_bounds(goal, cap)
                     )
                 finally:
                     self._active_reverse_snapshot = None
@@ -790,14 +928,18 @@ class ScenicRoutePlanner:
         use_reverse_resource_pruning = (
             reverse_snapshot is not None and reverse_lower_bounds is not None
         )
-        search_stamp = self.graph._heuristic_cache_stamp()
         minimum_cost_per_km = self._minimum_cost_per_km(cost_function)
-        use_geodesic_pruning = self._edge_distances_are_geodesic_lower_bounds()
+        # A distance/geodesic lower bound is not a safe duration bound:
+        # deliberately disable it for the duration resource.
+        use_geodesic_pruning = (
+            resource_kind == "distance"
+            and self._edge_distances_are_geodesic_lower_bounds()
+        )
         start_to_goal_km = self._haversine(
             start.lat, start.lon, goal.lat, goal.lon
         )
         labels: Dict[int, _PathLabel] = {
-            0: _PathLabel(0, start.id, 0.0, 0.0, None, None)
+            0: _PathLabel(0, start.id, 0.0, 0.0, 0.0, None, None)
         }
         labels_at_node: Dict[str, List[int]] = {start.id: [0]}
         active_labels = {0}
@@ -805,6 +947,7 @@ class ScenicRoutePlanner:
             (minimum_cost_per_km * start_to_goal_km, 0.0, 0)
         ]
         next_label_id = 1
+        search_stamp = self.graph._heuristic_cache_stamp()
         while frontier:
             current_stamp = self.graph._heuristic_cache_stamp()
             if current_stamp != search_stamp:
@@ -835,7 +978,7 @@ class ScenicRoutePlanner:
             if any(
                 other_id != label_id
                 and other_id in active_labels
-                and self._label_dominates(labels[other_id], label)
+                and self._label_dominates(labels[other_id], label, resource_kind)
                 for other_id in node_labels
             ):
                 active_labels.remove(label_id)
@@ -869,12 +1012,15 @@ class ScenicRoutePlanner:
                         continue
                     if not math.isfinite(augmented_lower_bound):
                         continue
-                    lambda_distance = (
-                        lambda_value * label.cumulative_distance_km
+                    label_resource = (
+                        label.cumulative_duration_minutes
+                        if resource_kind == "duration"
+                        else label.cumulative_distance_km
                     )
+                    lambda_resource = lambda_value * label_resource
                     lambda_cap = lambda_value * cap
                     if (
-                        not math.isfinite(lambda_distance)
+                        not math.isfinite(lambda_resource)
                         or not math.isfinite(lambda_cap)
                     ):
                         continue
@@ -882,7 +1028,7 @@ class ScenicRoutePlanner:
                         self._lagrangian_bound_exceeds_incumbent(
                             label.cumulative_cost,
                             augmented_lower_bound,
-                            label.cumulative_distance_km,
+                            label_resource,
                             lambda_value,
                             cap,
                             incumbent_cost,
@@ -913,10 +1059,15 @@ class ScenicRoutePlanner:
                 return path
             if use_reverse_resource_pruning:
                 reverse_lower_bound = reverse_lower_bounds.get(label.node_id)
+                label_resource = (
+                    label.cumulative_duration_minutes
+                    if resource_kind == "duration"
+                    else label.cumulative_distance_km
+                )
                 if (
                     reverse_lower_bound is None
                     or self._resource_bound_exceeds_cap(
-                        label.cumulative_distance_km,
+                        label_resource,
                         reverse_lower_bound,
                         cap,
                     )
@@ -937,12 +1088,23 @@ class ScenicRoutePlanner:
                 edge_distance_km = self._validated_nonnegative(
                     edge.distance_km, "edge distance_km"
                 )
+                edge_duration_minutes = self._edge_duration_minutes(edge)
                 next_distance = label.cumulative_distance_km + edge_distance_km
-                if not math.isfinite(next_distance):
+                next_duration = (
+                    label.cumulative_duration_minutes + edge_duration_minutes
+                )
+                if not math.isfinite(next_distance) or not math.isfinite(
+                    next_duration
+                ):
                     raise ValueError(
-                        "cumulative traversed distance must be finite and non-negative"
+                        "cumulative traversed resource must be finite and non-negative"
                     )
-                if next_distance > cap:
+                next_resource = (
+                    next_duration
+                    if resource_kind == "duration"
+                    else next_distance
+                )
+                if next_resource > cap:
                     continue
                 neighbor = self.graph.get_node(edge.end_node_id)
                 neighbor_to_goal = 0.0
@@ -957,7 +1119,7 @@ class ScenicRoutePlanner:
                     if (
                         reverse_lower_bound is None
                         or self._resource_bound_exceeds_cap(
-                            next_distance,
+                            next_resource,
                             reverse_lower_bound,
                             cap,
                         )
@@ -1006,10 +1168,15 @@ class ScenicRoutePlanner:
                             continue
                         if not math.isfinite(augmented_lower_bound):
                             continue
-                        lambda_distance = lambda_value * next_distance
+                        edge_resource = (
+                            next_duration
+                            if resource_kind == "duration"
+                            else next_distance
+                        )
+                        lambda_resource = lambda_value * edge_resource
                         lambda_cap = lambda_value * cap
                         if (
-                            not math.isfinite(lambda_distance)
+                            not math.isfinite(lambda_resource)
                             or not math.isfinite(lambda_cap)
                         ):
                             continue
@@ -1017,7 +1184,7 @@ class ScenicRoutePlanner:
                             self._lagrangian_bound_exceeds_incumbent(
                                 next_cost,
                                 augmented_lower_bound,
-                                next_distance,
+                                edge_resource,
                                 lambda_value,
                                 cap,
                                 incumbent_cost,
@@ -1039,6 +1206,7 @@ class ScenicRoutePlanner:
                     next_label_id,
                     edge.end_node_id,
                     next_distance,
+                    next_duration,
                     next_cost,
                     label_id,
                     edge,
@@ -1046,8 +1214,16 @@ class ScenicRoutePlanner:
                 existing_ids = labels_at_node.get(edge.end_node_id, [])
                 if any(
                     existing_id in active_labels
-                    and labels[existing_id].cumulative_distance_km
-                    == candidate.cumulative_distance_km
+                    and (
+                        labels[existing_id].cumulative_duration_minutes
+                        if resource_kind == "duration"
+                        else labels[existing_id].cumulative_distance_km
+                    )
+                    == (
+                        candidate.cumulative_duration_minutes
+                        if resource_kind == "duration"
+                        else candidate.cumulative_distance_km
+                    )
                     and labels[existing_id].cumulative_cost
                     == candidate.cumulative_cost
                     for existing_id in existing_ids
@@ -1055,15 +1231,13 @@ class ScenicRoutePlanner:
                     continue
                 if any(
                     existing_id in active_labels
-                    and self._label_dominates(labels[existing_id], candidate)
+                    and self._label_dominates(labels[existing_id], candidate, resource_kind)
                     for existing_id in existing_ids
                 ):
                     continue
 
                 for existing_id in existing_ids:
-                    if existing_id in active_labels and self._label_dominates(
-                        candidate, labels[existing_id]
-                    ):
+                    if existing_id in active_labels and self._label_dominates(candidate, labels[existing_id], resource_kind):
                         active_labels.remove(existing_id)
                 labels_at_node[edge.end_node_id] = [
                     existing_id
@@ -1085,6 +1259,16 @@ class ScenicRoutePlanner:
 
 
     @staticmethod
+    def _edge_duration_minutes(edge: Edge) -> float:
+        return ScenicRoutePlanner._validated_nonnegative(
+            edge.travel_time_minutes, "edge travel_time_minutes"
+        )
+
+    @classmethod
+    def _path_duration_minutes(cls, edges: List[Edge]) -> float:
+        return float(sum(cls._edge_duration_minutes(edge) for edge in edges))
+
+    @staticmethod
     def _path_distance_km(edges: List[Edge]) -> float:
         return float(sum(edge.distance_km for edge in edges))
 
@@ -1103,7 +1287,7 @@ class ScenicRoutePlanner:
     def _path_to_route(self, edges: List[Edge]) -> Route:
         segments: List[RouteSegment] = []
         total_distance_km = 0.0
-        scenic_distance_sum = 0.0
+        scenic_duration_sum = 0.0
         total_minutes = 0.0
         waypoints: List[Tuple[float, float]] = []
 
@@ -1123,15 +1307,16 @@ class ScenicRoutePlanner:
             )
 
             total_distance_km += edge.distance_km
-            scenic_distance_sum += edge.scenic_score * edge.distance_km
-            total_minutes += edge.travel_time_minutes
+            edge_minutes = edge.travel_time_minutes
+            scenic_duration_sum += edge.scenic_score * edge_minutes
+            total_minutes += edge_minutes
 
             if not waypoints:
                 waypoints.append((start_node.lat, start_node.lon))
             waypoints.append((end_node.lat, end_node.lon))
 
         avg_scenic = (
-            scenic_distance_sum / total_distance_km if total_distance_km > 0 else 0.0
+            scenic_duration_sum / total_minutes if total_minutes > 0 else 0.0
         )
         return Route(
             segments=segments,

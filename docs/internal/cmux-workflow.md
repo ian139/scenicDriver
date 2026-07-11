@@ -171,24 +171,30 @@ cmux sidebar open omp-worktrees
 
 The sidebar shows live CMUX workspaces. A git worktree appears there after it has been opened as a CMUX workspace.
 
-## Active worktree import
+## Legacy persisted-state migration
 
-Use this deterministic migration policy to import active Orca worktree views into CMUX without modifying or closing Orca runtime state:
+Older remote lifecycle runs may have state under `.orca-vast/state`. The active
+CMUX host implementation reads those files only when a matching CMUX state file
+does not exist, normalizes legacy workspace keys in memory, and writes the next
+state update under `.cmux-vast/state`. Active writes never contain legacy keys,
+and no legacy runtime setup, status, pairing, or worktree command is invoked.
 
-1. Inventory old active Orca worktrees with `orca worktree ps --json`.
-2. Inventory current CMUX workspaces with `cmux workspace list --json`.
-3. For each Orca worktree whose `status` is `active`, `isArchived` is `false`, and `path` is not already a CMUX workspace `current_directory`, open it with:
+## Opening an active workspace
 
-   ```bash
-   cmux new-workspace \
-     --name "<repo>: <displayName>" \
-     --description "<branch> · <workspaceStatus> · <comment>" \
-     --cwd "<path>" \
-     --focus false
-   ```
+Git worktrees and checkouts are created or opened by normal git/project tooling
+outside CMUX. The remote wrapper only prints the documented CMUX opening command;
+the operator decides when to run it:
 
-4. Do not start or resume OMP during bulk import; launching a new OMP process for every old worktree would duplicate Orca sessions. Users start OMP in a CMUX workspace only when they continue that work.
-5. For existing CMUX workspaces whose path already matches an imported worktree but whose title is generic, rename them with `cmux rename-workspace --workspace <workspace-ref> "<repo>: <displayName>"`.
+```bash
+cmux new-workspace \
+  --name "<repo>: <displayName>" \
+  --cwd "<absolute-worktree-path>" \
+  --focus false
+```
+
+Use `cmux workspace list --json` to inventory open workspaces by their
+`current_directory`. Do not create or open a workspace during bulk state
+migration, and do not start OMP automatically for imported state.
 
 ## Verification gate
 

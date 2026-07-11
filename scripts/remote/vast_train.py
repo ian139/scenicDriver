@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.remote.orca_vast_host import (  # noqa: E402
+from scripts.remote.cmux_vast_host import (  # noqa: E402
     ARTIFACTS_DIR,
     SshTarget,
     attach_ssh_key,

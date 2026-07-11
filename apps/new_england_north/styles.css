@@ -216,8 +216,8 @@ input[type="range"]:focus {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 14px;
-  max-height: min(34vh, 260px);
-  overflow: visible;
+  max-height: none;
+  overflow: hidden;
   padding: 15px;
   border: 1px solid rgba(130, 151, 137, 0.32);
   border-radius: var(--radius);
@@ -377,12 +377,6 @@ h3 {
   min-width: 0;
 }
 
-.field-row {
-  display: grid;
-  grid-column: 1 / -1;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
 
 .field {
   position: relative;
@@ -524,6 +518,29 @@ h3 {
   gap: 7px;
 }
 
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.toggle-row input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.route-diagnostics {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+
 .range-label {
   display: flex;
   align-items: baseline;
@@ -539,7 +556,8 @@ h3 {
 }
 
 .route-form .btn-primary {
-  grid-column: auto;
+  width: 100%;
+  align-self: end;
 }
 
 .dev-panel {
@@ -835,19 +853,6 @@ h3 {
   display: none !important;
 }
 
-@media (max-width: 900px) {
-  .control-panel {
-    max-height: min(42vh, 320px);
-  }
-
-  .route-form {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(118px, auto);
-  }
-
-  .route-form .btn-primary {
-    grid-column: 3;
-  }
-}
 
 @media (max-width: 760px) {
   body {
@@ -896,10 +901,6 @@ h3 {
 
   .route-form .btn-primary {
     grid-column: 1 / -1;
-  }
-
-  .field-row {
-    grid-template-columns: minmax(0, 1fr);
   }
 
   /* Keep autocomplete in the dock's single scroll context instead of clipping it. */

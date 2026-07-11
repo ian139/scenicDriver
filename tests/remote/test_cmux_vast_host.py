@@ -11,7 +11,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import pytest  # noqa: E402
 
-from scripts.remote import orca_vast_host  # noqa: E402
+from scripts.remote import cmux_vast_host  # noqa: E402
 
 
 def make_up_args(**overrides: object) -> argparse.Namespace:
@@ -27,7 +27,8 @@ def make_up_args(**overrides: object) -> argparse.Namespace:
         "local_secrets_env_file": ".secrets/aws.env",
         "remote_repo_dir": "/workspace/scenic-drive",
         "branch": "Ian139/RemoteTraining",
-        "orca_port": 6768,
+        "workspace_cwd": "/tmp/scenic-drive",
+        "cmux_focus": False,
         "timeout_seconds": 600,
         "bootstrap": "none",
     }
@@ -42,15 +43,15 @@ def completed(stdout: str = "", returncode: int = 0) -> subprocess.CompletedProc
 
 
 def test_ssh_commands_ignore_ephemeral_vast_known_hosts() -> None:
-    target = orca_vast_host.SshTarget(
+    target = cmux_vast_host.SshTarget(
         host="ssh3.vast.ai",
         port=12908,
         user="root",
         identity_file="/tmp/id_ed25519",
     )
 
-    ssh_command = orca_vast_host.ssh_base(target)
-    scp_command = orca_vast_host.scp_base(target)
+    ssh_command = cmux_vast_host.ssh_base(target)
+    scp_command = cmux_vast_host.scp_base(target)
 
     for command in (ssh_command, scp_command):
         assert "StrictHostKeyChecking=no" in command
@@ -60,36 +61,32 @@ def test_select_offer_id_at_returns_indexed_offer(monkeypatch: pytest.MonkeyPatc
         assert command[:3] == ["vastai", "search", "offers"]
         return completed('[{"id": 101}, {"id": 202}]')
 
-    monkeypatch.setattr(orca_vast_host, "run_command", fake_run_command)
+    monkeypatch.setattr(cmux_vast_host, "run_command", fake_run_command)
 
-    assert orca_vast_host.select_offer_id_at("num_gpus=1", 1) == 202
+    assert cmux_vast_host.select_offer_id_at("num_gpus=1", 1) == 202
     with pytest.raises(SystemExit, match="No Vast offers matched query"):
-        orca_vast_host.select_offer_id_at("num_gpus=1", 2)
+        cmux_vast_host.select_offer_id_at("num_gpus=1", 2)
 
 
 def test_do_up_retries_destroying_failed_ssh_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
     args = make_up_args()
     created = iter([111, 222])
     endpoint_calls: list[int] = []
-    ssh_attempts: list[orca_vast_host.SshTarget] = []
+    ssh_attempts: list[cmux_vast_host.SshTarget] = []
     destroy_commands: list[list[str]] = []
     bootstrap_calls: list[str] = []
     state_writes: list[dict] = []
 
-    monkeypatch.setattr(orca_vast_host, "check_up_preconditions", lambda _: None)
-    monkeypatch.setattr(orca_vast_host, "orca_status_ready", lambda: None)
-    monkeypatch.setattr(orca_vast_host, "create_instance", lambda offer_id, image, disk_gb: next(created))
-    monkeypatch.setattr(orca_vast_host, "attach_ssh_key", lambda instance_id, public_key: None)
-    monkeypatch.setattr(orca_vast_host, "reboot_instance", lambda instance_id: None)
-    monkeypatch.setattr(orca_vast_host, "write_state", lambda state: state_writes.append(dict(state)))
+    monkeypatch.setattr(cmux_vast_host, "create_instance", lambda offer_id, image, disk_gb: next(created))
+    monkeypatch.setattr(cmux_vast_host, "attach_ssh_key", lambda instance_id, public_key: None)
+    monkeypatch.setattr(cmux_vast_host, "reboot_instance", lambda instance_id: None)
+    monkeypatch.setattr(cmux_vast_host, "write_state", lambda state: state_writes.append(dict(state)))
 
     def fake_update_status(state: dict, status: str, **updates: object) -> None:
         state.update(updates)
         state["status"] = status
         state_writes.append(dict(state))
 
-    monkeypatch.setattr(orca_vast_host, "update_status", fake_update_status)
-    monkeypatch.setattr(orca_vast_host, "stop_tunnel", lambda state: None)
 
     def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         if command[:3] == ["vastai", "search", "offers"]:
@@ -99,36 +96,22 @@ def test_do_up_retries_destroying_failed_ssh_attempt(monkeypatch: pytest.MonkeyP
             return completed()
         raise AssertionError(f"unexpected command: {command}")
 
-    monkeypatch.setattr(orca_vast_host, "run_command", fake_run_command)
+    monkeypatch.setattr(cmux_vast_host, "run_command", fake_run_command)
 
     def fake_wait_for_instance_endpoint(instance_id: int, timeout_seconds: int) -> tuple[str, int]:
         endpoint_calls.append(instance_id)
         return (f"host-{instance_id}", 22000 + instance_id)
 
-    monkeypatch.setattr(orca_vast_host, "wait_for_instance_endpoint", fake_wait_for_instance_endpoint)
+    monkeypatch.setattr(cmux_vast_host, "wait_for_instance_endpoint", fake_wait_for_instance_endpoint)
 
-    def fake_wait_for_ssh(target: orca_vast_host.SshTarget, timeout_seconds: int) -> None:
+    def fake_wait_for_ssh(target: cmux_vast_host.SshTarget, timeout_seconds: int) -> None:
         ssh_attempts.append(target)
         if len(ssh_attempts) == 1:
             raise RuntimeError("ssh failed")
 
-    monkeypatch.setattr(orca_vast_host, "wait_for_ssh", fake_wait_for_ssh)
+    monkeypatch.setattr(cmux_vast_host, "wait_for_ssh", fake_wait_for_ssh)
 
-    for name in (
-        "copy_secrets",
-        "upload_repo",
-        "bootstrap_remote",
-        "run_remote_container_smoke",
-        "verify_remote_smoke",
-        "install_orca_server",
-        "start_remote_orca_server",
-        "start_tunnel",
-        "wait_for_pairing_url",
-        "orca_environment_add",
-    ):
-        monkeypatch.setattr(orca_vast_host, name, lambda *_, _name=name, **__: bootstrap_calls.append(_name))
-
-    state = orca_vast_host.do_up(args)
+    state = cmux_vast_host.do_up(args)
 
     assert destroy_commands == [["vastai", "destroy", "instance", "111", "--yes"]]
     assert endpoint_calls == [111, 111, 222, 222]
@@ -147,18 +130,17 @@ def test_do_up_retries_create_instance_failure(monkeypatch: pytest.MonkeyPatch) 
     create_offer_ids: list[int] = []
     destroy_commands: list[list[str]] = []
 
-    monkeypatch.setattr(orca_vast_host, "check_up_preconditions", lambda _: None)
-    monkeypatch.setattr(orca_vast_host, "orca_status_ready", lambda: None)
-    monkeypatch.setattr(orca_vast_host, "write_state", lambda state: None)
+    monkeypatch.setattr(cmux_vast_host, "check_up_preconditions", lambda _: None)
+    monkeypatch.setattr(cmux_vast_host, "write_state", lambda state: None)
     monkeypatch.setattr(
-        orca_vast_host,
+        cmux_vast_host,
         "update_status",
         lambda state, status, **updates: (state.update(updates), state.update({"status": status})),
     )
-    monkeypatch.setattr(orca_vast_host, "attach_ssh_key", lambda instance_id, public_key: None)
-    monkeypatch.setattr(orca_vast_host, "reboot_instance", lambda instance_id: None)
-    monkeypatch.setattr(orca_vast_host, "wait_for_instance_endpoint", lambda instance_id, timeout_seconds: ("host-333", 22333))
-    monkeypatch.setattr(orca_vast_host, "wait_for_ssh", lambda target, timeout_seconds: None)
+    monkeypatch.setattr(cmux_vast_host, "attach_ssh_key", lambda instance_id, public_key: None)
+    monkeypatch.setattr(cmux_vast_host, "reboot_instance", lambda instance_id: None)
+    monkeypatch.setattr(cmux_vast_host, "wait_for_instance_endpoint", lambda instance_id, timeout_seconds: ("host-333", 22333))
+    monkeypatch.setattr(cmux_vast_host, "wait_for_ssh", lambda target, timeout_seconds: None)
 
     def fake_create_instance(offer_id: int, image: str, disk_gb: int) -> int:
         create_offer_ids.append(offer_id)
@@ -166,7 +148,7 @@ def test_do_up_retries_create_instance_failure(monkeypatch: pytest.MonkeyPatch) 
             raise RuntimeError("create failed")
         return 333
 
-    monkeypatch.setattr(orca_vast_host, "create_instance", fake_create_instance)
+    monkeypatch.setattr(cmux_vast_host, "create_instance", fake_create_instance)
 
     def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         if command[:3] == ["vastai", "search", "offers"]:
@@ -176,9 +158,9 @@ def test_do_up_retries_create_instance_failure(monkeypatch: pytest.MonkeyPatch) 
             return completed()
         raise AssertionError(f"unexpected command: {command}")
 
-    monkeypatch.setattr(orca_vast_host, "run_command", fake_run_command)
+    monkeypatch.setattr(cmux_vast_host, "run_command", fake_run_command)
 
-    state = orca_vast_host.do_up(args)
+    state = cmux_vast_host.do_up(args)
 
     assert create_offer_ids == [9001, 9002]
     assert destroy_commands == []
@@ -194,15 +176,48 @@ def test_handle_start_task_returns_after_new_bootstrap_none_host(monkeypatch: py
         "ssh_host": "203.0.113.10",
         "ssh_port": 2222,
     }
-    args = argparse.Namespace(task_name="ssh-only", worktree_name=None, bootstrap="none")
+    args = argparse.Namespace(task_name="ssh-only", workspace_name=None, bootstrap="none")
+    monkeypatch.setattr(cmux_vast_host, "maybe_load_state", lambda task_name: None)
+    monkeypatch.setattr(cmux_vast_host, "do_up", lambda current_args: state)
 
-    monkeypatch.setattr(orca_vast_host, "maybe_load_state", lambda task_name: None)
-    monkeypatch.setattr(orca_vast_host, "do_up", lambda current_args: state)
-    monkeypatch.setattr(orca_vast_host, "ensure_tunnel", lambda _: pytest.fail("ensure_tunnel should not run"))
-    monkeypatch.setattr(orca_vast_host, "setup_existing_project", lambda *_: pytest.fail("setup_existing_project should not run"))
-
-    assert orca_vast_host.handle_start_task(args) == 0
+    assert cmux_vast_host.handle_start_task(args) == 0
     output = capsys.readouterr().out
     assert "Vast host ready (bootstrap none): ssh-only" in output
     assert "ssh -i /tmp/id_ed25519 -p 2222" in output
     assert "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@203.0.113.10" in output
+ 
+def test_legacy_state_is_read_and_normalized_to_cmux_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cmux_state_dir = tmp_path / ".cmux-vast" / "state"
+    legacy_state_dir = tmp_path / ".orca-vast" / "state"
+    legacy_state_dir.mkdir(parents=True)
+    (legacy_state_dir / "legacy.json").write_text(
+        '{"task_name":"legacy","status":"worktree_running","orca_worktree_id":"w-1",'
+        '"orca_worktree_path":"/workspace/scenic-drive","orca_worktree_name":"legacy-task",'
+        '"orca_agent":"none"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cmux_vast_host, "STATE_DIR", cmux_state_dir)
+    monkeypatch.setattr(cmux_vast_host, "LEGACY_STATE_DIR", legacy_state_dir)
+
+    state = cmux_vast_host.load_state("legacy")
+
+    assert state["cmux_workspace_id"] == "w-1"
+    assert state["cmux_workspace_path"] == "/workspace/scenic-drive"
+    assert state["cmux_workspace_name"] == "legacy-task"
+    assert "orca_worktree_id" not in state
+    cmux_vast_host.write_state(state)
+    assert (cmux_state_dir / "legacy.json").exists()
+    assert not (cmux_state_dir / "legacy.json").read_text(encoding="utf-8").find('"orca_') >= 0
+
+
+def test_cmux_workspace_command_uses_documented_flags_without_running_cli() -> None:
+    assert cmux_vast_host.build_cmux_workspace_command("legacy-task", "/tmp/scenic-drive") == [
+        "cmux",
+        "new-workspace",
+        "--name",
+        "legacy-task",
+        "--cwd",
+        "/tmp/scenic-drive",
+        "--focus",
+        "false",
+    ]

@@ -1,6 +1,7 @@
-# OMP + Orca development workflow
+# Historical OMP + Orca workflow (archived, non-active)
 
-Use this workflow for every OMP coordinator, Orca worker, and Orca dev session in this repository. `AGENTS.md` is the source of truth and is auto-loaded for agents launched from this workspace; do not ask the user to restate it.
+> This file is retained solely as project history. Do not execute its commands
+> or treat it as current workflow; use `docs/internal/cmux-workflow.md` instead.
 
 ## Always-on rules
 

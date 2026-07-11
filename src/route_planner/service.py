@@ -5,6 +5,7 @@ import json
 import math
 from collections import OrderedDict
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from .graph import RoadGraph
@@ -209,6 +210,7 @@ def diagnose_route_request(request: RouteRequest) -> dict[str, Any]:
 
 
 def plan_routes(request: RouteRequest) -> dict[str, Any]:
+    started_at = perf_counter()
     graph_path = Path(request.graph_geojson)
     if not graph_path.exists():
         raise FileNotFoundError(f"Graph GeoJSON not found: {graph_path}")
@@ -224,6 +226,9 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
         "end_snap_km": float(end_snap_km),
         "start_node_id": start_node.id,
         "end_node_id": end_node.id,
+        "requested_max_detour_factor": float(request.max_detour_factor),
+        "applied_max_detour_factor": float(request.max_detour_factor),
+        "avoid_highways_applied": bool(request.avoid_highways),
     }
     score_mapping = {
         "enabled": False,
@@ -256,6 +261,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
             "total_edges": int(total),
             "matched_ratio": float(matched / max(total, 1)),
         }
+    diagnostics["score_mapping_coverage"] = float(score_mapping["matched_ratio"])
 
     planner = ScenicRoutePlanner(graph=graph)
     scenic_route = planner.find_scenic_route(
@@ -268,11 +274,14 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
     features = [route_to_feature(scenic_route, "scenic")]
     routes = [{"route_kind": "scenic", "metrics": features[0]["properties"]}]
 
+    baseline_route: Route | None = None
     if request.include_baseline:
+        # The comparison baseline is only meaningful when it uses the same
+        # user-selected highway filter as the scenic route.
         baseline_route = planner.find_fastest_route(
             start=request.start,
             end=request.end,
-            avoid_highways=False,
+            avoid_highways=request.avoid_highways,
         )
         baseline_feature = route_to_feature(baseline_route, "baseline")
         features.append(baseline_feature)
@@ -280,6 +289,31 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
             {"route_kind": "baseline", "metrics": baseline_feature["properties"]}
         )
 
+    if baseline_route is not None:
+        fastest_duration = float(baseline_route.estimated_duration_minutes)
+        scenic_duration = float(scenic_route.estimated_duration_minutes)
+        fastest_distance = float(baseline_route.total_distance_km)
+        scenic_distance = float(scenic_route.total_distance_km)
+        diagnostics["scenic_fastest_duration_ratio"] = (
+            scenic_duration / fastest_duration
+            if fastest_duration > 0.0
+            else None
+        )
+        diagnostics["scenic_fastest_distance_ratio"] = (
+            scenic_distance / fastest_distance
+            if fastest_distance > 0.0
+            else None
+        )
+        diagnostics["duration_cap_satisfied"] = (
+            fastest_duration <= 0.0
+            or scenic_duration <= fastest_duration * request.max_detour_factor
+        )
+    else:
+        diagnostics["scenic_fastest_duration_ratio"] = None
+        diagnostics["scenic_fastest_distance_ratio"] = None
+        diagnostics["duration_cap_satisfied"] = None
+
+    diagnostics["planning_elapsed_ms"] = (perf_counter() - started_at) * 1000.0
     return {
         "request": request.to_dict(),
         "diagnostics": diagnostics,

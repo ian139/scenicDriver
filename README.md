@@ -374,7 +374,7 @@ scripts/remote/vast-train.sh cleanup <task-name> --copy-artifacts --destroy --ye
 
 Use `--epochs 1 --batch-size 64` for a cost-controlled smoke train. Omit those
 overrides for the real default training path. If the local orchestrator dies,
-rerun the cleanup command; it uses the recorded `.orca-vast/state/<task-name>.json`
+rerun the cleanup command; it uses the recorded `.cmux-vast/state/<task-name>.json`
 instance id and remote sentinel paths.
 
 Monitoring and cost controls:
@@ -394,7 +394,7 @@ docker rm -f scenic-vast-validate || true
 vastai destroy instance <instance-id> --yes
 ```
 
-For cmux-managed Vast worktree hosts/tasks, use the repo wrappers:
+For CMUX-managed Vast hosts/tasks, use the repo wrappers:
 
 ```bash
 scripts/remote/vast-start-task.sh scenic-vast-smoke 'Validate prebuilt image and S3-backed smoke run.' \
@@ -408,9 +408,11 @@ scripts/remote/vast-watch.sh --interval-seconds 60 --destroy --yes
 scripts/remote/vast-down.sh scenic-vast-smoke --copy-artifacts --destroy --yes
 ```
 
-`scripts/remote/vast-down.sh <task-name> --copy-artifacts --destroy --yes`
-remains a fallback for cmux-managed worktree tasks, not the primary training
-cleanup command.
+The `vast-start-task.sh` wrapper allocates/bootstrap-checks the Vast host and
+prints the documented `cmux new-workspace --name ... --cwd ... --focus false`
+command. It does not execute CMUX workspace creation; run that command only
+after the checkout path is ready. `vast-watch.sh` observes `cmux workspace list
+--json` before collecting artifacts or destroying the host.
 
 ## Repository layout
 

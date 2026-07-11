@@ -40,6 +40,7 @@ def test_remote_training_container_files_define_training_entrypoints() -> None:
 
     # --- .dockerignore entries ---
     dockerignore_text = dockerignore.read_text(encoding="utf-8")
+    # Keep the legacy state path ignored while CMUX migration reads old files.
     required_ignore_entries = [
         "data/raw/",
         "data/processed/",
@@ -50,6 +51,7 @@ def test_remote_training_container_files_define_training_entrypoints() -> None:
         ".git/",
         ".secrets/",
         ".orca-vast/",
+        ".cmux-vast/",
         "notebooks/__marimo__/",
     ]
     for entry in required_ignore_entries:
@@ -168,19 +170,19 @@ def test_minimal_inference_regression_cli_writes_json(tmp_path: Path) -> None:
 def test_vast_destroy_instance_uses_noninteractive_yes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scripts.remote import orca_vast_host
+    from scripts.remote import cmux_vast_host
 
     commands: list[list[str]] = []
-    monkeypatch.setattr(orca_vast_host, "require_commands", lambda commands: None)
+    monkeypatch.setattr(cmux_vast_host, "require_commands", lambda commands: None)
     monkeypatch.setattr(
-        orca_vast_host,
+        cmux_vast_host,
         "run_command",
         lambda command, **kwargs: commands.append(command),
     )
-    monkeypatch.setattr(orca_vast_host, "update_status", lambda state, status, **updates: state.update(status=status, **updates))
+    monkeypatch.setattr(cmux_vast_host, "update_status", lambda state, status, **updates: state.update(status=status, **updates))
 
     state = {"instance_id": 12345}
-    orca_vast_host.destroy_instance(state)
+    cmux_vast_host.destroy_instance(state)
 
     assert commands == [["vastai", "destroy", "instance", "12345", "--yes"]]
     assert state["status"] == "destroyed"
@@ -189,23 +191,22 @@ def test_vast_destroy_instance_uses_noninteractive_yes(
 def test_vast_failed_allocation_cleanup_uses_noninteractive_yes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from scripts.remote import orca_vast_host
+    from scripts.remote import cmux_vast_host
 
     commands: list[list[str]] = []
 
-    monkeypatch.setattr(orca_vast_host, "check_up_preconditions", lambda args: None)
-    monkeypatch.setattr(orca_vast_host, "select_offer_id_at", lambda query, index: 67890)
-    monkeypatch.setattr(orca_vast_host, "create_instance", lambda offer_id, image, disk_gb: 12345)
+    monkeypatch.setattr(cmux_vast_host, "check_up_preconditions", lambda args: None)
+    monkeypatch.setattr(cmux_vast_host, "select_offer_id_at", lambda query, index: 67890)
+    monkeypatch.setattr(cmux_vast_host, "create_instance", lambda offer_id, image, disk_gb: 12345)
     monkeypatch.setattr(
-        orca_vast_host,
+        cmux_vast_host,
         "attach_ssh_key",
         lambda instance_id, public_key_path: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    monkeypatch.setattr(orca_vast_host, "write_state", lambda state: None)
-    monkeypatch.setattr(orca_vast_host, "stop_tunnel", lambda state: None)
-    monkeypatch.setattr(orca_vast_host, "update_status", lambda state, status, **updates: state.update(status=status, **updates))
+    monkeypatch.setattr(cmux_vast_host, "write_state", lambda state: None)
+    monkeypatch.setattr(cmux_vast_host, "update_status", lambda state, status, **updates: state.update(status=status, **updates))
     monkeypatch.setattr(
-        orca_vast_host,
+        cmux_vast_host,
         "run_command",
         lambda command, **kwargs: commands.append(command),
     )
@@ -219,7 +220,7 @@ def test_vast_failed_allocation_cleanup_uses_noninteractive_yes(
         local_secrets_env_file=".secrets/aws.env",
         offer_id=None,
         offer_query="query",
-        orca_port=6768,
+        workspace_cwd="/tmp/scenic-drive",
         remote_repo_dir="/workspace/scenic-drive",
         ssh_public_key="~/.ssh/id_ed25519.pub",
         task_name="smoke",
@@ -227,6 +228,6 @@ def test_vast_failed_allocation_cleanup_uses_noninteractive_yes(
     )
 
     with pytest.raises(RuntimeError, match="boom"):
-        orca_vast_host.do_up(args)
+        cmux_vast_host.do_up(args)
 
     assert ["vastai", "destroy", "instance", "12345", "--yes"] in commands
