@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -185,7 +186,7 @@ def test_handle_start_task_returns_after_new_bootstrap_none_host(monkeypatch: py
     assert "Vast host ready (bootstrap none): ssh-only" in output
     assert "ssh -i /tmp/id_ed25519 -p 2222" in output
     assert "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@203.0.113.10" in output
- 
+
 def test_legacy_state_is_read_and_normalized_to_cmux_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cmux_state_dir = tmp_path / ".cmux-vast" / "state"
     legacy_state_dir = tmp_path / ".orca-vast" / "state"
@@ -201,9 +202,10 @@ def test_legacy_state_is_read_and_normalized_to_cmux_keys(tmp_path: Path, monkey
 
     state = cmux_vast_host.load_state("legacy")
 
-    assert state["cmux_workspace_id"] == "w-1"
-    assert state["cmux_workspace_path"] == "/workspace/scenic-drive"
-    assert state["cmux_workspace_name"] == "legacy-task"
+    assert state["cmux_workspace_id"] is None
+    assert state["cmux_workspace_path"] is None
+    assert state["cmux_workspace_registered"] is False
+    assert state["remote_repo_dir"] == "/workspace/scenic-drive"
     assert "orca_worktree_id" not in state
     cmux_vast_host.write_state(state)
     assert (cmux_state_dir / "legacy.json").exists()
@@ -221,3 +223,325 @@ def test_cmux_workspace_command_uses_documented_flags_without_running_cli() -> N
         "--focus",
         "false",
     ]
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [
+        (1, ""),
+        (0, "not-json"),
+        (0, "{}"),
+    ],
+)
+def test_watch_cmux_uncertainty_keeps_pending_without_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    stdout: str,
+) -> None:
+    state = {
+        "task_name": "cmux-uncertain",
+        "status": "workspace_pending",
+        "instance_id": 12345,
+        "cmux_workspace_id": "workspace-1",
+        "cmux_workspace_path": "/tmp/scenic-drive",
+    }
+    commands: list[list[str]] = []
+    copy_calls: list[dict] = []
+    destroy_calls: list[dict] = []
+
+    def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return completed(stdout=stdout, returncode=returncode)
+
+    monkeypatch.setattr(cmux_vast_host, "run_command", fake_run_command)
+    monkeypatch.setattr(cmux_vast_host, "copy_artifacts", lambda current: copy_calls.append(current))
+    monkeypatch.setattr(cmux_vast_host, "destroy_instance", lambda current: destroy_calls.append(current))
+
+    cmux_vast_host.process_watch_state(state, destroy=True, yes=True)
+
+    assert commands == [["cmux", "workspace", "list", "--json"]]
+    assert copy_calls == []
+    assert destroy_calls == []
+    assert state["status"] == "workspace_pending"
+
+
+def test_watch_empty_cmux_workspace_list_without_identity_keeps_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {
+        "task_name": "cmux-no-identity",
+        "status": "workspace_pending",
+        "instance_id": 12345,
+    }
+    copy_calls: list[dict] = []
+    destroy_calls: list[dict] = []
+
+    monkeypatch.setattr(cmux_vast_host, "run_command", lambda command, **_: completed("[]"))
+    monkeypatch.setattr(cmux_vast_host, "copy_artifacts", lambda current: copy_calls.append(current))
+    monkeypatch.setattr(cmux_vast_host, "destroy_instance", lambda current: destroy_calls.append(current))
+
+    cmux_vast_host.process_watch_state(state, destroy=True, yes=True)
+
+    assert copy_calls == []
+    assert destroy_calls == []
+    assert state["status"] == "workspace_pending"
+
+
+def test_watch_required_artifact_copy_failure_does_not_destroy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {
+        "task_name": "cmux-copy-failure",
+        "status": "workspace_pending",
+        "instance_id": 12345,
+        "cmux_workspace_id": "workspace-1",
+    }
+    destroy_calls: list[dict] = []
+
+    monkeypatch.setattr(cmux_vast_host, "workspace_closed", lambda current: True)
+    monkeypatch.setattr(cmux_vast_host, "copy_artifacts", lambda current: False)
+    monkeypatch.setattr(cmux_vast_host, "destroy_instance", lambda current: destroy_calls.append(current))
+
+    cmux_vast_host.process_watch_state(state, destroy=True, yes=True)
+
+    assert destroy_calls == []
+    assert state["status"] == "workspace_pending"
+
+def test_watch_missing_required_remote_path_does_not_destroy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {
+        "task_name": "cmux-missing-artifact",
+        "status": "workspace_pending",
+        "instance_id": 12345,
+        "cmux_workspace_id": "workspace-1",
+        "ssh_host": "ssh5.vast.ai",
+        "ssh_port": 2222,
+        "identity_file": "/tmp/id_ed25519",
+        "remote_repo_dir": "/workspace/scenic-drive",
+    }
+    copy_requests: list[tuple[str, bool]] = []
+    destroy_calls: list[dict] = []
+
+    def fake_copy_remote_path(target: object, remote_path: str, local_path: Path, *, required: bool) -> bool:
+        copy_requests.append((remote_path, required))
+        return not required
+    monkeypatch.setattr(cmux_vast_host, "workspace_closed", lambda current: True)
+    monkeypatch.setattr(cmux_vast_host, "copy_remote_path", fake_copy_remote_path)
+    monkeypatch.setattr(cmux_vast_host, "destroy_instance", lambda current: destroy_calls.append(current))
+
+    cmux_vast_host.process_watch_state(state, destroy=True, yes=True)
+
+    assert any(required for _, required in copy_requests)
+    assert destroy_calls == []
+    assert state["status"] == "workspace_pending"
+
+
+
+
+def test_partial_migration_does_not_confirm_cmux_from_legacy_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {
+        "task_name": "cmux-partial-migration",
+        "status": "workspace_pending",
+        "instance_id": 12345,
+        "remote_repo_dir": "/workspace/scenic-drive",
+        "cmux_workspace_id": None,
+        "cmux_workspace_path": None,
+        "orca_worktree_id": "legacy-worktree",
+        "orca_worktree_path": "/workspace/scenic-drive",
+    }
+    state = cmux_vast_host._normalize_state(state)
+    assert state["cmux_workspace_id"] is None
+    assert state["cmux_workspace_path"] is None
+    assert state["remote_repo_dir"] == "/workspace/scenic-drive"
+
+    destroy_calls: list[dict] = []
+    monkeypatch.setattr(
+        cmux_vast_host,
+        "run_command",
+        lambda command, **_: completed(
+            '[{"ref":"legacy-worktree","current_directory":"/workspace/scenic-drive"}]'
+        ),
+    )
+    monkeypatch.setattr(cmux_vast_host, "copy_artifacts", lambda current: pytest.fail("copy requires confirmed CMUX closure"))
+    monkeypatch.setattr(cmux_vast_host, "destroy_instance", lambda current: destroy_calls.append(current))
+
+    cmux_vast_host.process_watch_state(state, destroy=True, yes=True)
+
+    assert destroy_calls == []
+    assert state["status"] == "workspace_pending"
+
+def test_watch_destroys_after_observed_workspace_disappears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {
+        "task_name": "cmux-observed",
+        "status": "workspace_pending",
+        "instance_id": 12345,
+        "cmux_workspace_ref": "workspace-ref-1",
+    }
+    responses = iter(
+        [
+            completed('[{"ref":"workspace-ref-1"}]'),
+            completed('[{"ref":"unrelated-workspace"}]'),
+        ]
+    )
+    commands: list[list[str]] = []
+    writes: list[dict] = []
+    copy_calls: list[dict] = []
+    destroy_calls: list[dict] = []
+
+    def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return next(responses)
+
+    def fake_copy_artifacts(current: dict) -> bool:
+        copy_calls.append(current)
+        return True
+
+    def fake_destroy_instance(current: dict) -> None:
+        destroy_calls.append(current)
+        current["status"] = "destroyed"
+
+    monkeypatch.setattr(cmux_vast_host, "run_command", fake_run_command)
+    monkeypatch.setattr(cmux_vast_host, "write_state", lambda current: writes.append(dict(current)))
+    monkeypatch.setattr(cmux_vast_host, "copy_artifacts", fake_copy_artifacts)
+    monkeypatch.setattr(cmux_vast_host, "destroy_instance", fake_destroy_instance)
+
+    cmux_vast_host.process_watch_state(state, destroy=True, yes=True)
+
+    assert state["status"] == "workspace_pending"
+    assert state["cmux_workspace_observed"] is True
+    assert state["cmux_workspace_registered"] is True
+    assert state["cmux_workspace_observed_ref"] == "workspace-ref-1"
+    assert copy_calls == []
+    assert destroy_calls == []
+
+    cmux_vast_host.process_watch_state(state, destroy=True, yes=True)
+
+    assert commands == [
+        ["cmux", "workspace", "list", "--json"],
+        ["cmux", "workspace", "list", "--json"],
+    ]
+    assert len(writes) == 1
+    assert copy_calls == [state]
+    assert destroy_calls == [state]
+    assert state["status"] == "destroyed"
+
+
+def test_handle_start_task_registers_workspace_and_persists_distinct_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {
+        "task_name": "register-me",
+        "status": "ready",
+        "workspace_cwd": "/tmp/cmux-register",
+        "cmux_workspace_registered": False,
+        "cmux_workspace_ref": None,
+        "cmux_workspace_id": None,
+    }
+    args = argparse.Namespace(
+        task_name="register-me",
+        workspace_name="registered-task",
+        bootstrap="full",
+    )
+    writes: list[dict] = []
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(cmux_vast_host, "maybe_load_state", lambda task_name: state)
+    monkeypatch.setattr(cmux_vast_host, "write_state", lambda current: writes.append(dict(current)))
+
+    def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        assert command[:3] == ["cmux", "rpc", "workspace.create"]
+        assert json.loads(command[3]) == {
+            "cwd": "/tmp/cmux-register",
+            "focus": False,
+            "name": "registered-task",
+        }
+        return completed(
+            '{"workspace_ref":"cmux-ref-7","workspace_id":"6e2f3e0c-3a2d-4c9d-8f54-9a0e2f7d1b63"}'
+        )
+
+    monkeypatch.setattr(cmux_vast_host, "run_command", fake_run_command)
+
+    assert cmux_vast_host.handle_start_task(args) == 0
+
+    assert len(commands) == 1
+    assert state["status"] == "workspace_pending"
+    assert state["cmux_workspace_ref"] == "cmux-ref-7"
+    assert state["cmux_workspace_id"] == "6e2f3e0c-3a2d-4c9d-8f54-9a0e2f7d1b63"
+    assert state["cmux_workspace_registered"] is True
+    assert writes[-1]["cmux_workspace_ref"] == "cmux-ref-7"
+    assert writes[-1]["cmux_workspace_id"] == "6e2f3e0c-3a2d-4c9d-8f54-9a0e2f7d1b63"
+    assert writes[-1]["cmux_workspace_registered"] is True
+
+
+def test_handle_start_task_registration_failure_keeps_pending_without_identity_or_destroy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {
+        "task_name": "registration-retry",
+        "status": "ready",
+        "workspace_cwd": "/tmp/cmux-retry",
+        "cmux_workspace_registered": False,
+        "cmux_workspace_ref": None,
+        "cmux_workspace_id": None,
+    }
+    args = argparse.Namespace(
+        task_name="registration-retry",
+        workspace_name="retry-task",
+        bootstrap="full",
+    )
+    destroy_calls: list[dict] = []
+    writes: list[dict] = []
+
+    monkeypatch.setattr(cmux_vast_host, "maybe_load_state", lambda task_name: state)
+    monkeypatch.setattr(cmux_vast_host, "write_state", lambda current: writes.append(dict(current)))
+    monkeypatch.setattr(cmux_vast_host, "destroy_instance", lambda current: destroy_calls.append(current))
+    monkeypatch.setattr(
+        cmux_vast_host,
+        "run_command",
+        lambda command, **_: completed(returncode=1),
+    )
+
+    assert cmux_vast_host.handle_start_task(args) == 1
+
+    assert state["status"] == "workspace_pending"
+    assert state["cmux_workspace_ref"] is None
+    assert state["cmux_workspace_id"] is None
+    assert state["cmux_workspace_registered"] is False
+    assert "cmux_workspace_observed_ref" not in state
+    assert writes[-1]["status"] == "workspace_pending"
+    assert writes[-1]["cmux_workspace_ref"] is None
+    assert writes[-1]["cmux_workspace_id"] is None
+    assert destroy_calls == []
+
+
+def test_handle_start_task_skips_workspace_create_when_already_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {
+        "task_name": "already-registered",
+        "status": "workspace_pending",
+        "workspace_cwd": "/tmp/cmux-existing",
+        "cmux_workspace_ref": "cmux-ref-existing",
+        "cmux_workspace_id": "8b7b6d3e-cf9d-41e2-8c33-6b68f0a3b0e1",
+        "cmux_workspace_registered": True,
+    }
+    args = argparse.Namespace(
+        task_name="already-registered",
+        workspace_name="existing-task",
+        bootstrap="full",
+    )
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(cmux_vast_host, "maybe_load_state", lambda task_name: state)
+    monkeypatch.setattr(cmux_vast_host, "run_command", lambda command, **_: commands.append(command))
+
+    assert cmux_vast_host.handle_start_task(args) == 0
+
+    assert commands == []
+    assert state["cmux_workspace_ref"] == "cmux-ref-existing"
+    assert state["cmux_workspace_id"] == "8b7b6d3e-cf9d-41e2-8c33-6b68f0a3b0e1"

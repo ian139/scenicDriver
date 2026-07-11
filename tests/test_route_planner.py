@@ -328,7 +328,7 @@ def test_scenic_weight_zero_matches_fastest_and_nonzero_selects_scenic() -> None
     assert scenic.total_distance_km == 12.0
     assert scenic.average_scenic_score == pytest.approx(10.0)
     assert scenic.estimated_duration_minutes <= fastest.estimated_duration_minutes * 2.4
-    
+
 def test_scenic_duration_cap_factor_one_cannot_exceed_fastest() -> None:
     graph = RoadGraph()
     graph.add_node(Node(id="S", lat=42.0, lon=-72.0))

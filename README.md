@@ -408,11 +408,15 @@ scripts/remote/vast-watch.sh --interval-seconds 60 --destroy --yes
 scripts/remote/vast-down.sh scenic-vast-smoke --copy-artifacts --destroy --yes
 ```
 
-The `vast-start-task.sh` wrapper allocates/bootstrap-checks the Vast host and
-prints the documented `cmux new-workspace --name ... --cwd ... --focus false`
-command. It does not execute CMUX workspace creation; run that command only
-after the checkout path is ready. `vast-watch.sh` observes `cmux workspace list
---json` before collecting artifacts or destroying the host.
+The `vast-start-task.sh` wrapper allocates/bootstrap-checks the Vast host, then
+automatically creates and registers the CMUX workspace for the task. It
+persists the returned workspace ref and ID in
+`.cmux-vast/state/<task-name>.json`, so CMUX workspace tracking remains tied to
+that unique identity. If workspace creation or registration fails, the state
+stays `workspace_pending` with no recorded identity; rerun the same
+`vast-start-task.sh` command to retry safely. `vast-watch.sh` observes
+`cmux workspace list --json` using the recorded workspace identity before
+collecting artifacts or destroying the host.
 
 ## Repository layout
 

@@ -89,17 +89,44 @@ def rel_state_path(task_name: str) -> Path:
 
 
 def _normalize_state(state: dict) -> dict:
-    """Normalize legacy Orca keys in memory; writes always use CMUX keys."""
-    legacy_to_cmux = {
-        "orca_worktree_id": "cmux_workspace_id",
-        "orca_worktree_path": "cmux_workspace_path",
-        "orca_worktree_name": "cmux_workspace_name",
-        "orca_agent": "cmux_agent",
-    }
-    for legacy_key, cmux_key in legacy_to_cmux.items():
-        if cmux_key not in state and state.get(legacy_key) is not None:
-            state[cmux_key] = state[legacy_key]
-    if state.get("status") in {"orca_serving", "worktree_running"}:
+    """Normalize legacy Orca state without treating it as CMUX identity."""
+    legacy_id = state.get("orca_worktree_id")
+    legacy_path = state.get("orca_worktree_path")
+    legacy_active = state.get("status") in {"orca_serving", "worktree_running"}
+    legacy_identity = legacy_id is not None or legacy_path is not None
+
+    # An Orca worktree path was a remote repository path in the old state
+    # format, but only retain it when it cannot be the local CMUX cwd.
+    if (
+        (
+            "remote_repo_dir" not in state
+            or state.get("remote_repo_dir") is None
+            or state.get("remote_repo_dir") == ""
+        )
+        and isinstance(legacy_path, str)
+    ):
+        candidate = legacy_path.strip()
+        workspace_cwd = str(state.get("workspace_cwd") or "").rstrip("/")
+        if candidate.startswith("/") and candidate.rstrip("/") != workspace_cwd:
+            state["remote_repo_dir"] = candidate
+
+    if legacy_identity or legacy_active:
+        # A name/agent are descriptive metadata and remain useful after
+        # migration.  Neither is used as a CMUX identity.
+        if "cmux_workspace_name" not in state and state.get("orca_worktree_name") is not None:
+            state["cmux_workspace_name"] = state["orca_worktree_name"]
+        if "cmux_agent" not in state and state.get("orca_agent") is not None:
+            state["cmux_agent"] = state["orca_agent"]
+        # Legacy identity is not evidence that a CMUX workspace was
+        # registered.  Keep explicit CMUX fields, but never fill them from
+        # Orca values.
+        state.setdefault("cmux_workspace_id", None)
+        state.setdefault("cmux_workspace_path", None)
+        state["cmux_workspace_registered"] = False
+        state["cmux_workspace_observed"] = False
+        state.pop("cmux_workspace_observed_ref", None)
+
+    if legacy_active:
         state["status"] = "workspace_pending"
     for key in tuple(state):
         if key.startswith("orca_"):
@@ -489,6 +516,9 @@ def build_initial_state(args: argparse.Namespace, offer_id: int, instance_id: in
         "repo_source": "git-checkout-upload",
         "branch": args.branch,
         "cmux_workspace_id": None,
+        "cmux_workspace_ref": None,
+        "cmux_workspace_registered": False,
+        "cmux_workspace_observed": False,
         "cmux_workspace_path": None,
         "cmux_workspace_name": None,
         "cmux_agent": None,
@@ -640,6 +670,70 @@ def build_cmux_workspace_command(name: str, cwd: str) -> list[str]:
     ]
 
 
+def _cmux_scalar_identity(value: object) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    identity = str(value).strip()
+    return identity or None
+
+
+def build_cmux_workspace_registration_command(name: str, cwd: str) -> list[str]:
+    """Build the CMUX JSON-RPC workspace creation command."""
+    params = {"cwd": cwd, "focus": False, "name": name}
+    return [
+        "cmux",
+        "rpc",
+        "workspace.create",
+        json.dumps(params, separators=(",", ":"), sort_keys=True),
+    ]
+
+
+def parse_cmux_workspace_creation(payload: object) -> tuple[str, str]:
+    """Extract the CMUX ref and ID without using cwd or other metadata."""
+    if not isinstance(payload, dict):
+        raise RuntimeError("cmux workspace create returned a non-object JSON value")
+
+    # `cmux rpc` currently returns the workspace object directly.  Accept the
+    # envelope and nested workspace forms used by older/newer socket clients,
+    # while checking them before a generic `id` key (which may be a request ID).
+    for key in ("result", "workspace"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            try:
+                return parse_cmux_workspace_creation(nested)
+            except RuntimeError:
+                pass
+
+    ref = next(
+        (
+            identity
+            for key in ("workspace_ref", "ref")
+            if (identity := _cmux_scalar_identity(payload.get(key))) is not None
+        ),
+        None,
+    )
+    workspace_id = next(
+        (
+            identity
+            for key in ("workspace_id", "workspaceId", "id")
+            if (identity := _cmux_scalar_identity(payload.get(key))) is not None
+        ),
+        None,
+    )
+    if ref is None and workspace_id is None:
+        raise RuntimeError("cmux workspace create JSON did not include a ref or ID")
+    # A CLI version may return only one identifier.  Keep both state keys
+    # populated with the exact returned token in that case.
+    return ref or workspace_id or "", workspace_id or ref or ""
+
+
+def register_cmux_workspace(name: str, cwd: str) -> tuple[str, str]:
+    command = build_cmux_workspace_registration_command(name, cwd)
+    result = run_command(command)
+    payload = parse_json_output(result, "cmux workspace create")
+    return parse_cmux_workspace_creation(payload)
+
+
 def handle_start_task(args: argparse.Namespace) -> int:
     validate_task_name(args.task_name)
     state = maybe_load_state(args.task_name)
@@ -655,21 +749,81 @@ def handle_start_task(args: argparse.Namespace) -> int:
         print(f"State: {rel_state_path(args.task_name)}")
         return 0
     if state.get("status") == "workspace_pending":
-        name = str(state.get("cmux_workspace_name") or args.task_name)
-        cwd = str(state.get("workspace_cwd") or DEFAULT_CMUX_WORKSPACE_CWD)
+        name = str(state.get("cmux_workspace_name") or getattr(args, "workspace_name", None) or args.task_name)
+        cwd = str(state.get("workspace_cwd") or getattr(args, "workspace_cwd", None) or DEFAULT_CMUX_WORKSPACE_CWD)
     elif state.get("status") == "ready":
         name = str(getattr(args, "workspace_name", None) or args.task_name)
-        cwd = str(getattr(args, "workspace_cwd", None) or state.get("workspace_cwd") or DEFAULT_CMUX_WORKSPACE_CWD)
+        cwd = str(state.get("workspace_cwd") or getattr(args, "workspace_cwd", None) or DEFAULT_CMUX_WORKSPACE_CWD)
         state["cmux_workspace_name"] = name
         state["cmux_workspace_path"] = cwd
         state["cmux_agent"] = getattr(args, "agent", "none")
         state["workspace_cwd"] = cwd
+        state["cmux_workspace_ref"] = None
+        state["cmux_workspace_id"] = None
+        state["cmux_workspace_registered"] = False
+        state["cmux_workspace_observed"] = False
+        state.pop("cmux_workspace_observed_ref", None)
         update_status(state, "workspace_pending")
     else:
         raise SystemExit(f"State {rel_state_path(args.task_name)} has status {state.get('status')}")
-    command = build_cmux_workspace_command(name, cwd)
-    print(f"CMUX workspace command: {shlex.join(command)}")
-    print("CMUX workspace creation is left to the operator; no CMUX command was executed.")
+
+    registered = (
+        state.get("cmux_workspace_registered") is True
+        and (
+            _cmux_scalar_identity(state.get("cmux_workspace_ref")) is not None
+            or _cmux_scalar_identity(state.get("cmux_workspace_id")) is not None
+        )
+    )
+    if registered:
+        print(
+            "CMUX workspace already registered: "
+            f"ref={state.get('cmux_workspace_ref')} id={state.get('cmux_workspace_id')}"
+        )
+        print("Watch: scripts/remote/vast-watch.sh --once")
+        return 0
+
+    if getattr(args, "manual", False):
+        update_status(
+            state,
+            "workspace_pending",
+            cmux_workspace_ref=None,
+            cmux_workspace_id=None,
+            cmux_workspace_registered=False,
+            cmux_workspace_observed=False,
+        )
+        state.pop("cmux_workspace_observed_ref", None)
+        command = build_cmux_workspace_command(name, cwd)
+        print(f"CMUX workspace command (manual, unregistered): {shlex.join(command)}")
+        print("CMUX workspace creation was left to the operator; no identity was recorded.")
+        print("Watch: scripts/remote/vast-watch.sh --once")
+        return 0
+
+    try:
+        workspace_ref, workspace_id = register_cmux_workspace(name, cwd)
+    except Exception as exc:  # noqa: BLE001 - registration must remain retryable.
+        update_status(
+            state,
+            "workspace_pending",
+            cmux_workspace_ref=None,
+            cmux_workspace_id=None,
+            cmux_workspace_registered=False,
+            cmux_workspace_observed=False,
+            error=str(exc),
+        )
+        state.pop("cmux_workspace_observed_ref", None)
+        print(f"CMUX workspace registration failed; task remains pending: {exc}", file=sys.stderr)
+        return 1
+
+    update_status(
+        state,
+        "workspace_pending",
+        cmux_workspace_ref=workspace_ref,
+        cmux_workspace_id=workspace_id,
+        cmux_workspace_registered=True,
+        cmux_workspace_observed=False,
+    )
+    state.pop("cmux_workspace_observed_ref", None)
+    print(f"CMUX workspace registered: ref={workspace_ref} id={workspace_id}")
     print("Watch: scripts/remote/vast-watch.sh --once")
     return 0
 
@@ -679,10 +833,11 @@ def remote_file_exists(target: SshTarget, remote_path: str) -> bool:
     return result.returncode == 0
 
 
-def copy_remote_path(target: SshTarget, remote_path: str, local_path: Path, *, required: bool) -> None:
+def copy_remote_path(target: SshTarget, remote_path: str, local_path: Path, *, required: bool) -> bool:
     if not remote_file_exists(target, remote_path):
-        print(f"Warning: remote path missing: {remote_path}", file=sys.stderr)
-        return
+        message = f"remote path missing: {remote_path}"
+        print(("Warning: " if not required else "Warning (required): ") + message, file=sys.stderr)
+        return False
     local_path.parent.mkdir(parents=True, exist_ok=True)
     destination = str(local_path)
     if remote_path.endswith("/"):
@@ -691,48 +846,136 @@ def copy_remote_path(target: SshTarget, remote_path: str, local_path: Path, *, r
     result = run_command([*scp_base(target), "-r", f"{target.user}@{target.host}:{remote_path}", destination], check=False)
     if result.returncode != 0:
         message = f"failed to copy remote path: {remote_path}"
-        if required:
-            raise RuntimeError(message)
-        print("Warning: " + message, file=sys.stderr)
+        print(("Warning: " if not required else "Warning (required): ") + message, file=sys.stderr)
+        return False
+    return True
 
 
-def copy_artifacts(state: dict) -> None:
+def copy_artifacts(state: dict) -> bool:
+    remote_root = state.get("remote_repo_dir")
+    if (
+        not isinstance(remote_root, str)
+        or not remote_root.strip()
+        or not remote_root.strip().startswith("/")
+        or not remote_root.strip().strip("/")
+    ):
+        print("Warning: state has no valid remote_repo_dir; cannot copy artifacts", file=sys.stderr)
+        return False
     if not state.get("ssh_host") or not state.get("ssh_port"):
         print("Warning: state has no SSH endpoint; cannot copy artifacts", file=sys.stderr)
-        return
-    target = target_from_state(state)
-    task_name = state["task_name"]
+        return False
+    try:
+        target = target_from_state(state)
+        task_name = str(state["task_name"])
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"Warning: invalid state for artifact copy: {exc}", file=sys.stderr)
+        return False
+
+    remote_root = remote_root.strip().rstrip("/")
     artifact_dir = ARTIFACTS_DIR / task_name
-    remote_root = state.get("remote_repo_dir")
-    copy_remote_path(target, f"{remote_root}/data/processed/regression/", artifact_dir / "data" / "processed" / "regression", required=False)
-    copy_remote_path(target, f"{remote_root}/models/", artifact_dir / "models", required=False)
-    copy_remote_path(target, f"{remote_root}/scenic_artifacts/", artifact_dir / "scenic_artifacts", required=False)
-    copy_remote_path(target, "/tmp/scenic_container_smoke.json", artifact_dir / "scenic_container_smoke.json", required=False)
+    required_ok = True
+    copy_requests = (
+        (f"{remote_root}/data/processed/regression/", artifact_dir / "data" / "processed" / "regression", True),
+        (f"{remote_root}/models/", artifact_dir / "models", False),
+        (f"{remote_root}/scenic_artifacts/", artifact_dir / "scenic_artifacts", True),
+        ("/tmp/scenic_container_smoke.json", artifact_dir / "scenic_container_smoke.json", False),
+    )
+    for remote_path, local_path, required in copy_requests:
+        try:
+            copied = copy_remote_path(target, remote_path, local_path, required=required)
+        except Exception as exc:  # noqa: BLE001 - an artifact failure must block teardown.
+            print(f"Warning: failed to copy {remote_path}: {exc}", file=sys.stderr)
+            copied = False
+        if required and not copied:
+            required_ok = False
+    return required_ok
 
 
 def workspace_closed(state: dict) -> bool:
-    workspace_id = state.get("cmux_workspace_id")
-    workspace_path = state.get("cmux_workspace_path") or state.get("workspace_cwd")
-    result = run_command(["cmux", "workspace", "list", "--json"], check=False)
+    if state.get("cmux_workspace_registered") is False:
+        return False
+    recorded_values = {
+        identity
+        for identity in (
+            _cmux_scalar_identity(state.get("cmux_workspace_ref")),
+            _cmux_scalar_identity(state.get("cmux_workspace_id")),
+        )
+        if identity is not None
+    }
+    if not recorded_values:
+        return False
+
+    try:
+        result = run_command(["cmux", "workspace", "list", "--json"], check=False)
+    except Exception:
+        return False
     if result.returncode != 0:
-        return True
+        return False
     try:
         payload = parse_json_output(result, "cmux workspace list")
-    except RuntimeError:
-        return True
+    except Exception:
+        return False
+
     entries: object = payload
     if isinstance(payload, dict):
-        entries = payload.get("workspaces", payload.get("result", payload))
+        entries = payload.get("workspaces", payload.get("result"))
     if not isinstance(entries, list):
-        return True
+        return False
+    if not entries:
+        # An observed workspace may be the last workspace in the window.  An
+        # empty, successful JSON list is therefore a valid absence signal,
+        # while an unobserved empty list remains safely pending.
+        return (
+            state.get("cmux_workspace_observed") is True
+            and _cmux_scalar_identity(state.get("cmux_workspace_observed_ref")) in recorded_values
+        )
+    if any(not isinstance(entry, dict) for entry in entries):
+        return False
+
+    identity_present = False
+    observed_identity: str | None = None
     for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        entry_id = entry.get("id") or entry.get("workspace_id") or entry.get("workspaceId")
-        entry_path = entry.get("current_directory") or entry.get("currentDirectory") or entry.get("cwd")
-        if (workspace_id and str(entry_id) == str(workspace_id)) or (workspace_path and str(entry_path) == str(workspace_path)):
+        entry_ref = _cmux_scalar_identity(entry.get("ref"))
+        if "ref" in entry and entry.get("ref") is not None and entry_ref is None:
             return False
-    return True
+        entry_identities = [
+            identity
+            for identity in (
+                entry_ref,
+                *(
+                    _cmux_scalar_identity(entry.get(key))
+                    for key in ("id", "workspace_id", "workspaceId")
+                ),
+            )
+            if identity is not None
+        ]
+        if not entry_identities:
+            return False
+        matched_identity = next(
+            (identity for identity in entry_identities if identity in recorded_values),
+            None,
+        )
+        if matched_identity is not None:
+            identity_present = True
+            observed_identity = matched_identity
+
+    if identity_present:
+        state["cmux_workspace_registered"] = True
+        state["cmux_workspace_observed"] = True
+        state["cmux_workspace_observed_ref"] = observed_identity
+        try:
+            if state.get("task_name"):
+                write_state(state)
+        except Exception:
+            state.pop("cmux_workspace_observed_ref", None)
+            state["cmux_workspace_observed"] = False
+            return False
+        return False
+
+    return (
+        state.get("cmux_workspace_observed") is True
+        and _cmux_scalar_identity(state.get("cmux_workspace_observed_ref")) in recorded_values
+    )
 
 
 def destroy_instance(state: dict) -> None:
@@ -750,9 +993,16 @@ def process_watch_state(state: dict, *, destroy: bool, yes: bool) -> None:
         print(f"No CMUX workspace to watch for {task_name}: {status}")
         return
     if not workspace_closed(state):
-        print(f"CMUX workspace still open: {task_name}")
+        print(f"CMUX workspace still open or unconfirmed: {task_name}")
         return
-    copy_artifacts(state)
+    try:
+        artifacts_ok = copy_artifacts(state)
+    except Exception as exc:  # noqa: BLE001 - failed copies must leave the host retryable.
+        print(f"Warning: artifact copy failed for {task_name}: {exc}", file=sys.stderr)
+        artifacts_ok = False
+    if not artifacts_ok:
+        print(f"Required artifact copy incomplete; keeping Vast task: {task_name}", file=sys.stderr)
+        return
     if destroy and yes:
         destroy_instance(state)
         print(f"Vast task destroyed: {task_name}")
@@ -798,12 +1048,20 @@ def handle_watch(args: argparse.Namespace) -> int:
 def handle_down(args: argparse.Namespace) -> int:
     validate_task_name(args.task_name)
     state = load_state(args.task_name)
+    artifacts_ok = True
     if args.copy_artifacts or state["status"] in {"workspace_pending", "done", "failed"}:
-        copy_artifacts(state)
+        try:
+            artifacts_ok = copy_artifacts(state)
+        except Exception as exc:  # noqa: BLE001 - never destroy after a failed copy.
+            print(f"Warning: artifact copy failed for {args.task_name}: {exc}", file=sys.stderr)
+            artifacts_ok = False
     if not (args.destroy and args.yes):
         print(f"Destroy command: vastai destroy instance {state['instance_id']}")
         print("Not destroying without --destroy --yes")
         return 0
+    if not artifacts_ok:
+        print(f"Required artifact copy incomplete; refusing to destroy {args.task_name}", file=sys.stderr)
+        return 1
     destroy_instance(state)
     print(f"Vast task destroyed: {args.task_name}")
     return 0
@@ -818,11 +1076,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_up_options(up)
     up.set_defaults(func=handle_up)
 
-    start_task = subparsers.add_parser("start-task", help="Prepare a CMUX workspace opening command for a Vast host")
+    start_task = subparsers.add_parser("start-task", help="Create and register a CMUX workspace for a Vast host")
     start_task.add_argument("task_name")
-    start_task.add_argument("prompt", help="Operator prompt retained for wrapper compatibility; CMUX opening is manual.")
+    start_task.add_argument("prompt", help="Operator prompt retained for wrapper compatibility; not sent to CMUX.")
     start_task.add_argument("--agent", default="none")
     start_task.add_argument("--workspace-name")
+    start_task.add_argument(
+        "--manual",
+        "--manual-workspace",
+        dest="manual",
+        action="store_true",
+        help="Print a manual CMUX command and leave the workspace explicitly unregistered.",
+    )
     add_up_options(start_task)
     start_task.set_defaults(func=handle_start_task)
 
