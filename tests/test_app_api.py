@@ -398,7 +398,7 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
             "scenic_weight": 0.8,
             "region": "philadelphia",
             "max_detour_factor": 1.8,
-            "avoid_highways": False,
+            "avoid_highways": True,
             "include_baseline": True,
         },
     )
@@ -421,11 +421,56 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
     }
     assert payload["run_name"] == "test-run"
     assert payload["diagnostics"] == {"planner": "ok"}
+    assert payload["request"]["max_detour_factor"] == 1.8
+    assert payload["request"]["avoid_highways"] is True
     assert payload["routes"] == {"scenic": scenic_metrics, "baseline": baseline_metrics}
     assert payload["deltas"] == {
         "distance_km": 2.0,
         "duration_min": 4.0,
         "scenic_score": 0.6000000000000001,
     }
+
     assert payload["score_mapping"] == {"version": "test"}
     assert payload["geojson"] == {"type": "FeatureCollection", "features": []}
+
+def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
+    plan_calls: list[object] = []
+    diagnosis_calls: list[object] = []
+
+    monkeypatch.setattr(
+        app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+
+    def fake_plan(request):
+        plan_calls.append(request)
+        raise ValueError("detour cap is too tight")
+
+    def fake_diagnose(request):
+        diagnosis_calls.append(request)
+        return {"graph_nodes": 4, "graph_edges": 3}
+
+    monkeypatch.setattr(app_api, "plan_routes", fake_plan)
+    monkeypatch.setattr(app_api, "diagnose_route_request", fake_diagnose)
+
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 44.4, "lon": -70.2},
+            "end": {"lat": 44.5, "lon": -70.1},
+            "scenic_weight": 0.7,
+            "region": "new_england_north",
+            "max_detour_factor": 1.4,
+            "avoid_highways": True,
+            "include_baseline": True,
+        },
+    )
+
+    assert response.status_code == 422
+    assert len(plan_calls) == 1
+    request = plan_calls[0]
+    assert request.max_detour_factor == 1.4
+    assert request.avoid_highways is True
+    assert diagnosis_calls == [request]
+    detail = response.json()["detail"]
+    assert detail["diagnostics"] == {"graph_nodes": 4, "graph_edges": 3}

@@ -1,4 +1,4 @@
-"""State-backed Vast.ai GPU host allocator for Orca remote worktrees."""
+"""State-backed Vast.ai GPU host allocator with CMUX workspace handoff."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 import re
 import shlex
-import signal
 import subprocess
 import sys
 import tarfile
@@ -17,22 +16,21 @@ import time
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-STATE_DIR = PROJECT_ROOT / ".orca-vast" / "state"
-ARTIFACTS_DIR = PROJECT_ROOT / ".orca-vast" / "artifacts"
+STATE_DIR = PROJECT_ROOT / ".cmux-vast" / "state"
+LEGACY_STATE_DIR = PROJECT_ROOT / ".orca-vast" / "state"
+ARTIFACTS_DIR = PROJECT_ROOT / ".cmux-vast" / "artifacts"
 DEFAULT_OFFER_QUERY = "gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true"
 DEFAULT_IMAGE = "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04"
 DEFAULT_BRANCH = "Ian139/RemoteTraining"
 DEFAULT_REMOTE_REPO_DIR = "/workspace/scenic-drive"
 DEFAULT_REMOTE_ENV_FILE = "/root/.scenic/aws.env"
-DEFAULT_ORCA_PROJECT_ID = "github:ian139/scenicdriver"
-DEFAULT_ORCA_PORT = 6768
+DEFAULT_CMUX_WORKSPACE_CWD = str(PROJECT_ROOT)
 VALID_STATUSES = {
     "creating",
     "ssh_wait",
     "bootstrapping",
-    "orca_serving",
     "ready",
-    "worktree_running",
+    "workspace_pending",
     "provisioning",
     "training_running",
     "copying_artifacts",
@@ -47,6 +45,8 @@ VALID_STATUSES = {
 EXCLUDED_ROOTS = {
     ".git",
     ".venv",
+    ".cmux-vast",
+    # Keep legacy state out of remote overlays during migration.
     ".orca-vast",
     ".secrets",
     "data/raw",
@@ -57,7 +57,6 @@ EXCLUDED_ROOTS = {
     "scenic_artifacts",
 }
 EXCLUDED_NAMES = {"__pycache__", ".pytest_cache"}
-PAIRING_RE = re.compile(r"orca://pair\?\S+")
 
 
 @dataclass(frozen=True)
@@ -81,30 +80,86 @@ def state_path(task_name: str) -> Path:
     return STATE_DIR / f"{task_name}.json"
 
 
+def legacy_state_path(task_name: str) -> Path:
+    return LEGACY_STATE_DIR / f"{task_name}.json"
+
+
 def rel_state_path(task_name: str) -> Path:
     return state_path(task_name).relative_to(PROJECT_ROOT)
 
 
+def _normalize_state(state: dict) -> dict:
+    """Normalize legacy Orca state without treating it as CMUX identity."""
+    legacy_id = state.get("orca_worktree_id")
+    legacy_path = state.get("orca_worktree_path")
+    legacy_active = state.get("status") in {"orca_serving", "worktree_running"}
+    legacy_identity = legacy_id is not None or legacy_path is not None
+
+    # An Orca worktree path was a remote repository path in the old state
+    # format, but only retain it when it cannot be the local CMUX cwd.
+    if (
+        (
+            "remote_repo_dir" not in state
+            or state.get("remote_repo_dir") is None
+            or state.get("remote_repo_dir") == ""
+        )
+        and isinstance(legacy_path, str)
+    ):
+        candidate = legacy_path.strip()
+        workspace_cwd = str(state.get("workspace_cwd") or "").rstrip("/")
+        if candidate.startswith("/") and candidate.rstrip("/") != workspace_cwd:
+            state["remote_repo_dir"] = candidate
+
+    if legacy_identity or legacy_active:
+        # A name/agent are descriptive metadata and remain useful after
+        # migration.  Neither is used as a CMUX identity.
+        if "cmux_workspace_name" not in state and state.get("orca_worktree_name") is not None:
+            state["cmux_workspace_name"] = state["orca_worktree_name"]
+        if "cmux_agent" not in state and state.get("orca_agent") is not None:
+            state["cmux_agent"] = state["orca_agent"]
+        # Legacy identity is not evidence that a CMUX workspace was
+        # registered.  Keep explicit CMUX fields, but never fill them from
+        # Orca values.
+        state.setdefault("cmux_workspace_id", None)
+        state.setdefault("cmux_workspace_path", None)
+        state["cmux_workspace_registered"] = False
+        state["cmux_workspace_observed"] = False
+        state.pop("cmux_workspace_observed_ref", None)
+
+    if legacy_active:
+        state["status"] = "workspace_pending"
+    for key in tuple(state):
+        if key.startswith("orca_"):
+            state.pop(key, None)
+    return state
+
+
+def _state_source_path(task_name: str) -> Path | None:
+    current = state_path(task_name)
+    if current.exists():
+        return current
+    legacy = legacy_state_path(task_name)
+    return legacy if legacy.exists() else None
+
+
 def load_state(task_name: str) -> dict:
-    path = state_path(task_name)
-    if not path.exists():
+    path = _state_source_path(task_name)
+    if path is None:
         raise SystemExit(f"No state file for task: {task_name}")
     with path.open() as handle:
-        state = json.load(handle)
+        state = _normalize_state(json.load(handle))
     if state.get("status") not in VALID_STATUSES:
         raise SystemExit(f"Invalid state status in {path}: {state.get('status')}")
     return state
 
 
 def maybe_load_state(task_name: str) -> dict | None:
-    path = state_path(task_name)
-    if not path.exists():
-        return None
-    return load_state(task_name)
+    return load_state(task_name) if _state_source_path(task_name) is not None else None
 
 
 def write_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state = _normalize_state(state)
     state["updated_at"] = utc_now()
     path = state_path(state["task_name"])
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -161,16 +216,6 @@ def parse_json_output(result: subprocess.CompletedProcess[str], description: str
     return parse_json_text(result.stdout, description)
 
 
-def orca_status_ready() -> None:
-    result = run_command(["orca", "status", "--json"], check=False)
-    if result.returncode != 0:
-        raise SystemExit("Orca runtime is not ready; open Orca and rerun")
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise SystemExit("Orca runtime is not ready; open Orca and rerun") from exc
-    if not isinstance(payload, dict) or payload.get("ok") is not True:
-        raise SystemExit("Orca runtime is not ready; open Orca and rerun")
 
 
 def select_offer_id(query: str) -> int:
@@ -451,135 +496,6 @@ def verify_remote_smoke(target: SshTarget) -> None:
         raise RuntimeError("Remote CUDA smoke failed: " + result.stdout.strip())
 
 
-def install_orca_server(target: SshTarget) -> None:
-    script = r"""
-set -euo pipefail
-mkdir -p /opt/orca
-curl -L -o /opt/orca/orca-linux.AppImage https://github.com/stablyai/orca/releases/latest/download/orca-linux.AppImage
-chmod +x /opt/orca/orca-linux.AppImage
-cat >/usr/local/bin/orca <<'SH'
-#!/usr/bin/env bash
-export APPIMAGE_EXTRACT_AND_RUN=1
-exec /opt/orca/orca-linux.AppImage "$@"
-SH
-chmod +x /usr/local/bin/orca
-/usr/local/bin/orca serve --help >/tmp/orca_serve_help.txt
-""".strip()
-    result = ssh(target, "bash -lc " + shlex.quote(script), check=False)
-    if result.returncode != 0:
-        raise RuntimeError("Remote Orca AppImage could not run or expose orca serve")
-
-
-def start_remote_orca_server(target: SshTarget, port: int) -> None:
-    inner = f"tmux kill-session -t orca-vast-serve 2>/dev/null || true\ntmux new-session -d -s orca-vast-serve 'orca serve --port {int(port)} --pairing-address 127.0.0.1 --json 2>&1 | tee /workspace/orca-serve.log'"
-    ssh(target, "bash -lc " + shlex.quote(inner))
-
-
-def process_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        signal.pthread_kill(pid, 0) if False else None
-        return Path(f"/proc/{pid}").exists() or subprocess.run(["/bin/sh", "-c", "kill -0 \"$1\"", "sh", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    except Exception:
-        return False
-
-
-def pid_command(pid: int) -> str:
-    result = run_command(["ps", "-p", str(pid), "-o", "command="], check=False)
-    return result.stdout.strip() if result.returncode == 0 else ""
-
-
-def tunnel_command(state: dict) -> list[str]:
-    target = target_from_state(state)
-    port = int(state["orca_remote_port"])
-    return [*ssh_base(target), "-N", "-L", f"127.0.0.1:{port}:127.0.0.1:{port}"]
-
-
-def tunnel_pid_is_ours(state: dict) -> bool:
-    pid = state.get("orca_tunnel_pid")
-    if not pid:
-        return False
-    try:
-        pid_int = int(pid)
-    except (TypeError, ValueError):
-        return False
-    command = pid_command(pid_int)
-    port = int(state["orca_remote_port"])
-    return bool(command and "ssh" in command and "-N" in command and f"127.0.0.1:{port}:127.0.0.1:{port}" in command)
-
-
-def stop_tunnel(state: dict) -> None:
-    pid = state.get("orca_tunnel_pid")
-    if not pid:
-        return
-    try:
-        pid_int = int(pid)
-    except (TypeError, ValueError):
-        return
-    if tunnel_pid_is_ours(state):
-        try:
-            subprocess.run(["kill", str(pid_int)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-        state["orca_tunnel_pid"] = None
-        write_state(state)
-
-
-def start_tunnel(state: dict) -> None:
-    if tunnel_pid_is_ours(state):
-        return
-    port = int(state["orca_remote_port"])
-    proc = subprocess.Popen(tunnel_command(state), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    time.sleep(1)
-    if proc.poll() is not None:
-        raise RuntimeError(f"Local port {port} is unavailable; rerun with --orca-port <free-port>")
-    state["orca_tunnel_pid"] = proc.pid
-    write_state(state)
-
-
-def ensure_tunnel(state: dict) -> None:
-    if tunnel_pid_is_ours(state):
-        return
-    start_tunnel(state)
-
-
-def parse_pairing_from_log(text: str) -> str | None:
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("{"):
-            try:
-                payload = json.loads(stripped)
-            except json.JSONDecodeError:
-                payload = None
-            if isinstance(payload, dict):
-                for key in ("pairingUrl", "pairingURL", "pairing_url", "pairingCode", "pairing_code", "url"):
-                    value = payload.get(key)
-                    if isinstance(value, str) and value.startswith("orca://pair?"):
-                        return value
-    match = PAIRING_RE.search(text)
-    if match:
-        return match.group(0).rstrip("'\"")
-    return None
-
-
-def wait_for_pairing_url(target: SshTarget, timeout_seconds: int) -> str:
-    deadline = time.monotonic() + timeout_seconds
-    last_text = ""
-    while time.monotonic() < deadline:
-        result = ssh(target, "test -f /workspace/orca-serve.log && cat /workspace/orca-serve.log", check=False)
-        if result.returncode == 0:
-            last_text = result.stdout
-            pairing = parse_pairing_from_log(last_text)
-            if pairing:
-                return pairing
-        time.sleep(2)
-    raise RuntimeError("Timed out waiting for Orca pairing URL: " + last_text[-500:])
-
-
-def orca_environment_add(name: str, pairing_url: str) -> None:
-    run_command(["orca", "environment", "add", "--name", name, "--pairing-code", pairing_url, "--json"])
-
 
 def build_initial_state(args: argparse.Namespace, offer_id: int, instance_id: int) -> dict:
     now = utc_now()
@@ -599,16 +515,14 @@ def build_initial_state(args: argparse.Namespace, offer_id: int, instance_id: in
         "local_secrets_env_file": args.local_secrets_env_file,
         "repo_source": "git-checkout-upload",
         "branch": args.branch,
-        "orca_project_id": DEFAULT_ORCA_PROJECT_ID,
-        "orca_environment": None,
-        "orca_remote_port": args.orca_port,
-        "orca_tunnel_pid": None,
-        "orca_project_host_setup_id": None,
-        "orca_host_id": "local",
-        "orca_worktree_id": None,
-        "orca_worktree_path": None,
-        "orca_worktree_name": None,
-        "orca_agent": None,
+        "cmux_workspace_id": None,
+        "cmux_workspace_ref": None,
+        "cmux_workspace_registered": False,
+        "cmux_workspace_observed": False,
+        "cmux_workspace_path": None,
+        "cmux_workspace_name": None,
+        "cmux_agent": None,
+        "workspace_cwd": str(getattr(args, "workspace_cwd", DEFAULT_CMUX_WORKSPACE_CWD)),
         "created_at": now,
         "updated_at": now,
         "status": "creating",
@@ -617,14 +531,10 @@ def build_initial_state(args: argparse.Namespace, offer_id: int, instance_id: in
 
 def check_up_preconditions(args: argparse.Namespace) -> None:
     validate_task_name(args.task_name)
-    path = state_path(args.task_name)
-    if path.exists():
-        with path.open() as handle:
-            existing = json.load(handle)
-        if existing.get("status") != "destroyed":
-            raise SystemExit(f"State exists: {path.relative_to(PROJECT_ROOT)}; run vast-down or choose a new task name")
-    require_commands(["vastai", "ssh", "scp", "tar", "git", "uv", "orca"])
-    orca_status_ready()
+    existing = maybe_load_state(args.task_name)
+    if existing is not None and existing.get("status") != "destroyed":
+        raise SystemExit(f"State exists: {rel_state_path(args.task_name)}; run vast-down or choose a new task name")
+    require_commands(["vastai", "ssh", "scp", "tar", "git", "uv"])
     identity_file = str(Path(args.identity_file).expanduser())
     public_key = str(Path(args.ssh_public_key).expanduser())
     if not Path(identity_file).exists():
@@ -668,7 +578,6 @@ def do_up(args: argparse.Namespace) -> dict:
             if state is not None:
                 state["error"] = str(exc)
                 write_state(state)
-                stop_tunnel(state)
             if instance_id is not None:
                 run_command(["vastai", "destroy", "instance", str(instance_id), "--yes"], check=False)
                 if state is not None:
@@ -709,18 +618,7 @@ def do_up(args: argparse.Namespace) -> dict:
         finally:
             record_startup_timing(state, "container_smoke", phase_started)
 
-        phase_started = time.monotonic()
-        try:
-            install_orca_server(target)
-            update_status(state, "orca_serving")
-            start_remote_orca_server(target, args.orca_port)
-            start_tunnel(state)
-            pairing_url = wait_for_pairing_url(target, args.timeout_seconds)
-            environment = f"vast-{args.task_name}-{instance_id}"
-            orca_environment_add(environment, pairing_url)
-        finally:
-            record_startup_timing(state, "orca_serve_pairing", phase_started)
-        update_status(state, "ready", orca_environment=environment)
+        update_status(state, "ready", ssh_host=target.host, ssh_port=target.port)
         return state
     except Exception as exc:  # noqa: BLE001 - preserve instance for explicit teardown.
         update_status(state, "failed", error=str(exc))
@@ -733,127 +631,13 @@ def handle_up(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         print(str(exc), file=sys.stderr)
         return 1
-    print(f"Vast Orca host ready: {args.task_name}")
+    print(f"Vast CMUX host ready: {args.task_name}")
     print(f"State: {rel_state_path(args.task_name)}")
-    print(f"Orca environment: {state['orca_environment']}")
     print(f"Remote repo: {state['remote_repo_dir']}")
     print(f"Next: scripts/remote/vast-start-task.sh {args.task_name} '<prompt>'")
     return 0
 
 
-def ensure_remote_codex(target: SshTarget, state: dict) -> None:
-    script = """
-set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y nodejs npm
-if ! command -v codex >/dev/null 2>&1; then npm install -g @openai/codex; fi
-""".strip()
-    result = ssh(target, "bash -lc " + shlex.quote(script), check=False)
-    if result.returncode != 0:
-        update_status(state, "failed", error="Codex CLI install failed on remote host")
-        raise RuntimeError("Codex CLI install failed on remote host")
-
-
-def extract_first_string(payload: object, keys: tuple[str, ...]) -> str | None:
-    if isinstance(payload, dict):
-        for key in keys:
-            value = payload.get(key)
-            if isinstance(value, str) and value:
-                return value
-        for value in payload.values():
-            found = extract_first_string(value, keys)
-            if found:
-                return found
-    elif isinstance(payload, list):
-        for item in payload:
-            found = extract_first_string(item, keys)
-            if found:
-                return found
-    return None
-
-
-def setup_existing_project(state: dict, task_name: str) -> str | None:
-    env = str(state["orca_environment"])
-    project = str(state["orca_project_id"])
-    base = [
-        "orca",
-        "project",
-        "setup-existing-folder",
-        "--environment",
-        env,
-        "--project",
-        project,
-        "--host",
-        str(state.get("orca_host_id", "local")),
-        "--path",
-        str(state["remote_repo_dir"]),
-        "--kind",
-        "git",
-        "--display-name",
-        f"Scenic Drive Vast {task_name}",
-        "--json",
-    ]
-    result = run_command(base, check=False)
-    if result.returncode != 0 and str(state.get("orca_host_id", "local")) == "local":
-        setups = run_command(["orca", "project", "setups", "--environment", env, "--json"], check=False)
-        if setups.returncode != 0:
-            update_status(state, "failed", error="Orca project setup failed and host discovery failed")
-            raise RuntimeError("Orca project setup failed and host discovery failed")
-        payload = parse_json_output(setups, "orca project setups")
-        host_id = extract_first_string(payload, ("hostId", "host_id", "id"))
-        if not host_id:
-            update_status(state, "failed", error="Orca project setup failed and no host id was returned")
-            raise RuntimeError("Orca project setup failed and no host id was returned")
-        state["orca_host_id"] = host_id
-        write_state(state)
-        base[base.index("local")] = host_id
-        result = run_command(base, check=False)
-    if result.returncode != 0:
-        update_status(state, "failed", error=(result.stderr or result.stdout).strip() or "Orca project setup failed")
-        raise RuntimeError((result.stderr or result.stdout).strip() or "Orca project setup failed")
-    payload = parse_json_output(result, "orca project setup-existing-folder")
-    setup_id = extract_first_string(payload, ("setupId", "setup_id", "projectHostSetupId", "project_host_setup_id", "id"))
-    if setup_id:
-        state["orca_project_host_setup_id"] = setup_id
-        write_state(state)
-    return setup_id
-
-
-def create_worktree(state: dict, args: argparse.Namespace, setup_id: str | None) -> tuple[str, str | None]:
-    command = [
-        "orca",
-        "worktree",
-        "create",
-        "--environment",
-        str(state["orca_environment"]),
-        "--project",
-        str(state["orca_project_id"]),
-        "--host",
-        str(state.get("orca_host_id", "local")),
-        "--name",
-        args.worktree_name,
-        "--base-branch",
-        args.base_branch,
-        "--setup",
-        args.setup,
-        "--comment",
-        f"vast-task:{args.task_name}",
-        "--json",
-    ]
-    if args.agent != "none":
-        command.extend(["--agent", args.agent, "--prompt", args.prompt])
-    result = run_command(command)
-    payload = parse_json_output(result, "orca worktree create")
-    worktree_id = extract_first_string(payload, ("worktreeId", "worktree_id", "id"))
-    path = extract_first_string(payload, ("path", "worktreePath", "worktree_path"))
-    if not worktree_id:
-        raise RuntimeError("orca worktree create did not return a worktree id")
-    if not path:
-        show = run_command(["orca", "worktree", "show", "--environment", str(state["orca_environment"]), "--worktree", f"id:{worktree_id}", "--json"])
-        shown = parse_json_output(show, "orca worktree show")
-        path = extract_first_string(shown, ("path", "worktreePath", "worktree_path"))
-    return worktree_id, path
 
 
 def add_up_options(parser: argparse.ArgumentParser) -> None:
@@ -867,14 +651,91 @@ def add_up_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--local-secrets-env-file", default=".secrets/aws.env")
     parser.add_argument("--remote-repo-dir", default=DEFAULT_REMOTE_REPO_DIR)
     parser.add_argument("--branch", default=DEFAULT_BRANCH)
-    parser.add_argument("--orca-port", type=int, default=DEFAULT_ORCA_PORT)
+    parser.add_argument("--workspace-cwd", default=DEFAULT_CMUX_WORKSPACE_CWD)
     parser.add_argument("--timeout-seconds", type=int, default=1200)
-    parser.add_argument("--bootstrap", default="full", choices=("full", "none"), help="full: install deps + Orca + pair. none: stop after SSH ready.")
+    parser.add_argument("--bootstrap", default="full", choices=("full", "none"), help="full: install dependencies and smoke test; none: stop after SSH ready.")
+
+
+def build_cmux_workspace_command(name: str, cwd: str) -> list[str]:
+    """Build the documented CMUX opening command without executing it."""
+    return [
+        "cmux",
+        "new-workspace",
+        "--name",
+        name,
+        "--cwd",
+        cwd,
+        "--focus",
+        "false",
+    ]
+
+
+def _cmux_scalar_identity(value: object) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    identity = str(value).strip()
+    return identity or None
+
+
+def build_cmux_workspace_registration_command(name: str, cwd: str) -> list[str]:
+    """Build the CMUX JSON-RPC workspace creation command."""
+    params = {"cwd": cwd, "focus": False, "name": name}
+    return [
+        "cmux",
+        "rpc",
+        "workspace.create",
+        json.dumps(params, separators=(",", ":"), sort_keys=True),
+    ]
+
+
+def parse_cmux_workspace_creation(payload: object) -> tuple[str, str]:
+    """Extract the CMUX ref and ID without using cwd or other metadata."""
+    if not isinstance(payload, dict):
+        raise RuntimeError("cmux workspace create returned a non-object JSON value")
+
+    # `cmux rpc` currently returns the workspace object directly.  Accept the
+    # envelope and nested workspace forms used by older/newer socket clients,
+    # while checking them before a generic `id` key (which may be a request ID).
+    for key in ("result", "workspace"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            try:
+                return parse_cmux_workspace_creation(nested)
+            except RuntimeError:
+                pass
+
+    ref = next(
+        (
+            identity
+            for key in ("workspace_ref", "ref")
+            if (identity := _cmux_scalar_identity(payload.get(key))) is not None
+        ),
+        None,
+    )
+    workspace_id = next(
+        (
+            identity
+            for key in ("workspace_id", "workspaceId", "id")
+            if (identity := _cmux_scalar_identity(payload.get(key))) is not None
+        ),
+        None,
+    )
+    if ref is None and workspace_id is None:
+        raise RuntimeError("cmux workspace create JSON did not include a ref or ID")
+    # A CLI version may return only one identifier.  Keep both state keys
+    # populated with the exact returned token in that case.
+    return ref or workspace_id or "", workspace_id or ref or ""
+
+
+def register_cmux_workspace(name: str, cwd: str) -> tuple[str, str]:
+    command = build_cmux_workspace_registration_command(name, cwd)
+    result = run_command(command)
+    payload = parse_json_output(result, "cmux workspace create")
+    return parse_cmux_workspace_creation(payload)
 
 
 def handle_start_task(args: argparse.Namespace) -> int:
     validate_task_name(args.task_name)
-    args.worktree_name = args.worktree_name or args.task_name
     state = maybe_load_state(args.task_name)
     if state is None or state.get("status") == "destroyed":
         try:
@@ -887,40 +748,82 @@ def handle_start_task(args: argparse.Namespace) -> int:
         print(f"SSH: {' '.join(ssh_base(target_from_state(state)))}")
         print(f"State: {rel_state_path(args.task_name)}")
         return 0
-    elif state.get("status") == "worktree_running":
-        print(f"Orca worktree: {state.get('orca_worktree_id')}")
-        return 0
-    elif state.get("status") == "ready" and getattr(args, "bootstrap", "full") == "none":
-        print(f"Vast host ready (bootstrap none): {args.task_name}")
-        print(f"SSH: {' '.join(ssh_base(target_from_state(state)))}")
-        print(f"State: {rel_state_path(args.task_name)}")
-        return 0
-    elif state.get("status") != "ready":
+    if state.get("status") == "workspace_pending":
+        name = str(state.get("cmux_workspace_name") or getattr(args, "workspace_name", None) or args.task_name)
+        cwd = str(state.get("workspace_cwd") or getattr(args, "workspace_cwd", None) or DEFAULT_CMUX_WORKSPACE_CWD)
+    elif state.get("status") == "ready":
+        name = str(getattr(args, "workspace_name", None) or args.task_name)
+        cwd = str(state.get("workspace_cwd") or getattr(args, "workspace_cwd", None) or DEFAULT_CMUX_WORKSPACE_CWD)
+        state["cmux_workspace_name"] = name
+        state["cmux_workspace_path"] = cwd
+        state["cmux_agent"] = getattr(args, "agent", "none")
+        state["workspace_cwd"] = cwd
+        state["cmux_workspace_ref"] = None
+        state["cmux_workspace_id"] = None
+        state["cmux_workspace_registered"] = False
+        state["cmux_workspace_observed"] = False
+        state.pop("cmux_workspace_observed_ref", None)
+        update_status(state, "workspace_pending")
+    else:
         raise SystemExit(f"State {rel_state_path(args.task_name)} has status {state.get('status')}")
-    try:
-        ensure_tunnel(state)
-        target = target_from_state(state)
-        setup_id = setup_existing_project(state, args.task_name)
-        if args.agent == "codex":
-            ensure_remote_codex(target, state)
-        worktree_id, path = create_worktree(state, args, setup_id)
+
+    registered = (
+        state.get("cmux_workspace_registered") is True
+        and (
+            _cmux_scalar_identity(state.get("cmux_workspace_ref")) is not None
+            or _cmux_scalar_identity(state.get("cmux_workspace_id")) is not None
+        )
+    )
+    if registered:
+        print(
+            "CMUX workspace already registered: "
+            f"ref={state.get('cmux_workspace_ref')} id={state.get('cmux_workspace_id')}"
+        )
+        print("Watch: scripts/remote/vast-watch.sh --once")
+        return 0
+
+    if getattr(args, "manual", False):
         update_status(
             state,
-            "worktree_running",
-            orca_worktree_id=worktree_id,
-            orca_worktree_path=path,
-            orca_worktree_name=args.worktree_name,
-            orca_agent=None if args.agent == "none" else args.agent,
+            "workspace_pending",
+            cmux_workspace_ref=None,
+            cmux_workspace_id=None,
+            cmux_workspace_registered=False,
+            cmux_workspace_observed=False,
         )
-    except Exception as exc:  # noqa: BLE001
-        if state.get("status") != "failed":
-            update_status(state, "failed", error=str(exc))
-        print(str(exc), file=sys.stderr)
+        state.pop("cmux_workspace_observed_ref", None)
+        command = build_cmux_workspace_command(name, cwd)
+        print(f"CMUX workspace command (manual, unregistered): {shlex.join(command)}")
+        print("CMUX workspace creation was left to the operator; no identity was recorded.")
+        print("Watch: scripts/remote/vast-watch.sh --once")
+        return 0
+
+    try:
+        workspace_ref, workspace_id = register_cmux_workspace(name, cwd)
+    except Exception as exc:  # noqa: BLE001 - registration must remain retryable.
+        update_status(
+            state,
+            "workspace_pending",
+            cmux_workspace_ref=None,
+            cmux_workspace_id=None,
+            cmux_workspace_registered=False,
+            cmux_workspace_observed=False,
+            error=str(exc),
+        )
+        state.pop("cmux_workspace_observed_ref", None)
+        print(f"CMUX workspace registration failed; task remains pending: {exc}", file=sys.stderr)
         return 1
-    print(f"Vast task started: {args.task_name}")
-    print(f"Orca environment: {state['orca_environment']}")
-    print(f"Orca worktree: {state['orca_worktree_id']}")
-    print(f"Remote path: {state['orca_worktree_path']}")
+
+    update_status(
+        state,
+        "workspace_pending",
+        cmux_workspace_ref=workspace_ref,
+        cmux_workspace_id=workspace_id,
+        cmux_workspace_registered=True,
+        cmux_workspace_observed=False,
+    )
+    state.pop("cmux_workspace_observed_ref", None)
+    print(f"CMUX workspace registered: ref={workspace_ref} id={workspace_id}")
     print("Watch: scripts/remote/vast-watch.sh --once")
     return 0
 
@@ -930,10 +833,11 @@ def remote_file_exists(target: SshTarget, remote_path: str) -> bool:
     return result.returncode == 0
 
 
-def copy_remote_path(target: SshTarget, remote_path: str, local_path: Path, *, required: bool) -> None:
+def copy_remote_path(target: SshTarget, remote_path: str, local_path: Path, *, required: bool) -> bool:
     if not remote_file_exists(target, remote_path):
-        print(f"Warning: remote path missing: {remote_path}", file=sys.stderr)
-        return
+        message = f"remote path missing: {remote_path}"
+        print(("Warning: " if not required else "Warning (required): ") + message, file=sys.stderr)
+        return False
     local_path.parent.mkdir(parents=True, exist_ok=True)
     destination = str(local_path)
     if remote_path.endswith("/"):
@@ -942,37 +846,136 @@ def copy_remote_path(target: SshTarget, remote_path: str, local_path: Path, *, r
     result = run_command([*scp_base(target), "-r", f"{target.user}@{target.host}:{remote_path}", destination], check=False)
     if result.returncode != 0:
         message = f"failed to copy remote path: {remote_path}"
-        if required:
-            raise RuntimeError(message)
-        print("Warning: " + message, file=sys.stderr)
+        print(("Warning: " if not required else "Warning (required): ") + message, file=sys.stderr)
+        return False
+    return True
 
 
-def copy_artifacts(state: dict) -> None:
+def copy_artifacts(state: dict) -> bool:
+    remote_root = state.get("remote_repo_dir")
+    if (
+        not isinstance(remote_root, str)
+        or not remote_root.strip()
+        or not remote_root.strip().startswith("/")
+        or not remote_root.strip().strip("/")
+    ):
+        print("Warning: state has no valid remote_repo_dir; cannot copy artifacts", file=sys.stderr)
+        return False
     if not state.get("ssh_host") or not state.get("ssh_port"):
         print("Warning: state has no SSH endpoint; cannot copy artifacts", file=sys.stderr)
-        return
-    target = target_from_state(state)
-    task_name = state["task_name"]
-    artifact_dir = ARTIFACTS_DIR / task_name
-    remote_root = state.get("orca_worktree_path") or state.get("remote_repo_dir")
-    copy_remote_path(target, f"{remote_root}/data/processed/regression/", artifact_dir / "data" / "processed" / "regression", required=False)
-    copy_remote_path(target, f"{remote_root}/models/", artifact_dir / "models", required=False)
-    copy_remote_path(target, f"{remote_root}/scenic_artifacts/", artifact_dir / "scenic_artifacts", required=False)
-    copy_remote_path(target, "/tmp/scenic_container_smoke.json", artifact_dir / "scenic_container_smoke.json", required=False)
-
-
-def worktree_closed(state: dict) -> bool:
-    ensure_tunnel(state)
-    result = run_command(["orca", "worktree", "show", "--environment", str(state["orca_environment"]), "--worktree", f"id:{state['orca_worktree_id']}", "--json"], check=False)
-    if result.returncode != 0:
-        return True
-    payload = parse_json_output(result, "orca worktree show")
-    worktree = payload.get("result", {}).get("worktree") if isinstance(payload, dict) else None
-    if not isinstance(worktree, dict) and isinstance(payload, dict):
-        worktree = payload.get("worktree")
-    if not isinstance(worktree, dict):
         return False
-    return worktree.get("isArchived") is True or worktree.get("workspaceStatus") == "completed"
+    try:
+        target = target_from_state(state)
+        task_name = str(state["task_name"])
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"Warning: invalid state for artifact copy: {exc}", file=sys.stderr)
+        return False
+
+    remote_root = remote_root.strip().rstrip("/")
+    artifact_dir = ARTIFACTS_DIR / task_name
+    required_ok = True
+    copy_requests = (
+        (f"{remote_root}/data/processed/regression/", artifact_dir / "data" / "processed" / "regression", True),
+        (f"{remote_root}/models/", artifact_dir / "models", False),
+        (f"{remote_root}/scenic_artifacts/", artifact_dir / "scenic_artifacts", True),
+        ("/tmp/scenic_container_smoke.json", artifact_dir / "scenic_container_smoke.json", False),
+    )
+    for remote_path, local_path, required in copy_requests:
+        try:
+            copied = copy_remote_path(target, remote_path, local_path, required=required)
+        except Exception as exc:  # noqa: BLE001 - an artifact failure must block teardown.
+            print(f"Warning: failed to copy {remote_path}: {exc}", file=sys.stderr)
+            copied = False
+        if required and not copied:
+            required_ok = False
+    return required_ok
+
+
+def workspace_closed(state: dict) -> bool:
+    if state.get("cmux_workspace_registered") is False:
+        return False
+    recorded_values = {
+        identity
+        for identity in (
+            _cmux_scalar_identity(state.get("cmux_workspace_ref")),
+            _cmux_scalar_identity(state.get("cmux_workspace_id")),
+        )
+        if identity is not None
+    }
+    if not recorded_values:
+        return False
+
+    try:
+        result = run_command(["cmux", "workspace", "list", "--json"], check=False)
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        payload = parse_json_output(result, "cmux workspace list")
+    except Exception:
+        return False
+
+    entries: object = payload
+    if isinstance(payload, dict):
+        entries = payload.get("workspaces", payload.get("result"))
+    if not isinstance(entries, list):
+        return False
+    if not entries:
+        # An observed workspace may be the last workspace in the window.  An
+        # empty, successful JSON list is therefore a valid absence signal,
+        # while an unobserved empty list remains safely pending.
+        return (
+            state.get("cmux_workspace_observed") is True
+            and _cmux_scalar_identity(state.get("cmux_workspace_observed_ref")) in recorded_values
+        )
+    if any(not isinstance(entry, dict) for entry in entries):
+        return False
+
+    identity_present = False
+    observed_identity: str | None = None
+    for entry in entries:
+        entry_ref = _cmux_scalar_identity(entry.get("ref"))
+        if "ref" in entry and entry.get("ref") is not None and entry_ref is None:
+            return False
+        entry_identities = [
+            identity
+            for identity in (
+                entry_ref,
+                *(
+                    _cmux_scalar_identity(entry.get(key))
+                    for key in ("id", "workspace_id", "workspaceId")
+                ),
+            )
+            if identity is not None
+        ]
+        if not entry_identities:
+            return False
+        matched_identity = next(
+            (identity for identity in entry_identities if identity in recorded_values),
+            None,
+        )
+        if matched_identity is not None:
+            identity_present = True
+            observed_identity = matched_identity
+
+    if identity_present:
+        state["cmux_workspace_registered"] = True
+        state["cmux_workspace_observed"] = True
+        state["cmux_workspace_observed_ref"] = observed_identity
+        try:
+            if state.get("task_name"):
+                write_state(state)
+        except Exception:
+            state.pop("cmux_workspace_observed_ref", None)
+            state["cmux_workspace_observed"] = False
+            return False
+        return False
+
+    return (
+        state.get("cmux_workspace_observed") is True
+        and _cmux_scalar_identity(state.get("cmux_workspace_observed_ref")) in recorded_values
+    )
 
 
 def destroy_instance(state: dict) -> None:
@@ -986,15 +989,21 @@ def process_watch_state(state: dict, *, destroy: bool, yes: bool) -> None:
     task_name = state["task_name"]
     if status in {"destroyed", "done"}:
         return
-    if status != "worktree_running":
-        print(f"No remote worktree to watch for {task_name}: {status}")
+    if status != "workspace_pending":
+        print(f"No CMUX workspace to watch for {task_name}: {status}")
         return
-    if not worktree_closed(state):
-        print(f"Remote worktree still open: {task_name}")
+    if not workspace_closed(state):
+        print(f"CMUX workspace still open or unconfirmed: {task_name}")
         return
-    copy_artifacts(state)
+    try:
+        artifacts_ok = copy_artifacts(state)
+    except Exception as exc:  # noqa: BLE001 - failed copies must leave the host retryable.
+        print(f"Warning: artifact copy failed for {task_name}: {exc}", file=sys.stderr)
+        artifacts_ok = False
+    if not artifacts_ok:
+        print(f"Required artifact copy incomplete; keeping Vast task: {task_name}", file=sys.stderr)
+        return
     if destroy and yes:
-        stop_tunnel(state)
         destroy_instance(state)
         print(f"Vast task destroyed: {task_name}")
     else:
@@ -1006,14 +1015,19 @@ def states_to_watch(task_name: str | None) -> list[dict]:
     if task_name:
         validate_task_name(task_name)
         return [load_state(task_name)]
-    if not STATE_DIR.exists():
-        return []
     states: list[dict] = []
-    for path in sorted(STATE_DIR.glob("*.json")):
-        with path.open() as handle:
-            state = json.load(handle)
-        if state.get("status") in VALID_STATUSES:
-            states.append(state)
+    seen: set[str] = set()
+    for directory in (STATE_DIR, LEGACY_STATE_DIR):
+        if not directory.exists():
+            continue
+        for path in sorted(directory.glob("*.json")):
+            if path.name in seen:
+                continue
+            seen.add(path.name)
+            with path.open() as handle:
+                state = _normalize_state(json.load(handle))
+            if state.get("status") in VALID_STATUSES:
+                states.append(state)
     return states
 
 
@@ -1034,38 +1048,50 @@ def handle_watch(args: argparse.Namespace) -> int:
 def handle_down(args: argparse.Namespace) -> int:
     validate_task_name(args.task_name)
     state = load_state(args.task_name)
-    if args.copy_artifacts or state["status"] in {"worktree_running", "done", "failed"}:
-        copy_artifacts(state)
-    stop_tunnel(state)
+    artifacts_ok = True
+    if args.copy_artifacts or state["status"] in {"workspace_pending", "done", "failed"}:
+        try:
+            artifacts_ok = copy_artifacts(state)
+        except Exception as exc:  # noqa: BLE001 - never destroy after a failed copy.
+            print(f"Warning: artifact copy failed for {args.task_name}: {exc}", file=sys.stderr)
+            artifacts_ok = False
     if not (args.destroy and args.yes):
         print(f"Destroy command: vastai destroy instance {state['instance_id']}")
         print("Not destroying without --destroy --yes")
         return 0
+    if not artifacts_ok:
+        print(f"Required artifact copy incomplete; refusing to destroy {args.task_name}", file=sys.stderr)
+        return 1
     destroy_instance(state)
     print(f"Vast task destroyed: {args.task_name}")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Create, watch, and tear down Scenic Drive Vast.ai Orca hosts")
+    parser = argparse.ArgumentParser(description="Create, watch, and tear down Scenic Drive Vast.ai hosts with CMUX handoff")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    up = subparsers.add_parser("up", help="Create a Vast.ai GPU host and start Orca Remote Server")
+    up = subparsers.add_parser("up", help="Create a Vast.ai GPU host")
     up.add_argument("task_name")
     add_up_options(up)
     up.set_defaults(func=handle_up)
 
-    start_task = subparsers.add_parser("start-task", help="Create an Orca-managed remote worktree on a Vast host")
+    start_task = subparsers.add_parser("start-task", help="Create and register a CMUX workspace for a Vast host")
     start_task.add_argument("task_name")
-    start_task.add_argument("prompt")
-    start_task.add_argument("--agent", default="codex")
-    start_task.add_argument("--base-branch", default=DEFAULT_BRANCH)
-    start_task.add_argument("--worktree-name")
-    start_task.add_argument("--setup", default="skip", choices=("skip", "run"))
+    start_task.add_argument("prompt", help="Operator prompt retained for wrapper compatibility; not sent to CMUX.")
+    start_task.add_argument("--agent", default="none")
+    start_task.add_argument("--workspace-name")
+    start_task.add_argument(
+        "--manual",
+        "--manual-workspace",
+        dest="manual",
+        action="store_true",
+        help="Print a manual CMUX command and leave the workspace explicitly unregistered.",
+    )
     add_up_options(start_task)
     start_task.set_defaults(func=handle_start_task)
 
-    watch = subparsers.add_parser("watch", help="Watch Orca worktrees and stop Vast hosts when closed")
+    watch = subparsers.add_parser("watch", help="Watch CMUX workspaces and stop Vast hosts when closed")
     watch.add_argument("--task-name")
     watch.add_argument("--once", action="store_true")
     watch.add_argument("--interval-seconds", type=int, default=60)

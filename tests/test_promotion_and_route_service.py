@@ -4,6 +4,10 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import pytest
+
+from src.route_planner import service as route_service
+from src.route_planner.planner import Route, RouteSegment
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -136,3 +140,79 @@ def test_route_compare_service_smoke(tmp_path: Path) -> None:
     metrics = json.loads(route_metrics.read_text(encoding="utf-8"))
     assert "scenic" in metrics
     assert "score_mapping" in metrics
+
+
+def test_plan_routes_uses_requested_filter_for_baseline_and_reports_constraints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"id": "edge", "road_type": "secondary"},
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[-72.0, 42.0], [-72.0, 42.1]],
+                },
+            }
+        ],
+    }
+    graph_path = tmp_path / "graph.geojson"
+    graph_path.write_text(json.dumps(graph), encoding="utf-8")
+
+    def route(duration: float, distance: float, score: float) -> Route:
+        segment = RouteSegment(
+            start=(42.0, -72.0),
+            end=(42.1, -72.0),
+            distance_km=distance,
+            scenic_score=score,
+            road_name=None,
+            road_type="secondary",
+        )
+        return Route(
+            segments=[segment],
+            total_distance_km=distance,
+            average_scenic_score=score,
+            estimated_duration_minutes=duration,
+            waypoints=[(42.0, -72.0), (42.1, -72.0)],
+        )
+
+    class FakePlanner:
+        calls: list[tuple[str, bool]] = []
+
+        def __init__(self, *, graph: object) -> None:
+            del graph
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            self.calls.append(("scenic", bool(kwargs["avoid_highways"])))
+            return route(12.0, 10.0, 8.0)
+
+        def find_fastest_route(self, **kwargs: object) -> Route:
+            self.calls.append(("fastest", bool(kwargs["avoid_highways"])))
+            return route(10.0, 8.0, 4.0)
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
+    request = route_service.RouteRequest(
+        graph_geojson=str(graph_path),
+        start=(42.0, -72.0),
+        end=(42.1, -72.0),
+        avoid_highways=True,
+        max_detour_factor=1.5,
+        include_baseline=True,
+    )
+
+    result = route_service.plan_routes(request)
+    diagnostics = result["diagnostics"]
+
+    assert FakePlanner.calls == [("scenic", True), ("fastest", True)]
+    assert diagnostics["requested_max_detour_factor"] == pytest.approx(1.5)
+    assert diagnostics["applied_max_detour_factor"] == pytest.approx(1.5)
+    assert diagnostics["scenic_fastest_duration_ratio"] == pytest.approx(1.2)
+    assert diagnostics["scenic_fastest_distance_ratio"] == pytest.approx(1.25)
+    assert diagnostics["avoid_highways_applied"] is True
+    assert diagnostics["score_mapping_coverage"] == pytest.approx(
+        result["score_mapping"]["matched_ratio"]
+    )
+    assert diagnostics["score_mapping_coverage"] == pytest.approx(0.0)
+    assert diagnostics["planning_elapsed_ms"] >= 0.0

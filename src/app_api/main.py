@@ -556,54 +556,19 @@ def create_app() -> FastAPI:
             result = plan_routes(req)
             diagnostics = dict(result.get("diagnostics", {}))
         except ValueError as exc:
-            # Most common case: points geocode outside the selected graph/connected component
-            # or max detour cap is too tight. Retry with a higher detour cap once.
-            retry_cap = max(float(payload.max_detour_factor), 2.2)
-            if retry_cap > float(payload.max_detour_factor):
-                retry_req = RouteRequest(
-                    graph_geojson=str(graph_path),
-                    start=(payload.start.lat, payload.start.lon),
-                    end=(payload.end.lat, payload.end.lon),
-                    scenic_weight=float(payload.scenic_weight),
-                    avoid_highways=bool(payload.avoid_highways),
-                    max_detour_factor=retry_cap,
-                    include_baseline=bool(payload.include_baseline),
-                    tile_scores_json=str(report_json) if report_json.exists() else None,
-                    tile_score_fallback=1.0,
-                )
-                try:
-                    result = plan_routes(retry_req)
-                    diagnostics = dict(result.get("diagnostics", {}))
-                    result["retry_used"] = True
-                    result["retry_max_detour_factor"] = retry_cap
-                except ValueError:
-                    try:
-                        diagnostics = diagnose_route_request(req)
-                    except Exception:
-                        diagnostics = {}
-                    raise HTTPException(
-                        status_code=422,
-                        detail={
-                            "error": "no_route_found",
-                            "message": str(exc),
-                            "hint": f"Try different points in region '{payload.region}' or increase max detour.",
-                            "diagnostics": diagnostics,
-                        },
-                    ) from exc
-            else:
-                try:
-                    diagnostics = diagnose_route_request(req)
-                except Exception:
-                    diagnostics = {}
-                raise HTTPException(
-                    status_code=422,
-                    detail={
-                        "error": "no_route_found",
-                        "message": str(exc),
-                        "hint": f"Try different points in region '{payload.region}' or increase max detour.",
-                        "diagnostics": diagnostics,
-                    },
-                ) from exc
+            try:
+                diagnostics = diagnose_route_request(req)
+            except Exception:
+                diagnostics = {}
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "no_route_found",
+                    "message": str(exc),
+                    "hint": f"Try different points in region '{payload.region}' or increase max detour.",
+                    "diagnostics": diagnostics,
+                },
+            ) from exc
         routes = {r["route_kind"]: r["metrics"] for r in result.get("routes", [])}
         scenic = routes.get("scenic")
         baseline = routes.get("baseline")

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.remote import orca_vast_host
+from scripts.remote import cmux_vast_host
 
 
 def tar_names(path: Path) -> set[str]:
@@ -32,12 +32,13 @@ def test_make_overlay_tarball_excludes_git_and_generated_paths(tmp_path: Path) -
     write_file(source / "scenic_artifacts/run.txt")
     write_file(source / "cache/item")
     write_file(source / ".venv/bin/python")
-    write_file(source / ".orca-vast/state/task.json")
+    write_file(source / ".cmux-vast/state/task.json")
+    write_file(source / ".orca-vast/state/legacy.json")
     write_file(source / ".secrets/aws.env")
     write_file(source / "src/__pycache__/module.pyc")
     write_file(source / "ordinary/project_file.py")
 
-    tarball = orca_vast_host.make_overlay_tarball(source)
+    tarball = cmux_vast_host.make_overlay_tarball(source)
     try:
         names = tar_names(tarball)
     finally:
@@ -54,6 +55,7 @@ def test_make_overlay_tarball_excludes_git_and_generated_paths(tmp_path: Path) -
     assert not any(name.endswith("scenic_artifacts/run.txt") for name in names)
     assert not any(name.endswith("cache/item") for name in names)
     assert not any(".venv" in path_components(name) for name in names)
+    assert not any(".cmux-vast" in path_components(name) for name in names)
     assert not any(".orca-vast" in path_components(name) for name in names)
     assert not any(".secrets" in path_components(name) for name in names)
     assert any(name.endswith("ordinary/project_file.py") for name in names)
@@ -72,9 +74,9 @@ def test_make_repo_tarball_excludes_clone_git_and_preserves_project_files(
     subprocess.run(["git", "commit", "-m", "initial"], cwd=source, check=True, capture_output=True, text=True)
     write_file(source / "ordinary/uncommitted.py")
     write_file(source / ".git/objects/pack/big.pack")
-    monkeypatch.setattr(orca_vast_host, "PROJECT_ROOT", source)
+    monkeypatch.setattr(cmux_vast_host, "PROJECT_ROOT", source)
 
-    tarball = orca_vast_host.make_repo_tarball("test-branch")
+    tarball = cmux_vast_host.make_repo_tarball("test-branch")
     try:
         names = tar_names(tarball)
     finally:
@@ -91,10 +93,10 @@ def test_record_startup_timing_writes_elapsed_seconds(monkeypatch: pytest.Monkey
     writes: list[dict] = []
     state = {"task_name": "timing-smoke"}
 
-    monkeypatch.setattr(orca_vast_host.time, "monotonic", lambda: 12.345)
-    monkeypatch.setattr(orca_vast_host, "write_state", lambda current: writes.append(dict(current)))
+    monkeypatch.setattr(cmux_vast_host.time, "monotonic", lambda: 12.345)
+    monkeypatch.setattr(cmux_vast_host, "write_state", lambda current: writes.append(dict(current)))
 
-    orca_vast_host.record_startup_timing(state, "repo_upload", 10.0)
+    cmux_vast_host.record_startup_timing(state, "repo_upload", 10.0)
 
     assert state["startup_timings_seconds"]["repo_upload"] == 2.345
     assert writes == [state]

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.remote import orca_vast_host, vast_train
+from scripts.remote import cmux_vast_host, vast_train
 
 
 def make_config(**overrides: object) -> vast_train.VastTrainConfig:
@@ -219,7 +219,7 @@ def test_training_statuses_are_accepted_by_shared_state_loader() -> None:
         "destroyed",
     }
 
-    assert emitted_statuses <= orca_vast_host.VALID_STATUSES
+    assert emitted_statuses <= cmux_vast_host.VALID_STATUSES
 
 
 def test_failed_kept_state_is_not_reused_without_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

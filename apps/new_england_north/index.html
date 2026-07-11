@@ -33,24 +33,23 @@
           </header>
 
           <form id="routeForm" class="route-form">
-            <div class="field-row">
-              <label class="field">
-                <span class="field-label">Start point</span>
-                <span class="input-shell">
-                  <input id="startInput" name="start" autocomplete="off" value="44.475884, -73.214003" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="startSuggestions" />
-                  <button id="clearStartBtn" type="button" class="input-clear" aria-label="Clear start point" title="Clear start point">×</button>
-                </span>
-                <div id="startSuggestions" class="address-suggestions" role="listbox" aria-label="Start point suggestions"></div>
-              </label>
-              <label class="field">
-                <span class="field-label">End point</span>
-                <span class="input-shell">
-                  <input id="endInput" name="end" autocomplete="off" value="44.801616, -68.771305" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="endSuggestions" />
-                  <button id="clearEndBtn" type="button" class="input-clear" aria-label="Clear end point" title="Clear end point">×</button>
-                </span>
-                <div id="endSuggestions" class="address-suggestions" role="listbox" aria-label="End point suggestions"></div>
-              </label>
-            </div>
+            <label class="field">
+              <span class="field-label">Start point</span>
+              <span class="input-shell">
+                <input id="startInput" name="start" autocomplete="off" value="44.475884, -73.214003" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="startSuggestions" />
+                <button id="clearStartBtn" type="button" class="input-clear" aria-label="Clear start point" title="Clear start point">×</button>
+              </span>
+              <div id="startSuggestions" class="address-suggestions" role="listbox" aria-label="Start point suggestions"></div>
+            </label>
+            <label class="field">
+              <span class="field-label">End point</span>
+              <span class="input-shell">
+                <input id="endInput" name="end" autocomplete="off" value="44.801616, -68.771305" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="endSuggestions" />
+                <button id="clearEndBtn" type="button" class="input-clear" aria-label="Clear end point" title="Clear end point">×</button>
+              </span>
+              <div id="endSuggestions" class="address-suggestions" role="listbox" aria-label="End point suggestions"></div>
+            </label>
+            <button id="submitRoute" type="submit" class="btn-primary">Plan route</button>
 
             <div class="range-row">
               <label for="scenicWeight" class="range-label">
@@ -66,8 +65,10 @@
               </label>
               <input id="detourFactor" type="range" min="1.1" max="3" step="0.1" value="1.8" />
             </div>
-
-            <button id="submitRoute" type="submit" class="btn-primary">Plan route</button>
+            <label class="toggle-row" for="avoidHighways">
+              <input id="avoidHighways" type="checkbox" />
+              <span>Avoid highways</span>
+            </label>
           </form>
 
           <details class="dev-panel">

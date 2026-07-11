@@ -321,13 +321,201 @@ def test_scenic_weight_zero_matches_fastest_and_nonzero_selects_scenic() -> None
     planner = ScenicRoutePlanner(graph=graph)
     fastest = planner.find_fastest_route((42.0, -72.0), (42.02, -72.0))
     zero_weight = planner.find_scenic_route((42.0, -72.0), (42.02, -72.0), scenic_weight=0.0)
-    scenic = planner.find_scenic_route((42.0, -72.0), (42.02, -72.0), scenic_weight=0.8, max_detour_factor=1.8)
+    scenic = planner.find_scenic_route((42.0, -72.0), (42.02, -72.0), scenic_weight=0.8, max_detour_factor=2.4)
 
     assert zero_weight.waypoints == fastest.waypoints
     assert zero_weight.total_distance_km == fastest.total_distance_km == 10.0
     assert scenic.total_distance_km == 12.0
-    assert scenic.average_scenic_score == 10.0
-    assert scenic.total_distance_km <= fastest.total_distance_km * 1.8
+    assert scenic.average_scenic_score == pytest.approx(10.0)
+    assert scenic.estimated_duration_minutes <= fastest.estimated_duration_minutes * 2.4
+
+def test_scenic_duration_cap_factor_one_cannot_exceed_fastest() -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="S", lat=42.0, lon=-72.0))
+    graph.add_node(Node(id="A", lat=42.01, lon=-72.0))
+    graph.add_node(Node(id="G", lat=42.02, lon=-72.0))
+    graph.add_edge(
+        Edge(
+            id="fast",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=10.0,
+            scenic_score=0.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="slow-scenic-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=6.0,
+            scenic_score=10.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="slow-scenic-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=6.0,
+            scenic_score=10.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+
+    planner = ScenicRoutePlanner(graph=graph)
+    fastest = planner.find_fastest_route((42.0, -72.0), (42.02, -72.0))
+    route = planner.find_scenic_route(
+        (42.0, -72.0),
+        (42.02, -72.0),
+        scenic_weight=1.0,
+        max_detour_factor=1.0,
+    )
+
+    assert route.estimated_duration_minutes <= (
+        fastest.estimated_duration_minutes + 1e-9
+    )
+
+
+def test_longer_distance_equal_duration_scenic_path_is_eligible() -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="S", lat=42.0, lon=-72.0))
+    graph.add_node(Node(id="A", lat=42.01, lon=-72.0))
+    graph.add_node(Node(id="G", lat=42.02, lon=-72.0))
+    graph.add_edge(
+        Edge(
+            id="fast-ugly",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=10.0,
+            scenic_score=0.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="long-scenic-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=10.0,
+            scenic_score=10.0,
+            speed_limit_kmh=120,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="long-scenic-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=10.0,
+            scenic_score=10.0,
+            speed_limit_kmh=120,
+            one_way=True,
+        )
+    )
+
+    route = ScenicRoutePlanner(graph=graph).find_scenic_route(
+        (42.0, -72.0),
+        (42.02, -72.0),
+        scenic_weight=1.0,
+        max_detour_factor=1.0,
+    )
+
+    assert [segment.road_name for segment in route.segments] == [None, None]
+    assert route.total_distance_km == pytest.approx(20.0)
+    assert route.estimated_duration_minutes == pytest.approx(10.0)
+
+
+def test_over_duration_scenic_path_is_rejected_by_duration_cap() -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="S", lat=42.0, lon=-72.0))
+    graph.add_node(Node(id="A", lat=42.01, lon=-72.0))
+    graph.add_node(Node(id="G", lat=42.02, lon=-72.0))
+    graph.add_edge(
+        Edge(
+            id="fast-ugly",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=10.0,
+            scenic_score=0.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="over-duration-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=6.0,
+            scenic_score=10.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="over-duration-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=6.0,
+            scenic_score=10.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+
+    route = ScenicRoutePlanner(graph=graph).find_scenic_route(
+        (42.0, -72.0),
+        (42.02, -72.0),
+        scenic_weight=1.0,
+        max_detour_factor=1.0,
+    )
+
+    assert [segment.scenic_score for segment in route.segments] == [0.0]
+    assert route.estimated_duration_minutes == pytest.approx(10.0)
+
+
+def test_route_average_scenic_score_uses_travel_time_weighting() -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="S", lat=42.0, lon=-72.0))
+    graph.add_node(Node(id="A", lat=42.01, lon=-72.0))
+    graph.add_node(Node(id="G", lat=42.02, lon=-72.0))
+    first = Edge(
+        id="short-scenic",
+        start_node_id="S",
+        end_node_id="A",
+        distance_km=10.0,
+        scenic_score=10.0,
+        speed_limit_kmh=60,
+        one_way=True,
+    )
+    second = Edge(
+        id="long-ugly",
+        start_node_id="A",
+        end_node_id="G",
+        distance_km=10.0,
+        scenic_score=0.0,
+        speed_limit_kmh=30,
+        one_way=True,
+    )
+    graph.add_edge(first)
+    graph.add_edge(second)
+
+    route = ScenicRoutePlanner(graph=graph)._path_to_route([first, second])
+
+    expected = (
+        first.scenic_score * first.travel_time_minutes
+        + second.scenic_score * second.travel_time_minutes
+    ) / (first.travel_time_minutes + second.travel_time_minutes)
+    assert route.average_scenic_score == pytest.approx(expected)
 
 
 def test_scenic_cost_is_invariant_under_equivalent_edge_split() -> None:
@@ -2485,3 +2673,85 @@ def test_subclassed_builtin_cost_remains_exact_fallback() -> None:
 
     assert path is not None
     assert [edge.id for edge in path] == ["A-1", "A-2"]
+
+
+def test_duration_constrained_search_matches_exhaustive_feasible_optimum() -> None:
+    graph = RoadGraph()
+    for node_id, lat in (("S", 42.0), ("A", 42.01), ("B", 42.02), ("G", 42.03)):
+        graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
+    for edge in (
+        Edge(id="fast-ugly", start_node_id="S", end_node_id="G", distance_km=10.0, scenic_score=0.0, speed_limit_kmh=100, one_way=True),
+        Edge(id="best-1", start_node_id="S", end_node_id="A", distance_km=4.0, scenic_score=9.0, speed_limit_kmh=60, one_way=True),
+        Edge(id="best-2", start_node_id="A", end_node_id="G", distance_km=4.0, scenic_score=9.0, speed_limit_kmh=60, one_way=True),
+        Edge(id="over-1", start_node_id="S", end_node_id="B", distance_km=6.0, scenic_score=10.0, speed_limit_kmh=40, one_way=True),
+        Edge(id="over-2", start_node_id="B", end_node_id="G", distance_km=6.0, scenic_score=10.0, speed_limit_kmh=40, one_way=True),
+    ):
+        graph.add_edge(edge)
+    cost = ScenicCostFunction(scenic_weight=1.0)
+    cap_minutes = 8.0
+
+    def enumerate_paths(node_id: str, path: list[Edge]) -> list[list[Edge]]:
+        if node_id == "G":
+            return [path]
+        paths: list[list[Edge]] = []
+        for edge in graph.get_edges(node_id):
+            candidate = [*path, edge]
+            if sum(item.travel_time_minutes for item in candidate) <= cap_minutes:
+                paths.extend(enumerate_paths(edge.end_node_id, candidate))
+        return paths
+
+    feasible = enumerate_paths("S", [])
+    expected = min(feasible, key=lambda path: sum(cost.calculate(edge) for edge in path))
+    actual = ScenicRoutePlanner(graph=graph)._a_star(
+        graph.get_node("S"),
+        graph.get_node("G"),
+        cost_function=cost,
+        max_path_minutes=cap_minutes,
+        shortest_duration_minutes=6.0,
+    )
+
+    assert actual is not None
+    assert [edge.id for edge in actual] == [edge.id for edge in expected]
+
+
+def test_fastest_baseline_does_not_discount_scenic_byways() -> None:
+    graph = RoadGraph()
+    for node_id, lat in (("S", 42.0), ("A", 42.01), ("G", 42.02)):
+        graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
+    graph.add_edge(Edge(id="ordinary", start_node_id="S", end_node_id="G", distance_km=10.0, scenic_score=0.0, speed_limit_kmh=60, one_way=True))
+    graph.add_edge(Edge(id="byway-1", start_node_id="S", end_node_id="A", distance_km=7.5, scenic_score=10.0, road_type="scenic_byway", speed_limit_kmh=60, one_way=True))
+    graph.add_edge(Edge(id="byway-2", start_node_id="A", end_node_id="G", distance_km=7.5, scenic_score=10.0, road_type="scenic_byway", speed_limit_kmh=60, one_way=True))
+
+    fastest = ScenicRoutePlanner(graph=graph).find_fastest_route((42.0, -72.0), (42.02, -72.0))
+    capped = ScenicRoutePlanner(graph=graph).find_scenic_route(
+        (42.0, -72.0), (42.02, -72.0), scenic_weight=1.0, max_detour_factor=1.0
+    )
+
+    assert [segment.road_type for segment in fastest.segments] == ["secondary"]
+    assert capped.estimated_duration_minutes == pytest.approx(10.0)
+
+
+def test_duration_mode_keeps_equal_cost_faster_label() -> None:
+    graph = RoadGraph()
+    for node_id, lat in (("S", 42.0), ("X", 42.01), ("G", 42.02)):
+        graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
+    graph.add_edge(Edge(id="slow-byway", start_node_id="S", end_node_id="X", distance_km=2.0, scenic_score=5.0, road_type="scenic_byway", speed_limit_kmh=60, one_way=True))
+    graph.add_edge(Edge(id="fast-ordinary", start_node_id="S", end_node_id="X", distance_km=2.0, scenic_score=5.0, speed_limit_kmh=120, one_way=True))
+    graph.add_edge(Edge(id="finish", start_node_id="X", end_node_id="G", distance_km=3.0, scenic_score=5.0, speed_limit_kmh=90, one_way=True))
+    for index in range(257):
+        start_id = f"d{index}a"
+        end_id = f"d{index}b"
+        graph.add_node(Node(id=start_id, lat=0.0, lon=float(index) / 1000))
+        graph.add_node(Node(id=end_id, lat=0.0, lon=float(index + 1) / 1000))
+        graph.add_edge(Edge(id=f"dummy-{index}", start_node_id=start_id, end_node_id=end_id, distance_km=1.0, scenic_score=5.0, one_way=True))
+
+    path = ScenicRoutePlanner(graph=graph)._a_star(
+        graph.get_node("S"),
+        graph.get_node("G"),
+        cost_function=ScenicCostFunction(scenic_weight=0.0),
+        max_path_minutes=3.1,
+        shortest_duration_minutes=3.0,
+    )
+
+    assert path is not None
+    assert [edge.id for edge in path] == ["fast-ordinary", "finish"]

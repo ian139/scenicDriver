@@ -48,9 +48,9 @@ Moved to `archive/notes/`:
 - `archive/notes/coding-agent-session-mvp.md`
 - `archive/notes/archive-review-rebuild-guide.md`
 - `archive/notes/misplaced-job-application-AGENTS.md`
-- `archive/notes/orca-workflow.md`
+- `archive/notes/cmux-workflow-legacy.md` — historical non-active workflow; current replacement is `docs/internal/cmux-workflow.md`.
 
 ## Notes
 - This archive is intended to reduce confusion and operational risk, not to remove project history.
 - Active docs must use the current grouped paths under `apps/`, `docs/`, and `scripts/`.
-- Historical docs under `archive/notes/` may retain old command paths because they are records, not active instructions.
+- Historical docs under `archive/notes/` must be clearly marked historical and are never active instructions.

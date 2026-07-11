@@ -77,6 +77,7 @@ const el = {
   weightOut: document.getElementById("weightOut"),
   detourFactor: document.getElementById("detourFactor"),
   detourOut: document.getElementById("detourOut"),
+  avoidHighways: document.getElementById("avoidHighways"),
   submitRoute: document.getElementById("submitRoute"),
   routeTitle: document.getElementById("routeTitle"),
   routeOutput: document.getElementById("routeOutput"),
@@ -472,6 +473,39 @@ function signedNumber(value, digits, suffix = "") {
   return `${sign}${numeric.toFixed(digits)}${suffix}`;
 }
 
+function routeDiagnosticsMarkup(payload) {
+  const request = payload?.request || {};
+  const diagnostics = payload?.diagnostics || {};
+  const scoreMapping = payload?.score_mapping || {};
+  const parts = [];
+  const elapsedMs = Number(diagnostics.planning_elapsed_ms);
+  if (Number.isFinite(elapsedMs)) {
+    parts.push(`Planning ${formatNumber(elapsedMs, 0)} ms`);
+  }
+  const cap = Number(
+    diagnostics.applied_duration_factor ??
+      diagnostics.effective_max_detour_factor ??
+      request.max_detour_factor
+  );
+  if (Number.isFinite(cap)) {
+    parts.push(`Duration cap ${formatNumber(cap, 2)}×`);
+  }
+  if (typeof diagnostics.avoid_highways_applied === "boolean") {
+    parts.push(`Avoid highways ${diagnostics.avoid_highways_applied ? "on" : "off"}`);
+  } else if (typeof request.avoid_highways === "boolean") {
+    parts.push(`Avoid highways ${request.avoid_highways ? "on" : "off"}`);
+  }
+  const coverage = Number(
+    diagnostics.score_mapping_coverage ?? scoreMapping.matched_ratio
+  );
+  if (Number.isFinite(coverage)) {
+    parts.push(`Score coverage ${formatNumber(coverage * 100, 0)}%`);
+  }
+  return parts.length
+    ? `<small class="route-diagnostics">${escapeHtml(parts.join(" · "))}</small>`
+    : "";
+}
+
 function renderRouteComparison(payload) {
   const scenic = payload.routes?.scenic;
   const baseline = payload.routes?.baseline;
@@ -685,7 +719,10 @@ async function planRoute(event) {
     el.submitRoute.disabled = true;
     el.submitRoute.textContent = "Planning...";
   }
-  setRouteOutput("Computing route", "Calling <code>/v1/route/compare</code> with the same run used by the heatmap.");
+  setRouteOutput(
+    "Computing route",
+    "Calling <code>/v1/route/compare</code> with the same run used by the heatmap."
+  );
 
   try {
     const response = await fetch(api("/v1/route/compare"), {
@@ -698,17 +735,28 @@ async function planRoute(event) {
         end,
         scenic_weight: Number(el.scenicWeight.value),
         max_detour_factor: Number(el.detourFactor.value),
-        avoid_highways: false,
+        avoid_highways: Boolean(el.avoidHighways?.checked),
         include_baseline: true,
       }),
     });
     const payload = await response.json();
     if (!response.ok) {
-      throw new Error(payload?.detail?.message || payload?.detail || `${response.status} ${response.statusText}`);
+      const detail = payload?.detail;
+      const message =
+        detail && typeof detail === "object" ? detail.message : detail;
+      const hint = detail && typeof detail === "object" ? detail.hint : null;
+      throw new Error(
+        [message || `${response.status} ${response.statusText}`, hint]
+          .filter(Boolean)
+          .join(" — ")
+      );
     }
     renderRoute(payload.geojson);
     renderRouteComparison(payload);
-    setRouteOutput("Route computed", "Scenic and baseline routes are shown on the map.");
+    setRouteOutput(
+      "Route computed",
+      `Scenic and baseline routes are shown on the map.${routeDiagnosticsMarkup(payload)}`
+    );
     setApiStatus("API: online", "ok");
   } catch (error) {
     setApiStatus("API: route failed", "warn");
@@ -721,12 +769,13 @@ async function planRoute(event) {
   }
 }
 
-function buildShareUrl({ start, end, scenicWeight, maxDetour }) {
+function buildShareUrl({ start, end, scenicWeight, maxDetour, avoidHighways }) {
   const url = new URL(window.location.pathname, window.location.origin);
   url.searchParams.set("start", `${start.lat},${start.lon}`);
   url.searchParams.set("end", `${end.lat},${end.lon}`);
   url.searchParams.set("scenic_weight", String(scenicWeight));
   url.searchParams.set("max_detour", String(maxDetour));
+  url.searchParams.set("avoid_highways", avoidHighways ? "true" : "false");
   return url.toString();
 }
 
@@ -747,6 +796,12 @@ function applyUrlParams() {
   };
   applyRange("scenic_weight", el.scenicWeight);
   applyRange("max_detour", el.detourFactor);
+  const avoidHighways = params.get("avoid_highways");
+  if (avoidHighways !== null && el.avoidHighways) {
+    el.avoidHighways.checked = ["1", "true", "yes", "on"].includes(
+      avoidHighways.toLowerCase()
+    );
+  }
 }
 
 async function copyShareUrl() {
@@ -758,6 +813,7 @@ async function copyShareUrl() {
     end,
     scenicWeight: Number(el.scenicWeight.value),
     maxDetour: Number(el.detourFactor.value),
+    avoidHighways: Boolean(el.avoidHighways?.checked),
   });
   const originalLabel = el.shareRouteBtn.textContent;
   let copied = false;

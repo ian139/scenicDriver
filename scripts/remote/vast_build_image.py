@@ -15,7 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.remote.orca_vast_host import (  # noqa: E402
+from scripts.remote.cmux_vast_host import (  # noqa: E402
     SshTarget,
     attach_ssh_key,
     create_instance,
@@ -32,7 +32,7 @@ from scripts.remote.orca_vast_host import (  # noqa: E402
 )
 
 
-STATE_DIR = PROJECT_ROOT / ".orca-vast" / "state"
+STATE_DIR = PROJECT_ROOT / ".cmux-vast" / "state"
 DEFAULT_OFFER_QUERY = "num_gpus=1 dph<0.20 cpu_cores>=2 disk_space>=30 direct_port_count>=1 verified=true rentable=true"
 DEFAULT_IMAGE = "ubuntu:22.04"
 DEFAULT_REPO_URL = "https://github.com/ian139/scenicdriver.git"
