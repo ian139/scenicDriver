@@ -22,12 +22,17 @@ Scenic Drive scores scenic beauty from satellite imagery and terrain data, then 
 - `uv run python scripts/ingest/download_bbox_tiles.py ...`
 - `uv run python scripts/reports/heuristic_report.py ...`
 - `uv run python scripts/routing/route_compare_service.py ...`
+- `cp .env.beta.example .env.beta` and populate `MAPBOX_ACCESS_TOKEN`
+- `docker compose --env-file .env.beta -f compose.beta.yml up --build`
+- Open `http://localhost:${SCENIC_WEB_PORT:-80}`
+- `docker compose --env-file .env.beta -f compose.beta.yml down`
 
 ## Data And Artifact Policy
 - Keep large data, generated reports, caches, and model weights out of git.
 - Local generated paths are `data/raw/`, `data/processed/`, `data/NWPU-RESISC45/`, `models/`, `cache/`, and `scenic_artifacts/`.
 - Preserve `data/README.md` as the canonical data layout contract.
 - Preserve `archive/archive.md` as the archive manifest.
+- Beta deployment requires the canonical processed graph, learned run, registry, and active model checkpoint mounted from ignored `data/processed/` and `models/`; they remain outside Git and Docker image layers.
 
 ## Development Rules
 - Use `uv`, not `pip`, for Python dependency management.

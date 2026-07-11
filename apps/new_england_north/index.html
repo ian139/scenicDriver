@@ -20,90 +20,137 @@
       </section>
 
       <div class="bottom-overlay">
-        <div id="scaleTab" class="scale-tab" aria-label="Scenic heatmap scale">
-          <button id="scaleToggle" type="button" class="scale-toggle" aria-expanded="true" aria-controls="scalePanel">
-            <span class="scale-toggle-label">Scale</span>
-            <span class="scale-toggle-chevron" aria-hidden="true">▾</span>
-          </button>
-          <div id="scalePanel" class="scale-panel">
-            <span>Low</span>
-            <div class="legend-ramp" aria-hidden="true"></div>
-            <span>High</span>
-          </div>
-        </div>
         <aside class="control-panel" aria-label="Route controls">
-        <header class="panel-header">
-          <div class="panel-heading">
-            <h1>Scenic heatmap &amp; route planner</h1>
-            <p class="subhead">New England North</p>
-          </div>
-          <span class="status-chip" id="apiStatus">API: checking</span>
-        </header>
-
-        <form id="routeForm" class="route-form">
-          <div class="field-row">
-            <label class="field">
-              <span class="field-label">Start point</span>
-              <input id="startInput" name="start" autocomplete="off" value="44.475884, -73.214003" />
-              <div id="startSuggestions" class="address-suggestions" role="listbox"></div>
-            </label>
-            <label class="field">
-              <span class="field-label">End point</span>
-              <input id="endInput" name="end" autocomplete="off" value="44.801616, -68.771305" />
-              <div id="endSuggestions" class="address-suggestions" role="listbox"></div>
-            </label>
-          </div>
-
-          <div class="range-row">
-            <label for="scenicWeight" class="range-label">
-              <span>Scenic weight</span>
-              <span id="weightOut" class="range-value">0.80</span>
-            </label>
-            <input id="scenicWeight" type="range" min="0" max="1" step="0.05" value="0.8" />
-          </div>
-          <div class="range-row">
-            <label for="detourFactor" class="range-label">
-              <span>Max detour</span>
-              <span id="detourOut" class="range-value">1.80×</span>
-            </label>
-            <input id="detourFactor" type="range" min="1.1" max="3" step="0.1" value="1.8" />
-          </div>
-
-          <button id="submitRoute" type="submit" class="btn-primary">Plan route</button>
-        </form>
-
-        <div class="output-stack">
-        <section class="output-card" aria-label="Remote training">
-          <div class="output-header">
-            <div>
-              <p class="eyebrow">Remote training</p>
-              <h2>Active model evaluation</h2>
+          <header class="panel-header">
+            <div class="panel-heading">
+              <h1>Scenic heatmap &amp; route planner</h1>
+              <p class="subhead">New England North</p>
             </div>
-          </div>
-          <div id="trainingResults" class="route-output" aria-live="polite">
-            Loading remote training results…
-          </div>
-        </section>
+            <span class="status-chip" id="apiStatus">API: checking</span>
+          </header>
 
-        <section class="output-card" aria-label="Route output">
-          <div class="output-header">
+          <form id="routeForm" class="route-form">
+            <div class="field-row">
+              <label class="field">
+                <span class="field-label">Start point</span>
+                <span class="input-shell">
+                  <input id="startInput" name="start" autocomplete="off" value="44.475884, -73.214003" aria-controls="startSuggestions" />
+                  <button id="clearStartBtn" type="button" class="input-clear" aria-label="Clear start point" title="Clear start point">×</button>
+                </span>
+                <div id="startSuggestions" class="address-suggestions" role="listbox" aria-label="Start point suggestions"></div>
+              </label>
+              <label class="field">
+                <span class="field-label">End point</span>
+                <span class="input-shell">
+                  <input id="endInput" name="end" autocomplete="off" value="44.801616, -68.771305" aria-controls="endSuggestions" />
+                  <button id="clearEndBtn" type="button" class="input-clear" aria-label="Clear end point" title="Clear end point">×</button>
+                </span>
+                <div id="endSuggestions" class="address-suggestions" role="listbox" aria-label="End point suggestions"></div>
+              </label>
+            </div>
+
+            <div class="range-row">
+              <label for="scenicWeight" class="range-label">
+                <span>Scenic weight</span>
+                <span id="weightOut" class="range-value">0.80</span>
+              </label>
+              <input id="scenicWeight" type="range" min="0" max="1" step="0.05" value="0.8" />
+            </div>
+            <div class="range-row">
+              <label for="detourFactor" class="range-label">
+                <span>Max detour</span>
+                <span id="detourOut" class="range-value">1.80×</span>
+              </label>
+              <input id="detourFactor" type="range" min="1.1" max="3" step="0.1" value="1.8" />
+            </div>
+
+            <button id="submitRoute" type="submit" class="btn-primary">Plan route</button>
+          </form>
+
+          <div class="output-stack">
+            <section class="output-card" aria-label="Remote training">
+              <div class="output-header">
+                <div>
+                  <p class="eyebrow">Remote training</p>
+                  <h2>Active model evaluation</h2>
+                </div>
+              </div>
+              <div id="trainingResults" class="route-output" aria-live="polite">
+                Loading remote training results…
+              </div>
+            </section>
+
+            <section class="output-card route-status-card" aria-label="Route output">
+              <div class="output-header">
+                <div>
+                  <p class="eyebrow">Route output</p>
+                  <h2 id="routeTitle">Waiting for submit</h2>
+                  <div class="route-legend" aria-label="Route legend">
+                    <span class="route-key scenic">Scenic</span>
+                    <span class="route-key baseline">Baseline</span>
+                  </div>
+                </div>
+                <button id="clearRoute" type="button" class="btn-secondary">Clear</button>
+              </div>
+              <div id="routeOutput" class="route-output" aria-live="polite">
+                Enter start/end coordinates as <code>lat, lon</code>, then submit.
+              </div>
+            </section>
+          </div>
+        </aside>
+      </div>
+
+      <dialog id="routeResultsDialog" aria-labelledby="routeResultsTitle">
+        <div class="dialog-shell">
+          <header class="dialog-header">
             <div>
               <p class="eyebrow">Route output</p>
-              <h2 id="routeTitle">Waiting for submit</h2>
-              <div class="route-legend" aria-label="Route legend">
-                <span class="route-key scenic">Scenic</span>
-                <span class="route-key baseline">Baseline</span>
-              </div>
+              <h2 id="routeResultsTitle">Route comparison</h2>
             </div>
-            <button id="clearRoute" type="button" class="btn-secondary">Clear</button>
+          </header>
+
+          <div class="route-comparison">
+            <article class="route-card" data-route-kind="scenic">
+              <header class="route-card-header">
+                <div>
+                  <p class="eyebrow">Scenic route</p>
+                  <h3>Scenic</h3>
+                </div>
+                <span class="route-card-key scenic" aria-hidden="true"></span>
+              </header>
+              <dl class="metric-grid">
+                <div><dt>Distance</dt><dd><span id="scenicDistance">--</span></dd></div>
+                <div><dt>Duration</dt><dd><span id="scenicDuration">--</span></dd></div>
+                <div><dt>Average scenic score</dt><dd><span id="scenicScore">--</span></dd></div>
+                <div><dt>Distance vs baseline</dt><dd><span id="scenicDistanceDelta">--</span></dd></div>
+                <div><dt>Duration vs baseline</dt><dd><span id="scenicDurationDelta">--</span></dd></div>
+                <div><dt>Score vs baseline</dt><dd><span id="scenicScoreDelta">--</span></dd></div>
+              </dl>
+            </article>
+
+            <article class="route-card" data-route-kind="baseline">
+              <header class="route-card-header">
+                <div>
+                  <p class="eyebrow">Fastest route</p>
+                  <h3>Baseline</h3>
+                </div>
+                <span class="route-card-key baseline" aria-hidden="true"></span>
+              </header>
+              <dl class="metric-grid">
+                <div><dt>Distance</dt><dd><span id="baselineDistance">--</span></dd></div>
+                <div><dt>Duration</dt><dd><span id="baselineDuration">--</span></dd></div>
+                <div><dt>Average scenic score</dt><dd><span id="baselineScore">--</span></dd></div>
+              </dl>
+            </article>
           </div>
-          <div id="routeOutput" class="route-output">
-            Enter start/end coordinates as <code>lat, lon</code>, then submit.
+
+          <div class="dialog-actions">
+            <button id="shareRouteBtn" type="button" class="btn-primary">Share</button>
+            <button type="button" class="btn-secondary" disabled>Google Maps export coming soon</button>
+            <button id="closeRouteDialogBtn" type="button" class="btn-secondary">Close</button>
           </div>
-        </section>
         </div>
-      </aside>
-      </div>
+      </dialog>
     </main>
 
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>

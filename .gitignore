@@ -18,6 +18,7 @@ dist/
 # Local env / secrets
 .env
 .env.*
+!.env.beta.example
 !.env.example
 .secrets/
 

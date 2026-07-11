@@ -4,10 +4,15 @@ const DEFAULTS = Object.freeze({
   workingRun: "new_england_north_z14_v6_learned",
   sourceModel: "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt",
   activeRegistryModel: "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt",
-  apiBase: "http://localhost:8080",
+  apiBase: `${window.location.origin}/api`,
   center: [-70.15869140625, 44.99533046578542],
   zoom: 6.2,
 });
+
+const REGION_BOUNDS = Object.freeze([
+  Object.freeze([-73.5205078125, 42.488301979602255]),
+  Object.freeze([-66.796875, 47.50235895196859]),
+]);
 
 const params = new URLSearchParams(window.location.search);
 const CONFIG = Object.freeze({
@@ -21,7 +26,12 @@ const CONFIG = Object.freeze({
 // API base is a runtime variable (no longer bound to a DOM input). It can be
 // overridden via ?api=... and, if an `#apiBase` input is ever re-introduced, by
 // the user editing that field. Removed DOM must not break fetch paths.
-let apiBase = params.get("api") || DEFAULTS.apiBase;
+let apiBase =
+  params.get("api") ||
+  (["localhost", "127.0.0.1"].includes(window.location.hostname) &&
+  window.location.port === "3000"
+    ? "http://localhost:8080"
+    : DEFAULTS.apiBase);
 
 const HEATMAP_SOURCE = "scenic-heatmap-source";
 const HEATMAP_FILL = "scenic-heatmap-fill";
@@ -54,12 +64,23 @@ const el = {
   routeOutput: document.getElementById("routeOutput"),
   trainingResults: document.getElementById("trainingResults"),
   clearRoute: document.getElementById("clearRoute"),
-  scaleTab: document.getElementById("scaleTab"),
-  scaleToggle: document.getElementById("scaleToggle"),
-  scalePanel: document.getElementById("scalePanel"),
+  clearStartBtn: document.getElementById("clearStartBtn"),
+  clearEndBtn: document.getElementById("clearEndBtn"),
   apiBase: document.getElementById("apiBase"),
   inspectorScore: document.getElementById("inspectorScore"),
   inspectorCoords: document.getElementById("inspectorCoords"),
+  routeResultsDialog: document.getElementById("routeResultsDialog"),
+  scenicDistance: document.getElementById("scenicDistance"),
+  scenicDuration: document.getElementById("scenicDuration"),
+  scenicScore: document.getElementById("scenicScore"),
+  scenicDistanceDelta: document.getElementById("scenicDistanceDelta"),
+  scenicDurationDelta: document.getElementById("scenicDurationDelta"),
+  scenicScoreDelta: document.getElementById("scenicScoreDelta"),
+  baselineDistance: document.getElementById("baselineDistance"),
+  baselineDuration: document.getElementById("baselineDuration"),
+  baselineScore: document.getElementById("baselineScore"),
+  shareRouteBtn: document.getElementById("shareRouteBtn"),
+  closeRouteDialogBtn: document.getElementById("closeRouteDialogBtn"),
 };
 
 let map;
@@ -239,6 +260,13 @@ function fitToGeojson(geojson, options = {}) {
   });
 }
 
+function syncMinimumZoom() {
+  const camera = map.cameraForBounds(REGION_BOUNDS, { padding: 0 });
+  if (Number.isFinite(camera?.zoom)) {
+    map.setMinZoom(camera.zoom);
+  }
+}
+
 async function loadHeatmap() {
   const url = new URL(api("/v1/heatmap"));
   url.searchParams.set("region", CONFIG.sourceRegion);
@@ -324,17 +352,21 @@ async function checkApiHealth() {
 }
 
 function routeLayer(filterKind, color, width, opacity) {
+  const paint = {
+    "line-color": color,
+    "line-width": width,
+    "line-opacity": opacity,
+  };
+  if (filterKind === "baseline") {
+    paint["line-dasharray"] = [2, 2];
+  }
   return {
     id: filterKind === "scenic" ? ROUTE_SCENIC : ROUTE_BASELINE,
     type: "line",
     source: ROUTE_SOURCE,
     filter: ["==", ["get", "route_kind"], filterKind],
     layout: { "line-join": "round", "line-cap": "round" },
-    paint: {
-      "line-color": color,
-      "line-width": width,
-      "line-opacity": opacity,
-    },
+    paint,
   };
 }
 
@@ -344,8 +376,8 @@ function renderRoute(geojson) {
   removeSource(ROUTE_SOURCE);
 
   map.addSource(ROUTE_SOURCE, { type: "geojson", data: geojson });
-  map.addLayer(routeLayer("baseline", "#386f9f", 4, 0.62));
-  map.addLayer(routeLayer("scenic", "#b9653d", 5.5, 0.92));
+  map.addLayer(routeLayer("baseline", "#ffffff", 4, 0.62));
+  map.addLayer(routeLayer("scenic", "#62c58a", 5.5, 0.96));
   fitToGeojson(geojson, { maxZoom: 12 });
 }
 
@@ -356,17 +388,31 @@ function clearRoute() {
   setRouteOutput("Waiting for submit", "Enter start/end coordinates as <code>lat, lon</code>, then submit.");
 }
 
-function metricsMarkup(result) {
-  const scenic = result.routes?.scenic || {};
-  const deltas = result.deltas || {};
-  return `
-    <div class="metric-list">
-      <div><span>Scenic distance</span><b>${formatNumber(scenic.total_distance_km, 1)} km</b></div>
-      <div><span>Estimated duration</span><b>${formatNumber(scenic.estimated_duration_minutes, 0)} min</b></div>
-      <div><span>Average scenic score</span><b>${formatNumber(scenic.average_scenic_score, 2)} / 10</b></div>
-      <div><span>Scenic score delta</span><b>${formatNumber(deltas.scenic_score, 2)}</b></div>
-    </div>
-  `;
+function signedNumber(value, digits, suffix = "") {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "--";
+  const sign = numeric > 0 ? "+" : "";
+  return `${sign}${numeric.toFixed(digits)}${suffix}`;
+}
+
+function renderRouteComparison(payload) {
+  const scenic = payload.routes?.scenic;
+  const baseline = payload.routes?.baseline;
+  const deltas = payload.deltas;
+  if (!scenic || !baseline || deltas == null) {
+    throw new Error("API returned incomplete route comparison");
+  }
+  setText(el.scenicDistance, `${formatNumber(scenic.total_distance_km, 1)} km`);
+  setText(el.scenicDuration, `${formatNumber(scenic.estimated_duration_minutes, 0)} min`);
+  setText(el.scenicScore, `${formatNumber(scenic.average_scenic_score, 2)} / 10`);
+  setText(el.baselineDistance, `${formatNumber(baseline.total_distance_km, 1)} km`);
+  setText(el.baselineDuration, `${formatNumber(baseline.estimated_duration_minutes, 0)} min`);
+  setText(el.baselineScore, `${formatNumber(baseline.average_scenic_score, 2)} / 10`);
+  setText(el.scenicDistanceDelta, signedNumber(deltas.distance_km, 1, " km"));
+  setText(el.scenicDurationDelta, signedNumber(deltas.duration_min, 0, " min"));
+  setText(el.scenicScoreDelta, signedNumber(deltas.scenic_score, 2));
+  el.routeResultsDialog.showModal();
+  el.closeRouteDialogBtn.focus();
 }
 
 function validatedMetricsMarkup(result) {
@@ -416,8 +462,8 @@ function newSearchSessionToken() {
 
 function installAddressSearch(which) {
   const input = which === "start" ? el.startInput : el.endInput;
-  const suggestions =
-    which === "start" ? el.startSuggestions : el.endSuggestions;
+  const suggestions = which === "start" ? el.startSuggestions : el.endSuggestions;
+  const clearButton = which === "start" ? el.clearStartBtn : el.clearEndBtn;
   let sessionToken = newSearchSessionToken();
   let currentSuggestions = [];
   let activeSuggestion = -1;
@@ -431,12 +477,24 @@ function installAddressSearch(which) {
     suggestions.replaceChildren();
     suggestions.classList.remove("open");
   };
+  const renderStatus = (text, kind) => {
+    currentSuggestions = [];
+    activeSuggestion = -1;
+    input.removeAttribute("aria-activedescendant");
+    const row = document.createElement("div");
+    row.className = `address-suggestion-status ${kind}`;
+    row.setAttribute("role", "status");
+    row.textContent = text;
+    suggestions.replaceChildren(row);
+    suggestions.classList.add("open");
+  };
   const selectSuggestion = async (suggestion) => {
     request?.abort();
     request = new AbortController();
     const url = new URL(api("/v1/search/retrieve"));
     url.searchParams.set("mapbox_id", suggestion.mapbox_id);
     url.searchParams.set("session_token", sessionToken);
+    renderStatus("Searching…", "loading");
     try {
       const response = await fetch(url, { signal: request.signal });
       if (!response.ok) throw new Error(String(response.status));
@@ -450,11 +508,15 @@ function installAddressSearch(which) {
       closeSuggestions();
     } catch (error) {
       if (error.name !== "AbortError") {
-        setRouteOutput("Address unavailable", "Choose another address result.");
+        renderStatus("Address search unavailable", "error");
       }
     }
   };
   const renderSuggestions = (rows) => {
+    if (!rows.length) {
+      renderStatus("No matching locations", "empty");
+      return;
+    }
     currentSuggestions = rows;
     activeSuggestion = -1;
     input.removeAttribute("aria-activedescendant");
@@ -476,7 +538,7 @@ function installAddressSearch(which) {
       });
       suggestions.appendChild(option);
     });
-    suggestions.classList.toggle("open", rows.length > 0);
+    suggestions.classList.add("open");
   };
 
   input.addEventListener("input", () => {
@@ -494,16 +556,24 @@ function installAddressSearch(which) {
       url.searchParams.set("q", query);
       url.searchParams.set("session_token", sessionToken);
       url.searchParams.set("region", CONFIG.sourceRegion);
+      renderStatus("Searching…", "loading");
       try {
         const response = await fetch(url, { signal: request.signal });
         if (!response.ok) throw new Error(String(response.status));
         renderSuggestions((await response.json()).suggestions || []);
       } catch (error) {
-        if (error.name !== "AbortError") closeSuggestions();
+        if (error.name !== "AbortError") {
+          renderStatus("Address search unavailable", "error");
+        }
       }
     }, 200);
   });
   input.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeSuggestions();
+      return;
+    }
     if (!currentSuggestions.length) return;
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
@@ -511,30 +581,28 @@ function installAddressSearch(which) {
       activeSuggestion =
         (activeSuggestion + delta + currentSuggestions.length) %
         currentSuggestions.length;
-      suggestions.querySelectorAll(".address-suggestion").forEach(
-        (option, index) => {
-          option.setAttribute(
-            "aria-selected",
-            String(index === activeSuggestion)
-          );
-        }
-      );
-      input.setAttribute(
-        "aria-activedescendant",
-        `${which}-suggestion-${activeSuggestion}`
-      );
+      suggestions.querySelectorAll(".address-suggestion").forEach((option, index) => {
+        option.setAttribute("aria-selected", String(index === activeSuggestion));
+      });
+      input.setAttribute("aria-activedescendant", `${which}-suggestion-${activeSuggestion}`);
     } else if (event.key === "Enter" && activeSuggestion >= 0) {
       event.preventDefault();
       void selectSuggestion(currentSuggestions[activeSuggestion]);
-    } else if (event.key === "Escape") {
-      event.preventDefault();
-      closeSuggestions();
     }
   });
   input.addEventListener("blur", (event) => {
     if (!suggestions.contains(event.relatedTarget)) {
       setTimeout(closeSuggestions, 120);
     }
+  });
+  clearButton?.addEventListener("click", () => {
+    clearTimeout(timer);
+    request?.abort();
+    input.value = "";
+    selectedRoutePoints[which] = null;
+    sessionToken = newSearchSessionToken();
+    closeSuggestions();
+    input.focus();
   });
 }
 
@@ -545,6 +613,7 @@ async function planRoute(event) {
   const end = parsePoint(el.endInput.value) || selectedRoutePoints.end;
   if (!start || !end) {
     setRouteOutput("Invalid input", "Enter coordinates or choose an address suggestion.");
+    (!start ? el.startInput : el.endInput).focus();
     return;
   }
 
@@ -574,7 +643,8 @@ async function planRoute(event) {
       throw new Error(payload?.detail?.message || payload?.detail || `${response.status} ${response.statusText}`);
     }
     renderRoute(payload.geojson);
-    setRouteOutput("Route computed", metricsMarkup(payload));
+    renderRouteComparison(payload);
+    setRouteOutput("Route computed", "Scenic and baseline routes are shown on the map.");
     setApiStatus("API: online", "ok");
   } catch (error) {
     setApiStatus("API: route failed", "warn");
@@ -587,8 +657,67 @@ async function planRoute(event) {
   }
 }
 
+function buildShareUrl({ start, end, scenicWeight, maxDetour }) {
+  const url = new URL(window.location.pathname, window.location.origin);
+  url.searchParams.set("start", `${start.lat},${start.lon}`);
+  url.searchParams.set("end", `${end.lat},${end.lon}`);
+  url.searchParams.set("scenic_weight", String(scenicWeight));
+  url.searchParams.set("max_detour", String(maxDetour));
+  return url.toString();
+}
+
+function applyUrlParams() {
+  const start = parsePoint(params.get("start") || "");
+  const end = parsePoint(params.get("end") || "");
+  if (start) el.startInput.value = `${start.lat},${start.lon}`;
+  if (end) el.endInput.value = `${end.lat},${end.lon}`;
+  const applyRange = (key, input) => {
+    const raw = params.get(key);
+    if (raw === null) return;
+    const value = Number(raw);
+    const min = Number(input.min);
+    const max = Number(input.max);
+    if (Number.isFinite(value) && value >= min && value <= max) {
+      input.value = String(value);
+    }
+  };
+  applyRange("scenic_weight", el.scenicWeight);
+  applyRange("max_detour", el.detourFactor);
+}
+
+async function copyShareUrl() {
+  const start = parsePoint(el.startInput.value) || selectedRoutePoints.start;
+  const end = parsePoint(el.endInput.value) || selectedRoutePoints.end;
+  if (!start || !end) return;
+  const shareUrl = buildShareUrl({
+    start,
+    end,
+    scenicWeight: Number(el.scenicWeight.value),
+    maxDetour: Number(el.detourFactor.value),
+  });
+  try {
+    await navigator.clipboard.writeText(shareUrl);
+  } catch {
+    const textarea = document.createElement("textarea");
+    textarea.value = shareUrl;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    textarea.remove();
+  }
+  const originalLabel = el.shareRouteBtn.textContent;
+  el.shareRouteBtn.textContent = "Copied";
+  window.setTimeout(() => {
+    el.shareRouteBtn.textContent = originalLabel;
+  }, 1600);
+}
+
 function initBindings() {
-  // Optional provenance bindings (removed from the minimal viewer).
+  applyUrlParams();
+  el.submitRoute.disabled = true;
   setText(el.displayRange, CONFIG.displayRange);
   setText(el.sourceRegion, CONFIG.sourceRegion);
   setText(el.runName, CONFIG.workingRun);
@@ -596,27 +725,23 @@ function initBindings() {
   if (el.modelNote) {
     el.modelNote.textContent = `Scoring provenance: ${CONFIG.workingRun} at z14 using ${CONFIG.sourceModel}.`;
   }
-
-  if (el.scenicWeight) {
-    el.scenicWeight.addEventListener("input", () => {
-      setText(el.weightOut, Number(el.scenicWeight.value).toFixed(2));
-    });
-  }
-  if (el.detourFactor) {
-    el.detourFactor.addEventListener("input", () => {
-      setText(el.detourOut, `${Number(el.detourFactor.value).toFixed(2)}×`);
-    });
-  }
-  if (el.routeForm) el.routeForm.addEventListener("submit", planRoute);
+  const syncRangeOutputs = () => {
+    setText(el.weightOut, Number(el.scenicWeight.value).toFixed(2));
+    setText(el.detourOut, `${Number(el.detourFactor.value).toFixed(2)}×`);
+  };
+  el.scenicWeight?.addEventListener("input", syncRangeOutputs);
+  el.detourFactor?.addEventListener("input", syncRangeOutputs);
+  syncRangeOutputs();
+  el.routeForm?.addEventListener("submit", planRoute);
   installAddressSearch("start");
   installAddressSearch("end");
-  if (el.clearRoute) el.clearRoute.addEventListener("click", clearRoute);
-  if (el.scaleToggle && el.scaleTab) {
-    el.scaleToggle.addEventListener("click", () => {
-      const isClosed = el.scaleTab.classList.toggle("is-closed");
-      el.scaleToggle.setAttribute("aria-expanded", String(!isClosed));
-    });
-  }
+  el.clearRoute?.addEventListener("click", clearRoute);
+  el.closeRouteDialogBtn?.addEventListener("click", () => el.routeResultsDialog.close());
+  el.shareRouteBtn?.addEventListener("click", copyShareUrl);
+  el.routeResultsDialog?.addEventListener("click", (event) => {
+    if (event.target === el.routeResultsDialog) el.routeResultsDialog.close();
+  });
+  el.routeResultsDialog?.addEventListener("close", () => el.submitRoute.focus());
 }
 
 async function main() {
@@ -643,8 +768,8 @@ async function main() {
   if (validatedRoute) {
     style.sources[ROUTE_SOURCE] = { type: "geojson", data: validatedRoute.geojson };
     style.layers.push(
-      routeLayer("baseline", "#386f9f", 4, 0.62),
-      routeLayer("scenic", "#b9653d", 5.5, 0.92)
+      routeLayer("baseline", "#ffffff", 4, 0.62),
+      routeLayer("scenic", "#62c58a", 5.5, 0.96)
     );
   }
 
@@ -654,10 +779,17 @@ async function main() {
     center: DEFAULTS.center,
     zoom: DEFAULTS.zoom,
     attributionControl: true,
+    maxBounds: REGION_BOUNDS,
+    cooperativeGestures: true,
     dragRotate: false,
     pitchWithRotate: false,
   });
   map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), "top-right");
+  map.on("load", () => {
+    syncMinimumZoom();
+    el.submitRoute.disabled = false;
+  });
+  map.on("resize", syncMinimumZoom);
   if (heatmap) {
     map.once("load", () => {
       map.addSource(HEATMAP_SOURCE, {
@@ -722,7 +854,7 @@ async function main() {
     setText(el.inspectorCoords, `Learned scores · z${heatmap.tileZoom}`);
   }
   if (validatedRoute) {
-    setRouteOutput("Burlington → Bangor", validatedMetricsMarkup(validatedRoute));
+    setRouteOutput("Burlington → Bangor", "Validated scenic and baseline routes are shown on the map.");
   }
   if (artifactErrors.length) {
     setApiStatus("API: artifacts unavailable", "warn");

@@ -68,6 +68,29 @@ uv run marimo edit notebooks/train.mo.py
 
 Open `http://localhost:3000` for the web MVP after the API is running on `:8080`.
 
+### Beta deployment
+
+The beta runs as a single public Nginx origin backed by an internal FastAPI
+service. Processed route/heatmap artifacts and model weights are deployment
+prerequisites; they remain outside Git and Docker image layers and are mounted
+read-only from `data/processed/` and `models/`.
+
+```bash
+cp .env.beta.example .env.beta
+# Set MAPBOX_ACCESS_TOKEN in the untracked .env.beta, and optionally change SCENIC_WEB_PORT.
+docker compose --env-file .env.beta -f compose.beta.yml up --build
+```
+
+Open `http://localhost:${SCENIC_WEB_PORT:-80}`. Stop the beta with:
+
+```bash
+docker compose --env-file .env.beta -f compose.beta.yml down
+```
+
+Before startup, sync the canonical ignored New England graph, learned run,
+registry, and active registry checkpoint into their documented
+`data/processed/` and `models/` paths.
+
 ## Common workflows
 
 ### Ingest Mapbox tiles
