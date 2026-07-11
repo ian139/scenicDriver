@@ -780,7 +780,6 @@ async function main() {
     zoom: DEFAULTS.zoom,
     attributionControl: true,
     maxBounds: REGION_BOUNDS,
-    cooperativeGestures: true,
     dragRotate: false,
     pitchWithRotate: false,
   });
