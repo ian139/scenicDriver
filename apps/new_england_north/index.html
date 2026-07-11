@@ -5,28 +5,31 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Scenic Drive · New England North</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css?v=address-search-v1" />
+    <link rel="stylesheet" href="./styles.css?v=compact-elastic-beta-v2" />
   </head>
   <body>
     <main class="viewer-shell">
       <section class="map-stage" aria-label="New England North scenic map viewer">
         <div id="map" role="application" aria-label="Map with scenic heatmap and route overlays"></div>
 
-        <div id="inspector" class="inspector" aria-live="polite">
-          <span class="eyebrow">Scenic score</span>
-          <strong id="inspectorScore">--</strong>
-          <span id="inspectorCoords">Move over a heatmap cell</span>
-        </div>
       </section>
 
       <div class="bottom-overlay">
         <aside class="control-panel" aria-label="Route controls">
           <header class="panel-header">
             <div class="panel-heading">
-              <h1>Scenic heatmap &amp; route planner</h1>
-              <p class="subhead">New England North</p>
+              <p class="eyebrow">New England North</p>
+              <h1>Plan a scenic route</h1>
+              <p class="subhead">Balance the drive with the views.</p>
             </div>
-            <span class="status-chip" id="apiStatus">API: checking</span>
+            <div class="panel-meta">
+              <div id="inspector" class="inspector" role="group" aria-label="Scenic score readout" aria-live="off">
+                <span class="eyebrow">Scenic score</span>
+                <strong id="inspectorScore">--</strong>
+                <span id="inspectorCoords">Move over a heatmap cell</span>
+              </div>
+              <span class="status-chip" id="apiStatus">API: checking</span>
+            </div>
           </header>
 
           <form id="routeForm" class="route-form">
@@ -67,36 +70,42 @@
             <button id="submitRoute" type="submit" class="btn-primary">Plan route</button>
           </form>
 
-          <div class="output-stack">
-            <section class="output-card" aria-label="Remote training">
-              <div class="output-header">
-                <div>
-                  <p class="eyebrow">Remote training</p>
-                  <h2>Active model evaluation</h2>
-                </div>
-              </div>
-              <div id="trainingResults" class="route-output" aria-live="polite">
-                Loading remote training results…
-              </div>
-            </section>
-
-            <section class="output-card route-status-card" aria-label="Route output">
-              <div class="output-header">
-                <div>
-                  <p class="eyebrow">Route output</p>
-                  <h2 id="routeTitle">Waiting for submit</h2>
-                  <div class="route-legend" aria-label="Route legend">
-                    <span class="route-key scenic">Scenic</span>
-                    <span class="route-key baseline">Baseline</span>
+          <details class="dev-panel">
+            <summary>
+              <span>Developer panel</span>
+              <span class="dev-panel-hint">Diagnostics &amp; route output</span>
+            </summary>
+            <div class="output-stack">
+              <section class="output-card" aria-label="Remote training">
+                <div class="output-header">
+                  <div>
+                    <p class="eyebrow">Remote training</p>
+                    <h2>Active model evaluation</h2>
                   </div>
                 </div>
-                <button id="clearRoute" type="button" class="btn-secondary">Clear</button>
-              </div>
-              <div id="routeOutput" class="route-output" aria-live="polite">
-                Enter start/end coordinates as <code>lat, lon</code>, then submit.
-              </div>
-            </section>
-          </div>
+                <div id="trainingResults" class="route-output" aria-live="polite">
+                  Loading remote training results…
+                </div>
+              </section>
+
+              <section class="output-card route-status-card" aria-label="Route output">
+                <div class="output-header">
+                  <div>
+                    <p class="eyebrow">Route output</p>
+                    <h2 id="routeTitle">Waiting for submit</h2>
+                    <div class="route-legend" aria-label="Route legend">
+                      <span class="route-key scenic">Scenic</span>
+                      <span class="route-key baseline">Baseline</span>
+                    </div>
+                  </div>
+                  <button id="clearRoute" type="button" class="btn-secondary">Clear</button>
+                </div>
+                <div id="routeOutput" class="route-output" aria-live="polite">
+                  Enter start/end coordinates as <code>lat, lon</code>, then submit.
+                </div>
+              </section>
+            </div>
+          </details>
         </aside>
       </div>
 
@@ -154,6 +163,6 @@
     </main>
 
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <script type="module" src="./viewer.js?v=address-search-v2"></script>
+    <script type="module" src="./viewer.js?v=compact-elastic-beta-v2"></script>
   </body>
 </html>

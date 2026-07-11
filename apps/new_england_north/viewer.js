@@ -13,6 +13,20 @@ const REGION_BOUNDS = Object.freeze([
   Object.freeze([-73.5205078125, 42.488301979602255]),
   Object.freeze([-66.796875, 47.50235895196859]),
 ]);
+// Navigation stays unconstrained to the learned rectangle. This soft fit is
+// only a visual reference: a small lower buffer lets users pull back farther
+// before the map gently settles to the region overview.
+const MAP_NAVIGATION = Object.freeze({
+  softFitPaddingPx: 48, // Keep the soft overview just inside the viewport.
+  zoomOverscroll: 0.85, // Less than one zoom level of deliberate elastic pull.
+  bounceDurationMs: 360, // Short settle animation, close to a page-edge bounce.
+});
+
+const ZOOM_BOUNCE_EVENT = Object.freeze({ scenicZoomBounce: true });
+
+let softMinimumZoom = null;
+let zoomBounceActive = false;
+
 
 const params = new URLSearchParams(window.location.search);
 const CONFIG = Object.freeze({
@@ -260,11 +274,58 @@ function fitToGeojson(geojson, options = {}) {
   });
 }
 
-function syncMinimumZoom() {
-  const camera = map.cameraForBounds(REGION_BOUNDS, { padding: 0 });
+function syncZoomElasticity() {
+  const camera = map.cameraForBounds(REGION_BOUNDS, {
+    padding: MAP_NAVIGATION.softFitPaddingPx,
+  });
   if (Number.isFinite(camera?.zoom)) {
-    map.setMinZoom(camera.zoom);
+    softMinimumZoom = camera.zoom;
+    map.setMinZoom(Math.max(0, softMinimumZoom - MAP_NAVIGATION.zoomOverscroll));
   }
+}
+
+function cancelZoomBounce() {
+  if (!zoomBounceActive) return;
+  zoomBounceActive = false;
+  map.stop();
+}
+
+function handleZoomStart(event) {
+  // A user gesture can interrupt the settle animation. MapLibre propagates
+  // the event data from easeTo, so only the animation's own zoomstart is kept.
+  if (zoomBounceActive && !event?.scenicZoomBounce) {
+    cancelZoomBounce();
+  }
+}
+
+function prefersReducedMotion() {
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches === true;
+}
+
+function handleZoomEnd(event) {
+  if (event?.scenicZoomBounce) {
+    zoomBounceActive = false;
+    return;
+  }
+  // A gesture that interrupted a bounce owns this zoomend; re-check it
+  // rather than leaving the map below the soft region overview.
+  zoomBounceActive = false;
+  if (!Number.isFinite(softMinimumZoom) || map.getZoom() >= softMinimumZoom) return;
+  zoomBounceActive = true;
+  if (prefersReducedMotion()) {
+    // jumpTo is immediate and keeps the correction from overriding the user's
+    // reduced-motion preference.
+    map.jumpTo({ zoom: softMinimumZoom }, ZOOM_BOUNCE_EVENT);
+    return;
+  }
+  map.easeTo(
+    {
+      zoom: softMinimumZoom,
+      duration: MAP_NAVIGATION.bounceDurationMs,
+      easing: (progress) => 1 - (1 - progress) ** 3,
+    },
+    ZOOM_BOUNCE_EVENT
+  );
 }
 
 async function loadHeatmap() {
@@ -779,16 +840,17 @@ async function main() {
     center: DEFAULTS.center,
     zoom: DEFAULTS.zoom,
     attributionControl: true,
-    maxBounds: REGION_BOUNDS,
     dragRotate: false,
     pitchWithRotate: false,
   });
   map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), "top-right");
+  map.on("zoomstart", handleZoomStart);
+  map.on("zoomend", handleZoomEnd);
   map.on("load", () => {
-    syncMinimumZoom();
+    syncZoomElasticity();
     el.submitRoute.disabled = false;
   });
-  map.on("resize", syncMinimumZoom);
+  map.on("resize", syncZoomElasticity);
   if (heatmap) {
     map.once("load", () => {
       map.addSource(HEATMAP_SOURCE, {
