@@ -181,20 +181,29 @@ and no legacy runtime setup, status, pairing, or worktree command is invoked.
 
 ## Opening an active workspace
 
-Git worktrees and checkouts are created or opened by normal git/project tooling
-outside CMUX. The remote wrapper only prints the documented CMUX opening command;
-the operator decides when to run it:
+Normal `scripts/remote/vast-start-task.sh` (the `start-task` subcommand) allocates
+and bootstrap-checks the Vast host, then creates and registers its CMUX workspace
+through the v2 JSON-RPC call `cmux rpc workspace.create`. The wrapper persists the
+returned workspace reference and UUID separately in
+`.cmux-vast/state/<task-name>.json` as `cmux_workspace_ref` and
+`cmux_workspace_id`. `scripts/remote/vast-watch.sh` uses that recorded identity
+when it observes `cmux workspace list --json`; it does not infer a workspace from
+the name or current directory.
 
-```bash
-cmux new-workspace \
-  --name "<repo>: <displayName>" \
-  --cwd "<absolute-worktree-path>" \
-  --focus false
-```
+If workspace creation or registration fails, `start-task` clears the identity,
+leaves the state `workspace_pending`, records the error, and returns failure.
+Rerun the same command to retry registration safely.
 
-Use `cmux workspace list --json` to inventory open workspaces by their
-`current_directory`. Do not create or open a workspace during bulk state
-migration, and do not start OMP automatically for imported state.
+The explicit `--manual` exception prints a `cmux new-workspace` command and
+leaves the state `workspace_pending` and unregistered, with no identity recorded.
+Creating that workspace manually does not make it watchable until it is
+explicitly paired. Legacy migrated Orca state is likewise unregistered until an
+explicit pairing/registration action; migration only preserves descriptive
+metadata and never creates a CMUX workspace or infers CMUX identity from Orca
+fields.
+
+Do not create or open a workspace during bulk state migration, and do not start
+OMP automatically for imported state.
 
 ## Verification gate
 
