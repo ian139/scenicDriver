@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import heapq
 import math
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 from .cost import CostWeights, ScenicCostFunction
@@ -43,7 +44,20 @@ class _PathLabel:
     incoming_edge: Optional[Edge]
 
 
+@dataclass
+class _ReversePredecessorSnapshot:
+    graph: RoadGraph
+    stamp: object
+    predecessors: Dict[
+        str, List[Tuple[str, float, Optional[float]]]
+    ]
+
+
 class ScenicRoutePlanner:
+    _MINIMUM_COST_CACHE_CAPACITY = 8
+    _REVERSE_PREPROCESS_EDGE_THRESHOLD = 256
+    _SHORT_ROUTE_CAP_KM = 5.0
+
     def __init__(
         self,
         graph: Optional[RoadGraph] = None,
@@ -53,15 +67,19 @@ class ScenicRoutePlanner:
         self.cost_function = cost_function or ScenicCostFunction()
         # Heuristic scans are graph-state dependent.  Keep the graph reference
         # alongside each stamp so identity checks remain safe if ``self.graph``
-        # is replaced, and retain one ratio entry per built-in cost signature.
+        # is replaced.  The ratio cache is an LRU so a caller varying scenic
+        # weights cannot retain an unbounded number of signatures.
         self._geodesic_lower_bounds_cache: Optional[
             Tuple[RoadGraph, object, bool]
         ] = None
-        self._minimum_cost_per_km_cache: Dict[
+        self._minimum_cost_per_km_cache: OrderedDict[
             Tuple[int, object, Tuple[object, ...]], Tuple[RoadGraph, float]
-        ] = {}
+        ] = OrderedDict()
         self._minimum_cost_per_km_cache_context: Optional[
             Tuple[RoadGraph, object]
+        ] = None
+        self._active_reverse_snapshot: Optional[
+            _ReversePredecessorSnapshot
         ] = None
 
     def _make_cost_function(self, scenic_weight: float) -> ScenicCostFunction:
@@ -192,12 +210,24 @@ class ScenicRoutePlanner:
 
             for edge in self.graph.get_edges(current_id):
                 neighbor_id = edge.end_node_id
-                next_distance = best_distance_km[current_id] + edge.distance_km
-                if max_path_km is not None and next_distance > max_path_km:
-                    continue
-
-                edge_cost = cost_function.calculate(edge)
+                edge_distance_km = self._validated_nonnegative(
+                    edge.distance_km, "edge distance_km"
+                )
+                next_distance = (
+                    best_distance_km[current_id] + edge_distance_km
+                )
+                if not math.isfinite(next_distance):
+                    raise ValueError(
+                        "cumulative traversed distance must be finite and non-negative"
+                    )
+                edge_cost = self._validated_nonnegative(
+                    cost_function.calculate(edge), "edge calculated cost"
+                )
                 next_cost = current_cost + edge_cost
+                if not math.isfinite(next_cost):
+                    raise ValueError(
+                        "cumulative calculated cost must be finite and non-negative"
+                    )
                 if next_cost >= best_cost.get(neighbor_id, float("inf")):
                     continue
 
@@ -213,8 +243,6 @@ class ScenicRoutePlanner:
                 heapq.heappush(
                     frontier, (next_cost + heuristic, next_cost, neighbor_id)
                 )
-
-        return None
 
     @staticmethod
     def _label_dominates(first: _PathLabel, second: _PathLabel) -> bool:
@@ -232,7 +260,7 @@ class ScenicRoutePlanner:
     def _built_in_cost_signature(
         cost_function: ScenicCostFunction,
     ) -> Optional[Tuple[object, ...]]:
-        """Return immutable public inputs for the exact built-in cost function."""
+        """Return immutable inputs only for the untouched built-in cost."""
         if type(cost_function) is not ScenicCostFunction:
             return None
         if type(cost_function.weights) is not CostWeights:
@@ -240,6 +268,16 @@ class ScenicRoutePlanner:
         if "calculate" in cost_function.__dict__:
             return None
         if "_road_type_adjustment" in cost_function.__dict__:
+            return None
+        try:
+            if type(cost_function).calculate is not _ORIGINAL_SCENIC_CALCULATE:
+                return None
+            if (
+                type(cost_function)._road_type_adjustment
+                is not _ORIGINAL_SCENIC_ROAD_TYPE_ADJUSTMENT
+            ):
+                return None
+        except (AttributeError, TypeError):
             return None
         weights = cost_function.weights
         return (
@@ -256,16 +294,17 @@ class ScenicRoutePlanner:
         cost_function: ScenicCostFunction,
     ) -> bool:
         """Return whether the exact original built-in implementation is active."""
+        return ScenicRoutePlanner._built_in_cost_signature(cost_function) is not None
+
+    @staticmethod
+    def _validated_nonnegative(value: object, name: str) -> float:
         try:
-            return (
-                ScenicRoutePlanner._built_in_cost_signature(cost_function)
-                is not None
-                and type(cost_function).calculate is _ORIGINAL_SCENIC_CALCULATE
-                and type(cost_function)._road_type_adjustment
-                is _ORIGINAL_SCENIC_ROAD_TYPE_ADJUSTMENT
-            )
-        except (AttributeError, TypeError, ValueError, OverflowError):
-            return False
+            result = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} must be finite and non-negative") from exc
+        if not math.isfinite(result) or result < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+        return result
 
     def _edge_distances_are_geodesic_lower_bounds(self) -> bool:
         """Return whether stored traversable distances cover endpoint geodesics."""
@@ -275,18 +314,30 @@ class ScenicRoutePlanner:
         if cached is not None:
             cached_graph, cached_stamp, cached_result = cached
             if cached_graph is graph and cached_stamp == stamp:
-                return cached_result
+                if (
+                    graph is self.graph
+                    and graph._heuristic_cache_stamp() == stamp
+                ):
+                    return cached_result
+                self._geodesic_lower_bounds_cache = None
 
-        tolerance_km = 1e-9
         result = True
         for edge in graph.edges.values():
-            distance_km = float(edge.distance_km)
+            try:
+                distance_km = float(edge.distance_km)
+            except (TypeError, ValueError, OverflowError):
+                result = False
+                break
+            if not math.isfinite(distance_km) or distance_km < 0.0:
+                result = False
+                break
             start = graph.get_node(edge.start_node_id)
             end = graph.get_node(edge.end_node_id)
             endpoint_km = self._haversine(start.lat, start.lon, end.lat, end.lon)
-            if endpoint_km > tolerance_km and not (
-                distance_km + tolerance_km >= endpoint_km
-            ):
+            if not math.isfinite(endpoint_km) or endpoint_km < 0.0:
+                result = False
+                break
+            if distance_km < endpoint_km:
                 result = False
                 break
 
@@ -299,13 +350,7 @@ class ScenicRoutePlanner:
         return result
 
     def _minimum_cost_per_km(self, cost_function: ScenicCostFunction) -> float:
-        """Return a safe graph-wide nonnegative cost-per-kilometre lower bound.
-
-        The bound is only admissible when every positive-distance edge stores at
-        least its endpoint geodesic distance.  If that invariant is not proven,
-        return zero so A* remains correct for imported or manually-mutated
-        graphs.
-        """
+        """Return a safe graph-wide nonnegative cost-per-kilometre lower bound."""
         graph = self.graph
         stamp = graph._heuristic_cache_stamp()
         cache_context = self._minimum_cost_per_km_cache_context
@@ -314,7 +359,7 @@ class ScenicRoutePlanner:
             or cache_context[0] is not graph
             or cache_context[1] != stamp
         ):
-            self._minimum_cost_per_km_cache = {}
+            self._minimum_cost_per_km_cache = OrderedDict()
             self._minimum_cost_per_km_cache_context = (graph, stamp)
         signature = self._built_in_cost_signature(cost_function)
         cache_key = None
@@ -322,19 +367,29 @@ class ScenicRoutePlanner:
             cache_key = (id(graph), stamp, signature)
             cached = self._minimum_cost_per_km_cache.get(cache_key)
             if cached is not None and cached[0] is graph:
-                return cached[1]
+                if (
+                    graph is self.graph
+                    and graph._heuristic_cache_stamp() == stamp
+                ):
+                    self._minimum_cost_per_km_cache.move_to_end(cache_key)
+                    return cached[1]
+                self._minimum_cost_per_km_cache.pop(cache_key, None)
 
         if not self._edge_distances_are_geodesic_lower_bounds():
             minimum_cost_per_km = 0.0
         else:
             minimum_cost_per_km = float("inf")
             for edge in graph.edges.values():
-                distance_km = float(edge.distance_km)
+                distance_km = self._validated_nonnegative(
+                    edge.distance_km, "edge distance_km"
+                )
                 if distance_km <= 0.0:
                     continue
-                edge_cost = max(float(cost_function.calculate(edge)), 0.0)
+                edge_cost = self._validated_nonnegative(
+                    cost_function.calculate(edge), "edge calculated cost"
+                )
                 ratio = edge_cost / distance_km
-                if ratio < minimum_cost_per_km:
+                if math.isfinite(ratio) and ratio < minimum_cost_per_km:
                     minimum_cost_per_km = ratio
             if minimum_cost_per_km == float("inf"):
                 minimum_cost_per_km = 0.0
@@ -344,7 +399,7 @@ class ScenicRoutePlanner:
         # intentionally bypass this cache.
         final_stamp = graph._heuristic_cache_stamp()
         if graph is not self.graph or final_stamp != stamp:
-            self._minimum_cost_per_km_cache = {}
+            self._minimum_cost_per_km_cache = OrderedDict()
             self._minimum_cost_per_km_cache_context = None
             return 0.0
         if signature is not None:
@@ -353,57 +408,95 @@ class ScenicRoutePlanner:
                 graph,
                 minimum_cost_per_km,
             )
+            self._minimum_cost_per_km_cache.move_to_end(cache_key)
+            while len(self._minimum_cost_per_km_cache) > (
+                self._MINIMUM_COST_CACHE_CAPACITY
+            ):
+                self._minimum_cost_per_km_cache.popitem(last=False)
         return minimum_cost_per_km
+
+    def _build_reverse_predecessor_snapshot(
+        self,
+        cost_function: Optional[ScenicCostFunction] = None,
+    ) -> Optional[_ReversePredecessorSnapshot]:
+        """Build one directed predecessor snapshot for all reverse bounds."""
+        graph = self.graph
+        stamp = graph._heuristic_cache_stamp()
+        include_costs = (
+            cost_function is not None
+            and self._reverse_cost_eligible(cost_function)
+        )
+        predecessors: Dict[
+            str, List[Tuple[str, float, Optional[float]]]
+        ] = {}
+        # Materialize node IDs before enumeration.  The final stamp check
+        # rejects a concurrent mapping/edge mutation rather than mixing epochs.
+        for node_id in tuple(graph.nodes):
+            try:
+                edges = graph.get_edges(node_id)
+            except Exception:
+                return None
+            for edge in edges:
+                distance_km = self._validated_nonnegative(
+                    edge.distance_km, "edge distance_km"
+                )
+                edge_cost: Optional[float] = None
+                if include_costs:
+                    edge_cost = self._validated_nonnegative(
+                        cost_function.calculate(edge), "edge calculated cost"
+                    )
+                predecessors.setdefault(edge.end_node_id, []).append(
+                    (node_id, distance_km, edge_cost)
+                )
+        if graph is not self.graph or graph._heuristic_cache_stamp() != stamp:
+            return None
+        return _ReversePredecessorSnapshot(graph, stamp, predecessors)
+
+    def _active_or_build_reverse_snapshot(
+        self,
+        cost_function: Optional[ScenicCostFunction] = None,
+    ) -> Optional[_ReversePredecessorSnapshot]:
+        snapshot = self._active_reverse_snapshot
+        if snapshot is not None:
+            if (
+                snapshot.graph is self.graph
+                and self.graph._heuristic_cache_stamp() == snapshot.stamp
+            ):
+                if cost_function is None or not self._reverse_cost_eligible(
+                    cost_function
+                ) or all(
+                    edge_cost is not None
+                    for entries in snapshot.predecessors.values()
+                    for _, _, edge_cost in entries
+                ):
+                    return snapshot
+            return None
+        return self._build_reverse_predecessor_snapshot(cost_function)
 
     def _reverse_distance_lower_bounds(
         self,
         goal: Node,
         max_path_km: float,
     ) -> Optional[Dict[str, float]]:
-        """Return exact distance-to-goal bounds for the current traversal graph.
-
-        The predecessor multigraph is built from ``get_edges`` rather than the
-        stored edge table so generated reverse views have exactly the same
-        directed semantics as the forward search.  A malformed resource or
-        traversal distance disables this optimization and lets the existing
-        conservative pruning remain in force.
-        """
-        graph = self.graph
-        try:
-            cap = float(max_path_km)
-        except (TypeError, ValueError, OverflowError):
+        """Return exact distance-to-goal bounds for the current traversal graph."""
+        cap = self._validated_nonnegative(max_path_km, "max_path_km")
+        snapshot = self._active_or_build_reverse_snapshot()
+        if snapshot is None:
             return None
-        if not math.isfinite(cap) or cap < 0.0:
-            return None
-
-        stamp = graph._heuristic_cache_stamp()
-        predecessors: Dict[str, List[Tuple[str, float]]] = {}
-        for node_id in graph.nodes:
-            for edge in graph.get_edges(node_id):
-                try:
-                    distance_km = float(edge.distance_km)
-                except (TypeError, ValueError, OverflowError):
-                    return None
-                if not math.isfinite(distance_km) or distance_km < 0.0:
-                    return None
-                predecessors.setdefault(edge.end_node_id, []).append(
-                    (node_id, distance_km)
-                )
-
-        # A graph mutation during enumeration makes the snapshot unsafe.
-        if graph is not self.graph or graph._heuristic_cache_stamp() != stamp:
-            return None
-
         lower_bounds: Dict[str, float] = {goal.id: 0.0}
         frontier: List[Tuple[float, str]] = [(0.0, goal.id)]
         while frontier:
             distance_km, node_id = heapq.heappop(frontier)
             if lower_bounds.get(node_id) != distance_km:
                 continue
-            for predecessor_id, edge_distance_km in predecessors.get(
-                node_id, ()
-            ):
+            for (
+                predecessor_id,
+                edge_distance_km,
+                _edge_cost,
+            ) in snapshot.predecessors.get(node_id, ()):
                 next_distance_km = distance_km + edge_distance_km
+                if not math.isfinite(next_distance_km):
+                    return None
                 if next_distance_km > cap:
                     continue
                 previous_distance_km = lower_bounds.get(predecessor_id)
@@ -414,7 +507,10 @@ class ScenicRoutePlanner:
                     heapq.heappush(
                         frontier, (next_distance_km, predecessor_id)
                     )
-        if graph is not self.graph or graph._heuristic_cache_stamp() != stamp:
+        if (
+            snapshot.graph is not self.graph
+            or snapshot.graph._heuristic_cache_stamp() != snapshot.stamp
+        ):
             return None
         return lower_bounds
 
@@ -426,47 +522,33 @@ class ScenicRoutePlanner:
         """Return exact unconstrained cost-to-goal bounds for built-in costs."""
         if not self._reverse_cost_eligible(cost_function):
             return None
-
-        graph = self.graph
-        stamp = graph._heuristic_cache_stamp()
-        predecessors: Dict[str, List[Tuple[str, float]]] = {}
-        for node_id in graph.nodes:
-            try:
-                edges = graph.get_edges(node_id)
-            except Exception:
-                return None
-            for edge in edges:
-                try:
-                    edge_cost = float(cost_function.calculate(edge))
-                except Exception:
-                    return None
-                if not math.isfinite(edge_cost) or edge_cost < 0.0:
-                    return None
-                predecessors.setdefault(edge.end_node_id, []).append(
-                    (node_id, edge_cost)
-                )
-
-        if graph is not self.graph or graph._heuristic_cache_stamp() != stamp:
+        snapshot = self._active_or_build_reverse_snapshot(cost_function)
+        if snapshot is None:
             return None
-
         lower_bounds: Dict[str, float] = {goal.id: 0.0}
         frontier: List[Tuple[float, str]] = [(0.0, goal.id)]
         while frontier:
             cost, node_id = heapq.heappop(frontier)
             if lower_bounds.get(node_id) != cost:
                 continue
-            for predecessor_id, edge_cost in predecessors.get(node_id, ()):
+            for predecessor_id, _distance, edge_cost in snapshot.predecessors.get(
+                node_id, ()
+            ):
+                if edge_cost is None:
+                    return None
                 next_cost = cost + edge_cost
-                # Overflow cannot improve any finite incumbent; leave this
-                # predecessor absent so callers treat it as no completion.
                 if not math.isfinite(next_cost):
-                    continue
+                    return None
                 previous_cost = lower_bounds.get(predecessor_id)
                 if previous_cost is None or next_cost < previous_cost:
                     lower_bounds[predecessor_id] = next_cost
-                    heapq.heappush(frontier, (next_cost, predecessor_id))
-
-        if graph is not self.graph or graph._heuristic_cache_stamp() != stamp:
+                    heapq.heappush(
+                        frontier, (next_cost, predecessor_id)
+                    )
+        if (
+            snapshot.graph is not self.graph
+            or snapshot.graph._heuristic_cache_stamp() != snapshot.stamp
+        ):
             return None
         return lower_bounds
 
@@ -479,56 +561,32 @@ class ScenicRoutePlanner:
         """Return a local reverse potential for ``cost + lambda * distance``."""
         if not self._reverse_cost_eligible(cost_function):
             return None
-        try:
-            lagrangian_lambda = float(lambda_value)
-        except (TypeError, ValueError, OverflowError):
+        lagrangian_lambda = self._validated_nonnegative(
+            lambda_value, "lambda_value"
+        )
+        snapshot = self._active_or_build_reverse_snapshot(cost_function)
+        if snapshot is None:
             return None
-        if not math.isfinite(lagrangian_lambda) or lagrangian_lambda < 0.0:
-            return None
-
-        graph = self.graph
-        stamp = graph._heuristic_cache_stamp()
-        predecessors: Dict[str, List[Tuple[str, float]]] = {}
-        try:
-            for node_id in graph.nodes:
-                for edge in graph.get_edges(node_id):
-                    distance_km = float(edge.distance_km)
-                    edge_cost = float(cost_function.calculate(edge))
-                    if (
-                        not math.isfinite(distance_km)
-                        or distance_km < 0.0
-                        or not math.isfinite(edge_cost)
-                        or edge_cost < 0.0
-                    ):
-                        return None
-                    distance_term = lagrangian_lambda * distance_km
-                    augmented_cost = edge_cost + distance_term
-                    if (
-                        not math.isfinite(distance_term)
-                        or distance_term < 0.0
-                        or not math.isfinite(augmented_cost)
-                        or augmented_cost < 0.0
-                    ):
-                        return None
-                    predecessors.setdefault(edge.end_node_id, []).append(
-                        (node_id, augmented_cost)
-                    )
-        except Exception:
-            return None
-
-        if graph is not self.graph or graph._heuristic_cache_stamp() != stamp:
-            return None
-
         lower_bounds: Dict[str, float] = {goal.id: 0.0}
         frontier: List[Tuple[float, str]] = [(0.0, goal.id)]
         while frontier:
             augmented_cost, node_id = heapq.heappop(frontier)
             if lower_bounds.get(node_id) != augmented_cost:
                 continue
-            for predecessor_id, edge_augmented_cost in predecessors.get(
-                node_id, ()
+            for predecessor_id, edge_distance_km, edge_cost in (
+                snapshot.predecessors.get(node_id, ())
             ):
-                next_augmented_cost = augmented_cost + edge_augmented_cost
+                if edge_cost is None:
+                    return None
+                augmented_edge_cost = (
+                    edge_cost + lagrangian_lambda * edge_distance_km
+                )
+                if (
+                    not math.isfinite(augmented_edge_cost)
+                    or augmented_edge_cost < 0.0
+                ):
+                    return None
+                next_augmented_cost = augmented_cost + augmented_edge_cost
                 if (
                     not math.isfinite(next_augmented_cost)
                     or next_augmented_cost < 0.0
@@ -540,8 +598,10 @@ class ScenicRoutePlanner:
                     heapq.heappush(
                         frontier, (next_augmented_cost, predecessor_id)
                     )
-
-        if graph is not self.graph or graph._heuristic_cache_stamp() != stamp:
+        if (
+            snapshot.graph is not self.graph
+            or snapshot.graph._heuristic_cache_stamp() != snapshot.stamp
+        ):
             return None
         return lower_bounds
 
@@ -624,7 +684,6 @@ class ScenicRoutePlanner:
         reverse_lower_bound_km: float,
         max_path_km: float,
     ) -> bool:
-        """Check a resource bound with a conservative round-off allowance."""
         total_distance_km = cumulative_distance_km + reverse_lower_bound_km
         tolerance_km = 1e-9 * max(
             1.0,
@@ -645,64 +704,93 @@ class ScenicRoutePlanner:
         shortest_distance_km: float | None = None,
     ) -> Optional[List[Edge]]:
         """Find the least-cost path subject to an additive distance resource."""
+        cap = self._validated_nonnegative(max_path_km, "max_path_km")
         incumbent_cost: float | None = None
         if max_feasible_cost is not None:
-            try:
-                candidate_incumbent = float(max_feasible_cost)
-            except (TypeError, ValueError, OverflowError):
-                candidate_incumbent = float("nan")
-            if math.isfinite(candidate_incumbent):
-                incumbent_cost = candidate_incumbent
-        reverse_cost_lower_bounds: Optional[Dict[str, float]] = None
-        if incumbent_cost is not None:
-            reverse_cost_lower_bounds = self._reverse_cost_lower_bounds(
-                goal, cost_function
+            incumbent_cost = self._validated_nonnegative(
+                max_feasible_cost, "max_feasible_cost"
             )
-        use_reverse_cost_pruning = (
-            incumbent_cost is not None and reverse_cost_lower_bounds is not None
-        )
+        shortest_for_lagrangian: float | None = None
+        if shortest_distance_km is not None:
+            shortest_for_lagrangian = self._validated_nonnegative(
+                shortest_distance_km, "shortest_distance_km"
+            )
+        reverse_cost_lower_bounds: Optional[Dict[str, float]] = None
+        reverse_lower_bounds: Optional[Dict[str, float]] = None
         lagrangian_potentials: List[
             Tuple[float, Dict[str, float], object]
         ] = []
-        if incumbent_cost is not None:
-            try:
-                cap_for_lagrangian = float(max_path_km)
-                shortest_for_lagrangian = float(shortest_distance_km)
-                base_lambda = (
-                    incumbent_cost / shortest_for_lagrangian
-                )
-            except (TypeError, ValueError, OverflowError, ZeroDivisionError):
-                base_lambda = float("nan")
-                cap_for_lagrangian = float("nan")
-            if (
-                math.isfinite(cap_for_lagrangian)
-                and cap_for_lagrangian >= 0.0
-                and math.isfinite(base_lambda)
-                and base_lambda > 0.0
-            ):
-                for lambda_value in (base_lambda, base_lambda * 4.0):
-                    if (
-                        not math.isfinite(lambda_value)
-                        or lambda_value <= 0.0
-                    ):
-                        continue
-                    potential_stamp = self.graph._heuristic_cache_stamp()
-                    potential = self._reverse_augmented_cost_lower_bounds(
-                        goal, cost_function, lambda_value
-                    )
-                    if (
-                        potential is not None
-                        and self.graph is not None
-                        and self.graph._heuristic_cache_stamp()
-                        == potential_stamp
-                    ):
-                        lagrangian_potentials.append(
-                            (lambda_value, potential, potential_stamp)
-                        )
-        reverse_lower_bounds = self._reverse_distance_lower_bounds(
-            goal, max_path_km
+        reverse_snapshot: Optional[_ReversePredecessorSnapshot] = None
+        preprocess_reverse = not (
+            len(self.graph.edges) > self._REVERSE_PREPROCESS_EDGE_THRESHOLD
+            and cap <= self._SHORT_ROUTE_CAP_KM
         )
-        use_reverse_resource_pruning = reverse_lower_bounds is not None
+        if preprocess_reverse:
+            reverse_snapshot = self._build_reverse_predecessor_snapshot(
+                cost_function if incumbent_cost is not None else None
+            )
+            if reverse_snapshot is not None:
+                self._active_reverse_snapshot = reverse_snapshot
+                try:
+                    if incumbent_cost is not None:
+                        reverse_cost_lower_bounds = (
+                            self._reverse_cost_lower_bounds(
+                                goal, cost_function
+                            )
+                        )
+                        if (
+                            shortest_for_lagrangian is not None
+                            and shortest_for_lagrangian > 0.0
+                        ):
+                            base_lambda = (
+                                incumbent_cost / shortest_for_lagrangian
+                            )
+                            if math.isfinite(base_lambda) and base_lambda > 0.0:
+                                for lambda_value in (
+                                    base_lambda,
+                                    base_lambda * 4.0,
+                                ):
+                                    if (
+                                        not math.isfinite(lambda_value)
+                                        or lambda_value <= 0.0
+                                    ):
+                                        continue
+                                    potential = (
+                                        self._reverse_augmented_cost_lower_bounds(
+                                            goal,
+                                            cost_function,
+                                            lambda_value,
+                                        )
+                                    )
+                                    if potential is not None:
+                                        lagrangian_potentials.append(
+                                            (
+                                                lambda_value,
+                                                potential,
+                                                reverse_snapshot.stamp,
+                                            )
+                                        )
+                    reverse_lower_bounds = self._reverse_distance_lower_bounds(
+                        goal, cap
+                    )
+                finally:
+                    self._active_reverse_snapshot = None
+        if (
+            reverse_snapshot is not None
+            and self.graph._heuristic_cache_stamp() != reverse_snapshot.stamp
+        ):
+            reverse_snapshot = None
+            reverse_cost_lower_bounds = None
+            reverse_lower_bounds = None
+            lagrangian_potentials = []
+        use_reverse_cost_pruning = (
+            reverse_snapshot is not None
+            and reverse_cost_lower_bounds is not None
+        )
+        use_reverse_resource_pruning = (
+            reverse_snapshot is not None and reverse_lower_bounds is not None
+        )
+        search_stamp = self.graph._heuristic_cache_stamp()
         minimum_cost_per_km = self._minimum_cost_per_km(cost_function)
         use_geodesic_pruning = self._edge_distances_are_geodesic_lower_bounds()
         start_to_goal_km = self._haversine(
@@ -717,8 +805,19 @@ class ScenicRoutePlanner:
             (minimum_cost_per_km * start_to_goal_km, 0.0, 0)
         ]
         next_label_id = 1
-
         while frontier:
+            current_stamp = self.graph._heuristic_cache_stamp()
+            if current_stamp != search_stamp:
+                # A snapshot from an older graph epoch is never mixed with
+                # newer labels.  Disable every reverse bound atomically.
+                reverse_cost_lower_bounds = None
+                reverse_lower_bounds = None
+                lagrangian_potentials = []
+                use_reverse_cost_pruning = False
+                use_reverse_resource_pruning = False
+                minimum_cost_per_km = 0.0
+                use_geodesic_pruning = False
+                search_stamp = current_stamp
             _, _, label_id = heapq.heappop(frontier)
             if label_id not in active_labels:
                 continue
@@ -773,7 +872,7 @@ class ScenicRoutePlanner:
                     lambda_distance = (
                         lambda_value * label.cumulative_distance_km
                     )
-                    lambda_cap = lambda_value * max_path_km
+                    lambda_cap = lambda_value * cap
                     if (
                         not math.isfinite(lambda_distance)
                         or not math.isfinite(lambda_cap)
@@ -785,7 +884,7 @@ class ScenicRoutePlanner:
                             augmented_lower_bound,
                             label.cumulative_distance_km,
                             lambda_value,
-                            max_path_km,
+                            cap,
                             incumbent_cost,
                         )
                     )
@@ -819,7 +918,7 @@ class ScenicRoutePlanner:
                     or self._resource_bound_exceeds_cap(
                         label.cumulative_distance_km,
                         reverse_lower_bound,
-                        max_path_km,
+                        cap,
                     )
                 ):
                     continue
@@ -830,13 +929,20 @@ class ScenicRoutePlanner:
                 )
                 if (
                     label.cumulative_distance_km + straight_line_to_goal
-                    > max_path_km
+                    > cap
                 ):
                     continue
 
             for edge in self.graph.get_edges(label.node_id):
-                next_distance = label.cumulative_distance_km + edge.distance_km
-                if next_distance > max_path_km:
+                edge_distance_km = self._validated_nonnegative(
+                    edge.distance_km, "edge distance_km"
+                )
+                next_distance = label.cumulative_distance_km + edge_distance_km
+                if not math.isfinite(next_distance):
+                    raise ValueError(
+                        "cumulative traversed distance must be finite and non-negative"
+                    )
+                if next_distance > cap:
                     continue
                 neighbor = self.graph.get_node(edge.end_node_id)
                 neighbor_to_goal = 0.0
@@ -853,14 +959,21 @@ class ScenicRoutePlanner:
                         or self._resource_bound_exceeds_cap(
                             next_distance,
                             reverse_lower_bound,
-                            max_path_km,
+                            cap,
                         )
                     ):
                         continue
                 elif use_geodesic_pruning:
-                    if next_distance + neighbor_to_goal > max_path_km:
+                    if next_distance + neighbor_to_goal > cap:
                         continue
-                next_cost = label.cumulative_cost + cost_function.calculate(edge)
+                edge_cost = self._validated_nonnegative(
+                    cost_function.calculate(edge), "edge calculated cost"
+                )
+                next_cost = label.cumulative_cost + edge_cost
+                if not math.isfinite(next_cost):
+                    raise ValueError(
+                        "cumulative calculated cost must be finite and non-negative"
+                    )
                 if use_reverse_cost_pruning:
                     reverse_cost_lower_bound = reverse_cost_lower_bounds.get(
                         edge.end_node_id
@@ -894,7 +1007,7 @@ class ScenicRoutePlanner:
                         if not math.isfinite(augmented_lower_bound):
                             continue
                         lambda_distance = lambda_value * next_distance
-                        lambda_cap = lambda_value * max_path_km
+                        lambda_cap = lambda_value * cap
                         if (
                             not math.isfinite(lambda_distance)
                             or not math.isfinite(lambda_cap)
@@ -906,7 +1019,7 @@ class ScenicRoutePlanner:
                                 augmented_lower_bound,
                                 next_distance,
                                 lambda_value,
-                                max_path_km,
+                                cap,
                                 incumbent_cost,
                             )
                         )

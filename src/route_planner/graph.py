@@ -11,6 +11,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Tuple
 import msgspec
 import numpy as np
 
+_KD_SMALL_SUBTREE_CUTOFF = 32
 
 class _NodeRow(msgspec.Struct):
     # Legacy artifacts contain numeric IDs and numeric values serialized as
@@ -28,7 +29,7 @@ class _EdgeRow(msgspec.Struct):
     scenic_score: Any = 5.0
     road_name: Any = None
     road_type: Any = "secondary"
-    speed_limit_kmh: Any = 50
+    speed_limit_kmh: Any = None
     # Historical graph JSONs often omitted one_way.  Keep directed-edge
     # semantics for those artifacts while leaving Edge's public default alone.
     one_way: Any = True
@@ -114,6 +115,8 @@ class _NodeMapping(dict[str, Node]):
         return default  # type: ignore[return-value]
 
     def pop(self, key: str, *args: Any) -> Node:
+        if key not in self:
+            return super().pop(key, *args)
         value = super().pop(key, *args)
         self._changed()
         return value
@@ -163,6 +166,8 @@ class _EdgeMapping(dict[str, Edge]):
         return default  # type: ignore[return-value]
 
     def pop(self, key: str, *args: Any) -> Edge:
+        if key not in self:
+            return super().pop(key, *args)
         value = super().pop(key, *args)
         self._changed()
         return value
@@ -238,10 +243,17 @@ class RoadGraph:
         right_children = array("i")
         subtree_min_ranks = array("i")
 
-
         def select(lo: int, hi: int, target: int, axis: int) -> None:
             """Place the target order statistic in ``order[target]``."""
             if hi - lo <= 1:
+                return
+            if hi - lo <= _KD_SMALL_SUBTREE_CUTOFF:
+                coordinates = latitudes if axis == 0 else longitudes
+                sorted_ranks = sorted(
+                    order[lo:hi],
+                    key=lambda rank: (coordinates[rank], rank),
+                )
+                order[lo:hi] = array("i", sorted_ranks)
                 return
             values = latitude_view if axis == 0 else longitude_view
             segment = order_view[lo:hi]
@@ -285,6 +297,7 @@ class RoadGraph:
             right_children,
             subtree_min_ranks,
         )
+
 
     def add_edge(self, edge: Edge) -> None:
         if edge.start_node_id not in self.nodes:
@@ -581,6 +594,18 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     c = 2 * math.asin(math.sqrt(a))
     return r * c
 
+def _parse_osmnx_length_km(raw_length: Any) -> Optional[float]:
+    """Return a positive finite OSMnx edge length converted from metres."""
+    if isinstance(raw_length, bool):
+        return None
+    try:
+        length_m = float(raw_length)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(length_m) or length_m <= 0.0:
+        return None
+    return length_m / 1000.0
+
 
 def _graph_from_osmnx(G: Any, scenic_scores: Dict[str, float]) -> RoadGraph:
     graph = RoadGraph()
@@ -596,6 +621,7 @@ def _graph_from_osmnx(G: Any, scenic_scores: Dict[str, float]) -> RoadGraph:
 
     for u, v, key, data in G.edges(keys=True, data=True):
         edge_id = f"{u}-{v}-{key}"
+        total_length_km = _parse_osmnx_length_km(data.get("length"))
         scenic_score = float(scenic_scores.get(str(data.get("osmid", edge_id)), 5.0))
         road_name = data.get("name")
         road_type = _normalize_road_type(data.get("highway", "secondary"))
@@ -652,23 +678,43 @@ def _graph_from_osmnx(G: Any, scenic_scores: Dict[str, float]) -> RoadGraph:
             node_ids.append(intermediate_id)
         node_ids.append(end_id)
 
+        chord_distances_km: List[float] = []
+        for segment_start, segment_end in zip(node_ids, node_ids[1:]):
+            segment_start_node = graph.get_node(segment_start)
+            segment_end_node = graph.get_node(segment_end)
+            chord_distances_km.append(
+                _haversine_km(
+                    segment_start_node.lat,
+                    segment_start_node.lon,
+                    segment_end_node.lat,
+                    segment_end_node.lon,
+                )
+            )
+
+        chord_total_km = math.fsum(chord_distances_km)
+        if total_length_km is not None:
+            if math.isfinite(chord_total_km) and chord_total_km > 0.0:
+                segment_distances_km = [
+                    total_length_km * chord / chord_total_km
+                    for chord in chord_distances_km
+                ]
+            else:
+                segment_distances_km = [
+                    total_length_km / len(chord_distances_km)
+                    for _ in chord_distances_km
+                ]
+        else:
+            segment_distances_km = chord_distances_km
+
         for coordinate_index, (segment_start, segment_end) in enumerate(
             zip(node_ids, node_ids[1:])
         ):
-            segment_start_node = graph.get_node(segment_start)
-            segment_end_node = graph.get_node(segment_end)
-            segment_distance_km = _haversine_km(
-                segment_start_node.lat,
-                segment_start_node.lon,
-                segment_end_node.lat,
-                segment_end_node.lon,
-            )
             graph.add_edge(
                 Edge(
                     id=f"{u}-{v}-{key}-segment-{coordinate_index}",
                     start_node_id=segment_start,
                     end_node_id=segment_end,
-                    distance_km=float(segment_distance_km),
+                    distance_km=float(segment_distances_km[coordinate_index]),
                     scenic_score=float(max(0.0, min(10.0, scenic_score))),
                     road_name=road_name,
                     road_type=road_type,
