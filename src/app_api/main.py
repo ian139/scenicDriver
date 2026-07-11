@@ -553,10 +553,6 @@ def create_app() -> FastAPI:
         )
         diagnostics: dict[str, Any] = {}
         try:
-            diagnostics = diagnose_route_request(req)
-        except Exception:
-            diagnostics = {}
-        try:
             result = plan_routes(req)
             diagnostics = dict(result.get("diagnostics", {}))
         except ValueError as exc:
@@ -581,6 +577,10 @@ def create_app() -> FastAPI:
                     result["retry_used"] = True
                     result["retry_max_detour_factor"] = retry_cap
                 except ValueError:
+                    try:
+                        diagnostics = diagnose_route_request(req)
+                    except Exception:
+                        diagnostics = {}
                     raise HTTPException(
                         status_code=422,
                         detail={
@@ -591,6 +591,10 @@ def create_app() -> FastAPI:
                         },
                     ) from exc
             else:
+                try:
+                    diagnostics = diagnose_route_request(req)
+                except Exception:
+                    diagnostics = {}
                 raise HTTPException(
                     status_code=422,
                     detail={

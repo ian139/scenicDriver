@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-import json
 import io
+import json
+from pathlib import Path
 import struct
 
 from PIL import Image
-
 from fastapi.testclient import TestClient
 
 import src.app_api.main as app_api
 
 from src.app_api.main import create_app
+
+
 
 
 client = TestClient(create_app())
@@ -340,3 +342,90 @@ def test_route_compare_contract() -> None:
         assert "routes" in payload
         assert "score_mapping" in payload
         assert "geojson" in payload
+
+
+def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None:
+    graph_calls: list[str] = []
+    run_calls: list[str] = []
+    plan_calls: list[object] = []
+    diagnosis_calls: list[object] = []
+
+    def fake_graph(region: str):
+        graph_calls.append(region)
+        return Path("/tmp/fake-road-graph.geojson")
+
+    def fake_run(region: str):
+        run_calls.append(region)
+        return "test-run"
+
+    scenic_metrics = {
+        "total_distance_km": 10.0,
+        "estimated_duration_minutes": 20.0,
+        "average_scenic_score": 0.8,
+    }
+    baseline_metrics = {
+        "total_distance_km": 8.0,
+        "estimated_duration_minutes": 16.0,
+        "average_scenic_score": 0.2,
+    }
+
+    def fake_plan(request):
+        plan_calls.append(request)
+        return {
+            "routes": [
+                {"route_kind": "scenic", "metrics": scenic_metrics},
+                {"route_kind": "baseline", "metrics": baseline_metrics},
+            ],
+            "diagnostics": {"planner": "ok"},
+            "score_mapping": {"version": "test"},
+            "geojson": {"type": "FeatureCollection", "features": []},
+        }
+
+    def fake_diagnose(request):
+        diagnosis_calls.append(request)
+        return {"planner": "diagnosed"}
+
+    monkeypatch.setattr(app_api, "_region_to_graph", fake_graph)
+    monkeypatch.setattr(app_api, "_latest_run_for_region", fake_run)
+    monkeypatch.setattr(app_api, "plan_routes", fake_plan)
+    monkeypatch.setattr(app_api, "diagnose_route_request", fake_diagnose)
+
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 40.03, "lon": -75.22},
+            "end": {"lat": 40.065, "lon": -75.19},
+            "scenic_weight": 0.8,
+            "region": "philadelphia",
+            "max_detour_factor": 1.8,
+            "avoid_highways": False,
+            "include_baseline": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert graph_calls == ["philadelphia"]
+    assert run_calls == ["philadelphia"]
+    assert len(plan_calls) == 1
+    assert diagnosis_calls == []
+
+    payload = response.json()
+    assert set(payload) == {
+        "request",
+        "run_name",
+        "diagnostics",
+        "routes",
+        "deltas",
+        "score_mapping",
+        "geojson",
+    }
+    assert payload["run_name"] == "test-run"
+    assert payload["diagnostics"] == {"planner": "ok"}
+    assert payload["routes"] == {"scenic": scenic_metrics, "baseline": baseline_metrics}
+    assert payload["deltas"] == {
+        "distance_km": 2.0,
+        "duration_min": 4.0,
+        "scenic_score": 0.6000000000000001,
+    }
+    assert payload["score_mapping"] == {"version": "test"}
+    assert payload["geojson"] == {"type": "FeatureCollection", "features": []}

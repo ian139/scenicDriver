@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -139,14 +140,40 @@ def apply_tile_scores_to_graph(
 ) -> tuple[int, int]:
     matched = 0
     total = 0
+
+    # Segment-heavy graphs commonly repeat midpoint coordinates and tile keys.
+    # Keep both caches bounded so a broad graph cannot turn this into another
+    # graph-sized allocation. FIFO eviction makes memory use and access
+    # behavior deterministic while retaining insertion order for edges.
+    cache_limit = 4096
+    midpoint_tiles: OrderedDict[tuple[float, float], tuple[int, int]] = OrderedDict()
+    tile_results: OrderedDict[tuple[int, int, int], object] = OrderedDict()
+    cache_miss = object()
+
     for edge in graph.edges.values():
         total += 1
         start = graph.get_node(edge.start_node_id)
         end = graph.get_node(edge.end_node_id)
         mid_lat = 0.5 * (start.lat + end.lat)
         mid_lon = 0.5 * (start.lon + end.lon)
-        x, y = lat_lon_to_tile(mid_lat, mid_lon, zoom)
-        tile_score = score_map.get((zoom, x, y))
+
+        midpoint_key = (mid_lat, mid_lon)
+        tile = midpoint_tiles.get(midpoint_key)
+        if tile is None:
+            tile = lat_lon_to_tile(mid_lat, mid_lon, zoom)
+            if len(midpoint_tiles) >= cache_limit:
+                midpoint_tiles.popitem(last=False)
+            midpoint_tiles[midpoint_key] = tile
+        x, y = tile
+
+        tile_key = (zoom, x, y)
+        tile_score = tile_results.get(tile_key, cache_miss)
+        if tile_score is cache_miss:
+            tile_score = score_map.get(tile_key)
+            if len(tile_results) >= cache_limit:
+                tile_results.popitem(last=False)
+            tile_results[tile_key] = tile_score
+
         if tile_score is not None:
             edge.scenic_score = float(min(max(tile_score, 0.0), 10.0))
             matched += 1

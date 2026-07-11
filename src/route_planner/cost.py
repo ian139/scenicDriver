@@ -17,11 +17,11 @@ class ScenicCostFunction:
     """
     Edge cost for scenic routing.
 
-    Uses:
-        cost = alpha * travel_time_minutes + beta * (10 - scenic_score) + road_adjustment
-    where:
-        alpha = 1 - scenic_weight
-        beta = scenic_weight
+    All terms are additive minutes (or minute-scaled multipliers): travel time,
+    travel-time-weighted scenic exposure, and road-type adjustments.  Scenic
+    exposure is the time spent on an edge multiplied by its clamped scenic
+    disutility, so subdividing a road geometry does not change its total cost.
+    Costs are always clamped to ``>= 1e-6`` for shortest-path search.
     """
 
     def __init__(
@@ -38,12 +38,20 @@ class ScenicCostFunction:
         alpha = 1.0 - self.scenic_weight
         beta = self.scenic_weight
 
-        travel = max(edge.travel_time_minutes, 0.0) * self.weights.travel_time
+        travel_time_minutes = max(float(edge.travel_time_minutes), 0.0)
+        travel = travel_time_minutes * self.weights.travel_time
         scenic_score = float(min(max(edge.scenic_score, 0.0), 10.0))
-        scenic_penalty = (10.0 - scenic_score) * self.weights.scenic_reward
-        road_adj = self._road_type_adjustment(edge.road_type)
+        scenic_exposure = (
+            travel_time_minutes
+            * (10.0 - scenic_score)
+            / 10.0
+            * self.weights.scenic_reward
+        )
+        road_adjustment = (
+            travel_time_minutes * self._road_type_adjustment(edge.road_type)
+        )
 
-        raw = alpha * travel + beta * scenic_penalty + road_adj
+        raw = alpha * travel + beta * scenic_exposure + road_adjustment
         # Keep non-negative costs for Dijkstra/A* style search.
         return max(raw, 1e-6)
 
