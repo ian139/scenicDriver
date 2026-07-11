@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Scenic Drive · New England North</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css?v=compact-elastic-beta-v2" />
+    <link rel="stylesheet" href="./styles.css?v=compact-elastic-beta-v3" />
   </head>
   <body>
     <main class="viewer-shell">
@@ -37,7 +37,7 @@
               <label class="field">
                 <span class="field-label">Start point</span>
                 <span class="input-shell">
-                  <input id="startInput" name="start" autocomplete="off" value="44.475884, -73.214003" aria-controls="startSuggestions" />
+                  <input id="startInput" name="start" autocomplete="off" value="44.475884, -73.214003" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="startSuggestions" />
                   <button id="clearStartBtn" type="button" class="input-clear" aria-label="Clear start point" title="Clear start point">×</button>
                 </span>
                 <div id="startSuggestions" class="address-suggestions" role="listbox" aria-label="Start point suggestions"></div>
@@ -45,7 +45,7 @@
               <label class="field">
                 <span class="field-label">End point</span>
                 <span class="input-shell">
-                  <input id="endInput" name="end" autocomplete="off" value="44.801616, -68.771305" aria-controls="endSuggestions" />
+                  <input id="endInput" name="end" autocomplete="off" value="44.801616, -68.771305" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="endSuggestions" />
                   <button id="clearEndBtn" type="button" class="input-clear" aria-label="Clear end point" title="Clear end point">×</button>
                 </span>
                 <div id="endSuggestions" class="address-suggestions" role="listbox" aria-label="End point suggestions"></div>
@@ -163,6 +163,6 @@
     </main>
 
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <script type="module" src="./viewer.js?v=compact-elastic-beta-v2"></script>
+    <script type="module" src="./viewer.js?v=compact-elastic-beta-v3"></script>
   </body>
 </html>

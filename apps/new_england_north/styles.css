@@ -371,7 +371,7 @@ h3 {
 
 .route-form {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(132px, 0.72fr) minmax(118px, auto);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(132px, auto);
   align-items: end;
   gap: 10px;
   min-width: 0;

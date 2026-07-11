@@ -23,6 +23,10 @@ const MAP_NAVIGATION = Object.freeze({
 });
 
 const ZOOM_BOUNCE_EVENT = Object.freeze({ scenicZoomBounce: true });
+const PROGRAMMATIC_CAMERA_EVENT = Object.freeze({
+  scenicProgrammaticCamera: true,
+});
+
 
 let softMinimumZoom = null;
 let zoomBounceActive = false;
@@ -267,12 +271,18 @@ function fitToGeojson(geojson, options = {}) {
   const bounds = boundsForGeojson(geojson);
   if (!bounds) return;
   const bottomPadding = window.innerWidth > 760 ? 320 : Math.round(Math.min(window.innerHeight * 0.44, 380)) + 36;
-  map.fitBounds(bounds, {
-    padding: { top: 58, right: 54, bottom: bottomPadding, left: 54 },
-    duration: 600,
-    maxZoom: options.maxZoom ?? 12,
-  });
+  cancelZoomBounce();
+  map.fitBounds(
+    bounds,
+    {
+      padding: { top: 58, right: 54, bottom: bottomPadding, left: 54 },
+      duration: 600,
+      maxZoom: options.maxZoom ?? 12,
+    },
+    PROGRAMMATIC_CAMERA_EVENT
+  );
 }
+
 
 function syncZoomElasticity() {
   const camera = map.cameraForBounds(REGION_BOUNDS, {
@@ -291,19 +301,24 @@ function cancelZoomBounce() {
 }
 
 function handleZoomStart(event) {
-  // A user gesture can interrupt the settle animation. MapLibre propagates
-  // the event data from easeTo, so only the animation's own zoomstart is kept.
-  if (zoomBounceActive && !event?.scenicZoomBounce) {
+  // Programmatic camera transitions explicitly cancel a pending bounce before
+  // starting, then carry source metadata so this handler leaves them alone.
+  if (
+    zoomBounceActive &&
+    !event?.scenicZoomBounce &&
+    !event?.scenicProgrammaticCamera
+  ) {
     cancelZoomBounce();
   }
 }
+
 
 function prefersReducedMotion() {
   return window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches === true;
 }
 
 function handleZoomEnd(event) {
-  if (event?.scenicZoomBounce) {
+  if (event?.scenicZoomBounce || event?.scenicProgrammaticCamera) {
     zoomBounceActive = false;
     return;
   }
@@ -327,6 +342,7 @@ function handleZoomEnd(event) {
     ZOOM_BOUNCE_EVENT
   );
 }
+
 
 async function loadHeatmap() {
   const url = new URL(api("/v1/heatmap"));
@@ -476,23 +492,6 @@ function renderRouteComparison(payload) {
   el.closeRouteDialogBtn.focus();
 }
 
-function validatedMetricsMarkup(result) {
-  const scenic = result.routes.scenic;
-  const baseline = result.routes.baseline;
-  const mapping = result.score_mapping;
-  return `
-    <div class="metric-list">
-      <div><span>Scenic distance</span><b>${formatNumber(scenic.total_distance_km, 1)} km</b></div>
-      <div><span>Baseline distance</span><b>${formatNumber(baseline.total_distance_km, 1)} km</b></div>
-      <div><span>Scenic duration</span><b>${formatNumber(scenic.estimated_duration_minutes, 0)} min</b></div>
-      <div><span>Baseline duration</span><b>${formatNumber(baseline.estimated_duration_minutes, 0)} min</b></div>
-      <div><span>Scenic score</span><b>${formatNumber(scenic.average_scenic_score, 2)} / 10</b></div>
-      <div><span>Baseline score</span><b>${formatNumber(baseline.average_scenic_score, 2)} / 10</b></div>
-      <div><span>Score mapping</span><b>${formatNumber(Number(mapping.matched_ratio) * 100, 1)}%</b></div>
-      <div><span>Mapped edges</span><b>${Number(mapping.matched_edges).toLocaleString()} / ${Number(mapping.total_edges).toLocaleString()}</b></div>
-    </div>
-  `;
-}
 
 async function fetchValidatedRoute() {
   const url = new URL(api("/v1/validated-route"));
@@ -535,6 +534,7 @@ function installAddressSearch(which) {
     currentSuggestions = [];
     activeSuggestion = -1;
     input.removeAttribute("aria-activedescendant");
+    input.setAttribute("aria-expanded", "false");
     suggestions.replaceChildren();
     suggestions.classList.remove("open");
   };
@@ -542,9 +542,11 @@ function installAddressSearch(which) {
     currentSuggestions = [];
     activeSuggestion = -1;
     input.removeAttribute("aria-activedescendant");
+    input.setAttribute("aria-expanded", "true");
     const row = document.createElement("div");
     row.className = `address-suggestion-status ${kind}`;
-    row.setAttribute("role", "status");
+    row.setAttribute("role", "option");
+    row.setAttribute("aria-disabled", "true");
     row.textContent = text;
     suggestions.replaceChildren(row);
     suggestions.classList.add("open");
@@ -581,6 +583,7 @@ function installAddressSearch(which) {
     currentSuggestions = rows;
     activeSuggestion = -1;
     input.removeAttribute("aria-activedescendant");
+    input.setAttribute("aria-expanded", "true");
     suggestions.replaceChildren();
     rows.forEach((row, index) => {
       const option = document.createElement("div");
@@ -756,21 +759,34 @@ async function copyShareUrl() {
     scenicWeight: Number(el.scenicWeight.value),
     maxDetour: Number(el.detourFactor.value),
   });
-  try {
-    await navigator.clipboard.writeText(shareUrl);
-  } catch {
-    const textarea = document.createElement("textarea");
-    textarea.value = shareUrl;
-    textarea.setAttribute("readonly", "");
-    textarea.style.position = "fixed";
-    textarea.style.opacity = "0";
-    document.body.appendChild(textarea);
-    textarea.select();
-    document.execCommand("copy");
-    textarea.remove();
-  }
   const originalLabel = el.shareRouteBtn.textContent;
-  el.shareRouteBtn.textContent = "Copied";
+  let copied = false;
+  try {
+    const writeText = globalThis.navigator?.clipboard?.writeText;
+    if (typeof writeText === "function") {
+      await writeText.call(globalThis.navigator.clipboard, shareUrl);
+      copied = true;
+    }
+  } catch {
+    copied = false;
+  }
+  if (!copied) {
+    const textarea = document.createElement("textarea");
+    try {
+      textarea.value = shareUrl;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      copied = document.execCommand("copy") === true;
+    } catch {
+      copied = false;
+    } finally {
+      textarea.remove();
+    }
+  }
+  el.shareRouteBtn.textContent = copied ? "Copied" : "Copy failed";
   window.setTimeout(() => {
     el.shareRouteBtn.textContent = originalLabel;
   }, 1600);
