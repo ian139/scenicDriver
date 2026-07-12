@@ -6,6 +6,7 @@ from pathlib import Path
 import struct
 
 from PIL import Image
+import pytest
 from fastapi.testclient import TestClient
 
 import src.app_api.main as app_api
@@ -474,3 +475,180 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
     assert diagnosis_calls == [request]
     detail = response.json()["detail"]
     assert detail["diagnostics"] == {"graph_nodes": 4, "graph_edges": 3}
+
+
+def test_route_preload_lifespan_calls_once_and_skips_missing_optional(
+    tmp_path, monkeypatch
+) -> None:
+    default_graph = tmp_path / "default.graph.json"
+    default_report = tmp_path / "default.report.json"
+    default_graph.write_text("valid", encoding="utf-8")
+    default_report.write_text("valid", encoding="utf-8")
+    optional_graph = tmp_path / "optional.graph.json"
+    optional_report = tmp_path / "optional.report.json"
+    rows = [
+        {
+            "region": "optional",
+            "graph_path": optional_graph,
+            "tile_scores_path": optional_report,
+            "run_name": "optional-run",
+        },
+        {
+            "region": "default",
+            "graph_path": default_graph,
+            "tile_scores_path": default_report,
+            "run_name": "default-run",
+        },
+    ]
+    monkeypatch.setattr(app_api, "_configured_regions", lambda: rows)
+    monkeypatch.setattr(app_api, "_default_region_key", lambda: "default")
+    monkeypatch.setenv("SCENIC_ROUTE_PRELOAD", "required")
+    preload_calls: list[tuple[Path, Path, object, object]] = []
+
+    def fake_preload(graph_path, tile_path, zoom, fallback):
+        preload_calls.append((graph_path, tile_path, zoom, fallback))
+        return {
+            "graph_cache_hit": False,
+            "tile_score_cache_hit": False,
+            "scored_graph_cache_hit": False,
+        }
+
+    monkeypatch.setattr(app_api, "preload_route_assets", fake_preload)
+    with TestClient(create_app()) as test_client:
+        health = test_client.get("/v1/healthz")
+        assert health.status_code == 200
+        payload = health.json()["route_preload"]
+
+    assert preload_calls == [(default_graph, default_report, None, 1.0)]
+    assert payload["loaded_regions"] == ["default"]
+    assert payload["skipped_regions"] == ["optional"]
+    assert payload["regions"][0]["region"] == "optional"
+    assert payload["regions"][1]["region"] == "default"
+
+
+def test_route_preload_lifespan_fails_for_corrupt_default(
+    tmp_path, monkeypatch
+) -> None:
+    graph_path = tmp_path / "default.graph.json"
+    report_path = tmp_path / "default.report.json"
+    graph_path.write_text("present", encoding="utf-8")
+    report_path.write_text("present", encoding="utf-8")
+    monkeypatch.setattr(
+        app_api,
+        "_configured_regions",
+        lambda: [
+            {
+                "region": "default",
+                "graph_path": graph_path,
+                "tile_scores_path": report_path,
+                "run_name": "default-run",
+            }
+        ],
+    )
+    monkeypatch.setattr(app_api, "_default_region_key", lambda: "default")
+    monkeypatch.setenv("SCENIC_ROUTE_PRELOAD", "required")
+
+    def corrupt_preload(*args, **kwargs):
+        raise ValueError("corrupt graph")
+
+    monkeypatch.setattr(app_api, "preload_route_assets", corrupt_preload)
+    with pytest.raises(RuntimeError, match="default.*preload failed"):
+        with TestClient(create_app()):
+            pass
+
+
+def test_route_preload_default_mode_skips_missing_assets(tmp_path, monkeypatch) -> None:
+    rows = [
+        {
+            "region": "optional",
+            "graph_path": tmp_path / "optional.graph.json",
+            "tile_scores_path": tmp_path / "optional.report.json",
+            "run_name": "optional-run",
+        },
+        {
+            "region": "default",
+            "graph_path": tmp_path / "default.graph.json",
+            "tile_scores_path": tmp_path / "default.report.json",
+            "run_name": "default-run",
+        },
+    ]
+    monkeypatch.setattr(app_api, "_configured_regions", lambda: rows)
+    monkeypatch.setattr(app_api, "_default_region_key", lambda: "default")
+    monkeypatch.delenv("SCENIC_ROUTE_PRELOAD", raising=False)
+    preload_calls: list[object] = []
+    monkeypatch.setattr(
+        app_api,
+        "preload_route_assets",
+        lambda *args, **kwargs: preload_calls.append((args, kwargs)),
+    )
+
+    with TestClient(create_app()) as test_client:
+        payload = test_client.get("/v1/healthz").json()["route_preload"]
+
+    assert payload["mode"] == "best_effort"
+    assert payload["enabled"] is True
+    assert payload["loaded_regions"] == []
+    assert payload["skipped_regions"] == ["optional", "default"]
+    assert [row["status"] for row in payload["regions"]] == ["skipped", "skipped"]
+    assert preload_calls == []
+
+
+def test_route_preload_off_skips_all_assets(tmp_path, monkeypatch) -> None:
+    graph_path = tmp_path / "default.graph.json"
+    report_path = tmp_path / "default.report.json"
+    graph_path.write_text("present", encoding="utf-8")
+    report_path.write_text("present", encoding="utf-8")
+    monkeypatch.setattr(
+        app_api,
+        "_configured_regions",
+        lambda: [
+            {
+                "region": "default",
+                "graph_path": graph_path,
+                "tile_scores_path": report_path,
+                "run_name": "default-run",
+            }
+        ],
+    )
+    monkeypatch.setattr(app_api, "_default_region_key", lambda: "default")
+    monkeypatch.setenv("SCENIC_ROUTE_PRELOAD", "off")
+    preload_calls: list[object] = []
+    monkeypatch.setattr(
+        app_api,
+        "preload_route_assets",
+        lambda *args, **kwargs: preload_calls.append((args, kwargs)),
+    )
+
+    with TestClient(create_app()) as test_client:
+        payload = test_client.get("/v1/healthz").json()["route_preload"]
+
+    assert payload == {
+        "enabled": False,
+        "mode": "off",
+        "default_region": "default",
+        "regions": [],
+        "loaded_regions": [],
+        "skipped_regions": [],
+    }
+    assert preload_calls == []
+
+
+def test_route_preload_required_fails_for_missing_default(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api,
+        "_configured_regions",
+        lambda: [
+            {
+                "region": "default",
+                "graph_path": tmp_path / "default.graph.json",
+                "tile_scores_path": tmp_path / "default.report.json",
+                "run_name": "default-run",
+            }
+        ],
+    )
+    monkeypatch.setattr(app_api, "_default_region_key", lambda: "default")
+    monkeypatch.setenv("SCENIC_ROUTE_PRELOAD", "required")
+
+    with pytest.raises(RuntimeError, match="default.*missing"):
+        with TestClient(create_app()):
+            pass

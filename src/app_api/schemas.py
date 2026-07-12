@@ -14,7 +14,9 @@ class RouteCompareRequest(BaseModel):
     scenic_weight: float = Field(default=0.8, ge=0.0, le=1.0)
     region: str = Field(default="pittsfield")
     run_name: str | None = None
-    max_detour_factor: float = Field(default=1.8, ge=1.0)
+    max_detour_factor: float = Field(
+        default=1.8, ge=1.0, le=3.0, allow_inf_nan=False
+    )
     avoid_highways: bool = False
     include_baseline: bool = True
 

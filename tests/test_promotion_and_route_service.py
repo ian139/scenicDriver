@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
 import sys
+from threading import Event, Lock
 import pytest
 
 from src.route_planner import service as route_service
@@ -216,3 +218,350 @@ def test_plan_routes_uses_requested_filter_for_baseline_and_reports_constraints(
     )
     assert diagnostics["score_mapping_coverage"] == pytest.approx(0.0)
     assert diagnostics["planning_elapsed_ms"] >= 0.0
+
+
+def _write_cache_graph(path: Path, scenic_score: float = 1.0) -> None:
+    payload = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {
+                    "id": "edge",
+                    "road_type": "secondary",
+                    "scenic_score": scenic_score,
+                    "one_way": True,
+                },
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[-72.0, 42.0], [-72.0, 42.1]],
+                },
+            }
+        ],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_cache_tiles(path: Path, score: float) -> None:
+    x, y = route_service.lat_lon_to_tile(42.05, -72.0, 14)
+    path.write_text(
+        json.dumps({"tiles": [{"z": 14, "x": x, "y": y, "scenic_score": score}]}),
+        encoding="utf-8",
+    )
+
+
+def _cache_test_route(score: float) -> Route:
+    segment = RouteSegment(
+        start=(42.0, -72.0),
+        end=(42.1, -72.0),
+        distance_km=10.0,
+        scenic_score=score,
+        road_name=None,
+        road_type="secondary",
+    )
+    return Route(
+        segments=[segment],
+        total_distance_km=10.0,
+        average_scenic_score=score,
+        estimated_duration_minutes=12.0,
+        waypoints=[(42.0, -72.0), (42.1, -72.0)],
+    )
+
+
+def test_plan_routes_caches_graph_and_tile_parsing_and_preserves_response_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    tile_path = tmp_path / "tiles.json"
+    _write_cache_graph(graph_path)
+    _write_cache_tiles(tile_path, 8.0)
+    route_service.clear_route_caches()
+
+    graph_loads = 0
+    tile_loads = 0
+    original_graph_loader = route_service._load_graph
+    original_tile_loader = route_service.load_tile_scores
+
+    def counted_graph_loader(path: Path) -> object:
+        nonlocal graph_loads
+        graph_loads += 1
+        return original_graph_loader(path)
+
+    def counted_tile_loader(path: Path) -> object:
+        nonlocal tile_loads
+        tile_loads += 1
+        return original_tile_loader(path)
+
+    monkeypatch.setattr(route_service, "_load_graph", counted_graph_loader)
+    monkeypatch.setattr(route_service, "load_tile_scores", counted_tile_loader)
+
+    class FakePlanner:
+        def __init__(self, *, graph: object) -> None:
+            self.graph = graph
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            del kwargs
+            edge = next(iter(self.graph.edges.values()))
+            return _cache_test_route(float(edge.scenic_score))
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
+    request = route_service.RouteRequest(
+        graph_geojson=str(graph_path),
+        start=(42.0, -72.0),
+        end=(42.1, -72.0),
+        include_baseline=False,
+        tile_scores_json=str(tile_path),
+    )
+
+    first = route_service.plan_routes(request)
+    second = route_service.plan_routes(request)
+
+    assert graph_loads == 1
+    assert tile_loads == 1
+    assert first["routes"] == second["routes"]
+    assert first["geojson"] == second["geojson"]
+    assert set(first) == {"request", "diagnostics", "score_mapping", "routes", "geojson"}
+    assert second["diagnostics"]["graph_cache_hit"] is True
+    assert second["diagnostics"]["tile_score_cache_hit"] is True
+    assert second["diagnostics"]["scored_graph_cache_hit"] is True
+    assert second["score_mapping"] == first["score_mapping"]
+
+
+def test_plan_routes_invalidates_graph_and_tile_caches_when_files_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    tile_path = tmp_path / "tiles.json"
+    _write_cache_graph(graph_path)
+    _write_cache_tiles(tile_path, 8.0)
+    route_service.clear_route_caches()
+
+
+    scores: list[float] = []
+
+    class FakePlanner:
+        def __init__(self, *, graph: object) -> None:
+            self.graph = graph
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            del kwargs
+            edge = next(iter(self.graph.edges.values()))
+            scores.append(float(edge.scenic_score))
+            return _cache_test_route(float(edge.scenic_score))
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
+    request = route_service.RouteRequest(
+        graph_geojson=str(graph_path),
+        start=(42.0, -72.0),
+        end=(42.1, -72.0),
+        include_baseline=False,
+        tile_scores_json=str(tile_path),
+    )
+
+    first = route_service.plan_routes(request)
+    _write_cache_graph(graph_path, scenic_score=2.0)
+    second = route_service.plan_routes(request)
+    _write_cache_tiles(tile_path, 4.0)
+    third = route_service.plan_routes(request)
+
+    responses = (first, second, third)
+    assert scores == [8.0, 8.0, 4.0]
+    assert [
+        response["routes"][0]["metrics"]["average_scenic_score"]
+        for response in responses
+    ] == [8.0, 8.0, 4.0]
+    assert [
+        response["score_mapping"]["matched_edges"]
+        for response in responses
+    ] == [1, 1, 1]
+
+
+def test_plan_routes_tile_score_overlay_does_not_leak_between_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    first_tiles = tmp_path / "tiles-a.json"
+    second_tiles = tmp_path / "tiles-b.json"
+    _write_cache_graph(graph_path)
+    _write_cache_tiles(first_tiles, 9.0)
+    _write_cache_tiles(second_tiles, 3.0)
+    route_service.clear_route_caches()
+
+    scores: list[float] = []
+
+    class FakePlanner:
+        def __init__(self, *, graph: object) -> None:
+            self.graph = graph
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            del kwargs
+            edge = next(iter(self.graph.edges.values()))
+            scores.append(float(edge.scenic_score))
+            return _cache_test_route(float(edge.scenic_score))
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
+    base_request = {
+        "graph_geojson": str(graph_path),
+        "start": (42.0, -72.0),
+        "end": (42.1, -72.0),
+        "include_baseline": False,
+    }
+
+    route_service.plan_routes(
+        route_service.RouteRequest(**base_request, tile_scores_json=str(first_tiles))
+    )
+    route_service.plan_routes(route_service.RouteRequest(**base_request))
+    route_service.plan_routes(
+        route_service.RouteRequest(**base_request, tile_scores_json=str(second_tiles))
+    )
+
+    canonical = route_service._load_cached_graph(graph_path)[0]
+    assert scores == [9.0, 1.0, 3.0]
+    assert next(iter(canonical.edges.values())).scenic_score == pytest.approx(1.0)
+
+
+def test_preload_route_assets_populates_cache_before_first_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    tile_path = tmp_path / "tiles.json"
+    _write_cache_graph(graph_path)
+    _write_cache_tiles(tile_path, 8.0)
+    route_service.clear_route_caches()
+
+    preload = route_service.preload_route_assets(
+        graph_path,
+        tile_path,
+        None,
+        1.0,
+    )
+    assert preload["graph_cache_hit"] is False
+    assert preload["tile_score_cache_hit"] is False
+    assert preload["scored_graph_cache_hit"] is False
+    assert preload["score_mapping"]["matched_ratio"] == pytest.approx(1.0)
+
+    class FakePlanner:
+        def __init__(self, *, graph: object) -> None:
+            self.graph = graph
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            del kwargs
+            edge = next(iter(self.graph.edges.values()))
+            return _cache_test_route(float(edge.scenic_score))
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
+    result = route_service.plan_routes(
+        route_service.RouteRequest(
+            graph_geojson=str(graph_path),
+            start=(42.0, -72.0),
+            end=(42.1, -72.0),
+            include_baseline=False,
+            tile_scores_json=str(tile_path),
+            tile_score_fallback=1.0,
+        )
+    )
+    diagnostics = result["diagnostics"]
+    assert diagnostics["graph_cache_hit"] is True
+    assert diagnostics["tile_score_cache_hit"] is True
+    assert diagnostics["scored_graph_cache_hit"] is True
+    assert result["routes"][0]["metrics"]["average_scenic_score"] == pytest.approx(8.0)
+
+
+def test_concurrent_report_builds_publish_isolated_native_variants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    first_tiles = tmp_path / "tiles-a.json"
+    second_tiles = tmp_path / "tiles-b.json"
+    _write_cache_graph(graph_path)
+    _write_cache_tiles(first_tiles, 9.0)
+    _write_cache_tiles(second_tiles, 3.0)
+    route_service.clear_route_caches()
+
+    original_apply = route_service._apply_tile_scores_to_graph_native
+    first_builder_started = Event()
+    second_builder_started = Event()
+    release_first_builder = Event()
+    builder_graphs: list[object] = []
+    builder_lock = Lock()
+
+    def gated_apply(graph: object, *args: object, **kwargs: object) -> tuple[int, int]:
+        with builder_lock:
+            build_index = len(builder_graphs)
+            builder_graphs.append(graph)
+        if build_index == 0:
+            first_builder_started.set()
+            if not release_first_builder.wait(timeout=5.0):
+                raise AssertionError("timed out waiting to release first builder")
+        else:
+            second_builder_started.set()
+        return original_apply(graph, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        route_service, "_apply_tile_scores_to_graph_native", gated_apply
+    )
+
+    planned_graphs: list[object] = []
+
+    class FakePlanner:
+        def __init__(self, *, graph: object) -> None:
+            with builder_lock:
+                planned_graphs.append(graph)
+            self.graph = graph
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            del kwargs
+            edge = next(iter(self.graph.edges.values()))
+            return _cache_test_route(float(edge.scenic_score))
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
+    base_request = {
+        "graph_geojson": str(graph_path),
+        "start": (42.0, -72.0),
+        "end": (42.1, -72.0),
+        "include_baseline": False,
+    }
+    first_request = route_service.RouteRequest(
+        **base_request, tile_scores_json=str(first_tiles)
+    )
+    second_request = route_service.RouteRequest(
+        **base_request, tile_scores_json=str(second_tiles)
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(route_service.plan_routes, first_request)
+        assert first_builder_started.wait(timeout=5.0)
+        second_future = pool.submit(route_service.plan_routes, second_request)
+        # The first builder owns the cache lock through clone, scoring, and
+        # publication, so the second report cannot enter construction yet.
+        try:
+            assert not second_builder_started.is_set()
+        finally:
+            release_first_builder.set()
+        first_result = first_future.result(timeout=5.0)
+        second_result = second_future.result(timeout=5.0)
+
+    assert second_builder_started.is_set()
+    assert len(builder_graphs) == 2
+    first_variant, second_variant = builder_graphs
+    assert first_variant is not second_variant
+    assert float(next(iter(first_variant.edges.values())).scenic_score) == pytest.approx(
+        9.0
+    )
+    assert float(next(iter(second_variant.edges.values())).scenic_score) == pytest.approx(
+        3.0
+    )
+    assert float(next(iter(first_variant.edges.values())).scenic_score) == pytest.approx(
+        9.0
+    )
+    assert first_result["routes"][0]["metrics"]["average_scenic_score"] == pytest.approx(
+        9.0
+    )
+    assert second_result["routes"][0]["metrics"][
+        "average_scenic_score"
+    ] == pytest.approx(3.0)
+    assert len(planned_graphs) == 2
+    assert planned_graphs[0] is not planned_graphs[1]
+
+    canonical = route_service._load_cached_graph(graph_path)[0]
+    assert float(next(iter(canonical.edges.values())).scenic_score) == pytest.approx(1.0)

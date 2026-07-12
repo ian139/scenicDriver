@@ -4,6 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile.beta-api
     environment:
+      SCENIC_ROUTE_PRELOAD: required
       MAPBOX_ACCESS_TOKEN: ${MAPBOX_ACCESS_TOKEN}
     expose:
       - "8080"

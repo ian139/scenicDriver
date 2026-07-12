@@ -6,7 +6,14 @@ from dataclasses import dataclass
 
 from .graph import Edge
 
+HIGHWAY_ROAD_TYPES = frozenset({"highway", "motorway", "trunk"})
 SCENIC_BYWAY_DISCOUNT_CAP = 0.5
+
+
+def is_highway_road_type(road_type: object) -> bool:
+    return str(road_type).lower() in HIGHWAY_ROAD_TYPES
+
+
 MIN_EDGE_COST = 1e-6
 
 
@@ -46,7 +53,8 @@ class ScenicCostFunction:
     Scenic exposure is the time spent on an edge multiplied by its clamped
     scenic disutility, so subdividing a road geometry does not change its
     total cost.  Costs are always finite and clamped to ``>= 1e-6`` for
-    shortest-path search.
+    shortest-path search.  At ``scenic_weight=1`` this remains a positive
+    additive disutility objective, not a route-average scenic-score ratio.
     """
 
     def __init__(
@@ -103,7 +111,6 @@ class ScenicCostFunction:
         return max(raw, MIN_EDGE_COST)
 
     def _road_type_adjustment(self, road_type: str) -> float:
-        rt = str(road_type).lower()
-        if self.avoid_highways and rt in {"highway", "motorway", "trunk"}:
+        if self.avoid_highways and is_highway_road_type(road_type):
             return _finite_nonnegative(self.weights.highway_penalty)
         return 0.0

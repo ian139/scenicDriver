@@ -83,6 +83,57 @@ class Edge:
         speed = max(float(self.speed_limit_kmh), 1.0)
         return (self.distance_km / speed) * 60.0
 
+class _ReverseEdgeView:
+    """Allocation-free reverse traversal view over one canonical edge."""
+
+    __slots__ = ("_edge",)
+
+    def __init__(self, edge: Edge) -> None:
+        self._edge = edge
+
+    @property
+    def id(self) -> str:
+        return f"{self._edge.id}::rev"
+
+    @property
+    def start_node_id(self) -> str:
+        return self._edge.end_node_id
+
+    @property
+    def end_node_id(self) -> str:
+        return self._edge.start_node_id
+
+    @property
+    def distance_km(self) -> float:
+        return self._edge.distance_km
+
+    @property
+    def scenic_score(self) -> float:
+        return self._edge.scenic_score
+
+    @property
+    def road_name(self) -> Optional[str]:
+        return self._edge.road_name
+
+    @property
+    def road_type(self) -> str:
+        return self._edge.road_type
+
+    @property
+    def speed_limit_kmh(self) -> int:
+        return self._edge.speed_limit_kmh
+
+    @property
+    def travel_time_minutes(self) -> float:
+        return self._edge.travel_time_minutes
+
+    @property
+    def one_way(self) -> bool:
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._edge, name)
+
 
 class _NodeMapping(dict[str, Node]):
     """Dictionary facade that keeps the nearest-node index synchronized."""
@@ -192,6 +243,7 @@ class RoadGraph:
         self._heuristic_structure_epoch = 0
         self.nodes: Dict[str, Node] = _NodeMapping(self)
         self.edges: Dict[str, Edge] = _EdgeMapping(self)
+        self._reverse_edge_views: Dict[str, _ReverseEdgeView] = {}
         # node_id -> list[(edge_id, is_reverse_view)]
         self.adjacency: Dict[str, List[Tuple[str, bool]]] = {}
         # Built on the first nearest-node query and discarded whenever the
@@ -205,6 +257,7 @@ class RoadGraph:
 
     def _advance_heuristic_epoch(self) -> None:
         self._heuristic_structure_epoch += 1
+        self._reverse_edge_views.clear()
 
     def _heuristic_cache_stamp(self) -> Tuple[int, int, int]:
         return (
@@ -395,6 +448,19 @@ class RoadGraph:
                 )
             )
         return out
+    def iter_edges(self, node_id: str):
+        """Yield outgoing traversals without allocating a result list."""
+        for edge_id, reverse in self.adjacency.get(node_id, ()):
+            edge = self.edges[edge_id]
+            if not reverse:
+                yield edge
+                continue
+            reverse_view = self._reverse_edge_views.get(edge_id)
+            if reverse_view is None:
+                reverse_view = _ReverseEdgeView(edge)
+                self._reverse_edge_views[edge_id] = reverse_view
+            yield reverse_view
+
 
     def find_nearest_node(self, lat: float, lon: float) -> Node:
         return self.find_nearest_node_with_distance(lat, lon)[0]

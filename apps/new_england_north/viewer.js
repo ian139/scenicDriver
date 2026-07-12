@@ -483,7 +483,8 @@ function routeDiagnosticsMarkup(payload) {
     parts.push(`Planning ${formatNumber(elapsedMs, 0)} ms`);
   }
   const cap = Number(
-    diagnostics.applied_duration_factor ??
+    diagnostics.applied_max_detour_factor ??
+      diagnostics.applied_duration_factor ??
       diagnostics.effective_max_detour_factor ??
       request.max_detour_factor
   );
@@ -510,18 +511,18 @@ function renderRouteComparison(payload) {
   const scenic = payload.routes?.scenic;
   const baseline = payload.routes?.baseline;
   const deltas = payload.deltas;
-  if (!scenic || !baseline || deltas == null) {
-    throw new Error("API returned incomplete route comparison");
+  if (!scenic) {
+    throw new Error("API returned no scenic route");
   }
   setText(el.scenicDistance, `${formatNumber(scenic.total_distance_km, 1)} km`);
   setText(el.scenicDuration, `${formatNumber(scenic.estimated_duration_minutes, 0)} min`);
   setText(el.scenicScore, `${formatNumber(scenic.average_scenic_score, 2)} / 10`);
-  setText(el.baselineDistance, `${formatNumber(baseline.total_distance_km, 1)} km`);
-  setText(el.baselineDuration, `${formatNumber(baseline.estimated_duration_minutes, 0)} min`);
-  setText(el.baselineScore, `${formatNumber(baseline.average_scenic_score, 2)} / 10`);
-  setText(el.scenicDistanceDelta, signedNumber(deltas.distance_km, 1, " km"));
-  setText(el.scenicDurationDelta, signedNumber(deltas.duration_min, 0, " min"));
-  setText(el.scenicScoreDelta, signedNumber(deltas.scenic_score, 2));
+  setText(el.baselineDistance, baseline ? `${formatNumber(baseline.total_distance_km, 1)} km` : "--");
+  setText(el.baselineDuration, baseline ? `${formatNumber(baseline.estimated_duration_minutes, 0)} min` : "--");
+  setText(el.baselineScore, baseline ? `${formatNumber(baseline.average_scenic_score, 2)} / 10` : "--");
+  setText(el.scenicDistanceDelta, deltas ? signedNumber(deltas.distance_km, 1, " km") : "--");
+  setText(el.scenicDurationDelta, deltas ? signedNumber(deltas.duration_min, 0, " min") : "--");
+  setText(el.scenicScoreDelta, deltas ? signedNumber(deltas.scenic_score, 2) : "--");
   el.routeResultsDialog.showModal();
   el.closeRouteDialogBtn.focus();
 }

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from array import array
 from functools import lru_cache
 import io
 import json
+import logging
 import math
 import sys
 from dotenv import load_dotenv
@@ -18,7 +20,13 @@ import os
 import requests
 from urllib.parse import quote
 
-from src.route_planner.service import RouteRequest, diagnose_route_request, plan_routes
+from src.route_planner.service import (
+    RouteRequest,
+    diagnose_route_request,
+    plan_routes,
+    preload_route_assets,
+)
+
 
 from .contrib_repo import ContribRepo
 from .schemas import (
@@ -35,6 +43,7 @@ ROAD_GRAPHS_DIR = PROJECT_ROOT / "data/processed/road_graphs"
 RUNS_DIR = PROJECT_ROOT / "data/processed/heuristic_runs"
 MODEL_REGISTRY_PATH = PROJECT_ROOT / "data/processed/regression/model_registry.json"
 APP_REGIONS_PATH = PROJECT_ROOT / "config/app_regions.json"
+_LOGGER = logging.getLogger(__name__)
 
 
 def _load_app_region_config() -> dict[str, Any]:
@@ -226,6 +235,211 @@ def _latest_run_for_region(region: str) -> str | None:
     matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return matches[0].name
 
+_ROUTE_PRELOAD_MODES = frozenset({"off", "best_effort", "required"})
+_DEFAULT_ROUTE_PRELOAD_MODE = "best_effort"
+_LEGACY_ROUTE_PRELOAD_MODES = {
+    "0": "off",
+    "false": "off",
+    "no": "off",
+    "off": "off",
+    "1": "required",
+    "true": "required",
+    "yes": "required",
+    "on": "required",
+}
+
+
+def _route_preload_mode() -> str:
+    """Return the explicit startup route preload mode.
+
+    A fresh checkout defaults to best effort so ignored graph/report assets are
+    not required just to start the API.  Legacy boolean values retain their
+    former strict-enabled/disabled behavior where possible.
+    """
+
+    raw_value = os.getenv("SCENIC_ROUTE_PRELOAD")
+    if raw_value is None or not raw_value.strip():
+        return _DEFAULT_ROUTE_PRELOAD_MODE
+
+    value = raw_value.strip().lower().replace("-", "_")
+    if value in _ROUTE_PRELOAD_MODES:
+        return value
+    if value in _LEGACY_ROUTE_PRELOAD_MODES:
+        return _LEGACY_ROUTE_PRELOAD_MODES[value]
+
+    _LOGGER.warning(
+        "Unknown SCENIC_ROUTE_PRELOAD=%r; defaulting to %s",
+        raw_value,
+        _DEFAULT_ROUTE_PRELOAD_MODE,
+    )
+    return _DEFAULT_ROUTE_PRELOAD_MODE
+
+
+def _route_preload_enabled() -> bool:
+    """Return whether startup route materialization is enabled.
+
+    Kept as a compatibility helper for callers that only need the old
+    boolean view; startup itself uses :func:`_route_preload_mode`.
+    """
+
+    return _route_preload_mode() != "off"
+
+
+def _preload_configured_route_assets(
+    mode: str = _DEFAULT_ROUTE_PRELOAD_MODE,
+) -> dict[str, Any]:
+    """Preload configured graph/report pairs, retaining the default in cache."""
+
+    if mode not in _ROUTE_PRELOAD_MODES or mode == "off":
+        raise ValueError(f"Unsupported route preload mode: {mode!r}")
+
+    default_region = _default_region_key()
+    configured = list(_configured_regions())
+    configured.sort(
+        key=lambda item: (
+            str(item.get("region", "")).strip().lower() == default_region,
+        )
+    )
+    if default_region and not any(
+        str(item.get("region", "")).strip().lower() == default_region
+        for item in configured
+    ):
+        if mode == "required":
+            raise RuntimeError(
+                f"Configured default region '{default_region}' has no region entry"
+            )
+        _LOGGER.warning(
+            "Skipping route preload: configured default region '%s' has no "
+            "region entry",
+            default_region,
+        )
+
+    diagnostics: dict[str, Any] = {
+        "enabled": True,
+        "mode": mode,
+        "default_region": default_region,
+        "regions": [],
+    }
+    for item in configured:
+        region = str(item.get("region", "")).strip()
+        region_key = region.lower()
+        is_default = bool(default_region and region_key == default_region)
+        graph_value = item.get("graph_path") or item.get("graph")
+        graph_path = Path(graph_value) if graph_value else None
+        run_name = (
+            str(item["run_name"])
+            if item.get("run_name")
+            else _latest_run_for_region(region)
+        )
+        tile_value = (
+            item.get("tile_scores_json")
+            or item.get("tile_scores_path")
+            or item.get("report")
+            or item.get("report_json")
+        )
+        tile_path = (
+            Path(tile_value)
+            if tile_value
+            else RUNS_DIR / run_name / "report/report.json"
+            if run_name
+            else None
+        )
+        region_diag: dict[str, Any] = {
+            "region": region,
+            "default": is_default,
+            "graph_path": str(graph_path) if graph_path else None,
+            "tile_scores_path": str(tile_path) if tile_path else None,
+        }
+        missing: list[str] = []
+        if graph_path is None or not graph_path.exists():
+            missing.append("graph")
+        if tile_path is None or not tile_path.exists():
+            missing.append("report")
+        if missing:
+            reason = f"missing {', '.join(missing)} asset(s)"
+            if is_default and mode == "required":
+                raise RuntimeError(
+                    f"Configured default region '{region}' {reason}"
+                )
+            region_diag.update({"status": "skipped", "reason": reason})
+            diagnostics["regions"].append(region_diag)
+            _LOGGER.warning("Skipping route preload for %s: %s", region, reason)
+            continue
+        try:
+            preload_result = preload_route_assets(
+                graph_path,
+                tile_path,
+                item.get("tile_score_zoom"),
+                item.get("tile_score_fallback", 1.0),
+            )
+            if not isinstance(preload_result, dict):
+                preload_result = {}
+        except Exception as exc:
+            if is_default and mode == "required":
+                raise RuntimeError(
+                    f"Configured default region '{region}' preload failed"
+                ) from exc
+            reason = f"{type(exc).__name__}: {exc}"
+            region_diag.update({"status": "skipped", "reason": reason})
+            diagnostics["regions"].append(region_diag)
+            _LOGGER.warning(
+                "Skipping route preload for %s%s: %s",
+                "default " if is_default else "optional ",
+                region,
+                reason,
+            )
+            continue
+        region_diag.update({"status": "loaded", "preload": preload_result})
+        diagnostics["regions"].append(region_diag)
+        _LOGGER.info(
+            "Preloaded route assets for %s (graph_cache_hit=%s tile_cache_hit=%s "
+            "scored_cache_hit=%s)",
+            region,
+            preload_result.get("graph_cache_hit"),
+            preload_result.get("tile_score_cache_hit"),
+            preload_result.get("scored_graph_cache_hit"),
+        )
+
+    diagnostics["loaded_regions"] = [
+        row["region"]
+        for row in diagnostics["regions"]
+        if row.get("status") == "loaded"
+    ]
+    diagnostics["skipped_regions"] = [
+        row["region"]
+        for row in diagnostics["regions"]
+        if row.get("status") == "skipped"
+    ]
+    _LOGGER.info(
+        "Route preload complete: loaded=%d skipped=%d default=%s",
+        len(diagnostics["loaded_regions"]),
+        len(diagnostics["skipped_regions"]),
+        default_region,
+    )
+    return diagnostics
+
+
+@asynccontextmanager
+async def _api_lifespan(app: FastAPI):
+    mode = _route_preload_mode()
+    if mode != "off":
+        preload_diagnostics = _preload_configured_route_assets(mode)
+    else:
+        preload_diagnostics = {
+            "enabled": False,
+            "mode": mode,
+            "default_region": _default_region_key(),
+            "regions": [],
+            "loaded_regions": [],
+            "skipped_regions": [],
+        }
+        _LOGGER.warning(
+            "Route asset preload disabled by SCENIC_ROUTE_PRELOAD=%s",
+            mode,
+        )
+    app.state.route_preload_diagnostics = preload_diagnostics
+    yield
+
 
 def _list_regions() -> list[dict[str, Any]]:
     def _compute_geojson_bbox(path: Path) -> dict[str, float] | None:
@@ -380,7 +594,11 @@ def _tile_to_bounds(x: int, y: int, z: int) -> tuple[float, float, float, float]
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="ScenicDrive API", version="0.1.0")
+    app = FastAPI(
+        title="ScenicDrive API",
+        version="0.1.0",
+        lifespan=_api_lifespan,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -396,14 +614,27 @@ def create_app() -> FastAPI:
     )
 
     repo = ContribRepo()
-
     @app.get("/v1/healthz")
     def healthz() -> dict[str, Any]:
+        preload_mode = _route_preload_mode()
+        preload_diagnostics = getattr(
+            app.state,
+            "route_preload_diagnostics",
+            {
+                "enabled": preload_mode != "off",
+                "mode": preload_mode,
+                "default_region": _default_region_key(),
+                "regions": [],
+                "loaded_regions": [],
+                "skipped_regions": [],
+            },
+        )
         return {
             "ok": True,
             "default_region": _default_region_key(),
             "model_registry_exists": MODEL_REGISTRY_PATH.exists(),
             "regions_available": len(_list_regions()),
+            "route_preload": preload_diagnostics,
         }
 
     @app.get("/")
