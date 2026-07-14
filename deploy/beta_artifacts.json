@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "description": "Ignored beta deployment artifacts. Objects are addressed as s3://<bucket>/<prefix>/<source_key>; destination is relative to the project root. Gzip sources are decompressed before final SHA-256 and size verification.",
+  "artifacts": [
+    {
+      "name": "graph",
+      "destination": "data/processed/road_graphs/new_england_north_burlington_bangor_corridor35/road_graph.json",
+      "source_key": "data/processed/road_graphs/new_england_north_burlington_bangor_corridor35/road_graph.json.gz",
+      "compression": "gzip",
+      "sha256": "ad5fcddc464622464789ed0b9265055a3db0edfcf49c89958d2075d6e226fa7e",
+      "size_bytes": 490042661
+    },
+    {
+      "name": "report",
+      "destination": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json",
+      "source_key": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json.gz",
+      "compression": "gzip",
+      "sha256": "249fc55085b6fe17396fa022ff550100e7accbaca8902813cc6f53374dc88b39",
+      "size_bytes": 66101946
+    },
+    {
+      "name": "route.geojson",
+      "destination": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route.geojson",
+      "source_key": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route.geojson.gz",
+      "compression": "gzip",
+      "sha256": "f3c85a1e23dbc2735f584352efaf9594e22ab93cf7057666e4538aab8b5c89b9",
+      "size_bytes": 14385648
+    },
+    {
+      "name": "route_metrics.json",
+      "destination": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route_metrics.json",
+      "source_key": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route_metrics.json.gz",
+      "compression": "gzip",
+      "sha256": "42dd172a402faff22a87704467049ce98733d5d1177952fbd5b1053e97dfbcfd",
+      "size_bytes": 11775361
+    },
+    {
+      "name": "model_registry.json",
+      "destination": "data/processed/regression/model_registry.json",
+      "source_key": "data/processed/regression/model_registry.json",
+      "sha256": "3d6d5ba553bb78206cd487c613927953ca7888c61cfd1ed8331dced85fa7b44d",
+      "size_bytes": 6117
+    },
+    {
+      "name": "promoted_checkpoint",
+      "destination": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt",
+      "source_key": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt",
+      "sha256": "16b3edb65ea8c993de5ad81e93db4627e152d1400b6bfc2036b423fa90c5d641",
+      "size_bytes": 978489
+    }
+  ]
+}

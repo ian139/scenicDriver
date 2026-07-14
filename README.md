@@ -37,13 +37,28 @@ The web MVP includes:
 - route comparison and scenic controls
 - active remote-training evaluation
 
+## Release and deployment boundary
+
+This is a private source preview, not an open-source distribution. The root
+[`LICENSE`](LICENSE) reserves all rights and the repository remains not for
+distribution. Source checkouts intentionally exclude model weights, generated
+route/report data, datasets, and credentials.
+
+- **Source preview:** run the API and static viewer locally. The shell and
+  health endpoints work without ignored runtime artifacts, but the learned
+  heatmap and route comparison need the artifact set described in
+  [`NEXT_STEPS.md`](NEXT_STEPS.md).
+- **Hosted beta:** the Docker Compose deployment mounts those artifacts
+  read-only and requires a runtime `MAPBOX_ACCESS_TOKEN`. It is a separate
+  hosted deployment path, not a promise that the source preview is
+  self-contained.
+
 ## Tech stack
 
 - ML: PyTorch, timm, numpy, pandas
 - Geo: rasterio (optional), shapely (optional), osmnx (optional for routing)
 - Tooling: uv, marimo
 - Viewer/Web: static MapLibre app under `apps/new_england_north/`
-- API: FastAPI under `src/app_api/`
 
 ## Workflow
 
@@ -59,7 +74,7 @@ Use grouped workflow CLIs under `scripts/annotation/`, `scripts/ingest/`, `scrip
 ## Quick start
 
 ```bash
-uv sync
+uv sync --frozen --extra dev
 export MAPBOX_ACCESS_TOKEN=<your-token>
 uv run uvicorn src.app_api.main:app --host 0.0.0.0 --port 8080 --reload
 cd apps/new_england_north && python3 -m http.server 3000
@@ -74,6 +89,21 @@ The beta runs as a single public Nginx origin backed by an internal FastAPI
 service. Processed route/heatmap artifacts and model weights are deployment
 prerequisites; they remain outside Git and Docker image layers and are mounted
 read-only from `data/processed/` and `models/`.
+Before a hosted startup, populate the canonical ignored artifacts and verify
+their checksums:
+
+```bash
+SCENIC_S3_BUCKET=scenicdriver-data SCENIC_S3_PREFIX=releases/routeOptimizer/75ee0431/ \
+  uv run python scripts/deploy/bootstrap_beta_artifacts.py
+SCENIC_S3_BUCKET=scenicdriver-data SCENIC_S3_PREFIX=releases/routeOptimizer/75ee0431/ \
+  uv run python scripts/deploy/bootstrap_beta_artifacts.py --check-only
+```
+
+The JSON manifest records each destination, source key, byte size, compression,
+and SHA-256; the equivalent plain checksum list is
+[`deploy/beta_artifacts.sha256`](deploy/beta_artifacts.sha256). Keep S3
+credentials and the `.env.beta` file outside Git; see [`NEXT_STEPS.md`](NEXT_STEPS.md)
+for the complete artifact list and release boundary.
 
 ```bash
 cp .env.beta.example .env.beta
@@ -87,9 +117,6 @@ Open `http://localhost:${SCENIC_WEB_PORT:-80}`. Stop the beta with:
 docker compose --env-file .env.beta -f compose.beta.yml down
 ```
 
-Before startup, sync the canonical ignored New England graph, learned run,
-registry, and active registry checkpoint into their documented
-`data/processed/` and `models/` paths.
 
 ## Common workflows
 
@@ -464,8 +491,11 @@ archive/
 - Python 3.11+
 - `uv` package manager
 - Mapbox access token (free tier works)
+- Node.js 20+ for the viewer test
 - GPU recommended for training
 
 ## License
 
-Private repository - not for distribution.
+Private repository - not for distribution. All rights reserved; see
+[`LICENSE`](LICENSE). No source, model, data, artifact, or credential
+redistribution is authorized by this notice.

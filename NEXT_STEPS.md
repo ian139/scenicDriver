@@ -1,0 +1,118 @@
+# Release and deployment next steps
+
+## Release boundary
+
+The current release is a **source preview**, not an open-source distribution. The
+repository remains private and not for distribution; `LICENSE` is an
+all-rights-reserved notice. Do not publish a source archive, model weights,
+datasets, generated reports, credentials, or deployment images without written
+permission from the copyright owner.
+
+The source preview contains the application code, configuration, tests, locked
+Python dependencies, and the static New England North viewer. It intentionally
+does not contain the ignored runtime graph/report/checkpoint artifacts listed
+below. A clean checkout can run the API and viewer shell, but a complete learned
+heatmap and route comparison require the artifact set.
+
+## Reproduce the source preview
+
+Use Python 3.11+ and `uv`:
+
+```bash
+uv sync --frozen --extra dev
+uv run pytest -q
+node --test tests/test_new_england_north_viewer.mjs
+```
+
+To view the shell locally, start the API and static viewer in separate
+terminals:
+
+```bash
+uv run uvicorn src.app_api.main:app --host 0.0.0.0 --port 8080
+cd apps/new_england_north && python3 -m http.server 3000
+```
+
+Then open `http://localhost:3000`. With no ignored artifacts, leave
+`SCENIC_ROUTE_PRELOAD` unset (best-effort mode) or set it to `off`; the API will
+still start, while artifact-backed heatmap and route data remain unavailable.
+Address search also requires a runtime `MAPBOX_ACCESS_TOKEN`.
+
+## Required ignored artifacts for the hosted beta
+
+The hosted beta uses read-only mounts from `data/processed/` and `models/`.
+These paths are ignored by Git and must be supplied out of band:
+
+- `data/processed/road_graphs/new_england_north_burlington_bangor_corridor35/road_graph.json`
+- `data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json`
+- `data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route.geojson`
+- `data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route_metrics.json`
+- `data/processed/regression/model_registry.json`
+- `models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt`
+
+The registry's active checkpoint entry is authoritative. The checkpoint must
+exist at the registry destination and match the promoted model expected by the
+configured New England North region; do not rename or silently substitute it.
+Raw imagery, processed feature arrays, classifier weights, and other generated
+reports may be needed by training workflows but are not required by the beta
+runtime unless a manifest explicitly adds them.
+
+Use the checked-in manifest and bootstrap/checksum tool before starting a host:
+
+```bash
+SCENIC_S3_BUCKET=scenicdriver-data \
+SCENIC_S3_PREFIX=releases/routeOptimizer/75ee0431/ \
+  uv run python scripts/deploy/bootstrap_beta_artifacts.py
+SCENIC_S3_BUCKET=scenicdriver-data \
+SCENIC_S3_PREFIX=releases/routeOptimizer/75ee0431/ \
+  uv run python scripts/deploy/bootstrap_beta_artifacts.py --check-only
+```
+
+The bootstrap command downloads only the manifest destinations, and verifies
+SHA-256 and byte size for every artifact. Keep AWS credentials and the `.env.beta`
+file out of Git; provide credentials through the runtime environment or an
+external credentials file.
+
+The four largest JSON/GeoJSON objects are stored as `.gz` in S3 to make
+bootstrap transfer practical; the script decompresses them and verifies the
+uncompressed destination digest and size recorded in the manifest.
+The plain checksum list is also checked in at `deploy/beta_artifacts.sha256`
+for standard `sha256sum` tooling; keep it synchronized with the JSON manifest.
+
+## Hosted beta deployment
+
+A hosted deployment is distinct from the source preview. It requires Docker,
+the ignored artifacts above, and a Mapbox token supplied only at runtime:
+
+```bash
+cp .env.beta.example .env.beta
+# Edit .env.beta and set MAPBOX_ACCESS_TOKEN; do not commit .env.beta.
+docker compose --env-file .env.beta -f compose.beta.yml up --build
+```
+
+`compose.beta.yml` sets `SCENIC_ROUTE_PRELOAD=required`, which makes missing or
+invalid default-region graph and report assets fail startup instead of silently
+serving an incomplete beta.
+The API mounts `data/processed/` and `models/` read-only; model files and
+credentials must never be copied into the image layers. Stop the deployment
+with:
+
+```bash
+docker compose --env-file .env.beta -f compose.beta.yml down
+```
+
+## Ordered next steps
+
+1. Keep the complete, versioned beta artifact set in the private artifact store;
+   the current checked-in manifest uses
+   `releases/routeOptimizer/75ee0431/` as its S3 prefix.
+2. On the intended host, run the bootstrap download command and then repeat it
+   with `--check-only` before building Docker images.
+3. Run the strict-preload beta smoke check, including API health, heatmap data,
+   route comparison, and address search with a valid Mapbox token.
+4. Keep model/token credentials and all generated artifacts in external secret
+   and artifact stores; rotate tokens independently of source releases.
+5. Treat `.github/workflows/ci.yml` as the clean-runner gate: it installs the
+   frozen project plus locked `dev` extra, then runs both required test commands.
+6. Before any broader release, obtain explicit distribution permission and
+   replace this private preview boundary with an approved license and artifact
+   publication policy.

@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.16"
+          enable-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Keep the canonical frozen sync explicit. The project declares pytest,
+      # ruff, and black as the optional dev extra, so install that locked extra
+      # before running the Python tests as well.
+      - name: Install locked Python dependencies
+        run: uv sync --frozen
+
+      - name: Install locked development tools
+        run: uv sync --frozen --extra dev
+
+      - name: Run Python tests
+        run: uv run pytest -q
+
+      - name: Run viewer tests
+        run: node --test tests/test_new_england_north_viewer.mjs
