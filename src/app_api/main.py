@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import math
+import re
 import sys
 from dotenv import load_dotenv
 
@@ -44,6 +45,20 @@ RUNS_DIR = PROJECT_ROOT / "data/processed/heuristic_runs"
 MODEL_REGISTRY_PATH = PROJECT_ROOT / "data/processed/regression/model_registry.json"
 APP_REGIONS_PATH = PROJECT_ROOT / "config/app_regions.json"
 _LOGGER = logging.getLogger(__name__)
+
+_SAFE_REGION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_SAFE_RUN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def _safe_asset_name(value: str, *, kind: str) -> str:
+    pattern = _SAFE_REGION_RE if kind == "region" else _SAFE_RUN_RE
+    if not pattern.fullmatch(value):
+        raise HTTPException(status_code=422, detail=f"Invalid {kind}")
+    return value
+
+def _run_report_path(run_name: str) -> Path:
+    safe_run = _safe_asset_name(run_name, kind="run_name")
+    return RUNS_DIR / safe_run / "report/report.json"
 
 
 def _load_app_region_config() -> dict[str, Any]:
@@ -492,15 +507,10 @@ def _list_regions() -> list[dict[str, Any]]:
                 "region": region,
                 "display_name": item.get("display_name", region),
                 "description": item.get("description"),
-                "graph_geojson": str(graph) if graph else None,
                 "graph_exists": bool(graph and graph.exists()),
                 "latest_run_name": latest_run,
-                "report_json": str(RUNS_DIR / latest_run / "report/report.json")
-                if latest_run
-                else None,
                 "bbox": item.get("bbox"),
                 "map": item.get("map"),
-                "model_checkpoint": item.get("model_checkpoint"),
                 "is_default": region.lower() == default_region,
                 "source": "config",
             }
@@ -534,12 +544,8 @@ def _list_regions() -> list[dict[str, Any]]:
             {
                 "region": region,
                 "display_name": region,
-                "graph_geojson": str(graph),
                 "graph_exists": True,
                 "latest_run_name": latest_run,
-                "report_json": str(RUNS_DIR / latest_run / "report/report.json")
-                if latest_run
-                else None,
                 "bbox": bbox,
                 "is_default": region.lower() == default_region,
                 "source": "discovered",
@@ -593,6 +599,522 @@ def _tile_to_bounds(x: int, y: int, z: int) -> tuple[float, float, float, float]
     return lat_s, lon_w, lat_n, lon_e
 
 
+
+
+_REQUIRED_SCORE_MAPPING_FIELDS = (
+    "report_signature",
+    "graph_signature",
+    "normalization",
+    "fallback_edges",
+    "score_run",
+)
+_REQUIRED_COMPARISON_DIAGNOSTICS = (
+    "requested_scenic_weight",
+    "applied_scenic_weight",
+    "requested_max_detour_factor",
+    "applied_max_detour_factor",
+    "scenic_fastest_duration_ratio",
+    "score_mapping_coverage",
+    "optimization_mode",
+    "optimization_status",
+    "optimality_gap",
+    "certified_upper_bound",
+    "scenic_score_delta_absolute",
+    "scenic_score_delta_relative",
+    "same_route",
+    "no_better_route_reason",
+)
+
+_REQUIRED_ROUTE_METRICS = (
+    "edge_ids",
+    "segment_identity",
+    "raw_scenic_score",
+    "normalized_scenic_score",
+    "objective",
+    "objective_value",
+    "total_distance_km",
+    "estimated_duration_minutes",
+    "requested_scenic_weight",
+    "applied_scenic_weight",
+    "requested_max_detour_factor",
+    "applied_max_detour_factor",
+    "actual_duration_ratio",
+    "certified_upper_bound",
+    "exactness_status",
+    "optimality_gap",
+    "highway_count",
+    "score_coverage",
+    "score_run",
+    "zero_improvement_reason",
+    "no_route_reason",
+    "objective_components",
+)
+
+
+_PRIVATE_RESPONSE_KEYS = frozenset(
+    {"source", "graph_geojson", "tile_scores_json", "tile_score_fallback"}
+)
+
+
+def _redact_private_response(value: Any) -> Any:
+    """Remove filesystem-bearing metadata from public route responses."""
+
+    if isinstance(value, dict):
+        return {
+            key: _redact_private_response(item)
+            for key, item in value.items()
+            if key not in _PRIVATE_RESPONSE_KEYS
+        }
+    if isinstance(value, list):
+        return [_redact_private_response(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_private_response(item) for item in value]
+    return value
+
+
+def _public_route_request(
+    payload: RouteCompareRequest,
+    *,
+    run_name: str,
+) -> dict[str, Any]:
+    """Project only user-facing route controls; never expose asset paths."""
+
+    return {
+        "region": payload.region,
+        "run_name": run_name,
+        "start": {"lat": payload.start.lat, "lon": payload.start.lon},
+        "end": {"lat": payload.end.lat, "lon": payload.end.lon},
+        "scenic_weight": payload.scenic_weight,
+        "avoid_highways": payload.avoid_highways,
+        "max_detour_factor": payload.max_detour_factor,
+        "include_baseline": payload.include_baseline,
+    }
+
+
+def _public_preload_diagnostics(value: Any) -> dict[str, Any]:
+    """Project health preload data without exposing asset paths or errors."""
+
+    if not isinstance(value, dict):
+        return {
+            "enabled": False,
+            "mode": "off",
+            "default_region": _default_region_key(),
+            "regions": [],
+            "loaded_regions": [],
+            "skipped_regions": [],
+        }
+    public: dict[str, Any] = {
+        key: value.get(key)
+        for key in (
+            "enabled",
+            "mode",
+            "default_region",
+            "loaded_regions",
+            "skipped_regions",
+        )
+        if key in value
+    }
+    public_regions: list[dict[str, Any]] = []
+    for row in value.get("regions", []):
+        if not isinstance(row, dict):
+            continue
+        item: dict[str, Any] = {
+            key: row[key]
+            for key in ("region", "default", "status")
+            if key in row
+        }
+        preload = row.get("preload")
+        if isinstance(preload, dict):
+            cache_keys = (
+                "graph_cache_hit",
+                "tile_score_cache_hit",
+                "scored_graph_cache_hit",
+            )
+            cache = {key: preload[key] for key in cache_keys if key in preload}
+            mapping = preload.get("score_mapping")
+            if isinstance(mapping, dict):
+                coverage = {
+                    key: mapping[key]
+                    for key in (
+                        "enabled",
+                        "zoom",
+                        "matched_edges",
+                        "fallback_edges",
+                        "total_edges",
+                        "matched_ratio",
+                    )
+                    if key in mapping
+                }
+                signatures = {
+                    key: mapping[key]
+                    for key in (
+                        "report_signature",
+                        "graph_signature",
+                        "normalization",
+                        "score_run",
+                    )
+                    if key in mapping
+                }
+                if coverage:
+                    item["coverage"] = coverage
+                if signatures:
+                    item["signatures"] = signatures
+            timings = {
+                key: preload[key]
+                for key in (
+                    "preload_elapsed_ms",
+                    "graph_load_elapsed_ms",
+                    "tile_score_load_elapsed_ms",
+                    "score_application_elapsed_ms",
+                )
+                if key in preload
+            }
+            if cache:
+                item["cache"] = cache
+            if timings:
+                item["timings"] = timings
+        public_regions.append(item)
+    public["regions"] = public_regions
+    return public
+def _validate_certified_bound(
+    metrics: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    """Validate a certified upper-bound/gap pair without claiming exactness."""
+
+    status = str(metrics.get("exactness_status") or metrics.get("optimization_status") or "").lower()
+    exact = status in {"exact", "optimal"}
+    approximate = status.startswith("approximate") or status == "certified"
+    if not exact and not approximate:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "invalid_route_service_response",
+                "message": f"{label} result has unknown exactness status",
+            },
+        )
+    objective = metrics.get("objective_value")
+    upper_bound = metrics.get("certified_upper_bound")
+    gap = metrics.get("optimality_gap")
+    if exact:
+        valid_objective = (
+            not isinstance(objective, bool)
+            and isinstance(objective, (int, float))
+            and math.isfinite(float(objective))
+        )
+        valid_gap = gap is None or (
+            not isinstance(gap, bool)
+            and isinstance(gap, (int, float))
+            and math.isfinite(float(gap))
+            and abs(float(gap)) <= 1e-9
+        )
+        valid_bound = upper_bound is None or (
+            not isinstance(upper_bound, bool)
+            and isinstance(upper_bound, (int, float))
+            and math.isfinite(float(upper_bound))
+            and valid_objective
+            and abs(float(upper_bound) - float(objective)) <= 1e-9
+        )
+        if not valid_objective or not valid_gap or not valid_bound:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "invalid_route_service_response",
+                    "message": f"{label} exact result has inconsistent certification data",
+                },
+            )
+        return
+    if upper_bound is None:
+        if approximate:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "invalid_route_service_response",
+                    "message": f"{label} approximate result has no certified upper bound",
+                },
+            )
+        if gap is not None and (
+            isinstance(gap, bool)
+            or not isinstance(gap, (int, float))
+            or not math.isfinite(float(gap))
+            or abs(float(gap)) > 1e-9
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "invalid_route_service_response",
+                    "message": f"{label} exact result has a nonzero optimality gap",
+                },
+            )
+        return
+    if (
+        isinstance(objective, bool)
+        or isinstance(upper_bound, bool)
+        or isinstance(gap, bool)
+        or not isinstance(objective, (int, float))
+        or not isinstance(upper_bound, (int, float))
+        or not isinstance(gap, (int, float))
+        or not math.isfinite(float(objective))
+        or not math.isfinite(float(upper_bound))
+        or not math.isfinite(float(gap))
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "invalid_route_service_response",
+                "message": f"{label} certified bound is not finite numeric data",
+            },
+        )
+    tolerance = max(1e-9, abs(float(upper_bound)) * 1e-6)
+    if float(upper_bound) + tolerance < float(objective):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "invalid_route_service_response",
+                "message": f"{label} certified upper bound is below objective",
+            },
+        )
+    if abs((float(upper_bound) - float(objective)) - float(gap)) > tolerance:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "invalid_route_service_response",
+                "message": f"{label} certified gap does not match upper bound minus objective",
+            },
+        )
+
+
+
+
+def _validate_route_contract(
+    result: dict[str, Any],
+    *,
+    request: RouteRequest,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate the single service response schema before exposing it."""
+
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Route service returned an invalid response",
+        )
+    score_mapping = result.get("score_mapping")
+    if not isinstance(score_mapping, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Route service returned no score mapping metadata",
+        )
+    missing_mapping = [
+        key for key in _REQUIRED_SCORE_MAPPING_FIELDS if key not in score_mapping
+    ]
+    if missing_mapping:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "invalid_route_service_response",
+                "missing_score_mapping": missing_mapping,
+            },
+        )
+    diagnostics = result.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Route service returned no comparison diagnostics",
+        )
+    missing_diagnostics = [
+        key for key in _REQUIRED_COMPARISON_DIAGNOSTICS if key not in diagnostics
+    ]
+    if missing_diagnostics:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "invalid_route_service_response",
+                "missing_diagnostics": missing_diagnostics,
+            },
+        )
+
+    requested_weight = diagnostics["requested_scenic_weight"]
+    applied_weight = diagnostics["applied_scenic_weight"]
+    requested = diagnostics["requested_max_detour_factor"]
+    applied = diagnostics["applied_max_detour_factor"]
+    if (
+        isinstance(requested_weight, bool)
+        or isinstance(applied_weight, bool)
+        or not isinstance(requested_weight, (int, float))
+        or not isinstance(applied_weight, (int, float))
+        or not math.isfinite(float(requested_weight))
+        or not math.isfinite(float(applied_weight))
+        or float(requested_weight) != float(request.scenic_weight)
+        or float(applied_weight) != float(request.scenic_weight)
+        or isinstance(requested, bool)
+        or isinstance(applied, bool)
+        or not isinstance(requested, (int, float))
+        or not isinstance(applied, (int, float))
+        or not math.isfinite(float(requested))
+        or not math.isfinite(float(applied))
+        or float(requested) != float(request.max_detour_factor)
+        or float(applied) != float(request.max_detour_factor)
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "invalid_route_service_response",
+                "message": "Route service changed the requested settings",
+            },
+        )
+
+    rows = result.get("routes")
+    if not isinstance(rows, list):
+        raise HTTPException(
+            status_code=502,
+            detail="Route service returned no routes",
+        )
+    routes: dict[str, Any] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("route_kind"), str):
+            raise HTTPException(
+                status_code=502,
+                detail="Route service returned an invalid route row",
+            )
+        metrics = row.get("metrics")
+        if not isinstance(metrics, dict):
+            raise HTTPException(
+                status_code=502,
+                detail="Route service returned invalid route metrics",
+            )
+        missing_metrics = [
+            key for key in _REQUIRED_ROUTE_METRICS if key not in metrics
+        ]
+        if missing_metrics:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "invalid_route_service_response",
+                    "route_kind": row["route_kind"],
+                    "missing_metrics": missing_metrics,
+                },
+            )
+        metric_requested_weight = metrics["requested_scenic_weight"]
+        metric_applied_weight = metrics["applied_scenic_weight"]
+        metric_requested = metrics["requested_max_detour_factor"]
+        metric_applied = metrics["applied_max_detour_factor"]
+        if (
+            isinstance(metric_requested_weight, bool)
+            or isinstance(metric_applied_weight, bool)
+            or not isinstance(metric_requested_weight, (int, float))
+            or not isinstance(metric_applied_weight, (int, float))
+            or not math.isfinite(float(metric_requested_weight))
+            or not math.isfinite(float(metric_applied_weight))
+            or float(metric_requested_weight) != float(request.scenic_weight)
+            or float(metric_applied_weight) != float(request.scenic_weight)
+            or isinstance(metric_requested, bool)
+            or isinstance(metric_applied, bool)
+            or not isinstance(metric_requested, (int, float))
+            or not isinstance(metric_applied, (int, float))
+            or not math.isfinite(float(metric_requested))
+            or not math.isfinite(float(metric_applied))
+            or float(metric_requested) != float(request.max_detour_factor)
+            or float(metric_applied) != float(request.max_detour_factor)
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "invalid_route_service_response",
+                    "route_kind": row["route_kind"],
+                    "message": "Route service changed the requested settings",
+                },
+            )
+        for numeric_key in (
+            "objective",
+            "objective_value",
+            "total_distance_km",
+            "estimated_duration_minutes",
+            "raw_scenic_score",
+            "normalized_scenic_score",
+        ):
+            numeric_value = metrics[numeric_key]
+            if (
+                isinstance(numeric_value, bool)
+                or not isinstance(numeric_value, (int, float))
+                or not math.isfinite(float(numeric_value))
+            ):
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Route service returned invalid {numeric_key}",
+                )
+        if float(metrics["objective"]) != float(metrics["objective_value"]):
+            raise HTTPException(
+                status_code=502,
+                detail="Route service returned inconsistent objective fields",
+            )
+        components = metrics["objective_components"]
+        component_value = (
+            components.get("objective_value")
+            if isinstance(components, dict)
+            else None
+        )
+        if (
+            isinstance(component_value, bool)
+            or not isinstance(component_value, (int, float))
+            or not math.isfinite(float(component_value))
+            or not math.isclose(
+                float(component_value),
+                float(metrics["objective_value"]),
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail="Route service returned invalid objective components",
+            )
+        _validate_certified_bound(metrics, label=f"{row['route_kind']} route")
+        routes[row["route_kind"]] = dict(metrics)
+    if "scenic" not in routes:
+        raise HTTPException(
+            status_code=502,
+            detail="Route service returned no scenic route",
+        )
+    if request.include_baseline and "baseline" not in routes:
+        raise HTTPException(
+            status_code=502,
+            detail="Route service returned no baseline route",
+        )
+    geojson = result.get("geojson")
+    features = geojson.get("features") if isinstance(geojson, dict) else None
+    if (
+        not isinstance(geojson, dict)
+        or geojson.get("type") != "FeatureCollection"
+        or not isinstance(features, list)
+    ):
+        raise HTTPException(
+            status_code=502, detail="Route service returned invalid route GeoJSON"
+        )
+    feature_kinds = {
+        feature.get("properties", {}).get("route_kind")
+        for feature in features
+        if isinstance(feature, dict) and isinstance(feature.get("properties"), dict)
+    }
+    required_feature_kinds = {"scenic"} | (
+        {"baseline"} if request.include_baseline else set()
+    )
+    if not required_feature_kinds.issubset(feature_kinds):
+        raise HTTPException(
+            status_code=502, detail="Route service returned incomplete route GeoJSON"
+        )
+    _validate_certified_bound(
+        {
+            "objective_value": routes["scenic"]["objective_value"],
+            "certified_upper_bound": diagnostics["certified_upper_bound"],
+            "optimality_gap": diagnostics["optimality_gap"],
+            "optimization_status": diagnostics["optimization_status"],
+        },
+        label="comparison",
+    )
+    return dict(diagnostics), routes
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="ScenicDrive API",
@@ -617,17 +1139,19 @@ def create_app() -> FastAPI:
     @app.get("/v1/healthz")
     def healthz() -> dict[str, Any]:
         preload_mode = _route_preload_mode()
-        preload_diagnostics = getattr(
-            app.state,
-            "route_preload_diagnostics",
-            {
-                "enabled": preload_mode != "off",
-                "mode": preload_mode,
-                "default_region": _default_region_key(),
-                "regions": [],
-                "loaded_regions": [],
-                "skipped_regions": [],
-            },
+        preload_diagnostics = _public_preload_diagnostics(
+            getattr(
+                app.state,
+                "route_preload_diagnostics",
+                {
+                    "enabled": preload_mode != "off",
+                    "mode": preload_mode,
+                    "default_region": _default_region_key(),
+                    "regions": [],
+                    "loaded_regions": [],
+                    "skipped_regions": [],
+                },
+            )
         )
         return {
             "ok": True,
@@ -745,23 +1269,40 @@ def create_app() -> FastAPI:
             or not all(isinstance(value, (int, float)) for value in coordinates[:2])
         ):
             raise HTTPException(status_code=404, detail="Address result is unavailable")
+        lat = float(coordinates[1])
+        lon = float(coordinates[0])
+        if (
+            not math.isfinite(lat)
+            or not math.isfinite(lon)
+            or not -90.0 <= lat <= 90.0
+            or not -180.0 <= lon <= 180.0
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail="Search provider returned invalid coordinates",
+            )
         return {
             "result": {
                 "name": properties.get("name"),
                 "full_address": properties.get("full_address")
                 or properties.get("place_formatted")
                 or properties.get("name"),
-                "lat": float(coordinates[1]),
-                "lon": float(coordinates[0]),
+                "lat": lat,
+                "lon": lon,
             }
         }
 
     @app.post("/v1/route/compare")
     def route_compare(payload: RouteCompareRequest) -> dict[str, Any]:
+        _safe_asset_name(payload.region, kind="region")
         try:
             graph_path = _region_to_graph(payload.region)
         except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            _LOGGER.warning("Route graph unavailable for region %s: %s", payload.region, exc)
+            raise HTTPException(
+                status_code=404,
+                detail=f"Route assets are unavailable for region '{payload.region}'",
+            ) from None
 
         run_name = payload.run_name or _latest_run_for_region(payload.region)
         if not run_name:
@@ -769,23 +1310,28 @@ def create_app() -> FastAPI:
                 status_code=404,
                 detail=f"No run report available for region '{payload.region}'",
             )
-        report_json = RUNS_DIR / run_name / "report/report.json"
+        run_name = _safe_asset_name(run_name, kind="run_name")
+        report_json = _run_report_path(run_name)
+        if not report_json.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail=f"No run report available for region '{payload.region}'",
+            )
 
         req = RouteRequest(
             graph_geojson=str(graph_path),
             start=(payload.start.lat, payload.start.lon),
             end=(payload.end.lat, payload.end.lon),
-            scenic_weight=float(payload.scenic_weight),
-            avoid_highways=bool(payload.avoid_highways),
-            max_detour_factor=float(payload.max_detour_factor),
-            include_baseline=bool(payload.include_baseline),
-            tile_scores_json=str(report_json) if report_json.exists() else None,
-            tile_score_fallback=1.0,
+            scenic_weight=payload.scenic_weight,
+            avoid_highways=payload.avoid_highways,
+            max_detour_factor=payload.max_detour_factor,
+            include_baseline=payload.include_baseline,
+            tile_scores_json=str(report_json),
+            tile_score_fallback=None,
         )
-        diagnostics: dict[str, Any] = {}
         try:
             result = plan_routes(req)
-            diagnostics = dict(result.get("diagnostics", {}))
+            diagnostics, routes = _validate_route_contract(result, request=req)
         except ValueError as exc:
             try:
                 diagnostics = diagnose_route_request(req)
@@ -795,32 +1341,46 @@ def create_app() -> FastAPI:
                 status_code=422,
                 detail={
                     "error": "no_route_found",
-                    "message": str(exc),
+                    "message": "No route satisfies the requested controls.",
                     "hint": f"Try different points in region '{payload.region}' or increase max detour.",
                     "diagnostics": diagnostics,
                 },
             ) from exc
-        routes = {r["route_kind"]: r["metrics"] for r in result.get("routes", [])}
-        scenic = routes.get("scenic")
+
+        scenic = routes["scenic"]
         baseline = routes.get("baseline")
         deltas = None
-        if scenic and baseline:
+        if baseline is not None:
             deltas = {
                 "distance_km": float(scenic["total_distance_km"])
                 - float(baseline["total_distance_km"]),
                 "duration_min": float(scenic["estimated_duration_minutes"])
                 - float(baseline["estimated_duration_minutes"]),
-                "scenic_score": float(scenic["average_scenic_score"])
-                - float(baseline["average_scenic_score"]),
+                "scenic_score": diagnostics["scenic_score_delta_absolute"],
+                "scenic_score_absolute": diagnostics[
+                    "scenic_score_delta_absolute"
+                ],
+                "scenic_score_relative": diagnostics[
+                    "scenic_score_delta_relative"
+                ],
+                "normalized_scenic_score": float(
+                    scenic["normalized_scenic_score"]
+                )
+                - float(baseline["normalized_scenic_score"]),
             }
+        public_routes = _redact_private_response(routes)
+        public_score_mapping = _redact_private_response(
+            result.get("score_mapping", {})
+        )
+        public_geojson = _redact_private_response(result.get("geojson", {}))
         return {
-            "request": req.to_dict(),
+            "request": _public_route_request(payload, run_name=run_name),
             "run_name": run_name,
             "diagnostics": diagnostics,
-            "routes": routes,
+            "routes": public_routes,
             "deltas": deltas,
-            "score_mapping": result.get("score_mapping", {}),
-            "geojson": result.get("geojson", {}),
+            "score_mapping": public_score_mapping,
+            "geojson": public_geojson,
         }
 
     @app.get("/v1/validated-route")
@@ -872,6 +1432,9 @@ def create_app() -> FastAPI:
             "matched_edges",
             "total_edges",
             "matched_ratio",
+            "report_signature",
+            "graph_signature",
+            "score_run",
         )
         return {
             "region": region,
@@ -883,10 +1446,14 @@ def create_app() -> FastAPI:
                 "max_detour_factor": request.get("max_detour_factor"),
             },
             "score_mapping": {
-                key: score_mapping.get(key) for key in public_mapping_fields
+                key: score_mapping.get(key)
+                for key in public_mapping_fields
+                if score_mapping.get(key) is not None
             },
-            "routes": {"scenic": scenic, "baseline": baseline},
-            "geojson": route_geojson,
+            "routes": _redact_private_response(
+                {"scenic": scenic, "baseline": baseline}
+            ),
+            "geojson": _redact_private_response(route_geojson),
         }
 
     @app.get("/v1/heatmap")
@@ -897,12 +1464,14 @@ def create_app() -> FastAPI:
         max_tiles: int = 12000,
         tile_offset: int | None = None,
     ) -> dict[str, Any]:
+        _safe_asset_name(region, kind="region")
         selected_run = run_name or _latest_run_for_region(region)
         if not selected_run:
             raise HTTPException(
                 status_code=404, detail=f"No run report available for region '{region}'"
             )
-        report_json = RUNS_DIR / selected_run / "report/report.json"
+        selected_run = _safe_asset_name(selected_run, kind="run_name")
+        report_json = _run_report_path(selected_run)
         if not report_json.exists():
             raise HTTPException(
                 status_code=404, detail=f"Report not found for run '{selected_run}'"
@@ -1040,8 +1609,12 @@ def create_app() -> FastAPI:
     def heatmap_image(region: str, run_name: str | None = None) -> Response:
         from PIL import Image
 
+        _safe_asset_name(region, kind="region")
         selected_run = run_name or _latest_run_for_region(region)
-        report_json = RUNS_DIR / str(selected_run) / "report/report.json"
+        if not selected_run:
+            raise HTTPException(status_code=404, detail="No run report available")
+        selected_run = _safe_asset_name(selected_run, kind="run_name")
+        report_json = _run_report_path(selected_run)
         try:
             payload = json.loads(report_json.read_text(encoding="utf-8"))
             tiles = payload["tiles"]
@@ -1105,8 +1678,12 @@ def create_app() -> FastAPI:
 
     @app.get("/v1/heatmap-scores.bin")
     def heatmap_scores(region: str, run_name: str | None = None) -> Response:
+        _safe_asset_name(region, kind="region")
         selected_run = run_name or _latest_run_for_region(region)
-        report_json = RUNS_DIR / str(selected_run) / "report/report.json"
+        if not selected_run:
+            raise HTTPException(status_code=404, detail="No run report available")
+        selected_run = _safe_asset_name(selected_run, kind="run_name")
+        report_json = _run_report_path(selected_run)
         try:
             data, zoom, min_x, min_y, width, height = _load_tile_score_grid(
                 str(report_json), report_json.stat().st_mtime_ns

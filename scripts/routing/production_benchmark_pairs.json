@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "description": "Deterministic production-artifact routing benchmark endpoints. Coordinates are graph-node coordinates except the checked-in UI default reproduction, which intentionally preserves its historical request values. Categories are assigned only from completed response metrics by the runner.",
+  "graph": "data/processed/road_graphs/new_england_north_burlington_bangor_corridor35/road_graph.json",
+  "report": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json",
+  "historical_screenshot_coordinates": null,
+  "historical_screenshot_blocker": "Historical screenshot coordinates were not available in the checked-in repository or request context.",
+  "pairs": [
+    {"id":"short_burlington_01","start":[44.4758836,-73.2140035],"end":[44.4760002,-73.2140118]},
+    {"id":"short_montpelier_01","start":[44.260106,-72.575388],"end":[44.2601352,-72.5755114]},
+    {"id":"short_st_johnsbury_01","start":[44.4193575,-72.0150333],"end":[44.4193359,-72.0152585]},
+    {"id":"short_berlin_01","start":[44.2497076,-71.2539311],"end":[44.2500614,-71.2539611]},
+    {"id":"short_portland_01","start":[44.2948095,-70.3707125],"end":[44.2949108,-70.3705868]},
+    {"id":"short_bangor_01","start":[44.8016129,-68.7713352],"end":[44.8016253,-68.7711687]},
+    {"id":"short_bar_harbor_01","start":[44.6679197,-68.5218583],"end":[44.6681278,-68.5223999]},
+    {"id":"short_augusta_01","start":[44.3958091,-69.7691961],"end":[44.3958652,-69.769313]},
+    {"id":"short_concord_01","start":[44.0458239,-71.6827391],"end":[44.0458384,-71.6826934]},
+    {"id":"short_rutland_01","start":[44.063961,-72.772322],"end":[44.064124,-72.771662]},
+    {"id":"short_glens_falls_01","start":[44.2301107,-73.2412045],"end":[44.2302211,-73.2412814]},
+    {"id":"short_presque_isle_01","start":[44.9559271,-68.5450731],"end":[44.9551527,-68.5453413]},
+    {"id":"short_saranac_01","start":[44.2672289,-73.3047804],"end":[44.2671559,-73.304771]},
+    {"id":"medium_burlington_montpelier","start":[44.4758836,-73.2140035],"end":[44.260106,-72.575388]},
+    {"id":"medium_montpelier_st_johnsbury","start":[44.260106,-72.575388],"end":[44.4193575,-72.0150333]},
+    {"id":"medium_bangor_bar_harbor","start":[44.8016129,-68.7713352],"end":[44.6679197,-68.5218583]},
+    {"id":"medium_bangor_presque_isle","start":[44.8016129,-68.7713352],"end":[44.9559271,-68.5450731]},
+    {"id":"long_augusta_bangor","start":[44.3958091,-69.7691961],"end":[44.8016129,-68.7713352]},
+    {"id":"long_bar_harbor_augusta","start":[44.6679197,-68.5218583],"end":[44.3958091,-69.7691961]},
+    {"id":"long_burlington_st_johnsbury","start":[44.4758836,-73.2140035],"end":[44.4193575,-72.0150333]},
+    {"id":"long_rutland_bangor","start":[44.063961,-72.772322],"end":[44.8016129,-68.7713352]},
+    {"id":"checked_in_default_reproduction","start":[44.475884,-73.214003],"end":[44.801616,-68.771305]}
+  ]
+}

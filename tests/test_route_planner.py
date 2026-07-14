@@ -483,7 +483,7 @@ def test_over_duration_scenic_path_is_rejected_by_duration_cap() -> None:
     assert route.estimated_duration_minutes == pytest.approx(10.0)
 
 
-def test_route_average_scenic_score_uses_travel_time_weighting() -> None:
+def test_route_average_scenic_score_uses_distance_weighting() -> None:
     graph = RoadGraph()
     graph.add_node(Node(id="S", lat=42.0, lon=-72.0))
     graph.add_node(Node(id="A", lat=42.01, lon=-72.0))
@@ -512,9 +512,9 @@ def test_route_average_scenic_score_uses_travel_time_weighting() -> None:
     route = ScenicRoutePlanner(graph=graph)._path_to_route([first, second])
 
     expected = (
-        first.scenic_score * first.travel_time_minutes
-        + second.scenic_score * second.travel_time_minutes
-    ) / (first.travel_time_minutes + second.travel_time_minutes)
+        first.scenic_score * first.distance_km
+        + second.scenic_score * second.distance_km
+    ) / (first.distance_km + second.distance_km)
     assert route.average_scenic_score == pytest.approx(expected)
 
 
@@ -1041,8 +1041,8 @@ def test_scenic_route_keeps_a_path_equal_to_incumbent_cost() -> None:
         graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
 
     # The two-edge route is the shortest feasible incumbent (10 km).  The
-    # direct route is 12 km but has exactly the same scenic cost.  Equality
-    # with the incumbent must remain feasible rather than being pruned.
+    # direct route is 12 km and has the higher raw scenic score.  Under the
+    # normalized utility the duration and scenic tie-breaks select it.
     graph.add_edge(
         Edge(
             id="equal-direct",
@@ -1091,8 +1091,8 @@ def test_scenic_route_keeps_a_path_equal_to_incumbent_cost() -> None:
         scenic_weight=0.5,
         max_detour_factor=1.8,
     )
-    assert route.total_distance_km == pytest.approx(10.0)
-    assert route.average_scenic_score == pytest.approx(5.0)
+    assert route.total_distance_km == pytest.approx(12.0)
+    assert route.average_scenic_score == pytest.approx(7.5)
 
 
 def test_reverse_cost_bound_handles_generated_reverse_and_literal_id_collision() -> None:
@@ -3012,13 +3012,8 @@ def test_duration_oracle_matches_exact_scenic_optimum_with_hard_filter() -> None
     )
 
 
-def test_weight_one_uses_additive_scenic_disutility_not_route_average() -> None:
-    """Weight one minimizes total scenic exposure on feasible paths.
-
-    The longer detour has a higher duration-weighted average score, but its
-    total scenic disutility is larger.  The planner intentionally uses the
-    latter positive additive objective so the resource search remains exact.
-    """
+def test_weight_one_maximizes_distance_weighted_scenic_score() -> None:
+    """Weight one maximizes the normalized distance-weighted scenic score."""
     graph = RoadGraph()
     for node_id, lon in (("S", 0.0), ("A", 0.01), ("G", 0.02)):
         graph.add_node(Node(id=node_id, lat=42.0, lon=-72.0 + lon))
@@ -3066,9 +3061,12 @@ def test_weight_one_uses_additive_scenic_disutility_not_route_average() -> None:
         max_detour_factor=2.0,
     )
 
-    assert route.average_scenic_score == pytest.approx(8.0)
-    assert route.estimated_duration_minutes == pytest.approx(10.0)
-    assert [segment.road_name for segment in route.segments] == ["direct"]
+    assert route.average_scenic_score == pytest.approx(8.5)
+    assert route.estimated_duration_minutes == pytest.approx(20.0)
+    assert [segment.road_name for segment in route.segments] == [
+        "detour",
+        "detour",
+    ]
 
 
 def test_compiled_csr_handles_reverse_traversals_and_hard_highway_filter() -> None:

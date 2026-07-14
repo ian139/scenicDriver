@@ -6,7 +6,9 @@ from dataclasses import dataclass
 
 from .graph import Edge
 
-HIGHWAY_ROAD_TYPES = frozenset({"highway", "motorway", "trunk"})
+HIGHWAY_ROAD_TYPES = frozenset(
+    {"highway", "motorway", "motorway_link", "trunk", "trunk_link"}
+)
 SCENIC_BYWAY_DISCOUNT_CAP = 0.5
 
 
@@ -15,6 +17,271 @@ def is_highway_road_type(road_type: object) -> bool:
 
 
 MIN_EDGE_COST = 1e-6
+SCENIC_NORMALIZATION_VERSION = "linear-v1"
+
+
+def _required_finite(value: object, name: str, *, minimum: float | None = None) -> float:
+    """Return a finite number, rejecting malformed optimization inputs."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not math.isfinite(number) or (minimum is not None and number < minimum):
+        suffix = f" >= {minimum}" if minimum is not None else ""
+        raise ValueError(f"{name} must be finite{suffix}")
+    return number
+
+
+def _checked_add(left: float, right: float, name: str) -> float:
+    result = left + right
+    if not math.isfinite(result):
+        raise ValueError(f"{name} overflowed finite range")
+    return result
+
+
+def _checked_product(left: float, right: float, name: str) -> float:
+    result = left * right
+    if not math.isfinite(result):
+        raise ValueError(f"{name} overflowed finite range")
+    return result
+
+
+def clamp_scenic_score(score: object) -> float:
+    """Clamp an edge's scenic score to the immutable report range ``[0, 10]``."""
+    return min(max(_required_finite(score, "scenic score"), 0.0), 10.0)
+
+
+def normalize_scenic_score(score: object) -> float:
+    """Apply the stable linear ``linear-v1`` normalization to a raw score."""
+    return clamp_scenic_score(score) / 10.0
+
+
+def _edge_value(edge: object, name: str) -> object:
+    if isinstance(edge, dict):
+        try:
+            return edge[name]
+        except KeyError as exc:
+            raise ValueError(f"path edge is missing {name}") from exc
+    try:
+        return getattr(edge, name)
+    except AttributeError as exc:
+        raise ValueError(f"path edge is missing {name}") from exc
+def _optional_edge_value(edge: object, name: str) -> object | None:
+    if isinstance(edge, dict):
+        return edge.get(name)
+    return getattr(edge, name, None)
+
+
+
+
+def _edge_duration(edge: object) -> float:
+    return _required_finite(_edge_value(edge, "travel_time_minutes"), "edge duration", minimum=0.0)
+def _edge_distance(edge: object) -> float:
+    return _required_finite(_edge_value(edge, "distance_km"), "edge distance", minimum=0.0)
+
+
+def _edge_id(edge: object, position: int) -> str:
+    # Traversal identity distinguishes reverse/synthetic views even when their
+    # canonical edge IDs overlap another edge's textual ``::rev`` suffix.
+    value = _optional_edge_value(edge, "traversal_id")
+    if value is None or str(value) == "":
+        value = _edge_value(edge, "id")
+    if value is None or str(value) == "":
+        raise ValueError(f"path edge {position} is missing id")
+    return str(value)
+
+
+
+def distance_weighted_scenic_score(path: object) -> float:
+    """Return ``sum(distance * clamp(score)) / sum(distance)`` for ``path``.
+
+    Empty and zero-distance paths have score ``0``.  Malformed edge values are
+    rejected rather than silently changing the optimization objective.
+    """
+    try:
+        edges = tuple(path)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError("path must be an iterable of edges") from exc
+    total_distance = 0.0
+    weighted_score = 0.0
+    for edge in edges:
+        distance = _edge_distance(edge)
+        score = clamp_scenic_score(_edge_value(edge, "scenic_score"))
+        weighted_edge_score = _checked_product(
+            distance, score, "distance-weighted scenic score"
+        )
+        total_distance = _checked_add(total_distance, distance, "total distance")
+        weighted_score = _checked_add(
+            weighted_score, weighted_edge_score, "weighted scenic score"
+        )
+    if total_distance == 0.0:
+        return 0.0
+    return weighted_score / total_distance
+
+
+def duration_component(
+    duration_minutes: object,
+    fastest_duration_minutes: object,
+    kappa: object,
+) -> float:
+    """Return the normalized duration utility under ``T <= kappa*T_fast``."""
+    duration = _required_finite(duration_minutes, "duration", minimum=0.0)
+    fastest = _required_finite(
+        fastest_duration_minutes, "fastest duration", minimum=0.0
+    )
+    detour = _required_finite(kappa, "kappa", minimum=1.0)
+    if detour == 1.0:
+        return 1.0 if duration == fastest else 0.0
+    if fastest == 0.0:
+        return 1.0 if duration == 0.0 else 0.0
+    duration_cap = _checked_product(detour, fastest, "duration cap")
+    denominator = _checked_product(
+        detour - 1.0, fastest, "duration utility denominator"
+    )
+    numerator = duration_cap - duration
+    if not math.isfinite(numerator):
+        raise ValueError("duration utility numerator overflowed finite range")
+    value = numerator / denominator
+    if not math.isfinite(value):
+        raise ValueError("duration utility overflowed finite range")
+    return min(1.0, max(0.0, value))
+
+
+def combined_utility(
+    q: object,
+    kappa: object,
+    duration_minutes: object,
+    fastest_duration_minutes: object,
+    normalized_scenic_score: object,
+) -> float:
+    """Compute ``(1-q)*duration_component + q*normalized_scenic_score``."""
+    weight = _required_finite(q, "q")
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError("q must be in [0, 1]")
+    scenic = _required_finite(
+        normalized_scenic_score, "normalized scenic score"
+    )
+    if not 0.0 <= scenic <= 1.0:
+        raise ValueError("normalized scenic score must be in [0, 1]")
+    duration = duration_component(
+        duration_minutes, fastest_duration_minutes, kappa
+    )
+    return (1.0 - weight) * duration + weight * scenic
+
+
+@dataclass(frozen=True)
+class PathEvaluation:
+    """Independent, serializable diagnostics for one feasible candidate path."""
+
+    edge_ids: tuple[str, ...]
+    total_distance_km: float
+    duration_minutes: float
+    raw_scenic_score: float
+    normalized_scenic_score: float
+    duration_utility: float
+    objective: float
+    highway_count: int
+    score_coverage: float
+    score_run: tuple[tuple[str, float], ...]
+    normalization_version: str = SCENIC_NORMALIZATION_VERSION
+
+    @property
+    def canonical_edge_sequence(self) -> tuple[str, ...]:
+        return self.edge_ids
+
+
+def evaluate_path(
+    path: object,
+    *,
+    q: object,
+    kappa: object,
+    fastest_duration_minutes: object,
+) -> PathEvaluation:
+    """Evaluate a path without relying on planner state or cached objective data."""
+    try:
+        edges = tuple(path)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError("path must be an iterable of edges") from exc
+    edge_ids: list[str] = []
+    score_run: list[tuple[str, float]] = []
+    total_distance = 0.0
+    total_duration = 0.0
+    weighted_score = 0.0
+    scored_distance = 0.0
+    highway_count = 0
+    for position, edge in enumerate(edges):
+        edge_id = _edge_id(edge, position)
+        distance = _edge_distance(edge)
+        duration = _edge_duration(edge)
+        score = clamp_scenic_score(_edge_value(edge, "scenic_score"))
+        weighted_edge_score = _checked_product(
+            distance, score, "distance-weighted scenic score"
+        )
+        edge_ids.append(edge_id)
+        score_run.append((edge_id, score))
+        total_distance = _checked_add(total_distance, distance, "total distance")
+        total_duration = _checked_add(total_duration, duration, "total duration")
+        weighted_score = _checked_add(
+            weighted_score, weighted_edge_score, "weighted scenic score"
+        )
+        scored_distance = _checked_add(
+            scored_distance, distance, "scored distance"
+        )
+        highway_count += int(is_highway_road_type(_edge_value(edge, "road_type")))
+    raw_score = weighted_score / total_distance if total_distance else 0.0
+    normalized_score = raw_score / 10.0
+    coverage = scored_distance / total_distance if total_distance else 1.0
+    duration_utility = duration_component(
+        total_duration, fastest_duration_minutes, kappa
+    )
+    objective = combined_utility(
+        q,
+        kappa,
+        total_duration,
+        fastest_duration_minutes,
+        normalized_score,
+    )
+    return PathEvaluation(
+        edge_ids=tuple(edge_ids),
+        total_distance_km=total_distance,
+        duration_minutes=total_duration,
+        raw_scenic_score=raw_score,
+        normalized_scenic_score=normalized_score,
+        duration_utility=duration_utility,
+        objective=objective,
+        highway_count=highway_count,
+        score_coverage=coverage,
+        score_run=tuple(score_run),
+    )
+
+
+def compare_path_evaluations(
+    candidate: PathEvaluation, incumbent: PathEvaluation
+) -> int:
+    """Return ``1`` when candidate wins, ``-1`` when incumbent wins, else ``0``."""
+    candidate_key = (
+        candidate.objective,
+        candidate.raw_scenic_score,
+        -candidate.duration_minutes,
+    )
+    incumbent_key = (
+        incumbent.objective,
+        incumbent.raw_scenic_score,
+        -incumbent.duration_minutes,
+    )
+    if candidate_key > incumbent_key:
+        return 1
+    if candidate_key < incumbent_key:
+        return -1
+    if candidate.canonical_edge_sequence < incumbent.canonical_edge_sequence:
+        return 1
+    if candidate.canonical_edge_sequence > incumbent.canonical_edge_sequence:
+        return -1
+    return 0
+
+
+def is_better_path(candidate: PathEvaluation, incumbent: PathEvaluation) -> bool:
+    return compare_path_evaluations(candidate, incumbent) > 0
 
 
 def _finite_nonnegative(value: float, default: float = 0.0) -> float:

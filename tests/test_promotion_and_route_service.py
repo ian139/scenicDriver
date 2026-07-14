@@ -9,7 +9,7 @@ from threading import Event, Lock
 import pytest
 
 from src.route_planner import service as route_service
-from src.route_planner.planner import Route, RouteSegment
+from src.route_planner.planner import Route, RouteSegment, ScenicRoutePlanner
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -165,6 +165,9 @@ def test_plan_routes_uses_requested_filter_for_baseline_and_reports_constraints(
 
     def route(duration: float, distance: float, score: float) -> Route:
         segment = RouteSegment(
+            edge_id="fake-edge",
+            traversal_id="fake-edge::forward",
+            direction="forward",
             start=(42.0, -72.0),
             end=(42.1, -72.0),
             distance_km=distance,
@@ -217,9 +220,90 @@ def test_plan_routes_uses_requested_filter_for_baseline_and_reports_constraints(
         result["score_mapping"]["matched_ratio"]
     )
     assert diagnostics["score_mapping_coverage"] == pytest.approx(0.0)
+    assert diagnostics["requested_scenic_weight"] == pytest.approx(0.8)
+    assert diagnostics["applied_scenic_weight"] == pytest.approx(0.8)
+    scenic_metrics = result["routes"][0]["metrics"]
+    baseline_metrics = result["routes"][1]["metrics"]
+    assert scenic_metrics["objective_value"] != pytest.approx(
+        baseline_metrics["objective_value"]
+    )
+    assert scenic_metrics["objective"] == pytest.approx(
+        scenic_metrics["objective_value"]
+    )
+    assert baseline_metrics["objective"] == pytest.approx(
+        baseline_metrics["objective_value"]
+    )
+    assert isinstance(scenic_metrics["objective_components"], dict)
+    assert scenic_metrics["objective_components"]["objective_value"] == pytest.approx(
+        scenic_metrics["objective_value"]
+    )
+    assert baseline_metrics["objective_components"]["objective_value"] == pytest.approx(
+        baseline_metrics["objective_value"]
+    )
     assert diagnostics["planning_elapsed_ms"] >= 0.0
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("scenic_weight", float("nan")),
+        ("scenic_weight", float("inf")),
+        ("max_detour_factor", 3.1),
+        ("max_detour_factor", float("nan")),
+        ("start", [91.0, 0.0]),
+        ("end", [0.0, 181.0]),
+    ],
+)
+def test_route_request_rejects_nonfinite_and_out_of_contract_values(
+    field: str, value: object
+) -> None:
+    payload: dict[str, object] = {
+        "graph_geojson": "graph.geojson",
+        "start": [42.0, -72.0],
+        "end": [42.1, -72.0],
+    }
+    payload[field] = value
+    with pytest.raises(ValueError):
+        route_service.RouteRequest.from_dict(payload)
+
+
+def test_service_uses_canonical_normalization_version() -> None:
+    assert route_service._NORMALIZATION_VERSION == "linear-v1"
+
+
+def test_plan_routes_without_baseline_uses_route_fastest_duration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+
+    class FakePlanner:
+        def __init__(self, *, graph: object) -> None:
+            del graph
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            del kwargs
+            result = _cache_test_route(8.0)
+            result.estimated_duration_minutes = 12.0
+            result.fastest_duration_minutes = 10.0
+            return result
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
+    result = route_service.plan_routes(
+        route_service.RouteRequest(
+            graph_geojson=str(graph_path),
+            start=(42.0, -72.0),
+            end=(42.1, -72.0),
+            include_baseline=False,
+            scenic_weight=0.5,
+            max_detour_factor=1.5,
+        )
+    )
+    diagnostics = result["diagnostics"]
+    assert diagnostics["scenic_fastest_duration_ratio"] == pytest.approx(1.2)
+    assert result["routes"][0]["metrics"]["actual_duration_ratio"] == pytest.approx(
+        1.2
+    )
 def _write_cache_graph(path: Path, scenic_score: float = 1.0) -> None:
     payload = {
         "type": "FeatureCollection",
@@ -252,6 +336,9 @@ def _write_cache_tiles(path: Path, score: float) -> None:
 
 def _cache_test_route(score: float) -> Route:
     segment = RouteSegment(
+        edge_id="cache-edge",
+        traversal_id="cache-edge::forward",
+        direction="forward",
         start=(42.0, -72.0),
         end=(42.1, -72.0),
         distance_km=10.0,
@@ -266,6 +353,19 @@ def _cache_test_route(score: float) -> Route:
         estimated_duration_minutes=12.0,
         waypoints=[(42.0, -72.0), (42.1, -72.0)],
     )
+
+
+def test_clear_route_caches_releases_planner_graph_references() -> None:
+    retained_graph = object()
+    ScenicRoutePlanner._ELIGIBLE_REACHABILITY_SHARED_CACHE[
+        (retained_graph, "stamp", "start", "goal", True)
+    ] = False
+    ScenicRoutePlanner._FASTEST_PATH_SHARED_GRAPH = retained_graph
+
+    route_service.clear_route_caches()
+
+    assert not ScenicRoutePlanner._ELIGIBLE_REACHABILITY_SHARED_CACHE
+    assert ScenicRoutePlanner._FASTEST_PATH_SHARED_GRAPH is None
 
 
 def test_plan_routes_caches_graph_and_tile_parsing_and_preserves_response_shape(

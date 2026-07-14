@@ -1,4 +1,5 @@
 from __future__ import annotations
+import time
 
 from dataclasses import dataclass
 import heapq
@@ -15,7 +16,17 @@ except ImportError:  # pragma: no cover - exercised only without optional runtim
     _scipy_csr_matrix = None
     _scipy_shortest_path = None
 
-from .cost import CostWeights, ScenicCostFunction, is_highway_road_type
+from .cost import (
+    CostWeights,
+    ScenicCostFunction,
+    SCENIC_NORMALIZATION_VERSION,
+    clamp_scenic_score,
+    distance_weighted_scenic_score,
+    evaluate_path,
+    duration_component,
+    is_better_path,
+    is_highway_road_type,
+)
 from .graph import Edge, Node, RoadGraph
 
 _ORIGINAL_SCENIC_CALCULATE = ScenicCostFunction.calculate
@@ -32,6 +43,13 @@ class RouteSegment:
     scenic_score: float
     road_name: Optional[str]
     road_type: str
+    # The traversal identity is retained so callers can recompute metrics and
+    # distinguish a reverse view from its canonical source edge.
+    edge_id: str = ""
+    direction: str = "forward"
+    traversal_id: str = ""
+    # Exact per-edge travel duration retained for independent recomputation.
+    duration_minutes: float = 0.0
 
 
 @dataclass
@@ -41,7 +59,66 @@ class Route:
     average_scenic_score: float
     estimated_duration_minutes: float
     waypoints: List[Tuple[float, float]]
+    # Optimization diagnostics.  The first five fields above intentionally
+    # retain their historical order so direct callers remain source-compatible.
+    edge_ids: Tuple[str, ...] = ()
+    traversal_ids: Tuple[str, ...] = ()
+    raw_scenic_score: float = 0.0
+    normalized_scenic_score: float = 0.0
+    duration_utility: float = 0.0
+    objective_value: float = 0.0
+    fastest_duration_minutes: float = 0.0
+    requested_max_detour_factor: float = 1.0
+    applied_max_detour_factor: float = 1.0
+    duration_cap_minutes: float = 0.0
+    actual_duration_ratio: float = 1.0
+    exact: bool = False
+    exactness_status: str = "uncertified"
+    optimality_gap: Optional[float] = None
+    certified_upper_bound: Optional[float] = None
+    highway_count: int = 0
+    score_coverage: float = 1.0
+    score_run: Tuple[Tuple[str, float], ...] = ()
+    algorithm: str = "uncertified-production-search"
+    zero_improvement_reason: Optional[str] = None
+    no_route_reason: Optional[str] = None
+    normalization_version: str = "linear-v1"
 
+    @property
+    def is_exact(self) -> bool:
+        return self.exact
+
+    @property
+    def status(self) -> str:
+        return self.exactness_status
+
+    @property
+    def objective(self) -> float:
+        return self.objective_value
+
+    @property
+    def raw_scenic(self) -> float:
+        return self.raw_scenic_score
+
+    @property
+    def normalized_scenic(self) -> float:
+        return self.normalized_scenic_score
+    @property
+    def scenic_score_normalized(self) -> float:
+        """Compatibility spelling used by service serializers."""
+        return self.normalized_scenic_score
+
+    @property
+    def requested_cap(self) -> float:
+        return self.requested_max_detour_factor
+
+    @property
+    def applied_cap(self) -> float:
+        return self.applied_max_detour_factor
+
+    @property
+    def actual_ratio(self) -> float:
+        return self.actual_duration_ratio
 
 @dataclass
 class _PathLabel:
@@ -53,6 +130,18 @@ class _PathLabel:
     predecessor_label_id: Optional[int]
     incoming_edge: Optional[Edge]
 
+
+@dataclass
+class _FrontierLabel:
+    label_id: int
+    node_id: str
+    cumulative_duration_minutes: float
+    cumulative_distance_km: float
+    normalized_scenic_exposure: float
+    predecessor_label_id: Optional[int]
+    incoming_edge: Optional[Edge]
+    visited_nodes: frozenset[str]
+    edge_sequence: Tuple[str, ...]
 
 @dataclass
 class _ReversePredecessorSnapshot:
@@ -100,6 +189,19 @@ class ScenicRoutePlanner:
     _REVERSE_PREPROCESS_EDGE_THRESHOLD = 256
     _LARGE_GRAPH_EDGE_THRESHOLD = 100_000
     _SHORT_ROUTE_CAP_KM = 5.0
+    # Exhaustive simple-path enumeration is intentionally reserved for
+    # bounded oracle-sized graphs. Production graphs use the complete
+    # deadline-bounded multi-label frontier and report a certified
+    # upper bound/gap when interrupted.
+    _EXACT_ORACLE_MAX_NODES = 12
+    _EXACT_ORACLE_MAX_EDGES = 48
+    _PRODUCTION_FRONTIER_TIME_LIMIT_SECONDS = 4.0
+    _ELIGIBLE_REACHABILITY_CACHE_CAPACITY = 32
+    _ELIGIBLE_REACHABILITY_SHARED_CACHE: OrderedDict[
+        Tuple[RoadGraph, object, str, str, bool], bool
+    ] = OrderedDict()
+    _ELIGIBLE_REACHABILITY_SHARED_GRAPH: Optional[RoadGraph] = None
+    _ELIGIBLE_REACHABILITY_SHARED_STAMP: object = None
     _REVERSE_INDEX_CACHE: OrderedDict[
         Tuple[int, object, bool],
         Tuple[RoadGraph, Dict[str, List[Tuple[str, str, bool]]]],
@@ -117,11 +219,29 @@ class ScenicRoutePlanner:
     _FASTEST_PATH_SHARED_GRAPH: Optional[RoadGraph] = None
     _FASTEST_PATH_SHARED_STAMP: object = None
 
+    @classmethod
+    def clear_shared_caches(cls) -> None:
+        """Release graph-backed process caches used across planner instances."""
+
+        cls._ELIGIBLE_REACHABILITY_SHARED_CACHE.clear()
+        cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH = None
+        cls._ELIGIBLE_REACHABILITY_SHARED_STAMP = None
+        cls._REVERSE_INDEX_CACHE.clear()
+        cls._CSR_TOPOLOGY_CACHE = None
+        cls._CSR_DATA_CACHE.clear()
+        cls._FASTEST_PATH_SHARED_CACHE.clear()
+        cls._FASTEST_PATH_SHARED_GRAPH = None
+        cls._FASTEST_PATH_SHARED_STAMP = None
+
     def __init__(
         self,
         graph: Optional[RoadGraph] = None,
         cost_function: Optional[ScenicCostFunction] = None,
     ) -> None:
+        self._frontier_time_limit_seconds = (
+            self._PRODUCTION_FRONTIER_TIME_LIMIT_SECONDS
+        )
+        self._monotonic = time.monotonic
         self.graph = graph
         self.cost_function = cost_function or ScenicCostFunction()
         # Heuristic scans are graph-state dependent.  Keep the graph reference
@@ -144,7 +264,6 @@ class ScenicRoutePlanner:
         self._fastest_path_cache = type(self)._FASTEST_PATH_SHARED_CACHE
         self._csr_topology_cache = type(self)._CSR_TOPOLOGY_CACHE
         self._csr_data_cache = type(self)._CSR_DATA_CACHE
-
     def _make_cost_function(self, scenic_weight: float) -> ScenicCostFunction:
         return ScenicCostFunction(
             scenic_weight=scenic_weight,
@@ -440,6 +559,197 @@ class ScenicRoutePlanner:
             return None
         path_reversed.reverse()
         return path_reversed
+    def _compiled_weighted_path(
+        self,
+        topology: _CSRTopology,
+        start_index: int,
+        goal_index: int,
+        weights: np.ndarray,
+    ) -> Optional[List[Edge]]:
+        """Return one deterministic nonnegative-weight CSR shortest path."""
+        if _scipy_shortest_path is None:
+            return None
+        matrix = _scipy_csr_matrix(
+            (
+                weights,
+                topology.indices,
+                topology.indptr,
+            ),
+            shape=(len(topology.node_ids), len(topology.node_ids)),
+            copy=False,
+        )
+        distances, predecessors = _scipy_shortest_path(
+            matrix,
+            directed=True,
+            indices=start_index,
+            return_predecessors=True,
+            unweighted=False,
+            method="D",
+        )
+        if not math.isfinite(float(distances[goal_index])):
+            return None
+        path_reversed: List[Edge] = []
+        current_index = goal_index
+        visited = {current_index}
+        while current_index != start_index:
+            predecessor = int(predecessors[current_index])
+            if (
+                predecessor < 0
+                or predecessor >= len(topology.node_ids)
+                or predecessor in visited
+            ):
+                return None
+            row_start = int(topology.indptr[predecessor])
+            row_end = int(topology.indptr[predecessor + 1])
+            predecessor_distance = float(distances[predecessor])
+            current_distance = float(distances[current_index])
+            best_position: Optional[int] = None
+            best_key: Tuple[float, str, bool] | None = None
+            for position in range(row_start, row_end):
+                if int(topology.indices[position]) != current_index:
+                    continue
+                edge_weight = float(weights[position])
+                residual = abs(
+                    predecessor_distance + edge_weight - current_distance
+                )
+                if residual > max(1e-9, abs(current_distance) * 1e-10):
+                    continue
+                edge_id, reverse = topology.edge_refs[position]
+                key = (residual, str(edge_id), bool(reverse))
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_position = position
+            if best_position is None:
+                return None
+            edge_id, reverse = topology.edge_refs[best_position]
+            path_reversed.append(self._edge_from_reverse_index(edge_id, reverse))
+            current_index = predecessor
+            visited.add(current_index)
+        if (
+            self.graph is not topology.graph
+            or topology.graph._heuristic_cache_stamp() != topology.stamp
+        ):
+            return None
+        path_reversed.reverse()
+        return path_reversed
+
+    def _compiled_shortest_duration_average_path(
+        self,
+        start: Node,
+        goal: Node,
+        avoid_highways: bool,
+    ) -> Optional[List[Edge]]:
+        """Maximize distance-weighted scenic score among fastest paths.
+
+        Dinkelbach iterations solve the fractional distance-score objective on
+        the shortest-duration DAG.  A duration shift makes every transformed
+        edge weight nonnegative without changing the ranking because every
+        feasible path has identical total duration.
+        """
+        if _scipy_shortest_path is None or start.id == goal.id:
+            return [] if start.id == goal.id else None
+        fastest_cost = ScenicCostFunction(
+            scenic_weight=0.0,
+            avoid_highways=avoid_highways,
+            weights=CostWeights(
+                travel_time=1.0,
+                scenic_reward=0.0,
+                highway_penalty=0.0,
+                scenic_byway_bonus=0.0,
+            ),
+        )
+        signature = self._built_in_cost_signature(fastest_cost)
+        if signature is None:
+            return None
+        duration_data = self._csr_data(fastest_cost, signature)
+        if duration_data is None:
+            return None
+        topology = duration_data.topology
+        start_index = topology.node_index.get(start.id)
+        goal_index = topology.node_index.get(goal.id)
+        if start_index is None or goal_index is None:
+            return None
+        forward = _scipy_shortest_path(
+            duration_data.matrix,
+            directed=True,
+            indices=start_index,
+            return_predecessors=False,
+            unweighted=False,
+            method="D",
+        )
+        reverse = _scipy_shortest_path(
+            duration_data.matrix.transpose(),
+            directed=True,
+            indices=goal_index,
+            return_predecessors=False,
+            unweighted=False,
+            method="D",
+        )
+        total_duration = float(forward[goal_index])
+        if not math.isfinite(total_duration):
+            return None
+        row_lengths = np.diff(topology.indptr)
+        source_indices = np.repeat(
+            np.arange(len(topology.node_ids), dtype=np.int64), row_lengths
+        )
+        target_indices = topology.indices
+        prefix = forward[source_indices] + duration_data.weights
+        suffix = reverse[target_indices]
+        residual = np.abs(prefix + suffix - total_duration)
+        scale = np.maximum(
+            1.0,
+            np.maximum(np.abs(prefix + suffix), abs(total_duration)),
+        )
+        shortest_mask = (
+            np.isfinite(prefix)
+            & np.isfinite(suffix)
+            & (
+                residual <= np.maximum(1e-12, 1e-12 * scale)
+            )
+        )
+        if avoid_highways:
+            shortest_mask &= ~topology.highway_mask
+        if not shortest_mask.any():
+            return None
+        distance = topology.distance_km
+        reward = distance * np.minimum(np.maximum(topology.scenic_score, 0.0), 10.0)
+        duration = topology.travel_time_minutes
+        ratio = 0.0
+        best_path: Optional[List[Edge]] = None
+        for _ in range(12):
+            transformed = np.full_like(duration, np.inf, dtype=np.float64)
+            active = shortest_mask & np.isfinite(distance) & (distance >= 0.0)
+            valid_duration = active & np.isfinite(duration) & (duration > 0.0)
+            shift = 0.0
+            if valid_duration.any():
+                shift = float(
+                    np.max(
+                        np.maximum(
+                            0.0,
+                            (reward[valid_duration] - ratio * distance[valid_duration])
+                            / duration[valid_duration],
+                        )
+                    )
+                )
+            transformed[active] = (
+                shift * duration[active]
+                + ratio * distance[active]
+                - reward[active]
+            )
+            transformed[active] = np.maximum(transformed[active], 0.0)
+            candidate = self._compiled_weighted_path(
+                topology, start_index, goal_index, transformed
+            )
+            if candidate is None:
+                return best_path
+            candidate_score = distance_weighted_scenic_score(candidate)
+            if best_path is not None and abs(candidate_score - ratio) <= 1e-10:
+                best_path = candidate
+                break
+            best_path = candidate
+            ratio = candidate_score
+        return best_path
+
 
     def _csr_topology(
         self, avoid_highways: bool = False
@@ -680,6 +990,84 @@ class ScenicRoutePlanner:
         path_reversed.reverse()
         return path_reversed
 
+    def _compiled_reachability_cache_key(
+        self,
+        start: Node,
+        goal: Node,
+        cost_function: ScenicCostFunction,
+        stamp: object,
+    ) -> Tuple[RoadGraph, object, str, str, bool]:
+        graph = self.graph
+        assert graph is not None
+        return (
+            graph,
+            stamp,
+            str(start.id),
+            str(goal.id),
+            bool(self._avoids_highways(cost_function)),
+        )
+
+    def _compiled_reachability_result(
+        self,
+        start: Node,
+        goal: Node,
+        cost_function: ScenicCostFunction,
+    ) -> Optional[bool]:
+        graph = self.graph
+        if graph is None:
+            return None
+        stamp = graph._heuristic_cache_stamp()
+        cls = type(self)
+        if (
+            cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH is not graph
+            or cls._ELIGIBLE_REACHABILITY_SHARED_STAMP != stamp
+        ):
+            cls._ELIGIBLE_REACHABILITY_SHARED_CACHE.clear()
+            cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH = graph
+            cls._ELIGIBLE_REACHABILITY_SHARED_STAMP = stamp
+        cache = cls._ELIGIBLE_REACHABILITY_SHARED_CACHE
+        result = cache.get(
+            self._compiled_reachability_cache_key(
+                start, goal, cost_function, stamp
+            )
+        )
+        if result is not None:
+            cache.move_to_end(
+                self._compiled_reachability_cache_key(
+                    start, goal, cost_function, stamp
+                )
+            )
+            return bool(result)
+        return None
+
+    def _record_compiled_reachability(
+        self,
+        start: Node,
+        goal: Node,
+        cost_function: ScenicCostFunction,
+        stamp: object,
+        reachable: bool,
+    ) -> None:
+        graph = self.graph
+        if graph is None or graph._heuristic_cache_stamp() != stamp:
+            return
+        cls = type(self)
+        if (
+            cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH is not graph
+            or cls._ELIGIBLE_REACHABILITY_SHARED_STAMP != stamp
+        ):
+            cls._ELIGIBLE_REACHABILITY_SHARED_CACHE.clear()
+            cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH = graph
+            cls._ELIGIBLE_REACHABILITY_SHARED_STAMP = stamp
+        cache = cls._ELIGIBLE_REACHABILITY_SHARED_CACHE
+        key = self._compiled_reachability_cache_key(
+            start, goal, cost_function, stamp
+        )
+        cache[key] = bool(reachable)
+        cache.move_to_end(key)
+        while len(cache) > self._ELIGIBLE_REACHABILITY_CACHE_CAPACITY:
+            cache.popitem(last=False)
+
     def _compiled_builtin_path(
         self,
         start: Node,
@@ -712,6 +1100,13 @@ class ScenicRoutePlanner:
             method="D",
         )
         goal_distance = float(distances[goal_index])
+        self._record_compiled_reachability(
+            start,
+            goal,
+            cost_function,
+            topology.stamp,
+            math.isfinite(goal_distance),
+        )
         if not math.isfinite(goal_distance):
             return None
         duration_tie_path = self._compiled_duration_tie_path(
@@ -823,12 +1218,13 @@ class ScenicRoutePlanner:
             graph is not self.graph
             or graph._heuristic_cache_stamp() != stamp
         ):
-            return shortest_edges
+            raise RuntimeError("road graph changed during fastest-path search")
         self._fastest_path_cache[key] = tuple(shortest_edges)
         self._fastest_path_cache.move_to_end(key)
         while len(self._fastest_path_cache) > self._FASTEST_PATH_CACHE_CAPACITY:
             self._fastest_path_cache.popitem(last=False)
         return list(shortest_edges)
+
     def _iter_edges(self, node_id: str):
         """Iterate outgoing traversals without requiring list materialization."""
         graph = self.graph
@@ -900,7 +1296,7 @@ class ScenicRoutePlanner:
         edge = graph.edges[edge_id]
         if not reverse:
             return edge
-        return Edge(
+        reverse_edge = Edge(
             id=f"{edge.id}::rev",
             start_node_id=edge.end_node_id,
             end_node_id=edge.start_node_id,
@@ -911,6 +1307,14 @@ class ScenicRoutePlanner:
             speed_limit_kmh=edge.speed_limit_kmh,
             one_way=False,
         )
+        # Preserve source identity separately from the historical display ID;
+        # canonical IDs may themselves end in ``::rev``.
+        reverse_edge.traversal_id = f"reverse:{edge.id}"
+        reverse_edge.canonical_edge_id = str(edge.id)
+        reverse_edge.direction = "reverse"
+        reverse_edge._canonical_edge_id = str(edge.id)
+        reverse_edge._is_reverse_traversal = True
+        return reverse_edge
 
     def _bidirectional_builtin_path(
         self,
@@ -1074,6 +1478,612 @@ class ScenicRoutePlanner:
         return path
 
 
+    @staticmethod
+    def _duration_within_cap(duration: float, cap: float) -> bool:
+        tolerance = 1e-12 * max(1.0, abs(duration), abs(cap))
+        return duration <= cap + tolerance
+
+    def _is_bounded_oracle_graph(self) -> bool:
+        graph = self.graph
+        if graph is None:
+            return False
+        try:
+            return (
+                len(graph.nodes) <= self._EXACT_ORACLE_MAX_NODES
+                and len(graph.edges) <= self._EXACT_ORACLE_MAX_EDGES
+            )
+        except (AttributeError, TypeError):
+            return False
+
+    def _canonical_fastest_edges(
+        self, start: Node, goal: Node, avoid_highways: bool
+    ) -> Optional[List[Edge]]:
+        """Find a duration-optimal path with a deterministic edge tie-break.
+
+        The state key is ``(duration, edge-id sequence)``.  Positive-duration
+        cycles cannot improve a label; zero-duration cycles are explicitly
+        rejected by the simple-node check, so a returned path is always
+        simple.
+        """
+        if start.id == goal.id:
+            return []
+        frontier: List[Tuple[float, Tuple[str, ...], str, Tuple[Edge, ...], Tuple[str, ...]]] = [
+            (0.0, (), start.id, (), (start.id,))
+        ]
+        best: Dict[str, Tuple[float, Tuple[str, ...]]] = {start.id: (0.0, ())}
+        while frontier:
+            duration, sequence, node_id, path, nodes = heapq.heappop(frontier)
+            if best.get(node_id) != (duration, sequence):
+                continue
+            if node_id == goal.id:
+                return list(path)
+            for edge in sorted(
+                self._iter_edges(node_id),
+                key=lambda item: (str(item.id), str(item.end_node_id)),
+            ):
+                if avoid_highways and is_highway_road_type(edge.road_type):
+                    continue
+                neighbor_id = str(edge.end_node_id)
+                if neighbor_id in nodes:
+                    continue
+                self._validated_nonnegative(edge.distance_km, "edge distance_km")
+                edge_duration = self._edge_duration_minutes(edge)
+                next_duration = duration + edge_duration
+                if not math.isfinite(next_duration):
+                    raise ValueError(
+                        "cumulative duration must be finite and non-negative"
+                    )
+                next_sequence = sequence + (str(edge.id),)
+                next_key = (next_duration, next_sequence)
+                previous = best.get(neighbor_id)
+                if previous is not None and next_key >= previous:
+                    continue
+                best[neighbor_id] = next_key
+                heapq.heappush(
+                    frontier,
+                    (
+                        next_duration,
+                        next_sequence,
+                        neighbor_id,
+                        path + (edge,),
+                        nodes + (neighbor_id,),
+                    ),
+                )
+        return None
+
+    def _enumerate_simple_optimum(
+        self,
+        start: Node,
+        goal: Node,
+        *,
+        q: float,
+        kappa: float,
+        fastest_duration_minutes: float,
+        duration_cap_minutes: float,
+        avoid_highways: bool,
+    ) -> Tuple[Optional[List[Edge]], object]:
+        """Enumerate every feasible simple path on a bounded oracle graph."""
+        best_edges: Optional[List[Edge]] = None
+        best_evaluation = None
+        visited = {start.id}
+
+        def visit(node_id: str, path: Tuple[Edge, ...], duration: float) -> None:
+            nonlocal best_edges, best_evaluation
+            if node_id == goal.id:
+                evaluation = evaluate_path(
+                    path,
+                    q=q,
+                    kappa=kappa,
+                    fastest_duration_minutes=fastest_duration_minutes,
+                )
+                if (
+                    best_evaluation is None
+                    or is_better_path(evaluation, best_evaluation)
+                ):
+                    best_evaluation = evaluation
+                    best_edges = list(path)
+                return
+            outgoing = sorted(
+                self._iter_edges(node_id),
+                key=lambda item: (str(item.id), str(item.end_node_id)),
+            )
+            for edge in outgoing:
+                if avoid_highways and is_highway_road_type(edge.road_type):
+                    continue
+                neighbor_id = str(edge.end_node_id)
+                if neighbor_id in visited:
+                    continue
+                self._validated_nonnegative(edge.distance_km, "edge distance_km")
+                edge_duration = self._edge_duration_minutes(edge)
+                next_duration = duration + edge_duration
+                if not math.isfinite(next_duration):
+                    raise ValueError(
+                        "cumulative duration must be finite and non-negative"
+                    )
+                if not self._duration_within_cap(
+                    next_duration, duration_cap_minutes
+                ):
+                    continue
+                visited.add(neighbor_id)
+                visit(neighbor_id, path + (edge,), next_duration)
+                visited.remove(neighbor_id)
+
+        visit(start.id, (), 0.0)
+        return best_edges, best_evaluation
+
+    def _frontier_reverse_duration_lower_bounds(
+        self, goal: Node, avoid_highways: bool, duration_cap: float
+    ) -> Dict[str, float]:
+        fastest = ScenicRoutePlanner._make_fastest_cost_function(self)
+        fastest.avoid_highways = bool(avoid_highways)
+        signature = self._built_in_cost_signature(fastest)
+        if _scipy_shortest_path is not None and signature is not None:
+            data = self._csr_data(fastest, signature)
+            if data is not None:
+                goal_index = data.topology.node_index.get(goal.id)
+                if goal_index is not None:
+                    distances = _scipy_shortest_path(
+                        data.matrix.transpose(),
+                        directed=True,
+                        indices=goal_index,
+                        return_predecessors=False,
+                        unweighted=False,
+                        method="D",
+                    )
+                    if self.graph._heuristic_cache_stamp() == data.topology.stamp:
+                        return {
+                            node_id: float(distances[index])
+                            for index, node_id in enumerate(data.topology.node_ids)
+                        }
+        snapshot = self._build_reverse_predecessor_snapshot(fastest)
+        if snapshot is None:
+            return {str(node_id): 0.0 for node_id in self.graph.nodes}
+        bounds = {
+            str(node_id): float("inf") for node_id in self.graph.nodes
+        }
+        bounds[goal.id] = 0.0
+        queue: List[Tuple[float, str]] = [(0.0, goal.id)]
+        while queue:
+            distance, node_id = heapq.heappop(queue)
+            if distance != bounds.get(node_id):
+                continue
+            for predecessor, _, edge_duration, _ in snapshot.predecessors.get(
+                node_id, ()
+            ):
+                next_distance = distance + edge_duration
+                if not math.isfinite(next_distance) or not self._duration_within_cap(
+                    next_distance, duration_cap
+                ):
+                    continue
+                if next_distance < bounds.get(predecessor, float("inf")):
+                    bounds[predecessor] = next_distance
+                    heapq.heappush(queue, (next_distance, predecessor))
+        return bounds
+
+    @staticmethod
+    def _frontier_label_dominates(
+        first: _FrontierLabel, second: _FrontierLabel
+    ) -> bool:
+        """Safe dominance across all continuations.
+
+        ``first`` must leave at least as many unvisited nodes available.
+        Its lower duration, lower distance, and higher accumulated exposure
+        preserve both duration utility and every possible continuation ratio.
+        """
+        if first.node_id != second.node_id:
+            return False
+        if not first.visited_nodes.issubset(second.visited_nodes):
+            return False
+        if first.cumulative_duration_minutes > second.cumulative_duration_minutes:
+            return False
+        if first.cumulative_distance_km > second.cumulative_distance_km:
+            return False
+        if (
+            first.normalized_scenic_exposure
+            < second.normalized_scenic_exposure
+        ):
+            return False
+        metrics_strict = (
+            first.cumulative_duration_minutes
+            < second.cumulative_duration_minutes
+            or first.cumulative_distance_km
+            < second.cumulative_distance_km
+            or first.normalized_scenic_exposure
+            > second.normalized_scenic_exposure
+            or first.visited_nodes != second.visited_nodes
+        )
+        return metrics_strict and first.edge_sequence <= second.edge_sequence
+
+    def _frontier_warm_start_paths(
+        self,
+        start: Node,
+        goal: Node,
+        avoid_highways: bool,
+    ) -> List[List[Edge]]:
+        """Return feasible-quality incumbents without limiting the frontier.
+
+        These scalar paths only warm-start branch-and-bound. They never remove
+        labels, define the searched space, or support an exactness claim.
+        """
+        topology = self._csr_topology(False)
+        if topology is None:
+            return []
+        start_index = topology.node_index.get(start.id)
+        goal_index = topology.node_index.get(goal.id)
+        if start_index is None or goal_index is None:
+            return []
+        normalized = np.clip(topology.scenic_score, 0.0, 10.0) / 10.0
+        scenic_disutility = topology.distance_km * (1.0 - normalized)
+        valid = (
+            np.isfinite(scenic_disutility)
+            & np.isfinite(topology.travel_time_minutes)
+            & (scenic_disutility >= 0.0)
+            & (topology.travel_time_minutes >= 0.0)
+        )
+        if avoid_highways:
+            valid &= ~topology.highway_mask
+        positive_duration = valid & (topology.travel_time_minutes > 0.0)
+        if np.any(positive_duration):
+            ratios = (
+                scenic_disutility[positive_duration]
+                / topology.travel_time_minutes[positive_duration]
+            )
+            scale = float(np.median(ratios[np.isfinite(ratios)]))
+        else:
+            scale = 0.0
+        paths: List[List[Edge]] = []
+        seen: set[Tuple[str, ...]] = set()
+        for coefficient in (0.0, 0.25 * scale, scale, 4.0 * scale):
+            weights = scenic_disutility + coefficient * topology.travel_time_minutes
+            weights = np.where(valid, weights, np.inf)
+            path = self._compiled_weighted_path(
+                topology, start_index, goal_index, weights
+            )
+            if path is None or not self._simple_edge_path(path):
+                continue
+            identity = tuple(
+                str(getattr(edge, "traversal_id", "") or edge.id)
+                for edge in path
+            )
+            if identity not in seen:
+                seen.add(identity)
+                paths.append(path)
+        return paths
+
+    @staticmethod
+    def _frontier_path(
+        labels: Dict[int, _FrontierLabel], label_id: int
+    ) -> List[Edge]:
+        path: List[Edge] = []
+        current = labels[label_id]
+        while current.incoming_edge is not None:
+            path.append(current.incoming_edge)
+            predecessor = current.predecessor_label_id
+            assert predecessor is not None
+            current = labels[predecessor]
+        path.reverse()
+        return path
+
+    def _production_frontier_search(
+        self,
+        start: Node,
+        goal: Node,
+        *,
+        q: float,
+        kappa: float,
+        fastest_duration_minutes: float,
+        duration_cap_minutes: float,
+        avoid_highways: bool,
+        fastest_edges: List[Edge],
+        fastest_evaluation: object,
+        started_at: Optional[float] = None,
+    ) -> Tuple[List[Edge], object, bool, float]:
+        started = self._monotonic() if started_at is None else started_at
+        search_stamp = self.graph._heuristic_cache_stamp()
+        reverse_bounds = self._frontier_reverse_duration_lower_bounds(
+            goal, avoid_highways, duration_cap_minutes
+        )
+        if self.graph._heuristic_cache_stamp() != search_stamp:
+            raise RuntimeError(
+                "road graph changed during frontier-bound construction"
+            )
+        labels: Dict[int, _FrontierLabel] = {
+            0: _FrontierLabel(
+                0,
+                start.id,
+                0.0,
+                0.0,
+                0.0,
+                None,
+                None,
+                frozenset((start.id,)),
+                (),
+            )
+        }
+        active: set[int] = {0}
+        labels_at_node: Dict[str, set[int]] = {start.id: {0}}
+        frontier: List[Tuple[float, Tuple[str, ...], int]] = []
+
+        max_distance_per_minute: Optional[float] = None
+        zero_duration_distance = 0.0
+        topology = self._csr_topology(False)
+        if (
+            topology is not None
+            and topology.graph is self.graph
+            and topology.stamp == search_stamp
+        ):
+            eligible = (
+                ~topology.highway_mask
+                if avoid_highways
+                else np.ones(len(topology.edge_refs), dtype=np.bool_)
+            )
+            distances = topology.distance_km[eligible]
+            durations = topology.travel_time_minutes[eligible]
+            finite = (
+                np.isfinite(distances)
+                & np.isfinite(durations)
+                & (distances >= 0.0)
+                & (durations >= 0.0)
+            )
+            distances = distances[finite]
+            durations = durations[finite]
+            zero_duration_distance = float(
+                np.sum(distances[durations == 0.0], dtype=np.float64)
+            )
+            positive = durations > 0.0
+            if np.any(positive):
+                max_distance_per_minute = float(
+                    np.max(distances[positive] / durations[positive])
+                )
+
+        def upper_bound(label: _FrontierLabel) -> float:
+            remaining = reverse_bounds.get(label.node_id, float("inf"))
+            if not math.isfinite(remaining):
+                return float("-inf")
+            if not self._duration_within_cap(
+                label.cumulative_duration_minutes + remaining,
+                duration_cap_minutes,
+            ):
+                return float("-inf")
+            rounding_margin = 1e-12 * max(1.0, abs(remaining))
+            admissible_remaining = max(0.0, remaining - rounding_margin)
+            minimum_final_duration = (
+                label.cumulative_duration_minutes + admissible_remaining
+            )
+            duration_ub = duration_component(
+                minimum_final_duration,
+                fastest_duration_minutes,
+                kappa,
+            )
+            scenic_ub = 1.0
+            if max_distance_per_minute is not None:
+                remaining_budget = max(
+                    0.0,
+                    duration_cap_minutes
+                    - label.cumulative_duration_minutes,
+                )
+                maximum_suffix_distance = (
+                    zero_duration_distance
+                    + max_distance_per_minute * remaining_budget
+                )
+                denominator = (
+                    label.cumulative_distance_km
+                    + maximum_suffix_distance
+                )
+                if denominator > 0.0:
+                    scenic_ub = min(
+                        1.0,
+                        (
+                            label.normalized_scenic_exposure
+                            + maximum_suffix_distance
+                        )
+                        / denominator,
+                    )
+            return float((1.0 - q) * duration_ub + q * scenic_ub)
+
+        heapq.heappush(frontier, (-upper_bound(labels[0]), (), 0))
+        next_label_id = 1
+        incumbent_edges = list(fastest_edges)
+        incumbent_evaluation = fastest_evaluation
+        for warm_path in self._frontier_warm_start_paths(
+            start, goal, avoid_highways
+        ):
+            if not self._duration_within_cap(
+                self._path_duration_minutes(warm_path),
+                duration_cap_minutes,
+            ):
+                continue
+            warm_evaluation = evaluate_path(
+                warm_path,
+                q=q,
+                kappa=kappa,
+                fastest_duration_minutes=fastest_duration_minutes,
+            )
+            if is_better_path(warm_evaluation, incumbent_evaluation):
+                incumbent_edges = warm_path
+                incumbent_evaluation = warm_evaluation
+        timed_out = False
+
+        def deadline_reached() -> bool:
+            try:
+                limit = float(self._frontier_time_limit_seconds)
+                return limit <= 0.0 or self._monotonic() - started >= limit
+            except (TypeError, ValueError, OverflowError):
+                return False
+
+        def epoch_changed() -> bool:
+            return self.graph._heuristic_cache_stamp() != search_stamp
+
+        while frontier:
+            if epoch_changed():
+                raise RuntimeError(
+                    "road graph changed during frontier search"
+                )
+            if deadline_reached():
+                timed_out = True
+                break
+            _, _, label_id = heapq.heappop(frontier)
+            if label_id not in active:
+                continue
+            label = labels[label_id]
+            label_ub = upper_bound(label)
+            if label_ub == float("-inf"):
+                active.remove(label_id)
+                continue
+            incumbent_objective = float(
+                getattr(incumbent_evaluation, "objective")
+            )
+            if label_ub < incumbent_objective - 1e-12:
+                active.remove(label_id)
+                continue
+            if label.node_id == goal.id:
+                candidate = self._frontier_path(labels, label_id)
+                evaluation = evaluate_path(
+                    candidate,
+                    q=q,
+                    kappa=kappa,
+                    fastest_duration_minutes=fastest_duration_minutes,
+                )
+                if is_better_path(evaluation, incumbent_evaluation):
+                    incumbent_edges = candidate
+                    incumbent_evaluation = evaluation
+                active.remove(label_id)
+                continue
+            for edge in sorted(
+                self._iter_edges(label.node_id),
+                key=lambda item: (
+                    str(getattr(item, "traversal_id", "") or item.id),
+                    str(item.end_node_id),
+                ),
+            ):
+                if epoch_changed():
+                    raise RuntimeError(
+                        "road graph changed during frontier search"
+                    )
+                if deadline_reached():
+                    timed_out = True
+                    break
+                if avoid_highways and is_highway_road_type(edge.road_type):
+                    continue
+                neighbor = str(edge.end_node_id)
+                if neighbor in label.visited_nodes:
+                    continue
+                distance = self._validated_nonnegative(
+                    edge.distance_km, "edge distance_km"
+                )
+                edge_duration = self._edge_duration_minutes(edge)
+                next_distance = label.cumulative_distance_km + distance
+                next_duration = label.cumulative_duration_minutes + edge_duration
+                if not math.isfinite(next_distance) or not math.isfinite(
+                    next_duration
+                ):
+                    raise ValueError(
+                        "cumulative traversed resource must be finite and non-negative"
+                    )
+                remaining = reverse_bounds.get(neighbor, float("inf"))
+                if not math.isfinite(remaining) or not self._duration_within_cap(
+                    next_duration + remaining, duration_cap_minutes
+                ):
+                    continue
+                exposure = label.normalized_scenic_exposure + (
+                    distance * clamp_scenic_score(edge.scenic_score) / 10.0
+                )
+                if not math.isfinite(exposure):
+                    raise ValueError(
+                        "cumulative scenic exposure must be finite and non-negative"
+                    )
+                edge_token = str(
+                    getattr(edge, "traversal_id", "") or edge.id
+                )
+                candidate = _FrontierLabel(
+                    next_label_id,
+                    neighbor,
+                    next_duration,
+                    next_distance,
+                    exposure,
+                    label_id,
+                    edge,
+                    label.visited_nodes | frozenset((neighbor,)),
+                    label.edge_sequence + (edge_token,),
+                )
+                existing_ids = labels_at_node.get(neighbor, set())
+                if any(
+                    existing_id in active
+                    and self._frontier_label_dominates(
+                        labels[existing_id], candidate
+                    )
+                    for existing_id in existing_ids
+                ):
+                    continue
+                dominated_ids = [
+                    existing_id
+                    for existing_id in existing_ids
+                    if existing_id in active
+                    and self._frontier_label_dominates(
+                        candidate, labels[existing_id]
+                    )
+                ]
+                for dominated_id in dominated_ids:
+                    active.discard(dominated_id)
+                    existing_ids.discard(dominated_id)
+                labels[next_label_id] = candidate
+                active.add(next_label_id)
+                labels_at_node.setdefault(neighbor, set()).add(next_label_id)
+                heapq.heappush(
+                    frontier,
+                    (
+                        -upper_bound(candidate),
+                        candidate.edge_sequence,
+                        next_label_id,
+                    ),
+                )
+                next_label_id += 1
+            if not timed_out:
+                active.discard(label_id)
+            if timed_out:
+                break
+
+        if timed_out:
+            certified_upper_bound = float(
+                getattr(incumbent_evaluation, "objective")
+            )
+            for live_id in active:
+                certified_upper_bound = max(
+                    certified_upper_bound, upper_bound(labels[live_id])
+                )
+            exact = False
+        else:
+            certified_upper_bound = float(
+                getattr(incumbent_evaluation, "objective")
+            )
+            exact = True
+        certified_upper_bound = max(
+            float(getattr(incumbent_evaluation, "objective")),
+            certified_upper_bound,
+        )
+        return (
+            incumbent_edges,
+            incumbent_evaluation,
+            exact,
+            certified_upper_bound,
+        )
+    @staticmethod
+    def _simple_edge_path(edges: List[Edge]) -> bool:
+        nodes = set()
+        for edge in edges:
+            if edge.start_node_id in nodes:
+                return False
+            nodes.add(edge.start_node_id)
+        if edges and edges[-1].end_node_id in nodes:
+            return False
+        return True
+    @staticmethod
+    def _has_scenic_improvement(candidate: object, baseline: object) -> bool:
+        candidate_score = float(getattr(candidate, "normalized_scenic_score"))
+        baseline_score = float(getattr(baseline, "normalized_scenic_score"))
+        tolerance = 1e-12 * max(1.0, abs(candidate_score), abs(baseline_score))
+        return candidate_score > baseline_score + tolerance
+
     def find_scenic_route(
         self,
         start: Tuple[float, float],
@@ -1081,74 +2091,159 @@ class ScenicRoutePlanner:
         scenic_weight: float = 0.5,
         avoid_highways: bool = False,
         max_detour_factor: float = 1.8,
+        *,
+        q: Optional[float] = None,
+        kappa: Optional[float] = None,
     ) -> Route:
-        """Choose the exact additive scenic-cost optimum under a duration cap.
+        """Optimize the normalized distance-weighted scenic utility.
 
-        ``scenic_weight=1`` minimizes total duration-weighted scenic
-        disutility, rather than a ratio such as the route's average scenic
-        score.  The additive objective keeps positive edge costs and exact
-        loop-free resource-constrained search.
+        Bounded oracle graphs are solved by exhaustive simple-path enumeration
+        (exact, with deterministic ties). Larger graphs use the complete
+        multi-label frontier, returning exact metadata on normal exhaustion or
+        a deadline-bounded certified upper bound and gap.
         """
         if self.graph is None:
             raise RuntimeError("Road graph not loaded")
-        if max_detour_factor < 1.0:
-            raise ValueError("max_detour_factor must be >= 1.0")
+        if q is not None:
+            scenic_weight = q
+        if kappa is not None:
+            max_detour_factor = kappa
+        try:
+            q_value = float(scenic_weight)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("q must be finite and in [0, 1]") from exc
+        try:
+            kappa_value = float(max_detour_factor)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("kappa must be finite and >= 1") from exc
+        if (
+            not math.isfinite(q_value)
+            or q_value < 0.0
+            or q_value > 1.0
+        ):
+            raise ValueError("q must be finite and in [0, 1]")
+        if not math.isfinite(kappa_value) or kappa_value < 1.0:
+            raise ValueError("kappa must be finite and >= 1")
 
-        scenic_weight = float(min(max(scenic_weight, 0.0), 1.0))
         self.cost_function.avoid_highways = bool(avoid_highways)
-
-        if scenic_weight <= 0.0:
-            return self.find_fastest_route(start, end, avoid_highways=avoid_highways)
-
         start_node = self.graph.find_nearest_node(*start)
         end_node = self.graph.find_nearest_node(*end)
-        shortest_edges = self._cached_fastest_edges(
-            start_node, end_node, bool(avoid_highways)
-        )
+        bounded_graph = self._is_bounded_oracle_graph()
+        if bounded_graph:
+            shortest_edges = self._canonical_fastest_edges(
+                start_node, end_node, bool(avoid_highways)
+            )
+        else:
+            # The compiled exact duration solver reuses prewarmed CSR data and
+            # avoids scanning every Python adjacency row on production graphs.
+            shortest_edges = self._cached_fastest_edges(
+                start_node, end_node, bool(avoid_highways)
+            )
         if shortest_edges is None:
             raise ValueError("No route found between the given coordinates.")
+        fastest_duration = self._path_duration_minutes(shortest_edges)
+        duration_cap = fastest_duration * kappa_value
+        if not math.isfinite(duration_cap):
+            raise ValueError("kappa must produce a finite duration cap")
+        fastest_evaluation = evaluate_path(
+            shortest_edges,
+            q=q_value,
+            kappa=kappa_value,
+            fastest_duration_minutes=fastest_duration,
+        )
 
-        fastest_duration_minutes = self._path_duration_minutes(shortest_edges)
-        duration_cap_minutes = fastest_duration_minutes * float(max_detour_factor)
-        if not math.isfinite(duration_cap_minutes):
-            raise ValueError("max_detour_factor must produce a finite duration cap")
-
-        scenic_cost = self._make_cost_function(scenic_weight)
-        if max_detour_factor == 1.0:
-            shortest_duration_scenic_edges = (
-                self._compiled_shortest_duration_scenic_path(
-                    start_node, end_node, scenic_cost
-                )
+        if q_value == 0.0:
+            return self._path_to_route(
+                shortest_edges,
+                start_node=start_node,
+                goal_node=end_node,
+                evaluation=fastest_evaluation,
+                fastest_duration_minutes=fastest_duration,
+                requested_max_detour_factor=kappa_value,
+                exact=True,
+                exactness_status="exact",
+                algorithm=(
+                    "canonical-duration-dijkstra"
+                    if bounded_graph
+                    else "compiled-duration-dijkstra"
+                ),
             )
-            if shortest_duration_scenic_edges is not None:
-                return self._path_to_route(shortest_duration_scenic_edges)
-        unconstrained_scenic_edges = self._a_star(
+
+        if bounded_graph:
+            path_edges, evaluation = self._enumerate_simple_optimum(
+                start_node,
+                end_node,
+                q=q_value,
+                kappa=kappa_value,
+                fastest_duration_minutes=fastest_duration,
+                duration_cap_minutes=duration_cap,
+                avoid_highways=bool(avoid_highways),
+            )
+            no_scenic_improvement = not self._has_scenic_improvement(
+                evaluation, fastest_evaluation
+            )
+            return self._path_to_route(
+                path_edges,
+                start_node=start_node,
+                goal_node=end_node,
+                evaluation=evaluation,
+                fastest_duration_minutes=fastest_duration,
+                requested_max_detour_factor=kappa_value,
+                exact=True,
+                exactness_status="exact",
+                algorithm="exact-simple-path-oracle",
+                zero_improvement_reason=(
+                    "no_feasible_scenic_improvement"
+                    if no_scenic_improvement
+                    else None
+                ),
+            )
+        frontier_started = self._monotonic()
+
+        (
+            best_edges,
+            best_evaluation,
+            exact,
+            certified_upper_bound,
+        ) = self._production_frontier_search(
             start_node,
             end_node,
-            cost_function=scenic_cost,
+            q=q_value,
+            kappa=kappa_value,
+            fastest_duration_minutes=fastest_duration,
+            duration_cap_minutes=duration_cap,
+            avoid_highways=bool(avoid_highways),
+            fastest_edges=shortest_edges,
+            fastest_evaluation=fastest_evaluation,
+            started_at=frontier_started,
         )
-        if unconstrained_scenic_edges is not None:
-            unconstrained_duration = self._path_duration_minutes(
-                unconstrained_scenic_edges
-            )
-            if unconstrained_duration <= duration_cap_minutes:
-                return self._path_to_route(unconstrained_scenic_edges)
-        scenic_upper_bound = sum(
-            scenic_cost.calculate(edge) for edge in shortest_edges
+        no_scenic_improvement = not self._has_scenic_improvement(
+            best_evaluation, fastest_evaluation
         )
-        if not math.isfinite(scenic_upper_bound):
-            scenic_upper_bound = None
-        path_edges = self._a_star(
-            start_node,
-            end_node,
-            cost_function=scenic_cost,
-            max_path_minutes=duration_cap_minutes,
-            max_feasible_cost=scenic_upper_bound,
-            shortest_duration_minutes=fastest_duration_minutes,
+        return self._path_to_route(
+            best_edges,
+            start_node=start_node,
+            goal_node=end_node,
+            evaluation=best_evaluation,
+            fastest_duration_minutes=fastest_duration,
+            requested_max_detour_factor=kappa_value,
+            exact=exact,
+            exactness_status=(
+                "exact" if exact else "approximate-certified"
+            ),
+            optimality_gap=max(
+                0.0,
+                certified_upper_bound
+                - float(getattr(best_evaluation, "objective")),
+            ),
+            certified_upper_bound=certified_upper_bound,
+            algorithm="production-multilabel-frontier",
+            zero_improvement_reason=(
+                "no_feasible_scenic_improvement"
+                if no_scenic_improvement
+                else None
+            ),
         )
-        if path_edges is None:
-            raise ValueError("No route found between the given coordinates.")
-        return self._path_to_route(path_edges)
 
     def find_fastest_route(
         self,
@@ -1162,12 +2257,39 @@ class ScenicRoutePlanner:
         self.cost_function.avoid_highways = bool(avoid_highways)
         start_node = self.graph.find_nearest_node(*start)
         end_node = self.graph.find_nearest_node(*end)
-        shortest_edges = self._cached_fastest_edges(
-            start_node, end_node, bool(avoid_highways)
-        )
+        bounded_graph = self._is_bounded_oracle_graph()
+        if bounded_graph:
+            shortest_edges = self._canonical_fastest_edges(
+                start_node, end_node, bool(avoid_highways)
+            )
+        else:
+            shortest_edges = self._cached_fastest_edges(
+                start_node, end_node, bool(avoid_highways)
+            )
         if shortest_edges is None:
             raise ValueError("No route found between the given coordinates.")
-        return self._path_to_route(shortest_edges)
+        fastest_duration = self._path_duration_minutes(shortest_edges)
+        evaluation = evaluate_path(
+            shortest_edges,
+            q=0.0,
+            kappa=1.0,
+            fastest_duration_minutes=fastest_duration,
+        )
+        return self._path_to_route(
+            shortest_edges,
+            start_node=start_node,
+            goal_node=end_node,
+            evaluation=evaluation,
+            fastest_duration_minutes=fastest_duration,
+            requested_max_detour_factor=1.0,
+            exact=True,
+            exactness_status="exact",
+            algorithm=(
+                "canonical-duration-dijkstra"
+                if bounded_graph
+                else "compiled-duration-dijkstra"
+            ),
+        )
 
     def _a_star(
         self,
@@ -1210,11 +2332,25 @@ class ScenicRoutePlanner:
                 "shortest_duration_minutes requires max_path_minutes"
             )
         if self._reverse_cost_eligible(cost_function):
+            if (
+                self._compiled_reachability_result(
+                    start, goal, cost_function
+                )
+                is False
+            ):
+                return None
             compiled_path = self._compiled_builtin_path(
                 start, goal, cost_function
             )
             if compiled_path is not None:
                 return compiled_path
+            if (
+                self._compiled_reachability_result(
+                    start, goal, cost_function
+                )
+                is False
+            ):
+                return None
         if (
             len(self.graph.edges) > self._LARGE_GRAPH_EDGE_THRESHOLD
             and self._reverse_cost_eligible(cost_function)
@@ -1226,7 +2362,11 @@ class ScenicRoutePlanner:
                 return bidirectional_path
 
 
-        minimum_cost_per_km = self._minimum_cost_per_km(cost_function)
+        minimum_cost_per_km = (
+            self._minimum_cost_per_km(cost_function)
+            if self._reverse_cost_eligible(cost_function)
+            else 0.0
+        )
         start_to_goal_km = self._haversine(
             start.lat, start.lon, goal.lat, goal.lon
         )
@@ -1958,9 +3098,10 @@ class ScenicRoutePlanner:
         # Duration search is ordered directly by cost; a cost-per-distance
         # scan is neither admissible nor useful for that resource.
         minimum_cost_per_km = (
-            0.0
-            if resource_kind == "duration"
-            else self._minimum_cost_per_km(cost_function)
+            self._minimum_cost_per_km(cost_function)
+            if resource_kind == "distance"
+            and self._reverse_cost_eligible(cost_function)
+            else 0.0
         )
         # A distance/geodesic lower bound is not a safe duration bound:
         # deliberately disable it for the duration resource.
@@ -2344,46 +3485,157 @@ class ScenicRoutePlanner:
         edges.reverse()
         return edges
 
-    def _path_to_route(self, edges: List[Edge]) -> Route:
-        segments: List[RouteSegment] = []
-        total_distance_km = 0.0
-        scenic_duration_sum = 0.0
-        total_minutes = 0.0
-        waypoints: List[Tuple[float, float]] = []
+    def _path_to_route(
+        self,
+        edges: List[Edge],
+        *,
+        start_node: Optional[Node] = None,
+        goal_node: Optional[Node] = None,
+        evaluation: object = None,
+        fastest_duration_minutes: Optional[float] = None,
+        requested_max_detour_factor: float = 1.0,
+        exact: bool = False,
+        exactness_status: str = "uncertified",
+        optimality_gap: Optional[float] = None,
+        certified_upper_bound: Optional[float] = None,
+        algorithm: str = "uncertified-production-search",
+        zero_improvement_reason: Optional[str] = None,
+    ) -> Route:
+        if evaluation is None:
+            fallback_fastest = (
+                self._path_duration_minutes(edges)
+                if fastest_duration_minutes is None
+                else float(fastest_duration_minutes)
+            )
+            evaluation = evaluate_path(
+                edges,
+                q=0.0,
+                kappa=requested_max_detour_factor,
+                fastest_duration_minutes=fallback_fastest,
+            )
+        total_distance_km = float(getattr(evaluation, "total_distance_km"))
+        total_minutes = float(getattr(evaluation, "duration_minutes"))
+        raw_scenic = float(getattr(evaluation, "raw_scenic_score"))
+        normalized_scenic = float(
+            getattr(evaluation, "normalized_scenic_score")
+        )
+        evaluation_edge_ids = tuple(getattr(evaluation, "edge_ids"))
+        score_run = tuple(getattr(evaluation, "score_run"))
+        duration_utility = float(getattr(evaluation, "duration_utility"))
+        objective_value = float(getattr(evaluation, "objective"))
+        score_values = [float(score) for _, score in score_run]
+        if len(score_values) != len(edges):
+            raise ValueError("path evaluation score run does not match edges")
+        del evaluation_edge_ids
+        fastest = (
+            total_minutes
+            if fastest_duration_minutes is None
+            else float(fastest_duration_minutes)
+        )
+        cap = fastest * float(requested_max_detour_factor)
+        if fastest > 0.0:
+            actual_ratio = total_minutes / fastest
+        else:
+            actual_ratio = 1.0 if total_minutes == 0.0 else float("inf")
 
-        for edge in edges:
+        segments: List[RouteSegment] = []
+        canonical_edge_ids: List[str] = []
+        traversal_ids: List[str] = []
+        waypoints: List[Tuple[float, float]] = []
+        normalized_score_run: List[Tuple[str, float]] = []
+        if edges:
+            start_node = start_node or self.graph.get_node(edges[0].start_node_id)
+            goal_node = goal_node or self.graph.get_node(edges[-1].end_node_id)
+        elif start_node is None or goal_node is None:
+            raise ValueError("empty path requires start and goal nodes")
+        if not edges:
+            waypoints = [
+                (start_node.lat, start_node.lon),
+                (goal_node.lat, goal_node.lon),
+            ]
+        for index, edge in enumerate(edges):
             start_node = self.graph.get_node(edge.start_node_id)
             end_node = self.graph.get_node(edge.end_node_id)
-
+            direction = str(
+                getattr(
+                    edge,
+                    "direction",
+                    "reverse"
+                    if bool(getattr(edge, "_is_reverse_traversal", False))
+                    else "forward",
+                )
+            )
+            canonical_id = str(
+                getattr(
+                    edge,
+                    "canonical_edge_id",
+                    getattr(edge, "_canonical_edge_id", edge.id),
+                )
+            )
+            traversal_id = f"{index}:{direction}:{canonical_id}"
+            canonical_edge_ids.append(canonical_id)
+            traversal_ids.append(traversal_id)
+            normalized_score_run.append((traversal_id, score_values[index]))
             segments.append(
                 RouteSegment(
                     start=(start_node.lat, start_node.lon),
                     end=(end_node.lat, end_node.lon),
-                    distance_km=edge.distance_km,
-                    scenic_score=edge.scenic_score,
+                    distance_km=float(edge.distance_km),
+                    scenic_score=score_values[index],
                     road_name=edge.road_name,
                     road_type=edge.road_type,
+                    edge_id=canonical_id,
+                    direction=direction,
+                    traversal_id=traversal_id,
+                    duration_minutes=self._edge_duration_minutes(edge),
                 )
             )
-
-            total_distance_km += edge.distance_km
-            edge_minutes = edge.travel_time_minutes
-            scenic_duration_sum += edge.scenic_score * edge_minutes
-            total_minutes += edge_minutes
-
             if not waypoints:
                 waypoints.append((start_node.lat, start_node.lon))
             waypoints.append((end_node.lat, end_node.lon))
 
-        avg_scenic = (
-            scenic_duration_sum / total_minutes if total_minutes > 0 else 0.0
-        )
+        edge_ids = tuple(canonical_edge_ids)
+        score_run = tuple(normalized_score_run)
         return Route(
             segments=segments,
             total_distance_km=total_distance_km,
-            average_scenic_score=avg_scenic,
+            average_scenic_score=raw_scenic,
             estimated_duration_minutes=total_minutes,
             waypoints=waypoints,
+            edge_ids=edge_ids,
+            traversal_ids=tuple(traversal_ids),
+            raw_scenic_score=raw_scenic,
+            normalized_scenic_score=normalized_scenic,
+            duration_utility=duration_utility,
+            objective_value=objective_value,
+            fastest_duration_minutes=fastest,
+            requested_max_detour_factor=float(requested_max_detour_factor),
+            applied_max_detour_factor=float(requested_max_detour_factor),
+            duration_cap_minutes=cap,
+            actual_duration_ratio=actual_ratio,
+            exact=bool(exact),
+            exactness_status=str(exactness_status),
+            optimality_gap=(
+                None if optimality_gap is None else float(optimality_gap)
+            ),
+            certified_upper_bound=(
+                None
+                if certified_upper_bound is None
+                else float(certified_upper_bound)
+            ),
+            highway_count=int(getattr(evaluation, "highway_count")),
+            score_coverage=float(getattr(evaluation, "score_coverage")),
+            score_run=score_run,
+            algorithm=str(algorithm),
+            zero_improvement_reason=zero_improvement_reason,
+            no_route_reason=None,
+            normalization_version=str(
+                getattr(
+                    evaluation,
+                    "normalization_version",
+                    SCENIC_NORMALIZATION_VERSION,
+                )
+            ),
         )
 
     @staticmethod

@@ -16,6 +16,20 @@ from src.app_api.main import create_app
 
 
 
+@pytest.fixture(autouse=True)
+def _stub_named_test_run_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = tmp_path / "test-run-report.json"
+    report.write_text('{"tiles": [], "summary": {}}', encoding="utf-8")
+    original = app_api._run_report_path
+    monkeypatch.setattr(
+        app_api,
+        "_run_report_path",
+        lambda run_name: report if run_name == "test-run" else original(run_name),
+    )
+
+
 client = TestClient(create_app())
 
 
@@ -27,6 +41,84 @@ def test_healthz() -> None:
     assert "regions_available" in payload
 
 
+def test_healthz_redacts_preload_asset_paths(tmp_path, monkeypatch) -> None:
+    graph_path = tmp_path / "graph.json"
+    report_path = tmp_path / "report.json"
+    graph_path.write_text("graph", encoding="utf-8")
+    report_path.write_text("report", encoding="utf-8")
+    monkeypatch.setattr(
+        app_api,
+        "_configured_regions",
+        lambda: [
+            {
+                "region": "public-test",
+                "graph_path": graph_path,
+                "tile_scores_path": report_path,
+                "run_name": "public-run",
+            }
+        ],
+    )
+    monkeypatch.setattr(app_api, "_default_region_key", lambda: "public-test")
+    monkeypatch.setenv("SCENIC_ROUTE_PRELOAD", "required")
+    monkeypatch.setattr(
+        app_api,
+        "preload_route_assets",
+        lambda *args, **kwargs: {
+            "graph_path": str(graph_path),
+            "tile_scores_path": str(report_path),
+            "graph_cache_hit": True,
+            "tile_score_cache_hit": True,
+            "scored_graph_cache_hit": False,
+            "score_mapping": {
+                "source": str(report_path),
+                "matched_edges": 3,
+                "fallback_edges": 1,
+                "total_edges": 4,
+                "matched_ratio": 0.75,
+                "report_signature": "report-sig",
+                "graph_signature": "graph-sig",
+                "normalization": "linear-v1",
+                "score_run": "public-run",
+            },
+            "preload_elapsed_ms": 1.5,
+        },
+    )
+    with TestClient(create_app()) as test_client:
+        payload = test_client.get("/v1/healthz").json()
+    serialized = json.dumps(payload)
+    assert str(tmp_path) not in serialized
+    row = payload["route_preload"]["regions"][0]
+    assert row["coverage"]["matched_ratio"] == 0.75
+    assert row["signatures"]["graph_signature"] == "graph-sig"
+    assert row["timings"]["preload_elapsed_ms"] == 1.5
+    assert "graph_path" not in row
+    assert "tile_scores_path" not in row
+
+
+def test_route_compare_missing_graph_does_not_leak_path(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api,
+        "_region_to_graph",
+        lambda region: (_ for _ in ()).throw(
+            FileNotFoundError("/private/secret/road_graph.json")
+        ),
+    )
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 40.03, "lon": -75.22},
+            "end": {"lat": 40.065, "lon": -75.19},
+            "scenic_weight": 0.8,
+            "region": "philadelphia",
+            "max_detour_factor": 1.8,
+            "avoid_highways": False,
+            "include_baseline": True,
+        },
+    )
+    assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert "/private/secret" not in detail
+    assert detail == "Route assets are unavailable for region 'philadelphia'"
 def test_regions_list() -> None:
     resp = client.get("/v1/regions")
     assert resp.status_code == 200
@@ -345,6 +437,77 @@ def test_route_compare_contract() -> None:
         assert "geojson" in payload
 
 
+def _strict_route_metrics(
+    *,
+    distance_km: float,
+    duration_min: float,
+    raw_score: float,
+    edge_id: str,
+    route_kind: str = "scenic",
+    cap: float = 1.8,
+) -> dict[str, object]:
+    return {
+        "route_kind": route_kind,
+        "segments": 1,
+        "edge_ids": [edge_id],
+        "segment_identity": [{"edge_id": edge_id}],
+        "total_distance_km": distance_km,
+        "average_scenic_score": raw_score,
+        "raw_scenic_score": raw_score,
+        "normalized_scenic_score": raw_score / 10.0,
+        "estimated_duration_minutes": duration_min,
+        "objective": raw_score,
+        "objective_value": raw_score,
+        "objective_components": {"objective_value": raw_score},
+        "requested_scenic_weight": 0.8,
+        "applied_scenic_weight": 0.8,
+        "requested_max_detour_factor": cap,
+        "applied_max_detour_factor": cap,
+        "actual_duration_ratio": duration_min / 16.0,
+        "exactness_status": "exact",
+        "certified_upper_bound": None,
+        "optimality_gap": 0.0,
+        "highway_count": 0,
+        "score_coverage": 1.0,
+        "score_run": [[edge_id, raw_score]],
+        "zero_improvement_reason": None,
+        "no_route_reason": None,
+    }
+
+
+def _strict_diagnostics() -> dict[str, object]:
+    return {
+        "planner": "ok",
+        "requested_scenic_weight": 0.8,
+        "applied_scenic_weight": 0.8,
+        "requested_max_detour_factor": 1.8,
+        "applied_max_detour_factor": 1.8,
+        "scenic_fastest_duration_ratio": 1.25,
+        "optimization_mode": "exact",
+        "optimization_status": "optimal",
+        "optimality_gap": 0.0,
+        "certified_upper_bound": None,
+        "scenic_score_delta_absolute": 0.6,
+        "scenic_score_delta_relative": 3.0,
+        "same_route": False,
+        "no_better_route_reason": None,
+        "avoid_highways_applied": True,
+        "score_mapping_coverage": 1.0,
+        "planning_elapsed_ms": 0.1,
+    }
+
+
+def _strict_score_mapping() -> dict[str, object]:
+    return {
+        "version": "test",
+        "report_signature": "report-test",
+        "graph_signature": "graph-test",
+        "normalization": "linear-v1",
+        "fallback_edges": 0,
+        "score_run": "test-run",
+    }
+
+
 def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None:
     graph_calls: list[str] = []
     run_calls: list[str] = []
@@ -359,16 +522,19 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
         run_calls.append(region)
         return "test-run"
 
-    scenic_metrics = {
-        "total_distance_km": 10.0,
-        "estimated_duration_minutes": 20.0,
-        "average_scenic_score": 0.8,
-    }
-    baseline_metrics = {
-        "total_distance_km": 8.0,
-        "estimated_duration_minutes": 16.0,
-        "average_scenic_score": 0.2,
-    }
+    scenic_metrics = _strict_route_metrics(
+        distance_km=10.0,
+        duration_min=20.0,
+        raw_score=0.8,
+        edge_id="scenic-edge",
+    )
+    baseline_metrics = _strict_route_metrics(
+        distance_km=8.0,
+        duration_min=16.0,
+        raw_score=0.2,
+        edge_id="baseline-edge",
+        route_kind="baseline",
+    )
 
     def fake_plan(request):
         plan_calls.append(request)
@@ -377,9 +543,15 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
                 {"route_kind": "scenic", "metrics": scenic_metrics},
                 {"route_kind": "baseline", "metrics": baseline_metrics},
             ],
-            "diagnostics": {"planner": "ok"},
-            "score_mapping": {"version": "test"},
-            "geojson": {"type": "FeatureCollection", "features": []},
+            "diagnostics": _strict_diagnostics(),
+            "score_mapping": _strict_score_mapping(),
+            "geojson": {
+                "type": "FeatureCollection",
+                "features": [
+                    {"properties": {"route_kind": "scenic"}},
+                    {"properties": {"route_kind": "baseline"}},
+                ],
+            },
         }
 
     def fake_diagnose(request):
@@ -420,19 +592,26 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
         "score_mapping",
         "geojson",
     }
-    assert payload["run_name"] == "test-run"
-    assert payload["diagnostics"] == {"planner": "ok"}
+    assert payload["diagnostics"] == _strict_diagnostics()
     assert payload["request"]["max_detour_factor"] == 1.8
     assert payload["request"]["avoid_highways"] is True
     assert payload["routes"] == {"scenic": scenic_metrics, "baseline": baseline_metrics}
     assert payload["deltas"] == {
         "distance_km": 2.0,
         "duration_min": 4.0,
-        "scenic_score": 0.6000000000000001,
+        "scenic_score": 0.6,
+        "scenic_score_absolute": 0.6,
+        "scenic_score_relative": 3.0,
+        "normalized_scenic_score": 0.06,
     }
-
-    assert payload["score_mapping"] == {"version": "test"}
-    assert payload["geojson"] == {"type": "FeatureCollection", "features": []}
+    assert payload["score_mapping"] == _strict_score_mapping()
+    assert payload["geojson"] == {
+        "type": "FeatureCollection",
+        "features": [
+            {"properties": {"route_kind": "scenic"}},
+            {"properties": {"route_kind": "baseline"}},
+        ],
+    }
 
 def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
     plan_calls: list[object] = []
@@ -459,7 +638,7 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
         json={
             "start": {"lat": 44.4, "lon": -70.2},
             "end": {"lat": 44.5, "lon": -70.1},
-            "scenic_weight": 0.7,
+            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.4,
             "avoid_highways": True,
@@ -475,6 +654,283 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
     assert diagnosis_calls == [request]
     detail = response.json()["detail"]
     assert detail["diagnostics"] == {"graph_nodes": 4, "graph_edges": 3}
+
+
+def test_route_compare_rejects_incomplete_service_response(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+    scenic_metrics = _strict_route_metrics(
+        distance_km=10.0,
+        duration_min=20.0,
+        raw_score=0.8,
+        edge_id="scenic-edge",
+    )
+    scenic_metrics.pop("score_run")
+
+    monkeypatch.setattr(
+        app_api,
+        "plan_routes",
+        lambda request: {
+            "routes": [{"route_kind": "scenic", "metrics": scenic_metrics}],
+            "diagnostics": _strict_diagnostics(),
+            "score_mapping": _strict_score_mapping(),
+        },
+    )
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 40.03, "lon": -75.22},
+            "end": {"lat": 40.065, "lon": -75.19},
+            "scenic_weight": 0.8,
+            "region": "philadelphia",
+            "max_detour_factor": 1.8,
+            "avoid_highways": False,
+            "include_baseline": False,
+        },
+    )
+    assert response.status_code == 502
+    assert response.json()["detail"]["missing_metrics"] == ["score_run"]
+
+
+def test_route_compare_request_fixes_scenic_weight_at_point_eight() -> None:
+    from pydantic import ValidationError
+
+    request = app_api.RouteCompareRequest(
+        start={"lat": 40.03, "lon": -75.22},
+        end={"lat": 40.065, "lon": -75.19},
+    )
+    assert request.scenic_weight == pytest.approx(0.8)
+    with pytest.raises(ValidationError):
+        app_api.RouteCompareRequest(
+            start={"lat": 40.03, "lon": -75.22},
+            end={"lat": 40.065, "lon": -75.19},
+            scenic_weight=0.7,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("scenic_weight", float("nan")),
+        ("scenic_weight", float("inf")),
+        ("max_detour_factor", float("nan")),
+        ("max_detour_factor", float("inf")),
+    ],
+)
+def test_route_compare_request_rejects_nonfinite_controls(field, value) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        app_api.RouteCompareRequest(
+            start={"lat": 40.03, "lon": -75.22},
+            end={"lat": 40.065, "lon": -75.19},
+            **{field: value},
+        )
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ({"lat": 91.0, "lon": 0.0}, {"lat": 40.0, "lon": 0.0}),
+        ({"lat": -91.0, "lon": 0.0}, {"lat": 40.0, "lon": 0.0}),
+        ({"lat": 40.0, "lon": 181.0}, {"lat": 40.0, "lon": 0.0}),
+        ({"lat": 40.0, "lon": -181.0}, {"lat": 40.0, "lon": 0.0}),
+    ],
+)
+def test_route_compare_request_rejects_invalid_coordinates(start, end) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        app_api.RouteCompareRequest(start=start, end=end)
+
+
+def test_route_compare_rejects_inconsistent_certified_bound(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api, "_region_to_graph", lambda region: Path("/private/graph.json")
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+    scenic_metrics = _strict_route_metrics(
+        distance_km=10.0,
+        duration_min=20.0,
+        raw_score=0.8,
+        edge_id="scenic-edge",
+    )
+    scenic_metrics.update(
+        {
+            "exactness_status": "approximate_certified",
+            "certified_upper_bound": 1.0,
+            "optimality_gap": 0.5,
+        }
+    )
+    diagnostics = _strict_diagnostics()
+    diagnostics.update(
+        {
+            "optimization_status": "approximate_certified",
+            "certified_upper_bound": 1.0,
+            "optimality_gap": 0.5,
+        }
+    )
+    monkeypatch.setattr(
+        app_api,
+        "plan_routes",
+        lambda request: {
+            "routes": [{"route_kind": "scenic", "metrics": scenic_metrics}],
+            "diagnostics": diagnostics,
+            "score_mapping": _strict_score_mapping(),
+        },
+    )
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 40.03, "lon": -75.22},
+            "end": {"lat": 40.065, "lon": -75.19},
+            "scenic_weight": 0.8,
+            "region": "philadelphia",
+            "max_detour_factor": 1.8,
+            "avoid_highways": False,
+            "include_baseline": False,
+        },
+    )
+    assert response.status_code == 502
+    assert "certified gap" in response.json()["detail"]["message"]
+
+
+def test_route_compare_rejects_per_route_weight_mismatch(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api, "_region_to_graph", lambda region: Path("/private/graph.json")
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+    scenic_metrics = _strict_route_metrics(
+        distance_km=10.0,
+        duration_min=20.0,
+        raw_score=0.8,
+        edge_id="scenic-edge",
+    )
+    scenic_metrics["applied_scenic_weight"] = 0.7
+    monkeypatch.setattr(
+        app_api,
+        "plan_routes",
+        lambda request: {
+            "routes": [{"route_kind": "scenic", "metrics": scenic_metrics}],
+            "diagnostics": _strict_diagnostics(),
+            "score_mapping": _strict_score_mapping(),
+        },
+    )
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 40.03, "lon": -75.22},
+            "end": {"lat": 40.065, "lon": -75.19},
+            "scenic_weight": 0.8,
+            "region": "philadelphia",
+            "max_detour_factor": 1.8,
+            "avoid_highways": False,
+            "include_baseline": False,
+        },
+    )
+    assert response.status_code == 502
+    assert "requested settings" in response.json()["detail"]["message"]
+
+
+def test_route_compare_redacts_private_asset_paths(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api, "_region_to_graph", lambda region: Path("/private/graph.json")
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+    scenic_metrics = _strict_route_metrics(
+        distance_km=10.0,
+        duration_min=20.0,
+        raw_score=0.8,
+        edge_id="scenic-edge",
+    )
+    scenic_metrics["score_provenance"] = {"source": "/private/report.json"}
+    score_mapping = _strict_score_mapping()
+    score_mapping["source"] = "/private/report.json"
+    diagnostics = _strict_diagnostics()
+    diagnostics["score_mapping_coverage"] = 0.37
+    monkeypatch.setattr(
+        app_api,
+        "plan_routes",
+        lambda request: {
+            "routes": [{"route_kind": "scenic", "metrics": scenic_metrics}],
+            "diagnostics": diagnostics,
+            "score_mapping": score_mapping,
+            "geojson": {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "route_kind": "scenic",
+                            "score_provenance": {"source": "/private/report.json"}
+                        },
+                        "geometry": {"type": "LineString", "coordinates": []},
+                    }
+                ],
+            },
+        },
+    )
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 40.03, "lon": -75.22},
+            "end": {"lat": 40.065, "lon": -75.19},
+            "scenic_weight": 0.8,
+            "region": "philadelphia",
+            "max_detour_factor": 1.8,
+            "avoid_highways": False,
+            "include_baseline": False,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["diagnostics"]["score_mapping_coverage"] == 0.37
+    assert set(payload["request"]) == {
+        "region",
+        "run_name",
+        "start",
+        "end",
+        "scenic_weight",
+        "avoid_highways",
+        "max_detour_factor",
+        "include_baseline",
+    }
+    assert "source" not in payload["score_mapping"]
+    assert "source" not in payload["routes"]["scenic"]["score_provenance"]
+    assert (
+        "source"
+        not in payload["geojson"]["features"][0]["properties"]["score_provenance"]
+    )
+
+
+def test_new_england_viewer_renders_diagnostics_contract() -> None:
+    html = Path("apps/new_england_north/index.html").read_text(encoding="utf-8")
+    viewer = Path("apps/new_england_north/viewer.js").read_text(encoding="utf-8")
+    for element_id in (
+        "requestedScenicWeight",
+        "appliedScenicWeight",
+        "requestedDetourCap",
+        "appliedDetourCap",
+        "actualDurationRatio",
+        "optimizationMode",
+        "optimizationStatus",
+        "optimalityGap",
+        "certifiedUpperBound",
+        "sameRoute",
+        "noBetterRouteReason",
+    ):
+        assert f'id="{element_id}"' in html
+    assert "humanizeReason" in viewer
+    assert "approximation_did_not_find_scenic_improvement" in viewer
+    assert "X-Route-Request-ID" in viewer
+    assert "X-Route-Request-Fingerprint" in viewer
+    assert "Tile/report score coverage" in viewer
+    assert "addressRequestSequence" in viewer
+    assert "isCurrentAddressRequest" in viewer
+    assert 'id="scenicWeight"' not in html
+    assert "scenic_weight: DEFAULTS.scenicWeight" in viewer
+    assert 'url.searchParams.set("scenic_weight"' not in viewer
 
 
 def test_route_preload_lifespan_calls_once_and_skips_missing_optional(

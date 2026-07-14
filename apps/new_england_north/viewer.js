@@ -7,6 +7,7 @@ const DEFAULTS = Object.freeze({
   apiBase: `${window.location.origin}/api`,
   center: [-70.15869140625, 44.99533046578542],
   zoom: 6.2,
+  scenicWeight: 0.8,
 });
 
 const REGION_BOUNDS = Object.freeze([
@@ -73,8 +74,6 @@ const el = {
   endInput: document.getElementById("endInput"),
   startSuggestions: document.getElementById("startSuggestions"),
   endSuggestions: document.getElementById("endSuggestions"),
-  scenicWeight: document.getElementById("scenicWeight"),
-  weightOut: document.getElementById("weightOut"),
   detourFactor: document.getElementById("detourFactor"),
   detourOut: document.getElementById("detourOut"),
   avoidHighways: document.getElementById("avoidHighways"),
@@ -92,15 +91,34 @@ const el = {
   scenicDistance: document.getElementById("scenicDistance"),
   scenicDuration: document.getElementById("scenicDuration"),
   scenicScore: document.getElementById("scenicScore"),
+  scenicRawScore: document.getElementById("scenicRawScore"),
+  scenicNormalizedScore: document.getElementById("scenicNormalizedScore"),
   scenicDistanceDelta: document.getElementById("scenicDistanceDelta"),
   scenicDurationDelta: document.getElementById("scenicDurationDelta"),
   scenicScoreDelta: document.getElementById("scenicScoreDelta"),
   baselineDistance: document.getElementById("baselineDistance"),
   baselineDuration: document.getElementById("baselineDuration"),
   baselineScore: document.getElementById("baselineScore"),
+  baselineRawScore: document.getElementById("baselineRawScore"),
+  baselineNormalizedScore: document.getElementById("baselineNormalizedScore"),
+  scenicScoreUpliftAbsolute: document.getElementById("scenicScoreUpliftAbsolute"),
+  scenicScoreUpliftRelative: document.getElementById("scenicScoreUpliftRelative"),
+  requestedScenicWeight: document.getElementById("requestedScenicWeight"),
+  appliedScenicWeight: document.getElementById("appliedScenicWeight"),
+  requestedDetourCap: document.getElementById("requestedDetourCap"),
+  appliedDetourCap: document.getElementById("appliedDetourCap"),
+  actualDurationRatio: document.getElementById("actualDurationRatio"),
+  optimizationMode: document.getElementById("optimizationMode"),
+  optimizationStatus: document.getElementById("optimizationStatus"),
+  optimalityGap: document.getElementById("optimalityGap"),
+  certifiedUpperBound: document.getElementById("certifiedUpperBound"),
+  sameRoute: document.getElementById("sameRoute"),
+  noBetterRouteReason: document.getElementById("noBetterRouteReason"),
   shareRouteBtn: document.getElementById("shareRouteBtn"),
   closeRouteDialogBtn: document.getElementById("closeRouteDialogBtn"),
 };
+let routeRequestSequence = 0;
+let activeRouteRequest = null;
 
 let map;
 let latestHeatmap = null;
@@ -136,6 +154,7 @@ function escapeHtml(value) {
 }
 
 function formatNumber(value, digits = 1) {
+  if (value === null || value === undefined || value === "") return "--";
   const n = Number(value);
   return Number.isFinite(n) ? n.toFixed(digits) : "--";
 }
@@ -460,6 +479,9 @@ function renderRoute(geojson) {
 }
 
 function clearRoute() {
+  routeRequestSequence += 1;
+  activeRouteRequest?.controller.abort();
+  activeRouteRequest = null;
   removeLayer(ROUTE_SCENIC);
   removeLayer(ROUTE_BASELINE);
   removeSource(ROUTE_SOURCE);
@@ -467,62 +489,197 @@ function clearRoute() {
 }
 
 function signedNumber(value, digits, suffix = "") {
+  if (value === null || value === undefined || value === "") return "--";
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return "--";
   const sign = numeric > 0 ? "+" : "";
   return `${sign}${numeric.toFixed(digits)}${suffix}`;
 }
 
+function displayRatio(value, digits = 2) {
+  if (value === null || value === undefined || value === "") return "--";
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? `${numeric.toFixed(digits)}×` : "--";
+}
+
+function displayText(value) {
+  return value === null || value === undefined || value === "" ? "--" : String(value);
+}
+const REASON_PROSE = Object.freeze({
+  approximation_did_not_find_scenic_improvement:
+    "Search found no more-scenic route",
+  same_route: "Scenic and fastest routes use the same edge sequence",
+  no_route: "No route satisfies the requested controls",
+  no_feasible_route: "No route satisfies the requested controls",
+  avoid_highways_no_route: "No route satisfies the avoid-highways constraint",
+});
+
+function humanizeReason(reason, optimalityGap) {
+  if (reason === null || reason === undefined || reason === "") return "--";
+  const code = String(reason).trim();
+  const phrase =
+    REASON_PROSE[code] ||
+    code
+      .replace(/[_-]+/g, " ")
+      .replace(/\b\w/g, (letter) => letter.toUpperCase());
+  if (
+    optimalityGap === null ||
+    optimalityGap === undefined ||
+    optimalityGap === ""
+  ) {
+    return phrase;
+  }
+  const gap = Number(optimalityGap);
+  if (
+    code === "approximation_did_not_find_scenic_improvement" &&
+    Number.isFinite(gap)
+  ) {
+    return `${phrase}; optimality gap remains ${gap.toFixed(4)}.`;
+  }
+  return phrase;
+}
+
+function humanizeRouteState(value) {
+  if (typeof value === "boolean") {
+    return value ? "Yes (same route)" : "No (different route)";
+  }
+  return humanizeReason(value);
+}
+
 function routeDiagnosticsMarkup(payload) {
-  const request = payload?.request || {};
   const diagnostics = payload?.diagnostics || {};
+  const scenic = payload?.routes?.scenic || {};
   const scoreMapping = payload?.score_mapping || {};
   const parts = [];
   const elapsedMs = Number(diagnostics.planning_elapsed_ms);
   if (Number.isFinite(elapsedMs)) {
     parts.push(`Planning ${formatNumber(elapsedMs, 0)} ms`);
   }
-  const cap = Number(
-    diagnostics.applied_max_detour_factor ??
-      diagnostics.applied_duration_factor ??
-      diagnostics.effective_max_detour_factor ??
-      request.max_detour_factor
+  const mappingCoverage = Number(diagnostics.score_mapping_coverage);
+  parts.push(
+    `Requested weight ${displayText(formatNumber(diagnostics.requested_scenic_weight, 2))}`,
+    `Applied weight ${displayText(formatNumber(diagnostics.applied_scenic_weight, 2))}`,
+    `Requested cap ${displayRatio(diagnostics.requested_max_detour_factor)}`,
+    `Applied cap ${displayRatio(diagnostics.applied_max_detour_factor)}`,
+    `Actual ratio ${displayRatio(diagnostics.scenic_fastest_duration_ratio)}`,
+    `Optimization ${displayText(diagnostics.optimization_mode)} / ${displayText(
+      diagnostics.optimization_status
+    )}`,
+    `Gap ${displayText(formatNumber(diagnostics.optimality_gap, 4))}`,
+    `Certified UB ${displayText(formatNumber(diagnostics.certified_upper_bound, 4))}`,
+    `Tile/report score coverage ${
+      Number.isFinite(mappingCoverage)
+        ? formatNumber(mappingCoverage * 100, 0) + "%"
+        : "--"
+    }`,
+    `Highways ${displayText(scenic.highway_count)}`,
+    `Score run ${Array.isArray(scenic.score_run) ? scenic.score_run.length : "--"} edges`
   );
-  if (Number.isFinite(cap)) {
-    parts.push(`Duration cap ${formatNumber(cap, 2)}×`);
-  }
   if (typeof diagnostics.avoid_highways_applied === "boolean") {
     parts.push(`Avoid highways ${diagnostics.avoid_highways_applied ? "on" : "off"}`);
-  } else if (typeof request.avoid_highways === "boolean") {
-    parts.push(`Avoid highways ${request.avoid_highways ? "on" : "off"}`);
   }
-  const coverage = Number(
-    diagnostics.score_mapping_coverage ?? scoreMapping.matched_ratio
-  );
-  if (Number.isFinite(coverage)) {
-    parts.push(`Score coverage ${formatNumber(coverage * 100, 0)}%`);
+  if (scoreMapping.normalization) {
+    parts.push(`Normalization ${String(scoreMapping.normalization)}`);
   }
-  return parts.length
-    ? `<small class="route-diagnostics">${escapeHtml(parts.join(" · "))}</small>`
-    : "";
+  return `<small class="route-diagnostics">${escapeHtml(parts.join(" · "))}</small>`;
 }
 
 function renderRouteComparison(payload) {
   const scenic = payload.routes?.scenic;
   const baseline = payload.routes?.baseline;
+  const diagnostics = payload.diagnostics;
   const deltas = payload.deltas;
-  if (!scenic) {
-    throw new Error("API returned no scenic route");
+  if (!scenic || !diagnostics) {
+    throw new Error("API returned an incomplete route comparison");
   }
   setText(el.scenicDistance, `${formatNumber(scenic.total_distance_km, 1)} km`);
   setText(el.scenicDuration, `${formatNumber(scenic.estimated_duration_minutes, 0)} min`);
-  setText(el.scenicScore, `${formatNumber(scenic.average_scenic_score, 2)} / 10`);
-  setText(el.baselineDistance, baseline ? `${formatNumber(baseline.total_distance_km, 1)} km` : "--");
-  setText(el.baselineDuration, baseline ? `${formatNumber(baseline.estimated_duration_minutes, 0)} min` : "--");
-  setText(el.baselineScore, baseline ? `${formatNumber(baseline.average_scenic_score, 2)} / 10` : "--");
-  setText(el.scenicDistanceDelta, deltas ? signedNumber(deltas.distance_km, 1, " km") : "--");
-  setText(el.scenicDurationDelta, deltas ? signedNumber(deltas.duration_min, 0, " min") : "--");
-  setText(el.scenicScoreDelta, deltas ? signedNumber(deltas.scenic_score, 2) : "--");
+  setText(el.scenicScore, `${formatNumber(scenic.raw_scenic_score, 2)} / 10`);
+  setText(el.scenicRawScore, formatNumber(scenic.raw_scenic_score, 2));
+  setText(el.scenicNormalizedScore, formatNumber(scenic.normalized_scenic_score, 4));
+  setText(
+    el.baselineDistance,
+    baseline ? `${formatNumber(baseline.total_distance_km, 1)} km` : "--"
+  );
+  setText(
+    el.baselineDuration,
+    baseline ? `${formatNumber(baseline.estimated_duration_minutes, 0)} min` : "--"
+  );
+  setText(
+    el.baselineScore,
+    baseline ? `${formatNumber(baseline.raw_scenic_score, 2)} / 10` : "--"
+  );
+  setText(
+    el.baselineRawScore,
+    baseline ? formatNumber(baseline.raw_scenic_score, 2) : "--"
+  );
+  setText(
+    el.baselineNormalizedScore,
+    baseline ? formatNumber(baseline.normalized_scenic_score, 4) : "--"
+  );
+  setText(
+    el.scenicDistanceDelta,
+    deltas ? signedNumber(deltas.distance_km, 1, " km") : "--"
+  );
+  setText(
+    el.scenicDurationDelta,
+    deltas ? signedNumber(deltas.duration_min, 0, " min") : "--"
+  );
+  setText(
+    el.scenicScoreDelta,
+    deltas ? signedNumber(deltas.scenic_score_absolute, 2) : "--"
+  );
+  setText(
+    el.scenicScoreUpliftAbsolute,
+    signedNumber(diagnostics.scenic_score_delta_absolute, 2)
+  );
+  setText(
+    el.scenicScoreUpliftRelative,
+    diagnostics.scenic_score_delta_relative !== null &&
+      diagnostics.scenic_score_delta_relative !== undefined &&
+      Number.isFinite(Number(diagnostics.scenic_score_delta_relative))
+      ? signedNumber(
+          Number(diagnostics.scenic_score_delta_relative) * 100,
+          1,
+          "%"
+        )
+      : "--"
+  );
+  setText(
+    el.requestedScenicWeight,
+    formatNumber(diagnostics.requested_scenic_weight, 2)
+  );
+  setText(
+    el.appliedScenicWeight,
+    formatNumber(diagnostics.applied_scenic_weight, 2)
+  );
+  setText(
+    el.requestedDetourCap,
+    displayRatio(diagnostics.requested_max_detour_factor)
+  );
+  setText(
+    el.appliedDetourCap,
+    displayRatio(diagnostics.applied_max_detour_factor)
+  );
+  setText(
+    el.actualDurationRatio,
+    displayRatio(diagnostics.scenic_fastest_duration_ratio)
+  );
+  setText(el.optimizationMode, diagnostics.optimization_mode);
+  setText(el.optimizationStatus, diagnostics.optimization_status);
+  setText(el.optimalityGap, formatNumber(diagnostics.optimality_gap, 4));
+  setText(
+    el.certifiedUpperBound,
+    formatNumber(diagnostics.certified_upper_bound, 4)
+  );
+  setText(el.sameRoute, humanizeRouteState(diagnostics.same_route));
+  setText(
+    el.noBetterRouteReason,
+    humanizeReason(
+      diagnostics.no_better_route_reason,
+      diagnostics.optimality_gap
+    )
+  );
   el.routeResultsDialog.showModal();
   el.closeRouteDialogBtn.focus();
 }
@@ -563,9 +720,28 @@ function installAddressSearch(which) {
   let currentSuggestions = [];
   let activeSuggestion = -1;
   let timer = null;
-  let request = null;
+  let addressRequestSequence = 0;
+  let activeAddressRequest = null;
 
-  const closeSuggestions = () => {
+  const beginAddressRequest = (fingerprint) => {
+    activeAddressRequest?.controller.abort();
+    const token = {
+      id: ++addressRequestSequence,
+      fingerprint,
+      controller: new AbortController(),
+    };
+    activeAddressRequest = token;
+    return token;
+  };
+  const isCurrentAddressRequest = (token, fingerprint) =>
+    activeAddressRequest === token &&
+    token.id === addressRequestSequence &&
+    token.fingerprint === fingerprint;
+
+  const closeSuggestions = ({ invalidate = true } = {}) => {
+    if (invalidate) {
+      beginAddressRequest(JSON.stringify({ kind: "close" }));
+    }
     currentSuggestions = [];
     activeSuggestion = -1;
     input.removeAttribute("aria-activedescendant");
@@ -587,25 +763,35 @@ function installAddressSearch(which) {
     suggestions.classList.add("open");
   };
   const selectSuggestion = async (suggestion) => {
-    request?.abort();
-    request = new AbortController();
+    const fingerprint = JSON.stringify({
+      kind: "retrieve",
+      mapbox_id: suggestion.mapbox_id,
+      session_token: sessionToken,
+      region: CONFIG.sourceRegion,
+    });
+    const token = beginAddressRequest(fingerprint);
     const url = new URL(api("/v1/search/retrieve"));
     url.searchParams.set("mapbox_id", suggestion.mapbox_id);
     url.searchParams.set("session_token", sessionToken);
     renderStatus("Searching…", "loading");
     try {
-      const response = await fetch(url, { signal: request.signal });
+      const response = await fetch(url, { signal: token.controller.signal });
+      if (!isCurrentAddressRequest(token, fingerprint)) return;
       if (!response.ok) throw new Error(String(response.status));
       const result = (await response.json()).result;
+      if (!isCurrentAddressRequest(token, fingerprint)) return;
       if (!Number.isFinite(result?.lat) || !Number.isFinite(result?.lon)) {
         throw new Error("invalid address result");
       }
       selectedRoutePoints[which] = { lat: result.lat, lon: result.lon };
       input.value = result.full_address || result.name || suggestion.full_address;
       sessionToken = newSearchSessionToken();
-      closeSuggestions();
+      closeSuggestions({ invalidate: false });
     } catch (error) {
-      if (error.name !== "AbortError") {
+      if (
+        error?.name !== "AbortError" &&
+        isCurrentAddressRequest(token, fingerprint)
+      ) {
         renderStatus("Address search unavailable", "error");
       }
     }
@@ -643,25 +829,37 @@ function installAddressSearch(which) {
   input.addEventListener("input", () => {
     selectedRoutePoints[which] = null;
     clearTimeout(timer);
-    request?.abort();
     const query = input.value.trim();
+    const fingerprint = JSON.stringify({
+      kind: "suggest",
+      query,
+      session_token: sessionToken,
+      region: CONFIG.sourceRegion,
+    });
+    const token = beginAddressRequest(fingerprint);
     if (parsePoint(query) || query.length < 3) {
       closeSuggestions();
       return;
     }
     timer = setTimeout(async () => {
-      request = new AbortController();
+      if (!isCurrentAddressRequest(token, fingerprint)) return;
       const url = new URL(api("/v1/search/suggest"));
       url.searchParams.set("q", query);
       url.searchParams.set("session_token", sessionToken);
       url.searchParams.set("region", CONFIG.sourceRegion);
       renderStatus("Searching…", "loading");
       try {
-        const response = await fetch(url, { signal: request.signal });
+        const response = await fetch(url, { signal: token.controller.signal });
+        if (!isCurrentAddressRequest(token, fingerprint)) return;
         if (!response.ok) throw new Error(String(response.status));
-        renderSuggestions((await response.json()).suggestions || []);
+        const result = await response.json();
+        if (!isCurrentAddressRequest(token, fingerprint)) return;
+        renderSuggestions(result.suggestions || []);
       } catch (error) {
-        if (error.name !== "AbortError") {
+        if (
+          error?.name !== "AbortError" &&
+          isCurrentAddressRequest(token, fingerprint)
+        ) {
           renderStatus("Address search unavailable", "error");
         }
       }
@@ -696,7 +894,7 @@ function installAddressSearch(which) {
   });
   clearButton?.addEventListener("click", () => {
     clearTimeout(timer);
-    request?.abort();
+    beginAddressRequest(JSON.stringify({ kind: "clear" }));
     input.value = "";
     selectedRoutePoints[which] = null;
     sessionToken = newSearchSessionToken();
@@ -708,6 +906,9 @@ function installAddressSearch(which) {
 
 async function planRoute(event) {
   event.preventDefault();
+  const requestId = ++routeRequestSequence;
+  activeRouteRequest?.controller.abort();
+  activeRouteRequest = null;
   const start = parsePoint(el.startInput.value) || selectedRoutePoints.start;
   const end = parsePoint(el.endInput.value) || selectedRoutePoints.end;
   if (!start || !end) {
@@ -715,6 +916,21 @@ async function planRoute(event) {
     (!start ? el.startInput : el.endInput).focus();
     return;
   }
+
+  const requestBody = {
+    region: CONFIG.sourceRegion,
+    run_name: CONFIG.workingRun,
+    start,
+    end,
+    scenic_weight: DEFAULTS.scenicWeight,
+    max_detour_factor: Number(el.detourFactor.value),
+    avoid_highways: Boolean(el.avoidHighways?.checked),
+    include_baseline: true,
+  };
+  const fingerprint = JSON.stringify(requestBody);
+  const controller = new AbortController();
+  const requestToken = { requestId, fingerprint, controller };
+  activeRouteRequest = requestToken;
 
   if (el.submitRoute) {
     el.submitRoute.disabled = true;
@@ -725,22 +941,24 @@ async function planRoute(event) {
     "Calling <code>/v1/route/compare</code> with the same run used by the heatmap."
   );
 
+  const isCurrent = () =>
+    activeRouteRequest === requestToken &&
+    requestToken.requestId === routeRequestSequence &&
+    requestToken.fingerprint === fingerprint;
   try {
     const response = await fetch(api("/v1/route/compare"), {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        region: CONFIG.sourceRegion,
-        run_name: CONFIG.workingRun,
-        start,
-        end,
-        scenic_weight: Number(el.scenicWeight.value),
-        max_detour_factor: Number(el.detourFactor.value),
-        avoid_highways: Boolean(el.avoidHighways?.checked),
-        include_baseline: true,
-      }),
+      headers: {
+        "Content-Type": "application/json",
+        "X-Route-Request-ID": String(requestId),
+        "X-Route-Request-Fingerprint": fingerprint,
+      },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal,
     });
+    if (!isCurrent()) return;
     const payload = await response.json();
+    if (!isCurrent()) return;
     if (!response.ok) {
       const detail = payload?.detail;
       const message =
@@ -760,21 +978,24 @@ async function planRoute(event) {
     );
     setApiStatus("API: online", "ok");
   } catch (error) {
+    if (error?.name === "AbortError" || !isCurrent()) return;
     setApiStatus("API: route failed", "warn");
     setRouteOutput("Route failed", escapeHtml(error.message || error));
   } finally {
-    if (el.submitRoute) {
-      el.submitRoute.disabled = false;
-      el.submitRoute.textContent = "Plan route";
+    if (isCurrent()) {
+      activeRouteRequest = null;
+      if (el.submitRoute) {
+        el.submitRoute.disabled = false;
+        el.submitRoute.textContent = "Plan route";
+      }
     }
   }
 }
 
-function buildShareUrl({ start, end, scenicWeight, maxDetour, avoidHighways }) {
+function buildShareUrl({ start, end, maxDetour, avoidHighways }) {
   const url = new URL(window.location.pathname, window.location.origin);
   url.searchParams.set("start", `${start.lat},${start.lon}`);
   url.searchParams.set("end", `${end.lat},${end.lon}`);
-  url.searchParams.set("scenic_weight", String(scenicWeight));
   url.searchParams.set("max_detour", String(maxDetour));
   url.searchParams.set("avoid_highways", avoidHighways ? "true" : "false");
   return url.toString();
@@ -795,7 +1016,6 @@ function applyUrlParams() {
       input.value = String(value);
     }
   };
-  applyRange("scenic_weight", el.scenicWeight);
   applyRange("max_detour", el.detourFactor);
   const avoidHighways = params.get("avoid_highways");
   if (avoidHighways !== null && el.avoidHighways) {
@@ -812,7 +1032,6 @@ async function copyShareUrl() {
   const shareUrl = buildShareUrl({
     start,
     end,
-    scenicWeight: Number(el.scenicWeight.value),
     maxDetour: Number(el.detourFactor.value),
     avoidHighways: Boolean(el.avoidHighways?.checked),
   });
@@ -860,10 +1079,8 @@ function initBindings() {
     el.modelNote.textContent = `Scoring provenance: ${CONFIG.workingRun} at z14 using ${CONFIG.sourceModel}.`;
   }
   const syncRangeOutputs = () => {
-    setText(el.weightOut, Number(el.scenicWeight.value).toFixed(2));
     setText(el.detourOut, `${Number(el.detourFactor.value).toFixed(2)}×`);
   };
-  el.scenicWeight?.addEventListener("input", syncRangeOutputs);
   el.detourFactor?.addEventListener("input", syncRangeOutputs);
   syncRangeOutputs();
   el.routeForm?.addEventListener("submit", planRoute);

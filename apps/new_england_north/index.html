@@ -3,9 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Scenic Drive · New England North</title>
+    <title>Scenic Drive</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css?v=compact-elastic-beta-v3" />
+    <link rel="stylesheet" href="./styles.css?v=compact-elastic-beta-v5" />
   </head>
   <body>
     <main class="viewer-shell">
@@ -17,14 +17,9 @@
       <div class="bottom-overlay">
         <aside class="control-panel" aria-label="Route controls">
           <header class="panel-header">
-            <div class="panel-heading">
-              <p class="eyebrow">New England North</p>
-              <h1>Plan a scenic route</h1>
-              <p class="subhead">Balance the drive with the views.</p>
-            </div>
             <div class="panel-meta">
               <div id="inspector" class="inspector" role="group" aria-label="Scenic score readout" aria-live="off">
-                <span class="eyebrow">Scenic score</span>
+                <span class="overline">Scenic score</span>
                 <strong id="inspectorScore">--</strong>
                 <span id="inspectorCoords">Move over a heatmap cell</span>
               </div>
@@ -52,13 +47,6 @@
             <button id="submitRoute" type="submit" class="btn-primary">Plan route</button>
 
             <div class="range-row">
-              <label for="scenicWeight" class="range-label">
-                <span>Scenic weight</span>
-                <span id="weightOut" class="range-value">0.80</span>
-              </label>
-              <input id="scenicWeight" type="range" min="0" max="1" step="0.05" value="0.8" />
-            </div>
-            <div class="range-row">
               <label for="detourFactor" class="range-label">
                 <span>Max detour</span>
                 <span id="detourOut" class="range-value">1.80×</span>
@@ -80,7 +68,7 @@
               <section class="output-card" aria-label="Remote training">
                 <div class="output-header">
                   <div>
-                    <p class="eyebrow">Remote training</p>
+                    <p class="overline">Remote training</p>
                     <h2>Active model evaluation</h2>
                   </div>
                 </div>
@@ -92,7 +80,7 @@
               <section class="output-card route-status-card" aria-label="Route output">
                 <div class="output-header">
                   <div>
-                    <p class="eyebrow">Route output</p>
+                    <p class="overline">Route output</p>
                     <h2 id="routeTitle">Waiting for submit</h2>
                     <div class="route-legend" aria-label="Route legend">
                       <span class="route-key scenic">Scenic</span>
@@ -114,7 +102,7 @@
         <div class="dialog-shell">
           <header class="dialog-header">
             <div>
-              <p class="eyebrow">Route output</p>
+              <p class="overline">Route output</p>
               <h2 id="routeResultsTitle">Route comparison</h2>
             </div>
           </header>
@@ -123,7 +111,7 @@
             <article class="route-card" data-route-kind="scenic">
               <header class="route-card-header">
                 <div>
-                  <p class="eyebrow">Scenic route</p>
+                  <p class="overline">Scenic route</p>
                   <h3>Scenic</h3>
                 </div>
                 <span class="route-card-key scenic" aria-hidden="true"></span>
@@ -132,6 +120,8 @@
                 <div><dt>Distance</dt><dd><span id="scenicDistance">--</span></dd></div>
                 <div><dt>Duration</dt><dd><span id="scenicDuration">--</span></dd></div>
                 <div><dt>Average scenic score</dt><dd><span id="scenicScore">--</span></dd></div>
+                <div><dt>Raw scenic score</dt><dd><span id="scenicRawScore">--</span> / 10</dd></div>
+                <div><dt>Normalized scenic score</dt><dd><span id="scenicNormalizedScore">--</span></dd></div>
                 <div><dt>Distance vs baseline</dt><dd><span id="scenicDistanceDelta">--</span></dd></div>
                 <div><dt>Duration vs baseline</dt><dd><span id="scenicDurationDelta">--</span></dd></div>
                 <div><dt>Score vs baseline</dt><dd><span id="scenicScoreDelta">--</span></dd></div>
@@ -141,7 +131,7 @@
             <article class="route-card" data-route-kind="baseline">
               <header class="route-card-header">
                 <div>
-                  <p class="eyebrow">Fastest route</p>
+                  <p class="overline">Fastest route</p>
                   <h3>Baseline</h3>
                 </div>
                 <span class="route-card-key baseline" aria-hidden="true"></span>
@@ -150,9 +140,29 @@
                 <div><dt>Distance</dt><dd><span id="baselineDistance">--</span></dd></div>
                 <div><dt>Duration</dt><dd><span id="baselineDuration">--</span></dd></div>
                 <div><dt>Average scenic score</dt><dd><span id="baselineScore">--</span></dd></div>
+                <div><dt>Raw scenic score</dt><dd><span id="baselineRawScore">--</span> / 10</dd></div>
+                <div><dt>Normalized scenic score</dt><dd><span id="baselineNormalizedScore">--</span></dd></div>
               </dl>
             </article>
           </div>
+
+          <section class="route-diagnostics-card" aria-label="Route diagnostics">
+            <dl class="metric-grid">
+              <div><dt>Score uplift</dt><dd><span id="scenicScoreUpliftAbsolute">--</span></dd></div>
+              <div><dt>Relative uplift</dt><dd><span id="scenicScoreUpliftRelative">--</span></dd></div>
+              <div><dt>Requested scenic weight</dt><dd><span id="requestedScenicWeight">--</span></dd></div>
+              <div><dt>Applied scenic weight</dt><dd><span id="appliedScenicWeight">--</span></dd></div>
+              <div><dt>Requested cap</dt><dd><span id="requestedDetourCap">--</span></dd></div>
+              <div><dt>Applied cap</dt><dd><span id="appliedDetourCap">--</span></dd></div>
+              <div><dt>Actual duration ratio</dt><dd><span id="actualDurationRatio">--</span></dd></div>
+              <div><dt>Optimization mode</dt><dd><span id="optimizationMode">--</span></dd></div>
+              <div><dt>Optimization status</dt><dd><span id="optimizationStatus">--</span></dd></div>
+              <div><dt>Optimality gap</dt><dd><span id="optimalityGap">--</span></dd></div>
+              <div><dt>Certified upper bound</dt><dd><span id="certifiedUpperBound">--</span></dd></div>
+              <div><dt>Same route</dt><dd><span id="sameRoute">--</span></dd></div>
+              <div class="metric-wide"><dt>No-better-route explanation</dt><dd><span id="noBetterRouteReason">--</span></dd></div>
+            </dl>
+          </section>
 
           <div class="dialog-actions">
             <button id="shareRouteBtn" type="button" class="btn-primary">Share</button>

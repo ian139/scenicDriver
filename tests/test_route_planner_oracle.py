@@ -1,0 +1,685 @@
+from __future__ import annotations
+
+import math
+
+import pytest
+
+from src.route_planner.graph import Edge, Node, RoadGraph
+from src.route_planner.planner import _FrontierLabel, ScenicRoutePlanner
+
+
+def _tradeoff_graph() -> RoadGraph:
+    graph = RoadGraph()
+    for node_id, lat in (
+        ("S", 0.0),
+        ("M", 0.01),
+        ("A", 0.02),
+        ("G", 0.03),
+    ):
+        graph.add_node(Node(id=node_id, lat=lat, lon=0.0))
+    edges = (
+        # True fastest baseline: six minutes, score zero.
+        Edge(
+            id="fast",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=10.0,
+            scenic_score=0.0,
+            speed_limit_kmh=100,
+            one_way=True,
+        ),
+        # Intermediate: twelve minutes, score six.
+        Edge(
+            id="mid-1",
+            start_node_id="S",
+            end_node_id="M",
+            distance_km=4.0,
+            scenic_score=6.0,
+            speed_limit_kmh=40,
+            one_way=True,
+        ),
+        Edge(
+            id="mid-2",
+            start_node_id="M",
+            end_node_id="G",
+            distance_km=4.0,
+            scenic_score=6.0,
+            speed_limit_kmh=40,
+            one_way=True,
+        ),
+        # Scenic detour: twenty minutes, score ten.
+        Edge(
+            id="scenic-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=5.0,
+            scenic_score=10.0,
+            speed_limit_kmh=30,
+            one_way=True,
+        ),
+        Edge(
+            id="scenic-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=5.0,
+            scenic_score=10.0,
+            speed_limit_kmh=30,
+            one_way=True,
+        ),
+        # A tempting cycle must never become a feasible route prefix.
+        Edge(
+            id="cycle",
+            start_node_id="A",
+            end_node_id="S",
+            distance_km=0.01,
+            scenic_score=10.0,
+            speed_limit_kmh=1,
+            one_way=True,
+        ),
+    )
+    for edge in edges:
+        graph.add_edge(edge)
+    return graph
+
+
+def _route(planner: ScenicRoutePlanner, q: float, kappa: float):
+    return planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.03, 0.0),
+        q=q,
+        kappa=kappa,
+    )
+
+
+def test_oracle_fastest_and_scenic_differ_and_detour_unlocks() -> None:
+    planner = ScenicRoutePlanner(_tradeoff_graph())
+    fastest = _route(planner, q=0.0, kappa=4.0)
+    scenic = _route(planner, q=1.0, kappa=4.0)
+
+    assert fastest.edge_ids == ("fast",)
+    assert scenic.edge_ids == ("scenic-1", "scenic-2")
+    assert scenic.actual_duration_ratio == pytest.approx(20.0 / 6.0)
+    assert scenic.applied_max_detour_factor == pytest.approx(4.0)
+    assert scenic.exactness_status == "exact"
+    assert scenic.optimality_gap is None
+
+
+def test_oracle_q_zero_is_exact_fastest_and_q_one_is_scenic_optimum() -> None:
+    planner = ScenicRoutePlanner(_tradeoff_graph())
+    q0 = _route(planner, q=0.0, kappa=1.0)
+    q1 = _route(planner, q=1.0, kappa=4.0)
+
+    assert q0.edge_ids == ("fast",)
+    assert q0.objective_value == pytest.approx(1.0)
+    assert q1.average_scenic_score == pytest.approx(10.0)
+    assert q1.normalized_scenic_score == pytest.approx(1.0)
+    assert q1.objective_value == pytest.approx(1.0)
+
+
+def test_oracle_intermediate_q_selects_tradeoff_path() -> None:
+    planner = ScenicRoutePlanner(_tradeoff_graph())
+    route = _route(planner, q=0.5, kappa=4.0)
+
+    assert route.edge_ids == ("mid-1", "mid-2")
+    assert route.average_scenic_score == pytest.approx(6.0)
+    assert route.objective_value > 0.6
+    assert route.objective_value < 0.7
+
+
+def test_oracle_simple_paths_do_not_exploit_cycles() -> None:
+    route = _route(ScenicRoutePlanner(_tradeoff_graph()), q=1.0, kappa=20.0)
+    node_ids = [route.segments[0].start[0]] + [segment.end[0] for segment in route.segments]
+    assert len(node_ids) == len(set(node_ids))
+    assert route.edge_ids == ("scenic-1", "scenic-2")
+
+
+@pytest.mark.parametrize("road_type", ["motorway_link", "trunk_link"])
+def test_oracle_highway_filter_is_hard_for_baseline_and_scenic(
+    road_type: str,
+) -> None:
+    graph = RoadGraph()
+    for node_id, lat in (("S", 0.0), ("A", 0.01), ("G", 0.02)):
+        graph.add_node(Node(id=node_id, lat=lat, lon=0.0))
+    graph.add_edge(
+        Edge(
+            id=road_type,
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=5.0,
+            scenic_score=0.0,
+            road_type=road_type,
+            speed_limit_kmh=120,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="secondary-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=5.0,
+            scenic_score=10.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="secondary-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=5.0,
+            scenic_score=10.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    planner = ScenicRoutePlanner(graph)
+
+    assert _route_for_graph(planner, q=0.0, kappa=4.0, avoid_highways=True).edge_ids == (
+        "secondary-1",
+        "secondary-2",
+    )
+    scenic = planner.find_scenic_route(
+        (0.0, 0.0), (0.02, 0.0), q=1.0, kappa=4.0, avoid_highways=True
+    )
+    assert scenic.edge_ids == ("secondary-1", "secondary-2")
+    assert scenic.highway_count == 0
+
+
+def _route_for_graph(
+    planner: ScenicRoutePlanner,
+    *,
+    q: float,
+    kappa: float,
+    avoid_highways: bool,
+):
+    return planner.find_scenic_route(
+        (0.0, 0.0), (0.02, 0.0), q=q, kappa=kappa, avoid_highways=avoid_highways
+    )
+
+
+def test_oracle_cap_accepts_exact_boundary_and_rejects_over_cap() -> None:
+    graph = RoadGraph()
+    for node_id, lat in (("S", 0.0), ("A", 0.01), ("G", 0.02)):
+        graph.add_node(Node(id=node_id, lat=lat, lon=0.0))
+    graph.add_edge(
+        Edge(
+            id="fast",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=10.0,
+            scenic_score=0.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="boundary-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=7.5,
+            scenic_score=10.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="boundary-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=7.5,
+            scenic_score=10.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    planner = ScenicRoutePlanner(graph)
+    exact = planner.find_scenic_route(
+        (0.0, 0.0), (0.02, 0.0), q=1.0, kappa=1.5
+    )
+    over = planner.find_scenic_route(
+        (0.0, 0.0), (0.02, 0.0), q=1.0, kappa=1.4
+    )
+
+    assert exact.edge_ids == ("boundary-1", "boundary-2")
+    assert exact.estimated_duration_minutes == pytest.approx(
+        exact.duration_cap_minutes
+    )
+    assert over.edge_ids == ("fast",)
+    assert over.estimated_duration_minutes <= over.duration_cap_minutes
+def test_production_frontier_reports_exact_completion_certificate() -> None:
+    graph = _tradeoff_graph()
+    for index in range(25):
+        graph.add_node(
+            Node(id=f"isolated-{index}", lat=10.0 + index, lon=10.0)
+        )
+
+    route = _route(ScenicRoutePlanner(graph), q=0.5, kappa=4.0)
+
+    assert route.exact is True
+    assert route.exactness_status == "exact"
+    assert route.certified_upper_bound == pytest.approx(route.objective_value)
+    assert route.optimality_gap == pytest.approx(0.0)
+def test_reverse_collision_uses_canonical_and_positional_traversal_identity() -> None:
+    graph = RoadGraph()
+    for node_id, lat in (("S", 0.0), ("A", 0.01), ("G", 0.02)):
+        graph.add_node(Node(id=node_id, lat=lat, lon=0.0))
+    graph.add_edge(
+        Edge(
+            id="foo",
+            start_node_id="A",
+            end_node_id="S",
+            distance_km=1.0,
+            scenic_score=1.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="foo::rev",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=1.0,
+            scenic_score=9.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    planner = ScenicRoutePlanner(graph)
+    reverse = planner._edge_from_reverse_index("foo", True)
+    tail = graph.edges["foo::rev"]
+    route = planner._path_to_route([reverse, tail])
+
+    assert route.edge_ids == ("foo", "foo::rev")
+    assert route.traversal_ids == (
+        "0:reverse:foo",
+        "1:forward:foo::rev",
+    )
+    assert [segment.edge_id for segment in route.segments] == [
+        "foo",
+        "foo::rev",
+    ]
+    assert [segment.direction for segment in route.segments] == [
+        "reverse",
+        "forward",
+    ]
+    assert [segment.traversal_id for segment in route.segments] == list(
+        route.traversal_ids
+    )
+    assert tuple(edge_id for edge_id, _ in route.score_run) == route.traversal_ids
+    assert [segment.scenic_score for segment in route.segments] == [
+        pytest.approx(1.0),
+        pytest.approx(9.0),
+    ]
+    assert route.average_scenic_score == pytest.approx(5.0)
+
+
+def test_production_near_tie_over_cap_is_rejected_with_strict_tolerance() -> None:
+    graph = RoadGraph()
+    for node_id, lat in (("S", 0.0), ("A", 0.01), ("G", 0.02)):
+        graph.add_node(Node(id=node_id, lat=lat, lon=0.0))
+    graph.add_edge(
+        Edge(
+            id="fast",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=10.0,
+            scenic_score=0.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="near-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=5.0,
+            scenic_score=10.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="near-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=5.00000000005,
+            scenic_score=10.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    # Force production mode while keeping all unrelated edges disconnected.
+    for index in range(25):
+        graph.add_node(Node(id=f"orphan-{index}", lat=20.0 + index, lon=20.0))
+    for index in range(190):
+        graph.add_edge(
+            Edge(
+                id=f"orphan-edge-{index}",
+                start_node_id=f"orphan-{index % 25}",
+                end_node_id=f"orphan-{(index + 1) % 25}",
+                distance_km=1.0,
+                scenic_score=10.0,
+                speed_limit_kmh=60,
+                one_way=True,
+            )
+        )
+
+    route = ScenicRoutePlanner(graph).find_scenic_route(
+        (0.0, 0.0), (0.02, 0.0), q=1.0, kappa=1.0
+    )
+
+    assert route.edge_ids == ("fast",)
+    assert route.estimated_duration_minutes <= route.duration_cap_minutes
+def test_reverse_identity_is_stable_across_compiled_threshold() -> None:
+    def make_graph(extra: bool) -> RoadGraph:
+        graph = RoadGraph()
+        for node_id, lat in (("S", 0.0), ("A", 0.01), ("G", 0.02)):
+            graph.add_node(Node(id=node_id, lat=lat, lon=0.0))
+        graph.add_edge(
+            Edge(
+                id="foo",
+                start_node_id="A",
+                end_node_id="S",
+                distance_km=1.0,
+                scenic_score=1.0,
+                speed_limit_kmh=60,
+                one_way=False,
+            )
+        )
+        graph.add_edge(
+            Edge(
+                id="foo::rev",
+                start_node_id="A",
+                end_node_id="G",
+                distance_km=1.0,
+                scenic_score=9.0,
+                speed_limit_kmh=60,
+                one_way=True,
+            )
+        )
+        if extra:
+            for index in range(25):
+                graph.add_node(
+                    Node(id=f"threshold-{index}", lat=20.0 + index, lon=20.0)
+                )
+            for index in range(190):
+                graph.add_edge(
+                    Edge(
+                        id=f"threshold-edge-{index}",
+                        start_node_id=f"threshold-{index % 25}",
+                        end_node_id=f"threshold-{(index + 1) % 25}",
+                        distance_km=1.0,
+                        scenic_score=5.0,
+                        speed_limit_kmh=60,
+                        one_way=True,
+                    )
+                )
+        return graph
+
+    bounded = ScenicRoutePlanner(make_graph(False)).find_fastest_route(
+        (0.0, 0.0), (0.02, 0.0)
+    )
+    compiled = ScenicRoutePlanner(make_graph(True)).find_fastest_route(
+        (0.0, 0.0), (0.02, 0.0)
+    )
+
+    assert compiled.edge_ids == bounded.edge_ids == ("foo", "foo::rev")
+    assert [
+        segment.direction for segment in compiled.segments
+    ] == [segment.direction for segment in bounded.segments]
+    assert compiled.traversal_ids == bounded.traversal_ids
+
+def test_compiled_unreachable_cache_short_circuits_python_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="S", lat=0.0, lon=0.0))
+    graph.add_node(Node(id="A", lat=0.01, lon=0.0))
+    graph.add_node(Node(id="G", lat=0.02, lon=0.0))
+    graph.add_edge(
+        Edge(
+            id="blocked",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=1.0,
+            scenic_score=0.0,
+            road_type="motorway",
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    planner = ScenicRoutePlanner(graph)
+    planner.cost_function.avoid_highways = True
+    cost_function = planner._make_fastest_cost_function()
+
+    assert planner._a_star(
+        graph.nodes["S"],
+        graph.nodes["G"],
+        cost_function=cost_function,
+    ) is None
+
+    def fail_if_recomputed(*args: object, **kwargs: object) -> None:
+        raise AssertionError("compiled reachability miss was not cached")
+
+    monkeypatch.setattr(planner, "_compiled_builtin_path", fail_if_recomputed)
+    assert planner._a_star(
+        graph.nodes["S"],
+        graph.nodes["G"],
+        cost_function=cost_function,
+    ) is None
+
+
+def test_reachability_cache_drops_previous_graph_epoch() -> None:
+    first_graph = _tradeoff_graph()
+    second_graph = _tradeoff_graph()
+    ScenicRoutePlanner.clear_shared_caches()
+    first = ScenicRoutePlanner(first_graph)
+    second = ScenicRoutePlanner(second_graph)
+
+    first._record_compiled_reachability(
+        first_graph.nodes["S"],
+        first_graph.nodes["G"],
+        first.cost_function,
+        first_graph._heuristic_cache_stamp(),
+        False,
+    )
+    second._record_compiled_reachability(
+        second_graph.nodes["S"],
+        second_graph.nodes["G"],
+        second.cost_function,
+        second_graph._heuristic_cache_stamp(),
+        False,
+    )
+
+    assert ScenicRoutePlanner._ELIGIBLE_REACHABILITY_SHARED_GRAPH is second_graph
+    assert len(ScenicRoutePlanner._ELIGIBLE_REACHABILITY_SHARED_CACHE) == 1
+    assert all(
+        key[0] is second_graph
+        for key in ScenicRoutePlanner._ELIGIBLE_REACHABILITY_SHARED_CACHE
+    )
+
+
+def test_parallel_edges_do_not_corrupt_compiled_shortest_path() -> None:
+    graph = RoadGraph()
+    for node_id, lat in (("S", 0.0), ("A", 0.01), ("G", 0.02)):
+        graph.add_node(Node(id=node_id, lat=lat, lon=0.0))
+    graph.add_edge(
+        Edge(
+            id="zero",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=0.0,
+            scenic_score=0.0,
+            speed_limit_kmh=60.0,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="one",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=1.0,
+            scenic_score=0.0,
+            speed_limit_kmh=60.0,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="finish",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=1.0,
+            scenic_score=0.0,
+            speed_limit_kmh=60.0,
+            one_way=True,
+        )
+    )
+
+    planner = ScenicRoutePlanner(graph)
+    route = planner.find_fastest_route((0.0, 0.0), (0.02, 0.0))
+
+    assert route.edge_ids == ("zero", "finish")
+    assert route.estimated_duration_minutes == pytest.approx(1.0)
+
+
+def test_same_node_route_has_renderable_zero_length_geometry() -> None:
+    graph = _tradeoff_graph()
+    planner = ScenicRoutePlanner(graph)
+
+    route = planner.find_fastest_route((0.0, 0.0), (0.0, 0.0))
+
+    assert route.edge_ids == ()
+    assert route.waypoints == [(0.0, 0.0), (0.0, 0.0)]
+
+
+def _force_production(graph: RoadGraph) -> RoadGraph:
+    for index in range(25):
+        graph.add_node(
+            Node(
+                id=f"frontier-isolated-{index}",
+                lat=30.0 + index,
+                lon=30.0,
+            )
+        )
+    return graph
+
+
+def test_production_frontier_finds_optimum_and_completes_exactly() -> None:
+    planner = ScenicRoutePlanner(_force_production(_tradeoff_graph()))
+
+    route = _route(planner, q=0.5, kappa=4.0)
+
+    assert route.edge_ids == ("mid-1", "mid-2")
+    assert route.exact is True
+    assert route.exactness_status == "exact"
+    assert route.algorithm == "production-multilabel-frontier"
+    assert route.certified_upper_bound == pytest.approx(route.objective_value)
+    assert route.optimality_gap == pytest.approx(0.0)
+
+
+def _label(
+    *,
+    visited: set[str],
+    duration: float,
+    distance: float,
+    exposure: float,
+) -> _FrontierLabel:
+    return _FrontierLabel(
+        0,
+        "N",
+        duration,
+        distance,
+        exposure,
+        None,
+        None,
+        frozenset(visited),
+        (),
+    )
+
+
+def test_frontier_dominance_rejects_unsafe_ancestry() -> None:
+    planner = ScenicRoutePlanner()
+    first = _label(
+        visited={"S", "N", "blocked"},
+        duration=1.0,
+        distance=1.0,
+        exposure=1.0,
+    )
+    second = _label(
+        visited={"S", "N"},
+        duration=2.0,
+        distance=2.0,
+        exposure=0.0,
+    )
+
+    assert not planner._frontier_label_dominates(first, second)
+
+
+def test_frontier_dominance_rejects_ratio_unsafe_label() -> None:
+    planner = ScenicRoutePlanner()
+    first = _label(
+        visited={"S", "N"},
+        duration=1.0,
+        distance=1.0,
+        exposure=0.1,
+    )
+    second = _label(
+        visited={"S", "N"},
+        duration=2.0,
+        distance=2.0,
+        exposure=1.0,
+    )
+
+    assert not planner._frontier_label_dominates(first, second)
+
+
+def test_production_frontier_rejects_cycles_and_enforces_reverse_cap() -> None:
+    graph = _force_production(_tradeoff_graph())
+    planner = ScenicRoutePlanner(graph)
+
+    bounds = planner._frontier_reverse_duration_lower_bounds(
+        graph.nodes["G"], False, 6.0
+    )
+    assert bounds["S"] == pytest.approx(6.0)
+    route = planner.find_scenic_route(
+        (0.0, 0.0), (0.03, 0.0), q=1.0, kappa=1.0
+    )
+    node_ids = [route.segments[0].start[0]] + [
+        segment.end[0] for segment in route.segments
+    ]
+    assert len(node_ids) == len(set(node_ids))
+    assert route.edge_ids == ("fast",)
+    assert route.estimated_duration_minutes <= route.duration_cap_minutes
+
+
+def test_production_frontier_timeout_certifies_mid_expansion_upper_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = ScenicRoutePlanner(_force_production(_tradeoff_graph()))
+    planner._frontier_time_limit_seconds = 1.0
+    monkeypatch.setattr(
+        planner, "_frontier_warm_start_paths", lambda *_args: []
+    )
+    ticks = iter((0.0, 0.0, 0.0, 2.0))
+    monkeypatch.setattr(planner, "_monotonic", lambda: next(ticks))
+
+    route = _route(planner, q=1.0, kappa=4.0)
+
+    assert route.exact is False
+    assert route.exactness_status == "approximate-certified"
+    assert math.isfinite(route.certified_upper_bound)
+    assert route.certified_upper_bound >= route.objective_value
+    assert route.objective_value == pytest.approx(0.0)
+    assert route.certified_upper_bound >= 1.0
+    assert route.optimality_gap == pytest.approx(
+        route.certified_upper_bound - route.objective_value
+    )

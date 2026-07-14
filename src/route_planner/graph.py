@@ -94,6 +94,17 @@ class _ReverseEdgeView:
     @property
     def id(self) -> str:
         return f"{self._edge.id}::rev"
+    @property
+    def canonical_edge_id(self) -> str:
+        return str(self._edge.id)
+
+    @property
+    def direction(self) -> str:
+        return "reverse"
+
+    @property
+    def traversal_id(self) -> str:
+        return f"reverse:{self._edge.id}"
 
     @property
     def start_node_id(self) -> str:
