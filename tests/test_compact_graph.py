@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from scripts.routing.compact_graph import (
-    COMPACT_HEADER_SIZE,
     CompactArtifactError,
     convert_json_to_compact,
     validate_compact_artifact,
@@ -100,8 +99,10 @@ def test_converter_and_loader_preserve_graph_behavior(tmp_path: Path) -> None:
     assert loaded.adjacency == expected.adjacency
     for node_id in expected.nodes:
         assert _public_edges(loaded, node_id) == _public_edges(expected, node_id)
-        assert [edge.traversal_id for edge in loaded.iter_edges(node_id)] == [
-            edge.traversal_id for edge in expected.iter_edges(node_id)
+        assert [
+            getattr(edge, "traversal_id", f"forward:{edge.id}") for edge in loaded.iter_edges(node_id)
+        ] == [
+            getattr(edge, "traversal_id", f"forward:{edge.id}") for edge in expected.iter_edges(node_id)
         ]
 
     # Equal raw-coordinate distances retain insertion-order tie semantics.

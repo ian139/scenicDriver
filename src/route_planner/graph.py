@@ -571,9 +571,12 @@ class RoadGraph:
 
     @classmethod
     def load(cls, path: Path) -> "RoadGraph":
-        # Decode bytes directly into compact typed rows.  This avoids a
-        # temporary dict for every node and edge while retaining the legacy
-        # JSON object/array schema.
+        # Compact artifacts have a binary magic header; legacy graph JSON
+        # continues through the existing typed-row decoder unchanged.
+        from .compact_graph import is_compact_artifact, load_compact_graph
+
+        if is_compact_artifact(path):
+            return load_compact_graph(path)
         rows = msgspec.json.decode(path.read_bytes(), type=_GraphRows, strict=True)
         graph = cls()
         graph._bulk_load(rows.nodes, rows.edges)
