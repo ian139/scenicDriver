@@ -261,34 +261,13 @@ input[type="range"]:focus {
 .panel-meta {
   width: 100%;
   display: grid;
-  grid-template-columns: minmax(100px, auto) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(100px, auto) auto;
   align-items: end;
   justify-content: stretch;
   gap: 8px;
   min-width: 0;
 }
 
-.region-controls {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  align-items: end;
-  gap: 8px;
-  min-width: 0;
-}
-
-.region-controls > .field {
-  min-width: 0;
-}
-
-.region-controls select {
-  width: 100%;
-  max-width: 100%;
-}
-
-.region-controls > #regionStatus {
-  grid-column: 1 / -1;
-  min-width: 0;
-}
 
 h2,
 h3,
@@ -590,6 +569,30 @@ h3 {
   border-top: 1px solid rgba(130, 151, 137, 0.25);
 }
 
+.dev-panel .region-controls {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: end;
+  gap: 8px;
+  min-width: 0;
+  padding-top: 10px;
+}
+
+.dev-panel .region-controls > .field {
+  min-width: 0;
+}
+
+.dev-panel .region-controls select {
+  width: 100%;
+  max-width: 100%;
+}
+
+.dev-panel .region-controls > #regionStatus {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
 .dev-panel summary {
   display: flex;
   align-items: center;
@@ -632,6 +635,10 @@ h3 {
   max-height: min(72vh, 600px);
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+
+.control-panel:has(.address-suggestions.open) {
+  overflow: visible;
 }
 .output-stack {
   display: grid;
@@ -796,9 +803,14 @@ h3 {
 
 .dialog-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+}
+
+.dialog-header > div {
+  flex-shrink: 0;
 }
 
 .dialog-header h2 {
@@ -877,6 +889,10 @@ h3 {
   display: none !important;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 
 @media (max-width: 760px) {
   body {
@@ -920,8 +936,7 @@ h3 {
     grid-column: 2;
     justify-self: end;
   }
-
-  .region-controls {
+  .dev-panel .region-controls {
     grid-column: 1 / -1;
   }
 
@@ -940,6 +955,10 @@ h3 {
     max-height: none;
     overflow: visible;
     margin-top: 2px;
+  }
+
+  .control-panel:has(.address-suggestions.open) {
+    overflow-y: auto;
   }
 
   .output-stack {
@@ -993,12 +1012,11 @@ h3 {
     align-items: flex-end;
     gap: 10px;
   }
-
-  .region-controls {
+  .dev-panel .region-controls {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .region-controls > #regionStatus {
+  .dev-panel .region-controls > #regionStatus {
     grid-column: auto;
   }
 
