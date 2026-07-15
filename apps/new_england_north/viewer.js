@@ -639,6 +639,11 @@ function clearRoute() {
   removeLayer(ROUTE_SCENIC);
   removeLayer(ROUTE_BASELINE);
   removeSource(ROUTE_SOURCE);
+  if (el.submitRoute) {
+    el.submitRoute.disabled =
+      !mapReady || !CONFIG.workingRun || selectedRegionMetadata?.graph_exists === false;
+    el.submitRoute.textContent = "Plan route";
+  }
   setRouteOutput("Waiting for submit", "Enter start/end coordinates as <code>lat, lon</code>, then submit.");
 }
 
