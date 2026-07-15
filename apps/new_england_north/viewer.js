@@ -34,13 +34,13 @@ let zoomBounceActive = false;
 
 
 const params = new URLSearchParams(window.location.search);
-const CONFIG = Object.freeze({
-  displayRange: params.get("display") || DEFAULTS.displayRange,
-  sourceRegion: params.get("source") || DEFAULTS.sourceRegion,
+let CONFIG = {
+  displayRange: params.get("source") || params.get("region") || params.get("display") || DEFAULTS.displayRange,
+  sourceRegion: params.get("source") || params.get("region") || DEFAULTS.sourceRegion,
   workingRun: params.get("run") || DEFAULTS.workingRun,
   sourceModel: DEFAULTS.sourceModel,
   activeRegistryModel: DEFAULTS.activeRegistryModel,
-});
+};
 
 // API base is a runtime variable (no longer bound to a DOM input). It can be
 // overridden via ?api=... and, if an `#apiBase` input is ever re-introduced, by
@@ -66,6 +66,9 @@ const el = {
   sourceRegion: document.getElementById("sourceRegion"),
   runName: document.getElementById("runName"),
   modelNote: document.getElementById("modelNote"),
+  regionSelect: document.getElementById("regionSelect"),
+  runSelect: document.getElementById("runSelect"),
+  regionStatus: document.getElementById("regionStatus"),
   cellCount: document.getElementById("cellCount"),
   avgScore: document.getElementById("avgScore"),
   peakScore: document.getElementById("peakScore"),
@@ -133,9 +136,142 @@ let activeRouteRequest = null;
 let map;
 let latestHeatmap = null;
 const selectedRoutePoints = { start: null, end: null };
+let selectedRegionMetadata = null;
+let activeRegionBounds = REGION_BOUNDS;
 
 function api(path) {
   return `${apiBase.replace(/\/+$/, "")}${path}`;
+}
+
+function resolveRegionSelection(payload, requestedRegion, requestedRun) {
+  const regions = Array.isArray(payload?.regions)
+    ? payload.regions.filter(
+        (region) => region && typeof region.region === "string" && region.region.trim()
+      )
+    : [];
+  if (!regions.length) throw new Error("API returned no supported regions");
+  const requested = String(requestedRegion || "").toLowerCase();
+  const region =
+    regions.find((item) => item.region.toLowerCase() === requested) ||
+    regions.find((item) => item.is_default) ||
+    regions.find((item) => item.region.toLowerCase() === DEFAULTS.sourceRegion) ||
+    regions[0];
+  const latestRun =
+    typeof region.latest_run_name === "string" && region.latest_run_name.trim()
+      ? region.latest_run_name
+      : null;
+  return {
+    regions,
+    region,
+    run: requestedRun === latestRun ? requestedRun : latestRun,
+  };
+}
+
+function boundsFromRegion(region) {
+  const bbox = region?.bbox;
+  if (
+    !bbox ||
+    !["min_lon", "min_lat", "max_lon", "max_lat"].every((key) =>
+      Number.isFinite(Number(bbox[key]))
+    )
+  ) {
+    return REGION_BOUNDS;
+  }
+  return [
+    [Number(bbox.min_lon), Number(bbox.min_lat)],
+    [Number(bbox.max_lon), Number(bbox.max_lat)],
+  ];
+}
+
+function regionCamera(region) {
+  const center = region?.map?.center;
+  const lon = Number(center?.lon);
+  const lat = Number(center?.lat);
+  const zoom = Number(region?.map?.zoom);
+  return {
+    center:
+      Number.isFinite(lon) && Number.isFinite(lat)
+        ? [lon, lat]
+        : [
+            (activeRegionBounds[0][0] + activeRegionBounds[1][0]) / 2,
+            (activeRegionBounds[0][1] + activeRegionBounds[1][1]) / 2,
+          ],
+    zoom: Number.isFinite(zoom) ? zoom : DEFAULTS.zoom,
+  };
+}
+
+function selectionUrl(region, run) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("source", region);
+  if (run) url.searchParams.set("run", run);
+  else url.searchParams.delete("run");
+  url.searchParams.delete("region");
+  url.searchParams.delete("display");
+  return url;
+}
+
+function populateRegionControls(selection) {
+  if (!el.regionSelect || !el.runSelect) return;
+  el.regionSelect.replaceChildren(
+    ...selection.regions.map((region) => {
+      const option = document.createElement("option");
+      option.value = region.region;
+      option.textContent = region.display_name || region.region;
+      option.dataset.run = region.latest_run_name || "";
+      option.selected = region === selection.region;
+      return option;
+    })
+  );
+  const runOption = document.createElement("option");
+  runOption.value = selection.run || "";
+  runOption.textContent = selection.run || "No run available";
+  el.runSelect.replaceChildren(runOption);
+  el.regionSelect.disabled = false;
+  el.runSelect.disabled = !selection.run;
+}
+
+function validHeatmapMetadata(payload) {
+  const bounds = payload?.bounds;
+  return (
+    Number.isInteger(payload?.tile_zoom) &&
+    payload.tile_zoom > 0 &&
+    bounds &&
+    ["min_lon", "min_lat", "max_lon", "max_lat"].every(
+      (key) => Number.isFinite(Number(bounds[key]))
+    )
+  );
+}
+
+async function loadSupportedRegions() {
+  const response = await fetch(api("/v1/regions"));
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  const selection = resolveRegionSelection(
+    await response.json(),
+    CONFIG.sourceRegion,
+    params.get("run")
+  );
+  selectedRegionMetadata = selection.region;
+  activeRegionBounds = boundsFromRegion(selection.region);
+  CONFIG = {
+    ...CONFIG,
+    displayRange: selection.region.display_name || selection.region.region,
+    sourceRegion: selection.region.region,
+    workingRun: selection.run,
+  };
+  populateRegionControls(selection);
+  setText(
+    el.regionStatus,
+    selection.run
+      ? `${CONFIG.displayRange} · ${selection.run}`
+      : `${CONFIG.displayRange} has no configured scenic run`
+  );
+  if (params.has("region") || params.has("source") || params.has("run")) {
+    const alignedUrl = selectionUrl(CONFIG.sourceRegion, CONFIG.workingRun);
+    if (alignedUrl.href !== window.location.href) {
+      window.history.replaceState(null, "", alignedUrl);
+    }
+  }
+  return selection;
 }
 
 function setText(node, text) {
@@ -315,7 +451,7 @@ function fitToGeojson(geojson, options = {}) {
 
 
 function syncZoomElasticity() {
-  const camera = map.cameraForBounds(REGION_BOUNDS, {
+  const camera = map.cameraForBounds(activeRegionBounds, {
     padding: MAP_NAVIGATION.softFitPaddingPx,
   });
   if (Number.isFinite(camera?.zoom)) {
@@ -375,6 +511,9 @@ function handleZoomEnd(event) {
 
 
 async function loadHeatmap() {
+  if (!CONFIG.workingRun) {
+    throw new Error(`No scenic run is configured for ${CONFIG.displayRange}`);
+  }
   const url = new URL(api("/v1/heatmap"));
   url.searchParams.set("region", CONFIG.sourceRegion);
   url.searchParams.set("run_name", CONFIG.workingRun);
@@ -386,13 +525,7 @@ async function loadHeatmap() {
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     const payload = await response.json();
     const bounds = payload.bounds;
-    if (
-      payload.tile_zoom !== 14 ||
-      !bounds ||
-      !["min_lon", "min_lat", "max_lon", "max_lat"].every(
-        (key) => Number.isFinite(Number(bounds[key]))
-      )
-    ) {
+    if (!validHeatmapMetadata(payload)) {
       throw new Error("API returned invalid learned heatmap metadata");
     }
     const imageUrl = new URL(api("/v1/heatmap-image"));
@@ -760,8 +893,15 @@ function renderRouteComparison(payload) {
 
 
 async function fetchValidatedRoute() {
+  if (!CONFIG.workingRun) {
+    throw new Error(`No validated route run is configured for ${CONFIG.displayRange}`);
+  }
   const url = new URL(api("/v1/validated-route"));
   url.searchParams.set("region", CONFIG.sourceRegion);
+  url.searchParams.set("run_name", CONFIG.workingRun);
+  if (selectedRegionMetadata?.graph_exists === false) {
+    throw new Error(`Route graph is unavailable for ${CONFIG.displayRange}`);
+  }
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   const result = await response.json();
@@ -1077,6 +1217,8 @@ function buildShareUrl({ start, end, maxDetour, avoidHighways }) {
   url.searchParams.set("end", `${end.lat},${end.lon}`);
   url.searchParams.set("max_detour", String(maxDetour));
   url.searchParams.set("avoid_highways", avoidHighways ? "true" : "false");
+  url.searchParams.set("source", CONFIG.sourceRegion);
+  if (CONFIG.workingRun) url.searchParams.set("run", CONFIG.workingRun);
   return url.toString();
 }
 
@@ -1163,8 +1305,17 @@ function initBindings() {
   el.detourFactor?.addEventListener("input", syncRangeOutputs);
   syncRangeOutputs();
   el.routeForm?.addEventListener("submit", planRoute);
-  installAddressSearch("start");
-  installAddressSearch("end");
+  el.regionSelect?.addEventListener("change", () => {
+    const region = el.regionSelect.value;
+    const run =
+      el.regionSelect.selectedOptions[0]?.dataset.run ||
+      el.runSelect?.value ||
+      "";
+    window.location.assign(selectionUrl(region, run));
+  });
+  el.runSelect?.addEventListener("change", () => {
+    window.location.assign(selectionUrl(el.regionSelect.value, el.runSelect.value));
+  });
   el.clearRoute?.addEventListener("click", clearRoute);
   el.closeRouteDialogBtn?.addEventListener("click", () => el.routeResultsDialog.close());
   el.shareRouteBtn?.addEventListener("click", copyShareUrl);
@@ -1174,14 +1325,31 @@ function initBindings() {
   el.routeResultsDialog?.addEventListener("close", () => el.submitRoute.focus());
 }
 
+function initAddressSearch() {
+  installAddressSearch("start");
+  installAddressSearch("end");
+}
+
 async function main() {
   initBindings();
+  const artifactErrors = [];
+  try {
+    await loadSupportedRegions();
+    setText(el.displayRange, CONFIG.displayRange);
+    setText(el.sourceRegion, CONFIG.sourceRegion);
+    setText(el.runName, CONFIG.workingRun || "Unavailable");
+  } catch (error) {
+    const message = `Region metadata unavailable: ${error.message || error}`;
+    artifactErrors.push(message);
+    setText(el.regionStatus, message);
+    setApiStatus("API: regions unavailable", "warn");
+  }
+  initAddressSearch();
   void loadTrainingResults();
   await checkApiHealth();
 
   let heatmap = null;
   let validatedRoute = null;
-  const artifactErrors = [];
   try {
     heatmap = await loadHeatmap();
   } catch (error) {
@@ -1203,11 +1371,12 @@ async function main() {
     );
   }
 
+  const camera = regionCamera(selectedRegionMetadata);
   map = new maplibregl.Map({
     container: "map",
     style,
-    center: DEFAULTS.center,
-    zoom: DEFAULTS.zoom,
+    center: camera.center,
+    zoom: camera.zoom,
     attributionControl: true,
     dragRotate: false,
     pitchWithRotate: false,
@@ -1217,7 +1386,8 @@ async function main() {
   map.on("zoomend", handleZoomEnd);
   map.on("load", () => {
     syncZoomElasticity();
-    el.submitRoute.disabled = false;
+    el.submitRoute.disabled =
+      !CONFIG.workingRun || selectedRegionMetadata?.graph_exists === false;
   });
   map.on("resize", syncZoomElasticity);
   if (heatmap) {
@@ -1284,12 +1454,20 @@ async function main() {
     setText(el.inspectorCoords, `Learned scores · z${heatmap.tileZoom}`);
   }
   if (validatedRoute) {
-    setRouteOutput("Burlington → Bangor", "Validated scenic and baseline routes are shown on the map.");
+    const title =
+      CONFIG.sourceRegion === DEFAULTS.sourceRegion
+        ? "Burlington → Bangor"
+        : `${CONFIG.displayRange} validated route`;
+    setRouteOutput(title, "Validated scenic and baseline routes are shown on the map.");
   }
   if (artifactErrors.length) {
     setApiStatus("API: artifacts unavailable", "warn");
+    setText(el.regionStatus, artifactErrors.join(" "));
     if (!validatedRoute) {
-      setRouteOutput("Canonical artifacts unavailable", escapeHtml(artifactErrors.join(" ")));
+      setRouteOutput(
+        `${CONFIG.displayRange} artifacts unavailable`,
+        escapeHtml(artifactErrors.join(" "))
+      );
     }
   }
 }
