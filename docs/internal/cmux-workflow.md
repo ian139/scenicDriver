@@ -22,19 +22,31 @@ cmux hooks setup omp
 cmux agent-hibernation on
 ```
 
-## Coordinator startup
+## Coordinator startup and workspace groups
 
-Create one focused CMUX workspace and one advisor-enabled OMP parent for a new feature or risky fix:
+Create one CMUX workspace group for every repo-level feature or long-running
+workstream. The group always creates a fresh anchor workspace; use that anchor
+as the coordinator. Keep every worker, terminal view, and Git worktree for that
+effort inside the same group.
 
 ```bash
-cmux new-workspace \
-  --name "<short-feature-name>" \
+cmux workspace-group create \
+  --name "<repo>: <short-feature-name>" \
   --cwd "$PWD" \
-  --command 'omp --advisor --model "openai-codex/gpt-5.5" --thinking medium' \
-  --focus true
+  --json
+cmux workspace-group list --json
 ```
 
-CMUX owns the session view. Git worktrees are created or opened by normal git/project tooling outside CMUX, then opened in CMUX with `cmux new-workspace --cwd "<absolute-worktree-path>"`.
+Focus the returned group, then start the advisor-enabled OMP parent in its
+anchor workspace. Use the group header `+` or `cmux workspace-group
+new-workspace <group-id>` for additional workspaces; do not create ungrouped
+repo workspaces.
+
+CMUX owns the session view and grouping. Git worktrees are created or opened by
+normal Git/project tooling outside CMUX, then their workspaces are added to the
+matching group. Closing a group anchor dissolves the group, so do not close the
+anchor while the workstream is active. Use `ungroup` to preserve member
+workspaces or `delete` only when every member should be closed.
 
 ## Long-running workstream branches
 
@@ -44,16 +56,21 @@ Keep exactly three long-running Scenic Drive workstream branches beyond `main`:
 - `Ian139/UI-Fixes`: Figma-driven web/mobile UI rebuild, app shell work, and UI/API contract changes needed by the web or mobile interfaces.
 - `Ian139/S3Management`: S3 data movement, bucket layout, lifecycle policy, data acquisition, and S3-aware reporting/download paths.
 
-Open or create these branches outside CMUX by normal git/project tooling. After the checkout exists, open it in CMUX as the viewer/session host:
+Open or create these branches with normal Git/project tooling. Create or focus
+one persistent CMUX workspace group for each workstream, then add every
+feature-sized child worktree workspace to that group:
 
 ```bash
-cmux new-workspace \
-  --name "<workstream-name>" \
+cmux workspace-group create \
+  --name "Scenic Drive: <workstream-name>" \
   --cwd "<absolute-worktree-path>" \
-  --focus true
+  --json
+cmux workspace-group new-workspace <group-id> --placement end
 ```
 
-Create feature-sized child worktrees from the matching parent stream when work begins; do not create additional long-running top-level branches unless the task is truly cross-cutting and temporary. CMUX is not the git worktree creator.
+Do not create additional long-running top-level branches unless the task is
+truly cross-cutting and temporary. CMUX groups organize the whole repository's
+session topology; they do not create Git branches or worktrees.
 
 ## Planning checklist
 
@@ -90,17 +107,26 @@ After OMP starts, send the worker prompt contract below as the narrow task promp
 
 ## Isolated worker workspaces
 
-Use isolated worker workspaces when isolation, competing implementations, risky tests, or independent verification improves quality. Create the git worktree outside CMUX first, then open the checkout in CMUX:
+Use isolated worker workspaces when isolation, competing implementations,
+risky tests, or independent verification improves quality. Create the Git
+worktree outside CMUX first. Open that checkout as a CMUX workspace, then add
+the returned workspace ID to the matching feature/workstream group:
 
 ```bash
 cmux new-workspace \
   --name "<parent-feature>-<specific-subtask>" \
   --cwd "<absolute-worktree-path>" \
-  --command 'omp --model "ollama-cloud/deepseek-v4-pro" --thinking high' \
   --focus false
+cmux workspace-group add --group <group-id> --workspace <workspace-id>
 ```
 
-Isolated worker output is a patch proposal. The coordinator must inspect the worker diff, reject unrelated edits, integrate the useful patch into the parent worktree, and rerun focused verification in the parent before final verification.
+Start the worker in that member workspace. Never leave same-repository worker
+workspaces ungrouped.
+
+Isolated worker output is a patch proposal. The coordinator must inspect the
+worker diff, reject unrelated edits, integrate the useful patch into the parent
+worktree, and rerun focused verification in the parent before final
+verification.
 
 ## Markdown plan/viewer
 
@@ -204,6 +230,24 @@ fields.
 
 Do not create or open a workspace during bulk state migration, and do not start
 OMP automatically for imported state.
+## Repository-wide group operations
+
+These group rules apply to every Scenic Drive task, branch, worktree, and
+worker—not only UI or remote-training work.
+
+- Inspect topology with `cmux workspace-group list --json`.
+- Add an existing workspace with `cmux workspace-group add --group <group-id> --workspace <workspace-id>`.
+- Remove a workspace without closing it with `cmux workspace-group remove --workspace <workspace-id>`.
+- Use `collapse`/`expand`, `pin`/`unpin`, `set-color`, and `set-icon` to keep long-running workstreams legible.
+- Use `focus <group-id>` before spawning a member so `⌘N` and the header `+` inherit the correct group.
+- Use `ungroup <group-id>` when the container should disappear but member workspaces must survive.
+- Use `delete <group-id>` only when the anchor and every child workspace should close; deletion is irreversible.
+- Never promote an existing workspace to a newly created group anchor. CMUX always creates a fresh anchor by design.
+
+Per-group defaults and context-menu actions belong under `workspaceGroups` in
+`~/.config/cmux/cmux.json`, keyed by the anchor working directory. Repository
+guidance must use the documented `cmux workspace-group` CLI and must not depend
+on Orca runtime state.
 
 ## Verification gate
 

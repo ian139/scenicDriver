@@ -40,6 +40,10 @@ Scenic Drive scores scenic beauty from satellite imagery and terrain data, then 
 - Prefer one canonical workflow path; archive superseded alternatives instead of leaving duplicate active paths.
 - Run focused tests or smoke checks for changed API, script, notebook, or app paths before yielding.
 - OMP/CMUX workflow details live in `docs/internal/cmux-workflow.md`.
+- Use CMUX—not Orca—for repository workspaces, worker sessions, and worktree views.
+- Treat one CMUX workspace group as the container for each repo-level feature or workstream: its fresh anchor is the coordinator, and every same-repo worker/worktree workspace is a member.
+- Create and manage groups with `cmux workspace-group`; use the group header `+` or `cmux workspace-group new-workspace` for additional workspaces.
+- Keep Git branch/worktree creation in normal Git/project tooling, then open each checkout in the matching CMUX group.
 - Keep ML workflows in marimo notebooks (`notebooks/`).
 - Use grouped `scripts/` subdirectories for workflow CLIs only.
 - Keep large datasets and model weights out of git.
