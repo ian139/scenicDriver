@@ -4,6 +4,7 @@ import math
 
 import pytest
 
+from src.route_planner.cost import evaluate_path, resolve_routing_policy
 from src.route_planner.graph import Edge, Node, RoadGraph
 from src.route_planner.planner import _FrontierLabel, ScenicRoutePlanner
 
@@ -126,6 +127,41 @@ def test_oracle_q_zero_is_exact_fastest_and_q_one_is_scenic_optimum() -> None:
     assert q1.average_scenic_score == pytest.approx(10.0)
     assert q1.normalized_scenic_score == pytest.approx(1.0)
     assert q1.objective_value == pytest.approx(1.0)
+
+
+def test_resolved_policy_additive_preference_preserves_legacy_objective() -> None:
+    edge = Edge(
+        id="h",
+        start_node_id="S",
+        end_node_id="G",
+        distance_km=2.0,
+        scenic_score=5.0,
+        road_type="motorway",
+        speed_limit_kmh=60,
+        one_way=True,
+    )
+    legacy_policy = resolve_routing_policy(scenic_weight=0.5, kappa=2.0)
+    preferred_policy = resolve_routing_policy(
+        scenic_weight=0.5, kappa=2.0, highway_preference=0.25
+    )
+    legacy = evaluate_path(
+        [edge],
+        q=0.5,
+        kappa=2.0,
+        fastest_duration_minutes=edge.travel_time_minutes,
+        policy=legacy_policy,
+    )
+    preferred = evaluate_path(
+        [edge],
+        q=0.5,
+        kappa=2.0,
+        fastest_duration_minutes=edge.travel_time_minutes,
+        policy=preferred_policy,
+    )
+    assert legacy.objective == pytest.approx(0.75)
+    assert preferred.highway_cost == pytest.approx(0.25)
+    assert preferred.objective == pytest.approx(legacy.objective - 0.25)
+    assert preferred.policy != legacy.policy
 
 
 def test_oracle_intermediate_q_selects_tradeoff_path() -> None:

@@ -31,6 +31,49 @@ def _required_finite(value: object, name: str, *, minimum: float | None = None) 
         raise ValueError(f"{name} must be finite{suffix}")
     return number
 
+@dataclass(frozen=True)
+class RoutingPolicy:
+    """Resolved routing controls shared by every path evaluation and search."""
+
+    scenic_weight: float
+    kappa: float
+    strict_highways: bool = False
+    highway_preference: float = 0.0
+
+    @property
+    def avoid_highways(self) -> bool:
+        """Compatibility spelling for the strict highway filter."""
+        return self.strict_highways
+
+
+def resolve_routing_policy(
+    *,
+    scenic_weight: object,
+    kappa: object,
+    avoid_highways: object = False,
+    highway_preference: object = 0.0,
+    strict_highways: object | None = None,
+) -> RoutingPolicy:
+    """Normalize request controls once, before search or cache lookup."""
+    q_value = _required_finite(scenic_weight, "q")
+    if not 0.0 <= q_value <= 1.0:
+        raise ValueError("q must be finite and in [0, 1]")
+    kappa_value = _required_finite(kappa, "kappa", minimum=1.0)
+    preference_value = _required_finite(
+        highway_preference, "highway preference", minimum=0.0
+    )
+    strict_value = (
+        bool(avoid_highways)
+        if strict_highways is None
+        else bool(strict_highways)
+    )
+    return RoutingPolicy(
+        scenic_weight=q_value,
+        kappa=kappa_value,
+        strict_highways=strict_value,
+        highway_preference=preference_value,
+    )
+
 
 def _checked_add(left: float, right: float, name: str) -> float:
     result = left + right
@@ -184,6 +227,8 @@ class PathEvaluation:
     score_coverage: float
     score_run: tuple[tuple[str, float], ...]
     normalization_version: str = SCENIC_NORMALIZATION_VERSION
+    highway_cost: float = 0.0
+    policy: RoutingPolicy | None = None
 
     @property
     def canonical_edge_sequence(self) -> tuple[str, ...]:
@@ -196,8 +241,15 @@ def evaluate_path(
     q: object,
     kappa: object,
     fastest_duration_minutes: object,
+    policy: RoutingPolicy | None = None,
+    highway_preference: object = 0.0,
 ) -> PathEvaluation:
-    """Evaluate a path without relying on planner state or cached objective data."""
+    """Evaluate a path with the resolved policy objective."""
+    resolved = policy or resolve_routing_policy(
+        scenic_weight=q,
+        kappa=kappa,
+        highway_preference=highway_preference,
+    )
     try:
         edges = tuple(path)  # type: ignore[arg-type]
     except TypeError as exc:
@@ -209,6 +261,7 @@ def evaluate_path(
     weighted_score = 0.0
     scored_distance = 0.0
     highway_count = 0
+    highway_duration = 0.0
     for position, edge in enumerate(edges):
         edge_id = _edge_id(edge, position)
         distance = _edge_distance(edge)
@@ -227,20 +280,33 @@ def evaluate_path(
         scored_distance = _checked_add(
             scored_distance, distance, "scored distance"
         )
-        highway_count += int(is_highway_road_type(_edge_value(edge, "road_type")))
+        if is_highway_road_type(_edge_value(edge, "road_type")):
+            highway_count += 1
+            highway_duration = _checked_add(
+                highway_duration, duration, "highway duration"
+            )
     raw_score = weighted_score / total_distance if total_distance else 0.0
     normalized_score = raw_score / 10.0
     coverage = scored_distance / total_distance if total_distance else 1.0
     duration_utility = duration_component(
-        total_duration, fastest_duration_minutes, kappa
+        total_duration, fastest_duration_minutes, resolved.kappa
     )
-    objective = combined_utility(
-        q,
-        kappa,
+    base_objective = combined_utility(
+        resolved.scenic_weight,
+        resolved.kappa,
         total_duration,
         fastest_duration_minutes,
         normalized_score,
     )
+    fastest = _required_finite(
+        fastest_duration_minutes, "fastest duration", minimum=0.0
+    )
+    highway_cost = (
+        resolved.highway_preference
+        * highway_duration
+        / max(fastest, MIN_EDGE_COST)
+    )
+    objective = base_objective - highway_cost
     return PathEvaluation(
         edge_ids=tuple(edge_ids),
         total_distance_km=total_distance,
@@ -252,7 +318,10 @@ def evaluate_path(
         highway_count=highway_count,
         score_coverage=coverage,
         score_run=tuple(score_run),
+        highway_cost=highway_cost,
+        policy=resolved,
     )
+
 
 
 def compare_path_evaluations(
@@ -329,6 +398,9 @@ class ScenicCostFunction:
         scenic_weight: float = 0.5,
         avoid_highways: bool = False,
         weights: CostWeights | None = None,
+        *,
+        highway_preference: float = 0.0,
+        strict_highways: bool | None = None,
     ) -> None:
         try:
             scenic_weight_value = float(scenic_weight)
@@ -337,7 +409,13 @@ class ScenicCostFunction:
         if not math.isfinite(scenic_weight_value):
             scenic_weight_value = 0.5
         self.scenic_weight = min(max(scenic_weight_value, 0.0), 1.0)
-        self.avoid_highways = bool(avoid_highways)
+        self.strict_highways = (
+            bool(avoid_highways)
+            if strict_highways is None
+            else bool(strict_highways)
+        )
+        self.avoid_highways = self.strict_highways
+        self.highway_preference = _finite_nonnegative(highway_preference)
         self.weights = weights or CostWeights()
 
     def calculate(self, edge: Edge) -> float:
@@ -378,6 +456,10 @@ class ScenicCostFunction:
         return max(raw, MIN_EDGE_COST)
 
     def _road_type_adjustment(self, road_type: str) -> float:
-        if self.avoid_highways and is_highway_road_type(road_type):
+        if not is_highway_road_type(road_type):
+            return 0.0
+        if self.highway_preference > 0.0:
+            return self.highway_preference
+        if self.avoid_highways:
             return _finite_nonnegative(self.weights.highway_penalty)
         return 0.0
