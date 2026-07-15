@@ -1,5 +1,11 @@
 # Compact Graph Backend TODO
 
+## Wave 1 gate status (2026-07-14)
+
+No compact-graph TODO items are closed yet. A versioned MessagePack prototype passed parity checks but was rejected for integration because production `RoadGraph.load()` regressed from 9.54s (JSON) to 17.40s (compact), despite a 43.7% artifact-size reduction. The remaining runtime gate requires a packed fixed-width/CSR or mmap-backed layout with measured cold-load and RSS improvement.
+
+No routing-policy TODO item is closed yet. The soft highway-policy draft remains isolated on `wave1-routing` because its production scenic path exceeded the bounded test window and its policy-aware objective is not shared consistently across oracle, frontier, and certification paths.
+
 ## Design
 
 - [ ] Define a versioned, checksummed compact graph artifact format.
