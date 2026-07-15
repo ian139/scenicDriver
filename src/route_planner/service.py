@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 from threading import RLock
 from time import perf_counter
@@ -21,13 +22,40 @@ from .cost import (
     normalize_scenic_score,
 )
 from .graph import RoadGraph
-from .planner import Route, ScenicRoutePlanner
+from .planner import (
+    Route,
+    ScenicRoutePlanner,
+    _normalize_search_diagnostics,
+)
 
 
 _DEFAULT_SCENIC_WEIGHT = 0.8
 _DEFAULT_AVOID_HIGHWAYS = False
 _DEFAULT_MAX_DETOUR_FACTOR = 1.8
 _DEFAULT_INCLUDE_BASELINE = True
+
+
+class RouteConfigurationError(RuntimeError):
+    """Raised when deployment-supplied route configuration is invalid."""
+
+
+def _frontier_time_limit_from_env() -> float | None:
+    raw_value = os.environ.get("SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS")
+    if raw_value is None or not raw_value.strip():
+        return None
+    try:
+        return ScenicRoutePlanner.validate_frontier_time_limit_seconds(
+            raw_value.strip()
+        )
+    except ValueError as exc:
+        raise RouteConfigurationError(
+            "SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS must be finite and between 0 and 60 seconds"
+        ) from exc
+
+
+def validate_route_configuration() -> None:
+    """Validate deployment-supplied route settings before serving requests."""
+    _frontier_time_limit_from_env()
 
 
 @dataclass
@@ -612,7 +640,14 @@ def preload_route_assets(
         }
 
     planner_preload: dict[str, Any] = {}
-    planner = ScenicRoutePlanner(graph=graph)
+    frontier_time_limit_seconds = _frontier_time_limit_from_env()
+    if frontier_time_limit_seconds is None:
+        planner = ScenicRoutePlanner(graph=graph)
+    else:
+        planner = ScenicRoutePlanner(
+            graph=graph,
+            frontier_time_limit_seconds=frontier_time_limit_seconds,
+        )
     prewarm = getattr(planner, "prewarm_routing_cache", None)
     if callable(prewarm):
         prewarm_result = prewarm()
@@ -771,6 +806,9 @@ def route_to_feature(
         "zero_improvement_reason": getattr(route, "zero_improvement_reason", None),
         "no_route_reason": getattr(route, "no_route_reason", None),
         "score_run": getattr(route, "score_run", None),
+        "search_diagnostics": _normalize_search_diagnostics(
+            getattr(route, "search_diagnostics", None)
+        ),
     }
     if objective is not None:
         properties["objective_components"] = dict(objective)
@@ -1088,7 +1126,14 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
         "score_application_elapsed_ms": score_application_elapsed_ms,
     }
 
-    planner = ScenicRoutePlanner(graph=graph)
+    frontier_time_limit_seconds = _frontier_time_limit_from_env()
+    if frontier_time_limit_seconds is None:
+        planner = ScenicRoutePlanner(graph=graph)
+    else:
+        planner = ScenicRoutePlanner(
+            graph=graph,
+            frontier_time_limit_seconds=frontier_time_limit_seconds,
+        )
     scenic_route = planner.find_scenic_route(
         start=request.start,
         end=request.end,
@@ -1204,6 +1249,9 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
                 scenic_route, "exactness_status", "unknown"
             ),
         }
+    )
+    diagnostics["search_diagnostics"] = _normalize_search_diagnostics(
+        getattr(scenic_route, "search_diagnostics", None)
     )
     diagnostics["planning_elapsed_ms"] = (perf_counter() - started_at) * 1000.0
     return {

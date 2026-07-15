@@ -6,6 +6,7 @@ services:
     environment:
       SCENIC_ROUTE_PRELOAD: required
       MAPBOX_ACCESS_TOKEN: ${MAPBOX_ACCESS_TOKEN}
+      SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS: ${SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS:-4}
     expose:
       - "8080"
     volumes:

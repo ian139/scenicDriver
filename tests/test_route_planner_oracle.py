@@ -7,6 +7,18 @@ import pytest
 from src.route_planner.graph import Edge, Node, RoadGraph
 from src.route_planner.planner import _FrontierLabel, ScenicRoutePlanner
 
+_SEARCH_DIAGNOSTIC_KEYS = {
+    "time_limit_seconds",
+    "labels_generated",
+    "labels_expanded",
+    "labels_pruned",
+    "max_frontier_size",
+    "remaining_frontier_size",
+    "deadline_reached",
+    "elapsed_ms",
+    "mode",
+}
+
 
 def _tradeoff_graph() -> RoadGraph:
     graph = RoadGraph()
@@ -186,6 +198,91 @@ def test_oracle_highway_filter_is_hard_for_baseline_and_scenic(
     assert scenic.edge_ids == ("secondary-1", "secondary-2")
     assert scenic.highway_count == 0
 
+
+def test_avoid_highways_rejects_highway_only_connectivity_but_keeps_residential_path() -> (
+    None
+):
+    highway_only = RoadGraph()
+    highway_only.add_node(Node(id="S", lat=0.0, lon=0.0))
+    highway_only.add_node(Node(id="G", lat=0.02, lon=0.0))
+    highway_only.add_edge(
+        Edge(
+            id="only-highway",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=2.0,
+            scenic_score=0.0,
+            road_type="motorway",
+            speed_limit_kmh=100,
+            one_way=True,
+        )
+    )
+    highway_planner = ScenicRoutePlanner(highway_only)
+    with pytest.raises(ValueError, match="No route found between"):
+        highway_planner.find_fastest_route((0.0, 0.0), (0.02, 0.0), avoid_highways=True)
+    with pytest.raises(ValueError, match="No route found between"):
+        highway_planner.find_scenic_route(
+            (0.0, 0.0),
+            (0.02, 0.0),
+            scenic_weight=1.0,
+            avoid_highways=True,
+        )
+
+    connected = RoadGraph()
+    for node_id, lat in (("S", 0.0), ("R", 0.01), ("G", 0.02)):
+        connected.add_node(Node(id=node_id, lat=lat, lon=0.0))
+    connected.add_edge(
+        Edge(
+            id="highway",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=2.0,
+            scenic_score=0.0,
+            road_type="motorway",
+            speed_limit_kmh=100,
+            one_way=True,
+        )
+    )
+    connected.add_edge(
+        Edge(
+            id="residential",
+            start_node_id="S",
+            end_node_id="R",
+            distance_km=1.0,
+            scenic_score=8.0,
+            road_type="residential",
+            speed_limit_kmh=40,
+            one_way=True,
+        )
+    )
+    connected.add_edge(
+        Edge(
+            id="service",
+            start_node_id="R",
+            end_node_id="G",
+            distance_km=1.0,
+            scenic_score=9.0,
+            road_type="service",
+            speed_limit_kmh=40,
+            one_way=True,
+        )
+    )
+    planner = ScenicRoutePlanner(connected)
+
+    fastest = planner.find_fastest_route((0.0, 0.0), (0.02, 0.0), avoid_highways=True)
+    scenic = planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.02, 0.0),
+        scenic_weight=1.0,
+        max_detour_factor=4.0,
+        avoid_highways=True,
+    )
+    assert fastest.edge_ids == ("residential", "service")
+    assert scenic.edge_ids == ("residential", "service")
+    assert scenic.highway_count == 0
+    assert all(
+        segment.road_type not in {"motorway", "trunk"} for segment in scenic.segments
+    )
 
 def _route_for_graph(
     planner: ScenicRoutePlanner,
@@ -573,6 +670,110 @@ def _force_production(graph: RoadGraph) -> RoadGraph:
     return graph
 
 
+def _production_side_road_graph() -> RoadGraph:
+    graph = RoadGraph()
+    for node_id, lat in (
+        ("S", 0.0),
+        ("R1", 0.01),
+        ("R2", 0.02),
+        ("G", 0.03),
+    ):
+        graph.add_node(Node(id=node_id, lat=lat, lon=0.0))
+    for index in range(25):
+        graph.add_node(
+            Node(
+                id=f"production-isolated-{index}",
+                lat=30.0 + index,
+                lon=30.0,
+            )
+        )
+    for edge in (
+        Edge(
+            id="highway",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=8.0,
+            scenic_score=0.0,
+            road_type="motorway",
+            speed_limit_kmh=80,
+            one_way=True,
+        ),
+        Edge(
+            id="residential-1",
+            start_node_id="S",
+            end_node_id="R1",
+            distance_km=2.0,
+            scenic_score=10.0,
+            road_type="residential",
+            speed_limit_kmh=30,
+            one_way=True,
+        ),
+        Edge(
+            id="service",
+            start_node_id="R1",
+            end_node_id="R2",
+            distance_km=1.5,
+            scenic_score=10.0,
+            road_type="service",
+            speed_limit_kmh=25,
+            one_way=True,
+        ),
+        Edge(
+            id="residential-2",
+            start_node_id="R2",
+            end_node_id="G",
+            distance_km=2.0,
+            scenic_score=10.0,
+            road_type="residential",
+            speed_limit_kmh=30,
+            one_way=True,
+        ),
+    ):
+        graph.add_edge(edge)
+    return graph
+
+
+def test_production_frontier_selects_feasible_residential_service_detour() -> None:
+    graph = _production_side_road_graph()
+    planner = ScenicRoutePlanner(graph)
+
+    fastest = planner.find_fastest_route((0.0, 0.0), (0.03, 0.0))
+    scenic = planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.03, 0.0),
+        scenic_weight=1.0,
+        max_detour_factor=3.0,
+    )
+
+    assert fastest.edge_ids == ("highway",)
+    assert scenic.edge_ids == ("residential-1", "service", "residential-2")
+    assert [segment.road_type for segment in scenic.segments] == [
+        "residential",
+        "service",
+        "residential",
+    ]
+    assert scenic.algorithm == "production-multilabel-frontier"
+    assert scenic.average_scenic_score == pytest.approx(10.0)
+    assert scenic.objective_value == pytest.approx(1.0)
+    assert scenic.estimated_duration_minutes <= scenic.duration_cap_minutes
+
+
+@pytest.mark.parametrize("q", [0.0, 1.0])
+def test_exact_routes_report_zero_frontier_diagnostics(q: float) -> None:
+    route = _route(ScenicRoutePlanner(_tradeoff_graph()), q=q, kappa=4.0)
+
+    diagnostics = route.search_diagnostics
+    assert set(diagnostics) == _SEARCH_DIAGNOSTIC_KEYS
+    assert diagnostics["time_limit_seconds"] == pytest.approx(0.0)
+    assert diagnostics["labels_generated"] == 0
+    assert diagnostics["labels_expanded"] == 0
+    assert diagnostics["labels_pruned"] == 0
+    assert diagnostics["max_frontier_size"] == 0
+    assert diagnostics["remaining_frontier_size"] == 0
+    assert diagnostics["deadline_reached"] is False
+    assert diagnostics["elapsed_ms"] == pytest.approx(0.0)
+    assert diagnostics["mode"] == "exact"
+
 def test_production_frontier_finds_optimum_and_completes_exactly() -> None:
     planner = ScenicRoutePlanner(_force_production(_tradeoff_graph()))
 
@@ -661,6 +862,26 @@ def test_production_frontier_rejects_cycles_and_enforces_reverse_cap() -> None:
     assert route.estimated_duration_minutes <= route.duration_cap_minutes
 
 
+def test_production_frontier_timeout_during_preprocessing_certifies_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = ScenicRoutePlanner(_force_production(_tradeoff_graph()))
+    planner._frontier_time_limit_seconds = 1.0
+    ticks = [0.0, 0.0, 2.0]
+    monkeypatch.setattr(
+        planner,
+        "_monotonic",
+        lambda: ticks.pop(0) if ticks else 2.0,
+    )
+
+    route = _route(planner, q=1.0, kappa=4.0)
+
+    assert route.exact is False
+    assert route.exactness_status == "approximate-certified"
+    assert route.certified_upper_bound >= route.objective_value
+    assert route.search_diagnostics["deadline_reached"] is True
+
+
 def test_production_frontier_timeout_certifies_mid_expansion_upper_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -669,8 +890,12 @@ def test_production_frontier_timeout_certifies_mid_expansion_upper_bound(
     monkeypatch.setattr(
         planner, "_frontier_warm_start_paths", lambda *_args: []
     )
-    ticks = iter((0.0, 0.0, 0.0, 2.0))
-    monkeypatch.setattr(planner, "_monotonic", lambda: next(ticks))
+    ticks = [0.0, 0.0, 0.0]
+    monkeypatch.setattr(
+        planner,
+        "_monotonic",
+        lambda: ticks.pop(0) if ticks else 2.0,
+    )
 
     route = _route(planner, q=1.0, kappa=4.0)
 
@@ -683,3 +908,17 @@ def test_production_frontier_timeout_certifies_mid_expansion_upper_bound(
     assert route.optimality_gap == pytest.approx(
         route.certified_upper_bound - route.objective_value
     )
+    diagnostics = route.search_diagnostics
+    assert set(diagnostics) == _SEARCH_DIAGNOSTIC_KEYS
+    assert diagnostics["time_limit_seconds"] == pytest.approx(1.0)
+    assert diagnostics["labels_generated"] >= diagnostics["labels_expanded"] >= 0
+    assert diagnostics["labels_pruned"] >= 0
+    assert (
+        diagnostics["max_frontier_size"]
+        >= diagnostics["remaining_frontier_size"]
+        >= 0
+    )
+    assert diagnostics["remaining_frontier_size"] <= diagnostics["labels_generated"]
+    assert diagnostics["deadline_reached"] is True
+    assert diagnostics["elapsed_ms"] >= 0.0
+    assert diagnostics["mode"] == "frontier"

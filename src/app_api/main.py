@@ -13,7 +13,6 @@ import re
 import sys
 from dotenv import load_dotenv
 
-
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,12 +21,13 @@ import requests
 from urllib.parse import quote
 
 from src.route_planner.service import (
+    RouteConfigurationError,
     RouteRequest,
     diagnose_route_request,
     plan_routes,
     preload_route_assets,
+    validate_route_configuration,
 )
-
 
 from .contrib_repo import ContribRepo
 from .schemas import (
@@ -436,6 +436,7 @@ def _preload_configured_route_assets(
 
 @asynccontextmanager
 async def _api_lifespan(app: FastAPI):
+    validate_route_configuration()
     mode = _route_preload_mode()
     if mode != "off":
         preload_diagnostics = _preload_configured_route_assets(mode)
@@ -552,9 +553,6 @@ def _list_regions() -> list[dict[str, Any]]:
             }
         )
     return regions
-
-
-
 
 
 def _normalize_bbox(bbox: Any) -> dict[str, float] | None:
@@ -1332,6 +1330,15 @@ def create_app() -> FastAPI:
         try:
             result = plan_routes(req)
             diagnostics, routes = _validate_route_contract(result, request=req)
+        except RouteConfigurationError as exc:
+            _LOGGER.error("Invalid route configuration: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "route_configuration_invalid",
+                    "message": "Route planning configuration is invalid.",
+                },
+            ) from exc
         except ValueError as exc:
             try:
                 diagnostics = diagnose_route_request(req)

@@ -14,8 +14,6 @@ import src.app_api.main as app_api
 from src.app_api.main import create_app
 
 
-
-
 @pytest.fixture(autouse=True)
 def _stub_named_test_run_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -656,6 +654,37 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
     assert detail["diagnostics"] == {"graph_nodes": 4, "graph_edges": 3}
 
 
+def test_route_compare_reports_invalid_route_configuration(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+
+    def fake_plan(request):
+        raise app_api.RouteConfigurationError("invalid frontier budget")
+
+    monkeypatch.setattr(app_api, "plan_routes", fake_plan)
+
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 44.4, "lon": -70.2},
+            "end": {"lat": 44.5, "lon": -70.1},
+            "scenic_weight": 0.8,
+            "region": "new_england_north",
+            "max_detour_factor": 1.4,
+            "avoid_highways": True,
+            "include_baseline": True,
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "error": "route_configuration_invalid",
+        "message": "Route planning configuration is invalid.",
+    }
+
+
 def test_route_compare_rejects_incomplete_service_response(monkeypatch) -> None:
     monkeypatch.setattr(
         app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
@@ -902,6 +931,17 @@ def test_route_compare_redacts_private_asset_paths(monkeypatch) -> None:
         "source"
         not in payload["geojson"]["features"][0]["properties"]["score_provenance"]
     )
+def test_invalid_frontier_configuration_fails_startup_even_when_preload_off(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SCENIC_ROUTE_PRELOAD", "off")
+    monkeypatch.setenv("SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS", "nan")
+
+    with pytest.raises(
+        app_api.RouteConfigurationError, match="SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS"
+    ):
+        with TestClient(create_app()):
+            pass
 
 
 def test_new_england_viewer_renders_diagnostics_contract() -> None:

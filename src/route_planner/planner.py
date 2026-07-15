@@ -1,7 +1,7 @@
 from __future__ import annotations
 import time
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import heapq
 import math
 from collections import OrderedDict
@@ -33,6 +33,43 @@ _ORIGINAL_SCENIC_CALCULATE = ScenicCostFunction.calculate
 _ORIGINAL_SCENIC_ROAD_TYPE_ADJUSTMENT = (
     ScenicCostFunction._road_type_adjustment
 )
+_SEARCH_DIAGNOSTIC_KEYS = (
+    "time_limit_seconds",
+    "labels_generated",
+    "labels_expanded",
+    "labels_pruned",
+    "max_frontier_size",
+    "remaining_frontier_size",
+    "deadline_reached",
+    "elapsed_ms",
+    "mode",
+)
+
+
+def _exact_search_diagnostics() -> Dict[str, object]:
+    return {
+        "time_limit_seconds": 0.0,
+        "labels_generated": 0,
+        "labels_expanded": 0,
+        "labels_pruned": 0,
+        "max_frontier_size": 0,
+        "remaining_frontier_size": 0,
+        "deadline_reached": False,
+        "elapsed_ms": 0.0,
+        "mode": "exact",
+    }
+
+
+def _normalize_search_diagnostics(
+    diagnostics: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    normalized = _exact_search_diagnostics()
+    if diagnostics is not None:
+        for key in _SEARCH_DIAGNOSTIC_KEYS:
+            if key in diagnostics:
+                normalized[key] = diagnostics[key]
+    return normalized
+
 
 
 @dataclass
@@ -83,6 +120,9 @@ class Route:
     zero_improvement_reason: Optional[str] = None
     no_route_reason: Optional[str] = None
     normalization_version: str = "linear-v1"
+    search_diagnostics: Dict[str, object] = field(
+        default_factory=_exact_search_diagnostics
+    )
 
     @property
     def is_exact(self) -> bool:
@@ -196,6 +236,7 @@ class ScenicRoutePlanner:
     _EXACT_ORACLE_MAX_NODES = 12
     _EXACT_ORACLE_MAX_EDGES = 48
     _PRODUCTION_FRONTIER_TIME_LIMIT_SECONDS = 4.0
+    _MAX_FRONTIER_TIME_LIMIT_SECONDS = 60.0
     _ELIGIBLE_REACHABILITY_CACHE_CAPACITY = 32
     _ELIGIBLE_REACHABILITY_SHARED_CACHE: OrderedDict[
         Tuple[RoadGraph, object, str, str, bool], bool
@@ -233,13 +274,37 @@ class ScenicRoutePlanner:
         cls._FASTEST_PATH_SHARED_GRAPH = None
         cls._FASTEST_PATH_SHARED_STAMP = None
 
+    @classmethod
+    def validate_frontier_time_limit_seconds(cls, value: object) -> float:
+        try:
+            limit = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "frontier_time_limit_seconds must be finite and between 0 and 60 seconds"
+            ) from exc
+        if (
+            not math.isfinite(limit)
+            or limit < 0.0
+            or limit > cls._MAX_FRONTIER_TIME_LIMIT_SECONDS
+        ):
+            raise ValueError(
+                "frontier_time_limit_seconds must be finite and between 0 and 60 seconds"
+            )
+        return limit
+
+
     def __init__(
         self,
         graph: Optional[RoadGraph] = None,
         cost_function: Optional[ScenicCostFunction] = None,
+        frontier_time_limit_seconds: Optional[float] = None,
     ) -> None:
         self._frontier_time_limit_seconds = (
             self._PRODUCTION_FRONTIER_TIME_LIMIT_SECONDS
+            if frontier_time_limit_seconds is None
+            else self.validate_frontier_time_limit_seconds(
+                frontier_time_limit_seconds
+            )
         )
         self._monotonic = time.monotonic
         self.graph = graph
@@ -1612,11 +1677,23 @@ class ScenicRoutePlanner:
         return best_edges, best_evaluation
 
     def _frontier_reverse_duration_lower_bounds(
-        self, goal: Node, avoid_highways: bool, duration_cap: float
+        self,
+        goal: Node,
+        avoid_highways: bool,
+        duration_cap: float,
+        deadline: Optional[float] = None,
     ) -> Dict[str, float]:
+        def expired() -> bool:
+            return deadline is not None and self._monotonic() >= deadline
+
+        def zero_bounds() -> Dict[str, float]:
+            return {str(node_id): 0.0 for node_id in self.graph.nodes}
+
         fastest = ScenicRoutePlanner._make_fastest_cost_function(self)
         fastest.avoid_highways = bool(avoid_highways)
         signature = self._built_in_cost_signature(fastest)
+        if expired():
+            return zero_bounds()
         if _scipy_shortest_path is not None and signature is not None:
             data = self._csr_data(fastest, signature)
             if data is not None:
@@ -1630,26 +1707,34 @@ class ScenicRoutePlanner:
                         unweighted=False,
                         method="D",
                     )
+                    if expired():
+                        return zero_bounds()
                     if self.graph._heuristic_cache_stamp() == data.topology.stamp:
                         return {
                             node_id: float(distances[index])
                             for index, node_id in enumerate(data.topology.node_ids)
                         }
-        snapshot = self._build_reverse_predecessor_snapshot(fastest)
+        snapshot = self._build_reverse_predecessor_snapshot(
+            fastest, deadline=deadline
+        )
         if snapshot is None:
-            return {str(node_id): 0.0 for node_id in self.graph.nodes}
+            return zero_bounds()
         bounds = {
             str(node_id): float("inf") for node_id in self.graph.nodes
         }
         bounds[goal.id] = 0.0
         queue: List[Tuple[float, str]] = [(0.0, goal.id)]
         while queue:
+            if expired():
+                return zero_bounds()
             distance, node_id = heapq.heappop(queue)
             if distance != bounds.get(node_id):
                 continue
             for predecessor, _, edge_duration, _ in snapshot.predecessors.get(
                 node_id, ()
             ):
+                if expired():
+                    return zero_bounds()
                 next_distance = distance + edge_duration
                 if not math.isfinite(next_distance) or not self._duration_within_cap(
                     next_distance, duration_cap
@@ -1699,12 +1784,19 @@ class ScenicRoutePlanner:
         start: Node,
         goal: Node,
         avoid_highways: bool,
+        deadline: Optional[float] = None,
     ) -> List[List[Edge]]:
         """Return feasible-quality incumbents without limiting the frontier.
 
         These scalar paths only warm-start branch-and-bound. They never remove
         labels, define the searched space, or support an exactness claim.
         """
+
+        def expired() -> bool:
+            return deadline is not None and self._monotonic() >= deadline
+
+        if expired():
+            return []
         topology = self._csr_topology(False)
         if topology is None:
             return []
@@ -1734,11 +1826,15 @@ class ScenicRoutePlanner:
         paths: List[List[Edge]] = []
         seen: set[Tuple[str, ...]] = set()
         for coefficient in (0.0, 0.25 * scale, scale, 4.0 * scale):
+            if expired():
+                break
             weights = scenic_disutility + coefficient * topology.travel_time_minutes
             weights = np.where(valid, weights, np.inf)
             path = self._compiled_weighted_path(
                 topology, start_index, goal_index, weights
             )
+            if expired():
+                break
             if path is None or not self._simple_edge_path(path):
                 continue
             identity = tuple(
@@ -1777,11 +1873,17 @@ class ScenicRoutePlanner:
         fastest_edges: List[Edge],
         fastest_evaluation: object,
         started_at: Optional[float] = None,
-    ) -> Tuple[List[Edge], object, bool, float]:
+    ) -> Tuple[List[Edge], object, bool, float, Dict[str, object]]:
         started = self._monotonic() if started_at is None else started_at
+        try:
+            time_limit_seconds = float(self._frontier_time_limit_seconds)
+        except (TypeError, ValueError, OverflowError):
+            time_limit_seconds = float(self._PRODUCTION_FRONTIER_TIME_LIMIT_SECONDS)
+        time_limit_seconds = max(0.0, time_limit_seconds)
+        deadline = started + time_limit_seconds
         search_stamp = self.graph._heuristic_cache_stamp()
         reverse_bounds = self._frontier_reverse_duration_lower_bounds(
-            goal, avoid_highways, duration_cap_minutes
+            goal, avoid_highways, duration_cap_minutes, deadline
         )
         if self.graph._heuristic_cache_stamp() != search_stamp:
             raise RuntimeError(
@@ -1803,6 +1905,11 @@ class ScenicRoutePlanner:
         active: set[int] = {0}
         labels_at_node: Dict[str, set[int]] = {start.id: {0}}
         frontier: List[Tuple[float, Tuple[str, ...], int]] = []
+        labels_generated = 1
+        labels_expanded = 0
+        labels_pruned = 0
+        max_frontier_size = 0
+        last_observed_at = started
 
         max_distance_per_minute: Optional[float] = None
         zero_duration_distance = 0.0
@@ -1882,11 +1989,12 @@ class ScenicRoutePlanner:
             return float((1.0 - q) * duration_ub + q * scenic_ub)
 
         heapq.heappush(frontier, (-upper_bound(labels[0]), (), 0))
+        max_frontier_size = max(max_frontier_size, len(frontier))
         next_label_id = 1
         incumbent_edges = list(fastest_edges)
         incumbent_evaluation = fastest_evaluation
         for warm_path in self._frontier_warm_start_paths(
-            start, goal, avoid_highways
+            start, goal, avoid_highways, deadline
         ):
             if not self._duration_within_cap(
                 self._path_duration_minutes(warm_path),
@@ -1905,11 +2013,13 @@ class ScenicRoutePlanner:
         timed_out = False
 
         def deadline_reached() -> bool:
+            nonlocal last_observed_at
             try:
-                limit = float(self._frontier_time_limit_seconds)
-                return limit <= 0.0 or self._monotonic() - started >= limit
+                now = self._monotonic()
             except (TypeError, ValueError, OverflowError):
                 return False
+            last_observed_at = now
+            return now >= deadline
 
         def epoch_changed() -> bool:
             return self.graph._heuristic_cache_stamp() != search_stamp
@@ -1929,13 +2039,16 @@ class ScenicRoutePlanner:
             label_ub = upper_bound(label)
             if label_ub == float("-inf"):
                 active.remove(label_id)
+                labels_pruned += 1
                 continue
             incumbent_objective = float(
                 getattr(incumbent_evaluation, "objective")
             )
             if label_ub < incumbent_objective - 1e-12:
                 active.remove(label_id)
+                labels_pruned += 1
                 continue
+            labels_expanded += 1
             if label.node_id == goal.id:
                 candidate = self._frontier_path(labels, label_id)
                 evaluation = evaluate_path(
@@ -2014,6 +2127,8 @@ class ScenicRoutePlanner:
                     )
                     for existing_id in existing_ids
                 ):
+                    labels_generated += 1
+                    labels_pruned += 1
                     continue
                 dominated_ids = [
                     existing_id
@@ -2023,10 +2138,12 @@ class ScenicRoutePlanner:
                         candidate, labels[existing_id]
                     )
                 ]
+                labels_pruned += len(dominated_ids)
                 for dominated_id in dominated_ids:
                     active.discard(dominated_id)
                     existing_ids.discard(dominated_id)
                 labels[next_label_id] = candidate
+                labels_generated += 1
                 active.add(next_label_id)
                 labels_at_node.setdefault(neighbor, set()).add(next_label_id)
                 heapq.heappush(
@@ -2037,6 +2154,7 @@ class ScenicRoutePlanner:
                         next_label_id,
                     ),
                 )
+                max_frontier_size = max(max_frontier_size, len(active))
                 next_label_id += 1
             if not timed_out:
                 active.discard(label_id)
@@ -2061,12 +2179,30 @@ class ScenicRoutePlanner:
             float(getattr(incumbent_evaluation, "objective")),
             certified_upper_bound,
         )
+        try:
+            finished_at = self._monotonic()
+        except StopIteration:
+            finished_at = last_observed_at
+        elapsed_ms = max(0.0, (finished_at - started) * 1000.0)
+        search_diagnostics = {
+            "time_limit_seconds": time_limit_seconds,
+            "labels_generated": int(labels_generated),
+            "labels_expanded": int(labels_expanded),
+            "labels_pruned": int(labels_pruned),
+            "max_frontier_size": int(max_frontier_size),
+            "remaining_frontier_size": int(len(active)),
+            "deadline_reached": bool(timed_out),
+            "elapsed_ms": float(elapsed_ms),
+            "mode": "frontier",
+        }
         return (
             incumbent_edges,
             incumbent_evaluation,
             exact,
             certified_upper_bound,
+            search_diagnostics,
         )
+
     @staticmethod
     def _simple_edge_path(edges: List[Edge]) -> bool:
         nodes = set()
@@ -2077,6 +2213,7 @@ class ScenicRoutePlanner:
         if edges and edges[-1].end_node_id in nodes:
             return False
         return True
+
     @staticmethod
     def _has_scenic_improvement(candidate: object, baseline: object) -> bool:
         candidate_score = float(getattr(candidate, "normalized_scenic_score"))
@@ -2205,6 +2342,7 @@ class ScenicRoutePlanner:
             best_evaluation,
             exact,
             certified_upper_bound,
+            search_diagnostics,
         ) = self._production_frontier_search(
             start_node,
             end_node,
@@ -2237,6 +2375,7 @@ class ScenicRoutePlanner:
                 - float(getattr(best_evaluation, "objective")),
             ),
             certified_upper_bound=certified_upper_bound,
+            search_diagnostics=search_diagnostics,
             algorithm="production-multilabel-frontier",
             zero_improvement_reason=(
                 "no_feasible_scenic_improvement"
@@ -2621,6 +2760,8 @@ class ScenicRoutePlanner:
     def _build_reverse_predecessor_snapshot(
         self,
         cost_function: Optional[ScenicCostFunction] = None,
+        *,
+        deadline: Optional[float] = None,
     ) -> Optional[_ReversePredecessorSnapshot]:
         """Build one directed predecessor snapshot for all reverse bounds."""
         graph = self.graph
@@ -2633,14 +2774,22 @@ class ScenicRoutePlanner:
             str, List[Tuple[str, float, float, Optional[float]]]
         ] = {}
         avoid_highways = self._avoids_highways(cost_function)
+
+        def expired() -> bool:
+            return deadline is not None and self._monotonic() >= deadline
+
         # Materialize node IDs before enumeration.  The final stamp check
         # rejects a concurrent mapping/edge mutation rather than mixing epochs.
+        if expired():
+            return None
         for node_id in tuple(graph.nodes):
             try:
                 edges = graph.get_edges(node_id)
             except Exception:
                 return None
             for edge in edges:
+                if expired():
+                    return None
                 if avoid_highways and is_highway_road_type(edge.road_type):
                     continue
                 distance_km = self._validated_nonnegative(
@@ -3500,6 +3649,7 @@ class ScenicRoutePlanner:
         certified_upper_bound: Optional[float] = None,
         algorithm: str = "uncertified-production-search",
         zero_improvement_reason: Optional[str] = None,
+        search_diagnostics: Optional[Dict[str, object]] = None,
     ) -> Route:
         if evaluation is None:
             fallback_fastest = (
@@ -3636,6 +3786,7 @@ class ScenicRoutePlanner:
                     SCENIC_NORMALIZATION_VERSION,
                 )
             ),
+            search_diagnostics=_normalize_search_diagnostics(search_diagnostics),
         )
 
     @staticmethod

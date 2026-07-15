@@ -11,6 +11,18 @@ import pytest
 from src.route_planner import service as route_service
 from src.route_planner.planner import Route, RouteSegment, ScenicRoutePlanner
 
+_SEARCH_DIAGNOSTIC_KEYS = {
+    "time_limit_seconds",
+    "labels_generated",
+    "labels_expanded",
+    "labels_pruned",
+    "max_frontier_size",
+    "remaining_frontier_size",
+    "deadline_reached",
+    "elapsed_ms",
+    "mode",
+}
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -241,6 +253,18 @@ def test_plan_routes_uses_requested_filter_for_baseline_and_reports_constraints(
         baseline_metrics["objective_value"]
     )
     assert diagnostics["planning_elapsed_ms"] >= 0.0
+    search_diagnostics = diagnostics["search_diagnostics"]
+    assert set(search_diagnostics) == _SEARCH_DIAGNOSTIC_KEYS
+    assert scenic_metrics["search_diagnostics"] == search_diagnostics
+    assert set(baseline_metrics["search_diagnostics"]) == _SEARCH_DIAGNOSTIC_KEYS
+    assert (
+        result["geojson"]["features"][0]["properties"]["search_diagnostics"]
+        == scenic_metrics["search_diagnostics"]
+    )
+    assert (
+        result["geojson"]["features"][1]["properties"]["search_diagnostics"]
+        == baseline_metrics["search_diagnostics"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -354,6 +378,98 @@ def _cache_test_route(score: float) -> Route:
         waypoints=[(42.0, -72.0), (42.1, -72.0)],
     )
 
+
+def test_frontier_time_limit_constructor_validates_finite_bounds() -> None:
+    assert ScenicRoutePlanner()._frontier_time_limit_seconds == pytest.approx(4.0)
+    assert (
+        ScenicRoutePlanner(frontier_time_limit_seconds=0.0)._frontier_time_limit_seconds
+        == pytest.approx(0.0)
+    )
+    assert (
+        ScenicRoutePlanner(frontier_time_limit_seconds=60.0)._frontier_time_limit_seconds
+        == pytest.approx(60.0)
+    )
+    for value in ("nan", "inf", "-inf", -0.1, 60.1, "not-a-number"):
+        with pytest.raises(ValueError, match="finite and between 0 and 60"):
+            ScenicRoutePlanner(frontier_time_limit_seconds=value)
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("0", 0.0),
+        ("2.5", 2.5),
+        ("60", 60.0),
+    ],
+)
+def test_frontier_time_limit_env_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str | None,
+    expected: float | None,
+) -> None:
+    if raw_value is None:
+        monkeypatch.delenv("SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS", raw_value)
+
+    parsed = route_service._frontier_time_limit_from_env()
+    if expected is None:
+        assert parsed is None
+    else:
+        assert parsed == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("raw_value", ["nan", "inf", "-1", "60.1", "invalid"])
+def test_frontier_time_limit_env_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, raw_value: str
+) -> None:
+    monkeypatch.setenv("SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS", raw_value)
+
+    with pytest.raises(route_service.RouteConfigurationError):
+        route_service._frontier_time_limit_from_env()
+
+
+def test_frontier_time_limit_env_wires_plan_and_preload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+    route_service.clear_route_caches()
+    real_planner = route_service.ScenicRoutePlanner
+    constructor_limits: list[float | None] = []
+
+    class FakePlanner:
+        validate_frontier_time_limit_seconds = (
+            real_planner.validate_frontier_time_limit_seconds
+        )
+
+        def __init__(
+            self, *, graph: object, frontier_time_limit_seconds: float | None = None
+        ) -> None:
+            del graph
+            constructor_limits.append(frontier_time_limit_seconds)
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            del kwargs
+            return _cache_test_route(1.0)
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
+    monkeypatch.setenv("SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS", "2.5")
+
+    route_service.preload_route_assets(graph_path)
+    route_service.plan_routes(
+        route_service.RouteRequest(
+            graph_geojson=str(graph_path),
+            start=(42.0, -72.0),
+            end=(42.1, -72.0),
+            include_baseline=False,
+        )
+    )
+
+    assert constructor_limits == [2.5, 2.5]
 
 def test_clear_route_caches_releases_planner_graph_references() -> None:
     retained_graph = object()

@@ -109,6 +109,16 @@ const el = {
   appliedDetourCap: document.getElementById("appliedDetourCap"),
   actualDurationRatio: document.getElementById("actualDurationRatio"),
   optimizationMode: document.getElementById("optimizationMode"),
+  searchMode: document.getElementById("searchMode"),
+  searchTimeLimit: document.getElementById("searchTimeLimit"),
+  searchLabelsGenerated: document.getElementById("searchLabelsGenerated"),
+  searchLabelsExpanded: document.getElementById("searchLabelsExpanded"),
+  searchLabelsPruned: document.getElementById("searchLabelsPruned"),
+  searchMaxFrontierSize: document.getElementById("searchMaxFrontierSize"),
+  searchRemainingFrontierSize: document.getElementById("searchRemainingFrontierSize"),
+  searchElapsed: document.getElementById("searchElapsed"),
+  searchDeadlineReached: document.getElementById("searchDeadlineReached"),
+
   optimizationStatus: document.getElementById("optimizationStatus"),
   optimalityGap: document.getElementById("optimalityGap"),
   certifiedUpperBound: document.getElementById("certifiedUpperBound"),
@@ -505,6 +515,24 @@ function displayRatio(value, digits = 2) {
 function displayText(value) {
   return value === null || value === undefined || value === "" ? "--" : String(value);
 }
+
+function formatWithUnit(value, digits, unit) {
+  const formatted = formatNumber(value, digits);
+  return formatted === "--" ? "--" : `${formatted} ${unit}`;
+}
+
+function displayBoolean(value) {
+  return typeof value === "boolean" ? (value ? "Yes" : "No") : "--";
+}
+
+function getSearchDiagnostics(diagnostics) {
+  const searchDiagnostics = diagnostics?.search_diagnostics;
+  return searchDiagnostics &&
+    typeof searchDiagnostics === "object" &&
+    !Array.isArray(searchDiagnostics)
+    ? searchDiagnostics
+    : {};
+}
 const REASON_PROSE = Object.freeze({
   approximation_did_not_find_scenic_improvement:
     "Search found no more-scenic route",
@@ -514,14 +542,18 @@ const REASON_PROSE = Object.freeze({
   avoid_highways_no_route: "No route satisfies the avoid-highways constraint",
 });
 
-function humanizeReason(reason, optimalityGap) {
+function humanizeReason(reason, optimalityGap, deadlineReached = false) {
   if (reason === null || reason === undefined || reason === "") return "--";
   const code = String(reason).trim();
+  const deadlineWasReached = deadlineReached === true;
   const phrase =
-    REASON_PROSE[code] ||
-    code
-      .replace(/[_-]+/g, " ")
-      .replace(/\b\w/g, (letter) => letter.toUpperCase());
+    deadlineWasReached &&
+    code === "approximation_did_not_find_scenic_improvement"
+      ? "Search did not find a better weighted route within the search budget"
+      : REASON_PROSE[code] ||
+        code
+          .replace(/[_-]+/g, " ")
+          .replace(/\b\w/g, (letter) => letter.toUpperCase());
   if (
     optimalityGap === null ||
     optimalityGap === undefined ||
@@ -592,6 +624,7 @@ function renderRouteComparison(payload) {
   if (!scenic || !diagnostics) {
     throw new Error("API returned an incomplete route comparison");
   }
+  const searchDiagnostics = getSearchDiagnostics(diagnostics);
   setText(el.scenicDistance, `${formatNumber(scenic.total_distance_km, 1)} km`);
   setText(el.scenicDuration, `${formatNumber(scenic.estimated_duration_minutes, 0)} min`);
   setText(el.scenicScore, `${formatNumber(scenic.raw_scenic_score, 2)} / 10`);
@@ -667,6 +700,39 @@ function renderRouteComparison(payload) {
   );
   setText(el.optimizationMode, diagnostics.optimization_mode);
   setText(el.optimizationStatus, diagnostics.optimization_status);
+  setText(el.searchMode, displayText(searchDiagnostics.mode));
+  setText(
+    el.searchTimeLimit,
+    formatWithUnit(searchDiagnostics.time_limit_seconds, 2, "s")
+  );
+  setText(
+    el.searchLabelsGenerated,
+    formatNumber(searchDiagnostics.labels_generated, 0)
+  );
+  setText(
+    el.searchLabelsExpanded,
+    formatNumber(searchDiagnostics.labels_expanded, 0)
+  );
+  setText(
+    el.searchLabelsPruned,
+    formatNumber(searchDiagnostics.labels_pruned, 0)
+  );
+  setText(
+    el.searchMaxFrontierSize,
+    formatNumber(searchDiagnostics.max_frontier_size, 0)
+  );
+  setText(
+    el.searchRemainingFrontierSize,
+    formatNumber(searchDiagnostics.remaining_frontier_size, 0)
+  );
+  setText(
+    el.searchElapsed,
+    formatWithUnit(searchDiagnostics.elapsed_ms, 0, "ms")
+  );
+  setText(
+    el.searchDeadlineReached,
+    displayBoolean(searchDiagnostics.deadline_reached)
+  );
   setText(el.optimalityGap, formatNumber(diagnostics.optimality_gap, 4));
   setText(
     el.certifiedUpperBound,
@@ -677,7 +743,8 @@ function renderRouteComparison(payload) {
     el.noBetterRouteReason,
     humanizeReason(
       diagnostics.no_better_route_reason,
-      diagnostics.optimality_gap
+      diagnostics.optimality_gap,
+      searchDiagnostics.deadline_reached === true
     )
   );
   el.routeResultsDialog.showModal();
