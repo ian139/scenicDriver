@@ -184,6 +184,7 @@ class _FrontierLabel:
     incoming_edge: Optional[Edge]
     visited_nodes: frozenset[str]
     edge_sequence: Tuple[str, ...]
+    cumulative_highway_duration: float = 0.0
 
 @dataclass
 class _ReversePredecessorSnapshot:
@@ -241,12 +242,12 @@ class ScenicRoutePlanner:
     _MAX_FRONTIER_TIME_LIMIT_SECONDS = 60.0
     _ELIGIBLE_REACHABILITY_CACHE_CAPACITY = 32
     _ELIGIBLE_REACHABILITY_SHARED_CACHE: OrderedDict[
-        Tuple[RoadGraph, object, str, str, bool], bool
+        Tuple[RoadGraph, object, str, str, bool, float], bool
     ] = OrderedDict()
     _ELIGIBLE_REACHABILITY_SHARED_GRAPH: Optional[RoadGraph] = None
     _ELIGIBLE_REACHABILITY_SHARED_STAMP: object = None
     _REVERSE_INDEX_CACHE: OrderedDict[
-        Tuple[int, object, bool],
+        Tuple[int, object, bool, float],
         Tuple[RoadGraph, Dict[str, List[Tuple[str, str, bool]]]],
     ] = OrderedDict()
     # CSR state is shared by planner instances because the service constructs
@@ -257,7 +258,7 @@ class ScenicRoutePlanner:
         Tuple[int, object, Tuple[object, ...]], _CSRData
     ] = OrderedDict()
     _FASTEST_PATH_SHARED_CACHE: OrderedDict[
-        Tuple[RoadGraph, object, str, str, bool], Tuple[Edge, ...]
+        Tuple[RoadGraph, object, str, str, bool, float], Tuple[Edge, ...]
     ] = OrderedDict()
     _FASTEST_PATH_SHARED_GRAPH: Optional[RoadGraph] = None
     _FASTEST_PATH_SHARED_STAMP: object = None
@@ -884,6 +885,7 @@ class ScenicRoutePlanner:
             return None
         if (
             float(signature[0]) == 0.0
+            and float(signature[2]) == 0.0
             and float(signature[3]) == 1.0
             and float(signature[4]) == 0.0
             and float(signature[5]) == 0.0
@@ -1088,7 +1090,7 @@ class ScenicRoutePlanner:
         goal: Node,
         cost_function: ScenicCostFunction,
         stamp: object,
-    ) -> Tuple[RoadGraph, object, str, str, bool]:
+    ) -> Tuple[RoadGraph, object, str, str, bool, float]:
         graph = self.graph
         assert graph is not None
         return (
@@ -1097,6 +1099,7 @@ class ScenicRoutePlanner:
             str(start.id),
             str(goal.id),
             bool(self._avoids_highways(cost_function)),
+            float(getattr(cost_function, "highway_preference", 0.0)),
         )
 
     def _compiled_reachability_result(
@@ -1272,9 +1275,12 @@ class ScenicRoutePlanner:
             self._avoids_highways(cost_function)
             and is_highway_road_type(edge.road_type)
         )
-
     def _cached_fastest_edges(
-        self, start: Node, goal: Node, avoid_highways: bool
+        self,
+        start: Node,
+        goal: Node,
+        avoid_highways: bool,
+        highway_preference: float = 0.0,
     ) -> Optional[List[Edge]]:
         graph = self.graph
         assert graph is not None
@@ -1288,7 +1294,14 @@ class ScenicRoutePlanner:
             cls._FASTEST_PATH_SHARED_GRAPH = graph
             cls._FASTEST_PATH_SHARED_STAMP = stamp
         self._fastest_path_cache = cls._FASTEST_PATH_SHARED_CACHE
-        key = (graph, stamp, start.id, goal.id, bool(avoid_highways))
+        key = (
+            graph,
+            stamp,
+            start.id,
+            goal.id,
+            bool(avoid_highways),
+            float(highway_preference),
+        )
         cached = self._fastest_path_cache.get(key)
         if cached is not None:
             if (
@@ -1334,7 +1347,10 @@ class ScenicRoutePlanner:
         assert graph is not None
         stamp = graph._heuristic_cache_stamp()
         avoid_highways = self._avoids_highways(cost_function)
-        key = (id(graph), stamp, avoid_highways)
+        highway_preference = float(
+            getattr(cost_function, "highway_preference", 0.0)
+        )
+        key = (id(graph), stamp, avoid_highways, highway_preference)
         cached = self._REVERSE_INDEX_CACHE.get(key)
         if cached is not None:
             cached_graph, predecessors = cached
@@ -1792,6 +1808,11 @@ class ScenicRoutePlanner:
         if first.cumulative_distance_km > second.cumulative_distance_km:
             return False
         if (
+            first.cumulative_highway_duration
+            > second.cumulative_highway_duration
+        ):
+            return False
+        if (
             first.normalized_scenic_exposure
             < second.normalized_scenic_exposure
         ):
@@ -1799,10 +1820,11 @@ class ScenicRoutePlanner:
         metrics_strict = (
             first.cumulative_duration_minutes
             < second.cumulative_duration_minutes
-            or first.cumulative_distance_km
-            < second.cumulative_distance_km
+            or first.cumulative_distance_km < second.cumulative_distance_km
             or first.normalized_scenic_exposure
             > second.normalized_scenic_exposure
+            or first.cumulative_highway_duration
+            < second.cumulative_highway_duration
             or first.visited_nodes != second.visited_nodes
         )
         return metrics_strict and first.edge_sequence <= second.edge_sequence
@@ -1949,7 +1971,7 @@ class ScenicRoutePlanner:
         ):
             eligible = (
                 ~topology.highway_mask
-                if avoid_highways
+                if policy.strict_highways
                 else np.ones(len(topology.edge_refs), dtype=np.bool_)
             )
             distances = topology.distance_km[eligible]
@@ -2135,6 +2157,15 @@ class ScenicRoutePlanner:
                     raise ValueError(
                         "cumulative scenic exposure must be finite and non-negative"
                     )
+                highway_duration = label.cumulative_highway_duration + (
+                    edge_duration
+                    if is_highway_road_type(edge.road_type)
+                    else 0.0
+                )
+                if not math.isfinite(highway_duration):
+                    raise ValueError(
+                        "cumulative highway duration must be finite and non-negative"
+                    )
                 edge_token = str(
                     getattr(edge, "traversal_id", "") or edge.id
                 )
@@ -2148,6 +2179,7 @@ class ScenicRoutePlanner:
                     edge,
                     label.visited_nodes | frozenset((neighbor,)),
                     label.edge_sequence + (edge_token,),
+                    cumulative_highway_duration=highway_duration,
                 )
                 existing_ids = labels_at_node.get(neighbor, set())
                 if any(
@@ -2296,7 +2328,7 @@ class ScenicRoutePlanner:
             # The compiled exact duration solver reuses prewarmed CSR data and
             # avoids scanning every Python adjacency row on production graphs.
             shortest_edges = self._cached_fastest_edges(
-                start_node, end_node, policy.strict_highways
+                start_node, end_node, policy.strict_highways, policy.highway_preference
             )
         if shortest_edges is None:
             raise ValueError("No route found between the given coordinates.")
@@ -2433,7 +2465,7 @@ class ScenicRoutePlanner:
             )
         else:
             shortest_edges = self._cached_fastest_edges(
-                start_node, end_node, policy.strict_highways
+                start_node, end_node, policy.strict_highways, 0.0
             )
         if shortest_edges is None:
             raise ValueError("No route found between the given coordinates.")
