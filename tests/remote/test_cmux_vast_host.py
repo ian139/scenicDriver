@@ -78,6 +78,7 @@ def test_do_up_retries_destroying_failed_ssh_attempt(monkeypatch: pytest.MonkeyP
     bootstrap_calls: list[str] = []
     state_writes: list[dict] = []
 
+    monkeypatch.setattr(cmux_vast_host, "check_up_preconditions", lambda _: None)
     monkeypatch.setattr(cmux_vast_host, "create_instance", lambda offer_id, image, disk_gb: next(created))
     monkeypatch.setattr(cmux_vast_host, "attach_ssh_key", lambda instance_id, public_key: None)
     monkeypatch.setattr(cmux_vast_host, "reboot_instance", lambda instance_id: None)

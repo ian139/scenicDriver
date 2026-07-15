@@ -87,12 +87,13 @@ def main() -> None:
 
     import torch
 
+    checks = _check_imports() if args.check_imports else {}
     result: dict = {
-        "ok": True,
+        "ok": all(checks.values()) if args.check_imports else True,
         "device": device,
         "cuda_available": torch.cuda.is_available(),
         "torch_version": torch.__version__,
-        "checks": _check_imports() if args.check_imports else {},
+        "checks": checks,
         "cwd": os.getcwd(),
     }
 
@@ -101,6 +102,9 @@ def main() -> None:
     else:
         for key, value in result.items():
             print(f"{key}: {value}")
+
+    if args.check_imports and not result["ok"]:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

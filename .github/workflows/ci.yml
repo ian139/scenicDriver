@@ -32,13 +32,8 @@ jobs:
         with:
           node-version: "20"
 
-      # Keep the canonical frozen sync explicit. The project declares pytest,
-      # ruff, and black as the optional dev extra, so install that locked extra
-      # before running the Python tests as well.
+      # Sync project and test dependencies from the checked-in lockfile.
       - name: Install locked Python dependencies
-        run: uv sync --frozen
-
-      - name: Install locked development tools
         run: uv sync --frozen --extra dev
 
       - name: Run Python tests

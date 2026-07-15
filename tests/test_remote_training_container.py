@@ -28,8 +28,11 @@ def test_remote_training_container_files_define_training_entrypoints() -> None:
         "ca-certificates",
         "WORKDIR /workspace",
         "COPY pyproject.toml uv.lock ./",
-        "uv pip install --system",
-        "--no-deps \"timm>=1.0.24\"",
+        "uv export --locked --no-dev --no-emit-project",
+        "--prune torch",
+        "--prune torchvision",
+        "--output-file /tmp/remote-training-requirements.txt",
+        "--requirement /tmp/remote-training-requirements.txt",
         "--no-deps -e .",
         'CMD ["python", "scripts/remote/container_smoke.py"]',
     ]
