@@ -91,6 +91,8 @@ const el = {
   inspectorScore: document.getElementById("inspectorScore"),
   inspectorCoords: document.getElementById("inspectorCoords"),
   routeResultsDialog: document.getElementById("routeResultsDialog"),
+  verboseRouteResults: document.getElementById("verboseRouteResults"),
+  routeDiagnostics: document.getElementById("routeDiagnostics"),
   scenicDistance: document.getElementById("scenicDistance"),
   scenicDuration: document.getElementById("scenicDuration"),
   scenicScore: document.getElementById("scenicScore"),
@@ -132,6 +134,8 @@ const el = {
 };
 let routeRequestSequence = 0;
 let activeRouteRequest = null;
+let pendingRouteRender = null;
+let mapReady = false;
 
 let map;
 let latestHeatmap = null;
@@ -403,10 +407,12 @@ function cartoVoyagerStyle() {
 
 
 function removeLayer(id) {
+  if (!map) return;
   if (map.getLayer(id)) map.removeLayer(id);
 }
 
 function removeSource(id) {
+  if (!map) return;
   if (map.getSource(id)) map.removeSource(id);
 }
 
@@ -609,21 +615,26 @@ function routeLayer(filterKind, color, width, opacity) {
     paint,
   };
 }
-
 function renderRoute(geojson) {
-  removeLayer(ROUTE_SCENIC);
-  removeLayer(ROUTE_BASELINE);
-  removeSource(ROUTE_SOURCE);
-
-  map.addSource(ROUTE_SOURCE, { type: "geojson", data: geojson });
-  map.addLayer(routeLayer("baseline", "#ffffff", 4, 0.62));
-  map.addLayer(routeLayer("scenic", "#62c58a", 5.5, 0.96));
+  if (!map || !mapReady || !map.isStyleLoaded()) return;
+  const source = map.getSource(ROUTE_SOURCE);
+  if (source) {
+    source.setData(geojson);
+  } else {
+    map.addSource(ROUTE_SOURCE, { type: "geojson", data: geojson });
+    if (!map.getLayer(ROUTE_BASELINE)) {
+      map.addLayer(routeLayer("baseline", "#ffffff", 4, 0.62));
+    }
+    if (!map.getLayer(ROUTE_SCENIC)) {
+      map.addLayer(routeLayer("scenic", "#62c58a", 5.5, 0.96));
+    }
+  }
   fitToGeojson(geojson, { maxZoom: 12 });
 }
-
 function clearRoute() {
   routeRequestSequence += 1;
   activeRouteRequest?.controller.abort();
+  pendingRouteRender = null;
   activeRouteRequest = null;
   removeLayer(ROUTE_SCENIC);
   removeLayer(ROUTE_BASELINE);
@@ -754,6 +765,17 @@ function routeDiagnosticsMarkup(payload) {
     parts.push(`Normalization ${String(scoreMapping.normalization)}`);
   }
   return `<small class="route-diagnostics">${escapeHtml(parts.join(" · "))}</small>`;
+}
+
+function setRouteResultsVerbose(verbose) {
+  const enabled = Boolean(verbose);
+  if (el.verboseRouteResults) {
+    el.verboseRouteResults.checked = enabled;
+  }
+  if (el.routeDiagnostics) {
+    el.routeDiagnostics.hidden = !enabled;
+    el.routeDiagnostics.setAttribute("aria-hidden", String(!enabled));
+  }
 }
 
 function renderRouteComparison(payload) {
@@ -887,8 +909,10 @@ function renderRouteComparison(payload) {
       searchDiagnostics.deadline_reached === true
     )
   );
-  el.routeResultsDialog.showModal();
-  el.closeRouteDialogBtn.focus();
+  if (!el.routeResultsDialog.open) {
+    el.routeResultsDialog.showModal();
+    el.closeRouteDialogBtn.focus();
+  }
 }
 
 
@@ -1121,6 +1145,7 @@ function installAddressSearch(which) {
 async function planRoute(event) {
   event.preventDefault();
   const requestId = ++routeRequestSequence;
+  pendingRouteRender = null;
   activeRouteRequest?.controller.abort();
   activeRouteRequest = null;
   const start = parsePoint(el.startInput.value) || selectedRoutePoints.start;
@@ -1188,7 +1213,11 @@ async function planRoute(event) {
       error.routeFailureCode = failureCode;
       throw error;
     }
-    renderRoute(payload.geojson);
+    if (mapReady && map?.isStyleLoaded?.()) {
+      renderRoute(payload.geojson);
+    } else {
+      pendingRouteRender = { requestId, geojson: payload.geojson };
+    }
     renderRouteComparison(payload);
     setRouteOutput(
       "Route computed",
@@ -1291,6 +1320,7 @@ async function copyShareUrl() {
 
 function initBindings() {
   applyUrlParams();
+  setRouteResultsVerbose(false);
   el.submitRoute.disabled = true;
   setText(el.displayRange, CONFIG.displayRange);
   setText(el.sourceRegion, CONFIG.sourceRegion);
@@ -1305,6 +1335,9 @@ function initBindings() {
   el.detourFactor?.addEventListener("input", syncRangeOutputs);
   syncRangeOutputs();
   el.routeForm?.addEventListener("submit", planRoute);
+  el.verboseRouteResults?.addEventListener("change", () => {
+    setRouteResultsVerbose(el.verboseRouteResults.checked);
+  });
   el.regionSelect?.addEventListener("change", () => {
     const region = el.regionSelect.value;
     const run =
@@ -1385,6 +1418,12 @@ async function main() {
   map.on("zoomstart", handleZoomStart);
   map.on("zoomend", handleZoomEnd);
   map.on("load", () => {
+    mapReady = true;
+    const pending = pendingRouteRender;
+    pendingRouteRender = null;
+    if (pending?.requestId === routeRequestSequence) {
+      renderRoute(pending.geojson);
+    }
     syncZoomElasticity();
     el.submitRoute.disabled =
       !CONFIG.workingRun || selectedRegionMetadata?.graph_exists === false;

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Scenic Drive</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css?v=compact-elastic-beta-v7" />
+    <link rel="stylesheet" href="./styles.css?v=compact-elastic-beta-v8" />
   </head>
   <body>
     <main class="viewer-shell">
@@ -22,21 +22,6 @@
                 <span class="overline">Scenic score</span>
                 <strong id="inspectorScore">--</strong>
                 <span id="inspectorCoords">Move over a heatmap cell</span>
-              </div>
-              <div class="region-controls" role="group" aria-label="Region selection">
-                <label class="field" for="regionSelect">
-                  <span class="field-label">Supported region</span>
-                  <select id="regionSelect" name="region" aria-describedby="regionStatus" disabled>
-                    <option>Loading regions…</option>
-                  </select>
-                </label>
-                <label class="field" for="runSelect">
-                  <span class="field-label">Scenic run</span>
-                  <select id="runSelect" name="run" aria-describedby="regionStatus" disabled>
-                    <option>Loading runs…</option>
-                  </select>
-                </label>
-                <span id="regionStatus" class="field-label" role="status" aria-live="polite">Loading supported regions…</span>
               </div>
               <span class="status-chip" id="apiStatus">API: checking</span>
             </div>
@@ -79,6 +64,21 @@
               <span>Developer panel</span>
               <span class="dev-panel-hint">Diagnostics &amp; route output</span>
             </summary>
+            <div class="region-controls" role="group" aria-label="Region selection">
+              <label class="field" for="regionSelect">
+                <span class="field-label">Supported region</span>
+                <select id="regionSelect" name="region" aria-describedby="regionStatus" disabled>
+                  <option>Loading regions…</option>
+                </select>
+              </label>
+              <label class="field" for="runSelect">
+                <span class="field-label">Scenic run</span>
+                <select id="runSelect" name="run" aria-describedby="regionStatus" disabled>
+                  <option>Loading runs…</option>
+                </select>
+              </label>
+              <span id="regionStatus" class="field-label" role="status" aria-live="polite">Loading supported regions…</span>
+            </div>
             <div class="output-stack">
               <section class="output-card" aria-label="Remote training">
                 <div class="output-header">
@@ -120,6 +120,10 @@
               <p class="overline">Route output</p>
               <h2 id="routeResultsTitle">Route comparison</h2>
             </div>
+            <label class="toggle-row" for="verboseRouteResults">
+              <input id="verboseRouteResults" type="checkbox" aria-controls="routeDiagnostics" />
+              <span>Show route diagnostics</span>
+            </label>
           </header>
 
           <div class="route-comparison">
@@ -160,8 +164,7 @@
               </dl>
             </article>
           </div>
-
-          <section class="route-diagnostics-card" aria-label="Route diagnostics">
+          <section id="routeDiagnostics" class="route-diagnostics-card" aria-label="Route diagnostics" hidden>
             <dl class="metric-grid">
               <div><dt>Score uplift</dt><dd><span id="scenicScoreUpliftAbsolute">--</span></dd></div>
               <div><dt>Relative uplift</dt><dd><span id="scenicScoreUpliftRelative">--</span></dd></div>
@@ -198,6 +201,6 @@
     </main>
 
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <script type="module" src="./viewer.js?v=supported-regions-v1"></script>
+    <script type="module" src="./viewer.js?v=supported-regions-v2"></script>
   </body>
 </html>
