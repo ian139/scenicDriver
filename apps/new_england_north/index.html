@@ -9,7 +9,7 @@
   </head>
   <body>
     <main class="viewer-shell">
-      <section class="map-stage" aria-label="New England North scenic map viewer">
+      <section class="map-stage" aria-label="Scenic map viewer">
         <div id="map" role="application" aria-label="Map with scenic heatmap and route overlays"></div>
 
       </section>
@@ -23,6 +23,19 @@
                 <strong id="inspectorScore">--</strong>
                 <span id="inspectorCoords">Move over a heatmap cell</span>
               </div>
+              <label class="field" for="regionSelect">
+                <span class="field-label">Supported region</span>
+                <select id="regionSelect" name="region" aria-describedby="regionStatus" disabled>
+                  <option>Loading regions…</option>
+                </select>
+              </label>
+              <label class="field" for="runSelect">
+                <span class="field-label">Scenic run</span>
+                <select id="runSelect" name="run" aria-describedby="regionStatus" disabled>
+                  <option>Loading runs…</option>
+                </select>
+              </label>
+              <span id="regionStatus" class="field-label" role="status" aria-live="polite">Loading supported regions…</span>
               <span class="status-chip" id="apiStatus">API: checking</span>
             </div>
           </header>
@@ -183,6 +196,6 @@
     </main>
 
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <script type="module" src="./viewer.js?v=avoid-highways-no-route-v1"></script>
+    <script type="module" src="./viewer.js?v=supported-regions-v1"></script>
   </body>
 </html>
