@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Scenic Drive</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css?v=compact-elastic-beta-v5" />
+    <link rel="stylesheet" href="./styles.css?v=compact-elastic-beta-v7" />
   </head>
   <body>
     <main class="viewer-shell">
@@ -23,19 +23,21 @@
                 <strong id="inspectorScore">--</strong>
                 <span id="inspectorCoords">Move over a heatmap cell</span>
               </div>
-              <label class="field" for="regionSelect">
-                <span class="field-label">Supported region</span>
-                <select id="regionSelect" name="region" aria-describedby="regionStatus" disabled>
-                  <option>Loading regions…</option>
-                </select>
-              </label>
-              <label class="field" for="runSelect">
-                <span class="field-label">Scenic run</span>
-                <select id="runSelect" name="run" aria-describedby="regionStatus" disabled>
-                  <option>Loading runs…</option>
-                </select>
-              </label>
-              <span id="regionStatus" class="field-label" role="status" aria-live="polite">Loading supported regions…</span>
+              <div class="region-controls" role="group" aria-label="Region selection">
+                <label class="field" for="regionSelect">
+                  <span class="field-label">Supported region</span>
+                  <select id="regionSelect" name="region" aria-describedby="regionStatus" disabled>
+                    <option>Loading regions…</option>
+                  </select>
+                </label>
+                <label class="field" for="runSelect">
+                  <span class="field-label">Scenic run</span>
+                  <select id="runSelect" name="run" aria-describedby="regionStatus" disabled>
+                    <option>Loading runs…</option>
+                  </select>
+                </label>
+                <span id="regionStatus" class="field-label" role="status" aria-live="polite">Loading supported regions…</span>
+              </div>
               <span class="status-chip" id="apiStatus">API: checking</span>
             </div>
           </header>
@@ -57,7 +59,7 @@
               </span>
               <div id="endSuggestions" class="address-suggestions" role="listbox" aria-label="End point suggestions"></div>
             </label>
-            <button id="submitRoute" type="submit" class="btn-primary">Plan route</button>
+            <button id="submitRoute" type="submit" class="btn-primary" disabled>Plan route</button>
 
             <div class="range-row">
               <label for="detourFactor" class="range-label">

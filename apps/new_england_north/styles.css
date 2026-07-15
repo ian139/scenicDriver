@@ -93,6 +93,12 @@ button:disabled {
   letter-spacing: 0.005em;
 }
 
+.btn-primary:disabled {
+  background: #252c27;
+  border-color: var(--line);
+  color: var(--faint);
+}
+
 .btn-primary:not(:disabled):hover {
   background: var(--accent-strong);
 }
@@ -245,6 +251,7 @@ input[type="range"]:focus {
 }
 
 .panel-header {
+  grid-column: 1 / -1;
   display: flex;
   align-items: flex-end;
   justify-content: flex-start;
@@ -254,9 +261,32 @@ input[type="range"]:focus {
 .panel-meta {
   width: 100%;
   display: grid;
+  grid-template-columns: minmax(100px, auto) minmax(0, 1fr) auto;
   align-items: end;
   justify-content: stretch;
   gap: 8px;
+  min-width: 0;
+}
+
+.region-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.region-controls > .field {
+  min-width: 0;
+}
+
+.region-controls select {
+  width: 100%;
+  max-width: 100%;
+}
+
+.region-controls > #regionStatus {
+  grid-column: 1 / -1;
   min-width: 0;
 }
 
@@ -363,6 +393,7 @@ h3 {
 }
 
 .route-form {
+  grid-column: 1 / -1;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(132px, auto);
   align-items: end;
@@ -875,8 +906,23 @@ h3 {
 
 
   .panel-meta {
-    display: flex;
-    justify-content: space-between;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+    gap: 8px 10px;
+  }
+
+  .panel-meta .inspector {
+    grid-column: 1;
+  }
+
+  .panel-meta .status-chip {
+    grid-column: 2;
+    justify-self: end;
+  }
+
+  .region-controls {
+    grid-column: 1 / -1;
   }
 
 
@@ -946,6 +992,14 @@ h3 {
   .panel-meta {
     align-items: flex-end;
     gap: 10px;
+  }
+
+  .region-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .region-controls > #regionStatus {
+    grid-column: auto;
   }
 
   .inspector {
