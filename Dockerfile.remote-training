@@ -6,7 +6,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PATH="/opt/conda/bin:/root/.local/bin:${PATH}"
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
-ENV UV_HTTP_TIMEOUT=120
 
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
