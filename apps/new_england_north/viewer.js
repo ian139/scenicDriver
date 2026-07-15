@@ -533,6 +533,13 @@ function getSearchDiagnostics(diagnostics) {
     ? searchDiagnostics
     : {};
 }
+function routeFailurePresentation(code) {
+  if (code === "no_route_found") {
+    return { status: "API: no route found", title: "No route found" };
+  }
+  return { status: "API: route failed", title: "Route failed" };
+}
+
 const REASON_PROSE = Object.freeze({
   approximation_did_not_find_scenic_improvement:
     "Search found no more-scenic route",
@@ -1028,14 +1035,18 @@ async function planRoute(event) {
     if (!isCurrent()) return;
     if (!response.ok) {
       const detail = payload?.detail;
+      const failureCode =
+        detail && typeof detail === "object" ? detail.error : null;
       const message =
         detail && typeof detail === "object" ? detail.message : detail;
       const hint = detail && typeof detail === "object" ? detail.hint : null;
-      throw new Error(
+      const error = new Error(
         [message || `${response.status} ${response.statusText}`, hint]
           .filter(Boolean)
           .join(" — ")
       );
+      error.routeFailureCode = failureCode;
+      throw error;
     }
     renderRoute(payload.geojson);
     renderRouteComparison(payload);
@@ -1046,8 +1057,9 @@ async function planRoute(event) {
     setApiStatus("API: online", "ok");
   } catch (error) {
     if (error?.name === "AbortError" || !isCurrent()) return;
-    setApiStatus("API: route failed", "warn");
-    setRouteOutput("Route failed", escapeHtml(error.message || error));
+    const presentation = routeFailurePresentation(error?.routeFailureCode);
+    setApiStatus(presentation.status, "warn");
+    setRouteOutput(presentation.title, escapeHtml(error.message || error));
   } finally {
     if (isCurrent()) {
       activeRouteRequest = null;

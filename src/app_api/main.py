@@ -1344,12 +1344,24 @@ def create_app() -> FastAPI:
                 diagnostics = diagnose_route_request(req)
             except Exception:
                 diagnostics = {}
+            if req.avoid_highways:
+                message = "No route satisfies the avoid-highways constraint."
+                hint = (
+                    "Turn off Avoid highways, choose different points, "
+                    "or increase max detour."
+                )
+            else:
+                message = "No route satisfies the requested controls."
+                hint = (
+                    f"Try different points in region '{payload.region}' "
+                    "or increase max detour."
+                )
             raise HTTPException(
                 status_code=422,
                 detail={
                     "error": "no_route_found",
-                    "message": "No route satisfies the requested controls.",
-                    "hint": f"Try different points in region '{payload.region}' or increase max detour.",
+                    "message": message,
+                    "hint": hint,
                     "diagnostics": diagnostics,
                 },
             ) from exc

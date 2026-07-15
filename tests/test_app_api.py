@@ -652,6 +652,10 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
     assert diagnosis_calls == [request]
     detail = response.json()["detail"]
     assert detail["diagnostics"] == {"graph_nodes": 4, "graph_edges": 3}
+    assert detail["message"] == "No route satisfies the avoid-highways constraint."
+    assert detail["hint"] == (
+        "Turn off Avoid highways, choose different points, or increase max detour."
+    )
 
 
 def test_route_compare_reports_invalid_route_configuration(monkeypatch) -> None:

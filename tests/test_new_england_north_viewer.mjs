@@ -11,6 +11,10 @@ const installStart = viewerSource.indexOf("function installAddressSearch");
 const installEnd = viewerSource.indexOf("\n\nasync function planRoute", installStart);
 assert.ok(installStart >= 0 && installEnd > installStart);
 const installSource = viewerSource.slice(installStart, installEnd);
+const failureStart = viewerSource.indexOf("function routeFailurePresentation");
+const failureEnd = viewerSource.indexOf("\n\nconst REASON_PROSE", failureStart);
+assert.ok(failureStart >= 0 && failureEnd > failureStart);
+const failureSource = viewerSource.slice(failureStart, failureEnd);
 
 class FakeElement {
   constructor(tag = "div") {
@@ -127,6 +131,20 @@ function makeHarness() {
 
 const response = (payload) => ({ ok: true, json: async () => payload });
 const tick = (ms = 230) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("route failure presentation distinguishes no-route constraints", () => {
+  const context = {};
+  vm.runInNewContext(
+    `${failureSource}\nglobalThis.routeFailurePresentation = routeFailurePresentation;`,
+    context
+  );
+  const noRoute = context.routeFailurePresentation("no_route_found");
+  assert.equal(noRoute.status, "API: no route found");
+  assert.equal(noRoute.title, "No route found");
+  const other = context.routeFailurePresentation("server_error");
+  assert.equal(other.status, "API: route failed");
+  assert.equal(other.title, "Route failed");
+});
 
 test("address suggest/retrieve guards reject stale responses and close invalidates", async () => {
   const harness = makeHarness();
