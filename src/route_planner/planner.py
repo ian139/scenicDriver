@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - exercised only without optional runtim
 
 from .cost import (
     CostWeights,
+    RoutingPolicy,
     ScenicCostFunction,
     SCENIC_NORMALIZATION_VERSION,
     clamp_scenic_score,
@@ -26,6 +27,7 @@ from .cost import (
     duration_component,
     is_better_path,
     is_highway_road_type,
+    resolve_routing_policy,
 )
 from .graph import Edge, Node, RoadGraph
 
@@ -330,9 +332,19 @@ class ScenicRoutePlanner:
         self._csr_topology_cache = type(self)._CSR_TOPOLOGY_CACHE
         self._csr_data_cache = type(self)._CSR_DATA_CACHE
     def _make_cost_function(self, scenic_weight: float) -> ScenicCostFunction:
+        strict = bool(
+            getattr(
+                self.cost_function,
+                "avoid_highways",
+                getattr(self.cost_function, "strict_highways", False),
+            )
+        )
+        preference = float(getattr(self.cost_function, "highway_preference", 0.0))
         return ScenicCostFunction(
             scenic_weight=scenic_weight,
-            avoid_highways=self.cost_function.avoid_highways,
+            avoid_highways=strict,
+            strict_highways=strict,
+            highway_preference=preference,
             weights=self.cost_function.weights,
         )
 
@@ -340,9 +352,18 @@ class ScenicRoutePlanner:
         # Fastest routing is always the true travel-duration objective.  Do
         # not inherit user scenic/custom weights, which could otherwise alter
         # the detour baseline.
+        strict = bool(
+            getattr(
+                self.cost_function,
+                "avoid_highways",
+                getattr(self.cost_function, "strict_highways", False),
+            )
+        )
         return ScenicCostFunction(
             scenic_weight=0.0,
-            avoid_highways=self.cost_function.avoid_highways,
+            avoid_highways=strict,
+            strict_highways=strict,
+            highway_preference=0.0,
             weights=CostWeights(
                 travel_time=1.0,
                 scenic_reward=0.0,
@@ -849,8 +870,9 @@ class ScenicRoutePlanner:
         signature: Tuple[object, ...],
     ) -> Optional[np.ndarray]:
         """Compute built-in scalar edge weights from cached primitive arrays."""
-        avoid_highways = bool(signature[1])
-        blocked = avoid_highways & topology.highway_mask
+        strict_highways = bool(signature[1])
+        highway_preference = float(signature[2])
+        blocked = strict_highways & topology.highway_mask
         active = ~blocked
         valid = (
             np.isfinite(topology.distance_km)
@@ -862,10 +884,10 @@ class ScenicRoutePlanner:
             return None
         if (
             float(signature[0]) == 0.0
-            and float(signature[2]) == 1.0
-            and float(signature[3]) == 0.0
+            and float(signature[3]) == 1.0
             and float(signature[4]) == 0.0
             and float(signature[5]) == 0.0
+            and float(signature[6]) == 0.0
         ):
             weights = topology.travel_time_minutes.copy()
         else:
@@ -877,10 +899,10 @@ class ScenicRoutePlanner:
                 return number if math.isfinite(number) and number >= 0.0 else 0.0
 
             scenic_weight = finite_nonnegative(signature[0])
-            travel_weight = finite_nonnegative(signature[2])
-            scenic_reward = finite_nonnegative(signature[3])
-            highway_penalty = finite_nonnegative(signature[4])
-            byway_bonus = min(finite_nonnegative(signature[5]), 0.5)
+            travel_weight = finite_nonnegative(signature[3])
+            scenic_reward = finite_nonnegative(signature[4])
+            highway_penalty = finite_nonnegative(signature[5])
+            byway_bonus = min(finite_nonnegative(signature[6]), 0.5)
             duration = topology.travel_time_minutes
             scenic_score = np.minimum(
                 np.maximum(np.nan_to_num(topology.scenic_score, nan=0.0), 0.0),
@@ -901,9 +923,14 @@ class ScenicRoutePlanner:
                 base,
             )
             adjustment = np.where(
-                avoid_highways & topology.highway_mask,
-                duration * highway_penalty,
-                0.0,
+                (highway_preference > 0.0)
+                & topology.highway_mask,
+                duration * highway_preference,
+                np.where(
+                    strict_highways & topology.highway_mask,
+                    duration * highway_penalty,
+                    0.0,
+                ),
             )
             with np.errstate(over="ignore", invalid="ignore"):
                 raw = base + adjustment
@@ -1235,7 +1262,7 @@ class ScenicRoutePlanner:
         selected = cost_function if cost_function is not None else self.cost_function
         value = getattr(selected, "avoid_highways", None)
         if value is None:
-            value = getattr(self.cost_function, "avoid_highways", False)
+            value = getattr(selected, "strict_highways", False)
         return bool(value)
 
     def _edge_is_eligible(
@@ -1625,7 +1652,7 @@ class ScenicRoutePlanner:
         kappa: float,
         fastest_duration_minutes: float,
         duration_cap_minutes: float,
-        avoid_highways: bool,
+        policy: RoutingPolicy,
     ) -> Tuple[Optional[List[Edge]], object]:
         """Enumerate every feasible simple path on a bounded oracle graph."""
         best_edges: Optional[List[Edge]] = None
@@ -1640,6 +1667,7 @@ class ScenicRoutePlanner:
                     q=q,
                     kappa=kappa,
                     fastest_duration_minutes=fastest_duration_minutes,
+                    policy=policy,
                 )
                 if (
                     best_evaluation is None
@@ -1653,7 +1681,7 @@ class ScenicRoutePlanner:
                 key=lambda item: (str(item.id), str(item.end_node_id)),
             )
             for edge in outgoing:
-                if avoid_highways and is_highway_road_type(edge.road_type):
+                if policy.strict_highways and is_highway_road_type(edge.road_type):
                     continue
                 neighbor_id = str(edge.end_node_id)
                 if neighbor_id in visited:
@@ -1869,7 +1897,7 @@ class ScenicRoutePlanner:
         kappa: float,
         fastest_duration_minutes: float,
         duration_cap_minutes: float,
-        avoid_highways: bool,
+        policy: RoutingPolicy,
         fastest_edges: List[Edge],
         fastest_evaluation: object,
         started_at: Optional[float] = None,
@@ -1883,7 +1911,7 @@ class ScenicRoutePlanner:
         deadline = started + time_limit_seconds
         search_stamp = self.graph._heuristic_cache_stamp()
         reverse_bounds = self._frontier_reverse_duration_lower_bounds(
-            goal, avoid_highways, duration_cap_minutes, deadline
+            goal, policy.strict_highways, duration_cap_minutes, deadline
         )
         if self.graph._heuristic_cache_stamp() != search_stamp:
             raise RuntimeError(
@@ -1994,7 +2022,7 @@ class ScenicRoutePlanner:
         incumbent_edges = list(fastest_edges)
         incumbent_evaluation = fastest_evaluation
         for warm_path in self._frontier_warm_start_paths(
-            start, goal, avoid_highways, deadline
+            start, goal, policy.strict_highways, deadline
         ):
             if not self._duration_within_cap(
                 self._path_duration_minutes(warm_path),
@@ -2006,6 +2034,7 @@ class ScenicRoutePlanner:
                 q=q,
                 kappa=kappa,
                 fastest_duration_minutes=fastest_duration_minutes,
+                policy=policy,
             )
             if is_better_path(warm_evaluation, incumbent_evaluation):
                 incumbent_edges = warm_path
@@ -2056,6 +2085,7 @@ class ScenicRoutePlanner:
                     q=q,
                     kappa=kappa,
                     fastest_duration_minutes=fastest_duration_minutes,
+                    policy=policy,
                 )
                 if is_better_path(evaluation, incumbent_evaluation):
                     incumbent_edges = candidate
@@ -2076,7 +2106,7 @@ class ScenicRoutePlanner:
                 if deadline_reached():
                     timed_out = True
                     break
-                if avoid_highways and is_highway_road_type(edge.road_type):
+                if policy.strict_highways and is_highway_road_type(edge.road_type):
                     continue
                 neighbor = str(edge.end_node_id)
                 if neighbor in label.visited_nodes:
@@ -2231,50 +2261,42 @@ class ScenicRoutePlanner:
         *,
         q: Optional[float] = None,
         kappa: Optional[float] = None,
+        highway_preference: Optional[float] = None,
+        strict_highways: Optional[bool] = None,
     ) -> Route:
-        """Optimize the normalized distance-weighted scenic utility.
-
-        Bounded oracle graphs are solved by exhaustive simple-path enumeration
-        (exact, with deterministic ties). Larger graphs use the complete
-        multi-label frontier, returning exact metadata on normal exhaustion or
-        a deadline-bounded certified upper bound and gap.
-        """
+        """Optimize the normalized distance-weighted scenic utility."""
         if self.graph is None:
             raise RuntimeError("Road graph not loaded")
         if q is not None:
             scenic_weight = q
         if kappa is not None:
             max_detour_factor = kappa
-        try:
-            q_value = float(scenic_weight)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("q must be finite and in [0, 1]") from exc
-        try:
-            kappa_value = float(max_detour_factor)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("kappa must be finite and >= 1") from exc
-        if (
-            not math.isfinite(q_value)
-            or q_value < 0.0
-            or q_value > 1.0
-        ):
-            raise ValueError("q must be finite and in [0, 1]")
-        if not math.isfinite(kappa_value) or kappa_value < 1.0:
-            raise ValueError("kappa must be finite and >= 1")
-
-        self.cost_function.avoid_highways = bool(avoid_highways)
+        policy = resolve_routing_policy(
+            scenic_weight=scenic_weight,
+            kappa=max_detour_factor,
+            avoid_highways=avoid_highways,
+            highway_preference=(
+                0.0 if highway_preference is None else highway_preference
+            ),
+            strict_highways=strict_highways,
+        )
+        self.cost_function.strict_highways = policy.strict_highways
+        self.cost_function.avoid_highways = policy.strict_highways
+        self.cost_function.highway_preference = policy.highway_preference
+        q_value = policy.scenic_weight
+        kappa_value = policy.kappa
         start_node = self.graph.find_nearest_node(*start)
         end_node = self.graph.find_nearest_node(*end)
         bounded_graph = self._is_bounded_oracle_graph()
         if bounded_graph:
             shortest_edges = self._canonical_fastest_edges(
-                start_node, end_node, bool(avoid_highways)
+                start_node, end_node, policy.strict_highways
             )
         else:
             # The compiled exact duration solver reuses prewarmed CSR data and
             # avoids scanning every Python adjacency row on production graphs.
             shortest_edges = self._cached_fastest_edges(
-                start_node, end_node, bool(avoid_highways)
+                start_node, end_node, policy.strict_highways
             )
         if shortest_edges is None:
             raise ValueError("No route found between the given coordinates.")
@@ -2287,9 +2309,10 @@ class ScenicRoutePlanner:
             q=q_value,
             kappa=kappa_value,
             fastest_duration_minutes=fastest_duration,
+            policy=policy,
         )
 
-        if q_value == 0.0:
+        if q_value == 0.0 and policy.highway_preference == 0.0:
             return self._path_to_route(
                 shortest_edges,
                 start_node=start_node,
@@ -2314,7 +2337,7 @@ class ScenicRoutePlanner:
                 kappa=kappa_value,
                 fastest_duration_minutes=fastest_duration,
                 duration_cap_minutes=duration_cap,
-                avoid_highways=bool(avoid_highways),
+                policy=policy,
             )
             no_scenic_improvement = not self._has_scenic_improvement(
                 evaluation, fastest_evaluation
@@ -2350,7 +2373,7 @@ class ScenicRoutePlanner:
             kappa=kappa_value,
             fastest_duration_minutes=fastest_duration,
             duration_cap_minutes=duration_cap,
-            avoid_highways=bool(avoid_highways),
+            policy=policy,
             fastest_edges=shortest_edges,
             fastest_evaluation=fastest_evaluation,
             started_at=frontier_started,
@@ -2393,17 +2416,24 @@ class ScenicRoutePlanner:
     ) -> Route:
         if self.graph is None:
             raise RuntimeError("Road graph not loaded")
-        self.cost_function.avoid_highways = bool(avoid_highways)
+        policy = resolve_routing_policy(
+            scenic_weight=0.0,
+            kappa=1.0,
+            avoid_highways=avoid_highways,
+        )
+        self.cost_function.strict_highways = policy.strict_highways
+        self.cost_function.avoid_highways = policy.strict_highways
+        self.cost_function.highway_preference = 0.0
         start_node = self.graph.find_nearest_node(*start)
         end_node = self.graph.find_nearest_node(*end)
         bounded_graph = self._is_bounded_oracle_graph()
         if bounded_graph:
             shortest_edges = self._canonical_fastest_edges(
-                start_node, end_node, bool(avoid_highways)
+                start_node, end_node, policy.strict_highways
             )
         else:
             shortest_edges = self._cached_fastest_edges(
-                start_node, end_node, bool(avoid_highways)
+                start_node, end_node, policy.strict_highways
             )
         if shortest_edges is None:
             raise ValueError("No route found between the given coordinates.")
@@ -2413,6 +2443,7 @@ class ScenicRoutePlanner:
             q=0.0,
             kappa=1.0,
             fastest_duration_minutes=fastest_duration,
+            policy=policy,
         )
         return self._path_to_route(
             shortest_edges,
@@ -2622,7 +2653,8 @@ class ScenicRoutePlanner:
         weights = cost_function.weights
         return (
             float(cost_function.scenic_weight),
-            bool(cost_function.avoid_highways),
+            bool(getattr(cost_function, "strict_highways", False)),
+            float(getattr(cost_function, "highway_preference", 0.0)),
             float(weights.travel_time),
             float(weights.scenic_reward),
             float(weights.highway_penalty),
