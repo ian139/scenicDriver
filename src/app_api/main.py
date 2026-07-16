@@ -14,6 +14,7 @@ import sys
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException
+from scalar_fastapi import get_scalar_api_reference
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -1328,6 +1329,13 @@ def create_app() -> FastAPI:
         ],
     )
 
+    @app.get("/scalar", include_in_schema=False)
+    def scalar_docs() -> Any:
+        return get_scalar_api_reference(
+            openapi_url=app.openapi_url,
+            title=f"{app.title} Scalar Reference",
+        )
+
     repo = ContribRepo()
     @app.get("/v1/healthz")
     def healthz() -> dict[str, Any]:
@@ -1360,6 +1368,7 @@ def create_app() -> FastAPI:
             "name": "ScenicDrive API",
             "version": "0.1.0",
             "docs": "/docs",
+            "scalar_docs": "/scalar",
             "health": "/v1/healthz",
             "regions": "/v1/regions",
         }

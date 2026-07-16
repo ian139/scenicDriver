@@ -23,6 +23,7 @@ dependencies = [
   "requests>=2.31",
   "tqdm>=4.66",
   "python-dotenv>=1.0",
+  "scalar-fastapi>=1.8.2",
 ]
 
 [project.optional-dependencies]

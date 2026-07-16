@@ -38,6 +38,17 @@ def test_healthz() -> None:
     assert payload["ok"] is True
     assert "regions_available" in payload
 
+def test_scalar_docs() -> None:
+    resp = client.get("/scalar")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "ScenicDrive API Scalar Reference" in resp.text
+    assert "/openapi.json" in resp.text
+
+def test_root_advertises_scalar_docs() -> None:
+    payload = client.get("/").json()
+    assert payload["scalar_docs"] == "/scalar"
+
 
 def test_healthz_redacts_preload_asset_paths(tmp_path, monkeypatch) -> None:
     graph_path = tmp_path / "graph.json"
