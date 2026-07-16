@@ -1829,12 +1829,186 @@ class ScenicRoutePlanner:
         )
         return metrics_strict and first.edge_sequence <= second.edge_sequence
 
+    def _frontier_beam_warm_start_paths(
+        self,
+        start: Node,
+        goal: Node,
+        avoid_highways: bool,
+        deadline: Optional[float],
+        duration_cap_minutes: Optional[float],
+        reverse_bounds: Optional[Dict[str, float]],
+        max_distance_per_minute: Optional[float],
+        zero_duration_distance: float,
+    ) -> List[List[Edge]]:
+        """Find a few scenic feasible paths with a bounded label beam."""
+        if duration_cap_minutes is None or reverse_bounds is None:
+            return []
+
+        def expired() -> bool:
+            return deadline is not None and self._monotonic() >= deadline
+
+        beam_width = 128
+        max_expanded = 4096
+        labels: Dict[int, _FrontierLabel] = {
+            0: _FrontierLabel(
+                0,
+                start.id,
+                0.0,
+                0.0,
+                0.0,
+                None,
+                None,
+                frozenset((start.id,)),
+                (),
+            )
+        }
+        beam_ids = [0]
+        goal_ids: List[int] = []
+        next_label_id = 1
+        expanded = 0
+        maximum_suffix_rate = (
+            max_distance_per_minute
+            if max_distance_per_minute is not None
+            and math.isfinite(max_distance_per_minute)
+            and max_distance_per_minute >= 0.0
+            else 0.0
+        )
+
+        def rank(label: _FrontierLabel) -> tuple[float, float, float, float, Tuple[str, ...]]:
+            remaining_budget = max(
+                0.0,
+                duration_cap_minutes - label.cumulative_duration_minutes,
+            )
+            maximum_suffix_distance = (
+                zero_duration_distance
+                + maximum_suffix_rate * remaining_budget
+            )
+            denominator = (
+                label.cumulative_distance_km + maximum_suffix_distance
+            )
+            upper = (
+                (
+                    label.normalized_scenic_exposure
+                    + maximum_suffix_distance
+                )
+                / denominator
+                if denominator > 0.0
+                else 0.0
+            )
+            partial = (
+                label.normalized_scenic_exposure
+                / label.cumulative_distance_km
+                if label.cumulative_distance_km > 0.0
+                else 0.0
+            )
+            return (
+                -float(min(1.0, upper)),
+                -float(partial),
+                -float(label.normalized_scenic_exposure),
+                float(label.cumulative_duration_minutes),
+                label.edge_sequence,
+            )
+
+        while beam_ids and expanded < max_expanded:
+            if expired():
+                break
+            next_ids: List[int] = []
+            for label_id in beam_ids:
+                label = labels[label_id]
+                if label.node_id == goal.id:
+                    goal_ids.append(label_id)
+                    continue
+                expanded += 1
+                for edge in sorted(
+                    self._iter_edges(label.node_id),
+                    key=lambda item: (
+                        -float(clamp_scenic_score(item.scenic_score)),
+                        float(self._edge_duration_minutes(item)),
+                        str(getattr(item, "traversal_id", "") or item.id),
+                        str(item.end_node_id),
+                    ),
+                ):
+                    if expired():
+                        break
+                    if (
+                        avoid_highways
+                        and is_highway_road_type(edge.road_type)
+                    ):
+                        continue
+                    neighbor = str(edge.end_node_id)
+                    if neighbor in label.visited_nodes:
+                        continue
+                    distance = self._validated_nonnegative(
+                        edge.distance_km, "edge distance_km"
+                    )
+                    edge_duration = self._edge_duration_minutes(edge)
+                    next_distance = label.cumulative_distance_km + distance
+                    next_duration = (
+                        label.cumulative_duration_minutes + edge_duration
+                    )
+                    if not math.isfinite(next_distance) or not math.isfinite(
+                        next_duration
+                    ):
+                        continue
+                    remaining = reverse_bounds.get(neighbor, float("inf"))
+                    if not math.isfinite(remaining) or not self._duration_within_cap(
+                        next_duration + remaining,
+                        duration_cap_minutes,
+                    ):
+                        continue
+                    candidate = _FrontierLabel(
+                        next_label_id,
+                        neighbor,
+                        next_duration,
+                        next_distance,
+                        label.normalized_scenic_exposure
+                        + distance * clamp_scenic_score(edge.scenic_score) / 10.0,
+                        label_id,
+                        edge,
+                        label.visited_nodes | frozenset((neighbor,)),
+                        label.edge_sequence
+                        + (
+                            str(
+                                getattr(edge, "traversal_id", "")
+                                or edge.id
+                            ),
+                        ),
+                    )
+                    labels[next_label_id] = candidate
+                    next_ids.append(next_label_id)
+                    next_label_id += 1
+                if expired():
+                    break
+            if not next_ids:
+                break
+            next_ids.sort(key=lambda label_id: rank(labels[label_id]))
+            beam_ids = next_ids[:beam_width]
+
+        paths: List[List[Edge]] = []
+        seen: set[Tuple[str, ...]] = set()
+        for label_id in sorted(goal_ids, key=lambda item: rank(labels[item])):
+            path = self._frontier_path(labels, label_id)
+            if not self._simple_edge_path(path):
+                continue
+            identity = tuple(
+                str(getattr(edge, "traversal_id", "") or edge.id)
+                for edge in path
+            )
+            if identity not in seen:
+                seen.add(identity)
+                paths.append(path)
+        return paths
+
     def _frontier_warm_start_paths(
         self,
         start: Node,
         goal: Node,
         avoid_highways: bool,
         deadline: Optional[float] = None,
+        duration_cap_minutes: Optional[float] = None,
+        reverse_bounds: Optional[Dict[str, float]] = None,
+        max_distance_per_minute: Optional[float] = None,
+        zero_duration_distance: float = 0.0,
     ) -> List[List[Edge]]:
         """Return feasible-quality incumbents without limiting the frontier.
 
@@ -1875,6 +2049,29 @@ class ScenicRoutePlanner:
             scale = 0.0
         paths: List[List[Edge]] = []
         seen: set[Tuple[str, ...]] = set()
+
+        def add_path(path: Optional[List[Edge]]) -> None:
+            if path is None or not self._simple_edge_path(path):
+                return
+            identity = tuple(
+                str(getattr(edge, "traversal_id", "") or edge.id)
+                for edge in path
+            )
+            if identity not in seen:
+                seen.add(identity)
+                paths.append(path)
+
+        for path in self._frontier_beam_warm_start_paths(
+            start,
+            goal,
+            avoid_highways,
+            deadline,
+            duration_cap_minutes,
+            reverse_bounds,
+            max_distance_per_minute,
+            zero_duration_distance,
+        ):
+            add_path(path)
         for coefficient in (0.0, 0.25 * scale, scale, 4.0 * scale):
             if expired():
                 break
@@ -1887,13 +2084,7 @@ class ScenicRoutePlanner:
                 break
             if path is None or not self._simple_edge_path(path):
                 continue
-            identity = tuple(
-                str(getattr(edge, "traversal_id", "") or edge.id)
-                for edge in path
-            )
-            if identity not in seen:
-                seen.add(identity)
-                paths.append(path)
+            add_path(path)
         return paths
 
     @staticmethod
@@ -2044,7 +2235,14 @@ class ScenicRoutePlanner:
         incumbent_edges = list(fastest_edges)
         incumbent_evaluation = fastest_evaluation
         for warm_path in self._frontier_warm_start_paths(
-            start, goal, policy.strict_highways, deadline
+            start,
+            goal,
+            policy.strict_highways,
+            deadline,
+            duration_cap_minutes=duration_cap_minutes,
+            reverse_bounds=reverse_bounds,
+            max_distance_per_minute=max_distance_per_minute,
+            zero_duration_distance=zero_duration_distance,
         ):
             if not self._duration_within_cap(
                 self._path_duration_minutes(warm_path),
