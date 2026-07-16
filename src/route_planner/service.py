@@ -778,8 +778,9 @@ def route_to_feature(
         "normalization_version": getattr(
             route, "normalization_version", _NORMALIZATION_VERSION
         ),
-        "optimization_mode": getattr(
-            route, "optimization_mode", "distance_weighted_scenic"
+        "optimization_mode": objective_values.get(
+            "optimization_mode",
+            getattr(route, "optimization_mode", "distance_weighted_scenic"),
         ),
         "optimization_status": getattr(route, "status", "ok"),
         "exactness_status": getattr(route, "exactness_status", "unknown"),
@@ -962,7 +963,7 @@ def _objective_components(
         "duration_utility": float(duration_utility),
         "scenic_utility": float(normalized),
         "objective_value": float(objective),
-        "raw_scenic_score": scenic_raw,
+        "optimization_mode": "scenic_score_under_duration_cap",
         "normalized_scenic_score": normalized,
         "requested_scenic_weight": float(request.scenic_weight),
         "applied_scenic_weight": float(request.scenic_weight),
@@ -1163,6 +1164,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
             "duration_utility": 1.0,
             "scenic_utility": baseline_normalized,
             "objective_value": baseline_normalized,
+            "optimization_mode": "fastest_duration_baseline",
             "raw_scenic_score": baseline_raw,
             "normalized_scenic_score": baseline_normalized,
             "requested_scenic_weight": float(request.scenic_weight),
@@ -1221,8 +1223,9 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
             )
             if baseline_route is not None
             else None,
-            "optimization_mode": getattr(
-                scenic_route, "optimization_mode", "distance_weighted_scenic"
+            "optimization_mode": objective.get(
+                "optimization_mode",
+                getattr(scenic_route, "optimization_mode", "distance_weighted_scenic"),
             ),
             "optimization_status": getattr(
                 scenic_route, "status", "ok" if baseline_route is not None else "uncertified"

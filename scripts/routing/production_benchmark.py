@@ -1390,6 +1390,7 @@ def _direct_planner_response(
             "duration_utility": 1.0,
             "scenic_utility": baseline_normalized,
             "objective_value": baseline_normalized,
+            "optimization_mode": "fastest_duration_baseline",
             "raw_scenic_score": float(baseline_route.average_scenic_score),
             "normalized_scenic_score": baseline_normalized,
             "requested_scenic_weight": float(request.scenic_weight),
