@@ -2376,10 +2376,10 @@ class ScenicRoutePlanner:
             goal,
             policy.strict_highways,
             deadline,
-            duration_cap_minutes=duration_cap_minutes,
-            reverse_bounds=reverse_bounds,
-            max_distance_per_minute=max_distance_per_minute,
-            zero_duration_distance=zero_duration_distance,
+            duration_cap_minutes,
+            reverse_bounds,
+            max_distance_per_minute,
+            zero_duration_distance,
         ):
             if not self._duration_within_cap(
                 self._path_duration_minutes(warm_path),
