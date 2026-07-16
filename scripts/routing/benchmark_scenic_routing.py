@@ -1,8 +1,8 @@
 """Deterministic in-memory benchmark for scenic-priority routing.
 
-The benchmark intentionally stays small enough for the production planner's
-exact simple-path oracle.  Every score and invariant is recomputed from the
-returned route segments before a metric is emitted.
+The benchmark includes bounded exact-oracle cases and a deterministic
+production-frontier stress case. Every score and invariant is recomputed from
+the returned route segments before a metric is emitted.
 """
 from __future__ import annotations
 
@@ -143,6 +143,58 @@ def build_competing_scenic_detours_graph() -> RoadGraph:
     return graph
 
 
+def build_frontier_timeout_stress_graph() -> RoadGraph:
+    """Build many non-dominated alternatives for the production frontier."""
+
+    stages = 30
+    options = 4
+    graph = RoadGraph()
+    graph.add_node(Node(id="S", lat=46.0, lon=-72.0))
+    for stage in range(stages):
+        graph.add_node(
+            Node(
+                id=f"L{stage + 1}",
+                lat=46.0 + 0.01 * (stage + 1),
+                lon=-72.0,
+            )
+        )
+    graph.add_node(
+        Node(
+            id="G",
+            lat=46.0 + 0.01 * (stages + 1),
+            lon=-72.0,
+        )
+    )
+    nodes = ["S"] + [f"L{index}" for index in range(1, stages + 1)] + ["G"]
+    for stage in range(stages + 1):
+        for option in range(options):
+            distance_km = (
+                1.0
+                + 0.35 * option
+                + 0.04 * ((stage * 17 + option * 11) % 11) / 10.0
+            )
+            speed_limit_kmh = 60 - 5 * option - ((stage * 3 + option * 5) % 4)
+            scenic_score = max(
+                0.0,
+                min(
+                    10.0,
+                    1.0
+                    + 2.3 * option
+                    + 0.14 * (((stage * 7 + option * 3) % 11) - 5),
+                ),
+            )
+            _add_edge(
+                graph,
+                f"stress-{stage}-{option}",
+                nodes[stage],
+                nodes[stage + 1],
+                distance_km,
+                scenic_score,
+                speed_limit_kmh,
+            )
+    return graph
+
+
 def build_hard_cap_graph() -> RoadGraph:
     """Build a 1.1-cap case with a high-score detour outside the cap."""
 
@@ -209,6 +261,13 @@ def build_benchmark_cases() -> tuple[BenchmarkCase, ...]:
             end=(43.0300, -72.0000),
             max_detour_factor=2.1,
             avoid_highways=True,
+        ),
+        BenchmarkCase(
+            name="frontier_timeout_stress",
+            graph=build_frontier_timeout_stress_graph(),
+            start=(46.0, -72.0),
+            end=(46.31, -72.0),
+            max_detour_factor=1.1,
         ),
         BenchmarkCase(
             name="hard_cap_1_1",
