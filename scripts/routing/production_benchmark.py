@@ -547,7 +547,12 @@ def _duration_utility(
 
 
 def recompute_objective(
-    *, q: float, kappa: float, scenic: Mapping[str, Any], baseline: Mapping[str, Any] | None
+    *,
+    q: float,
+    kappa: float,
+    scenic: Mapping[str, Any],
+    baseline: Mapping[str, Any] | None,
+    scenic_priority: bool = False,
 ) -> dict[str, float | None]:
     """Recompute service objective components from independent path metrics."""
     scenic_duration = _as_float(scenic.get("duration_minutes_recomputed"))
@@ -593,7 +598,9 @@ def recompute_objective(
     duration_utility = _duration_utility(
         scenic_duration, fastest_duration, kappa
     )
-    objective = (1.0 - q) * duration_utility + q * scenic_utility
+    objective = scenic_utility if scenic_priority else (
+        (1.0 - q) * duration_utility + q * scenic_utility
+    )
     return {
         "duration_utility": float(duration_utility),
         "scenic_utility": float(scenic_utility),
@@ -695,12 +702,10 @@ def _no_better_reason_consistent(
             return reason == "approximation_did_not_find_scenic_improvement"
         return reason == "same_route"
     if uplift is not None and uplift <= 0.0:
-        if status == "exact":
-            return reason == "no_better_route"
-        if status == "approximate-certified":
+        if gap is not None and gap > 1e-8:
             return reason == "approximation_did_not_find_scenic_improvement"
+        return reason == "no_better_route"
     return reason is None
-
 
 def evaluate_service_response(
     result: Mapping[str, Any],
@@ -710,6 +715,7 @@ def evaluate_service_response(
     avoid_highways: bool,
     edge_index: Mapping[str, Any] | None = None,
     node_index: Mapping[str, Any] | None = None,
+    scenic_priority: bool = False,
 ) -> dict[str, Any]:
     """Evaluate a strict response against canonical graph-edge metrics."""
     routes = {
@@ -739,7 +745,11 @@ def evaluate_service_response(
         else None
     )
     recomputed = recompute_objective(
-        q=q, kappa=kappa, scenic=scenic, baseline=baseline
+        q=q,
+        kappa=kappa,
+        scenic=scenic,
+        baseline=baseline,
+        scenic_priority=scenic_priority,
     )
     declared_properties = scenic_feature.get("properties", {})
     declared_objective = _as_float(
@@ -1350,6 +1360,7 @@ def _direct_planner_response(
         scenic_weight=request.scenic_weight,
         avoid_highways=request.avoid_highways,
         max_detour_factor=request.max_detour_factor,
+        scenic_priority=True,
     )
     baseline_route = (
         planner.find_fastest_route(
@@ -1378,10 +1389,7 @@ def _direct_planner_response(
         baseline_objective = {
             "duration_utility": 1.0,
             "scenic_utility": baseline_normalized,
-            "objective_value": (
-                (1.0 - float(request.scenic_weight))
-                + float(request.scenic_weight) * baseline_normalized
-            ),
+            "objective_value": baseline_normalized,
             "raw_scenic_score": float(baseline_route.average_scenic_score),
             "normalized_scenic_score": baseline_normalized,
             "requested_scenic_weight": float(request.scenic_weight),
@@ -1553,6 +1561,7 @@ def run_benchmark(
                         avoid_highways=spec.avoid_highways,
                         edge_index=edge_index,
                         node_index=node_index,
+                        scenic_priority=True,
                     )
                     row["reason"] = (
                         None
@@ -1581,6 +1590,7 @@ def run_benchmark(
                             avoid_highways=spec.avoid_highways,
                             edge_index=edge_index,
                             node_index=node_index,
+                            scenic_priority=True,
                         )
                         parity = _evaluations_match(
                             row["evaluation"], direct_evaluation

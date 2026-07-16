@@ -2016,16 +2016,14 @@ class ScenicRoutePlanner:
             if max_distance_per_minute is not None:
                 remaining_budget = max(
                     0.0,
-                    duration_cap_minutes
-                    - label.cumulative_duration_minutes,
+                    duration_cap_minutes - label.cumulative_duration_minutes,
                 )
                 maximum_suffix_distance = (
                     zero_duration_distance
                     + max_distance_per_minute * remaining_budget
                 )
                 denominator = (
-                    label.cumulative_distance_km
-                    + maximum_suffix_distance
+                    label.cumulative_distance_km + maximum_suffix_distance
                 )
                 if denominator > 0.0:
                     scenic_ub = min(
@@ -2036,6 +2034,8 @@ class ScenicRoutePlanner:
                         )
                         / denominator,
                     )
+            if policy.scenic_priority:
+                return float(scenic_ub)
             return float((1.0 - q) * duration_ub + q * scenic_ub)
 
         heapq.heappush(frontier, (-upper_bound(labels[0]), (), 0))
@@ -2295,8 +2295,9 @@ class ScenicRoutePlanner:
         kappa: Optional[float] = None,
         highway_preference: Optional[float] = None,
         strict_highways: Optional[bool] = None,
+        scenic_priority: bool = False,
     ) -> Route:
-        """Optimize the normalized distance-weighted scenic utility."""
+        """Optimize scenic score within a hard duration cap when requested."""
         if self.graph is None:
             raise RuntimeError("Road graph not loaded")
         if q is not None:
@@ -2311,6 +2312,7 @@ class ScenicRoutePlanner:
                 0.0 if highway_preference is None else highway_preference
             ),
             strict_highways=strict_highways,
+            scenic_priority=scenic_priority,
         )
         self.cost_function.strict_highways = policy.strict_highways
         self.cost_function.avoid_highways = policy.strict_highways
@@ -2344,7 +2346,11 @@ class ScenicRoutePlanner:
             policy=policy,
         )
 
-        if q_value == 0.0 and policy.highway_preference == 0.0:
+        if (
+            q_value == 0.0
+            and policy.highway_preference == 0.0
+            and not policy.scenic_priority
+        ):
             return self._path_to_route(
                 shortest_edges,
                 start_node=start_node,

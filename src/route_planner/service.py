@@ -17,7 +17,6 @@ from typing import Any
 from .cost import (
     HIGHWAY_ROAD_TYPES,
     SCENIC_NORMALIZATION_VERSION,
-    combined_utility,
     duration_component,
     normalize_scenic_score,
 )
@@ -911,15 +910,10 @@ def _objective_components(
         duration_component(scenic_duration, fastest_duration, kappa)
     )
     normalized = _normalized_score(scenic_raw)
-    objective = float(
-        combined_utility(
-            request.scenic_weight,
-            kappa,
-            scenic_duration,
-            fastest_duration,
-            normalized,
-        )
-    )
+    # The route planner already enforces the hard cap and selects the highest
+    # normalized scenic score. Keep the response objective aligned with that
+    # primary metric instead of reintroducing a duration trade-off here.
+    objective = normalized
     baseline_raw = (
         float(baseline_route.average_scenic_score)
         if baseline_route is not None
@@ -1140,6 +1134,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
         scenic_weight=request.scenic_weight,
         avoid_highways=request.avoid_highways,
         max_detour_factor=request.max_detour_factor,
+        scenic_priority=True,
     )
 
     baseline_route: Route | None = None
@@ -1167,10 +1162,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
         baseline_objective = {
             "duration_utility": 1.0,
             "scenic_utility": baseline_normalized,
-            "objective_value": (
-                (1.0 - float(request.scenic_weight))
-                + float(request.scenic_weight) * baseline_normalized
-            ),
+            "objective_value": baseline_normalized,
             "raw_scenic_score": baseline_raw,
             "normalized_scenic_score": baseline_normalized,
             "requested_scenic_weight": float(request.scenic_weight),

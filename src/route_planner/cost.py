@@ -39,6 +39,7 @@ class RoutingPolicy:
     kappa: float
     strict_highways: bool = False
     highway_preference: float = 0.0
+    scenic_priority: bool = False
 
     @property
     def avoid_highways(self) -> bool:
@@ -53,6 +54,7 @@ def resolve_routing_policy(
     avoid_highways: object = False,
     highway_preference: object = 0.0,
     strict_highways: object | None = None,
+    scenic_priority: object = False,
 ) -> RoutingPolicy:
     """Normalize request controls once, before search or cache lookup."""
     q_value = _required_finite(scenic_weight, "q")
@@ -72,6 +74,7 @@ def resolve_routing_policy(
         kappa=kappa_value,
         strict_highways=strict_value,
         highway_preference=preference_value,
+        scenic_priority=bool(scenic_priority),
     )
 
 
@@ -243,12 +246,14 @@ def evaluate_path(
     fastest_duration_minutes: object,
     policy: RoutingPolicy | None = None,
     highway_preference: object = 0.0,
+    scenic_priority: object = False,
 ) -> PathEvaluation:
     """Evaluate a path with the resolved policy objective."""
     resolved = policy or resolve_routing_policy(
         scenic_weight=q,
         kappa=kappa,
         highway_preference=highway_preference,
+        scenic_priority=scenic_priority,
     )
     try:
         edges = tuple(path)  # type: ignore[arg-type]
@@ -291,13 +296,18 @@ def evaluate_path(
     duration_utility = duration_component(
         total_duration, fastest_duration_minutes, resolved.kappa
     )
-    base_objective = combined_utility(
-        resolved.scenic_weight,
-        resolved.kappa,
-        total_duration,
-        fastest_duration_minutes,
-        normalized_score,
-    )
+    if resolved.scenic_priority:
+        # Scenic score is the primary objective; duration is a hard
+        # feasibility constraint and only breaks equal-score ties.
+        base_objective = normalized_score
+    else:
+        base_objective = combined_utility(
+            resolved.scenic_weight,
+            resolved.kappa,
+            total_duration,
+            fastest_duration_minutes,
+            normalized_score,
+        )
     fastest = _required_finite(
         fastest_duration_minutes, "fastest duration", minimum=0.0
     )
@@ -306,7 +316,11 @@ def evaluate_path(
         * highway_duration
         / max(fastest, MIN_EDGE_COST)
     )
-    objective = base_objective - highway_cost
+    objective = (
+        base_objective
+        if resolved.scenic_priority
+        else base_objective - highway_cost
+    )
     return PathEvaluation(
         edge_ids=tuple(edge_ids),
         total_distance_km=total_distance,
@@ -328,16 +342,31 @@ def compare_path_evaluations(
     candidate: PathEvaluation, incumbent: PathEvaluation
 ) -> int:
     """Return ``1`` when candidate wins, ``-1`` when incumbent wins, else ``0``."""
-    candidate_key = (
-        candidate.objective,
-        candidate.raw_scenic_score,
-        -candidate.duration_minutes,
+    scenic_priority = bool(
+        candidate.policy is not None and candidate.policy.scenic_priority
     )
-    incumbent_key = (
-        incumbent.objective,
-        incumbent.raw_scenic_score,
-        -incumbent.duration_minutes,
-    )
+    if scenic_priority:
+        candidate_key = (
+            candidate.normalized_scenic_score,
+            -candidate.duration_minutes,
+            -candidate.total_distance_km,
+        )
+        incumbent_key = (
+            incumbent.normalized_scenic_score,
+            -incumbent.duration_minutes,
+            -incumbent.total_distance_km,
+        )
+    else:
+        candidate_key = (
+            candidate.objective,
+            candidate.raw_scenic_score,
+            -candidate.duration_minutes,
+        )
+        incumbent_key = (
+            incumbent.objective,
+            incumbent.raw_scenic_score,
+            -incumbent.duration_minutes,
+        )
     if candidate_key > incumbent_key:
         return 1
     if candidate_key < incumbent_key:
