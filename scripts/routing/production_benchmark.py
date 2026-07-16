@@ -46,7 +46,15 @@ DEFAULT_REPORT = Path(
 Q_VALUES = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
 KAPPA_VALUES = (1.0, 1.1, 1.2, 1.4, 1.8, 2.2, 3.0)
 HIGHWAY_TYPES = frozenset(
-    {"highway", "motorway", "trunk", "motorway_link", "trunk_link"}
+    {
+        "highway",
+        "motorway",
+        "motorway_link",
+        "primary",
+        "primary_link",
+        "trunk",
+        "trunk_link",
+    }
 )
 REQUIRED_CATEGORIES = (
     "short urban",
@@ -149,6 +157,16 @@ def _close_enough(first: float | None, second: float | None) -> bool:
     return abs(first - second) <= 1e-8 * max(1.0, abs(first), abs(second))
 
 
+def _dedupe_geometry_coordinates(
+    coordinates: list[list[float]],
+) -> list[list[float]]:
+    result: list[list[float]] = []
+    for coordinate in coordinates:
+        if not result or coordinate != result[-1]:
+            result.append(coordinate)
+    return result
+
+
 def _edge_segment_consistent(
     edge_id: str,
     row: Mapping[str, Any],
@@ -209,6 +227,8 @@ def recompute_feature_metrics(
     *,
     edge_index: Mapping[str, Any] | None = None,
     node_index: Mapping[str, Any] | None = None,
+    requested_start: tuple[float, float] | None = None,
+    requested_end: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Recompute metrics from emitted identities, segments, and graph edges.
 
@@ -258,16 +278,32 @@ def recompute_feature_metrics(
         else 0.0
     )
     segment_normalized_score = _normalise_score(segment_raw_score)
+    zero_edge_equal_endpoint = (
+        not rows
+        and requested_start is not None
+        and requested_end is not None
+        and requested_start == requested_end
+    )
     segment_durations = [
         _as_float(row.get("duration_minutes")) for row in rows
     ]
-    segment_duration_available = bool(rows) and all(
-        duration is not None for duration in segment_durations
+    segment_duration_available = (
+        zero_edge_equal_endpoint
+        or (
+            bool(rows)
+            and all(
+                duration is not None for duration in segment_durations
+            )
+        )
     )
     segment_duration = (
-        sum(float(duration) for duration in segment_durations)
-        if segment_duration_available
-        else None
+        0.0
+        if zero_edge_equal_endpoint
+        else (
+            sum(float(duration) for duration in segment_durations)
+            if segment_duration_available
+            else None
+        )
     )
     segment_highway_count = sum(
         1
@@ -333,7 +369,33 @@ def recompute_feature_metrics(
         )
         else []
     )
-    geometry_sequence_ok = geometry_coordinates == segment_geometry
+    if requested_start is not None and requested_end is not None:
+        requested_geometry = [
+            [float(requested_start[1]), float(requested_start[0])],
+            *segment_geometry,
+            [float(requested_end[1]), float(requested_end[0])],
+        ]
+        expected_geometry = (
+            requested_geometry
+            if zero_edge_equal_endpoint
+            else _dedupe_geometry_coordinates(requested_geometry)
+        )
+    else:
+        expected_geometry = segment_geometry
+    geometry_sequence_coordinates = (
+        geometry_coordinates
+        if zero_edge_equal_endpoint
+        else (
+            _dedupe_geometry_coordinates(geometry_coordinates)
+            if isinstance(geometry_coordinates, list)
+            and all(
+                isinstance(coordinate, list)
+                for coordinate in geometry_coordinates
+            )
+            else geometry_coordinates
+        )
+    )
+    geometry_sequence_ok = geometry_sequence_coordinates == expected_geometry
     edge_segment_consistency = (
         all(
             _edge_segment_consistent(
@@ -404,6 +466,7 @@ def recompute_feature_metrics(
         "duration": segment_duration_available
         and _close_enough(segment_duration, declared_duration),
         "highway_count": segment_highway_count == declared_highway_count,
+        "geometry_sequence": geometry_sequence_ok,
     }
     if edge_metrics_available:
         edge_consistency = {
@@ -616,9 +679,15 @@ def _route_snapshot(
     *,
     edge_index: Mapping[str, Any] | None = None,
     node_index: Mapping[str, Any] | None = None,
+    requested_start: tuple[float, float] | None = None,
+    requested_end: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     metrics = recompute_feature_metrics(
-        feature, edge_index=edge_index, node_index=node_index
+        feature,
+        edge_index=edge_index,
+        node_index=node_index,
+        requested_start=requested_start,
+        requested_end=requested_end,
     )
     properties = feature.get("properties", {})
     declared = {
@@ -715,6 +784,8 @@ def evaluate_service_response(
     avoid_highways: bool,
     edge_index: Mapping[str, Any] | None = None,
     node_index: Mapping[str, Any] | None = None,
+    requested_start: tuple[float, float] | None = None,
+    requested_end: tuple[float, float] | None = None,
     scenic_priority: bool = False,
 ) -> dict[str, Any]:
     """Evaluate a strict response against canonical graph-edge metrics."""
@@ -733,13 +804,19 @@ def evaluate_service_response(
     if scenic_feature is None:
         raise ValueError("strict response did not contain a scenic feature")
     scenic = _route_snapshot(
-        scenic_feature, edge_index=edge_index, node_index=node_index
+        scenic_feature,
+        edge_index=edge_index,
+        node_index=node_index,
+        requested_start=requested_start,
+        requested_end=requested_end,
     )
     baseline = (
         _route_snapshot(
             baseline_feature,
             edge_index=edge_index,
             node_index=node_index,
+            requested_start=requested_start,
+            requested_end=requested_end,
         )
         if baseline_feature is not None
         else None
@@ -940,9 +1017,15 @@ def evaluate_service_response(
             _as_float(diagnostics_payload.get("scenic_score_delta_absolute")),
             _as_float(scenic.get("scenic_score_delta_absolute")),
         )
-        and _close_enough(
-            _as_float(diagnostics_payload.get("scenic_score_delta_relative")),
-            _as_float(scenic.get("scenic_score_delta_relative")),
+        and (
+            (
+                diagnostics_payload.get("scenic_score_delta_relative") is None
+                and scenic.get("scenic_score_delta_relative") is None
+            )
+            or _close_enough(
+                _as_float(diagnostics_payload.get("scenic_score_delta_relative")),
+                _as_float(scenic.get("scenic_score_delta_relative")),
+            )
         )
         and diagnostics_payload.get("same_route")
         == scenic.get("same_route")
@@ -1379,6 +1462,8 @@ def _direct_planner_response(
         "scenic",
         objective=objective,
         score_provenance=score_mapping,
+        requested_start=request.start,
+        requested_end=request.end,
     )
     features = [scenic_feature]
     routes = [{"route_kind": "scenic", "metrics": scenic_feature["properties"]}]
@@ -1408,6 +1493,8 @@ def _direct_planner_response(
             "baseline",
             objective=baseline_objective,
             score_provenance=score_mapping,
+            requested_start=request.start,
+            requested_end=request.end,
         )
         features.append(baseline_feature)
         routes.append(
@@ -1562,6 +1649,8 @@ def run_benchmark(
                         avoid_highways=spec.avoid_highways,
                         edge_index=edge_index,
                         node_index=node_index,
+                        requested_start=spec.start,
+                        requested_end=spec.end,
                         scenic_priority=True,
                     )
                     row["reason"] = (
@@ -1591,6 +1680,8 @@ def run_benchmark(
                             avoid_highways=spec.avoid_highways,
                             edge_index=edge_index,
                             node_index=node_index,
+                            requested_start=spec.start,
+                            requested_end=spec.end,
                             scenic_priority=True,
                         )
                         parity = _evaluations_match(

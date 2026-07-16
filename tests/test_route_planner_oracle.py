@@ -181,7 +181,9 @@ def test_oracle_simple_paths_do_not_exploit_cycles() -> None:
     assert route.edge_ids == ("scenic-1", "scenic-2")
 
 
-@pytest.mark.parametrize("road_type", ["motorway_link", "trunk_link"])
+@pytest.mark.parametrize(
+    "road_type", ["motorway_link", "trunk_link", "primary", "primary_link"]
+)
 def test_oracle_highway_filter_is_hard_for_baseline_and_scenic(
     road_type: str,
 ) -> None:
@@ -235,9 +237,79 @@ def test_oracle_highway_filter_is_hard_for_baseline_and_scenic(
     assert scenic.highway_count == 0
 
 
-def test_avoid_highways_rejects_highway_only_connectivity_but_keeps_residential_path() -> (
-    None
-):
+def test_primary_shortcut_is_excluded_by_checked_filter() -> None:
+    graph = RoadGraph()
+    for node_id, lat in (("S", 0.0), ("R", 0.01), ("G", 0.02)):
+        graph.add_node(Node(id=node_id, lat=lat, lon=0.0))
+    graph.add_edge(
+        Edge(
+            id="primary-shortcut",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=2.0,
+            scenic_score=0.0,
+            road_type="primary",
+            speed_limit_kmh=100,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="secondary-detour",
+            start_node_id="S",
+            end_node_id="R",
+            distance_km=1.0,
+            scenic_score=8.0,
+            road_type="secondary",
+            speed_limit_kmh=40,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="residential-detour",
+            start_node_id="R",
+            end_node_id="G",
+            distance_km=1.0,
+            scenic_score=9.0,
+            road_type="residential",
+            speed_limit_kmh=40,
+            one_way=True,
+        )
+    )
+    planner = ScenicRoutePlanner(graph)
+
+    assert planner.find_fastest_route(
+        (0.0, 0.0), (0.02, 0.0), avoid_highways=False
+    ).edge_ids == ("primary-shortcut",)
+    assert planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.02, 0.0),
+        q=0.0,
+        kappa=1.0,
+        avoid_highways=False,
+    ).edge_ids == ("primary-shortcut",)
+
+    fastest = planner.find_fastest_route(
+        (0.0, 0.0), (0.02, 0.0), avoid_highways=True
+    )
+    scenic = planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.02, 0.0),
+        q=1.0,
+        kappa=4.0,
+        avoid_highways=True,
+    )
+    assert fastest.edge_ids == ("secondary-detour", "residential-detour")
+    assert scenic.edge_ids == ("secondary-detour", "residential-detour")
+    assert all(segment.road_type != "primary" for segment in scenic.segments)
+    assert scenic.highway_count == 0
+
+
+@pytest.mark.parametrize("road_type", ["motorway", "primary"])
+def test_avoid_highways_rejects_highway_only_connectivity_but_keeps_residential_path(
+    road_type: str,
+) -> None:
     highway_only = RoadGraph()
     highway_only.add_node(Node(id="S", lat=0.0, lon=0.0))
     highway_only.add_node(Node(id="G", lat=0.02, lon=0.0))
@@ -248,7 +320,7 @@ def test_avoid_highways_rejects_highway_only_connectivity_but_keeps_residential_
             end_node_id="G",
             distance_km=2.0,
             scenic_score=0.0,
-            road_type="motorway",
+            road_type=road_type,
             speed_limit_kmh=100,
             one_way=True,
         )
@@ -737,6 +809,40 @@ def test_parallel_edges_do_not_corrupt_compiled_shortest_path() -> None:
     assert route.estimated_duration_minutes == pytest.approx(1.0)
 
 
+def test_compiled_path_positions_preserve_reverse_traversal_identity() -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="A", lat=0.0, lon=0.0))
+    graph.add_node(Node(id="B", lat=0.01, lon=0.0))
+    graph.add_edge(
+        Edge(
+            id="two-way",
+            start_node_id="A",
+            end_node_id="B",
+            distance_km=1.0,
+            scenic_score=5.0,
+            speed_limit_kmh=60,
+            one_way=False,
+        )
+    )
+    planner = ScenicRoutePlanner(graph)
+    topology = planner._csr_topology(False)
+    assert topology is not None
+
+    result = planner._compiled_weighted_path_with_positions(
+        topology,
+        topology.node_index["B"],
+        topology.node_index["A"],
+        topology.travel_time_minutes,
+    )
+
+    assert result is not None
+    path, positions = result
+    assert len(path) == len(positions) == 1
+    assert path[0].start_node_id == "B"
+    assert path[0].end_node_id == "A"
+    assert topology.edge_refs[int(positions[0])] == ("two-way", True)
+
+
 def test_same_node_route_has_renderable_zero_length_geometry() -> None:
     graph = _tradeoff_graph()
     planner = ScenicRoutePlanner(graph)
@@ -822,6 +928,319 @@ def _production_side_road_graph() -> RoadGraph:
     return graph
 
 
+def _production_lower_prefix_multiedge_detour_graph() -> RoadGraph:
+    graph = RoadGraph()
+    for node_id, lat in (
+        ("S", 0.0),
+        ("A", 0.01),
+        ("B", 0.02),
+        ("C", 0.03),
+        ("G", 0.04),
+    ):
+        graph.add_node(Node(id=node_id, lat=lat, lon=0.0))
+    for index in range(25):
+        graph.add_node(
+            Node(
+                id=f"lower-prefix-isolated-{index}",
+                lat=30.0 + index,
+                lon=30.0,
+            )
+        )
+    for edge in (
+        Edge(
+            id="fast",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=8.0,
+            scenic_score=0.0,
+            speed_limit_kmh=80,
+            one_way=True,
+        ),
+        Edge(
+            id="slow-first",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=2.0,
+            scenic_score=1.0,
+            speed_limit_kmh=30,
+            one_way=True,
+        ),
+        Edge(
+            id="slow-finish",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=3.0,
+            scenic_score=2.0,
+            speed_limit_kmh=45,
+            one_way=True,
+        ),
+        Edge(
+            id="detour-1",
+            start_node_id="A",
+            end_node_id="B",
+            distance_km=1.0,
+            scenic_score=10.0,
+            speed_limit_kmh=30,
+            one_way=True,
+        ),
+        Edge(
+            id="detour-2",
+            start_node_id="B",
+            end_node_id="C",
+            distance_km=1.0,
+            scenic_score=10.0,
+            speed_limit_kmh=30,
+            one_way=True,
+        ),
+        Edge(
+            id="detour-3",
+            start_node_id="C",
+            end_node_id="G",
+            distance_km=2.0,
+            scenic_score=10.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        ),
+    ):
+        graph.add_edge(edge)
+    return graph
+
+
+def _production_corridor_diversity_graph() -> RoadGraph:
+    graph = RoadGraph()
+    for node_id, lat in (
+        ("S", 0.0),
+        ("C", 0.01),
+        ("A", 0.02),
+        ("G", 0.03),
+    ):
+        graph.add_node(Node(id=node_id, lat=lat, lon=0.0))
+    for index in range(25):
+        graph.add_node(
+            Node(
+                id=f"corridor-isolated-{index}",
+                lat=30.0 + index,
+                lon=30.0,
+            )
+        )
+    for edge in (
+        Edge(
+            id="shared-connector",
+            start_node_id="S",
+            end_node_id="C",
+            distance_km=1.0,
+            scenic_score=0.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        ),
+        Edge(
+            id="direct",
+            start_node_id="C",
+            end_node_id="G",
+            distance_km=10.0,
+            scenic_score=6.0,
+            speed_limit_kmh=600,
+            one_way=True,
+        ),
+        Edge(
+            id="scenic-1",
+            start_node_id="C",
+            end_node_id="A",
+            distance_km=20.0,
+            scenic_score=9.0,
+            speed_limit_kmh=600,
+            one_way=True,
+        ),
+        Edge(
+            id="scenic-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=20.0,
+            scenic_score=9.0,
+            speed_limit_kmh=600,
+            one_way=True,
+        ),
+    ):
+        graph.add_edge(edge)
+    return graph
+
+
+def _shared_root_beam_graph() -> RoadGraph:
+    graph = RoadGraph()
+    graph.add_node(Node(id="S", lat=0.0, lon=0.0))
+    graph.add_node(Node(id="C", lat=0.01, lon=0.0))
+    graph.add_node(Node(id="G", lat=0.04, lon=0.0))
+    graph.add_edge(
+        Edge(
+            id="shared-root",
+            start_node_id="S",
+            end_node_id="C",
+            distance_km=1.0,
+            scenic_score=0.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    for index in range(20):
+        branch = f"B{index:02d}"
+        graph.add_node(
+            Node(id=branch, lat=0.02, lon=index * 0.001)
+        )
+        graph.add_edge(
+            Edge(
+                id=f"branch-{index:02d}-in",
+                start_node_id="C",
+                end_node_id=branch,
+                distance_km=1.0,
+                scenic_score=float(index) / 2.0,
+                speed_limit_kmh=60,
+                one_way=True,
+            )
+        )
+        graph.add_edge(
+            Edge(
+                id=f"branch-{index:02d}-out",
+                start_node_id=branch,
+                end_node_id="G",
+                distance_km=1.0,
+                scenic_score=float(index) / 2.0,
+                speed_limit_kmh=60,
+                one_way=True,
+            )
+        )
+    return graph
+
+
+def test_corridor_warm_start_finds_material_detour_and_respects_cap() -> None:
+    graph = _production_corridor_diversity_graph()
+    planner = ScenicRoutePlanner(
+        graph,
+        frontier_time_limit_seconds=0.0,
+    )
+
+    fastest = planner.find_fastest_route((0.0, 0.0), (0.03, 0.0))
+    scenic = planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.03, 0.0),
+        scenic_weight=1.0,
+        max_detour_factor=3.0,
+        scenic_priority=True,
+    )
+    tight = planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.03, 0.0),
+        scenic_weight=1.0,
+        max_detour_factor=2.4,
+        scenic_priority=True,
+    )
+
+    assert fastest.edge_ids == ("shared-connector", "direct")
+    assert scenic.edge_ids == (
+        "shared-connector",
+        "scenic-1",
+        "scenic-2",
+    )
+    assert (
+        scenic.normalized_scenic_score
+        >= fastest.normalized_scenic_score + 0.3
+    )
+    assert 1.0 < scenic.actual_duration_ratio <= 3.0 + 1e-12
+    assert len(scenic.waypoints) == len(set(scenic.waypoints))
+    assert tight.edge_ids == fastest.edge_ids
+    assert tight.actual_duration_ratio <= 2.4 + 1e-12
+
+
+def test_beam_uses_capacity_when_paths_share_first_edge() -> None:
+    graph = _shared_root_beam_graph()
+    planner = ScenicRoutePlanner(graph)
+    bounds = planner._frontier_reverse_duration_lower_bounds(
+        graph.nodes["G"],
+        False,
+        10.0,
+    )
+
+    paths = planner._frontier_beam_warm_start_paths(
+        graph.nodes["S"],
+        graph.nodes["G"],
+        False,
+        None,
+        10.0,
+        bounds,
+        1.0,
+        0.0,
+    )
+
+    identities = {
+        tuple(edge.id for edge in path)
+        for path in paths
+    }
+    assert len(identities) == 20
+    assert all(path[0] == "shared-root" for path in identities)
+
+
+def test_local_detour_budget_counts_final_replacement_edge() -> None:
+    corridor = _production_corridor_diversity_graph()
+    corridor_paths = ScenicRoutePlanner(
+        corridor
+    )._frontier_local_detour_paths(
+        [[corridor.edges["direct"]]],
+        avoid_highways=False,
+        duration_cap_minutes=10.0,
+        budget=2,
+    )
+    lower_prefix = _production_lower_prefix_multiedge_detour_graph()
+    lower_prefix_paths = ScenicRoutePlanner(
+        lower_prefix
+    )._frontier_local_detour_paths(
+        [[lower_prefix.edges["slow-finish"]]],
+        avoid_highways=False,
+        duration_cap_minutes=10.0,
+        budget=3,
+    )
+
+    assert any(
+        tuple(edge.id for edge in path) == ("scenic-1", "scenic-2")
+        for path in corridor_paths
+    )
+    assert any(
+        tuple(edge.id for edge in path)
+        == ("detour-1", "detour-2", "detour-3")
+        for path in lower_prefix_paths
+    )
+
+
+def test_production_frontier_finds_lower_prefix_multiedge_detour() -> None:
+    graph = _production_lower_prefix_multiedge_detour_graph()
+    planner = ScenicRoutePlanner(graph)
+
+    fastest = planner.find_fastest_route((0.0, 0.0), (0.04, 0.0))
+    scenic = planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.04, 0.0),
+        scenic_weight=1.0,
+        max_detour_factor=1.8,
+        scenic_priority=True,
+    )
+
+    assert fastest.edge_ids == ("fast",)
+    assert scenic.edge_ids == (
+        "slow-first",
+        "detour-1",
+        "detour-2",
+        "detour-3",
+    )
+    assert scenic.normalized_scenic_score > fastest.normalized_scenic_score
+    assert scenic.actual_duration_ratio <= 1.8 + 1e-12
+    assert scenic.actual_duration_ratio > 1.0
+    assert scenic.segments[0].scenic_score < max(
+        segment.scenic_score for segment in scenic.segments[1:]
+    )
+    node_ids = [scenic.segments[0].start[0]] + [
+        segment.end[0] for segment in scenic.segments
+    ]
+    assert len(node_ids) == len(set(node_ids))
+
+
 def test_production_frontier_selects_feasible_residential_service_detour() -> None:
     graph = _production_side_road_graph()
     planner = ScenicRoutePlanner(graph)
@@ -893,6 +1312,7 @@ def _label(
         None,
         frozenset(visited),
         (),
+        root_traversal_id="",
     )
 
 

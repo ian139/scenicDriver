@@ -7,7 +7,15 @@ from dataclasses import dataclass
 from .graph import Edge
 
 HIGHWAY_ROAD_TYPES = frozenset(
-    {"highway", "motorway", "motorway_link", "trunk", "trunk_link"}
+    {
+        "highway",
+        "motorway",
+        "motorway_link",
+        "primary",
+        "primary_link",
+        "trunk",
+        "trunk_link",
+    }
 )
 SCENIC_BYWAY_DISCOUNT_CAP = 0.5
 

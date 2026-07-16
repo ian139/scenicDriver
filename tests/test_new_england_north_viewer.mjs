@@ -11,6 +11,11 @@ const installStart = viewerSource.indexOf("function installAddressSearch");
 const installEnd = viewerSource.indexOf("\n\nasync function planRoute", installStart);
 assert.ok(installStart >= 0 && installEnd > installStart);
 const installSource = viewerSource.slice(installStart, installEnd);
+
+const routeStart = viewerSource.indexOf("function routeLayer");
+const routeEnd = viewerSource.indexOf("\n\nfunction clearRoute", routeStart);
+assert.ok(routeStart >= 0 && routeEnd > routeStart);
+const routeSource = viewerSource.slice(routeStart, routeEnd);
 const failureStart = viewerSource.indexOf("function routeFailurePresentation");
 const failureEnd = viewerSource.indexOf("\n\nconst REASON_PROSE", failureStart);
 assert.ok(failureStart >= 0 && failureEnd > failureStart);
@@ -311,6 +316,130 @@ function makeHarness() {
   context.installAddressSearch("start");
   return { context, input, suggestions, clear, pending, selectedRoutePoints };
 }
+
+function makeRouteGeojson() {
+  return {
+    type: "FeatureCollection",
+    features: [
+      {
+        type: "Feature",
+        properties: { route_kind: "scenic" },
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [-75.22, 40.03],
+            [-75.21, 40.04],
+            [-75.19, 40.065],
+          ],
+        },
+      },
+      {
+        type: "Feature",
+        properties: { route_kind: "baseline" },
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [-75.22, 40.03],
+            [-75.2, 40.045],
+            [-75.19, 40.065],
+          ],
+        },
+      },
+    ],
+  };
+}
+
+function makeRouteHarness() {
+  const layers = new Map();
+  const previousSource = { type: "geojson", data: { old: true } };
+  const sources = new Map([["route-source", previousSource]]);
+  const operations = [];
+  const fitted = [];
+  const map = {
+    getLayer(id) {
+      return layers.get(id) || null;
+    },
+    removeLayer(id) {
+      operations.push(["remove-layer", id]);
+      layers.delete(id);
+    },
+    getSource(id) {
+      return sources.get(id) || null;
+    },
+    removeSource(id) {
+      operations.push(["remove-source", id]);
+      sources.delete(id);
+    },
+    addSource(id, source) {
+      operations.push(["add-source", id]);
+      sources.set(id, source);
+    },
+    addLayer(layer) {
+      operations.push(["add-layer", layer.id]);
+      layers.set(layer.id, layer);
+    },
+  };
+  const context = {
+    Array,
+    Error,
+    Math,
+    Number,
+    Set,
+    ROUTE_SOURCE: "route-source",
+    ROUTE_BASELINE: "route-baseline",
+    ROUTE_SCENIC: "route-scenic",
+    map,
+    removeLayer: (id) => {
+      if (map.getLayer(id)) map.removeLayer(id);
+    },
+    removeSource: (id) => {
+      if (map.getSource(id)) map.removeSource(id);
+    },
+    fitToGeojson: (geojson) => fitted.push(geojson),
+  };
+  vm.runInNewContext(
+    `${routeSource}
+globalThis.renderRoute = renderRoute;
+globalThis.validateRouteGeojson = validateRouteGeojson;`,
+    context
+  );
+  return { context, layers, sources, operations, fitted, previousSource };
+}
+
+test("route rendering validates complete endpoint geometry before replacing source", () => {
+  const harness = makeRouteHarness();
+  const endpoints = {
+    start: { lat: 40.03, lon: -75.22 },
+    end: { lat: 40.065, lon: -75.19 },
+  };
+  const geojson = makeRouteGeojson();
+  harness.context.renderRoute(geojson, endpoints);
+
+  const installed = harness.sources.get("route-source");
+  assert.deepEqual(installed.data, geojson);
+  assert.equal(harness.layers.size, 2);
+  assert.deepEqual(harness.fitted, [geojson]);
+  assert.ok(
+    installed.data.features.every(
+      (feature) =>
+        feature.geometry.type === "LineString" &&
+        feature.geometry.coordinates[0][0] === endpoints.start.lon &&
+        feature.geometry.coordinates[0][1] === endpoints.start.lat &&
+        feature.geometry.coordinates.at(-1)[0] === endpoints.end.lon &&
+        feature.geometry.coordinates.at(-1)[1] === endpoints.end.lat
+    )
+  );
+
+  const sourceBeforeInvalid = installed;
+  const invalid = JSON.parse(JSON.stringify(geojson));
+  invalid.features[0].geometry.coordinates[0] = [-75.23, 40.03];
+  assert.throws(
+    () => harness.context.renderRoute(invalid, endpoints),
+    /does not start at the request/
+  );
+  assert.strictEqual(harness.sources.get("route-source"), sourceBeforeInvalid);
+  assert.equal(harness.fitted.length, 1);
+});
 
 const response = (payload) => ({ ok: true, json: async () => payload });
 const tick = (ms = 230) => new Promise((resolve) => setTimeout(resolve, ms));

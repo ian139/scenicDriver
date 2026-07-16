@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 from copy import deepcopy
+import math
 import pytest
 
 from types import SimpleNamespace
@@ -15,6 +16,10 @@ from scripts.routing.production_benchmark import (
     _evaluations_match,
     evaluate_service_response,
     recompute_feature_metrics,
+)
+from scripts.routing.benchmark_scenic_routing import (
+    _run_case,
+    build_benchmark_cases,
 )
 
 def _feature(
@@ -171,6 +176,174 @@ def test_recompute_feature_metrics_uses_segment_identity() -> None:
     assert metrics["segment_identity_sha256"] != metrics["geometry_sha256"]
 
 
+def test_recompute_feature_metrics_includes_requested_endpoints() -> None:
+    feature = _feature(
+        "scenic",
+        score=7.0,
+        duration=3.0,
+        edge_ids=("e0", "e1"),
+        road_types=("secondary", "residential"),
+    )
+    edge_index = {
+        "e0": SimpleNamespace(
+            start_node_id="n0",
+            end_node_id="n1",
+            distance_km=2.0,
+            scenic_score=7.0,
+            travel_time_minutes=1.5,
+            road_type="secondary",
+        ),
+        "e1": SimpleNamespace(
+            start_node_id="n1",
+            end_node_id="n2",
+            distance_km=2.0,
+            scenic_score=7.0,
+            travel_time_minutes=1.5,
+            road_type="residential",
+        ),
+    }
+    metrics = recompute_feature_metrics(
+        feature,
+        edge_index=edge_index,
+        requested_start=(41.99, -72.0),
+        requested_end=(42.02, -72.0),
+    )
+
+    assert metrics["edge_metric_consistency"]["geometry_sequence"] is False
+
+
+
+@pytest.mark.parametrize(
+    ("coordinates", "expected"),
+    [
+        ([[-72.0, 42.0]], False),
+        ([[-72.0, 42.0], [-72.0, 42.0]], True),
+    ],
+)
+def test_recompute_feature_metrics_validates_zero_edge_equal_endpoint_geometry(
+    coordinates: list[list[float]], expected: bool
+) -> None:
+    feature = {
+        "properties": {
+            "edge_ids": [],
+            "traversal_ids": [],
+            "segment_identity": [],
+            "total_distance_km": 0.0,
+            "raw_scenic_score": 0.0,
+            "average_scenic_score": 0.0,
+            "normalized_scenic_score": 0.0,
+            "estimated_duration_minutes": 0.0,
+            "highway_count": 0,
+        },
+        "geometry": {
+            "type": "LineString",
+            "coordinates": coordinates,
+        },
+    }
+
+    metrics = recompute_feature_metrics(
+        feature,
+        requested_start=(42.0, -72.0),
+        requested_end=(42.0, -72.0),
+    )
+
+    assert metrics["edge_metric_consistency"]["geometry_sequence"] is expected
+
+
+def _zero_edge_response(
+    coordinates: list[list[float]],
+) -> dict[str, object]:
+    response = _response()
+    features = response["geojson"]["features"]
+    assert isinstance(features, list)
+    for feature in features:
+        assert isinstance(feature, dict)
+        properties = feature["properties"]
+        assert isinstance(properties, dict)
+        properties.update(
+            {
+                "edge_ids": [],
+                "traversal_ids": [],
+                "segment_identity": [],
+                "total_distance_km": 0.0,
+                "average_scenic_score": 0.0,
+                "raw_scenic_score": 0.0,
+                "normalized_scenic_score": 0.0,
+                "estimated_duration_minutes": 0.0,
+                "duration_utility": 1.0,
+                "actual_duration_ratio": 1.0,
+                "scenic_score_delta_absolute": 0.0,
+                "scenic_score_delta_relative": None,
+                "same_route": True,
+                "no_better_route_reason": "same_route",
+                "objective_value": 0.5,
+            }
+        )
+        geometry = feature["geometry"]
+        assert isinstance(geometry, dict)
+        geometry["coordinates"] = coordinates
+    routes = response["routes"]
+    assert isinstance(routes, list)
+    for route, feature in zip(routes, features):
+        assert isinstance(route, dict)
+        assert isinstance(feature, dict)
+        route["metrics"] = feature["properties"]
+    diagnostics = response["diagnostics"]
+    assert isinstance(diagnostics, dict)
+    diagnostics.update(
+        {
+            "normalized_scenic_score": 0.0,
+            "scenic_score_delta_absolute": 0.0,
+            "scenic_score_delta_relative": None,
+            "same_route": True,
+            "no_better_route_reason": "same_route",
+        }
+    )
+    return response
+
+
+@pytest.mark.parametrize(
+    ("coordinates", "expected_status"),
+    [
+        ([[-72.0, 42.0]], "invalid"),
+        ([[-72.0, 42.0], [-72.0, 42.0]], "ok"),
+    ],
+)
+def test_evaluate_service_response_validates_zero_edge_geometry(
+    coordinates: list[list[float]], expected_status: str
+) -> None:
+    evaluation = evaluate_service_response(
+        _zero_edge_response(coordinates),
+        q=0.5,
+        kappa=1.8,
+        avoid_highways=False,
+        requested_start=(42.0, -72.0),
+        requested_end=(42.0, -72.0),
+    )
+
+    assert evaluation["status"] == expected_status
+    if expected_status == "ok":
+        assert evaluation["failed_invariants"] == []
+        assert evaluation["duration_minutes"] == pytest.approx(0.0)
+        assert evaluation["objective"]["recomputed"] == pytest.approx(0.5)
+    else:
+        assert "edge_metric_recomputation" in evaluation["failed_invariants"]
+
+
+
+def test_evaluate_service_response_rejects_zero_edge_distinct_endpoints() -> None:
+    evaluation = evaluate_service_response(
+        _zero_edge_response([[-72.0, 42.0], [-71.99, 42.0]]),
+        q=0.5,
+        kappa=1.8,
+        avoid_highways=False,
+        requested_start=(42.0, -72.0),
+        requested_end=(42.0, -71.99),
+    )
+
+    assert evaluation["status"] == "invalid"
+    assert "edge_metric_recomputation" in evaluation["failed_invariants"]
+
 def test_recompute_feature_metrics_uses_canonical_edge_duration() -> None:
     feature = _feature(
         "scenic",
@@ -211,6 +384,22 @@ def test_recompute_feature_metrics_uses_canonical_edge_duration() -> None:
         "highway_count": True,
     }
 
+
+
+
+def test_evaluate_service_response_rejects_missing_scenic_feature() -> None:
+    response = _response()
+    response["geojson"]["features"] = [
+        response["geojson"]["features"][1]
+    ]
+
+    with pytest.raises(ValueError, match="did not contain a scenic feature"):
+        evaluate_service_response(
+            response,
+            q=0.5,
+            kappa=1.8,
+            avoid_highways=False,
+        )
 
 def test_evaluate_service_response_recomputes_objective_and_cap() -> None:
     evaluation = evaluate_service_response(_response(), q=0.5, kappa=1.8, avoid_highways=False)
@@ -445,3 +634,17 @@ def test_strict_direct_parity_checks_route_identity_and_objective() -> None:
     direct["routes"]["scenic"]["traversal_ids"] = ["different"]
     checks = _evaluations_match(strict, direct)
     assert checks["scenic_traversal_ids"] is False
+
+def test_frontier_extended_stress_beats_recorded_baseline() -> None:
+    case = next(
+        item
+        for item in build_benchmark_cases()
+        if item.name == "frontier_extended_stress"
+    )
+    normalized_score, scenic_uplift, duration_ratio = _run_case(case)
+
+    assert math.isfinite(normalized_score)
+    assert math.isfinite(scenic_uplift)
+    assert math.isfinite(duration_ratio)
+    assert normalized_score >= 0.18672137028069238 - 1e-12
+    assert duration_ratio <= 1.1 + 1e-12
