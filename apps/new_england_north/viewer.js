@@ -794,11 +794,18 @@ function validateRouteGeojson(geojson, endpoints = null) {
 
 function renderRoute(geojson, endpoints = null) {
   validateRouteGeojson(geojson, endpoints);
-  if (!map || !mapReady || !map.isStyleLoaded()) return;
+  if (
+    !map ||
+    (typeof mapReady !== "undefined" && !mapReady) ||
+    typeof map.isStyleLoaded === "function" && !map.isStyleLoaded()
+  ) {
+    return;
+  }
   const source = map.getSource(ROUTE_SOURCE);
-  if (source) {
+  if (source && typeof source.setData === "function") {
     source.setData(geojson);
   } else {
+    if (source) removeSource(ROUTE_SOURCE);
     map.addSource(ROUTE_SOURCE, { type: "geojson", data: geojson });
     if (!map.getLayer(ROUTE_BASELINE)) {
       map.addLayer(routeLayer("baseline", "#ffffff", 4, 0.62));
@@ -809,6 +816,7 @@ function renderRoute(geojson, endpoints = null) {
   }
   fitToGeojson(geojson, { maxZoom: 12 });
 }
+
 function clearRoute() {
   routeRequestSequence += 1;
   activeRouteRequest?.controller.abort();
