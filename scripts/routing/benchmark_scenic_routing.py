@@ -36,6 +36,41 @@ class BenchmarkCase:
     end: tuple[float, float]
     max_detour_factor: float
     avoid_highways: bool = False
+    frontier_call_budget: int | None = None
+
+
+class _CallBudgetFrontierPlanner(ScenicRoutePlanner):
+    """Run the production frontier under a deterministic logical budget."""
+
+    _CLOCK_SCALE = 1000.0
+
+    def __init__(self, graph: RoadGraph, frontier_call_budget: int) -> None:
+        if frontier_call_budget <= 0:
+            raise ValueError("frontier call budget must be positive")
+        self._frontier_call_budget = float(frontier_call_budget)
+        self._logical_clock_started = False
+        self._frontier_clock_calls = 0
+        super().__init__(
+            graph=graph,
+            frontier_time_limit_seconds=(
+                self._frontier_call_budget / self._CLOCK_SCALE + 0.0005
+            ),
+        )
+        # The production search still executes unchanged. Only its deadline
+        # source is replaced so preprocessing and warm starts are unmetered,
+        # while frontier expansion receives a fixed call budget.
+        self._monotonic = self._logical_monotonic
+
+    def _logical_monotonic(self) -> float:
+        if not self._logical_clock_started:
+            return 0.0
+        self._frontier_clock_calls += 1
+        return self._frontier_clock_calls / self._CLOCK_SCALE
+
+    def _frontier_warm_start_paths(self, *args: Any, **kwargs: Any) -> list[list[Edge]]:
+        paths = super()._frontier_warm_start_paths(*args, **kwargs)
+        self._logical_clock_started = True
+        return paths
 
 
 @dataclass(frozen=True)
@@ -268,6 +303,7 @@ def build_benchmark_cases() -> tuple[BenchmarkCase, ...]:
             start=(46.0, -72.0),
             end=(46.31, -72.0),
             max_detour_factor=1.1,
+            frontier_call_budget=30000,
         ),
         BenchmarkCase(
             name="hard_cap_1_1",
@@ -470,7 +506,14 @@ def _run_case(case: BenchmarkCase) -> tuple[float, float, float]:
     if max_detour_factor < 1.0:
         raise ValueError(f"{case.name} max detour factor must be at least one")
 
-    planner = ScenicRoutePlanner(graph=case.graph)
+    planner: ScenicRoutePlanner
+    if case.frontier_call_budget is None:
+        planner = ScenicRoutePlanner(graph=case.graph)
+    else:
+        planner = _CallBudgetFrontierPlanner(
+            graph=case.graph,
+            frontier_call_budget=case.frontier_call_budget,
+        )
 
     fastest_route = planner.find_fastest_route(
         case.start,
