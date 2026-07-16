@@ -178,25 +178,29 @@ def build_competing_scenic_detours_graph() -> RoadGraph:
     return graph
 
 
-def build_frontier_timeout_stress_graph() -> RoadGraph:
+def build_frontier_timeout_stress_graph(
+    stages: int = 30,
+    *,
+    latitude: float = 46.0,
+) -> RoadGraph:
     """Build many non-dominated alternatives for the production frontier."""
 
-    stages = 30
+    stages = int(stages)
     options = 4
     graph = RoadGraph()
-    graph.add_node(Node(id="S", lat=46.0, lon=-72.0))
+    graph.add_node(Node(id="S", lat=latitude, lon=-72.0))
     for stage in range(stages):
         graph.add_node(
             Node(
                 id=f"L{stage + 1}",
-                lat=46.0 + 0.01 * (stage + 1),
+                lat=latitude + 0.01 * (stage + 1),
                 lon=-72.0,
             )
         )
     graph.add_node(
         Node(
             id="G",
-            lat=46.0 + 0.01 * (stages + 1),
+            lat=latitude + 0.01 * (stages + 1),
             lon=-72.0,
         )
     )
@@ -302,6 +306,17 @@ def build_benchmark_cases() -> tuple[BenchmarkCase, ...]:
             graph=build_frontier_timeout_stress_graph(),
             start=(46.0, -72.0),
             end=(46.31, -72.0),
+            max_detour_factor=1.1,
+            frontier_call_budget=30000,
+        ),
+        BenchmarkCase(
+            name="frontier_extended_stress",
+            graph=build_frontier_timeout_stress_graph(
+                stages=40,
+                latitude=47.0,
+            ),
+            start=(47.0, -72.0),
+            end=(47.41, -72.0),
             max_detour_factor=1.1,
             frontier_call_budget=30000,
         ),
