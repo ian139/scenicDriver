@@ -2085,6 +2085,143 @@ class ScenicRoutePlanner:
             if path is None or not self._simple_edge_path(path):
                 continue
             add_path(path)
+        if duration_cap_minutes is not None and paths:
+            def path_stats(path: List[Edge]) -> tuple[float, float, float]:
+                distance = 0.0
+                duration = 0.0
+                exposure = 0.0
+                for edge in path:
+                    edge_distance = self._validated_nonnegative(
+                        edge.distance_km,
+                        "edge distance_km",
+                    )
+                    edge_duration = self._edge_duration_minutes(edge)
+                    distance += edge_distance
+                    duration += edge_duration
+                    exposure += (
+                        edge_distance
+                        * clamp_scenic_score(edge.scenic_score)
+                        / 10.0
+                    )
+                return distance, duration, exposure
+
+            pair_candidates: List[tuple[float, List[Edge]]] = []
+            pair_budget = 20_000
+            for base_path in sorted(
+                paths,
+                key=lambda candidate: (
+                    -(
+                        path_stats(candidate)[2]
+                        / path_stats(candidate)[0]
+                        if path_stats(candidate)[0] > 0.0
+                        else 0.0
+                    ),
+                    tuple(
+                        str(getattr(edge, "traversal_id", "") or edge.id)
+                        for edge in candidate
+                    ),
+                ),
+            )[:4]:
+                base_distance, base_duration, base_exposure = path_stats(
+                    base_path
+                )
+                if base_duration > duration_cap_minutes + 1e-12:
+                    continue
+                indexed_edges = list(enumerate(base_path[:64]))
+                alternatives: List[List[Edge]] = []
+                for _, edge in indexed_edges:
+                    current_identity = str(
+                        getattr(edge, "traversal_id", "") or edge.id
+                    )
+                    alternatives.append(
+                        [
+                            alternative
+                            for alternative in self._iter_edges(
+                                edge.start_node_id
+                            )
+                            if str(alternative.end_node_id)
+                            == str(edge.end_node_id)
+                            and str(
+                                getattr(
+                                    alternative,
+                                    "traversal_id",
+                                    "",
+                                )
+                                or alternative.id
+                            )
+                            != current_identity
+                            and not (
+                                avoid_highways
+                                and is_highway_road_type(
+                                    alternative.road_type
+                                )
+                            )
+                        ]
+                    )
+                for left_index, (_, left_edge) in enumerate(indexed_edges):
+                    if not alternatives[left_index]:
+                        continue
+                    for right_index in range(
+                        left_index + 1,
+                        len(indexed_edges),
+                    ):
+                        if not alternatives[right_index]:
+                            continue
+                        for left_alternative in alternatives[left_index]:
+                            for right_alternative in alternatives[right_index]:
+                                pair_budget -= 1
+                                if pair_budget < 0:
+                                    break
+                                if expired():
+                                    break
+                                candidate = list(base_path)
+                                candidate[left_index] = left_alternative
+                                candidate[right_index] = right_alternative
+                                distance, duration, exposure = path_stats(
+                                    candidate
+                                )
+                                if (
+                                    duration
+                                    > duration_cap_minutes + 1e-12
+                                    or distance <= 0.0
+                                ):
+                                    continue
+                                score = exposure / distance
+                                base_score = (
+                                    base_exposure / base_distance
+                                    if base_distance > 0.0
+                                    else 0.0
+                                )
+                                if score <= base_score + 1e-12:
+                                    continue
+                                pair_candidates.append((score, candidate))
+                                pair_candidates.sort(
+                                    key=lambda item: (
+                                        -item[0],
+                                        tuple(
+                                            str(
+                                                getattr(
+                                                    edge,
+                                                    "traversal_id",
+                                                    "",
+                                                )
+                                                or edge.id
+                                            )
+                                            for edge in item[1]
+                                        ),
+                                    )
+                                )
+                                del pair_candidates[32:]
+                            if pair_budget < 0 or expired():
+                                break
+                        if pair_budget < 0 or expired():
+                            break
+                    if pair_budget < 0 or expired():
+                        break
+                if pair_budget < 0 or expired():
+                    break
+            for _, candidate in pair_candidates:
+                add_path(candidate)
         return paths
 
     @staticmethod
