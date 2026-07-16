@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Scenic Drive</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css?v=compact-elastic-beta-v8" />
+    <link rel="stylesheet" href="./styles.css?v=route-popup-v1" />
   </head>
   <body>
     <main class="viewer-shell">
@@ -78,6 +78,10 @@
                 </select>
               </label>
               <span id="regionStatus" class="field-label" role="status" aria-live="polite">Loading supported regions…</span>
+              <label class="toggle-row" for="verboseRouteResults">
+                <input id="verboseRouteResults" type="checkbox" aria-controls="routeDiagnostics" />
+                <span>Show route diagnostics</span>
+              </label>
             </div>
             <div class="output-stack">
               <section class="output-card" aria-label="Remote training">
@@ -120,10 +124,6 @@
               <p class="overline">Route output</p>
               <h2 id="routeResultsTitle">Route comparison</h2>
             </div>
-            <label class="toggle-row" for="verboseRouteResults">
-              <input id="verboseRouteResults" type="checkbox" aria-controls="routeDiagnostics" />
-              <span>Show route diagnostics</span>
-            </label>
           </header>
 
           <div class="route-comparison">
@@ -139,11 +139,11 @@
                 <div><dt>Distance</dt><dd><span id="scenicDistance">--</span></dd></div>
                 <div><dt>Duration</dt><dd><span id="scenicDuration">--</span></dd></div>
                 <div><dt>Average scenic score</dt><dd><span id="scenicScore">--</span></dd></div>
-                <div><dt>Raw scenic score</dt><dd><span id="scenicRawScore">--</span> / 10</dd></div>
-                <div><dt>Normalized scenic score</dt><dd><span id="scenicNormalizedScore">--</span></dd></div>
-                <div><dt>Distance vs baseline</dt><dd><span id="scenicDistanceDelta">--</span></dd></div>
-                <div><dt>Duration vs baseline</dt><dd><span id="scenicDurationDelta">--</span></dd></div>
-                <div><dt>Score vs baseline</dt><dd><span id="scenicScoreDelta">--</span></dd></div>
+                <div class="route-detail-metric"><dt>Raw scenic score</dt><dd><span id="scenicRawScore">--</span> / 10</dd></div>
+                <div class="route-detail-metric"><dt>Normalized scenic score</dt><dd><span id="scenicNormalizedScore">--</span></dd></div>
+                <div class="route-detail-metric"><dt>Distance vs baseline</dt><dd><span id="scenicDistanceDelta">--</span></dd></div>
+                <div class="route-detail-metric"><dt>Duration vs baseline</dt><dd><span id="scenicDurationDelta">--</span></dd></div>
+                <div class="route-detail-metric"><dt>Score vs baseline</dt><dd><span id="scenicScoreDelta">--</span></dd></div>
               </dl>
             </article>
 
@@ -159,8 +159,8 @@
                 <div><dt>Distance</dt><dd><span id="baselineDistance">--</span></dd></div>
                 <div><dt>Duration</dt><dd><span id="baselineDuration">--</span></dd></div>
                 <div><dt>Average scenic score</dt><dd><span id="baselineScore">--</span></dd></div>
-                <div><dt>Raw scenic score</dt><dd><span id="baselineRawScore">--</span> / 10</dd></div>
-                <div><dt>Normalized scenic score</dt><dd><span id="baselineNormalizedScore">--</span></dd></div>
+                <div class="route-detail-metric"><dt>Raw scenic score</dt><dd><span id="baselineRawScore">--</span> / 10</dd></div>
+                <div class="route-detail-metric"><dt>Normalized scenic score</dt><dd><span id="baselineNormalizedScore">--</span></dd></div>
               </dl>
             </article>
           </div>
@@ -201,6 +201,6 @@
     </main>
 
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <script type="module" src="./viewer.js?v=supported-regions-v3"></script>
+    <script type="module" src="./viewer.js?v=route-popup-v1"></script>
   </body>
 </html>

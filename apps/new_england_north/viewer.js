@@ -135,6 +135,8 @@ const el = {
 let routeRequestSequence = 0;
 let activeRouteRequest = null;
 let pendingRouteRender = null;
+let verboseRouteResults = false;
+let latestRoutePayload = null;
 let mapReady = false;
 
 let map;
@@ -597,6 +599,89 @@ async function checkApiHealth() {
   }
 }
 
+function withRequestedRouteEndpoints(geojson, start, end) {
+  if (!geojson || typeof geojson !== "object" || !Array.isArray(geojson.features)) {
+    return geojson;
+  }
+
+  const requestedStart = [Number(start?.lon), Number(start?.lat)];
+  const requestedEnd = [Number(end?.lon), Number(end?.lat)];
+  const endpointsAreValid =
+    requestedStart.every(Number.isFinite) && requestedEnd.every(Number.isFinite);
+  const endpointToleranceSquared = 1e-14;
+
+  const isValidCoordinate = (coordinate) =>
+    Array.isArray(coordinate) &&
+    Number.isFinite(coordinate[0]) &&
+    Number.isFinite(coordinate[1]);
+  const distanceSquared = (first, second) => {
+    const deltaLon = first[0] - second[0];
+    const deltaLat = first[1] - second[1];
+    return deltaLon * deltaLon + deltaLat * deltaLat;
+  };
+  const isNearEndpoint = (coordinate, endpoint) =>
+    distanceSquared(coordinate, endpoint) <= endpointToleranceSquared;
+
+  const copyFeature = (feature) => {
+    if (!feature || typeof feature !== "object") return feature;
+    const geometry = feature.geometry;
+    if (
+      !geometry ||
+      typeof geometry !== "object" ||
+      geometry.type !== "LineString" ||
+      !Array.isArray(geometry.coordinates)
+    ) {
+      return { ...feature };
+    }
+
+    const sourceCoordinates = geometry.coordinates;
+    if (
+      sourceCoordinates.length === 0 ||
+      !sourceCoordinates.every(isValidCoordinate)
+    ) {
+      return { ...feature };
+    }
+
+    const coordinates = sourceCoordinates.map((coordinate) => coordinate.slice());
+    if (endpointsAreValid) {
+      const lastIndex = coordinates.length - 1;
+      const forwardDistance =
+        distanceSquared(coordinates[0], requestedStart) +
+        distanceSquared(coordinates[lastIndex], requestedEnd);
+      const reverseDistance =
+        distanceSquared(coordinates[0], requestedEnd) +
+        distanceSquared(coordinates[lastIndex], requestedStart);
+      if (reverseDistance < forwardDistance) coordinates.reverse();
+
+      if (isNearEndpoint(coordinates[0], requestedStart)) {
+        coordinates[0] = requestedStart.slice();
+      } else {
+        coordinates.unshift(requestedStart.slice());
+      }
+      const orientedLastIndex = coordinates.length - 1;
+      if (isNearEndpoint(coordinates[orientedLastIndex], requestedEnd)) {
+        coordinates[orientedLastIndex] = requestedEnd.slice();
+      } else {
+        coordinates.push(requestedEnd.slice());
+      }
+    }
+
+    return {
+      ...feature,
+      geometry: {
+        ...geometry,
+        coordinates,
+      },
+    };
+  };
+
+  return {
+    ...geojson,
+    features: geojson.features.map(copyFeature),
+  };
+}
+
+ 
 function routeLayer(filterKind, color, width, opacity) {
   const paint = {
     "line-color": color,
@@ -636,6 +721,7 @@ function clearRoute() {
   activeRouteRequest?.controller.abort();
   pendingRouteRender = null;
   activeRouteRequest = null;
+  latestRoutePayload = null;
   removeLayer(ROUTE_SCENIC);
   removeLayer(ROUTE_BASELINE);
   removeSource(ROUTE_SOURCE);
@@ -735,51 +821,98 @@ function humanizeRouteState(value) {
 }
 
 function routeDiagnosticsMarkup(payload) {
-  const diagnostics = payload?.diagnostics || {};
+  const diagnostics = payload?.diagnostics;
+  if (
+    !diagnostics ||
+    typeof diagnostics !== "object" ||
+    Array.isArray(diagnostics) ||
+    Object.keys(diagnostics).length === 0
+  ) {
+    return "";
+  }
   const scenic = payload?.routes?.scenic || {};
   const scoreMapping = payload?.score_mapping || {};
   const parts = [];
-  const elapsedMs = Number(diagnostics.planning_elapsed_ms);
-  if (Number.isFinite(elapsedMs)) {
-    parts.push(`Planning ${formatNumber(elapsedMs, 0)} ms`);
+  const append = (label, value) => {
+    if (value !== null && value !== undefined && value !== "" && value !== "--") {
+      parts.push(`${label} ${value}`);
+    }
+  };
+  const elapsedRaw = diagnostics.planning_elapsed_ms;
+  const elapsedMs = Number(elapsedRaw);
+  if (
+    elapsedRaw !== null &&
+    elapsedRaw !== undefined &&
+    elapsedRaw !== "" &&
+    Number.isFinite(elapsedMs)
+  ) {
+    append("Planning", `${formatNumber(elapsedMs, 0)} ms`);
   }
-  const mappingCoverage = Number(diagnostics.score_mapping_coverage);
-  parts.push(
-    `Requested weight ${displayText(formatNumber(diagnostics.requested_scenic_weight, 2))}`,
-    `Applied weight ${displayText(formatNumber(diagnostics.applied_scenic_weight, 2))}`,
-    `Requested cap ${displayRatio(diagnostics.requested_max_detour_factor)}`,
-    `Applied cap ${displayRatio(diagnostics.applied_max_detour_factor)}`,
-    `Actual ratio ${displayRatio(diagnostics.scenic_fastest_duration_ratio)}`,
-    `Optimization ${displayText(diagnostics.optimization_mode)} / ${displayText(
-      diagnostics.optimization_status
-    )}`,
-    `Gap ${displayText(formatNumber(diagnostics.optimality_gap, 4))}`,
-    `Certified UB ${displayText(formatNumber(diagnostics.certified_upper_bound, 4))}`,
-    `Tile/report score coverage ${
-      Number.isFinite(mappingCoverage)
-        ? formatNumber(mappingCoverage * 100, 0) + "%"
-        : "--"
-    }`,
-    `Highways ${displayText(scenic.highway_count)}`,
-    `Score run ${Array.isArray(scenic.score_run) ? scenic.score_run.length : "--"} edges`
+  append(
+    "Requested weight",
+    displayText(formatNumber(diagnostics.requested_scenic_weight, 2))
   );
+  append(
+    "Applied weight",
+    displayText(formatNumber(diagnostics.applied_scenic_weight, 2))
+  );
+  append("Requested cap", displayRatio(diagnostics.requested_max_detour_factor));
+  append("Applied cap", displayRatio(diagnostics.applied_max_detour_factor));
+  append("Actual ratio", displayRatio(diagnostics.scenic_fastest_duration_ratio));
+  const optimization = [
+    displayText(diagnostics.optimization_mode),
+    displayText(diagnostics.optimization_status),
+  ]
+    .filter((value) => value !== "--")
+    .join(" / ");
+  append("Optimization", optimization);
+  append("Gap", displayText(formatNumber(diagnostics.optimality_gap, 4)));
+  append(
+    "Certified UB",
+    displayText(formatNumber(diagnostics.certified_upper_bound, 4))
+  );
+  const mappingCoverageRaw = diagnostics.score_mapping_coverage;
+  const mappingCoverage = Number(mappingCoverageRaw);
+  if (
+    mappingCoverageRaw !== null &&
+    mappingCoverageRaw !== undefined &&
+    mappingCoverageRaw !== "" &&
+    Number.isFinite(mappingCoverage)
+  ) {
+    append("Tile/report score coverage", `${formatNumber(mappingCoverage * 100, 0)}%`);
+  }
+  append("Highways", displayText(scenic.highway_count));
+  if (Array.isArray(scenic.score_run)) {
+    append("Score run", `${scenic.score_run.length} edges`);
+  }
   if (typeof diagnostics.avoid_highways_applied === "boolean") {
-    parts.push(`Avoid highways ${diagnostics.avoid_highways_applied ? "on" : "off"}`);
+    append("Avoid highways", diagnostics.avoid_highways_applied ? "on" : "off");
   }
   if (scoreMapping.normalization) {
-    parts.push(`Normalization ${String(scoreMapping.normalization)}`);
+    append("Normalization", String(scoreMapping.normalization));
   }
-  return `<small class="route-diagnostics">${escapeHtml(parts.join(" · "))}</small>`;
+  return parts.length
+    ? `<small class="route-diagnostics">${escapeHtml(parts.join(" · "))}</small>`
+    : "";
+}
+
+function routeOutputMarkup(payload) {
+  const status = "Scenic and baseline routes are shown on the map.";
+  return verboseRouteResults ? `${status}${routeDiagnosticsMarkup(payload)}` : status;
 }
 
 function setRouteResultsVerbose(verbose) {
-  const enabled = Boolean(verbose);
+  verboseRouteResults = Boolean(verbose);
   if (el.verboseRouteResults) {
-    el.verboseRouteResults.checked = enabled;
+    el.verboseRouteResults.checked = verboseRouteResults;
   }
+  el.routeResultsDialog?.classList?.toggle?.("verbose", verboseRouteResults);
   if (el.routeDiagnostics) {
-    el.routeDiagnostics.hidden = !enabled;
-    el.routeDiagnostics.setAttribute("aria-hidden", String(!enabled));
+    el.routeDiagnostics.hidden = !verboseRouteResults;
+    el.routeDiagnostics.setAttribute("aria-hidden", String(!verboseRouteResults));
+  }
+  if (latestRoutePayload) {
+    setRouteOutput("Route computed", routeOutputMarkup(latestRoutePayload));
   }
 }
 
@@ -1151,6 +1284,7 @@ async function planRoute(event) {
   event.preventDefault();
   const requestId = ++routeRequestSequence;
   pendingRouteRender = null;
+  latestRoutePayload = null;
   activeRouteRequest?.controller.abort();
   activeRouteRequest = null;
   const start = parsePoint(el.startInput.value) || selectedRoutePoints.start;
@@ -1161,19 +1295,27 @@ async function planRoute(event) {
     return;
   }
 
-  const requestBody = {
+  const requestBody = Object.freeze({
     region: CONFIG.sourceRegion,
     run_name: CONFIG.workingRun,
-    start,
-    end,
+    start: Object.freeze({ lat: start.lat, lon: start.lon }),
+    end: Object.freeze({ lat: end.lat, lon: end.lon }),
     scenic_weight: DEFAULTS.scenicWeight,
     max_detour_factor: Number(el.detourFactor.value),
     avoid_highways: Boolean(el.avoidHighways?.checked),
     include_baseline: true,
-  };
+  });
   const fingerprint = JSON.stringify(requestBody);
   const controller = new AbortController();
-  const requestToken = { requestId, fingerprint, controller };
+  const requestToken = Object.freeze({
+    requestId,
+    fingerprint,
+    controller,
+    endpoints: Object.freeze({
+      start: requestBody.start,
+      end: requestBody.end,
+    }),
+  });
   activeRouteRequest = requestToken;
 
   if (el.submitRoute) {
@@ -1218,16 +1360,19 @@ async function planRoute(event) {
       error.routeFailureCode = failureCode;
       throw error;
     }
+    const normalizedGeojson = withRequestedRouteEndpoints(
+      payload.geojson,
+      requestToken.endpoints.start,
+      requestToken.endpoints.end
+    );
     if (mapReady && map?.isStyleLoaded?.()) {
-      renderRoute(payload.geojson);
+      renderRoute(normalizedGeojson);
     } else {
-      pendingRouteRender = { requestId, geojson: payload.geojson };
+      pendingRouteRender = { requestId, geojson: normalizedGeojson };
     }
     renderRouteComparison(payload);
-    setRouteOutput(
-      "Route computed",
-      `Scenic and baseline routes are shown on the map.${routeDiagnosticsMarkup(payload)}`
-    );
+    latestRoutePayload = payload;
+    setRouteOutput("Route computed", routeOutputMarkup(payload));
     setApiStatus("API: online", "ok");
   } catch (error) {
     if (error?.name === "AbortError" || !isCurrent()) return;

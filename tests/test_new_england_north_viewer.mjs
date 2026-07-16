@@ -19,6 +19,55 @@ const regionStart = viewerSource.indexOf("function resolveRegionSelection");
 const regionEnd = viewerSource.indexOf("\n\nfunction setText", regionStart);
 assert.ok(regionStart >= 0 && regionEnd > regionStart);
 const regionSource = viewerSource.slice(regionStart, regionEnd);
+const endpointStart = viewerSource.indexOf("function withRequestedRouteEndpoints");
+const endpointEnd = viewerSource.indexOf("function routeLayer", endpointStart);
+assert.ok(endpointStart >= 0 && endpointEnd > endpointStart);
+const endpointSource = viewerSource.slice(endpointStart, endpointEnd);
+const formatterStart = viewerSource.indexOf("function escapeHtml");
+const formatterEnd = viewerSource.indexOf("\n\nfunction renderTrainingResults", formatterStart);
+assert.ok(formatterStart >= 0 && formatterEnd > formatterStart);
+const formatterSource = viewerSource.slice(formatterStart, formatterEnd);
+const displayStart = viewerSource.indexOf("function displayRatio");
+const displayEnd = viewerSource.indexOf("\n\nfunction formatWithUnit", displayStart);
+assert.ok(displayStart >= 0 && displayEnd > displayStart);
+const displaySource = viewerSource.slice(displayStart, displayEnd);
+const diagnosticsStart = viewerSource.indexOf("function routeDiagnosticsMarkup");
+const diagnosticsEnd = viewerSource.indexOf("\n\nfunction routeOutputMarkup", diagnosticsStart);
+assert.ok(diagnosticsStart >= 0 && diagnosticsEnd > diagnosticsStart);
+const diagnosticsSource = viewerSource.slice(diagnosticsStart, diagnosticsEnd);
+const outputStart = viewerSource.indexOf("function routeOutputMarkup");
+const outputEnd = viewerSource.indexOf("\n\nfunction setRouteResultsVerbose", outputStart);
+assert.ok(outputStart >= 0 && outputEnd > outputStart);
+const outputSource = viewerSource.slice(outputStart, outputEnd);
+
+function makeRouteOutputHarness() {
+  const context = { Number, String, Array, Object, Math };
+  vm.runInNewContext(
+    `${formatterSource}
+${displaySource}
+${diagnosticsSource}
+let verboseRouteResults = false;
+${outputSource}
+globalThis.routeOutputMarkup = routeOutputMarkup;
+globalThis.setVerboseRouteResultsForTest = (value) => {
+  verboseRouteResults = Boolean(value);
+};`,
+    context
+  );
+  return context;
+}
+
+
+function withRequestedRouteEndpointsForTest() {
+  const context = { Number, Array, Object, Math };
+  vm.runInNewContext(
+    `${endpointSource}
+globalThis.withRequestedRouteEndpoints = withRequestedRouteEndpoints;`,
+    context
+  );
+  return context.withRequestedRouteEndpoints;
+}
+
 
 class FakeElement {
   constructor(tag = "div") {
@@ -132,6 +181,131 @@ globalThis.loadSupportedRegions = loadSupportedRegions;`,
   );
   return { context, regionSelect, runSelect, regionStatus, replacements };
 }
+
+test("route GeoJSON endpoints orient and connect every valid line without mutation", () => {
+  const withRequestedRouteEndpoints = withRequestedRouteEndpointsForTest();
+  const start = { lat: 10, lon: 20 };
+  const end = { lat: 13, lon: 24 };
+  const source = {
+    type: "FeatureCollection",
+    properties: { request: "preserve" },
+    features: [
+      {
+        type: "Feature",
+        properties: { route_kind: "scenic" },
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [20.00000005, 10.00000005],
+            [21, 11],
+            [23.99999995, 12.99999995],
+          ],
+        },
+      },
+      {
+        type: "Feature",
+        properties: { route_kind: "baseline" },
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [24, 13],
+            [23, 12],
+            [20, 10],
+          ],
+        },
+      },
+    ],
+  };
+  const original = JSON.parse(JSON.stringify(source));
+  const normalized = withRequestedRouteEndpoints(source, start, end);
+
+  assert.notStrictEqual(normalized, source);
+  assert.notStrictEqual(normalized.features, source.features);
+  assert.deepEqual(JSON.parse(JSON.stringify(normalized.features[0].geometry.coordinates)), [
+    [20, 10],
+    [21, 11],
+    [24, 13],
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(normalized.features[1].geometry.coordinates)), [
+    [20, 10],
+    [23, 12],
+    [24, 13],
+  ]);
+  assert.equal(normalized.features[0].properties, source.features[0].properties);
+  assert.deepEqual(source, original);
+});
+
+test("malformed and empty line geometries stay unchanged", () => {
+  const withRequestedRouteEndpoints = withRequestedRouteEndpointsForTest();
+  const source = {
+    type: "FeatureCollection",
+    features: [
+      {
+        type: "Feature",
+        properties: { route_kind: "empty" },
+        geometry: { type: "LineString", coordinates: [] },
+      },
+      {
+        type: "Feature",
+        properties: { route_kind: "malformed" },
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [1, 2],
+            ["invalid", 3],
+          ],
+        },
+      },
+      {
+        type: "Feature",
+        properties: { route_kind: "point" },
+        geometry: { type: "Point", coordinates: [1, 2] },
+      },
+    ],
+  };
+
+  const normalized = withRequestedRouteEndpoints(
+    source,
+    { lat: 10, lon: 20 },
+    { lat: 13, lon: 24 }
+  );
+
+  assert.deepEqual(JSON.parse(JSON.stringify(normalized)), source);
+  assert.notStrictEqual(normalized, source);
+});
+
+test("route output stays compact until diagnostics are explicitly enabled", () => {
+  const harness = makeRouteOutputHarness();
+  const payload = {
+    routes: { scenic: { highway_count: 1, score_run: ["edge-1"] } },
+    diagnostics: {
+      planning_elapsed_ms: 24,
+      requested_scenic_weight: 0.8,
+    },
+  };
+  const compact = harness.routeOutputMarkup(payload);
+  assert.equal(compact, "Scenic and baseline routes are shown on the map.");
+  assert.doesNotMatch(compact, /route-diagnostics|Planning/);
+
+  harness.setVerboseRouteResultsForTest(true);
+  const verbose = harness.routeOutputMarkup(payload);
+  assert.match(verbose, /route-diagnostics/);
+  assert.match(verbose, /Planning 24 ms/);
+  assert.doesNotMatch(verbose, /--/);
+  assert.equal(
+    harness.routeOutputMarkup({
+      routes: { scenic: {} },
+      diagnostics: { planning_elapsed_ms: null, score_mapping_coverage: null },
+    }),
+    "Scenic and baseline routes are shown on the map."
+  );
+  assert.equal(
+    harness.routeOutputMarkup({}),
+    "Scenic and baseline routes are shown on the map."
+  );
+});
+
+
 
 const supportedRegions = {
   regions: [

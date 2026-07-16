@@ -593,6 +593,10 @@ h3 {
   min-width: 0;
 }
 
+.dev-panel .region-controls > .toggle-row {
+  grid-column: 1 / -1;
+}
+
 .dev-panel summary {
   display: flex;
   align-items: center;
@@ -779,18 +783,24 @@ h3 {
   max-height: min(88vh, 700px);
   margin: auto;
   padding: 0;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius);
-  background: var(--glass-fallback);
-  background: var(--glass);
+  border: 0;
+  background: transparent;
   color: var(--ink);
-  box-shadow: var(--shadow);
-  backdrop-filter: blur(16px) saturate(1.08);
-  -webkit-backdrop-filter: blur(16px) saturate(1.08);
 }
 
 #routeResultsDialog::backdrop {
-  background: rgba(0, 0, 0, 0.66);
+  background: rgba(16, 20, 18, 0.52);
+}
+
+@keyframes route-dialog-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .dialog-shell {
@@ -799,6 +809,14 @@ h3 {
   max-height: inherit;
   overflow-y: auto;
   padding: 20px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--glass-fallback);
+  background: var(--glass);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  animation: route-dialog-reveal 120ms ease-out both;
 }
 
 .dialog-header {
@@ -857,6 +875,14 @@ h3 {
   gap: 12px;
   padding-bottom: 7px;
   border-bottom: 1px solid var(--line);
+}
+
+.metric-grid > .route-detail-metric {
+  display: none;
+}
+
+#routeResultsDialog.verbose .metric-grid > .route-detail-metric {
+  display: flex;
 }
 
 .metric-grid > div:last-child {
@@ -1051,5 +1077,9 @@ h3 {
 
   .dev-panel[open] .output-stack {
     animation: none !important;
+  }
+
+  .dialog-shell {
+    animation: none;
   }
 }
