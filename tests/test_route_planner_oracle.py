@@ -1011,3 +1011,33 @@ def test_production_frontier_timeout_certifies_mid_expansion_upper_bound(
     assert diagnostics["deadline_reached"] is True
     assert diagnostics["elapsed_ms"] >= 0.0
     assert diagnostics["mode"] == "frontier"
+
+def test_scenic_priority_maximizes_score_under_duration_cap() -> None:
+    planner = ScenicRoutePlanner(_force_production(_tradeoff_graph()))
+    route = planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.03, 0.0),
+        q=0.5,
+        kappa=4.0,
+        scenic_priority=True,
+    )
+
+    assert route.edge_ids == ("scenic-1", "scenic-2")
+    assert route.normalized_scenic_score == pytest.approx(1.0)
+    assert route.estimated_duration_minutes <= route.duration_cap_minutes
+    node_ids = [route.segments[0].start[0]] + [
+        segment.end[0] for segment in route.segments
+    ]
+    assert len(node_ids) == len(set(node_ids))
+
+def test_scenic_priority_overrides_zero_weight_shortcut() -> None:
+    route = ScenicRoutePlanner(_tradeoff_graph()).find_scenic_route(
+        (0.0, 0.0),
+        (0.03, 0.0),
+        q=0.0,
+        kappa=4.0,
+        scenic_priority=True,
+    )
+
+    assert route.edge_ids == ("scenic-1", "scenic-2")
+    assert route.estimated_duration_minutes <= route.duration_cap_minutes
