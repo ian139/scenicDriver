@@ -448,7 +448,13 @@ def _strict_route_metrics(
         "route_kind": route_kind,
         "segments": 1,
         "edge_ids": [edge_id],
-        "segment_identity": [{"edge_id": edge_id}],
+        "segment_identity": [
+            {
+                "edge_id": edge_id,
+                "start": [40.03, -75.22],
+                "end": [40.065, -75.19],
+            }
+        ],
         "total_distance_km": distance_km,
         "average_scenic_score": raw_score,
         "raw_scenic_score": raw_score,
@@ -470,6 +476,28 @@ def _strict_route_metrics(
         "score_run": [[edge_id, raw_score]],
         "zero_improvement_reason": None,
         "no_route_reason": None,
+    }
+
+def _strict_geojson(*metrics: dict[str, object]) -> dict[str, object]:
+    return {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {
+                    "route_kind": route_metrics["route_kind"],
+                    "segment_identity": route_metrics["segment_identity"],
+                },
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [
+                        [-75.22, 40.03],
+                        [-75.19, 40.065],
+                    ],
+                },
+            }
+            for route_metrics in metrics
+        ],
     }
 
 
@@ -543,13 +571,7 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
             ],
             "diagnostics": _strict_diagnostics(),
             "score_mapping": _strict_score_mapping(),
-            "geojson": {
-                "type": "FeatureCollection",
-                "features": [
-                    {"properties": {"route_kind": "scenic"}},
-                    {"properties": {"route_kind": "baseline"}},
-                ],
-            },
+            "geojson": _strict_geojson(scenic_metrics, baseline_metrics),
         }
 
     def fake_diagnose(request):
@@ -603,18 +625,124 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
         "normalized_scenic_score": 0.06,
     }
     assert payload["score_mapping"] == _strict_score_mapping()
-    assert payload["geojson"] == {
-        "type": "FeatureCollection",
-        "features": [
-            {"properties": {"route_kind": "scenic"}},
-            {"properties": {"route_kind": "baseline"}},
-        ],
+    assert payload["geojson"] == _strict_geojson(scenic_metrics, baseline_metrics)
+
+
+def _strict_geometry_request(
+    *, include_baseline: bool = False
+) -> app_api.RouteRequest:
+    return app_api.RouteRequest(
+        graph_geojson="test-graph",
+        start=(40.03, -75.22),
+        end=(40.065, -75.19),
+        include_baseline=include_baseline,
+    )
+
+
+def test_route_geometry_rejects_missing_or_wrong_geometry() -> None:
+    metrics = _strict_route_metrics(
+        distance_km=10.0,
+        duration_min=20.0,
+        raw_score=0.8,
+        edge_id="scenic-edge",
+    )
+    geojson = _strict_geojson(metrics)
+    geojson["features"][0]["geometry"] = {
+        "type": "Point",
+        "coordinates": [-75.22, 40.03],
     }
 
+    with pytest.raises(app_api.HTTPException) as raised:
+        app_api._validate_route_geometry(
+            geojson,
+            request=_strict_geometry_request(),
+            routes={"scenic": metrics},
+        )
+
+    assert raised.value.status_code == 502
+    assert "LineString" in str(raised.value.detail)
+
+
+def test_route_geometry_rejects_duplicate_features_and_identity_mismatch() -> None:
+    metrics = _strict_route_metrics(
+        distance_km=10.0,
+        duration_min=20.0,
+        raw_score=0.8,
+        edge_id="scenic-edge",
+    )
+    duplicate = _strict_geojson(metrics, metrics)
+    with pytest.raises(app_api.HTTPException, match="duplicate"):
+        app_api._validate_route_geometry(
+            duplicate,
+            request=_strict_geometry_request(),
+            routes={"scenic": metrics},
+        )
+
+    mismatched = _strict_geojson(metrics)
+    mismatched["features"][0]["properties"]["segment_identity"] = [
+        {
+            "edge_id": "other-edge",
+            "start": [40.03, -75.22],
+            "end": [40.065, -75.19],
+        }
+    ]
+    with pytest.raises(app_api.HTTPException, match="does not match"):
+        app_api._validate_route_geometry(
+            mismatched,
+            request=_strict_geometry_request(),
+            routes={"scenic": metrics},
+        )
+
+
+def test_route_geometry_rejects_discontinuous_segments_and_wrong_endpoint() -> None:
+    metrics = _strict_route_metrics(
+        distance_km=10.0,
+        duration_min=20.0,
+        raw_score=0.8,
+        edge_id="scenic-edge",
+    )
+    metrics["segment_identity"] = [
+        {
+            "edge_id": "first",
+            "start": [40.03, -75.22],
+            "end": [40.04, -75.21],
+        },
+        {
+            "edge_id": "second",
+            "start": [40.05, -75.20],
+            "end": [40.065, -75.19],
+        },
+    ]
+    geojson = _strict_geojson(metrics)
+    with pytest.raises(app_api.HTTPException, match="not continuous"):
+        app_api._validate_route_geometry(
+            geojson,
+            request=_strict_geometry_request(),
+            routes={"scenic": metrics},
+        )
+
+    endpoint_metrics = _strict_route_metrics(
+        distance_km=10.0,
+        duration_min=20.0,
+        raw_score=0.8,
+        edge_id="scenic-edge",
+    )
+    endpoint_geojson = _strict_geojson(endpoint_metrics)
+    endpoint_geojson["features"][0]["geometry"]["coordinates"][-1] = [
+        -75.18,
+        40.065,
+    ]
+    with pytest.raises(app_api.HTTPException, match="does not end"):
+        app_api._validate_route_geometry(
+            endpoint_geojson,
+            request=_strict_geometry_request(),
+            routes={"scenic": endpoint_metrics},
+        )
+    
+    
 def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
     plan_calls: list[object] = []
     diagnosis_calls: list[object] = []
-
     monkeypatch.setattr(
         app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
     )
@@ -882,6 +1010,10 @@ def test_route_compare_redacts_private_asset_paths(monkeypatch) -> None:
     score_mapping["source"] = "/private/report.json"
     diagnostics = _strict_diagnostics()
     diagnostics["score_mapping_coverage"] = 0.37
+    geojson = _strict_geojson(scenic_metrics)
+    geojson["features"][0]["properties"]["score_provenance"] = {
+        "source": "/private/report.json"
+    }
     monkeypatch.setattr(
         app_api,
         "plan_routes",
@@ -889,19 +1021,7 @@ def test_route_compare_redacts_private_asset_paths(monkeypatch) -> None:
             "routes": [{"route_kind": "scenic", "metrics": scenic_metrics}],
             "diagnostics": diagnostics,
             "score_mapping": score_mapping,
-            "geojson": {
-                "type": "FeatureCollection",
-                "features": [
-                    {
-                        "type": "Feature",
-                        "properties": {
-                            "route_kind": "scenic",
-                            "score_provenance": {"source": "/private/report.json"}
-                        },
-                        "geometry": {"type": "LineString", "coordinates": []},
-                    }
-                ],
-            },
+            "geojson": geojson,
         },
     )
     response = TestClient(create_app()).post(

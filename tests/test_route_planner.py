@@ -563,6 +563,53 @@ def test_osm_linestring_intermediate_coordinates_survive_route_feature() -> None
     ]
 
 
+def test_zero_edge_route_feature_keeps_requested_endpoints() -> None:
+    from src.route_planner.service import route_to_feature
+
+    graph = RoadGraph()
+    graph.add_node(Node(id="only", lat=42.0, lon=-72.0))
+    planner = ScenicRoutePlanner(graph=graph)
+    route = planner.find_fastest_route(
+        (42.001, -72.001),
+        (42.002, -72.002),
+    )
+    feature = route_to_feature(
+        route,
+        "baseline",
+        requested_start=(42.001, -72.001),
+        requested_end=(42.002, -72.002),
+    )
+
+    assert route.edge_ids == ()
+    assert feature["geometry"]["coordinates"] == [
+        [-72.001, 42.001],
+        [-72.002, 42.002],
+    ]
+    assert feature["properties"]["segment_identity"] == []
+
+
+
+def test_zero_edge_equal_endpoint_route_feature_has_two_positions() -> None:
+    from src.route_planner.service import route_to_feature
+
+    graph = RoadGraph()
+    graph.add_node(Node(id="only", lat=42.0, lon=-72.0))
+    route = ScenicRoutePlanner(graph=graph).find_fastest_route(
+        (42.0, -72.0),
+        (42.0, -72.0),
+    )
+    feature = route_to_feature(
+        route,
+        "baseline",
+        requested_start=(42.0, -72.0),
+        requested_end=(42.0, -72.0),
+    )
+
+    assert feature["geometry"]["coordinates"] == [
+        [-72.0, 42.0],
+        [-72.0, 42.0],
+    ]
+
 def test_osm_length_is_authoritative_for_curves_and_geometryless_edges() -> None:
     from src.route_planner.graph import _graph_from_osmnx, _haversine_km
 

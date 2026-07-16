@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 from array import array
 from functools import lru_cache
 import io
@@ -885,6 +885,201 @@ def _validate_certified_bound(
 
 
 
+def _invalid_route_geometry(message: str) -> NoReturn:
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "error": "invalid_route_service_response",
+            "message": message,
+        },
+    )
+
+
+def _route_coordinate(
+    value: Any,
+    *,
+    label: str,
+    latitude_first: bool = False,
+) -> tuple[float, float]:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 2
+        or any(
+            isinstance(item, bool) or not isinstance(item, (int, float))
+            for item in value
+        )
+    ):
+        _invalid_route_geometry(f"{label} must be a numeric coordinate pair")
+    try:
+        first = float(value[0])
+        second = float(value[1])
+    except (TypeError, ValueError, OverflowError):
+        _invalid_route_geometry(f"{label} must be a numeric coordinate pair")
+    latitude, longitude = (
+        (first, second) if latitude_first else (second, first)
+    )
+    if (
+        not math.isfinite(latitude)
+        or not math.isfinite(longitude)
+        or not -90.0 <= latitude <= 90.0
+        or not -180.0 <= longitude <= 180.0
+    ):
+        _invalid_route_geometry(f"{label} contains invalid coordinates")
+    return longitude, latitude
+
+
+def _route_coordinates_match(
+    first: tuple[float, float],
+    second: tuple[float, float],
+) -> bool:
+    return all(
+        math.isclose(
+            first[index],
+            second[index],
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        )
+        for index in range(2)
+    )
+
+
+def _dedupe_route_coordinates(
+    coordinates: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    result: list[tuple[float, float]] = []
+    for coordinate in coordinates:
+        if not result or not _route_coordinates_match(coordinate, result[-1]):
+            result.append(coordinate)
+    return result
+
+
+def _validate_route_geometry(
+    geojson: Any,
+    *,
+    request: RouteRequest,
+    routes: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    if (
+        not isinstance(geojson, dict)
+        or geojson.get("type") != "FeatureCollection"
+        or not isinstance(geojson.get("features"), list)
+    ):
+        _invalid_route_geometry("Route service returned invalid route GeoJSON")
+    features = geojson["features"]
+    expected_kinds = {"scenic"} | (
+        {"baseline"} if request.include_baseline else set()
+    )
+    required_start = (float(request.start[1]), float(request.start[0]))
+    required_end = (float(request.end[1]), float(request.end[0]))
+    validated: dict[str, dict[str, Any]] = {}
+    for index, feature in enumerate(features):
+        if not isinstance(feature, dict):
+            _invalid_route_geometry(f"route feature {index} is malformed")
+        properties = feature.get("properties")
+        if not isinstance(properties, dict):
+            _invalid_route_geometry(
+                f"route feature {index} has no properties"
+            )
+        route_kind = properties.get("route_kind")
+        if not isinstance(route_kind, str) or route_kind not in expected_kinds:
+            _invalid_route_geometry(
+                f"route feature {index} has an unexpected route kind"
+            )
+        if route_kind in validated:
+            _invalid_route_geometry(
+                f"route GeoJSON contains duplicate {route_kind} features"
+            )
+        geometry = feature.get("geometry")
+        if (
+            not isinstance(geometry, dict)
+            or geometry.get("type") != "LineString"
+            or not isinstance(geometry.get("coordinates"), list)
+        ):
+            _invalid_route_geometry(
+                f"{route_kind} route geometry is not a LineString"
+            )
+        raw_coordinates = geometry["coordinates"]
+        if len(raw_coordinates) < 2:
+            _invalid_route_geometry(
+                f"{route_kind} route geometry has fewer than two coordinates"
+            )
+        coordinates = _dedupe_route_coordinates(
+            [
+                _route_coordinate(
+                    coordinate,
+                    label=f"{route_kind} geometry coordinate {coordinate_index}",
+                )
+                for coordinate_index, coordinate in enumerate(raw_coordinates)
+            ]
+        )
+        if not _route_coordinates_match(coordinates[0], required_start):
+            _invalid_route_geometry(
+                f"{route_kind} route geometry does not start at the request"
+            )
+        if not _route_coordinates_match(coordinates[-1], required_end):
+            _invalid_route_geometry(
+                f"{route_kind} route geometry does not end at the request"
+            )
+        rows = properties.get("segment_identity")
+        if not isinstance(rows, list):
+            _invalid_route_geometry(
+                f"{route_kind} route has no segment identity rows"
+            )
+        expected_metrics = routes.get(route_kind)
+        if (
+            not isinstance(expected_metrics, dict)
+            or rows != expected_metrics.get("segment_identity")
+        ):
+            _invalid_route_geometry(
+                f"{route_kind} segment identity does not match route metrics"
+            )
+        segment_coordinates: list[tuple[float, float]] = []
+        previous_end: tuple[float, float] | None = None
+        for row_index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                _invalid_route_geometry(
+                    f"{route_kind} segment row {row_index} is malformed"
+                )
+            segment_start = _route_coordinate(
+                row.get("start"),
+                label=f"{route_kind} segment row {row_index} start",
+                latitude_first=True,
+            )
+            segment_end = _route_coordinate(
+                row.get("end"),
+                label=f"{route_kind} segment row {row_index} end",
+                latitude_first=True,
+            )
+            if (
+                previous_end is not None
+                and not _route_coordinates_match(previous_end, segment_start)
+            ):
+                _invalid_route_geometry(
+                    f"{route_kind} segment rows are not continuous"
+                )
+            if not segment_coordinates:
+                segment_coordinates.append(segment_start)
+            segment_coordinates.append(segment_end)
+            previous_end = segment_end
+        expected_coordinates = _dedupe_route_coordinates(
+            [required_start, *segment_coordinates, required_end]
+        )
+        if len(coordinates) != len(expected_coordinates) or any(
+            not _route_coordinates_match(actual, expected)
+            for actual, expected in zip(coordinates, expected_coordinates)
+        ):
+            _invalid_route_geometry(
+                f"{route_kind} route geometry omits or reorders scored segments"
+            )
+        validated[route_kind] = feature
+    if set(validated) != expected_kinds:
+        missing = sorted(expected_kinds - set(validated))
+        _invalid_route_geometry(
+            f"Route GeoJSON is missing route features: {', '.join(missing)}"
+        )
+    return validated
+
+
 def _validate_route_contract(
     result: dict[str, Any],
     *,
@@ -969,11 +1164,31 @@ def _validate_route_contract(
             detail="Route service returned no routes",
         )
     routes: dict[str, Any] = {}
+    expected_route_kinds = {"scenic"} | (
+        {"baseline"} if request.include_baseline else set()
+    )
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("route_kind"), str):
             raise HTTPException(
                 status_code=502,
                 detail="Route service returned an invalid route row",
+            )
+        route_kind = row["route_kind"]
+        if route_kind not in expected_route_kinds:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "invalid_route_service_response",
+                    "message": f"Route service returned unexpected {route_kind} route",
+                },
+            )
+        if route_kind in routes:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "invalid_route_service_response",
+                    "message": f"Route service returned duplicate {route_kind} routes",
+                },
             )
         metrics = row.get("metrics")
         if not isinstance(metrics, dict):
@@ -989,7 +1204,7 @@ def _validate_route_contract(
                 status_code=502,
                 detail={
                     "error": "invalid_route_service_response",
-                    "route_kind": row["route_kind"],
+                    "route_kind": route_kind,
                     "missing_metrics": missing_metrics,
                 },
             )
@@ -1080,27 +1295,7 @@ def _validate_route_contract(
             detail="Route service returned no baseline route",
         )
     geojson = result.get("geojson")
-    features = geojson.get("features") if isinstance(geojson, dict) else None
-    if (
-        not isinstance(geojson, dict)
-        or geojson.get("type") != "FeatureCollection"
-        or not isinstance(features, list)
-    ):
-        raise HTTPException(
-            status_code=502, detail="Route service returned invalid route GeoJSON"
-        )
-    feature_kinds = {
-        feature.get("properties", {}).get("route_kind")
-        for feature in features
-        if isinstance(feature, dict) and isinstance(feature.get("properties"), dict)
-    }
-    required_feature_kinds = {"scenic"} | (
-        {"baseline"} if request.include_baseline else set()
-    )
-    if not required_feature_kinds.issubset(feature_kinds):
-        raise HTTPException(
-            status_code=502, detail="Route service returned incomplete route GeoJSON"
-        )
+    _validate_route_geometry(geojson, request=request, routes=routes)
     _validate_certified_bound(
         {
             "objective_value": routes["scenic"]["objective_value"],

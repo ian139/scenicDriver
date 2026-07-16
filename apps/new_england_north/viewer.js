@@ -610,7 +610,100 @@ function routeLayer(filterKind, color, width, opacity) {
   };
 }
 
-function renderRoute(geojson) {
+function routeCoordinatesMatch(first, second) {
+  return first.every((value, index) => {
+    const difference = Math.abs(value - second[index]);
+    return difference <= Math.max(1e-9, 1e-12 * Math.max(Math.abs(value), Math.abs(second[index])));
+  });
+}
+
+function validateRouteCoordinate(value, label) {
+  if (
+    !Array.isArray(value) ||
+    value.length !== 2 ||
+    value.some((item) => typeof item !== "number" || !Number.isFinite(item))
+  ) {
+    throw new Error(`${label} must be a finite coordinate pair`);
+  }
+  const [lon, lat] = value;
+  if (lon < -180 || lon > 180 || lat < -90 || lat > 90) {
+    throw new Error(`${label} is outside coordinate bounds`);
+  }
+  return [lon, lat];
+}
+
+function validateRouteGeojson(geojson, endpoints = null) {
+  if (
+    !geojson ||
+    geojson.type !== "FeatureCollection" ||
+    !Array.isArray(geojson.features)
+  ) {
+    throw new Error("Route response is not a FeatureCollection");
+  }
+  const expectedKinds = new Set(["scenic", "baseline"]);
+  const seenKinds = new Set();
+  const requested = endpoints
+    ? {
+        start: validateRouteCoordinate(
+          [endpoints.start?.lon, endpoints.start?.lat],
+          "requested start"
+        ),
+        end: validateRouteCoordinate(
+          [endpoints.end?.lon, endpoints.end?.lat],
+          "requested end"
+        ),
+      }
+    : null;
+  for (const [index, feature] of geojson.features.entries()) {
+    const properties = feature?.properties;
+    const routeKind = properties?.route_kind;
+    if (
+      !feature ||
+      typeof feature !== "object" ||
+      !properties ||
+      typeof properties !== "object" ||
+      !expectedKinds.has(routeKind)
+    ) {
+      throw new Error(`Route feature ${index} has an unexpected route kind`);
+    }
+    if (seenKinds.has(routeKind)) {
+      throw new Error(`Route response contains duplicate ${routeKind} features`);
+    }
+    seenKinds.add(routeKind);
+    const geometry = feature.geometry;
+    if (
+      !geometry ||
+      geometry.type !== "LineString" ||
+      !Array.isArray(geometry.coordinates) ||
+      geometry.coordinates.length < 2
+    ) {
+      throw new Error(`${routeKind} route geometry is missing or invalid`);
+    }
+    const coordinates = geometry.coordinates.map((coordinate, coordinateIndex) =>
+      validateRouteCoordinate(
+        coordinate,
+        `${routeKind} geometry coordinate ${coordinateIndex}`
+      )
+    );
+    if (requested) {
+      if (!routeCoordinatesMatch(coordinates[0], requested.start)) {
+        throw new Error(`${routeKind} route geometry does not start at the request`);
+      }
+      if (!routeCoordinatesMatch(coordinates.at(-1), requested.end)) {
+        throw new Error(`${routeKind} route geometry does not end at the request`);
+      }
+    }
+  }
+  for (const routeKind of expectedKinds) {
+    if (!seenKinds.has(routeKind)) {
+      throw new Error(`Route response is missing ${routeKind} geometry`);
+    }
+  }
+  return geojson;
+}
+
+function renderRoute(geojson, endpoints = null) {
+  validateRouteGeojson(geojson, endpoints);
   removeLayer(ROUTE_SCENIC);
   removeLayer(ROUTE_BASELINE);
   removeSource(ROUTE_SOURCE);
@@ -905,6 +998,7 @@ async function fetchValidatedRoute() {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   const result = await response.json();
+  validateRouteGeojson(result.geojson);
   const kinds = new Set(
     result.geojson?.features?.map((feature) => feature.properties?.route_kind)
   );
@@ -1188,7 +1282,7 @@ async function planRoute(event) {
       error.routeFailureCode = failureCode;
       throw error;
     }
-    renderRoute(payload.geojson);
+    renderRoute(payload.geojson, { start, end });
     renderRouteComparison(payload);
     setRouteOutput(
       "Route computed",
