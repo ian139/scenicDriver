@@ -95,6 +95,33 @@ def _tradeoff_graph() -> RoadGraph:
     return graph
 
 
+def test_large_graph_fastest_uses_reverse_same_edge_access() -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="A", lat=0.0, lon=0.0))
+    graph.add_node(Node(id="B", lat=0.0, lon=1.0))
+    graph.add_edge(
+        Edge(
+            id="two-way",
+            start_node_id="A",
+            end_node_id="B",
+            distance_km=10.0,
+            scenic_score=5.0,
+            speed_limit_kmh=60,
+            one_way=False,
+        )
+    )
+    for index in range(2_001):
+        graph.add_node(Node(id=f"isolated-{index}", lat=10.0 + index, lon=10.0))
+
+    planner = ScenicRoutePlanner(graph)
+    route = planner.find_fastest_route((0.0, 0.8), (0.0, 0.2))
+
+    assert route.edge_ids == ("two-way",)
+    assert route.segments[0].direction == "reverse"
+    assert route.estimated_duration_minutes == pytest.approx(6.0)
+    assert route.waypoints == [(0.0, 0.8), (0.0, 0.2)]
+
+
 def _route(planner: ScenicRoutePlanner, q: float, kappa: float):
     return planner.find_scenic_route(
         (0.0, 0.0),

@@ -3262,7 +3262,7 @@ class ScenicRoutePlanner:
         *,
         avoid_highways: bool,
     ) -> Route:
-        """Solve endpoint access without rebuilding the production CSR graph."""
+        """Solve all legal projected endpoint access states on the base graph."""
         base = self.graph
         assert base is not None
         excluded = HIGHWAY_ROAD_TYPES if avoid_highways else frozenset()
@@ -3272,8 +3272,8 @@ class ScenicRoutePlanner:
         ends, _ = base.find_nearest_edge_positions_with_distance(
             *end, excluded_road_types=excluded
         )
-        start_projection, end_projection = starts[0], ends[0]
-        start_id, end_id = "__route_large_start__", "__route_large_end__"
+        start_id = "__route_large_start__"
+        end_id = "__route_large_end__"
 
         def partial(
             source: Edge,
@@ -3301,92 +3301,111 @@ class ScenicRoutePlanner:
             value.source_fraction = float(fraction)
             return value
 
-        prefixes = [
-            (
-                str(start_projection.edge.end_node_id),
-                partial(
-                    start_projection.edge,
-                    f"{start_id}:forward",
-                    start_id,
-                    start_projection.edge.end_node_id,
-                    1.0 - float(start_projection.fraction),
-                    "forward",
-                ),
-            )
-        ]
-        if not start_projection.edge.one_way:
-            prefixes.append(
+        best: tuple[float, list[Edge], object, object] | None = None
+        for start_index, start_projection in enumerate(starts):
+            prefixes = [
                 (
-                    str(start_projection.edge.start_node_id),
+                    str(start_projection.edge.end_node_id),
                     partial(
                         start_projection.edge,
-                        f"{start_id}:reverse",
+                        f"{start_id}:{start_index}:forward",
                         start_id,
-                        start_projection.edge.start_node_id,
-                        float(start_projection.fraction),
-                        "reverse",
+                        start_projection.edge.end_node_id,
+                        1.0 - float(start_projection.fraction),
+                        "forward",
                     ),
                 )
-            )
-        suffixes = [
-            (
-                str(end_projection.edge.start_node_id),
-                partial(
-                    end_projection.edge,
-                    f"{end_id}:forward",
-                    end_projection.edge.start_node_id,
-                    end_id,
-                    float(end_projection.fraction),
-                    "forward",
-                ),
-            )
-        ]
-        if not end_projection.edge.one_way:
-            suffixes.append(
-                (
-                    str(end_projection.edge.end_node_id),
-                    partial(
-                        end_projection.edge,
-                        f"{end_id}:reverse",
-                        end_projection.edge.end_node_id,
-                        end_id,
-                        1.0 - float(end_projection.fraction),
-                        "reverse",
-                    ),
+            ]
+            if not start_projection.edge.one_way:
+                prefixes.append(
+                    (
+                        str(start_projection.edge.start_node_id),
+                        partial(
+                            start_projection.edge,
+                            f"{start_id}:{start_index}:reverse",
+                            start_id,
+                            start_projection.edge.start_node_id,
+                            float(start_projection.fraction),
+                            "reverse",
+                        ),
+                    )
                 )
-            )
-        best: tuple[float, list[Edge], Edge, Edge] | None = None
-        for prefix_node, prefix in prefixes:
-            for suffix_node, suffix in suffixes:
-                middle = self._cached_fastest_edges(
-                    base.get_node(prefix_node),
-                    base.get_node(suffix_node),
-                    avoid_highways,
-                    0.0,
-                )
-                if middle is None:
+            for end_index, end_projection in enumerate(ends):
+                suffixes = [
+                    (
+                        str(end_projection.edge.start_node_id),
+                        partial(
+                            end_projection.edge,
+                            f"{end_id}:{end_index}:forward",
+                            end_projection.edge.start_node_id,
+                            end_id,
+                            float(end_projection.fraction),
+                            "forward",
+                        ),
+                    )
+                ]
+                if not end_projection.edge.one_way:
+                    suffixes.append(
+                        (
+                            str(end_projection.edge.end_node_id),
+                            partial(
+                                end_projection.edge,
+                                f"{end_id}:{end_index}:reverse",
+                                end_projection.edge.end_node_id,
+                                end_id,
+                                1.0 - float(end_projection.fraction),
+                                "reverse",
+                            ),
+                        )
+                    )
+                for prefix_node, prefix in prefixes:
+                    for suffix_node, suffix in suffixes:
+                        middle = self._cached_fastest_edges(
+                            base.get_node(prefix_node),
+                            base.get_node(suffix_node),
+                            avoid_highways,
+                            0.0,
+                        )
+                        if middle is None:
+                            continue
+                        candidate = [prefix, *middle, suffix]
+                        duration = self._path_duration_minutes(candidate)
+                        if best is None or duration < best[0]:
+                            best = (duration, candidate, start_projection, end_projection)
+                if str(start_projection.edge.id) != str(end_projection.edge.id):
                     continue
-                candidate = [prefix, *middle, suffix]
-                duration = self._path_duration_minutes(candidate)
-                if best is None or duration < best[0]:
-                    best = (duration, candidate, prefix, suffix)
-        if (
-            start_projection.edge.id == end_projection.edge.id
-            and float(start_projection.fraction) <= float(end_projection.fraction)
-        ):
-            direct = partial(
-                start_projection.edge,
-                f"{start_id}:direct",
-                start_id,
-                end_id,
-                float(end_projection.fraction) - float(start_projection.fraction),
-                "forward",
-            )
-            direct_duration = self._path_duration_minutes([direct])
-            if best is None or direct_duration < best[0]:
-                best = (direct_duration, [direct], direct, direct)
+                start_fraction = float(start_projection.fraction)
+                end_fraction = float(end_projection.fraction)
+                if start_fraction <= end_fraction:
+                    direct = partial(
+                        start_projection.edge,
+                        f"{start_id}:{start_index}:{end_index}:direct-forward",
+                        start_id,
+                        end_id,
+                        end_fraction - start_fraction,
+                        "forward",
+                    )
+                    direct_duration = self._path_duration_minutes([direct])
+                    if best is None or direct_duration < best[0]:
+                        best = (direct_duration, [direct], start_projection, end_projection)
+                if (
+                    not start_projection.edge.one_way
+                    and start_fraction >= end_fraction
+                ):
+                    direct = partial(
+                        start_projection.edge,
+                        f"{start_id}:{start_index}:{end_index}:direct-reverse",
+                        start_id,
+                        end_id,
+                        start_fraction - end_fraction,
+                        "reverse",
+                    )
+                    direct_duration = self._path_duration_minutes([direct])
+                    if best is None or direct_duration < best[0]:
+                        best = (direct_duration, [direct], start_projection, end_projection)
         if best is None:
             raise ValueError("No route found between the given coordinates.")
+        _, best_edges, start_projection, end_projection = best
         render_graph = RoadGraph()
         render_graph.nodes = dict(base.nodes)
         render_graph.edges = dict(base.edges)
@@ -3400,27 +3419,30 @@ class ScenicRoutePlanner:
         render_graph.add_node(
             Node(end_id, float(end_projection.lat), float(end_projection.lon))
         )
-        for edge in best[1]:
+        for edge in best_edges:
             if edge.id not in render_graph.edges:
                 render_graph.add_edge(edge)
         policy = resolve_routing_policy(
-            scenic_weight=0.0, kappa=1.0, avoid_highways=avoid_highways
+            scenic_weight=0.0,
+            kappa=1.0,
+            avoid_highways=avoid_highways,
         )
+        duration = self._path_duration_minutes(best_edges)
         evaluation = evaluate_path(
-            best[1],
+            best_edges,
             q=0.0,
             kappa=1.0,
-            fastest_duration_minutes=best[0],
+            fastest_duration_minutes=duration,
             policy=policy,
         )
         self.graph = render_graph
         try:
             return self._path_to_route(
-                best[1],
+                best_edges,
                 start_node=render_graph.get_node(start_id),
                 goal_node=render_graph.get_node(end_id),
                 evaluation=evaluation,
-                fastest_duration_minutes=best[0],
+                fastest_duration_minutes=duration,
                 requested_max_detour_factor=1.0,
                 exact=True,
                 exactness_status="exact",
