@@ -122,6 +122,42 @@ def test_large_graph_fastest_uses_reverse_same_edge_access() -> None:
     assert route.waypoints == [(0.0, 0.8), (0.0, 0.2)]
 
 
+
+
+def test_large_graph_fastest_checks_all_tied_edge_projections() -> None:
+    graph = RoadGraph()
+    for node_id in ("A", "B", "C", "D"):
+        graph.add_node(Node(id=node_id, lat=0.0, lon=0.0 if node_id in ("A", "C") else 1.0))
+    graph.add_edge(
+        Edge(
+            id="a-bad",
+            start_node_id="A",
+            end_node_id="B",
+            distance_km=10.0,
+            scenic_score=1.0,
+            speed_limit_kmh=10,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="z-good",
+            start_node_id="C",
+            end_node_id="D",
+            distance_km=10.0,
+            scenic_score=1.0,
+            speed_limit_kmh=100,
+            one_way=True,
+        )
+    )
+    for index in range(2_001):
+        graph.add_node(Node(id=f"isolated-{index}", lat=10.0 + index, lon=10.0))
+
+    planner = ScenicRoutePlanner(graph)
+    route = planner.find_fastest_route((0.0, 0.2), (0.0, 0.8))
+
+    assert route.edge_ids == ("z-good",)
+    assert route.estimated_duration_minutes == pytest.approx(3.6)
 def _route(planner: ScenicRoutePlanner, q: float, kappa: float):
     return planner.find_scenic_route(
         (0.0, 0.0),
