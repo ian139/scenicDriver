@@ -704,31 +704,9 @@ def route_to_feature(
     requested_start: tuple[float, float] | None = None,
     requested_end: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
-    if requested_start is None and requested_end is None:
-        coords = [[lon, lat] for lat, lon in route.waypoints]
-    else:
-        coords: list[list[float]] = []
-
-        def append_coordinate(point: tuple[float, float]) -> None:
-            coordinate = [float(point[1]), float(point[0])]
-            if not coords or coordinate != coords[-1]:
-                coords.append(coordinate)
-
-        if requested_start is not None:
-            append_coordinate(requested_start)
-        if route.segments:
-            for waypoint in route.waypoints:
-                append_coordinate(waypoint)
-        if requested_end is not None:
-            append_coordinate(requested_end)
-        if (
-            not route.segments
-            and requested_start is not None
-            and requested_end is not None
-            and requested_start == requested_end
-        ):
-            # A zero-edge equal-point route still needs two LineString positions.
-            coords.append([float(requested_end[1]), float(requested_end[0])])
+    # Route waypoints are the authoritative road traversal.  Never prepend or
+    # append request coordinates: doing so creates unscored, off-road geometry.
+    coords = [[float(lon), float(lat)] for lat, lon in route.waypoints]
     raw_score = float(route.average_scenic_score)
     normalized_score = float(
         getattr(route, "scenic_score_normalized", _normalized_score(raw_score))
@@ -756,6 +734,8 @@ def route_to_feature(
             "normalized_scenic_score": _normalized_score(segment.scenic_score),
             "road_name": segment.road_name,
             "road_type": segment.road_type,
+            "source_edge_id": getattr(segment, "source_edge_id", None),
+            "source_fraction": getattr(segment, "source_fraction", None),
         }
         for index, segment in enumerate(route.segments)
     ]
@@ -783,6 +763,26 @@ def route_to_feature(
         "requested_max_detour_factor": objective_values.get(
             "requested_max_detour_factor",
             getattr(route, "requested_max_detour_factor", None),
+        ),
+        "requested_start": (
+            None
+            if requested_start is None
+            else [float(requested_start[0]), float(requested_start[1])]
+        ),
+        "requested_end": (
+            None
+            if requested_end is None
+            else [float(requested_end[0]), float(requested_end[1])]
+        ),
+        "snapped_start": (
+            [float(route.waypoints[0][0]), float(route.waypoints[0][1])]
+            if route.waypoints
+            else None
+        ),
+        "snapped_end": (
+            [float(route.waypoints[-1][0]), float(route.waypoints[-1][1])]
+            if route.waypoints
+            else None
         ),
         "applied_max_detour_factor": objective_values.get(
             "applied_max_detour_factor",

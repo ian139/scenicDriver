@@ -563,29 +563,17 @@ def test_osm_linestring_intermediate_coordinates_survive_route_feature() -> None
     ]
 
 
-def test_zero_edge_route_feature_keeps_requested_endpoints() -> None:
+def test_zero_edge_route_feature_uses_snapped_road_geometry() -> None:
     from src.route_planner.service import route_to_feature
 
     graph = RoadGraph()
     graph.add_node(Node(id="only", lat=42.0, lon=-72.0))
     planner = ScenicRoutePlanner(graph=graph)
-    route = planner.find_fastest_route(
-        (42.001, -72.001),
-        (42.002, -72.002),
-    )
-    feature = route_to_feature(
-        route,
-        "baseline",
-        requested_start=(42.001, -72.001),
-        requested_end=(42.002, -72.002),
-    )
-
-    assert route.edge_ids == ()
-    assert feature["geometry"]["coordinates"] == [
-        [-72.001, 42.001],
-        [-72.002, 42.002],
-    ]
-    assert feature["properties"]["segment_identity"] == []
+    with pytest.raises(ValueError, match="No route found"):
+        planner.find_fastest_route(
+            (42.001, -72.001),
+            (42.002, -72.002),
+        )
 
 
 

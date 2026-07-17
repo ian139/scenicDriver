@@ -24,10 +24,6 @@ const regionStart = viewerSource.indexOf("function resolveRegionSelection");
 const regionEnd = viewerSource.indexOf("\n\nfunction setText", regionStart);
 assert.ok(regionStart >= 0 && regionEnd > regionStart);
 const regionSource = viewerSource.slice(regionStart, regionEnd);
-const endpointStart = viewerSource.indexOf("function withRequestedRouteEndpoints");
-const endpointEnd = viewerSource.indexOf("function routeLayer", endpointStart);
-assert.ok(endpointStart >= 0 && endpointEnd > endpointStart);
-const endpointSource = viewerSource.slice(endpointStart, endpointEnd);
 const formatterStart = viewerSource.indexOf("function escapeHtml");
 const formatterEnd = viewerSource.indexOf("\n\nfunction renderTrainingResults", formatterStart);
 assert.ok(formatterStart >= 0 && formatterEnd > formatterStart);
@@ -63,15 +59,6 @@ globalThis.setVerboseRouteResultsForTest = (value) => {
 }
 
 
-function withRequestedRouteEndpointsForTest() {
-  const context = { Number, Array, Object, Math };
-  vm.runInNewContext(
-    `${endpointSource}
-globalThis.withRequestedRouteEndpoints = withRequestedRouteEndpoints;`,
-    context
-  );
-  return context.withRequestedRouteEndpoints;
-}
 
 
 class FakeElement {
@@ -187,97 +174,6 @@ globalThis.loadSupportedRegions = loadSupportedRegions;`,
   return { context, regionSelect, runSelect, regionStatus, replacements };
 }
 
-test("route GeoJSON endpoints orient and connect every valid line without mutation", () => {
-  const withRequestedRouteEndpoints = withRequestedRouteEndpointsForTest();
-  const start = { lat: 10, lon: 20 };
-  const end = { lat: 13, lon: 24 };
-  const source = {
-    type: "FeatureCollection",
-    properties: { request: "preserve" },
-    features: [
-      {
-        type: "Feature",
-        properties: { route_kind: "scenic" },
-        geometry: {
-          type: "LineString",
-          coordinates: [
-            [20.00000005, 10.00000005],
-            [21, 11],
-            [23.99999995, 12.99999995],
-          ],
-        },
-      },
-      {
-        type: "Feature",
-        properties: { route_kind: "baseline" },
-        geometry: {
-          type: "LineString",
-          coordinates: [
-            [24, 13],
-            [23, 12],
-            [20, 10],
-          ],
-        },
-      },
-    ],
-  };
-  const original = JSON.parse(JSON.stringify(source));
-  const normalized = withRequestedRouteEndpoints(source, start, end);
-
-  assert.notStrictEqual(normalized, source);
-  assert.notStrictEqual(normalized.features, source.features);
-  assert.deepEqual(JSON.parse(JSON.stringify(normalized.features[0].geometry.coordinates)), [
-    [20, 10],
-    [21, 11],
-    [24, 13],
-  ]);
-  assert.deepEqual(JSON.parse(JSON.stringify(normalized.features[1].geometry.coordinates)), [
-    [20, 10],
-    [23, 12],
-    [24, 13],
-  ]);
-  assert.equal(normalized.features[0].properties, source.features[0].properties);
-  assert.deepEqual(source, original);
-});
-
-test("malformed and empty line geometries stay unchanged", () => {
-  const withRequestedRouteEndpoints = withRequestedRouteEndpointsForTest();
-  const source = {
-    type: "FeatureCollection",
-    features: [
-      {
-        type: "Feature",
-        properties: { route_kind: "empty" },
-        geometry: { type: "LineString", coordinates: [] },
-      },
-      {
-        type: "Feature",
-        properties: { route_kind: "malformed" },
-        geometry: {
-          type: "LineString",
-          coordinates: [
-            [1, 2],
-            ["invalid", 3],
-          ],
-        },
-      },
-      {
-        type: "Feature",
-        properties: { route_kind: "point" },
-        geometry: { type: "Point", coordinates: [1, 2] },
-      },
-    ],
-  };
-
-  const normalized = withRequestedRouteEndpoints(
-    source,
-    { lat: 10, lon: 20 },
-    { lat: 13, lon: 24 }
-  );
-
-  assert.deepEqual(JSON.parse(JSON.stringify(normalized)), source);
-  assert.notStrictEqual(normalized, source);
-});
 
 test("route output stays compact until diagnostics are explicitly enabled", () => {
   const harness = makeRouteOutputHarness();
@@ -308,6 +204,26 @@ test("route output stays compact until diagnostics are explicitly enabled", () =
     harness.routeOutputMarkup({}),
     "Scenic and baseline routes are shown on the map."
   );
+});
+
+test("route output identifies road-snapped selected endpoints", () => {
+  const harness = makeRouteOutputHarness();
+  const output = harness.routeOutputMarkup({
+    geojson: {
+      features: [
+        {
+          properties: {
+            route_kind: "scenic",
+            snapped_start: [44.47588, -73.214],
+            snapped_end: [44.80162, -68.7713],
+          },
+        },
+      ],
+    },
+  });
+  assert.match(output, /Road-snapped endpoints/);
+  assert.match(output, /44\.47588/);
+  assert.match(output, /-68\.77130/);
 });
 
 

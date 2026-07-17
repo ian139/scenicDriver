@@ -599,87 +599,6 @@ async function checkApiHealth() {
   }
 }
 
-function withRequestedRouteEndpoints(geojson, start, end) {
-  if (!geojson || typeof geojson !== "object" || !Array.isArray(geojson.features)) {
-    return geojson;
-  }
-
-  const requestedStart = [Number(start?.lon), Number(start?.lat)];
-  const requestedEnd = [Number(end?.lon), Number(end?.lat)];
-  const endpointsAreValid =
-    requestedStart.every(Number.isFinite) && requestedEnd.every(Number.isFinite);
-  const endpointToleranceSquared = 1e-14;
-
-  const isValidCoordinate = (coordinate) =>
-    Array.isArray(coordinate) &&
-    Number.isFinite(coordinate[0]) &&
-    Number.isFinite(coordinate[1]);
-  const distanceSquared = (first, second) => {
-    const deltaLon = first[0] - second[0];
-    const deltaLat = first[1] - second[1];
-    return deltaLon * deltaLon + deltaLat * deltaLat;
-  };
-  const isNearEndpoint = (coordinate, endpoint) =>
-    distanceSquared(coordinate, endpoint) <= endpointToleranceSquared;
-
-  const copyFeature = (feature) => {
-    if (!feature || typeof feature !== "object") return feature;
-    const geometry = feature.geometry;
-    if (
-      !geometry ||
-      typeof geometry !== "object" ||
-      geometry.type !== "LineString" ||
-      !Array.isArray(geometry.coordinates)
-    ) {
-      return { ...feature };
-    }
-
-    const sourceCoordinates = geometry.coordinates;
-    if (
-      sourceCoordinates.length === 0 ||
-      !sourceCoordinates.every(isValidCoordinate)
-    ) {
-      return { ...feature };
-    }
-
-    const coordinates = sourceCoordinates.map((coordinate) => coordinate.slice());
-    if (endpointsAreValid) {
-      const lastIndex = coordinates.length - 1;
-      const forwardDistance =
-        distanceSquared(coordinates[0], requestedStart) +
-        distanceSquared(coordinates[lastIndex], requestedEnd);
-      const reverseDistance =
-        distanceSquared(coordinates[0], requestedEnd) +
-        distanceSquared(coordinates[lastIndex], requestedStart);
-      if (reverseDistance < forwardDistance) coordinates.reverse();
-
-      if (isNearEndpoint(coordinates[0], requestedStart)) {
-        coordinates[0] = requestedStart.slice();
-      } else {
-        coordinates.unshift(requestedStart.slice());
-      }
-      const orientedLastIndex = coordinates.length - 1;
-      if (isNearEndpoint(coordinates[orientedLastIndex], requestedEnd)) {
-        coordinates[orientedLastIndex] = requestedEnd.slice();
-      } else {
-        coordinates.push(requestedEnd.slice());
-      }
-    }
-
-    return {
-      ...feature,
-      geometry: {
-        ...geometry,
-        coordinates,
-      },
-    };
-  };
-
-  return {
-    ...geojson,
-    features: geojson.features.map(copyFeature),
-  };
-}
 
 
 function routeLayer(filterKind, color, width, opacity) {
@@ -998,7 +917,19 @@ function routeDiagnosticsMarkup(payload) {
 }
 
 function routeOutputMarkup(payload) {
-  const status = "Scenic and baseline routes are shown on the map.";
+  const scenicFeature = payload.geojson?.features?.find(
+    (feature) => feature?.properties?.route_kind === "scenic"
+  );
+  const snappedStart = scenicFeature?.properties?.snapped_start;
+  const snappedEnd = scenicFeature?.properties?.snapped_end;
+  const snapped =
+    Array.isArray(snappedStart) &&
+    snappedStart.length === 2 &&
+    Array.isArray(snappedEnd) &&
+    snappedEnd.length === 2
+      ? ` Road-snapped endpoints: ${formatNumber(snappedStart[0], 5)}, ${formatNumber(snappedStart[1], 5)} → ${formatNumber(snappedEnd[0], 5)}, ${formatNumber(snappedEnd[1], 5)}.`
+      : "";
+  const status = `Scenic and baseline routes are shown on the map.${snapped}`;
   return verboseRouteResults ? `${status}${routeDiagnosticsMarkup(payload)}` : status;
 }
 
@@ -1462,15 +1393,11 @@ async function planRoute(event) {
       error.routeFailureCode = failureCode;
       throw error;
     }
-    const normalizedGeojson = withRequestedRouteEndpoints(
-      payload.geojson,
-      requestToken.endpoints.start,
-      requestToken.endpoints.end
-    );
+    const routeGeojson = validateRouteGeojson(payload.geojson);
     if (mapReady && map?.isStyleLoaded?.()) {
-      renderRoute(normalizedGeojson);
+      renderRoute(routeGeojson);
     } else {
-      pendingRouteRender = { requestId, geojson: normalizedGeojson };
+      pendingRouteRender = { requestId, geojson: routeGeojson };
     }
     renderRouteComparison(payload);
     latestRoutePayload = payload;

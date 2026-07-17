@@ -970,8 +970,6 @@ def _validate_route_geometry(
     expected_kinds = {"scenic"} | (
         {"baseline"} if request.include_baseline else set()
     )
-    required_start = (float(request.start[1]), float(request.start[0]))
-    required_end = (float(request.end[1]), float(request.end[0]))
     validated: dict[str, dict[str, Any]] = {}
     for index, feature in enumerate(features):
         if not isinstance(feature, dict):
@@ -1013,14 +1011,6 @@ def _validate_route_geometry(
                 for coordinate_index, coordinate in enumerate(raw_coordinates)
             ]
         )
-        if not _route_coordinates_match(coordinates[0], required_start):
-            _invalid_route_geometry(
-                f"{route_kind} route geometry does not start at the request"
-            )
-        if not _route_coordinates_match(coordinates[-1], required_end):
-            _invalid_route_geometry(
-                f"{route_kind} route geometry does not end at the request"
-            )
         rows = properties.get("segment_identity")
         if not isinstance(rows, list):
             _invalid_route_geometry(
@@ -1062,15 +1052,18 @@ def _validate_route_geometry(
                 segment_coordinates.append(segment_start)
             segment_coordinates.append(segment_end)
             previous_end = segment_end
-        expected_coordinates = _dedupe_route_coordinates(
-            [required_start, *segment_coordinates, required_end]
-        )
-        if len(coordinates) != len(expected_coordinates) or any(
-            not _route_coordinates_match(actual, expected)
-            for actual, expected in zip(coordinates, expected_coordinates)
-        ):
+        if segment_coordinates:
+            expected_coordinates = _dedupe_route_coordinates(segment_coordinates)
+            if len(coordinates) != len(expected_coordinates) or any(
+                not _route_coordinates_match(actual, expected)
+                for actual, expected in zip(coordinates, expected_coordinates)
+            ):
+                _invalid_route_geometry(
+                    f"{route_kind} route geometry omits or reorders scored segments"
+                )
+        elif len(coordinates) < 2:
             _invalid_route_geometry(
-                f"{route_kind} route geometry omits or reorders scored segments"
+                f"{route_kind} zero-edge route geometry is not renderable"
             )
         validated[route_kind] = feature
     if set(validated) != expected_kinds:

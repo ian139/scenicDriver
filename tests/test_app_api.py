@@ -743,7 +743,7 @@ def test_route_geometry_rejects_discontinuous_segments_and_wrong_endpoint() -> N
         -75.18,
         40.065,
     ]
-    with pytest.raises(app_api.HTTPException, match="does not end"):
+    with pytest.raises(app_api.HTTPException, match="omits or reorders"):
         app_api._validate_route_geometry(
             endpoint_geojson,
             request=_strict_geometry_request(),

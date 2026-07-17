@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - exercised only without optional runtim
 
 from .cost import (
     CostWeights,
+    HIGHWAY_ROAD_TYPES,
     RoutingPolicy,
     ScenicCostFunction,
     SCENIC_NORMALIZATION_VERSION,
@@ -230,6 +231,7 @@ class ScenicRoutePlanner:
     _FASTEST_PATH_CACHE_CAPACITY = 8
     _CSR_DATA_CACHE_CAPACITY = 8
     _REVERSE_INDEX_CACHE_CAPACITY = 2
+    _ENDPOINT_OVERLAY_MAX_NODES = 2_000
     _REVERSE_PREPROCESS_EDGE_THRESHOLD = 256
     _LARGE_GRAPH_EDGE_THRESHOLD = 100_000
     _SHORT_ROUTE_CAP_KM = 5.0
@@ -3041,16 +3043,410 @@ class ScenicRoutePlanner:
             search_diagnostics,
         )
 
+    def _endpoint_graph(
+        self,
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+        *,
+        avoid_highways: bool = False,
+    ) -> RoadGraph:
+        """Return a request-local graph with legal partial-edge endpoints."""
+        base = self.graph
+        if base is None:
+            raise RuntimeError("Road graph not loaded")
+        excluded_road_types = (
+            HIGHWAY_ROAD_TYPES if avoid_highways else frozenset()
+        )
+        try:
+            start_projections, _ = base.find_nearest_edge_positions_with_distance(
+                *start,
+                excluded_road_types=excluded_road_types,
+            )
+            end_projections, _ = base.find_nearest_edge_positions_with_distance(
+                *end,
+                excluded_road_types=excluded_road_types,
+            )
+        except ValueError:
+            start_node, _ = base.find_nearest_node_with_distance(*start)
+            end_node, _ = base.find_nearest_node_with_distance(*end)
+            if start != end or start_node.id != end_node.id:
+                raise ValueError("No route found between the given coordinates.")
+            overlay = RoadGraph()
+            overlay.nodes = dict(base.nodes)
+            overlay.edges = dict(base.edges)
+            overlay.adjacency = {
+                node_id: list(adjacencies)
+                for node_id, adjacencies in base.adjacency.items()
+            }
+            overlay._heuristic_structure_epoch = base._heuristic_structure_epoch
+            overlay._reverse_edge_views = {}
+            overlay._route_endpoint_node_ids = (start_node.id, end_node.id)
+            return overlay
+        overlay = RoadGraph()
+        overlay.nodes = dict(base.nodes)
+        overlay.edges = dict(base.edges)
+        overlay.adjacency = {
+            node_id: list(adjacencies)
+            for node_id, adjacencies in base.adjacency.items()
+        }
+        overlay._heuristic_structure_epoch = base._heuristic_structure_epoch
+        overlay._reverse_edge_views = {}
+
+        start_projection = start_projections[0]
+        end_projection = end_projections[0]
+        epsilon = 1e-12
+        start_fraction = float(start_projection.fraction)
+        end_fraction = float(end_projection.fraction)
+        start_id = "__route_request_start__"
+        end_id = "__route_request_end__"
+        if start_fraction <= epsilon:
+            start_id = str(start_projection.edge.start_node_id)
+        elif start_fraction >= 1.0 - epsilon:
+            start_id = str(start_projection.edge.end_node_id)
+        if end_fraction <= epsilon:
+            end_id = str(end_projection.edge.start_node_id)
+        elif end_fraction >= 1.0 - epsilon:
+            end_id = str(end_projection.edge.end_node_id)
+        while start_id in overlay.nodes and start_id.startswith("__route_request_start__"):
+            start_id += "_"
+        while (
+            end_id in overlay.nodes
+            and end_id.startswith("__route_request_end__")
+        ) or (
+            end_id == start_id
+            and end_id.startswith("__route_request_end__")
+        ):
+            end_id += "_"
+        if start_id not in overlay.nodes:
+            overlay.add_node(
+                Node(
+                    start_id,
+                    float(start_projection.lat),
+                    float(start_projection.lon),
+                )
+            )
+        if end_id not in overlay.nodes:
+            overlay.add_node(
+                Node(
+                    end_id,
+                    float(end_projection.lat),
+                    float(end_projection.lon),
+                )
+            )
+        start_is_virtual = start_id.startswith("__route_request_start__")
+        end_is_virtual = end_id.startswith("__route_request_end__")
+
+        def partial_edge(
+            edge: Edge,
+            edge_id: str,
+            from_node: str,
+            to_node: str,
+            fraction: float,
+        ) -> Edge:
+            fraction = min(1.0, max(0.0, float(fraction)))
+            value = Edge(
+                id=edge_id,
+                start_node_id=from_node,
+                end_node_id=to_node,
+                distance_km=float(edge.distance_km) * fraction,
+                scenic_score=float(edge.scenic_score),
+                road_name=edge.road_name,
+                road_type=edge.road_type,
+                speed_limit_kmh=edge.speed_limit_kmh,
+                one_way=True,
+            )
+            value.canonical_edge_id = str(edge.id)
+            value.direction = (
+                "reverse" if ":reverse" in edge_id else "forward"
+            )
+            value.source_fraction = fraction
+            return value
+
+        if start_is_virtual:
+            for projection_index, projection in enumerate(start_projections):
+                edge = projection.edge
+                fraction = float(projection.fraction)
+                overlay.add_edge(
+                    partial_edge(
+                        edge,
+                        f"__route_start__:{projection_index}:forward",
+                        start_id,
+                        edge.end_node_id,
+                        1.0 - fraction,
+                    )
+                )
+                if not edge.one_way:
+                    overlay.add_edge(
+                        partial_edge(
+                            edge,
+                            f"__route_start__:{projection_index}:reverse",
+                            start_id,
+                            edge.start_node_id,
+                            fraction,
+                        )
+                    )
+
+        if end_is_virtual:
+            for projection_index, projection in enumerate(end_projections):
+                edge = projection.edge
+                fraction = float(projection.fraction)
+                overlay.add_edge(
+                    partial_edge(
+                        edge,
+                        f"__route_end__:{projection_index}:forward",
+                        edge.start_node_id,
+                        end_id,
+                        fraction,
+                    )
+                )
+                if not edge.one_way:
+                    overlay.add_edge(
+                        partial_edge(
+                            edge,
+                            f"__route_end__:{projection_index}:reverse",
+                            edge.end_node_id,
+                            end_id,
+                            1.0 - fraction,
+                        )
+                    )
+
+        end_by_edge = {
+            str(projection.edge.id): projection
+            for projection in end_projections
+        }
+        if start_is_virtual and end_is_virtual:
+            for projection_index, projection in enumerate(start_projections):
+                edge = projection.edge
+                end_projection = end_by_edge.get(str(edge.id))
+                if end_projection is None:
+                    continue
+                start_fraction = float(projection.fraction)
+                end_fraction = float(end_projection.fraction)
+                if start_fraction <= end_fraction:
+                    overlay.add_edge(
+                        partial_edge(
+                            edge,
+                            f"__route_direct__:{projection_index}:forward",
+                            start_id,
+                            end_id,
+                            end_fraction - start_fraction,
+                        )
+                    )
+                if not edge.one_way and start_fraction >= end_fraction:
+                    overlay.add_edge(
+                        partial_edge(
+                            edge,
+                            f"__route_direct__:{projection_index}:reverse",
+                            start_id,
+                            end_id,
+                            start_fraction - end_fraction,
+                        )
+                    )
+        overlay._route_endpoint_node_ids = (start_id, end_id)
+        return overlay
+
+    def _routing_endpoint_nodes(
+        self, start: Tuple[float, float], end: Tuple[float, float]
+    ) -> Tuple[Node, Node]:
+        endpoint_ids = getattr(self.graph, "_route_endpoint_node_ids", None)
+        if endpoint_ids is not None:
+            return (
+                self.graph.get_node(endpoint_ids[0]),
+                self.graph.get_node(endpoint_ids[1]),
+            )
+        return self.graph.find_nearest_node(*start), self.graph.find_nearest_node(*end)
+    def _large_graph_fastest_route(
+        self,
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+        *,
+        avoid_highways: bool,
+    ) -> Route:
+        """Solve endpoint access without rebuilding the production CSR graph."""
+        base = self.graph
+        assert base is not None
+        excluded = HIGHWAY_ROAD_TYPES if avoid_highways else frozenset()
+        starts, _ = base.find_nearest_edge_positions_with_distance(
+            *start, excluded_road_types=excluded
+        )
+        ends, _ = base.find_nearest_edge_positions_with_distance(
+            *end, excluded_road_types=excluded
+        )
+        start_projection, end_projection = starts[0], ends[0]
+        start_id, end_id = "__route_large_start__", "__route_large_end__"
+
+        def partial(
+            source: Edge,
+            edge_id: str,
+            from_id: str,
+            to_id: str,
+            fraction: float,
+            direction: str,
+        ) -> Edge:
+            value = Edge(
+                id=edge_id,
+                start_node_id=from_id,
+                end_node_id=to_id,
+                distance_km=float(source.distance_km) * max(
+                    0.0, min(1.0, float(fraction))
+                ),
+                scenic_score=float(source.scenic_score),
+                road_name=source.road_name,
+                road_type=source.road_type,
+                speed_limit_kmh=source.speed_limit_kmh,
+                one_way=True,
+            )
+            value.canonical_edge_id = str(source.id)
+            value.direction = direction
+            value.source_fraction = float(fraction)
+            return value
+
+        prefixes = [
+            (
+                str(start_projection.edge.end_node_id),
+                partial(
+                    start_projection.edge,
+                    f"{start_id}:forward",
+                    start_id,
+                    start_projection.edge.end_node_id,
+                    1.0 - float(start_projection.fraction),
+                    "forward",
+                ),
+            )
+        ]
+        if not start_projection.edge.one_way:
+            prefixes.append(
+                (
+                    str(start_projection.edge.start_node_id),
+                    partial(
+                        start_projection.edge,
+                        f"{start_id}:reverse",
+                        start_id,
+                        start_projection.edge.start_node_id,
+                        float(start_projection.fraction),
+                        "reverse",
+                    ),
+                )
+            )
+        suffixes = [
+            (
+                str(end_projection.edge.start_node_id),
+                partial(
+                    end_projection.edge,
+                    f"{end_id}:forward",
+                    end_projection.edge.start_node_id,
+                    end_id,
+                    float(end_projection.fraction),
+                    "forward",
+                ),
+            )
+        ]
+        if not end_projection.edge.one_way:
+            suffixes.append(
+                (
+                    str(end_projection.edge.end_node_id),
+                    partial(
+                        end_projection.edge,
+                        f"{end_id}:reverse",
+                        end_projection.edge.end_node_id,
+                        end_id,
+                        1.0 - float(end_projection.fraction),
+                        "reverse",
+                    ),
+                )
+            )
+        best: tuple[float, list[Edge], Edge, Edge] | None = None
+        for prefix_node, prefix in prefixes:
+            for suffix_node, suffix in suffixes:
+                middle = self._cached_fastest_edges(
+                    base.get_node(prefix_node),
+                    base.get_node(suffix_node),
+                    avoid_highways,
+                    0.0,
+                )
+                if middle is None:
+                    continue
+                candidate = [prefix, *middle, suffix]
+                duration = self._path_duration_minutes(candidate)
+                if best is None or duration < best[0]:
+                    best = (duration, candidate, prefix, suffix)
+        if (
+            start_projection.edge.id == end_projection.edge.id
+            and float(start_projection.fraction) <= float(end_projection.fraction)
+        ):
+            direct = partial(
+                start_projection.edge,
+                f"{start_id}:direct",
+                start_id,
+                end_id,
+                float(end_projection.fraction) - float(start_projection.fraction),
+                "forward",
+            )
+            direct_duration = self._path_duration_minutes([direct])
+            if best is None or direct_duration < best[0]:
+                best = (direct_duration, [direct], direct, direct)
+        if best is None:
+            raise ValueError("No route found between the given coordinates.")
+        render_graph = RoadGraph()
+        render_graph.nodes = dict(base.nodes)
+        render_graph.edges = dict(base.edges)
+        render_graph.adjacency = {
+            node_id: list(adjacencies)
+            for node_id, adjacencies in base.adjacency.items()
+        }
+        render_graph.add_node(
+            Node(start_id, float(start_projection.lat), float(start_projection.lon))
+        )
+        render_graph.add_node(
+            Node(end_id, float(end_projection.lat), float(end_projection.lon))
+        )
+        for edge in best[1]:
+            if edge.id not in render_graph.edges:
+                render_graph.add_edge(edge)
+        policy = resolve_routing_policy(
+            scenic_weight=0.0, kappa=1.0, avoid_highways=avoid_highways
+        )
+        evaluation = evaluate_path(
+            best[1],
+            q=0.0,
+            kappa=1.0,
+            fastest_duration_minutes=best[0],
+            policy=policy,
+        )
+        self.graph = render_graph
+        try:
+            return self._path_to_route(
+                best[1],
+                start_node=render_graph.get_node(start_id),
+                goal_node=render_graph.get_node(end_id),
+                evaluation=evaluation,
+                fastest_duration_minutes=best[0],
+                requested_max_detour_factor=1.0,
+                exact=True,
+                exactness_status="exact",
+                algorithm="endpoint-access-duration-dijkstra",
+            )
+        finally:
+            self.graph = base
+
+
     @staticmethod
     def _simple_edge_path(edges: List[Edge]) -> bool:
-        nodes = set()
+        """Check that a path is a simple, connected directed traversal."""
+        if not edges:
+            return True
+        nodes: set[str] = set()
+        previous_end: Optional[str] = None
         for edge in edges:
-            if edge.start_node_id in nodes:
+            start_id = str(edge.start_node_id)
+            end_id = str(edge.end_node_id)
+            if previous_end is not None and start_id != previous_end:
                 return False
-            nodes.add(edge.start_node_id)
-        if edges and edges[-1].end_node_id in nodes:
-            return False
-        return True
+            if start_id in nodes:
+                return False
+            nodes.add(start_id)
+            previous_end = end_id
+        return previous_end not in nodes
 
     @staticmethod
     def _has_scenic_improvement(candidate: object, baseline: object) -> bool:
@@ -3072,10 +3468,38 @@ class ScenicRoutePlanner:
         highway_preference: Optional[float] = None,
         strict_highways: Optional[bool] = None,
         scenic_priority: bool = False,
+        _endpoint_graph: bool = False,
     ) -> Route:
         """Optimize scenic score within a hard duration cap when requested."""
         if self.graph is None:
             raise RuntimeError("Road graph not loaded")
+        if not _endpoint_graph:
+            base_graph = self.graph
+            self.graph = self._endpoint_graph(
+                start,
+                end,
+                avoid_highways=(
+                    bool(strict_highways)
+                    if strict_highways is not None
+                    else bool(avoid_highways)
+                ),
+            )
+            try:
+                return self.find_scenic_route(
+                    start,
+                    end,
+                    scenic_weight,
+                    avoid_highways,
+                    max_detour_factor,
+                    q=q,
+                    kappa=kappa,
+                    highway_preference=highway_preference,
+                    strict_highways=strict_highways,
+                    scenic_priority=scenic_priority,
+                    _endpoint_graph=True,
+                )
+            finally:
+                self.graph = base_graph
         if q is not None:
             scenic_weight = q
         if kappa is not None:
@@ -3095,8 +3519,7 @@ class ScenicRoutePlanner:
         self.cost_function.highway_preference = policy.highway_preference
         q_value = policy.scenic_weight
         kappa_value = policy.kappa
-        start_node = self.graph.find_nearest_node(*start)
-        end_node = self.graph.find_nearest_node(*end)
+        start_node, end_node = self._routing_endpoint_nodes(start, end)
         bounded_graph = self._is_bounded_oracle_graph()
         if bounded_graph:
             shortest_edges = self._canonical_fastest_edges(
@@ -3225,9 +3648,32 @@ class ScenicRoutePlanner:
         end: Tuple[float, float],
         *,
         avoid_highways: bool = False,
+        _endpoint_graph: bool = False,
     ) -> Route:
         if self.graph is None:
             raise RuntimeError("Road graph not loaded")
+        if not _endpoint_graph:
+            base_graph = self.graph
+            if len(base_graph.nodes) > self._ENDPOINT_OVERLAY_MAX_NODES:
+                return self._large_graph_fastest_route(
+                    start,
+                    end,
+                    avoid_highways=avoid_highways,
+                )
+            self.graph = self._endpoint_graph(
+                start,
+                end,
+                avoid_highways=bool(avoid_highways),
+            )
+            try:
+                return self.find_fastest_route(
+                    start,
+                    end,
+                    avoid_highways=avoid_highways,
+                    _endpoint_graph=True,
+                )
+            finally:
+                self.graph = base_graph
         policy = resolve_routing_policy(
             scenic_weight=0.0,
             kappa=1.0,
@@ -3236,8 +3682,7 @@ class ScenicRoutePlanner:
         self.cost_function.strict_highways = policy.strict_highways
         self.cost_function.avoid_highways = policy.strict_highways
         self.cost_function.highway_preference = 0.0
-        start_node = self.graph.find_nearest_node(*start)
-        end_node = self.graph.find_nearest_node(*end)
+        start_node, end_node = self._routing_endpoint_nodes(start, end)
         bounded_graph = self._is_bounded_oracle_graph()
         if bounded_graph:
             shortest_edges = self._canonical_fastest_edges(
@@ -4540,6 +4985,13 @@ class ScenicRoutePlanner:
         if edges:
             start_node = start_node or self.graph.get_node(edges[0].start_node_id)
             goal_node = goal_node or self.graph.get_node(edges[-1].end_node_id)
+            if not self._simple_edge_path(edges):
+                raise ValueError("route edge traversal is disconnected or cyclic")
+            if (
+                edges[0].start_node_id != start_node.id
+                or edges[-1].end_node_id != goal_node.id
+            ):
+                raise ValueError("route edge traversal has invalid endpoints")
         elif start_node is None or goal_node is None:
             raise ValueError("empty path requires start and goal nodes")
         if not edges:
@@ -4570,20 +5022,21 @@ class ScenicRoutePlanner:
             canonical_edge_ids.append(canonical_id)
             traversal_ids.append(traversal_id)
             normalized_score_run.append((traversal_id, score_values[index]))
-            segments.append(
-                RouteSegment(
-                    start=(start_node.lat, start_node.lon),
-                    end=(end_node.lat, end_node.lon),
-                    distance_km=float(edge.distance_km),
-                    scenic_score=score_values[index],
-                    road_name=edge.road_name,
-                    road_type=edge.road_type,
-                    edge_id=canonical_id,
-                    direction=direction,
-                    traversal_id=traversal_id,
-                    duration_minutes=self._edge_duration_minutes(edge),
-                )
+            segment = RouteSegment(
+                start=(start_node.lat, start_node.lon),
+                end=(end_node.lat, end_node.lon),
+                distance_km=float(edge.distance_km),
+                scenic_score=score_values[index],
+                road_name=edge.road_name,
+                road_type=edge.road_type,
+                edge_id=canonical_id,
+                direction=direction,
+                traversal_id=traversal_id,
+                duration_minutes=self._edge_duration_minutes(edge),
             )
+            segment.source_edge_id = getattr(edge, "canonical_edge_id", None)
+            segment.source_fraction = getattr(edge, "source_fraction", None)
+            segments.append(segment)
             if not waypoints:
                 waypoints.append((start_node.lat, start_node.lon))
             waypoints.append((end_node.lat, end_node.lon))

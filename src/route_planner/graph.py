@@ -12,6 +12,9 @@ import msgspec
 import numpy as np
 
 _KD_SMALL_SUBTREE_CUTOFF = 32
+_EDGE_PROJECTION_CHUNK_SIZE = 65_536
+_EDGE_PROJECTION_TIE_TOLERANCE_KM = 1e-9
+
 
 class _NodeRow(msgspec.Struct):
     # Legacy artifacts contain numeric IDs and numeric values serialized as
@@ -82,6 +85,15 @@ class Edge:
     def travel_time_minutes(self) -> float:
         speed = max(float(self.speed_limit_kmh), 1.0)
         return (self.distance_km / speed) * 60.0
+
+@dataclass(frozen=True)
+class EdgeProjection:
+    edge: Edge
+    fraction: float
+    lat: float
+    lon: float
+    snap_distance_km: float
+
 
 class _ReverseEdgeView:
     """Allocation-free reverse traversal view over one canonical edge."""
@@ -265,10 +277,13 @@ class RoadGraph:
         self._nearest_spatial_index: Optional[
             Tuple[int, Tuple[str, ...], array, array, array, array, array, array]
         ] = None
+        self._nearest_edge_projection_index: Optional[Tuple[Any, ...]] = None
 
     def _advance_heuristic_epoch(self) -> None:
         self._heuristic_structure_epoch += 1
         self._reverse_edge_views.clear()
+        self._invalidate_nearest_edge_projection_index()
+
 
     def _heuristic_cache_stamp(self) -> Tuple[int, int, int]:
         return (
@@ -279,7 +294,107 @@ class RoadGraph:
 
     def _invalidate_nearest_spatial_index(self) -> None:
         self._nearest_spatial_index = None
+        self._nearest_edge_projection_index = None
 
+    def _invalidate_nearest_edge_projection_index(self) -> None:
+        self._nearest_edge_projection_index = None
+
+
+    def _build_nearest_edge_projection_index(self) -> Tuple[Any, ...]:
+        """Build compact primitive arrays for canonical finite edge segments."""
+        stamp = self._heuristic_cache_stamp()
+        edge_ids: List[str] = []
+        edge_keys: List[str] = []
+        road_type_codes: List[int] = []
+        start_latitudes: List[float] = []
+        start_longitudes: List[float] = []
+        end_latitudes: List[float] = []
+        end_longitudes: List[float] = []
+        road_type_index: Dict[str, int] = {}
+
+        for edge_key, edge in self.edges.items():
+            start = self.nodes.get(edge.start_node_id)
+            end = self.nodes.get(edge.end_node_id)
+            if start is None or end is None:
+                continue
+            try:
+                start_lat = float(start.lat)
+                start_lon = float(start.lon)
+                end_lat = float(end.lat)
+                end_lon = float(end.lon)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not all(
+                math.isfinite(value)
+                for value in (start_lat, start_lon, end_lat, end_lon)
+            ):
+                continue
+            road_type = _normalize_road_type(edge.road_type)
+            code = road_type_index.get(road_type)
+            if code is None:
+                code = len(road_type_index)
+                road_type_index[road_type] = code
+            edge_ids.append(str(edge.id))
+            edge_keys.append(edge_key)
+            road_type_codes.append(code)
+            start_latitudes.append(start_lat)
+            start_longitudes.append(start_lon)
+            end_latitudes.append(end_lat)
+            end_longitudes.append(end_lon)
+
+        return (
+            stamp,
+            tuple(edge_ids),
+            tuple(edge_keys),
+            tuple(road_type_index),
+            np.asarray(road_type_codes, dtype=np.int32),
+            np.asarray(start_latitudes, dtype=np.float64),
+            np.asarray(start_longitudes, dtype=np.float64),
+            np.asarray(end_latitudes, dtype=np.float64),
+            np.asarray(end_longitudes, dtype=np.float64),
+        )
+
+    @staticmethod
+    def _project_edge_chunk(
+        query_lat: float,
+        query_lon: float,
+        longitude_scale: float,
+        start_latitudes: np.ndarray,
+        start_longitudes: np.ndarray,
+        end_latitudes: np.ndarray,
+        end_longitudes: np.ndarray,
+        start: int,
+        stop: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        start_lat = start_latitudes[start:stop]
+        start_lon = start_longitudes[start:stop]
+        delta_lat = end_latitudes[start:stop] - start_lat
+        delta_lon = (end_longitudes[start:stop] - start_lon) * longitude_scale
+        query_delta_lat = query_lat - start_lat
+        query_delta_lon = (query_lon - start_lon) * longitude_scale
+        denominator = delta_lat * delta_lat + delta_lon * delta_lon
+        numerator = query_delta_lat * delta_lat + query_delta_lon * delta_lon
+        fractions = np.zeros_like(denominator)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            np.divide(numerator, denominator, out=fractions, where=denominator > 0.0)
+        np.clip(fractions, 0.0, 1.0, out=fractions)
+        projected_latitudes = start_lat + fractions * (end_latitudes[start:stop] - start_lat)
+        projected_longitudes = start_lon + fractions * (end_longitudes[start:stop] - start_lon)
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            dlat = np.radians(projected_latitudes - query_lat)
+            dlon = np.radians(projected_longitudes - query_lon)
+            haversine = np.sin(dlat / 2.0) ** 2
+            haversine += (
+                np.cos(np.radians(query_lat))
+                * np.cos(np.radians(projected_latitudes))
+                * np.sin(dlon / 2.0) ** 2
+            )
+            np.clip(haversine, 0.0, 1.0, out=haversine)
+            np.sqrt(haversine, out=haversine)
+            np.arcsin(haversine, out=haversine)
+            haversine *= 2.0 * 6371.0
+        return fractions, projected_latitudes, projected_longitudes, haversine
     def add_node(self, node: Node) -> None:
         self.nodes[node.id] = node
         self.adjacency.setdefault(node.id, [])
@@ -544,6 +659,112 @@ class RoadGraph:
         assert best_found
         best = self.nodes[node_ids[best_rank]]
         return best, _haversine_km(query_lat, query_lon, best.lat, best.lon)
+
+    def find_nearest_edge_positions_with_distance(
+        self,
+        lat: float,
+        lon: float,
+        *,
+        excluded_road_types: frozenset = frozenset(),
+    ) -> tuple[list[EdgeProjection], float]:
+        """Return canonical edge projections tied at the nearest segment."""
+        query_lat = float(lat)
+        query_lon = float(lon)
+        if not math.isfinite(query_lat) or not math.isfinite(query_lon):
+            raise ValueError("Query coordinates must be finite")
+
+        stamp = self._heuristic_cache_stamp()
+        index = self._nearest_edge_projection_index
+        if index is None or index[0] != stamp:
+            index = self._build_nearest_edge_projection_index()
+            self._nearest_edge_projection_index = index
+        (
+            _stamp,
+            edge_ids,
+            edge_keys,
+            road_type_names,
+            road_type_codes,
+            start_latitudes,
+            start_longitudes,
+            end_latitudes,
+            end_longitudes,
+        ) = index
+        if not edge_ids:
+            raise ValueError("Road graph has no eligible finite segment")
+
+        excluded = {
+            str(road_type).strip().lower()
+            for road_type in (excluded_road_types or ())
+        }
+        allowed_types = np.asarray(
+            [road_type not in excluded for road_type in road_type_names],
+            dtype=np.bool_,
+        )
+        if not np.any(allowed_types):
+            raise ValueError("Road graph has no eligible finite segment")
+
+        longitude_scale = math.cos(math.radians(query_lat))
+        best_distance = float("inf")
+        edge_count = len(edge_ids)
+        for start in range(0, edge_count, _EDGE_PROJECTION_CHUNK_SIZE):
+            stop = min(start + _EDGE_PROJECTION_CHUNK_SIZE, edge_count)
+            _fractions, _projected_latitudes, _projected_longitudes, distances = (
+                self._project_edge_chunk(
+                    query_lat,
+                    query_lon,
+                    longitude_scale,
+                    start_latitudes,
+                    start_longitudes,
+                    end_latitudes,
+                    end_longitudes,
+                    start,
+                    stop,
+                )
+            )
+            eligible = allowed_types[road_type_codes[start:stop]]
+            finite = eligible & np.isfinite(distances)
+            if np.any(finite):
+                best_distance = min(best_distance, float(np.min(distances[finite])))
+
+        if not math.isfinite(best_distance):
+            raise ValueError("Road graph has no eligible finite segment")
+
+        cutoff = best_distance + _EDGE_PROJECTION_TIE_TOLERANCE_KM
+        projections: List[Tuple[str, str, EdgeProjection]] = []
+        for start in range(0, edge_count, _EDGE_PROJECTION_CHUNK_SIZE):
+            stop = min(start + _EDGE_PROJECTION_CHUNK_SIZE, edge_count)
+            fractions, projected_latitudes, projected_longitudes, distances = (
+                self._project_edge_chunk(
+                    query_lat,
+                    query_lon,
+                    longitude_scale,
+                    start_latitudes,
+                    start_longitudes,
+                    end_latitudes,
+                    end_longitudes,
+                    start,
+                    stop,
+                )
+            )
+            eligible = allowed_types[road_type_codes[start:stop]]
+            tied = eligible & np.isfinite(distances) & (distances <= cutoff)
+            for local_index in np.flatnonzero(tied):
+                index_in_cache = start + int(local_index)
+                projections.append(
+                    (
+                        edge_ids[index_in_cache],
+                        str(edge_keys[index_in_cache]),
+                        EdgeProjection(
+                            edge=self.edges[edge_keys[index_in_cache]],
+                            fraction=float(fractions[local_index]),
+                            lat=float(projected_latitudes[local_index]),
+                            lon=float(projected_longitudes[local_index]),
+                            snap_distance_km=float(distances[local_index]),
+                        ),
+                    )
+                )
+        projections.sort(key=lambda item: (item[0], item[1]))
+        return [projection for _edge_id, _edge_key, projection in projections], best_distance
 
     def save(self, path: Path) -> None:
         data = {
