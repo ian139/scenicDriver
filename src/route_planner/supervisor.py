@@ -10,10 +10,12 @@ deadline and SIGKILL'd at ``deadline + grace``.  After a hard kill, a fresh
 child is forked from the still-preloaded supervisor.  The supervisor remains
 reusable.
 
-The caller computes a single absolute ``expires_at`` value before queue/IPC and
-passes it to ``run_job`` as either a ``RoutingDeadline`` or a
-``deadline_seconds`` convenience value.  The supervisor and worker use that exact
-``expires_at`` so queued or IPC delays cannot extend the request budget.
+A single persistent fork-shared cancellation byte (``multiprocessing.Event``)
+is created in ``start`` and inherited by the supervisor and every worker.  The
+parent mirrors any caller ``cancel_event`` into this shared byte; the worker's
+``RoutingDeadline`` observes it; the supervisor polls it and terminates the
+worker promptly.  This keeps ``cancel_event`` semantics across processes
+without serializing the original event object.
 
 IPC uses ``Connection.send_bytes`` / ``recv_bytes`` with explicit ``pickle``
 framing so payloads are not limited to ``PIPE_BUF``.  The implementation
@@ -39,10 +41,11 @@ import threading
 import traceback
 from typing import Any, Callable
 
-from .cancellation import RoutingCancelled, RoutingDeadline, RoutingTimeout
+from .cancellation import CancelToken, RoutingCancelled, RoutingDeadline, RoutingTimeout
 
 
 _PRELOAD_MARKER: Any = None
+_CANCEL_EVENT: Any | None = None
 
 
 def get_preload_marker() -> Any:
@@ -53,6 +56,11 @@ def get_preload_marker() -> Any:
 def _set_preload_marker(value: Any) -> None:
     global _PRELOAD_MARKER
     _PRELOAD_MARKER = value
+
+
+def _set_cancel_event(event: Any) -> None:
+    global _CANCEL_EVENT
+    _CANCEL_EVENT = event
 
 
 @dataclass(frozen=True)
@@ -197,10 +205,9 @@ def _recv_object(conn, timeout: float | None = None) -> Any:
 def _run_one_job(job: _WorkerJob) -> _WorkerResult:
     """Execute a single job in the persistent worker."""
     try:
-        deadline = (
-            RoutingDeadline(expires_at=job.expires_at)
-            if job.expires_at is not None
-            else RoutingDeadline()
+        deadline = RoutingDeadline(
+            expires_at=job.expires_at,
+            cancel_event=_CANCEL_EVENT,
         )
         value = job.func(deadline, *job.args, **job.kwargs)
         return _WorkerResult(value=value, error=None, worker_pid=os.getpid())
@@ -248,8 +255,9 @@ def _reap_process(process: BaseProcess, timeout: float = 5.0) -> None:
 class _WorkerHandle:
     """One persistent disposable child of the supervisor."""
 
-    def __init__(self, ctx: ForkContext) -> None:
+    def __init__(self, ctx: ForkContext, cancel_event: Any) -> None:
         self._ctx = ctx
+        self._cancel_event = cancel_event
         self._proc: BaseProcess | None = None
         self._work_conn: Any | None = None
 
@@ -292,6 +300,17 @@ class _WorkerHandle:
                 pass
         self._shutdown_worker()
 
+    def _dispose_and_return(
+        self, error: BaseException, worker_pid: int | None
+    ) -> _JobResult:
+        """Kill the current worker and return a routing-cancellation/timeout error."""
+        if worker_pid is not None:
+            error.worker_pid = worker_pid  # type: ignore[attr-defined]
+        if self._proc is not None and self._proc.is_alive():
+            self._proc.kill()
+            self._proc.join(timeout=1.0)
+        self._shutdown_worker()
+        return _JobResult(value=None, error=error, worker_pid=worker_pid)
     def run_job(self, job: _Job) -> _JobResult:
         """Forward a job to the persistent child and enforce its deadline."""
         self._ensure_worker()
@@ -316,7 +335,6 @@ class _WorkerHandle:
             _send_object(self._work_conn, worker_job)
         except (BrokenPipeError, EOFError, OSError):
             pid = self._proc.pid if self._proc is not None else worker_pid
-            self._shutdown_worker()
             error = SupervisorError("worker pipe closed before job could be sent")
             if pid is not None:
                 error.worker_pid = pid  # type: ignore[attr-defined]
@@ -327,21 +345,17 @@ class _WorkerHandle:
         while True:
             now = time.monotonic()
             if hard_at is not None and now >= hard_at:
-                # Hard stop: SIGKILL immediately and do not wait through a
-                # graceful join sequence.
-                pid = self._proc.pid if self._proc is not None else worker_pid
-                if self._proc is not None and self._proc.is_alive():
-                    self._proc.kill()
-                    self._proc.join(timeout=1.0)
-                self._shutdown_worker()
-                error = RoutingTimeout("routing request deadline exceeded")
-                if pid is not None:
-                    error.worker_pid = pid  # type: ignore[attr-defined]
-                return _JobResult(value=None, error=error, worker_pid=pid)
+                return self._dispose_and_return(
+                    RoutingTimeout("routing request deadline exceeded"), worker_pid
+                )
             if deadline_at is not None and not terminated and now >= deadline_at:
                 if self._proc is not None and self._proc.is_alive():
                     self._proc.terminate()
                 terminated = True
+            if self._cancel_event.is_set():
+                return self._dispose_and_return(
+                    RoutingCancelled("routing request was cancelled"), worker_pid
+                )
             try:
                 worker_result = _recv_object(self._work_conn, timeout=0.05)
                 break
@@ -351,41 +365,57 @@ class _WorkerHandle:
                 break
 
         if worker_result is None:
-            pid = self._proc.pid if self._proc is not None else worker_pid
-            self._shutdown_worker()
+            # Worker died or stopped responding without a usable result.
             if hard_at is not None:
                 error: BaseException = RoutingTimeout(
                     "routing request deadline exceeded"
                 )
             else:
                 error = SupervisorError("worker process did not return a result")
-            if pid is not None:
-                error.worker_pid = pid  # type: ignore[attr-defined]
-            return _JobResult(value=None, error=error, worker_pid=pid)
+            return self._dispose_and_return(error, worker_pid)
 
-        # Worker responded.  If it returned an error, deserialize it; if it
-        # returned a value, keep the child alive for the next job.
-        if worker_result.error is not None:
-            error = _deserialize_error(worker_result.error)
-            if worker_result.worker_pid is not None:
-                error.worker_pid = worker_result.worker_pid  # type: ignore[attr-defined]
-            return _JobResult(value=None, error=error, worker_pid=worker_result.worker_pid)
+        # A late response that crossed expires_at or a cancellation must be
+        # rejected before deserializing/propagating any worker-produced error,
+        # so that a non-timeout error returned after the deadline still becomes
+        # a RoutingTimeout and the worker is disposed.
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            return self._dispose_and_return(
+                RoutingTimeout("routing request deadline exceeded"), worker_pid
+            )
+        if self._cancel_event.is_set():
+            return self._dispose_and_return(
+                RoutingCancelled("routing request was cancelled"), worker_pid
+            )
 
-        return _JobResult(
-            value=worker_result.value,
-            error=None,
-            worker_pid=worker_result.worker_pid,
-        )
+        if worker_result.error is None:
+            return _JobResult(
+                value=worker_result.value,
+                error=None,
+                worker_pid=worker_result.worker_pid,
+            )
+
+        # The worker returned an exception.  Cancellation and timeout from the
+        # worker dispose the child; other exceptions keep it alive.
+        error = _deserialize_error(worker_result.error)
+        if worker_result.worker_pid is not None:
+            error.worker_pid = worker_result.worker_pid  # type: ignore[attr-defined]
+
+        if isinstance(error, (RoutingCancelled, RoutingTimeout)):
+            return self._dispose_and_return(error, worker_result.worker_pid)
+
+        return _JobResult(value=None, error=error, worker_pid=worker_result.worker_pid)
 
 
 def _supervisor_entry(
     cmd_conn,
     preload_marker: Any,
+    cancel_event: Any,
 ) -> None:
     """Main loop of the long-lived supervisor process."""
     _set_preload_marker(preload_marker)
+    _set_cancel_event(cancel_event)
     ctx: ForkContext = multiprocessing.get_context("fork")
-    worker = _WorkerHandle(ctx)
+    worker = _WorkerHandle(ctx, cancel_event)
     try:
         _send_object(cmd_conn, _Ready())
         while True:
@@ -421,7 +451,8 @@ class PreloadedRouteSupervisor:
     disposable planning child.  Successful jobs reuse that child so mutated
     caches survive, while an unresponsive child is SIGTERM'd at the deadline
     and SIGKILL'd at ``deadline + grace``; a fresh child is then forked from
-    the still-preloaded supervisor.
+    the still-preloaded supervisor.  A persistent fork-shared cancellation
+    byte propagates ``RoutingDeadline.cancel_event`` across processes.
 
     IPC uses ``Connection.send_bytes`` / ``recv_bytes`` with explicit
     ``pickle`` framing so that payloads are not limited to ``PIPE_BUF``.
@@ -439,11 +470,13 @@ class PreloadedRouteSupervisor:
         self,
         process: BaseProcess,
         cmd_conn: Any,
+        cancel_event: Any,
         default_deadline_seconds: float | None,
         default_grace_seconds: float,
     ) -> None:
         self._process = process
         self._cmd = cmd_conn
+        self._cancel_event = cancel_event
         self._default_deadline_seconds = default_deadline_seconds
         self._default_grace_seconds = default_grace_seconds
         self._lock = threading.Lock()
@@ -466,10 +499,11 @@ class PreloadedRouteSupervisor:
             )
 
         ctx: ForkContext = multiprocessing.get_context("fork")
+        cancel_event = ctx.Event()
         cmd_parent, cmd_child = ctx.Pipe(duplex=True)
         proc = ctx.Process(
             target=_supervisor_entry,
-            args=(cmd_child, preload_marker),
+            args=(cmd_child, preload_marker, cancel_event),
             daemon=False,
         )
         proc.start()
@@ -497,10 +531,41 @@ class PreloadedRouteSupervisor:
         return cls(
             process=proc,
             cmd_conn=cmd_parent,
+            cancel_event=cancel_event,
             default_deadline_seconds=default_deadline_seconds,
             default_grace_seconds=default_grace_seconds,
         )
 
+    def _parent_deadline(
+        self,
+        deadline: RoutingDeadline | None,
+        deadline_seconds: float | None,
+    ) -> RoutingDeadline:
+        """Build the caller-side RoutingDeadline used for checks and mirroring."""
+        if deadline is not None:
+            return deadline
+        effective_seconds = (
+            deadline_seconds
+            if deadline_seconds is not None
+            else self._default_deadline_seconds
+        )
+        if effective_seconds is not None:
+            return RoutingDeadline.after(float(effective_seconds))
+        return RoutingDeadline()
+
+    def _check_parent_deadline(
+        self, parent_deadline: RoutingDeadline
+    ) -> None:
+        """Mirror a caller-side cancellation into the shared fork event.
+
+        Absolute expiry and hard-kill are enforced by the supervisor so the
+        parent does not override the supervisor's result and lose worker_pid.
+        """
+        if (
+            parent_deadline.cancel_event is not None
+            and parent_deadline.cancel_event.is_set()
+        ):
+            self._cancel_event.set()
     def run_job(
         self,
         func: Callable[..., Any],
@@ -519,12 +584,12 @@ class PreloadedRouteSupervisor:
         available.
 
         ``deadline`` and ``deadline_seconds`` are mutually exclusive.  If
-        ``deadline`` is supplied, its absolute ``expires_at`` is used and a
-        caller-side cooperative check is performed before the job is sent.
-        If ``deadline_seconds`` is supplied, ``expires_at`` is computed from
-        the current monotonic clock before queue/IPC so delays do not extend
-        the budget.  ``grace_seconds`` defaults to the value supplied to
-        ``start``.
+        ``deadline`` is supplied, its absolute ``expires_at`` and any
+        ``cancel_event`` are used; the local ``cancel_event`` is mirrored into
+        a fork-shared byte so the worker and supervisor can observe it.  If
+        ``deadline_seconds`` is supplied, ``expires_at`` is computed from the
+        current monotonic clock before queue/IPC so delays do not extend the
+        budget.  ``grace_seconds`` defaults to the value supplied to ``start``.
         """
         if self._closed:
             raise SupervisorError("supervisor is closed")
@@ -534,20 +599,8 @@ class PreloadedRouteSupervisor:
         if deadline is not None and deadline_seconds is not None:
             raise ValueError("deadline and deadline_seconds are mutually exclusive")
 
-        if deadline is not None:
-            # Caller-side cooperative cancellation/timeout check before IPC.
-            deadline.check()
-            expires_at = deadline.expires_at
-        else:
-            if deadline_seconds is None:
-                deadline_seconds = self._default_deadline_seconds
-            if deadline_seconds is not None:
-                deadline_seconds = float(deadline_seconds)
-                if deadline_seconds < 0.0 or not math.isfinite(deadline_seconds):
-                    raise ValueError("deadline_seconds must be non-negative and finite")
-                expires_at = time.monotonic() + deadline_seconds
-            else:
-                expires_at = None
+        parent_deadline = self._parent_deadline(deadline, deadline_seconds)
+        expires_at = parent_deadline.expires_at
 
         if grace_seconds is None:
             grace_seconds = self._default_grace_seconds
@@ -565,18 +618,44 @@ class PreloadedRouteSupervisor:
         )
 
         with self._lock:
+            # Jobs serialize; clear any stale cancellation before starting.
+            self._cancel_event.clear()
+
+            # Caller-side deadline/cancellation check before IPC only. Once the
+            # job is dispatched, the supervisor owns the absolute deadline and
+            # hard kill, and returns a typed _JobResult preserving worker_pid.
+            try:
+                parent_deadline.check()
+            except (RoutingCancelled, RoutingTimeout):
+                self._cancel_event.set()
+                raise
+
             try:
                 _send_object(self._cmd, job)
             except (BrokenPipeError, EOFError, OSError) as exc:
                 raise SupervisorError(
                     "supervisor process closed unexpectedly"
                 ) from exc
-            try:
-                result = _recv_object(self._cmd)
-            except (BrokenPipeError, EOFError, OSError) as exc:
-                raise SupervisorError(
-                    "supervisor process closed unexpectedly"
-                ) from exc
+
+            while True:
+                # Propagate a caller-side cancellation to the supervisor; let
+                # the supervisor return RoutingCancelled with worker_pid attached.
+                if parent_deadline.cancel_event is not None:
+                    if parent_deadline.cancel_event.is_set():
+                        self._cancel_event.set()
+
+                if not self._process.is_alive():
+                    raise SupervisorError("supervisor process died")
+
+                try:
+                    result = _recv_object(self._cmd, timeout=0.05)
+                    break
+                except TimeoutError:
+                    continue
+                except (BrokenPipeError, EOFError, OSError) as exc:
+                    raise SupervisorError(
+                        "supervisor process closed unexpectedly"
+                    ) from exc
 
         if not isinstance(result, _JobResult):
             raise SupervisorError(
@@ -586,7 +665,13 @@ class PreloadedRouteSupervisor:
             if result.worker_pid is not None:
                 result.error.worker_pid = result.worker_pid  # type: ignore[attr-defined]
             raise result.error
+
+        # Success path: verify the caller's deadline has not been exceeded while
+        # we were waiting, in case the response crossed expires_at without the
+        # supervisor detecting it (e.g. a non-deadline-aware job).
+        parent_deadline.check()
         return result.value
+
 
     def health(self) -> dict[str, Any]:
         """Return a small health snapshot."""
