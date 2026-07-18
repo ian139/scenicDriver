@@ -238,6 +238,13 @@ class _ReversePredecessorSnapshot:
         str, List[Tuple[str, float, float, Optional[float]]]
     ]
 
+class _ZeroBounds(dict[str, float]):
+    """Allocation-free view that disables lower-bound pruning."""
+
+    def get(self, key: str, default: object = None) -> float:
+        del key, default
+        return 0.0
+
 
 @dataclass(frozen=True)
 class _CSRTopology:
@@ -252,6 +259,12 @@ class _CSRTopology:
     node_index: Dict[str, int]
     indptr: np.ndarray
     indices: np.ndarray
+    # Reverse rows are compact numeric views into the forward CSR.  A reverse
+    # entry stores its predecessor node and the exact forward traversal
+    # position, so reverse search never needs a Python incoming-edge map.
+    reverse_indptr: np.ndarray
+    reverse_indices: np.ndarray
+    reverse_positions: np.ndarray
     edge_refs: Tuple[Tuple[str, bool], ...]
     distance_km: np.ndarray
     travel_time_minutes: np.ndarray
@@ -467,12 +480,14 @@ class ScenicRoutePlanner:
             "data_variants": len(type(self)._CSR_DATA_CACHE),
         }
     def _build_csr_topology(
-
-        self, avoid_highways: bool = False
+        self,
+        avoid_highways: bool = False,
+        *,
+        owner: Optional[RoadGraph] = None,
     ) -> Optional[_CSRTopology]:
         """Build one all-traversal CSR topology for the current graph epoch."""
         del avoid_highways  # Highway filtering is a data mask, not topology.
-        graph = self.graph
+        graph = owner if owner is not None else self.graph
         if graph is None or _scipy_csr_matrix is None:
             return None
         stamp = graph._heuristic_cache_stamp()
@@ -524,8 +539,48 @@ class ScenicRoutePlanner:
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
         _check_active_deadline()
+        active_graph = self.graph
+        owner_is_active = active_graph is graph or (
+            isinstance(active_graph, EndpointRoadGraph)
+            and active_graph.base_graph is graph
+        )
         if (
-            graph is not self.graph
+            not owner_is_active
+            or graph._heuristic_cache_stamp() != stamp
+        ):
+            return None
+
+        # Build incoming rows from the forward CSR in two numeric passes.  The
+        # temporary cursor/count arrays are bounded by V; no Python
+        # predecessor lists or edge/weight copies are retained.
+        node_count = len(node_ids)
+        forward_indptr = np.asarray(indptr, dtype=np.int64)
+        forward_indices = np.asarray(indices, dtype=np.int32)
+        reverse_indptr = np.zeros(node_count + 1, dtype=np.int64)
+        for target_index in forward_indices:
+            reverse_indptr[int(target_index) + 1] += 1
+        np.cumsum(reverse_indptr, out=reverse_indptr)
+        reverse_indices = np.empty(len(forward_indices), dtype=np.int32)
+        reverse_positions = np.empty(len(forward_indices), dtype=np.int64)
+        reverse_cursor = reverse_indptr[:-1].copy()
+        for source_index in range(node_count):
+            _check_active_deadline_at(source_index)
+            row_start = int(forward_indptr[source_index])
+            row_end = int(forward_indptr[source_index + 1])
+            for position in range(row_start, row_end):
+                target_index = int(forward_indices[position])
+                reverse_position = int(reverse_cursor[target_index])
+                reverse_indices[reverse_position] = source_index
+                reverse_positions[reverse_position] = position
+                reverse_cursor[target_index] += 1
+        _check_active_deadline()
+        active_graph = self.graph
+        owner_is_active = active_graph is graph or (
+            isinstance(active_graph, EndpointRoadGraph)
+            and active_graph.base_graph is graph
+        )
+        if (
+            not owner_is_active
             or graph._heuristic_cache_stamp() != stamp
         ):
             return None
@@ -535,8 +590,11 @@ class ScenicRoutePlanner:
             avoid_highways=False,
             node_ids=node_ids,
             node_index=node_index,
-            indptr=np.asarray(indptr, dtype=np.int64),
-            indices=np.asarray(indices, dtype=np.int32),
+            indptr=forward_indptr,
+            indices=forward_indices,
+            reverse_indptr=reverse_indptr,
+            reverse_indices=reverse_indices,
+            reverse_positions=reverse_positions,
             edge_refs=tuple(edge_refs),
             distance_km=np.asarray(distances, dtype=np.float64),
             travel_time_minutes=np.asarray(durations, dtype=np.float64),
@@ -907,13 +965,29 @@ class ScenicRoutePlanner:
             best_path = candidate
             ratio = candidate_score
         return best_path
-
-
     def _csr_topology(
-        self, avoid_highways: bool = False
+        self,
+        avoid_highways: bool = False,
+        *,
+        owner: Optional[RoadGraph] = None,
     ) -> Optional[_CSRTopology]:
         del avoid_highways
-        graph = self.graph
+        active_graph = self.graph
+        graph = owner
+        if graph is None and active_graph is not None:
+            if isinstance(active_graph, EndpointRoadGraph):
+                base_graph = active_graph.base_graph
+                try:
+                    graph = (
+                        base_graph
+                        if len(base_graph.edges)
+                        > self._LARGE_GRAPH_EDGE_THRESHOLD
+                        else active_graph
+                    )
+                except (AttributeError, TypeError):
+                    graph = active_graph
+            else:
+                graph = active_graph
         if graph is None or _scipy_csr_matrix is None:
             return None
         stamp = graph._heuristic_cache_stamp()
@@ -929,7 +1003,7 @@ class ScenicRoutePlanner:
             cls._CSR_DATA_CACHE.clear()
             self._csr_topology_cache = None
             self._csr_data_cache = cls._CSR_DATA_CACHE
-        topology = self._build_csr_topology()
+        topology = self._build_csr_topology(owner=graph)
         if topology is not None:
             cls._CSR_TOPOLOGY_CACHE = topology
             self._csr_topology_cache = topology
@@ -1028,15 +1102,15 @@ class ScenicRoutePlanner:
         if topology is None:
             return None
         stamp = topology.stamp
-        key = (id(graph), stamp, signature)
+        owner = topology.graph
+        key = (id(owner), stamp, signature)
         data_cache = type(self)._CSR_DATA_CACHE
         self._csr_data_cache = data_cache
         cached = data_cache.get(key)
         if cached is not None:
             if (
                 cached.topology is topology
-                and graph is self.graph
-                and graph._heuristic_cache_stamp() == stamp
+                and owner._heuristic_cache_stamp() == stamp
                 and self._built_in_cost_signature(cost_function) == signature
             ):
                 data_cache.move_to_end(key)
@@ -1064,8 +1138,7 @@ class ScenicRoutePlanner:
             weights=weight_array,
         )
         if (
-            graph is not self.graph
-            or graph._heuristic_cache_stamp() != stamp
+            owner._heuristic_cache_stamp() != stamp
             or self._built_in_cost_signature(cost_function) != signature
         ):
             return None
@@ -1507,163 +1580,271 @@ class ScenicRoutePlanner:
         goal: Node,
         cost_function: ScenicCostFunction,
     ) -> Optional[List[Edge]]:
-        """Run exact bidirectional Dijkstra for large built-in-cost graphs."""
+        """Run target-bounded Dijkstra over compact base plus local edges."""
         if start.id == goal.id:
             return []
         graph = self.graph
         assert graph is not None
-        predecessors = self._cached_reverse_index(cost_function)
-        if predecessors is None:
+        active_stamp = graph._heuristic_cache_stamp()
+        topology = self._csr_topology()
+        if topology is None:
             return None
         signature = self._built_in_cost_signature(cost_function)
-        fastest_cost = (
-            signature is not None
-            and signature[0] == 0.0
-            and signature[2:] == (1.0, 0.0, 0.0, 0.0)
+        if signature is None:
+            return None
+        data = self._csr_data(cost_function, signature)
+        weights = (
+            data.weights
+            if data is not None and data.topology is topology
+            else self._vectorized_builtin_weights(topology, signature)
         )
-        if "get_edges" in getattr(graph, "__dict__", {}):
-            edge_iterator = graph.get_edges
-        else:
-            edge_iterator = getattr(graph, "iter_edges", None)
-            if not callable(edge_iterator):
-                edge_iterator = graph.get_edges
-        avoid_highways = self._avoids_highways(cost_function)
-        forward_frontier: List[Tuple[float, str]] = [(0.0, start.id)]
-        reverse_frontier: List[Tuple[float, str]] = [(0.0, goal.id)]
-        forward_costs: Dict[str, float] = {start.id: 0.0}
-        reverse_costs: Dict[str, float] = {goal.id: 0.0}
-        forward_parent: Dict[str, Tuple[str, Edge]] = {}
-        reverse_parent: Dict[str, Tuple[str, str, bool]] = {}
-        incumbent = float("inf")
-        meeting_node: Optional[str] = None
+        if weights is None:
+            return None
+        base_index = topology.node_index
+        start_id = str(start.id)
+        goal_id = str(goal.id)
+        if start_id not in graph.nodes or goal_id not in graph.nodes:
+            return None
 
+        def local_edge_cost(edge_id: str, reverse: bool) -> float:
+            edge = graph.edges[edge_id]
+            if reverse:
+                edge = self._edge_from_reverse_index(edge_id, True)
+            return self._validated_nonnegative(
+                cost_function.calculate(edge), "edge calculated cost"
+            )
+
+        def forward_steps(node_id: str):
+            base_node_index = base_index.get(node_id)
+            if base_node_index is not None:
+                row_start = int(topology.indptr[base_node_index])
+                row_end = int(topology.indptr[base_node_index + 1])
+                for position in range(row_start, row_end):
+                    edge_cost = float(weights[position])
+                    if math.isfinite(edge_cost):
+                        yield (
+                            str(topology.node_ids[int(topology.indices[position])]),
+                            edge_cost,
+                            ("base", position),
+                        )
+            if isinstance(graph, EndpointRoadGraph):
+                for edge_id, reverse in graph.iter_local_edges(node_id):
+                    edge = graph.edges[edge_id]
+                    neighbor = (
+                        edge.start_node_id if reverse else edge.end_node_id
+                    )
+                    if self._avoids_highways(cost_function) and is_highway_road_type(
+                        edge.road_type
+                    ):
+                        continue
+                    edge_cost = local_edge_cost(edge_id, bool(reverse))
+                    if math.isfinite(edge_cost):
+                        yield (
+                            str(neighbor),
+                            edge_cost,
+                            ("local", str(edge_id), bool(reverse)),
+                        )
+
+        def reverse_steps(node_id: str):
+            base_node_index = base_index.get(node_id)
+            if base_node_index is not None:
+                row_start = int(topology.reverse_indptr[base_node_index])
+                row_end = int(topology.reverse_indptr[base_node_index + 1])
+                for reverse_position in range(row_start, row_end):
+                    predecessor_index = int(
+                        topology.reverse_indices[reverse_position]
+                    )
+                    position = int(topology.reverse_positions[reverse_position])
+                    edge_cost = float(weights[position])
+                    if math.isfinite(edge_cost):
+                        yield (
+                            str(topology.node_ids[predecessor_index]),
+                            edge_cost,
+                            ("base", position),
+                        )
+            if isinstance(graph, EndpointRoadGraph):
+                for edge_id, reverse in graph.iter_local_predecessors(node_id):
+                    edge = graph.edges[edge_id]
+                    predecessor = (
+                        edge.end_node_id if reverse else edge.start_node_id
+                    )
+                    if self._avoids_highways(cost_function) and is_highway_road_type(
+                        edge.road_type
+                    ):
+                        continue
+                    edge_cost = local_edge_cost(edge_id, bool(reverse))
+                    if math.isfinite(edge_cost):
+                        yield (
+                            str(predecessor),
+                            edge_cost,
+                            ("local", str(edge_id), bool(reverse)),
+                        )
+
+        def token_edge_id(token: Tuple[object, ...]) -> str:
+            if token[0] == "base":
+                return str(topology.edge_refs[int(str(token[1]))][0])
+            return str(token[1])
+
+        forward_costs: Dict[str, float] = {start_id: 0.0}
+        reverse_costs: Dict[str, float] = {goal_id: 0.0}
+        forward_keys: Dict[str, Tuple[str, ...]] = {start_id: ()}
+        reverse_keys: Dict[str, Tuple[str, ...]] = {goal_id: ()}
+        forward_parent: Dict[str, Tuple[str, Tuple[object, ...]]] = {}
+        reverse_parent: Dict[str, Tuple[str, Tuple[object, ...]]] = {}
+        forward_frontier: List[Tuple[float, Tuple[str, ...], str]] = [
+            (0.0, (), start_id)
+        ]
+        reverse_frontier: List[Tuple[float, Tuple[str, ...], str]] = [
+            (0.0, (), goal_id)
+        ]
+        incumbent = float("inf")
+        meeting_id: Optional[str] = None
+        meeting_key: Optional[Tuple[str, ...]] = None
         expanded = 0
+
+        def consider(node_id: str, candidate: float) -> None:
+            nonlocal incumbent, meeting_id, meeting_key
+            forward_key = forward_keys.get(node_id)
+            reverse_key = reverse_keys.get(node_id)
+            if forward_key is None or reverse_key is None:
+                return
+            candidate_key = forward_key + reverse_key
+            if candidate < incumbent or (
+                candidate == incumbent
+                and (meeting_key is None or candidate_key < meeting_key)
+            ):
+                incumbent = candidate
+                meeting_id = node_id
+                meeting_key = candidate_key
+
         while forward_frontier and reverse_frontier:
             _check_active_deadline_at(expanded)
             expanded += 1
-            if forward_frontier[0][0] + reverse_frontier[0][0] >= incumbent:
+            if (
+                incumbent != float("inf")
+                and forward_frontier[0][0] + reverse_frontier[0][0]
+                > incumbent
+            ):
                 break
             expand_forward = (
                 forward_frontier[0][0] <= reverse_frontier[0][0]
             )
             if expand_forward:
-                current_cost, current_id = heapq.heappop(
+                current_cost, current_key, current_id = heapq.heappop(
                     forward_frontier
                 )
-                if current_cost != forward_costs.get(current_id):
+                if (
+                    current_cost != forward_costs.get(current_id, float("inf"))
+                    or current_key != forward_keys.get(current_id)
+                ):
                     continue
                 reverse_cost = reverse_costs.get(current_id)
                 if reverse_cost is not None:
-                    candidate = current_cost + reverse_cost
-                    if candidate < incumbent:
-                        incumbent = candidate
-                        meeting_node = current_id
-                for edge in edge_iterator(current_id):
-                    if avoid_highways and is_highway_road_type(
-                        edge.road_type
-                    ):
-                        continue
-                    self._validated_nonnegative(
-                        edge.distance_km, "edge distance_km"
-                    )
-                    edge_duration_minutes = self._edge_duration_minutes(edge)
-                    if fastest_cost:
-                        edge_cost = edge_duration_minutes
-                    else:
-                        edge_cost = self._validated_nonnegative(
-                            cost_function.calculate(edge),
-                            "edge calculated cost",
-                        )
+                    consider(current_id, current_cost + reverse_cost)
+                for neighbor_id, edge_cost, token in forward_steps(current_id):
                     next_cost = current_cost + edge_cost
+                    next_key = current_key + (token_edge_id(token),)
                     if not math.isfinite(next_cost):
                         raise ValueError(
                             "cumulative calculated cost must be finite and non-negative"
                         )
-                    neighbor_id = edge.end_node_id
-                    if next_cost >= forward_costs.get(
+                    previous_cost = forward_costs.get(
                         neighbor_id, float("inf")
+                    )
+                    previous_key = forward_keys.get(neighbor_id)
+                    if next_cost > previous_cost or (
+                        next_cost == previous_cost
+                        and previous_key is not None
+                        and next_key >= previous_key
                     ):
                         continue
                     forward_costs[neighbor_id] = next_cost
-                    forward_parent[neighbor_id] = (current_id, edge)
+                    forward_keys[neighbor_id] = next_key
+                    forward_parent[neighbor_id] = (current_id, token)
                     heapq.heappush(
-                        forward_frontier, (next_cost, neighbor_id)
+                        forward_frontier, (next_cost, next_key, neighbor_id)
                     )
                     reverse_cost = reverse_costs.get(neighbor_id)
                     if reverse_cost is not None:
-                        candidate = next_cost + reverse_cost
-                        if candidate < incumbent:
-                            incumbent = candidate
-                            meeting_node = neighbor_id
+                        consider(neighbor_id, next_cost + reverse_cost)
             else:
-                current_cost, current_id = heapq.heappop(
+                current_cost, current_key, current_id = heapq.heappop(
                     reverse_frontier
                 )
-                if current_cost != reverse_costs.get(current_id):
+                if (
+                    current_cost != reverse_costs.get(current_id, float("inf"))
+                    or current_key != reverse_keys.get(current_id)
+                ):
                     continue
                 forward_cost = forward_costs.get(current_id)
                 if forward_cost is not None:
-                    candidate = current_cost + forward_cost
-                    if candidate < incumbent:
-                        incumbent = candidate
-                        meeting_node = current_id
-                for (
-                    predecessor_id,
-                    edge_id,
-                    reverse,
-                ) in predecessors.get(current_id, ()):
-                    if fastest_cost:
-                        edge_cost = self._edge_duration_minutes(
-                            graph.edges[edge_id]
-                        )
-                    else:
-                        edge = self._edge_from_reverse_index(
-                            edge_id, reverse
-                        )
-                        edge_cost = self._validated_nonnegative(
-                            cost_function.calculate(edge),
-                            "edge calculated cost",
-                        )
+                    consider(current_id, current_cost + forward_cost)
+                for predecessor_id, edge_cost, token in reverse_steps(current_id):
                     next_cost = current_cost + edge_cost
+                    next_key = (token_edge_id(token),) + current_key
                     if not math.isfinite(next_cost):
                         raise ValueError(
                             "cumulative calculated cost must be finite and non-negative"
                         )
-                    if next_cost >= reverse_costs.get(
+                    previous_cost = reverse_costs.get(
                         predecessor_id, float("inf")
+                    )
+                    previous_key = reverse_keys.get(predecessor_id)
+                    if next_cost > previous_cost or (
+                        next_cost == previous_cost
+                        and previous_key is not None
+                        and next_key >= previous_key
                     ):
                         continue
                     reverse_costs[predecessor_id] = next_cost
-                    reverse_parent[predecessor_id] = (
-                        current_id,
-                        edge_id,
-                        reverse,
-                    )
+                    reverse_keys[predecessor_id] = next_key
+                    reverse_parent[predecessor_id] = (current_id, token)
                     heapq.heappush(
-                        reverse_frontier, (next_cost, predecessor_id)
+                        reverse_frontier, (next_cost, next_key, predecessor_id)
                     )
                     forward_cost = forward_costs.get(predecessor_id)
                     if forward_cost is not None:
-                        candidate = next_cost + forward_cost
-                        if candidate < incumbent:
-                            incumbent = candidate
-                            meeting_node = predecessor_id
+                        consider(predecessor_id, next_cost + forward_cost)
 
-        if meeting_node is None:
+        if (
+            meeting_id is None
+            or graph is not self.graph
+            or graph._heuristic_cache_stamp() != active_stamp
+            or topology.graph._heuristic_cache_stamp() != topology.stamp
+            or self._built_in_cost_signature(cost_function) != signature
+        ):
             return None
-        path: List[Edge] = []
-        current_id = meeting_node
-        while current_id != start.id:
-            predecessor_id, edge = forward_parent[current_id]
-            path.append(edge)
-            current_id = predecessor_id
-        path.reverse()
-        current_id = meeting_node
-        while current_id != goal.id:
-            next_id, edge_id, reverse = reverse_parent[current_id]
-            path.append(self._edge_from_reverse_index(edge_id, reverse))
+
+        def edge_for_token(token: Tuple[object, ...]) -> Edge:
+            if token[0] == "base":
+                edge_id, reverse = topology.edge_refs[int(str(token[1]))]
+            else:
+                edge_id, reverse = str(token[1]), bool(token[2])
+            return self._edge_from_reverse_index(edge_id, reverse)
+
+        path_reversed: List[Edge] = []
+        current_id = meeting_id
+        visited = {current_id}
+        while current_id != start_id:
+            parent = forward_parent.get(current_id)
+            if parent is None or parent[0] in visited:
+                return None
+            previous_id, token = parent
+            path_reversed.append(edge_for_token(token))
+            current_id = previous_id
+            visited.add(current_id)
+        path_reversed.reverse()
+        current_id = meeting_id
+        visited = {current_id}
+        while current_id != goal_id:
+            parent = reverse_parent.get(current_id)
+            if parent is None or parent[0] in visited:
+                return None
+            next_id, token = parent
+            path_reversed.append(edge_for_token(token))
             current_id = next_id
-        return path
+            visited.add(current_id)
+        return path_reversed
 
 
     @staticmethod
@@ -1817,62 +1998,95 @@ class ScenicRoutePlanner:
             return deadline is not None and self._monotonic() >= deadline
 
         def zero_bounds() -> Dict[str, float]:
-            return {str(node_id): 0.0 for node_id in self.graph.nodes}
+            return _ZeroBounds()
 
         fastest = ScenicRoutePlanner._make_fastest_cost_function(self)
         fastest.avoid_highways = bool(avoid_highways)
         signature = self._built_in_cost_signature(fastest)
-        if expired():
+        graph = self.graph
+        if graph is None or signature is None or expired():
             return zero_bounds()
-        if _scipy_shortest_path is not None and signature is not None:
-            data = self._csr_data(fastest, signature)
-            if data is not None:
-                goal_index = data.topology.node_index.get(goal.id)
-                if goal_index is not None:
-                    distances = _scipy_shortest_path(
-                        data.matrix.transpose(),
-                        directed=True,
-                        indices=goal_index,
-                        return_predecessors=False,
-                        unweighted=False,
-                        method="D",
-                    )
-                    if expired():
-                        return zero_bounds()
-                    if self.graph._heuristic_cache_stamp() == data.topology.stamp:
-                        return {
-                            node_id: float(distances[index])
-                            for index, node_id in enumerate(data.topology.node_ids)
-                        }
-        snapshot = self._build_reverse_predecessor_snapshot(
-            fastest, deadline=deadline
+        active_stamp = graph._heuristic_cache_stamp()
+        topology = self._csr_topology()
+        if topology is None:
+            return zero_bounds()
+        data = self._csr_data(fastest, signature)
+        weights = (
+            data.weights
+            if data is not None and data.topology is topology
+            else self._vectorized_builtin_weights(topology, signature)
         )
-        if snapshot is None:
+        if weights is None:
             return zero_bounds()
-        bounds = {
-            str(node_id): float("inf") for node_id in self.graph.nodes
-        }
-        bounds[goal.id] = 0.0
-        queue: List[Tuple[float, str]] = [(0.0, goal.id)]
+        goal_id = str(goal.id)
+        bounds: Dict[str, float] = {goal_id: 0.0}
+        queue: List[Tuple[float, str]] = [(0.0, goal_id)]
         while queue:
             if expired():
                 return zero_bounds()
             distance, node_id = heapq.heappop(queue)
             if distance != bounds.get(node_id):
                 continue
-            for predecessor, _, edge_duration, _ in snapshot.predecessors.get(
-                node_id, ()
-            ):
-                if expired():
-                    return zero_bounds()
-                next_distance = distance + edge_duration
-                if not math.isfinite(next_distance) or not self._duration_within_cap(
-                    next_distance, duration_cap
-                ):
-                    continue
-                if next_distance < bounds.get(predecessor, float("inf")):
-                    bounds[predecessor] = next_distance
-                    heapq.heappush(queue, (next_distance, predecessor))
+            base_node_index = topology.node_index.get(node_id)
+            if base_node_index is not None:
+                row_start = int(topology.reverse_indptr[base_node_index])
+                row_end = int(topology.reverse_indptr[base_node_index + 1])
+                for reverse_position in range(row_start, row_end):
+                    predecessor_index = int(
+                        topology.reverse_indices[reverse_position]
+                    )
+                    position = int(topology.reverse_positions[reverse_position])
+                    edge_duration = float(
+                        topology.travel_time_minutes[position]
+                    )
+                    if not math.isfinite(float(weights[position])):
+                        continue
+                    predecessor = str(topology.node_ids[predecessor_index])
+                    next_distance = distance + edge_duration
+                    if (
+                        not math.isfinite(next_distance)
+                        or not self._duration_within_cap(
+                            next_distance, duration_cap
+                        )
+                    ):
+                        continue
+                    if next_distance < bounds.get(
+                        predecessor, float("inf")
+                    ):
+                        bounds[predecessor] = next_distance
+                        heapq.heappush(queue, (next_distance, predecessor))
+            if isinstance(graph, EndpointRoadGraph):
+                for edge_id, reverse in graph.iter_local_predecessors(node_id):
+                    edge = graph.edges[edge_id]
+                    if avoid_highways and is_highway_road_type(
+                        edge.road_type
+                    ):
+                        continue
+                    edge_duration = self._edge_duration_minutes(edge)
+                    predecessor = str(
+                        edge.end_node_id
+                        if reverse
+                        else edge.start_node_id
+                    )
+                    next_distance = distance + edge_duration
+                    if (
+                        not math.isfinite(next_distance)
+                        or not self._duration_within_cap(
+                            next_distance, duration_cap
+                        )
+                    ):
+                        continue
+                    if next_distance < bounds.get(
+                        predecessor, float("inf")
+                    ):
+                        bounds[predecessor] = next_distance
+                        heapq.heappush(queue, (next_distance, predecessor))
+        if (
+            graph is not self.graph
+            or graph._heuristic_cache_stamp() != active_stamp
+            or topology.graph._heuristic_cache_stamp() != topology.stamp
+        ):
+            return zero_bounds()
         return bounds
 
     @staticmethod
@@ -3957,13 +4171,28 @@ class ScenicRoutePlanner:
             raise ValueError(
                 "shortest_duration_minutes requires max_path_minutes"
             )
-        if self._reverse_cost_eligible(cost_function):
-            if (
-                self._compiled_reachability_result(
-                    start, goal, cost_function
-                )
-                is False
-            ):
+        eligible_builtin = self._reverse_cost_eligible(cost_function)
+        large_builtin = eligible_builtin and (
+            len(self.graph.edges) > self._LARGE_GRAPH_EDGE_THRESHOLD
+            or (
+                isinstance(self.graph, EndpointRoadGraph)
+                and len(self.graph.base_graph.edges)
+                > self._LARGE_GRAPH_EDGE_THRESHOLD
+            )
+        )
+        if large_builtin:
+            # The compact target-bounded search must precede any full-source
+            # SciPy invocation on production-sized graphs.
+            bidirectional_path = self._bidirectional_builtin_path(
+                start, goal, cost_function
+            )
+            if bidirectional_path is not None:
+                return bidirectional_path
+        elif eligible_builtin:
+            reachability = self._compiled_reachability_result(
+                start, goal, cost_function
+            )
+            if reachability is False:
                 return None
             compiled_path = self._compiled_builtin_path(
                 start, goal, cost_function
@@ -3977,16 +4206,6 @@ class ScenicRoutePlanner:
                 is False
             ):
                 return None
-        if (
-            len(self.graph.edges) > self._LARGE_GRAPH_EDGE_THRESHOLD
-            and self._reverse_cost_eligible(cost_function)
-        ):
-            bidirectional_path = self._bidirectional_builtin_path(
-                start, goal, cost_function
-            )
-            if bidirectional_path is not None:
-                return bidirectional_path
-
 
         minimum_cost_per_km = (
             self._minimum_cost_per_km(cost_function)

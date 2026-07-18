@@ -1736,3 +1736,130 @@ def test_scenic_priority_overrides_zero_weight_shortcut() -> None:
 
     assert route.edge_ids == ("scenic-1", "scenic-2")
     assert route.estimated_duration_minutes <= route.duration_cap_minutes
+
+def test_compact_reverse_csr_has_numeric_positions_and_inbound_mapping() -> None:
+    graph = RoadGraph()
+    for node_id in ("S", "A", "G"):
+        graph.add_node(Node(node_id, 0.0, 0.0))
+    graph.add_edge(
+        Edge("forward", "S", "A", 1.0, 5.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge("finish", "A", "G", 1.0, 5.0, speed_limit_kmh=60, one_way=True)
+    )
+    planner = ScenicRoutePlanner(graph)
+    topology = planner._csr_topology()
+    assert topology is not None
+    assert topology.reverse_indptr.shape == (len(topology.node_ids) + 1,)
+    assert topology.reverse_indices.shape == topology.indices.shape
+    assert topology.reverse_positions.shape == topology.indices.shape
+    assert topology.reverse_indptr.dtype.kind in "iu"
+    assert topology.reverse_indices.dtype.kind in "iu"
+    assert topology.reverse_positions.dtype.kind in "iu"
+    assert topology.reverse_indptr.nbytes + topology.reverse_indices.nbytes + topology.reverse_positions.nbytes <= (
+        32 * (len(topology.node_ids) + len(topology.indices))
+    )
+    goal_index = topology.node_index["G"]
+    reverse_start = int(topology.reverse_indptr[goal_index])
+    reverse_position = int(topology.reverse_positions[reverse_start])
+    assert topology.edge_refs[reverse_position] == ("finish", False)
+    assert int(topology.reverse_indices[reverse_start]) == topology.node_index["A"]
+
+
+def test_endpoint_scenic_search_reuses_prewarmed_base_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = ScenicRoutePlanner(
+        _production_corridor_diversity_graph(),
+        frontier_time_limit_seconds=0.0,
+    )
+    planner._LARGE_GRAPH_EDGE_THRESHOLD = 0
+    planner.prewarm_routing_cache()
+
+    def fail_rebuild(*args: object, **kwargs: object) -> object:
+        raise AssertionError("endpoint query rebuilt base CSR")
+
+    monkeypatch.setattr(planner, "_build_csr_topology", fail_rebuild)
+    route = planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.03, 0.0),
+        scenic_weight=1.0,
+        max_detour_factor=3.0,
+        scenic_priority=True,
+    )
+    assert route.edge_ids == (
+        "shared-connector",
+        "scenic-1",
+        "scenic-2",
+    )
+
+
+def test_target_bounded_builtin_search_matches_canonical_without_reverse_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    for index in range(20):
+        graph.add_node(Node(str(index), 0.0, float(index)))
+    graph.add_edge(
+        Edge("z-direct", "0", "19", 2.0, 5.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge("a-first", "0", "1", 1.0, 5.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge("a-last", "1", "19", 1.0, 5.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge("wrong-way", "19", "18", 1.0, 5.0, speed_limit_kmh=60, one_way=True)
+    )
+    planner = ScenicRoutePlanner(graph)
+    planner._LARGE_GRAPH_EDGE_THRESHOLD = 0
+    monkeypatch.setattr(
+        planner,
+        "_cached_reverse_index",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy reverse map used")
+        ),
+    )
+    fastest = planner._make_fastest_cost_function()
+    expected = planner._canonical_fastest_edges(
+        graph.get_node("0"), graph.get_node("19"), False
+    )
+    actual = planner._bidirectional_builtin_path(
+        graph.get_node("0"), graph.get_node("19"), fastest
+    )
+    assert [edge.id for edge in actual or []] == [
+        edge.id for edge in expected or []
+    ]
+    assert (
+        planner._bidirectional_builtin_path(
+            graph.get_node("19"), graph.get_node("0"), fastest
+        )
+        is None
+    )
+
+
+def test_target_bounded_query_has_no_dense_node_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    for index in range(2_000):
+        graph.add_node(Node(str(index), 0.0, float(index)))
+    graph.add_edge(
+        Edge("only", "0", "1", 1.0, 5.0, speed_limit_kmh=60, one_way=True)
+    )
+    planner = ScenicRoutePlanner(graph)
+    planner._LARGE_GRAPH_EDGE_THRESHOLD = 0
+    planner.prewarm_routing_cache()
+    monkeypatch.setattr(
+        "src.route_planner.planner.np.full",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("query allocated dense node state")
+        ),
+    )
+    path = planner._bidirectional_builtin_path(
+        graph.get_node("0"),
+        graph.get_node("1"),
+        planner._make_fastest_cost_function(),
+    )
+    assert [edge.id for edge in path or []] == ["only"]
