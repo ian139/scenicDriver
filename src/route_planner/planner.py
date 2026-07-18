@@ -1,10 +1,13 @@
 from __future__ import annotations
 import time
 
+from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import heapq
 import math
-from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -15,6 +18,8 @@ try:
 except ImportError:  # pragma: no cover - exercised only without optional runtime
     _scipy_csr_matrix = None
     _scipy_shortest_path = None
+
+from .cancellation import RoutingDeadline
 
 from .cost import (
     CostWeights,
@@ -47,6 +52,41 @@ _SEARCH_DIAGNOSTIC_KEYS = (
     "elapsed_ms",
     "mode",
 )
+
+
+_ACTIVE_ROUTING_DEADLINE: ContextVar[RoutingDeadline | None] = ContextVar(
+    "active_routing_deadline", default=None
+)
+
+
+def _check_active_deadline() -> None:
+    deadline = _ACTIVE_ROUTING_DEADLINE.get()
+    if deadline is not None:
+        deadline.check()
+
+
+def _check_active_deadline_at(counter: int) -> None:
+    if counter & 1023 == 0:
+        _check_active_deadline()
+
+
+@contextmanager
+def _routing_deadline_scope(
+    deadline: RoutingDeadline | None,
+) -> Iterator[None]:
+    active = _ACTIVE_ROUTING_DEADLINE.get()
+    token = (
+        _ACTIVE_ROUTING_DEADLINE.set(deadline)
+        if deadline is not None and deadline is not active
+        else None
+    )
+    try:
+        _check_active_deadline()
+        yield
+        _check_active_deadline()
+    finally:
+        if token is not None:
+            _ACTIVE_ROUTING_DEADLINE.reset(token)
 
 
 def _exact_search_diagnostics() -> Dict[str, object]:
@@ -447,7 +487,8 @@ class ScenicRoutePlanner:
             scenic_byway_mask: List[bool] = []
             adjacency = graph.adjacency
             edges = graph.edges
-            for source_id in node_ids:
+            for source_index, source_id in enumerate(node_ids):
+                _check_active_deadline_at(source_index)
                 for edge_id, reverse in adjacency.get(source_id, ()):
                     edge = edges[edge_id]
                     target_id = (
@@ -480,6 +521,7 @@ class ScenicRoutePlanner:
                 indptr.append(len(indices))
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
+        _check_active_deadline()
         if (
             graph is not self.graph
             or graph._heuristic_cache_stamp() != stamp
@@ -1213,6 +1255,7 @@ class ScenicRoutePlanner:
         goal_index = topology.node_index.get(goal.id)
         if start_index is None or goal_index is None:
             return None
+        _check_active_deadline()
         distances, predecessors = _scipy_shortest_path(
             compiled.matrix,
             directed=True,
@@ -1221,6 +1264,7 @@ class ScenicRoutePlanner:
             unweighted=False,
             method="D",
         )
+        _check_active_deadline()
         goal_distance = float(distances[goal_index])
         self._record_compiled_reachability(
             start,
@@ -1397,7 +1441,10 @@ class ScenicRoutePlanner:
             return None
         predecessors: Dict[str, List[Tuple[str, str, bool]]] = {}
         try:
-            for source_id, traversals in adjacency.items():
+            for source_index, (source_id, traversals) in enumerate(
+                adjacency.items()
+            ):
+                _check_active_deadline_at(source_index)
                 for edge_id, reverse in traversals:
                     edge = edges[edge_id]
                     if avoid_highways and is_highway_road_type(
@@ -1412,6 +1459,7 @@ class ScenicRoutePlanner:
                     )
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
+        _check_active_deadline()
         if (
             graph is not self.graph
             or graph._heuristic_cache_stamp() != stamp
@@ -1487,7 +1535,10 @@ class ScenicRoutePlanner:
         incumbent = float("inf")
         meeting_node: Optional[str] = None
 
+        expanded = 0
         while forward_frontier and reverse_frontier:
+            _check_active_deadline_at(expanded)
+            expanded += 1
             if forward_frontier[0][0] + reverse_frontier[0][0] >= incumbent:
                 break
             expand_forward = (
@@ -1646,7 +1697,10 @@ class ScenicRoutePlanner:
             (0.0, (), start.id, (), (start.id,))
         ]
         best: Dict[str, Tuple[float, Tuple[str, ...]]] = {start.id: (0.0, ())}
+        expanded = 0
         while frontier:
+            _check_active_deadline_at(expanded)
+            expanded += 1
             duration, sequence, node_id, path, nodes = heapq.heappop(frontier)
             if best.get(node_id) != (duration, sequence):
                 continue
@@ -1704,6 +1758,7 @@ class ScenicRoutePlanner:
 
         def visit(node_id: str, path: Tuple[Edge, ...], duration: float) -> None:
             nonlocal best_edges, best_evaluation
+            _check_active_deadline()
             if node_id == goal.id:
                 evaluation = evaluate_path(
                     path,
@@ -1711,6 +1766,7 @@ class ScenicRoutePlanner:
                     kappa=kappa,
                     fastest_duration_minutes=fastest_duration_minutes,
                     policy=policy,
+                    check_cancelled=_check_active_deadline,
                 )
                 if (
                     best_evaluation is None
@@ -1755,6 +1811,7 @@ class ScenicRoutePlanner:
         deadline: Optional[float] = None,
     ) -> Dict[str, float]:
         def expired() -> bool:
+            _check_active_deadline()
             return deadline is not None and self._monotonic() >= deadline
 
         def zero_bounds() -> Dict[str, float]:
@@ -1894,6 +1951,7 @@ class ScenicRoutePlanner:
             return []
 
         def expired() -> bool:
+            _check_active_deadline()
             return deadline is not None and self._monotonic() >= deadline
         beam_width = 256
         per_root_limit = 16
@@ -2118,6 +2176,7 @@ class ScenicRoutePlanner:
             return []
 
         def expired() -> bool:
+            _check_active_deadline()
             return deadline is not None and self._monotonic() >= deadline
 
         scale = (
@@ -2196,6 +2255,7 @@ class ScenicRoutePlanner:
         """
 
         def expired() -> bool:
+            _check_active_deadline()
             return deadline is not None and self._monotonic() >= deadline
 
         if expired():
@@ -2691,6 +2751,7 @@ class ScenicRoutePlanner:
         started_at: Optional[float] = None,
     ) -> Tuple[List[Edge], object, bool, float, Dict[str, object]]:
         del started_at
+        _check_active_deadline()
         try:
             time_limit_seconds = float(self._frontier_time_limit_seconds)
         except (TypeError, ValueError, OverflowError):
@@ -2833,6 +2894,7 @@ class ScenicRoutePlanner:
                 kappa=kappa,
                 fastest_duration_minutes=fastest_duration_minutes,
                 policy=policy,
+                check_cancelled=_check_active_deadline,
             )
             if is_better_path(warm_evaluation, incumbent_evaluation):
                 incumbent_edges = warm_path
@@ -2844,6 +2906,7 @@ class ScenicRoutePlanner:
 
         def deadline_reached() -> bool:
             nonlocal last_observed_at
+            _check_active_deadline()
             try:
                 now = self._monotonic()
             except (TypeError, ValueError, OverflowError):
@@ -2887,6 +2950,7 @@ class ScenicRoutePlanner:
                     kappa=kappa,
                     fastest_duration_minutes=fastest_duration_minutes,
                     policy=policy,
+                    check_cancelled=_check_active_deadline,
                 )
                 if is_better_path(evaluation, incumbent_evaluation):
                     incumbent_edges = candidate
@@ -3043,6 +3107,27 @@ class ScenicRoutePlanner:
             search_diagnostics,
         )
 
+    @staticmethod
+    def _copy_endpoint_overlay(base: RoadGraph) -> RoadGraph:
+        """Clone mutable endpoint state with cooperative cancellation."""
+        overlay = RoadGraph()
+        overlay.nodes = {}
+        for index, (node_id, node) in enumerate(base.nodes.items()):
+            _check_active_deadline_at(index)
+            overlay.nodes[node_id] = node
+        overlay.edges = {}
+        for index, (edge_id, edge) in enumerate(base.edges.items()):
+            _check_active_deadline_at(index)
+            overlay.edges[edge_id] = edge
+        overlay.adjacency = {}
+        for index, (node_id, adjacencies) in enumerate(base.adjacency.items()):
+            _check_active_deadline_at(index)
+            overlay.adjacency[node_id] = list(adjacencies)
+        overlay._heuristic_structure_epoch = base._heuristic_structure_epoch
+        overlay._reverse_edge_views = {}
+        _check_active_deadline()
+        return overlay
+
     def _endpoint_graph(
         self,
         start: Tuple[float, float],
@@ -3054,6 +3139,7 @@ class ScenicRoutePlanner:
         base = self.graph
         if base is None:
             raise RuntimeError("Road graph not loaded")
+        _check_active_deadline()
         excluded_road_types = (
             HIGHWAY_ROAD_TYPES if avoid_highways else frozenset()
         )
@@ -3061,36 +3147,26 @@ class ScenicRoutePlanner:
             start_projections, _ = base.find_nearest_edge_positions_with_distance(
                 *start,
                 excluded_road_types=excluded_road_types,
+                check_cancelled=_check_active_deadline,
             )
             end_projections, _ = base.find_nearest_edge_positions_with_distance(
                 *end,
                 excluded_road_types=excluded_road_types,
+                check_cancelled=_check_active_deadline,
             )
         except ValueError:
-            start_node, _ = base.find_nearest_node_with_distance(*start)
-            end_node, _ = base.find_nearest_node_with_distance(*end)
+            start_node, _ = base.find_nearest_node_with_distance(
+                *start, check_cancelled=_check_active_deadline
+            )
+            end_node, _ = base.find_nearest_node_with_distance(
+                *end, check_cancelled=_check_active_deadline
+            )
             if start != end or start_node.id != end_node.id:
                 raise ValueError("No route found between the given coordinates.")
-            overlay = RoadGraph()
-            overlay.nodes = dict(base.nodes)
-            overlay.edges = dict(base.edges)
-            overlay.adjacency = {
-                node_id: list(adjacencies)
-                for node_id, adjacencies in base.adjacency.items()
-            }
-            overlay._heuristic_structure_epoch = base._heuristic_structure_epoch
-            overlay._reverse_edge_views = {}
+            overlay = self._copy_endpoint_overlay(base)
             overlay._route_endpoint_node_ids = (start_node.id, end_node.id)
             return overlay
-        overlay = RoadGraph()
-        overlay.nodes = dict(base.nodes)
-        overlay.edges = dict(base.edges)
-        overlay.adjacency = {
-            node_id: list(adjacencies)
-            for node_id, adjacencies in base.adjacency.items()
-        }
-        overlay._heuristic_structure_epoch = base._heuristic_structure_epoch
-        overlay._reverse_edge_views = {}
+        overlay = self._copy_endpoint_overlay(base)
 
         epsilon = 1e-12
 
@@ -3292,6 +3368,7 @@ class ScenicRoutePlanner:
                         )
                     )
         overlay._route_endpoint_node_ids = (start_id, end_id)
+        _check_active_deadline()
         return overlay
 
     def _routing_endpoint_nodes(
@@ -3303,7 +3380,14 @@ class ScenicRoutePlanner:
                 self.graph.get_node(endpoint_ids[0]),
                 self.graph.get_node(endpoint_ids[1]),
             )
-        return self.graph.find_nearest_node(*start), self.graph.find_nearest_node(*end)
+        return (
+            self.graph.find_nearest_node(
+                *start, check_cancelled=_check_active_deadline
+            ),
+            self.graph.find_nearest_node(
+                *end, check_cancelled=_check_active_deadline
+            ),
+        )
     def _large_graph_fastest_route(
         self,
         start: Tuple[float, float],
@@ -3314,12 +3398,17 @@ class ScenicRoutePlanner:
         """Solve all legal projected endpoint access states on the base graph."""
         base = self.graph
         assert base is not None
+        _check_active_deadline()
         excluded = HIGHWAY_ROAD_TYPES if avoid_highways else frozenset()
         starts, _ = base.find_nearest_edge_positions_with_distance(
-            *start, excluded_road_types=excluded
+            *start,
+            excluded_road_types=excluded,
+            check_cancelled=_check_active_deadline,
         )
         ends, _ = base.find_nearest_edge_positions_with_distance(
-            *end, excluded_road_types=excluded
+            *end,
+            excluded_road_types=excluded,
+            check_cancelled=_check_active_deadline,
         )
         start_id = "__route_large_start__"
         end_id = "__route_large_end__"
@@ -3478,6 +3567,7 @@ class ScenicRoutePlanner:
             kappa=1.0,
             fastest_duration_minutes=duration,
             policy=policy,
+            check_cancelled=_check_active_deadline,
         )
         self.graph = render_graph
         try:
@@ -3522,6 +3612,38 @@ class ScenicRoutePlanner:
         return candidate_score > baseline_score + tolerance
 
     def find_scenic_route(
+        self,
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+        scenic_weight: float = 0.5,
+        avoid_highways: bool = False,
+        max_detour_factor: float = 1.8,
+        *,
+        q: Optional[float] = None,
+        kappa: Optional[float] = None,
+        highway_preference: Optional[float] = None,
+        strict_highways: Optional[bool] = None,
+        scenic_priority: bool = False,
+        _endpoint_graph: bool = False,
+        deadline: RoutingDeadline | None = None,
+    ) -> Route:
+        """Optimize scenic score within one shared request deadline."""
+        with _routing_deadline_scope(deadline):
+            return self._find_scenic_route(
+                start,
+                end,
+                scenic_weight,
+                avoid_highways,
+                max_detour_factor,
+                q=q,
+                kappa=kappa,
+                highway_preference=highway_preference,
+                strict_highways=strict_highways,
+                scenic_priority=scenic_priority,
+                _endpoint_graph=_endpoint_graph,
+            )
+
+    def _find_scenic_route(
         self,
         start: Tuple[float, float],
         end: Tuple[float, float],
@@ -3609,6 +3731,7 @@ class ScenicRoutePlanner:
             kappa=kappa_value,
             fastest_duration_minutes=fastest_duration,
             policy=policy,
+            check_cancelled=_check_active_deadline,
         )
 
         if (
@@ -3715,6 +3838,24 @@ class ScenicRoutePlanner:
         *,
         avoid_highways: bool = False,
         _endpoint_graph: bool = False,
+        deadline: RoutingDeadline | None = None,
+    ) -> Route:
+        """Return the minimum-duration route within one request deadline."""
+        with _routing_deadline_scope(deadline):
+            return self._find_fastest_route(
+                start,
+                end,
+                avoid_highways=avoid_highways,
+                _endpoint_graph=_endpoint_graph,
+            )
+
+    def _find_fastest_route(
+        self,
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+        *,
+        avoid_highways: bool = False,
+        _endpoint_graph: bool = False,
     ) -> Route:
         if self.graph is None:
             raise RuntimeError("Road graph not loaded")
@@ -3767,6 +3908,7 @@ class ScenicRoutePlanner:
             kappa=1.0,
             fastest_duration_minutes=fastest_duration,
             policy=policy,
+            check_cancelled=_check_active_deadline,
         )
         return self._path_to_route(
             shortest_edges,
@@ -3878,7 +4020,10 @@ class ScenicRoutePlanner:
             if not callable(edge_iterator):
                 edge_iterator = self.graph.get_edges
 
+        expanded = 0
         while frontier:
+            _check_active_deadline_at(expanded)
+            expanded += 1
             _, current_cost, current_id = heapq.heappop(frontier)
             if current_id == goal.id:
                 return self._reconstruct_path(came_from, goal.id)
@@ -4131,6 +4276,7 @@ class ScenicRoutePlanner:
         avoid_highways = self._avoids_highways(cost_function)
 
         def expired() -> bool:
+            _check_active_deadline()
             return deadline is not None and self._monotonic() >= deadline
 
         # Materialize node IDs before enumeration.  The final stamp check
@@ -4200,6 +4346,7 @@ class ScenicRoutePlanner:
         lower_bounds: Dict[str, float] = {goal.id: 0.0}
         frontier: List[Tuple[float, str]] = [(0.0, goal.id)]
         while frontier:
+            _check_active_deadline()
             distance_km, node_id = heapq.heappop(frontier)
             if lower_bounds.get(node_id) != distance_km:
                 continue
@@ -4244,6 +4391,7 @@ class ScenicRoutePlanner:
         lower_bounds: Dict[str, float] = {goal.id: 0.0}
         frontier: List[Tuple[float, str]] = [(0.0, goal.id)]
         while frontier:
+            _check_active_deadline()
             duration_minutes, node_id = heapq.heappop(frontier)
             if lower_bounds.get(node_id) != duration_minutes:
                 continue
@@ -4290,6 +4438,7 @@ class ScenicRoutePlanner:
         lower_bounds: Dict[str, float] = {goal.id: 0.0}
         frontier: List[Tuple[float, str]] = [(0.0, goal.id)]
         while frontier:
+            _check_active_deadline()
             cost, node_id = heapq.heappop(frontier)
             if lower_bounds.get(node_id) != cost:
                 continue
@@ -4336,6 +4485,7 @@ class ScenicRoutePlanner:
         lower_bounds: Dict[str, float] = {goal.id: 0.0}
         frontier: List[Tuple[float, str]] = [(0.0, goal.id)]
         while frontier:
+            _check_active_deadline()
             augmented_cost, node_id = heapq.heappop(frontier)
             if lower_bounds.get(node_id) != augmented_cost:
                 continue
@@ -4637,7 +4787,10 @@ class ScenicRoutePlanner:
         validate_nonnegative = self._validated_nonnegative
         validate_duration = self._edge_duration_minutes
         calculate_cost = cost_function.calculate
+        expanded = 0
         while frontier:
+            _check_active_deadline_at(expanded)
+            expanded += 1
             current_stamp = self.graph._heuristic_cache_stamp()
             if current_stamp != search_stamp:
                 # A snapshot from an older graph epoch is never mixed with
@@ -5006,6 +5159,7 @@ class ScenicRoutePlanner:
         zero_improvement_reason: Optional[str] = None,
         search_diagnostics: Optional[Dict[str, object]] = None,
     ) -> Route:
+        _check_active_deadline()
         if evaluation is None:
             fallback_fastest = (
                 self._path_duration_minutes(edges)
@@ -5017,6 +5171,7 @@ class ScenicRoutePlanner:
                 q=0.0,
                 kappa=requested_max_detour_factor,
                 fastest_duration_minutes=fallback_fastest,
+                check_cancelled=_check_active_deadline,
             )
         total_distance_km = float(getattr(evaluation, "total_distance_km"))
         total_minutes = float(getattr(evaluation, "duration_minutes"))
@@ -5066,6 +5221,7 @@ class ScenicRoutePlanner:
                 (goal_node.lat, goal_node.lon),
             ]
         for index, edge in enumerate(edges):
+            _check_active_deadline_at(index)
             start_node = self.graph.get_node(edge.start_node_id)
             end_node = self.graph.get_node(edge.end_node_id)
             start_coordinate = getattr(

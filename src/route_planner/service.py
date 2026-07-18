@@ -1044,18 +1044,8 @@ def _load_graph(
 ) -> RoadGraph:
     # Support both FeatureCollection road graphs (.geojson) and serialized RoadGraph JSONs.
     if path.suffix.lower() == ".geojson":
-        if check_cancelled is not None:
-            try:
-                return RoadGraph.from_geojson(path, check_cancelled=check_cancelled)
-            except TypeError:
-                pass
-        return RoadGraph.from_geojson(path)
-    if check_cancelled is not None:
-        try:
-            return RoadGraph.load(path, check_cancelled=check_cancelled)
-        except TypeError:
-            pass
-    return RoadGraph.load(path)
+        return RoadGraph.from_geojson(path, check_cancelled=check_cancelled)
+    return RoadGraph.load(path, check_cancelled=check_cancelled)
 
 
 def diagnose_route_request(

@@ -1,6 +1,11 @@
 from threading import Event
 
 import pytest
+import src.route_planner.planner as planner_module
+
+from src.route_planner.cost import evaluate_path
+from src.route_planner.graph import Edge, Node, RoadGraph
+from src.route_planner.planner import ScenicRoutePlanner
 
 from src.route_planner.cancellation import (
     RoutingCancelled,
@@ -30,3 +35,131 @@ def test_deadline_reports_one_shared_remaining_budget() -> None:
     deadline = RoutingDeadline.after(3.0, clock=lambda: next(ticks))
 
     assert deadline.remaining_seconds() == pytest.approx(1.5)
+
+
+def _line_graph() -> RoadGraph:
+    graph = RoadGraph()
+    graph.add_node(Node("a", 42.0, -72.0))
+    graph.add_node(Node("b", 42.0, -71.99))
+    graph.add_edge(
+        Edge(
+            "ab",
+            "a",
+            "b",
+            distance_km=1.0,
+            scenic_score=5.0,
+            speed_limit_kmh=60,
+        )
+    )
+    return graph
+
+
+def test_planner_rejects_expired_deadline_before_mutating_graph() -> None:
+    graph = _line_graph()
+    planner = ScenicRoutePlanner(graph)
+
+    with pytest.raises(RoutingTimeout, match="deadline exceeded"):
+        planner.find_fastest_route(
+            (42.0, -72.0),
+            (42.0, -71.99),
+            deadline=RoutingDeadline.after(0.0),
+        )
+
+    assert planner.graph is graph
+
+
+def test_planner_cancellation_interrupts_endpoint_resolution_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _line_graph()
+    planner = ScenicRoutePlanner(graph)
+    cancelled = Event()
+    deadline = RoutingDeadline(cancel_event=cancelled)
+    original = graph.find_nearest_edge_positions_with_distance
+    calls = 0
+
+    def cancelling_projection(*args: object, **kwargs: object):
+        nonlocal calls
+        callback = kwargs.get("check_cancelled")
+        assert callable(callback)
+        result = original(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            cancelled.set()
+        return result
+
+    monkeypatch.setattr(
+        graph,
+        "find_nearest_edge_positions_with_distance",
+        cancelling_projection,
+    )
+
+    with pytest.raises(RoutingCancelled, match="was cancelled"):
+        planner.find_fastest_route(
+            (42.0, -72.0),
+            (42.0, -71.99),
+            deadline=deadline,
+        )
+
+    assert calls == 1
+    assert planner.graph is graph
+
+
+def test_native_search_boundary_propagates_cancellation_and_restores_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if planner_module._scipy_shortest_path is None:
+        pytest.skip("SciPy routing backend is unavailable")
+    graph = _line_graph()
+    planner = ScenicRoutePlanner(graph)
+    cancelled = Event()
+    deadline = RoutingDeadline(cancel_event=cancelled)
+    original = planner_module._scipy_shortest_path
+
+    def cancelling_shortest_path(*args: object, **kwargs: object):
+        result = original(*args, **kwargs)
+        cancelled.set()
+        return result
+
+    monkeypatch.setattr(planner, "_EXACT_ORACLE_MAX_NODES", 0)
+    monkeypatch.setattr(planner, "_EXACT_ORACLE_MAX_EDGES", 0)
+    monkeypatch.setattr(
+        planner_module,
+        "_scipy_shortest_path",
+        cancelling_shortest_path,
+    )
+
+    with pytest.raises(RoutingCancelled, match="was cancelled"):
+        planner.find_fastest_route(
+            (42.0, -72.0),
+            (42.0, -71.99),
+            deadline=deadline,
+        )
+
+    assert planner.graph is graph
+
+
+def test_path_scoring_stops_consuming_edges_after_cancellation() -> None:
+    cancelled = Event()
+    deadline = RoutingDeadline(cancel_event=cancelled)
+    edge = _line_graph().edges["ab"]
+    consumed = 0
+
+    def edges():
+        nonlocal consumed
+        for index in range(3_000):
+            if index == 1_024:
+                cancelled.set()
+            consumed += 1
+            yield edge
+
+    with pytest.raises(RoutingCancelled, match="was cancelled"):
+        evaluate_path(
+            edges(),
+            q=0.5,
+            kappa=1.8,
+            fastest_duration_minutes=1.0,
+            check_cancelled=deadline.check,
+        )
+
+    assert consumed == 1_025

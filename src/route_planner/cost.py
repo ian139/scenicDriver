@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .graph import Edge
@@ -255,6 +256,7 @@ def evaluate_path(
     policy: RoutingPolicy | None = None,
     highway_preference: object = 0.0,
     scenic_priority: object = False,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> PathEvaluation:
     """Evaluate a path with the resolved policy objective."""
     resolved = policy or resolve_routing_policy(
@@ -264,7 +266,7 @@ def evaluate_path(
         scenic_priority=scenic_priority,
     )
     try:
-        edges = tuple(path)  # type: ignore[arg-type]
+        edges = iter(path)  # type: ignore[arg-type]
     except TypeError as exc:
         raise ValueError("path must be an iterable of edges") from exc
     edge_ids: list[str] = []
@@ -276,6 +278,8 @@ def evaluate_path(
     highway_count = 0
     highway_duration = 0.0
     for position, edge in enumerate(edges):
+        if check_cancelled is not None and position & 1023 == 0:
+            check_cancelled()
         edge_id = _edge_id(edge, position)
         distance = _edge_distance(edge)
         duration = _edge_duration(edge)
@@ -298,6 +302,8 @@ def evaluate_path(
             highway_duration = _checked_add(
                 highway_duration, duration, "highway duration"
             )
+    if check_cancelled is not None:
+        check_cancelled()
     raw_score = weighted_score / total_distance if total_distance else 0.0
     normalized_score = raw_score / 10.0
     coverage = scored_distance / total_distance if total_distance else 1.0
