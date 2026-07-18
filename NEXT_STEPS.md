@@ -128,6 +128,26 @@ with:
 docker compose --env-file .env.beta -f compose.beta.yml down
 ```
 
+## Routing performance delivery
+
+- [x] Deadline propagation and cancellation — integrated at `dc84492f`.
+  One absolute `RoutingDeadline` now reaches API validation, service loading and
+  scoring, endpoint resolution, graph and planner searches, path evaluation,
+  benchmark cases, and the persistent hard-stop worker. In-flight cancellation
+  crosses the fork boundary; expired, cancelled, and late IPC results stop and
+  reap the disposable worker without returning partial routes. Gate:
+  `349 passed` across the focused routing/API/benchmark suite, plus zero Pyright
+  errors for the cancellation/supervisor boundary.
+- [ ] Zero-copy scenic endpoint access — next. Current blocker:
+  `_copy_endpoint_overlay` duplicates the complete graph for every scenic
+  request; the production graph has 10,162,024 nodes and 10,792,528 traversals.
+- [ ] Compact reverse CSR and target-bounded bidirectional search.
+- [ ] Versioned persisted spatial edge index with corruption recovery.
+- [ ] Re-run the unchanged 10-second production benchmark after the three
+  remaining implementation gates.
+- [ ] Evaluate CCH or MLD only if that integrated benchmark still misses the
+  latency target and graph traversal remains the measured bottleneck.
+
 ## Ordered next steps
 
 1. Keep the complete, versioned beta artifact set in the private artifact store;
