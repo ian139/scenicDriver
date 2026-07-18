@@ -4,6 +4,9 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import math
+import os
+import signal
+import time
 from pathlib import Path
 import sys
 import pytest
@@ -1212,3 +1215,297 @@ def test_benchmark_cli_rejects_invalid_bounds(args, attribute, monkeypatch) -> N
     monkeypatch.setattr(sys, "argv", ["production_benchmark", *args])
     with pytest.raises(SystemExit):
         parse_args()
+
+def test_case_deadline_alarms_classify_as_timeout() -> None:
+    if not hasattr(signal, "SIGALRM"):
+        pytest.skip("SIGALRM unavailable")
+    import time
+
+    with pytest.raises(production_benchmark.RoutingTimeout):
+        with production_benchmark._case_deadline(0.05) as deadline:
+            assert isinstance(deadline, production_benchmark.RoutingDeadline)
+            time.sleep(0.5)
+    error = production_benchmark.CaseTimeout("alarm test")
+    assert production_benchmark._error_reason(error) == "timeout"
+    assert production_benchmark._error_reason(
+        production_benchmark.RoutingTimeout("routing test")
+    ) == "timeout"
+    assert production_benchmark._error_reason(
+        production_benchmark.RoutingCancelled("cancel test")
+    ) == "cancelled"
+
+
+def test_direct_planner_response_forwards_one_deadline_identity(monkeypatch) -> None:
+    deadlines: list[tuple[str, Any]] = []
+
+    class FakeRoute:
+        average_scenic_score = 5.0
+
+    class FakePlanner:
+        graph = SimpleNamespace(nodes={}, edges={})
+
+        def find_scenic_route(self, **kwargs):
+            deadlines.append(("scenic", kwargs.get("deadline")))
+            return FakeRoute()
+
+        def find_fastest_route(self, **kwargs):
+            deadlines.append(("baseline", kwargs.get("deadline")))
+            return FakeRoute()
+
+    def fake_objective(request, scenic, baseline, *, deadline=None, **kwargs):
+        deadlines.append(("objective", deadline))
+        return {"objective_value": 0.5}
+
+    def fake_route_to_feature(route, kind, *, deadline=None, **kwargs):
+        deadlines.append((kind, deadline))
+        return {
+            "properties": {
+                "exactness_status": "exact",
+                "optimality_gap": None,
+                "certified_upper_bound": None,
+                "normalized_scenic_score": 0.5,
+                "scenic_score_delta_absolute": None,
+                "scenic_score_delta_relative": None,
+                "same_route": None,
+                "no_better_route_reason": None,
+            },
+            "type": "Feature",
+        }
+
+    monkeypatch.setattr(
+        production_benchmark.route_service, "_objective_components", fake_objective
+    )
+    monkeypatch.setattr(
+        production_benchmark.route_service, "route_to_feature", fake_route_to_feature
+    )
+
+    planner = FakePlanner()
+    request = production_benchmark.RouteRequest(
+        graph_geojson="g.geojson",
+        start=(1.0, 2.0),
+        end=(1.1, 2.1),
+        scenic_weight=0.5,
+        max_detour_factor=1.8,
+        avoid_highways=False,
+        include_baseline=True,
+        tile_scores_json="r.json",
+    )
+    deadline = production_benchmark.RoutingDeadline.after(10.0)
+    response = production_benchmark._direct_planner_response(
+        planner,
+        request,
+        score_mapping={},
+        deadline=deadline,
+    )
+    assert response is not None
+    assert len(deadlines) == 5
+    assert all(d is deadline for _, d in deadlines)
+
+
+def test_persistent_planning_child_reuses_context_and_survives_cache_mutation(
+    monkeypatch,
+) -> None:
+    cache: dict[tuple[str, bool], tuple[str, str]] = {}
+
+    def fake_execute(*, spec, index, route_error_cache, **kwargs):
+        key = (spec.pair_id, spec.avoid_highways)
+        hit = key in route_error_cache
+        if not hit:
+            route_error_cache[key] = ("no_route", "fake")
+        return {
+            "case_index": index,
+            "case_id": production_benchmark._case_id(spec),
+            "reason": "no_route",
+            "route_error_cache_hit": hit,
+            "cache_len": len(route_error_cache),
+        }
+
+    monkeypatch.setattr(production_benchmark, "_execute_case", fake_execute)
+    context = ({}, SimpleNamespace(), {}, {})
+    supervisor = production_benchmark._PersistentPlanningChild(
+        context, cache, grace_seconds=0.1
+    )
+    original_pid = supervisor._child_pid
+    try:
+        spec = CaseSpec("p", (1.0, 2.0), (1.1, 2.1), 0.0, 1.0, False)
+        row0 = supervisor.run(spec, 0, Path("g"), Path("r"), 10.0, False)
+        assert row0["route_error_cache_hit"] is False
+        assert row0["cache_len"] == 1
+        row1 = supervisor.run(spec, 1, Path("g"), Path("r"), 10.0, False)
+        assert row1["route_error_cache_hit"] is True
+        assert row1["cache_len"] == 1
+        assert supervisor._child_pid == original_pid
+    finally:
+        supervisor.close()
+    assert supervisor._child_pid is None
+
+
+def test_persistent_planning_child_replaces_unresponsive_child(monkeypatch) -> None:
+    def fake_execute(*, spec, index, **kwargs):
+        if index == 0:
+            signal.signal(signal.SIGALRM, signal.SIG_IGN)
+            r, _ = os.pipe()
+            os.read(r, 1)
+        return _checkpoint_row(index, spec)
+
+    monkeypatch.setattr(production_benchmark, "_execute_case", fake_execute)
+    context = ({}, SimpleNamespace(), {}, {})
+    supervisor = production_benchmark._PersistentPlanningChild(
+        context, {}, grace_seconds=0.1
+    )
+    original_pid = supervisor._child_pid
+    try:
+        spec = CaseSpec("p", (1.0, 2.0), (1.1, 2.1), 0.0, 1.0, False)
+        with pytest.raises(production_benchmark.CaseTimeout):
+            supervisor.run(spec, 0, Path("g"), Path("r"), 0.01, False)
+        assert supervisor._child_pid != original_pid
+        assert supervisor.context is context
+        row = supervisor.run(spec, 1, Path("g"), Path("r"), 10.0, False)
+        assert row["case_id"] == production_benchmark._case_id(spec)
+        assert row["case_index"] == 1
+    finally:
+        supervisor.close()
+
+
+def test_persistent_planning_child_cleans_up_no_zombies(monkeypatch) -> None:
+    def fake_execute(*, spec, index, **kwargs):
+        return _checkpoint_row(index, spec)
+
+    monkeypatch.setattr(production_benchmark, "_execute_case", fake_execute)
+    context = ({}, SimpleNamespace(), {}, {})
+    supervisor = production_benchmark._PersistentPlanningChild(
+        context, {}, grace_seconds=0.1
+    )
+    original_pid = supervisor._child_pid
+    spec = CaseSpec("p", (1.0, 2.0), (1.1, 2.1), 0.0, 1.0, False)
+    supervisor.run(spec, 0, Path("g"), Path("r"), 10.0, False)
+    supervisor.close()
+    assert supervisor._child_pid is None
+    with pytest.raises(ChildProcessError):
+        os.waitpid(original_pid, 0)
+
+
+def test_persistent_planning_child_sends_large_payloads(monkeypatch) -> None:
+    def fake_execute(*, spec, index, **kwargs):
+        return {
+            **_checkpoint_row(index, spec),
+            "payload": "x" * 1_000_000,
+        }
+
+    monkeypatch.setattr(production_benchmark, "_execute_case", fake_execute)
+    context = ({}, SimpleNamespace(), {}, {})
+    supervisor = production_benchmark._PersistentPlanningChild(
+        context, {}, grace_seconds=0.1
+    )
+    try:
+        spec = CaseSpec("p", (1.0, 2.0), (1.1, 2.1), 0.0, 1.0, False)
+        row = supervisor.run(spec, 0, Path("g"), Path("r"), 10.0, False)
+        assert len(row["payload"]) == 1_000_000
+    finally:
+        supervisor.close()
+
+
+def test_persistent_planning_child_does_not_reload_graph(monkeypatch) -> None:
+    calls: list[tuple[Path, Path]] = []
+
+    def fake_execute(*, spec, index, **kwargs):
+        return _checkpoint_row(index, spec)
+
+    def raising_preload(*args, **kwargs):
+        raise AssertionError("graph preload called in child")
+
+    monkeypatch.setattr(production_benchmark, "_execute_case", fake_execute)
+    context = ({"score_mapping": {}}, SimpleNamespace(), {}, {})
+    supervisor = production_benchmark._PersistentPlanningChild(
+        context, {}, grace_seconds=0.1
+    )
+    try:
+        # If the child tried to preload, it would hit this; the child only uses
+        # the inherited context.
+        monkeypatch.setattr(
+            production_benchmark, "_prepare_benchmark_context", raising_preload
+        )
+        spec = CaseSpec("p", (1.0, 2.0), (1.1, 2.1), 0.0, 1.0, False)
+        row = supervisor.run(spec, 0, Path("g"), Path("r"), 10.0, False)
+        assert row["case_id"] == production_benchmark._case_id(spec)
+    finally:
+        supervisor.close()
+
+
+def test_run_case_worker_executes_in_process_when_supervisor_unavailable(
+    monkeypatch,
+) -> None:
+    def fake_execute(**kwargs):
+        return {
+            "case_id": production_benchmark._case_id(kwargs["spec"]),
+            "marker": "in_process",
+            "wall_ms": 1.0,
+        }
+
+    monkeypatch.setattr(production_benchmark, "_execute_case", fake_execute)
+    monkeypatch.setattr(
+        production_benchmark, "_WORKER_CONTEXT", ({}, SimpleNamespace(), {}, {})
+    )
+    monkeypatch.setattr(production_benchmark, "_WORKER_ERRORS", {})
+    monkeypatch.setattr(production_benchmark, "_WORKER_SUPERVISOR", None)
+    spec = CaseSpec("p", (1.0, 2.0), (1.1, 2.1), 0.0, 1.0, False)
+    row = production_benchmark._run_case_worker(
+        (0, spec, Path("g"), Path("r"), 10.0, False)
+    )
+    assert row["marker"] == "in_process"
+
+
+def test_run_case_worker_hard_timeout_wall_ms_is_nonzero(monkeypatch) -> None:
+    class FakeSupervisor:
+        def run(self, *args, **kwargs):
+            time.sleep(0.05)
+            raise production_benchmark.CaseTimeout("fake timeout")
+
+    monkeypatch.setattr(
+        production_benchmark, "_WORKER_CONTEXT", ({}, SimpleNamespace(), {}, {})
+    )
+    monkeypatch.setattr(production_benchmark, "_WORKER_ERRORS", {})
+    monkeypatch.setattr(production_benchmark, "_WORKER_SUPERVISOR", FakeSupervisor())
+    spec = CaseSpec("p", (1.0, 2.0), (1.1, 2.1), 0.0, 1.0, False)
+    row = production_benchmark._run_case_worker(
+        (0, spec, Path("g"), Path("r"), 10.0, False)
+    )
+    assert row["reason"] == "timeout"
+    assert row["wall_ms"] >= 50.0
+
+
+def test_run_benchmark_hard_timeout_wall_ms_is_nonzero(tmp_path, monkeypatch) -> None:
+    spec = CaseSpec("p", (1.0, 2.0), (1.1, 2.1), 0.0, 1.0, False)
+
+    def fake_execute(*, index, **kwargs):
+        if index == 0:
+            signal.signal(signal.SIGALRM, signal.SIG_IGN)
+            r, _ = os.pipe()
+            os.read(r, 1)
+        return _checkpoint_row(index, kwargs["spec"])
+
+    monkeypatch.setattr(production_benchmark, "_SUPERVISOR_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(production_benchmark, "_load_corpus", lambda path: {"pairs": []})
+    monkeypatch.setattr(production_benchmark, "_case_specs", lambda corpus: [spec])
+    monkeypatch.setattr(
+        production_benchmark,
+        "_prepare_benchmark_context",
+        lambda graph, report: ({}, 0.0, SimpleNamespace(), {}, {}, {}),
+    )
+    monkeypatch.setattr(production_benchmark, "_classify_pairs", lambda corpus, rows: ({}, {}))
+    monkeypatch.setattr(production_benchmark, "_invariant_summary", lambda rows: {})
+    monkeypatch.setattr(production_benchmark, "_execute_case", fake_execute)
+    output = tmp_path / "benchmark.json"
+    result = production_benchmark.run_benchmark(
+        corpus_path=tmp_path / "corpus.json",
+        graph_path=tmp_path / "graph",
+        report_path=tmp_path / "report",
+        output_path=output,
+        case_timeout_seconds=0.01,
+    )
+    assert result["matrix"]["all_cases_persisted"] is True
+    rows = json.loads(output.read_text())["results"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["reason"] == "timeout"
+    assert row["wall_ms"] >= 50.0

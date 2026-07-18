@@ -14,20 +14,29 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import pickle
+import struct
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import tempfile
-from pathlib import Path
+import select
 import signal
 import sys
-from time import perf_counter
-from typing import Any, Iterator, Mapping
+import atexit
+import tempfile
+from pathlib import Path
+from time import monotonic, perf_counter
+from typing import Any, Callable, Iterator, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.route_planner import service as route_service  # noqa: E402
+from src.route_planner.cancellation import (  # noqa: E402
+    RoutingCancelled,
+    RoutingDeadline,
+    RoutingTimeout,
+)
 from src.route_planner.planner import ScenicRoutePlanner  # noqa: E402
 from src.route_planner.service import (  # noqa: E402
     RouteRequest,
@@ -35,6 +44,7 @@ from src.route_planner.service import (  # noqa: E402
     plan_routes,
     preload_route_assets,
 )
+
 
 DEFAULT_CORPUS = Path("scripts/routing/production_benchmark_pairs.json")
 DEFAULT_OUTPUT = Path(
@@ -94,28 +104,258 @@ class CaseTimeout(TimeoutError):
     """A per-case alarm, retained as a distinct machine-readable reason."""
 
 
-@contextmanager
-def _case_deadline(seconds: float) -> Iterator[None]:
-    """Interrupt a production request without dropping its case row.
+_SUPERVISOR_GRACE_SECONDS = 2.0
+_HAS_POSIX_FORK = hasattr(os, "fork")
 
-    ``SIGALRM`` is available on the production POSIX workers.  A non-positive
-    deadline disables the alarm and is useful for focused tests.
+
+@contextmanager
+def _case_deadline(seconds: float) -> Iterator[RoutingDeadline]:
+    """Yield one RoutingDeadline and arm SIGALRM as an outer fallback.
+
+    A non-positive deadline disables both the cooperative deadline and the
+    alarm; this is useful for focused tests.
     """
     if seconds <= 0.0 or not hasattr(signal, "SIGALRM"):
-        yield
+        yield RoutingDeadline()
         return
 
+    deadline = RoutingDeadline.after(seconds)
+
     def _raise_timeout(_signum: int, _frame: Any) -> None:
-        raise CaseTimeout(f"case exceeded {seconds:g}s deadline")
+        raise RoutingTimeout(f"case exceeded {seconds:g}s deadline")
 
     old_handler = signal.signal(signal.SIGALRM, _raise_timeout)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
+    remaining = deadline.remaining_seconds()
+    if remaining is None or remaining <= 0.0:
+        remaining = 1e-9
+    signal.setitimer(signal.ITIMER_REAL, remaining)
     try:
-        yield
+        yield deadline
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, old_handler)
 
+def _reap_child(pid: int) -> None:
+    try:
+        while True:
+            waited, _ = os.waitpid(pid, 0)
+            if waited == pid:
+                break
+    except (ChildProcessError, OSError):
+        pass
+
+
+def _reconstruct_exception(name: str, message: str) -> BaseException:
+    if name == "KeyboardInterrupt":
+        raise KeyboardInterrupt(message)
+    if name == "CaseTimeout" or name == "RoutingTimeout":
+        return CaseTimeout(message)
+    if name == "RoutingCancelled":
+        return RoutingCancelled(message)
+    return RuntimeError(f"{name}: {message}")
+
+
+class _PersistentPlanningChild:
+    """One forked planning child, reused across benchmark cases.
+
+    The child inherits the parent's preloaded context via ``os.fork`` and
+    keeps it warm across sequential requests.  The parent enforces a per-case
+    deadline plus a small grace and only replaces the child when it becomes
+    unresponsive.
+    """
+
+    _HEADER_FMT = "!I"
+    _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
+
+    def __init__(
+        self,
+        context: tuple[dict[str, Any], ScenicRoutePlanner, dict[str, Any], dict[str, Any]],
+        route_error_cache: dict[tuple[str, bool], tuple[str, str]],
+        grace_seconds: float = _SUPERVISOR_GRACE_SECONDS,
+    ):
+        self.context = context
+        self.route_error_cache = route_error_cache
+        self.grace_seconds = grace_seconds
+        self._child_pid: int | None = None
+        self._request_write: int | None = None
+        self._response_read: int | None = None
+        self._start()
+
+    def _start(self) -> None:
+        request_read, request_write = os.pipe()
+        response_read, response_write = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(request_write)
+            os.close(response_read)
+            try:
+                self._child_loop(request_read, response_write)
+            finally:
+                os._exit(0)
+        os.close(request_read)
+        os.close(response_write)
+        self._child_pid = pid
+        self._request_write = request_write
+        self._response_read = response_read
+
+    def _child_loop(self, request_read: int, response_write: int) -> None:
+        while True:
+            request = self._recv(request_read, timeout=None)
+            if request is None:
+                break
+            try:
+                row = _execute_case(
+                    spec=request["spec"],
+                    index=request["index"],
+                    graph_path=Path(request["graph_path"]),
+                    report_path=Path(request["report_path"]),
+                    case_timeout_seconds=request["case_timeout_seconds"],
+                    strict_service_full=request["strict_service_full"],
+                    context=self.context,
+                    route_error_cache=self.route_error_cache,
+                )
+                self._send(response_write, {"ok": row})
+            except BaseException as error:
+                self._send(
+                    response_write,
+                    {
+                        "err": str(error),
+                        "type": type(error).__name__,
+                    },
+                )
+
+    def _write_all(
+        self, fd: int, data: bytes, timeout: float | None
+    ) -> None:
+        deadline = monotonic() + timeout if timeout is not None else None
+        while data:
+            if deadline is not None:
+                remaining = deadline - monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError("planning child write timeout")
+                _, ready, _ = select.select([], [fd], [], max(0.0, remaining))
+                if not ready:
+                    raise TimeoutError("planning child write timeout")
+            try:
+                written = os.write(fd, data)
+            except InterruptedError:
+                continue
+            if written == 0:
+                raise RuntimeError("zero write to planning child pipe")
+            data = data[written:]
+
+    def _send(self, fd: int, obj: Any, timeout: float | None = None) -> None:
+        payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        header = struct.pack(self._HEADER_FMT, len(payload))
+        self._write_all(fd, header + payload, timeout)
+
+    def _recv(self, fd: int, timeout: float | None) -> Any | None:
+        header = self._read_exact(fd, self._HEADER_SIZE, timeout)
+        if not header:
+            return None
+        (length,) = struct.unpack(self._HEADER_FMT, header)
+        payload = self._read_exact(fd, length, timeout)
+        if payload is None or len(payload) != length:
+            raise RuntimeError("incomplete payload from planning child")
+        return pickle.loads(payload)
+
+    def _read_exact(
+        self, fd: int, n: int, timeout: float | None
+    ) -> bytes | None:
+        deadline = monotonic() + timeout if timeout is not None else None
+        seen = 0
+        chunks: list[bytes] = []
+        while seen < n:
+            if deadline is not None:
+                remaining = deadline - monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError("planning child read timeout")
+                ready, _, _ = select.select([fd], [], [], max(0.0, remaining))
+                if not ready:
+                    raise TimeoutError("planning child read timeout")
+            else:
+                select.select([fd], [], [], None)
+            try:
+                chunk = os.read(fd, n - seen)
+            except InterruptedError:
+                continue
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            seen += len(chunk)
+        return b"".join(chunks)
+
+    def run(
+        self,
+        spec: CaseSpec,
+        index: int,
+        graph_path: Path,
+        report_path: Path,
+        case_timeout_seconds: float,
+        strict_service_full: bool,
+    ) -> dict[str, Any]:
+        case_id = _case_id(spec)
+        case_deadline_seconds = _case_deadline_seconds(case_id, case_timeout_seconds)
+        request = {
+            "spec": spec,
+            "index": index,
+            "graph_path": str(graph_path),
+            "report_path": str(report_path),
+            "case_timeout_seconds": case_timeout_seconds,
+            "strict_service_full": strict_service_full,
+        }
+        self._send(self._request_write, request)
+        try:
+            response = self._recv(
+                self._response_read,
+                case_deadline_seconds + self.grace_seconds,
+            )
+        except TimeoutError:
+            self._replace_child()
+            raise CaseTimeout("case exceeded hard supervisor deadline")
+        if response is None:
+            self._replace_child()
+            raise CaseTimeout("case exceeded hard supervisor deadline")
+        if "ok" in response:
+            return response["ok"]
+        raise _reconstruct_exception(
+            response.get("type", "RuntimeError"),
+            response.get("err", ""),
+        )
+
+    def _replace_child(self) -> None:
+        self._kill_and_reap()
+        self._close_fds()
+        self._start()
+
+    def _kill_and_reap(self) -> None:
+        if self._child_pid is not None:
+            try:
+                os.kill(self._child_pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            _reap_child(self._child_pid)
+            self._child_pid = None
+
+    def _close_fds(self) -> None:
+        for fd in (self._request_write, self._response_read):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self._request_write = None
+        self._response_read = None
+
+    def close(self) -> None:
+        if self._request_write is not None:
+            try:
+                os.close(self._request_write)
+            except OSError:
+                pass
+            self._request_write = None
+        self._kill_and_reap()
+        self._close_fds()
 
 def _as_float(value: Any, default: float | None = None) -> float | None:
     try:
@@ -1510,9 +1750,11 @@ def evaluate_service_response(
 
 
 def _error_reason(error: BaseException) -> str:
-    message = str(error)
-    if isinstance(error, CaseTimeout):
+    if isinstance(error, (CaseTimeout, RoutingTimeout, TimeoutError)):
         return "timeout"
+    if isinstance(error, RoutingCancelled):
+        return "cancelled"
+    message = str(error)
     if "no route" in message.lower():
         return "no_route"
     if isinstance(error, ValueError):
@@ -1878,13 +2120,19 @@ def _direct_planner_response(
     request: RouteRequest,
     *,
     score_mapping: Mapping[str, Any],
+    deadline: RoutingDeadline | None = None,
 ) -> dict[str, Any]:
     """Adapt one direct planner call to the strict service response shape.
 
     Matrix cases use the already loaded/scored graph and one long-lived
     planner.  A small deterministic subset still calls ``plan_routes`` below
     so strict API serialization and service cache boundaries remain exercised.
+    The same ``RoutingDeadline`` is forwarded unchanged to every routing,
+    scoring, and serialization stage.
     """
+    if deadline is None:
+        deadline = RoutingDeadline()
+    deadline.check()
     scenic_route = planner.find_scenic_route(
         start=request.start,
         end=request.end,
@@ -1892,19 +2140,24 @@ def _direct_planner_response(
         avoid_highways=request.avoid_highways,
         max_detour_factor=request.max_detour_factor,
         scenic_priority=True,
+        deadline=deadline,
     )
+    deadline.check()
     baseline_route = (
         planner.find_fastest_route(
             start=request.start,
             end=request.end,
             avoid_highways=request.avoid_highways,
+            deadline=deadline,
         )
         if request.include_baseline
         else None
     )
+    deadline.check()
     objective = route_service._objective_components(
-        request, scenic_route, baseline_route
+        request, scenic_route, baseline_route, deadline=deadline
     )
+    deadline.check()
     scenic_feature = route_service.route_to_feature(
         scenic_route,
         "scenic",
@@ -1912,7 +2165,9 @@ def _direct_planner_response(
         score_provenance=score_mapping,
         requested_start=request.start,
         requested_end=request.end,
+        deadline=deadline,
     )
+    deadline.check()
     features = [scenic_feature]
     routes = [{"route_kind": "scenic", "metrics": scenic_feature["properties"]}]
     if baseline_route is not None:
@@ -1936,6 +2191,7 @@ def _direct_planner_response(
             "same_route": None,
             "no_better_route_reason": None,
         }
+        deadline.check()
         baseline_feature = route_service.route_to_feature(
             baseline_route,
             "baseline",
@@ -1943,7 +2199,9 @@ def _direct_planner_response(
             score_provenance=score_mapping,
             requested_start=request.start,
             requested_end=request.end,
+            deadline=deadline,
         )
+        deadline.check()
         features.append(baseline_feature)
         routes.append(
             {"route_kind": "baseline", "metrics": baseline_feature["properties"]}
@@ -2191,52 +2449,24 @@ def _execute_case(
         row["route_error_cache_hit"] = True
     else:
         try:
-            with _case_deadline(case_deadline_seconds):
+            with _case_deadline(case_deadline_seconds) as deadline:
+                deadline.check()
                 if strict_service:
-                    response = plan_routes(request)
+                    response = plan_routes(request, deadline=deadline)
                 else:
                     planning_started = perf_counter()
                     response = _direct_planner_response(
                         matrix_planner,
                         request,
                         score_mapping=preload["score_mapping"],
+                        deadline=deadline,
                     )
                     response["diagnostics"]["planning_elapsed_ms"] = (
                         perf_counter() - planning_started
                     ) * 1000.0
-            row["evaluation"] = evaluate_service_response(
-                response,
-                q=spec.q,
-                kappa=spec.kappa,
-                avoid_highways=spec.avoid_highways,
-                edge_index=edge_index,
-                node_index=node_index,
-                requested_start=spec.start,
-                requested_end=spec.end,
-                scenic_priority=True,
-            )
-            row["reason"] = (
-                None
-                if row["evaluation"].get("status") == "ok"
-                else "invalid:"
-                + ",".join(row["evaluation"].get("failed_invariants", []))
-            )
-            row["route_error_cache_hit"] = False
-            if (
-                spec.pair_id == "checked_in_default_reproduction"
-                and spec.q == 0.8
-                and spec.kappa == 1.8
-                and not spec.avoid_highways
-                and row["evaluation"].get("status") == "ok"
-            ):
-                with _case_deadline(case_timeout_seconds):
-                    direct_response = _direct_planner_response(
-                        matrix_planner,
-                        request,
-                        score_mapping=preload["score_mapping"],
-                    )
-                direct_evaluation = evaluate_service_response(
-                    direct_response,
+                deadline.check()
+                row["evaluation"] = evaluate_service_response(
+                    response,
                     q=spec.q,
                     kappa=spec.kappa,
                     avoid_highways=spec.avoid_highways,
@@ -2246,19 +2476,54 @@ def _execute_case(
                     requested_end=spec.end,
                     scenic_priority=True,
                 )
-                parity = _evaluations_match(row["evaluation"], direct_evaluation)
-                row["ui_reproduction_parity"] = {
-                    "strict_service": row["evaluation"],
-                    "direct_planner": direct_evaluation,
-                    "checks": parity,
-                    "pass": bool(parity) and all(parity.values()),
-                }
-                if not row["ui_reproduction_parity"]["pass"]:
-                    row["evaluation"]["status"] = "invalid"
-                    row["evaluation"].setdefault("failed_invariants", []).append(
-                        "strict_direct_parity"
+                deadline.check()
+                row["reason"] = (
+                    None
+                    if row["evaluation"].get("status") == "ok"
+                    else "invalid:"
+                    + ",".join(row["evaluation"].get("failed_invariants", []))
+                )
+                row["route_error_cache_hit"] = False
+                if (
+                    spec.pair_id == "checked_in_default_reproduction"
+                    and spec.q == 0.8
+                    and spec.kappa == 1.8
+                    and not spec.avoid_highways
+                    and row["evaluation"].get("status") == "ok"
+                ):
+                    deadline.check()
+                    direct_response = _direct_planner_response(
+                        matrix_planner,
+                        request,
+                        score_mapping=preload["score_mapping"],
+                        deadline=deadline,
                     )
-                    row["reason"] = "invalid:strict_direct_parity"
+                    deadline.check()
+                    direct_evaluation = evaluate_service_response(
+                        direct_response,
+                        q=spec.q,
+                        kappa=spec.kappa,
+                        avoid_highways=spec.avoid_highways,
+                        edge_index=edge_index,
+                        node_index=node_index,
+                        requested_start=spec.start,
+                        requested_end=spec.end,
+                        scenic_priority=True,
+                    )
+                    deadline.check()
+                    parity = _evaluations_match(row["evaluation"], direct_evaluation)
+                    row["ui_reproduction_parity"] = {
+                        "strict_service": row["evaluation"],
+                        "direct_planner": direct_evaluation,
+                        "checks": parity,
+                        "pass": bool(parity) and all(parity.values()),
+                    }
+                    if not row["ui_reproduction_parity"]["pass"]:
+                        row["evaluation"]["status"] = "invalid"
+                        row["evaluation"].setdefault("failed_invariants", []).append(
+                            "strict_direct_parity"
+                        )
+                        row["reason"] = "invalid:strict_direct_parity"
         except Exception as error:
             row["evaluation"] = {"status": "error"}
             row["reason"] = _error_reason(error)
@@ -2292,9 +2557,11 @@ def _execute_case(
     return row
 
 
+
 _WORKER_CONTEXT: tuple[
     dict[str, Any], ScenicRoutePlanner, dict[str, Any], dict[str, Any]
 ] | None = None
+_WORKER_SUPERVISOR: _PersistentPlanningChild | None = None
 _WORKER_ERRORS: dict[tuple[str, bool], tuple[str, str]] = {}
 _WORKER_PRELOAD: dict[str, Any] = {}
 _WORKER_PRELOAD_WALL_MS = 0.0
@@ -2302,7 +2569,7 @@ _WORKER_PLANNER_PRELOAD: dict[str, Any] = {}
 
 
 def _init_case_worker(graph_path: Path, report_path: Path) -> None:
-    global _WORKER_CONTEXT, _WORKER_ERRORS, _WORKER_PRELOAD, _WORKER_PRELOAD_WALL_MS, _WORKER_PLANNER_PRELOAD
+    global _WORKER_CONTEXT, _WORKER_SUPERVISOR, _WORKER_ERRORS, _WORKER_PRELOAD, _WORKER_PRELOAD_WALL_MS, _WORKER_PLANNER_PRELOAD
     (
         preload,
         preload_wall_ms,
@@ -2316,6 +2583,18 @@ def _init_case_worker(graph_path: Path, report_path: Path) -> None:
     _WORKER_PRELOAD = preload
     _WORKER_PRELOAD_WALL_MS = preload_wall_ms
     _WORKER_PLANNER_PRELOAD = planner_preload
+    if _HAS_POSIX_FORK:
+        _WORKER_SUPERVISOR = _PersistentPlanningChild(
+            _WORKER_CONTEXT, _WORKER_ERRORS
+        )
+        atexit.register(_close_worker_supervisor)
+
+
+def _close_worker_supervisor() -> None:
+    global _WORKER_SUPERVISOR
+    if _WORKER_SUPERVISOR is not None:
+        _WORKER_SUPERVISOR.close()
+        _WORKER_SUPERVISOR = None
 
 
 def _worker_context_snapshot() -> dict[str, Any]:
@@ -2334,6 +2613,24 @@ def _run_case_worker(
     if _WORKER_CONTEXT is None:
         raise RuntimeError("case worker was not initialized")
     index, spec, graph_path, report_path, timeout, strict_full = args
+    if _WORKER_SUPERVISOR is not None:
+        started = perf_counter()
+        try:
+            return _WORKER_SUPERVISOR.run(
+                spec,
+                index,
+                graph_path,
+                report_path,
+                timeout,
+                strict_full,
+            )
+        except TimeoutError:
+            wall_ms = (perf_counter() - started) * 1000.0
+            case_id = _case_id(spec)
+            case_deadline_seconds = _case_deadline_seconds(case_id, timeout)
+            return _timeout_row(
+                index, spec, case_deadline_seconds, strict_full, wall_ms
+            )
     return _execute_case(
         spec=spec,
         index=index,
@@ -2344,6 +2641,39 @@ def _run_case_worker(
         context=_WORKER_CONTEXT,
         route_error_cache=_WORKER_ERRORS,
     )
+
+def _timeout_row(
+    index: int,
+    spec: CaseSpec,
+    case_deadline_seconds: float,
+    strict_service_full: bool,
+    wall_ms: float,
+) -> dict[str, Any]:
+    case_id = _case_id(spec)
+    return {
+        "case_index": index,
+        "case_id": case_id,
+        "execution_mode": (
+            "strict_service"
+            if strict_service_full or case_id in STRICT_SERVICE_CASE_IDS
+            else "direct_planner"
+        ),
+        "pair_id": spec.pair_id,
+        "start": list(spec.start),
+        "end": list(spec.end),
+        "geodesic_distance_km": _haversine_km(spec.start, spec.end),
+        "q": spec.q,
+        "kappa": spec.kappa,
+        "avoid_highways": spec.avoid_highways,
+        "case_timeout_seconds": case_deadline_seconds,
+        "evaluation": {"status": "error"},
+        "reason": "timeout",
+        "error": "case exceeded hard supervisor deadline",
+        "route_error_cache_hit": False,
+        "wall_ms": wall_ms,
+        "phase_ms": {},
+        "cache": {"route_error_cache_hit": False},
+    }
 
 
 def _worker_failure_row(
@@ -2456,68 +2786,107 @@ def run_benchmark(
             for start in range(0, len(remaining), effective_group_size)
         ]
     stream_mode = "a" if resume and jsonl_path.exists() else "w"
-    with jsonl_path.open(stream_mode, encoding="utf-8") as stream:
-        def persist(row: dict[str, Any]) -> None:
-            row = dict(row)
-            row["checkpoint_fingerprint"] = checkpoint_fingerprint
-            rows.append(row)
-            stream.write(json.dumps(row, sort_keys=True) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+    supervisor: _PersistentPlanningChild | None = None
+    if workers == 1 and _HAS_POSIX_FORK:
+        supervisor = _PersistentPlanningChild(context, route_error_cache)
+    try:
+        with jsonl_path.open(stream_mode, encoding="utf-8") as stream:
+            def persist(row: dict[str, Any]) -> None:
+                row = dict(row)
+                row["checkpoint_fingerprint"] = checkpoint_fingerprint
+                rows.append(row)
+                stream.write(json.dumps(row, sort_keys=True) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
 
-        if workers == 1:
-            for index, spec in pending_cases:
-                persist(
-                    _execute_case(
-                        spec=spec,
-                        index=index,
-                        graph_path=graph_path,
-                        report_path=report_path,
-                        case_timeout_seconds=case_timeout_seconds,
-                        strict_service_full=strict_service_full,
-                        context=context,
-                        route_error_cache=route_error_cache,
-                    )
-                )
-        else:
-            with ProcessPoolExecutor(
-                max_workers=workers,
-                initializer=_init_case_worker,
-                initargs=(graph_path, report_path),
-            ) as pool:
-                worker_metadata = pool.submit(_worker_context_snapshot).result()
-                preload = dict(worker_metadata["preload"])
-                preload_wall_ms = float(worker_metadata["preload_wall_ms"])
-                planner_preload = {
-                    **dict(worker_metadata["planner_matrix_preload"]),
-                    "isolated_workers": workers,
-                }
-                for group in groups:
-                    for window_start in range(0, len(group), workers):
-                        window = group[window_start : window_start + workers]
-                        futures = {
-                            pool.submit(
-                                _run_case_worker,
-                                (
-                                    index,
-                                    spec,
-                                    graph_path,
-                                    report_path,
-                                    case_timeout_seconds,
-                                    strict_service_full,
-                                ),
-                            ): (index, spec)
-                            for index, spec in window
-                        }
-                        for future in as_completed(futures):
-                            index, spec = futures[future]
-                            try:
-                                row = future.result()
-                            except Exception as error:
-                                row = _worker_failure_row(
-                                    index, spec, error, strict_service_full
-                                )
-                            persist(row)
+            if workers == 1:
+                for index, spec in pending_cases:
+                    started = perf_counter()
+                    try:
+                        if supervisor is not None:
+                            row = supervisor.run(
+                                spec,
+                                index,
+                                graph_path,
+                                report_path,
+                                case_timeout_seconds,
+                                strict_service_full,
+                            )
+                        else:
+                            row = _execute_case(
+                                spec=spec,
+                                index=index,
+                                graph_path=graph_path,
+                                report_path=report_path,
+                                case_timeout_seconds=case_timeout_seconds,
+                                strict_service_full=strict_service_full,
+                                context=context,
+                                route_error_cache=route_error_cache,
+                            )
+                    except TimeoutError:
+                        wall_ms = (perf_counter() - started) * 1000.0
+                        case_id = _case_id(spec)
+                        case_deadline_seconds = _case_deadline_seconds(
+                            case_id, case_timeout_seconds
+                        )
+                        row = _timeout_row(
+                            index,
+                            spec,
+                            case_deadline_seconds,
+                            strict_service_full,
+                            wall_ms,
+                        )
+                    persist(row)
+                    if (
+                        row.get("reason") == "no_route"
+                        and not row.get("route_error_cache_hit")
+                    ):
+                        route_error_cache[(spec.pair_id, spec.avoid_highways)] = (
+                            str(row["reason"]),
+                            str(row["error"]),
+                        )
+            else:
+                with ProcessPoolExecutor(
+                    max_workers=workers,
+                    initializer=_init_case_worker,
+                    initargs=(graph_path, report_path),
+                ) as pool:
+                    worker_metadata = pool.submit(_worker_context_snapshot).result()
+                    preload = dict(worker_metadata["preload"])
+                    preload_wall_ms = float(worker_metadata["preload_wall_ms"])
+                    planner_preload = {
+                        **dict(worker_metadata["planner_matrix_preload"]),
+                        "isolated_workers": workers,
+                    }
+                    for group in groups:
+                        for window_start in range(0, len(group), workers):
+                            window = group[window_start : window_start + workers]
+                            futures = {
+                                pool.submit(
+                                    _run_case_worker,
+                                    (
+                                        index,
+                                        spec,
+                                        graph_path,
+                                        report_path,
+                                        case_timeout_seconds,
+                                        strict_service_full,
+                                    ),
+                                ): (index, spec)
+                                for index, spec in window
+                            }
+                            for future in as_completed(futures):
+                                index, spec = futures[future]
+                                try:
+                                    row = future.result()
+                                except Exception as error:
+                                    row = _worker_failure_row(
+                                        index, spec, error, strict_service_full
+                                    )
+                                persist(row)
+    finally:
+        if supervisor is not None:
+            supervisor.close()
     rows.sort(key=lambda row: planned_ids.index(str(row["case_id"])))
     discovered, missing = _classify_pairs(corpus, rows)
     completed = [row for row in rows if row["evaluation"].get("status") == "ok"]
