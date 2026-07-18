@@ -138,10 +138,18 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   reap the disposable worker without returning partial routes. Gate:
   `349 passed` across the focused routing/API/benchmark suite, plus zero Pyright
   errors for the cancellation/supervisor boundary.
-- [ ] Zero-copy scenic endpoint access — next. Current blocker:
-  `_copy_endpoint_overlay` duplicates the complete graph for every scenic
-  request; the production graph has 10,162,024 nodes and 10,792,528 traversals.
-- [ ] Compact reverse CSR and target-bounded bidirectional search.
+- [x] Zero-copy scenic endpoint access — integrated at `6e1fb38c`.
+  Scenic endpoint graphs now share base nodes, edges, and adjacency storage,
+  own only frozen request-local additions, and serialize same-planner requests.
+  A 10,000-extra-node allocation probe fell from 976,560 bytes for the former
+  clone to 12,095 bytes (12,863 bytes for the small structural overlay). Gate:
+  `280 passed` across planner/oracle/cancellation/objective/service/API coverage,
+  Ruff passed, and graph Pyright diagnostics stayed at the same seven
+  pre-existing errors.
+- [ ] Compact reverse CSR and target-bounded bidirectional search — next.
+  Current reverse traversal state is a Python dictionary of per-node lists, and
+  the large-graph scalar path still runs full single-source SciPy Dijkstra
+  before its target-bounded bidirectional fallback.
 - [ ] Versioned persisted spatial edge index with corruption recovery.
 - [ ] Re-run the unchanged 10-second production benchmark after the three
   remaining implementation gates.
