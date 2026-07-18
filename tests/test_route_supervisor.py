@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from src.route_planner.cancellation import RoutingTimeout
+from src.route_planner.cancellation import RoutingDeadline, RoutingTimeout
 from src.route_planner import supervisor as supervisor_module
 from src.route_planner.supervisor import (
     PreloadedRouteSupervisor,
@@ -42,6 +42,11 @@ def _job_deadline_identity_and_budget(deadline, budget: float) -> dict:
 
 def _inner_deadline_id(deadline) -> int:
     return id(deadline)
+
+
+def _job_return_expires_at(deadline) -> tuple[float | None, float]:
+    """Return the deadline's absolute expiry and the child's current monotonic clock."""
+    return deadline.expires_at, time.monotonic()
 
 
 def _job_raise_value_error(deadline, message: str) -> None:
@@ -102,24 +107,74 @@ def test_successful_response() -> None:
 
 def test_one_deadline_identity_and_absolute_budget() -> None:
     budget = 10.0
-    sent_at = time.monotonic()
+    deadline = RoutingDeadline.after(budget)
+    expected_expires = deadline.expires_at
     with PreloadedRouteSupervisor.start() as sup:
         result = sup.run_job(
             _job_deadline_identity_and_budget,
             budget,
-            deadline_seconds=budget,
+            deadline=deadline,
             grace_seconds=0.5,
         )
-    received_at = time.monotonic()
 
     # Exactly one RoutingDeadline object is created in the child and passed
-    # through to helpers.
+    # through to helpers, using the caller's absolute expires_at.
     assert result["id"] == result["helper_id"]
-    assert result["expires_at"] is not None
-    # expires_at is absolute and anchored close to the requested budget.
-    elapsed_max = received_at - sent_at
-    assert budget <= result["expires_at"] - sent_at <= budget + elapsed_max
+    assert result["expires_at"] == expected_expires
     assert 0.0 < result["remaining"] <= budget
+
+
+def test_deadline_object_exact_expiry_observed_by_worker() -> None:
+    budget = 10.0
+    deadline = RoutingDeadline.after(budget)
+    with PreloadedRouteSupervisor.start() as sup:
+        child_expires, child_now = sup.run_job(
+            _job_return_expires_at,
+            deadline=deadline,
+            grace_seconds=0.5,
+        )
+    assert child_expires is not None
+    assert child_expires == deadline.expires_at
+    # Child received the same absolute deadline; its own clock is consistent.
+    assert deadline.expires_at is not None
+    assert child_now <= deadline.expires_at + budget
+
+def test_queued_delay_does_not_extend_deadline() -> None:
+    """A RoutingDeadline passed before queue/IPC keeps its original budget."""
+    budget = 0.5
+    deadline = RoutingDeadline.after(budget)
+    expected_expires = deadline.expires_at
+    time.sleep(0.15)  # simulate caller-side queuing/serialization delay
+    sent_at = time.monotonic()
+
+    with PreloadedRouteSupervisor.start() as sup:
+        child_expires, _ = sup.run_job(
+            _job_return_expires_at,
+            deadline=deadline,
+            grace_seconds=0.2,
+        )
+    # Expiry did not shift because of the sleep or IPC.
+    assert child_expires is not None
+    assert child_expires == expected_expires
+    assert child_expires - sent_at < budget
+
+def test_already_expired_deadline_fails_before_send() -> None:
+    """Caller-side check rejects an expired deadline before any IPC."""
+    deadline = RoutingDeadline(expires_at=time.monotonic() - 0.01)
+    with PreloadedRouteSupervisor.start() as sup:
+        with pytest.raises(RoutingTimeout, match="deadline exceeded"):
+            sup.run_job(_job_success, "too-late", deadline=deadline)
+
+
+def test_deadline_and_deadline_seconds_are_mutually_exclusive() -> None:
+    with PreloadedRouteSupervisor.start() as sup:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            sup.run_job(
+                _job_success,
+                "x",
+                deadline=RoutingDeadline.after(5.0),
+                deadline_seconds=5.0,
+            )
 
 
 def test_uncooperative_child_hard_killed_within_bounded_wall_time() -> None:

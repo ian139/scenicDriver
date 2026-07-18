@@ -10,6 +10,11 @@ deadline and SIGKILL'd at ``deadline + grace``.  After a hard kill, a fresh
 child is forked from the still-preloaded supervisor.  The supervisor remains
 reusable.
 
+The caller computes a single absolute ``expires_at`` value before queue/IPC and
+passes it to ``run_job`` as either a ``RoutingDeadline`` or a
+``deadline_seconds`` convenience value.  The supervisor and worker use that exact
+``expires_at`` so queued or IPC delays cannot extend the request budget.
+
 IPC uses ``Connection.send_bytes`` / ``recv_bytes`` with explicit ``pickle``
 framing so payloads are not limited to ``PIPE_BUF``.  The implementation
 retries on ``InterruptedError`` and never relies on a single ``os.write``.
@@ -67,7 +72,7 @@ class _Job:
     func: Callable[..., Any]
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
-    deadline_seconds: float | None
+    expires_at: float | None
     grace_seconds: float
 
 
@@ -78,7 +83,7 @@ class _WorkerJob:
     func: Callable[..., Any]
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
-    deadline_at: float | None
+    expires_at: float | None
 
 
 @dataclass(frozen=True)
@@ -193,8 +198,8 @@ def _run_one_job(job: _WorkerJob) -> _WorkerResult:
     """Execute a single job in the persistent worker."""
     try:
         deadline = (
-            RoutingDeadline(expires_at=job.deadline_at)
-            if job.deadline_at is not None
+            RoutingDeadline(expires_at=job.expires_at)
+            if job.expires_at is not None
             else RoutingDeadline()
         )
         value = job.func(deadline, *job.args, **job.kwargs)
@@ -293,11 +298,7 @@ class _WorkerHandle:
         assert self._work_conn is not None and self._proc is not None
 
         worker_pid = self._proc.pid
-        deadline_at = (
-            time.monotonic() + job.deadline_seconds
-            if job.deadline_seconds is not None
-            else None
-        )
+        deadline_at = job.expires_at
         hard_at = (
             deadline_at + job.grace_seconds
             if deadline_at is not None and job.grace_seconds is not None
@@ -308,7 +309,7 @@ class _WorkerHandle:
             func=job.func,
             args=job.args,
             kwargs=job.kwargs,
-            deadline_at=deadline_at,
+            expires_at=job.expires_at,
         )
 
         try:
@@ -504,6 +505,7 @@ class PreloadedRouteSupervisor:
         self,
         func: Callable[..., Any],
         *args: Any,
+        deadline: RoutingDeadline | None = None,
         deadline_seconds: float | None = None,
         grace_seconds: float | None = None,
         **kwargs: Any,
@@ -516,23 +518,39 @@ class PreloadedRouteSupervisor:
         which will be propagated to the caller where the exception class is
         available.
 
-        ``deadline_seconds`` and ``grace_seconds`` may be overridden per job;
-        defaults fall back to the values supplied to ``start``.
+        ``deadline`` and ``deadline_seconds`` are mutually exclusive.  If
+        ``deadline`` is supplied, its absolute ``expires_at`` is used and a
+        caller-side cooperative check is performed before the job is sent.
+        If ``deadline_seconds`` is supplied, ``expires_at`` is computed from
+        the current monotonic clock before queue/IPC so delays do not extend
+        the budget.  ``grace_seconds`` defaults to the value supplied to
+        ``start``.
         """
         if self._closed:
             raise SupervisorError("supervisor is closed")
         if not self._process.is_alive():
             raise SupervisorError("supervisor process is not alive")
 
-        if deadline_seconds is None:
-            deadline_seconds = self._default_deadline_seconds
+        if deadline is not None and deadline_seconds is not None:
+            raise ValueError("deadline and deadline_seconds are mutually exclusive")
+
+        if deadline is not None:
+            # Caller-side cooperative cancellation/timeout check before IPC.
+            deadline.check()
+            expires_at = deadline.expires_at
+        else:
+            if deadline_seconds is None:
+                deadline_seconds = self._default_deadline_seconds
+            if deadline_seconds is not None:
+                deadline_seconds = float(deadline_seconds)
+                if deadline_seconds < 0.0 or not math.isfinite(deadline_seconds):
+                    raise ValueError("deadline_seconds must be non-negative and finite")
+                expires_at = time.monotonic() + deadline_seconds
+            else:
+                expires_at = None
+
         if grace_seconds is None:
             grace_seconds = self._default_grace_seconds
-
-        if deadline_seconds is not None:
-            deadline_seconds = float(deadline_seconds)
-            if deadline_seconds < 0.0 or not math.isfinite(deadline_seconds):
-                raise ValueError("deadline_seconds must be non-negative and finite")
         if grace_seconds is not None:
             grace_seconds = float(grace_seconds)
             if grace_seconds < 0.0 or not math.isfinite(grace_seconds):
@@ -542,7 +560,7 @@ class PreloadedRouteSupervisor:
             func=func,
             args=args,
             kwargs=kwargs,
-            deadline_seconds=deadline_seconds,
+            expires_at=expires_at,
             grace_seconds=grace_seconds,
         )
 
