@@ -1407,6 +1407,58 @@ def test_route_preload_off_skips_all_assets(tmp_path, monkeypatch) -> None:
     }
     assert preload_calls == []
 
+def test_route_supervisor_starts_after_preload_and_closes_on_lifespan_exit(
+    monkeypatch,
+) -> None:
+    diagnostics = {
+        "enabled": True,
+        "mode": "required",
+        "loaded_regions": ["default"],
+        "regions": [],
+    }
+    monkeypatch.setattr(app_api, "validate_route_configuration", lambda: None)
+    monkeypatch.setattr(app_api, "_route_preload_mode", lambda: "required")
+    monkeypatch.setattr(
+        app_api, "_preload_configured_route_assets", lambda mode: diagnostics
+    )
+    starts: list[dict[str, object]] = []
+    closed: list[object] = []
+
+    class FakeSupervisor:
+        @classmethod
+        def start(cls, **kwargs):
+            starts.append(kwargs)
+            return cls()
+
+        def close(self) -> None:
+            closed.append(self)
+
+    monkeypatch.setattr(app_api, "PreloadedRouteSupervisor", FakeSupervisor)
+    app = create_app()
+    with TestClient(app):
+        assert app.state.route_supervisor is not None
+
+    assert len(starts) == 1
+    assert starts[0]["preload_marker"] is diagnostics
+    assert starts[0]["default_deadline_seconds"] is None
+    assert starts[0]["default_grace_seconds"] == 0.5
+    assert len(closed) == 1
+    assert app.state.route_supervisor is None
+
+
+def test_route_supervisor_not_started_when_preload_is_off(monkeypatch) -> None:
+    monkeypatch.setattr(app_api, "validate_route_configuration", lambda: None)
+    monkeypatch.setattr(app_api, "_route_preload_mode", lambda: "off")
+
+    class FailingSupervisor:
+        @classmethod
+        def start(cls, **kwargs):
+            raise AssertionError("supervisor must not start with preload off")
+
+    monkeypatch.setattr(app_api, "PreloadedRouteSupervisor", FailingSupervisor)
+    with TestClient(create_app()):
+        pass
+
 
 def test_route_preload_required_fails_for_missing_default(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
@@ -1584,3 +1636,113 @@ def test_route_compare_fallback_diagnose_maps_routing_cancelled_to_non_no_route(
     )
     assert response.status_code != 422
     assert response.json()["detail"]["error"] == "routing_cancelled"
+
+
+def _route_compare_payload() -> dict[str, object]:
+    return {
+        "start": {"lat": 44.4, "lon": -70.2},
+        "end": {"lat": 44.5, "lon": -70.1},
+        "scenic_weight": 0.8,
+        "region": "new_england_north",
+        "max_detour_factor": 1.8,
+        "avoid_highways": False,
+        "include_baseline": False,
+    }
+
+
+def _stub_route_compare_assets(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api,
+        "_region_to_graph",
+        lambda region: Path("/tmp/fake-road-graph.geojson"),
+    )
+    monkeypatch.setattr(
+        app_api, "_latest_run_for_region", lambda region: "test-run"
+    )
+
+
+def test_route_compare_supervisor_receives_parent_deadline_without_in_process_plan(
+    monkeypatch,
+) -> None:
+    _stub_route_compare_assets(monkeypatch)
+    plan_calls: list[object] = []
+    run_calls: list[tuple[object, object, RoutingDeadline]] = []
+    validation_deadlines: list[RoutingDeadline] = []
+
+    def fail_plan(request, **kwargs):
+        plan_calls.append(request)
+        raise AssertionError("in-process planning is not expected")
+
+    def fake_validate(result, *, request, deadline):
+        validation_deadlines.append(deadline)
+        return (
+            {
+                "scenic_score_delta_absolute": 0.0,
+                "scenic_score_delta_relative": 0.0,
+            },
+            {
+                "scenic": {
+                    "total_distance_km": 1.0,
+                    "estimated_duration_minutes": 2.0,
+                    "normalized_scenic_score": 0.5,
+                }
+            },
+        )
+
+    class FakeSupervisor:
+        def run_job(self, func, route_request, *, deadline):
+            run_calls.append((func, route_request, deadline))
+            return {"score_mapping": {}, "geojson": {}}
+
+    monkeypatch.setattr(app_api, "plan_routes", fail_plan)
+    monkeypatch.setattr(app_api, "_validate_route_contract", fake_validate)
+    app = create_app()
+    app.state.route_supervisor = FakeSupervisor()
+    response = TestClient(app).post("/v1/route/compare", json=_route_compare_payload())
+
+    assert response.status_code == 200
+    assert plan_calls == []
+    assert len(run_calls) == 1
+    worker, route_request, deadline = run_calls[0]
+    assert worker is app_api._plan_routes_worker
+    assert isinstance(route_request, app_api.RouteRequest)
+    assert isinstance(deadline, RoutingDeadline)
+    assert validation_deadlines == [deadline]
+
+
+def test_route_compare_supervisor_routing_timeout_maps_to_504(monkeypatch) -> None:
+    _stub_route_compare_assets(monkeypatch)
+
+    class FakeSupervisor:
+        def run_job(self, *args, **kwargs):
+            raise RoutingTimeout("deadline exceeded in supervisor")
+
+    monkeypatch.setattr(
+        app_api,
+        "plan_routes",
+        lambda *args, **kwargs: pytest.fail("in-process planning is not expected"),
+    )
+    app = create_app()
+    app.state.route_supervisor = FakeSupervisor()
+    response = TestClient(app).post("/v1/route/compare", json=_route_compare_payload())
+
+    assert response.status_code == 504
+    assert response.json()["detail"]["error"] == "routing_deadline_exceeded"
+
+
+def test_route_compare_supervisor_error_maps_to_structured_503(monkeypatch) -> None:
+    _stub_route_compare_assets(monkeypatch)
+
+    class FakeSupervisor:
+        def run_job(self, *args, **kwargs):
+            raise app_api.SupervisorError("private supervisor failure")
+
+    app = create_app()
+    app.state.route_supervisor = FakeSupervisor()
+    response = TestClient(app).post("/v1/route/compare", json=_route_compare_payload())
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "error": "routing_supervisor_unavailable",
+        "message": "The routing service is temporarily unavailable.",
+    }
