@@ -146,13 +146,18 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   `280 passed` across planner/oracle/cancellation/objective/service/API coverage,
   Ruff passed, and graph Pyright diagnostics stayed at the same seven
   pre-existing errors.
-- [ ] Compact reverse CSR and target-bounded bidirectional search — next.
-  Current reverse traversal state is a Python dictionary of per-node lists, and
-  the large-graph scalar path still runs full single-source SciPy Dijkstra
-  before its target-bounded bidirectional fallback.
-- [ ] Versioned persisted spatial edge index with corruption recovery.
-- [ ] Re-run the unchanged 10-second production benchmark after the three
-  remaining implementation gates.
+- [x] Compact reverse CSR and target-bounded bidirectional search — integrated
+  at `ca5a7c30`. Reverse traversal now uses numeric CSR rows and forward-edge
+  positions instead of Python predecessor lists. Production-sized built-in
+  searches run sparse, target-bounded bidirectional Dijkstra before any
+  full-source SciPy path, including base-CSR plus request-local endpoint edges.
+  Directed, tied, reverse, unreachable, mutation, compactness, sparse-state,
+  and prewarmed endpoint behavior are covered. Gate: `284 passed` across the
+  integrated routing/service/API suite, Ruff passed, and an independent review
+  found no correctness blocker.
+- [ ] Versioned persisted spatial edge index with corruption recovery — next.
+- [ ] Re-run the unchanged 10-second production benchmark after the persisted
+  index gate.
 - [ ] Evaluate CCH or MLD only if that integrated benchmark still misses the
   latency target and graph traversal remains the measured bottleneck.
 
