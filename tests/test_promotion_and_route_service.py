@@ -9,6 +9,12 @@ from threading import Event, Lock
 import pytest
 
 from src.route_planner import service as route_service
+from src.route_planner.cancellation import (
+    RoutingCancelled,
+    RoutingDeadline,
+    RoutingTimeout,
+)
+from src.route_planner.graph import Edge, Node, RoadGraph
 from src.route_planner.planner import Route, RouteSegment, ScenicRoutePlanner
 
 _SEARCH_DIAGNOSTIC_KEYS = {
@@ -547,15 +553,15 @@ def test_plan_routes_caches_graph_and_tile_parsing_and_preserves_response_shape(
     original_graph_loader = route_service._load_graph
     original_tile_loader = route_service.load_tile_scores
 
-    def counted_graph_loader(path: Path) -> object:
+    def counted_graph_loader(path: Path, **kwargs: object) -> object:
         nonlocal graph_loads
         graph_loads += 1
-        return original_graph_loader(path)
+        return original_graph_loader(path, **kwargs)
 
-    def counted_tile_loader(path: Path) -> object:
+    def counted_tile_loader(path: Path, **kwargs: object) -> object:
         nonlocal tile_loads
         tile_loads += 1
-        return original_tile_loader(path)
+        return original_tile_loader(path, **kwargs)
 
     monkeypatch.setattr(route_service, "_load_graph", counted_graph_loader)
     monkeypatch.setattr(route_service, "load_tile_scores", counted_tile_loader)
@@ -749,7 +755,7 @@ def test_diagnose_reuses_exclusive_scored_graph_after_control_failure(
     )
     assert preload["score_mapping"]["matched_ratio"] == pytest.approx(1.0)
 
-    def fail_raw_load(_path: Path) -> object:
+    def fail_raw_load(_path: Path, **_kwargs: object) -> object:
         pytest.fail("diagnostics reloaded the raw graph")
 
     monkeypatch.setattr(route_service, "_load_graph", fail_raw_load)
@@ -826,7 +832,7 @@ def test_plan_routes_accepts_snap_limit_boundary_and_rejects_coverage(
     monkeypatch.setattr(
         route_service,
         "_endpoint_snap_diagnostics",
-        lambda graph, request: dict(snap_values),
+        lambda graph, request, **kwargs: dict(snap_values),
     )
 
     class FakePlanner:
@@ -855,7 +861,7 @@ def test_plan_routes_accepts_snap_limit_boundary_and_rejects_coverage(
     monkeypatch.setattr(
         route_service,
         "_endpoint_snap_diagnostics",
-        lambda graph, request: dict(over_limit),
+        lambda graph, request, **kwargs: dict(over_limit),
     )
     with pytest.raises(route_service.RouteCoverageError) as caught:
         route_service.plan_routes(
@@ -881,7 +887,7 @@ def test_plan_routes_keeps_control_constrained_snap_failure_as_value_error(
     monkeypatch.setattr(
         route_service,
         "_endpoint_snap_diagnostics",
-        lambda graph, request: {
+        lambda graph, request, **kwargs: {
             "start_snap_km": 2.0,
             "end_snap_km": 2.0,
             "start_all_road_snap_km": 0.5,
@@ -1007,3 +1013,211 @@ def test_concurrent_report_builds_publish_isolated_native_variants(
 
     canonical = route_service._load_cached_graph(graph_path)[0]
     assert float(next(iter(canonical.edges.values())).scenic_score) == pytest.approx(1.0)
+
+
+def test_deadline_seconds_from_env_default_and_validation() -> None:
+    route_service.clear_route_caches()
+    assert route_service._deadline_seconds_from_env() == 10.0
+    assert route_service.validate_route_configuration() is None
+
+    with pytest.raises(route_service.RouteConfigurationError, match="finite"):
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setenv("SCENIC_ROUTE_DEADLINE_SECONDS", "not-a-number")
+            route_service._deadline_seconds_from_env()
+
+    for bad in ("-1", "inf", "nan"):
+        with pytest.raises(route_service.RouteConfigurationError, match="finite"):
+            with pytest.MonkeyPatch().context() as mp:
+                mp.setenv("SCENIC_ROUTE_DEADLINE_SECONDS", bad)
+                route_service._deadline_seconds_from_env()
+
+
+class _UnexpectedPlanner:
+    def __init__(self, *, graph: object) -> None:
+        raise AssertionError("planner should not be instantiated")
+
+
+def test_plan_routes_raises_routing_timeout_for_already_expired_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", _UnexpectedPlanner)
+
+    expired = RoutingDeadline.after(0.0)
+    with pytest.raises(RoutingTimeout):
+        route_service.plan_routes(
+            route_service.RouteRequest(
+                graph_geojson=str(graph_path),
+                start=(42.0, -72.0),
+                end=(42.1, -72.0),
+                include_baseline=False,
+            ),
+            deadline=expired,
+        )
+
+
+def test_deadline_propagated_by_identity_to_planner_and_serialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+    seen_deadlines: list[RoutingDeadline | None] = []
+    captured_highway_deadline: list[RoutingDeadline | None] = []
+    original_highway_count = route_service._route_highway_count
+
+    def counting_highway_count(route: Route, *, deadline: RoutingDeadline | None = None) -> int:
+        captured_highway_deadline.append(deadline)
+        return original_highway_count(route, deadline=deadline)
+
+    monkeypatch.setattr(route_service, "_route_highway_count", counting_highway_count)
+
+    deadline = RoutingDeadline.after(60.0)
+
+    class FakePlanner:
+        def __init__(self, *, graph: object) -> None:
+            self.graph = graph
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            seen_deadlines.append(kwargs.get("deadline"))
+            edge = next(iter(self.graph.edges.values()))
+            return _cache_test_route(float(edge.scenic_score))
+
+        def find_fastest_route(self, **kwargs: object) -> Route:
+            seen_deadlines.append(kwargs.get("deadline"))
+            edge = next(iter(self.graph.edges.values()))
+            return _cache_test_route(float(edge.scenic_score))
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
+    result = route_service.plan_routes(
+        route_service.RouteRequest(
+            graph_geojson=str(graph_path),
+            start=(42.0, -72.0),
+            end=(42.1, -72.0),
+            include_baseline=True,
+        ),
+        deadline=deadline,
+    )
+
+    assert len(result["routes"]) == 2
+    assert all(d is deadline for d in seen_deadlines)
+    assert all(d is deadline for d in captured_highway_deadline)
+    assert len(captured_highway_deadline) == 3
+
+
+def test_routing_cancelled_during_scoring_is_not_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    tile_path = tmp_path / "tiles.json"
+    _write_cache_graph(graph_path)
+    _write_cache_tiles(tile_path, 8.0)
+    route_service.clear_route_caches()
+
+    def exploding_apply(*args: object, **kwargs: object) -> None:
+        raise RoutingCancelled("cancelled during scoring")
+
+    monkeypatch.setattr(route_service, "_apply_tile_scores_to_graph_native", exploding_apply)
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", _UnexpectedPlanner)
+
+    with pytest.raises(RoutingCancelled, match="cancelled during scoring"):
+        route_service.plan_routes(
+            route_service.RouteRequest(
+                graph_geojson=str(graph_path),
+                start=(42.0, -72.0),
+                end=(42.1, -72.0),
+                include_baseline=False,
+                tile_scores_json=str(tile_path),
+            ),
+            deadline=RoutingDeadline.after(60.0),
+        )
+
+
+def test_routing_timeout_during_diagnostics_is_not_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+
+    def timeout_diagnostics(*args: object, **kwargs: object) -> None:
+        raise RoutingTimeout("deadline in diagnostics")
+
+    monkeypatch.setattr(route_service, "_endpoint_snap_diagnostics", timeout_diagnostics)
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", _UnexpectedPlanner)
+
+    with pytest.raises(RoutingTimeout, match="deadline in diagnostics"):
+        route_service.plan_routes(
+            route_service.RouteRequest(
+                graph_geojson=str(graph_path),
+                start=(42.0, -72.0),
+                end=(42.1, -72.0),
+                include_baseline=False,
+            ),
+            deadline=RoutingDeadline.after(60.0),
+        )
+
+
+class _CountingDeadline:
+    """A test-only deadline that raises after a configurable number of checks."""
+
+    def __init__(self, raise_after: int, exception: Exception) -> None:
+        self._raise_after = raise_after
+        self._exception = exception
+        self.checks = 0
+
+    def check(self) -> None:
+        self.checks += 1
+        if self.checks >= self._raise_after:
+            raise self._exception
+
+
+def test_clone_graph_for_scoring_checks_periodically() -> None:
+    graph = RoadGraph()
+    for i in range(3_000):
+        graph.add_node(Node(id=f"n{i}", lat=42.0 + i * 1e-6, lon=-72.0 + i * 1e-6))
+        if i > 0:
+            graph.add_edge(
+                Edge(
+                    id=f"e{i}",
+                    start_node_id=f"n{i - 1}",
+                    end_node_id=f"n{i}",
+                    distance_km=1.0,
+                    scenic_score=5.0,
+                )
+            )
+
+    deadline = _CountingDeadline(2, RoutingCancelled("clone cancelled"))
+    with pytest.raises(RoutingCancelled, match="clone cancelled"):
+        route_service._clone_graph_for_scoring(graph, deadline=deadline)
+    assert deadline.checks >= 1
+
+
+def test_load_cached_graph_checks_after_load_before_publication(
+    tmp_path: Path,
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+    route_service.clear_route_caches()
+
+    deadline = _CountingDeadline(2, RoutingCancelled("after load"))
+    with pytest.raises(RoutingCancelled, match="after load"):
+        route_service._load_cached_graph(graph_path, deadline=deadline)
+    assert len(route_service._GRAPH_CACHE) == 0
+
+
+def test_route_to_feature_checks_during_waypoint_materialization() -> None:
+    waypoints = [(42.0 + i * 1e-6, -72.0 + i * 1e-6) for i in range(3_000)]
+    route = Route(
+        waypoints=waypoints,
+        total_distance_km=10.0,
+        estimated_duration_minutes=15.0,
+        average_scenic_score=6.0,
+        edge_ids=[],
+        traversal_ids=[],
+        segments=[],
+    )
+
+    deadline = _CountingDeadline(2, RoutingTimeout("waypoint timeout"))
+    with pytest.raises(RoutingTimeout, match="waypoint timeout"):
+        route_service.route_to_feature(route, "scenic", deadline=deadline)
+    assert deadline.checks >= 1

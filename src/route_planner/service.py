@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import copy
 from dataclasses import dataclass
 import hashlib
@@ -20,6 +20,11 @@ from .cost import (
     duration_component,
     normalize_scenic_score,
 )
+from .cancellation import (
+    RoutingCancelled,
+    RoutingDeadline,
+    RoutingTimeout,
+)
 from .graph import RoadGraph
 from .planner import (
     Route,
@@ -32,6 +37,33 @@ _DEFAULT_SCENIC_WEIGHT = 0.8
 _DEFAULT_AVOID_HIGHWAYS = False
 _DEFAULT_MAX_DETOUR_FACTOR = 1.8
 _DEFAULT_INCLUDE_BASELINE = True
+
+_DEFAULT_SCENIC_ROUTE_DEADLINE_SECONDS = 10.0
+_DEADLINE_CHECK_INTERVAL = 256
+
+
+def _maybe_check_deadline(
+    deadline: RoutingDeadline | None, counter: int, *, interval: int = _DEADLINE_CHECK_INTERVAL
+) -> None:
+    if deadline is not None and counter % interval == 0:
+        deadline.check()
+
+
+def _deadline_seconds_from_env() -> float:
+    raw_value = os.environ.get("SCENIC_ROUTE_DEADLINE_SECONDS")
+    if raw_value is None or not raw_value.strip():
+        return _DEFAULT_SCENIC_ROUTE_DEADLINE_SECONDS
+    try:
+        value = float(raw_value.strip())
+    except ValueError as exc:
+        raise RouteConfigurationError(
+            "SCENIC_ROUTE_DEADLINE_SECONDS must be a finite non-negative number"
+        ) from exc
+    if not math.isfinite(value) or value < 0.0:
+        raise RouteConfigurationError(
+            "SCENIC_ROUTE_DEADLINE_SECONDS must be finite and non-negative"
+        )
+    return value
 
 
 class RouteConfigurationError(RuntimeError):
@@ -74,6 +106,7 @@ def _frontier_time_limit_from_env() -> float | None:
 def validate_route_configuration() -> None:
     """Validate deployment-supplied route settings before serving requests."""
     _frontier_time_limit_from_env()
+    _deadline_seconds_from_env()
 
 
 @dataclass
@@ -294,6 +327,7 @@ def _apply_tile_scores_to_graph_native(
     *,
     zoom: int,
     fallback: float | None,
+    deadline: RoutingDeadline | None = None,
 ) -> tuple[int, int]:
     """Materialize tile scores directly on one private graph variant.
 
@@ -302,6 +336,9 @@ def _apply_tile_scores_to_graph_native(
     again, so requests with different reports cannot observe one another's
     edge mutations.
     """
+
+    if deadline is not None:
+        deadline.check()
 
 
     matched = 0
@@ -313,6 +350,7 @@ def _apply_tile_scores_to_graph_native(
 
     for edge in graph.edges.values():
         total += 1
+        _maybe_check_deadline(deadline, total)
         start = graph.get_node(edge.start_node_id)
         end = graph.get_node(edge.end_node_id)
         midpoint_key = (
@@ -345,13 +383,23 @@ def _apply_tile_scores_to_graph_native(
     return matched, total
 
 
-def _clone_graph_for_scoring(graph: RoadGraph) -> RoadGraph:
+def _clone_graph_for_scoring(
+    graph: RoadGraph,
+    deadline: RoutingDeadline | None = None,
+) -> RoadGraph:
     """Copy nodes and native ``Edge`` objects for an isolated score variant."""
+    if deadline is not None:
+        deadline.check()
 
     variant = RoadGraph()
+    counter = 0
     for node in graph.nodes.values():
+        counter += 1
+        _maybe_check_deadline(deadline, counter, interval=1024)
         variant.add_node(copy(node))
     for edge in graph.edges.values():
+        counter += 1
+        _maybe_check_deadline(deadline, counter, interval=1024)
         variant.add_edge(copy(edge))
     return variant
 
@@ -370,8 +418,12 @@ def _load_cached_graph(
     path: Path,
     *,
     scored_cache_key: _ScoredGraphCacheKey | None = None,
+    deadline: RoutingDeadline | None = None,
 ) -> tuple[RoadGraph, str, _FileSignature, bool]:
     global _ACTIVE_GRAPH_VARIANT_KEY
+
+    if deadline is not None:
+        deadline.check()
 
     path_key = _resolved_path_key(path)
     signature = _file_signature(path)
@@ -403,9 +455,16 @@ def _load_cached_graph(
             if stale_key[0] == path_key:
                 _GRAPH_CACHE.pop(stale_key, None)
         _clear_scored_variant_locked()
-        graph = _load_graph(path)
+        graph = _load_graph(
+            path,
+            check_cancelled=deadline.check if deadline is not None else None,
+        )
+        if deadline is not None:
+            deadline.check()
         final_signature = _file_signature(path)
         final_key = (path_key, final_signature)
+        if deadline is not None:
+            deadline.check()
         _GRAPH_CACHE[final_key] = graph
         _GRAPH_CACHE.move_to_end(final_key)
         while len(_GRAPH_CACHE) > _CACHE_CAPACITY:
@@ -413,11 +472,18 @@ def _load_cached_graph(
         return graph, path_key, final_signature, False
 
 
-def load_tile_scores(path: Path) -> tuple[dict[tuple[int, int, int], float], int]:
+def load_tile_scores(
+    path: Path,
+    deadline: RoutingDeadline | None = None,
+) -> tuple[dict[tuple[int, int, int], float], int]:
+    if deadline is not None:
+        deadline.check()
+
     payload = json.loads(path.read_text(encoding="utf-8"))
     score_map: dict[tuple[int, int, int], float] = {}
     zoom_counts: dict[int, int] = {}
-    for tile in payload.get("tiles", []):
+    for index, tile in enumerate(payload.get("tiles", [])):
+        _maybe_check_deadline(deadline, index)
         x, y, z, scenic = (
             tile.get("x"),
             tile.get("y"),
@@ -437,7 +503,11 @@ def load_tile_scores(path: Path) -> tuple[dict[tuple[int, int, int], float], int
 
 def _load_cached_tile_scores(
     path: Path,
+    deadline: RoutingDeadline | None = None,
 ) -> tuple[Mapping[tuple[int, int, int], float], int, str, _FileSignature, bool]:
+    if deadline is not None:
+        deadline.check()
+
     path_key = _resolved_path_key(path)
     signature = _file_signature(path)
     cache_key = (path_key, signature)
@@ -452,7 +522,7 @@ def _load_cached_tile_scores(
             if stale_key[0] == path_key:
                 _TILE_SCORE_CACHE.pop(stale_key, None)
         _clear_scored_variant_locked()
-        score_map, inferred_zoom = load_tile_scores(path)
+        score_map, inferred_zoom = load_tile_scores(path, deadline=deadline)
         immutable_map = MappingProxyType(dict(score_map))
         final_signature = _file_signature(path)
         final_key = (path_key, final_signature)
@@ -472,6 +542,7 @@ def _get_scored_graph(
     zoom: int,
     fallback: float | None,
     exclusive_source: bool = False,
+    deadline: RoutingDeadline | None = None,
 ) -> tuple[RoadGraph, int, int, bool]:
     """Atomically get or build one immutable native-edge score variant.
 
@@ -483,6 +554,9 @@ def _get_scored_graph(
     """
 
     global _ACTIVE_GRAPH_VARIANT_KEY
+    if deadline is not None:
+        deadline.check()
+
     cache_key = (
         graph_key,
         tile_key,
@@ -518,13 +592,14 @@ def _get_scored_graph(
         # fetched before this lock).  Normal requests always score a clone;
         # startup may explicitly score this source graph in place.
         scored_graph = (
-            graph if exclusive_source else _clone_graph_for_scoring(graph)
+            graph if exclusive_source else _clone_graph_for_scoring(graph, deadline=deadline)
         )
         matched, total = _apply_tile_scores_to_graph_native(
             scored_graph,
             score_map,
             zoom=int(zoom),
             fallback=fallback,
+            deadline=deadline,
         )
         fallback_edges = int(total - matched) if fallback is not None else 0
         object.__setattr__(
@@ -550,6 +625,7 @@ def preload_route_assets(
     tile_score_zoom: int | None = None,
     tile_score_fallback: float | None = None,
     exclusive_scoring: bool = False,
+    deadline: RoutingDeadline | None = None,
 ) -> dict[str, Any]:
     """Load and materialize one route graph without planning a route.
 
@@ -560,6 +636,9 @@ def preload_route_assets(
     """
 
     started_at = perf_counter()
+    if deadline is not None:
+        deadline.check()
+
     graph_file = Path(graph_path)
     if not graph_file.exists():
         raise FileNotFoundError(f"Graph asset not found: {graph_file}")
@@ -597,7 +676,7 @@ def preload_route_assets(
             tile_path_key,
             tile_signature,
             tile_score_cache_hit,
-        ) = _load_cached_tile_scores(tile_file)
+        ) = _load_cached_tile_scores(tile_file, deadline=deadline)
         zoom = (
             int(tile_score_zoom)
             if tile_score_zoom is not None
@@ -632,6 +711,7 @@ def preload_route_assets(
     graph, graph_path_key, graph_signature, graph_cache_hit = _load_cached_graph(
         graph_file,
         scored_cache_key=scored_cache_key,
+        deadline=deadline,
     )
     if not graph.nodes or not graph.edges:
         raise ValueError(f"Graph asset has no usable nodes/edges: {graph_file}")
@@ -659,6 +739,7 @@ def preload_route_assets(
             zoom=zoom,
             fallback=fallback,
             exclusive_source=bool(exclusive_scoring),
+            deadline=deadline,
         )
         mapping_meta = getattr(
             graph,
@@ -681,6 +762,9 @@ def preload_route_assets(
         }
 
     planner_preload: dict[str, Any] = {}
+    if deadline is not None:
+        deadline.check()
+
     frontier_time_limit_seconds = _frontier_time_limit_from_env()
     if frontier_time_limit_seconds is None:
         planner = ScenicRoutePlanner(graph=graph)
@@ -725,16 +809,23 @@ def _segment_identity(segment: Any, index: int) -> str:
     return str(edge_id)
 
 
-def _route_highway_count(route: Route) -> int:
+def _route_highway_count(
+    route: Route,
+    deadline: RoutingDeadline | None = None,
+) -> int:
+    if deadline is not None:
+        deadline.check()
+
     declared = getattr(route, "highway_count", None)
     if declared is not None:
         return int(declared)
     highway_names = HIGHWAY_ROAD_TYPES
-    return sum(
-        1
-        for segment in route.segments
-        if str(getattr(segment, "road_type", "")).lower() in highway_names
-    )
+    count = 0
+    for index, segment in enumerate(route.segments):
+        _maybe_check_deadline(deadline, index, interval=64)
+        if str(getattr(segment, "road_type", "")).lower() in highway_names:
+            count += 1
+    return count
 
 
 def route_to_feature(
@@ -745,42 +836,59 @@ def route_to_feature(
     score_provenance: Mapping[str, Any] | None = None,
     requested_start: tuple[float, float] | None = None,
     requested_end: tuple[float, float] | None = None,
+    deadline: RoutingDeadline | None = None,
 ) -> dict[str, Any]:
     # Route waypoints are the authoritative road traversal.  Never prepend or
     # append request coordinates: doing so creates unscored, off-road geometry.
-    coords = [[float(lon), float(lat)] for lat, lon in route.waypoints]
+    if deadline is not None:
+        deadline.check()
+
+    coords = []
+    for index, (lat, lon) in enumerate(route.waypoints):
+        _maybe_check_deadline(deadline, index, interval=1024)
+        coords.append([float(lon), float(lat)])
     raw_score = float(route.average_scenic_score)
     normalized_score = float(
         getattr(route, "scenic_score_normalized", _normalized_score(raw_score))
     )
     route_edge_ids = getattr(route, "edge_ids", None)
-    identities = list(route_edge_ids) if route_edge_ids else [
-        _segment_identity(segment, index)
-        for index, segment in enumerate(route.segments)
-    ]
+    if route_edge_ids:
+        identities = list(route_edge_ids)
+    else:
+        identities = []
+        for index, segment in enumerate(route.segments):
+            _maybe_check_deadline(deadline, index, interval=64)
+            identities.append(_segment_identity(segment, index))
     route_traversal_ids = getattr(route, "traversal_ids", None)
-    traversal_ids = list(route_traversal_ids) if route_traversal_ids else [
-        str(getattr(segment, "traversal_id", identities[index]))
-        for index, segment in enumerate(route.segments)
-    ]
-    segment_rows = [
-        {
-            "edge_id": identities[index],
-            "traversal_id": traversal_ids[index],
-            "direction": getattr(segment, "direction", None),
-            "start": [float(segment.start[0]), float(segment.start[1])],
-            "end": [float(segment.end[0]), float(segment.end[1])],
-            "distance_km": float(segment.distance_km),
-            "duration_minutes": float(segment.duration_minutes),
-            "scenic_score": float(segment.scenic_score),
-            "normalized_scenic_score": _normalized_score(segment.scenic_score),
-            "road_name": segment.road_name,
-            "road_type": segment.road_type,
-            "source_edge_id": getattr(segment, "source_edge_id", None),
-            "source_fraction": getattr(segment, "source_fraction", None),
-        }
-        for index, segment in enumerate(route.segments)
-    ]
+    if route_traversal_ids:
+        traversal_ids = list(route_traversal_ids)
+    else:
+        traversal_ids = []
+        for index, segment in enumerate(route.segments):
+            _maybe_check_deadline(deadline, index, interval=64)
+            traversal_ids.append(
+                str(getattr(segment, "traversal_id", identities[index]))
+            )
+    segment_rows = []
+    for index, segment in enumerate(route.segments):
+        _maybe_check_deadline(deadline, index, interval=64)
+        segment_rows.append(
+            {
+                "edge_id": identities[index],
+                "traversal_id": traversal_ids[index],
+                "direction": getattr(segment, "direction", None),
+                "start": [float(segment.start[0]), float(segment.start[1])],
+                "end": [float(segment.end[0]), float(segment.end[1])],
+                "distance_km": float(segment.distance_km),
+                "duration_minutes": float(segment.duration_minutes),
+                "scenic_score": float(segment.scenic_score),
+                "normalized_scenic_score": _normalized_score(segment.scenic_score),
+                "road_name": segment.road_name,
+                "road_type": segment.road_type,
+                "source_edge_id": getattr(segment, "source_edge_id", None),
+                "source_fraction": getattr(segment, "source_fraction", None),
+            }
+        )
     objective_values = dict(objective or {})
     properties: dict[str, Any] = {
         "route_kind": route_kind,
@@ -801,7 +909,7 @@ def route_to_feature(
             "applied_scenic_weight", None
         ),
         "estimated_duration_minutes": float(route.estimated_duration_minutes),
-        "highway_count": _route_highway_count(route),
+        "highway_count": _route_highway_count(route, deadline=deadline),
         "requested_max_detour_factor": objective_values.get(
             "requested_max_detour_factor",
             getattr(route, "requested_max_detour_factor", None),
@@ -882,6 +990,8 @@ def route_to_feature(
         properties["objective_components"] = dict(objective)
     if score_provenance is not None:
         properties["score_provenance"] = dict(score_provenance)
+    if deadline is not None:
+        deadline.check()
     return {
         "type": "Feature",
         "properties": properties,
@@ -909,6 +1019,7 @@ def apply_tile_scores_to_graph(
     *,
     zoom: int,
     fallback: float | None,
+    deadline: RoutingDeadline | None = None,
 ) -> tuple[int, int]:
     """Apply tile scores in-place for direct callers.
 
@@ -922,20 +1033,42 @@ def apply_tile_scores_to_graph(
         score_map,
         zoom=zoom,
         fallback=fallback,
+        deadline=deadline,
     )
 
 
-def _load_graph(path: Path) -> RoadGraph:
+def _load_graph(
+    path: Path,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> RoadGraph:
     # Support both FeatureCollection road graphs (.geojson) and serialized RoadGraph JSONs.
     if path.suffix.lower() == ".geojson":
+        if check_cancelled is not None:
+            try:
+                return RoadGraph.from_geojson(path, check_cancelled=check_cancelled)
+            except TypeError:
+                pass
         return RoadGraph.from_geojson(path)
+    if check_cancelled is not None:
+        try:
+            return RoadGraph.load(path, check_cancelled=check_cancelled)
+        except TypeError:
+            pass
     return RoadGraph.load(path)
 
 
-def diagnose_route_request(request: RouteRequest) -> dict[str, Any]:
+def diagnose_route_request(
+    request: RouteRequest,
+    *,
+    deadline: RoutingDeadline | None = None,
+) -> dict[str, Any]:
     graph_path = Path(request.graph_geojson)
     if not graph_path.exists():
         raise FileNotFoundError(f"Graph GeoJSON not found: {graph_path}")
+
+    if deadline is not None:
+        deadline.check()
 
     graph_path_key = _resolved_path_key(graph_path)
     graph_signature_hint = _file_signature(graph_path)
@@ -949,7 +1082,7 @@ def diagnose_route_request(request: RouteRequest) -> dict[str, Any]:
                 tile_path_key,
                 tile_signature,
                 _tile_cache_hit,
-            ) = _load_cached_tile_scores(tile_file)
+            ) = _load_cached_tile_scores(tile_file, deadline=deadline)
             zoom = (
                 int(request.tile_score_zoom)
                 if request.tile_score_zoom is not None
@@ -969,18 +1102,21 @@ def diagnose_route_request(request: RouteRequest) -> dict[str, Any]:
     graph = _load_cached_graph(
         graph_path,
         scored_cache_key=scored_cache_key,
+        deadline=deadline,
     )[0]
     diagnostics = {
         "graph_nodes": int(len(graph.nodes)),
         "graph_edges": int(len(graph.edges)),
     }
-    diagnostics.update(_endpoint_snap_diagnostics(graph, request))
+    diagnostics.update(_endpoint_snap_diagnostics(graph, request, deadline=deadline))
     return diagnostics
 
 
 def _endpoint_snap_diagnostics(
     graph: RoadGraph,
     request: RouteRequest,
+    *,
+    deadline: RoutingDeadline | None = None,
 ) -> dict[str, Any]:
     """Return non-raising edge-projection diagnostics for both endpoints.
 
@@ -990,6 +1126,11 @@ def _endpoint_snap_diagnostics(
     projection is also recorded for distinguishing missing coverage from a
     control-constrained route.
     """
+
+    if deadline is not None:
+        deadline.check()
+
+    check_cancelled = deadline.check if deadline is not None else None
 
     excluded_road_types = (
         HIGHWAY_ROAD_TYPES if request.avoid_highways else frozenset()
@@ -1005,17 +1146,22 @@ def _endpoint_snap_diagnostics(
     max_snap_distance_km = request.max_snap_distance_km
 
     for endpoint, point in (("start", request.start), ("end", request.end)):
+        if deadline is not None:
+            deadline.check()
         eligible_distance: float | None = None
         try:
             _projections, raw_distance = (
                 graph.find_nearest_edge_positions_with_distance(
                     *point,
                     excluded_road_types=excluded_road_types,
+                    check_cancelled=check_cancelled,
                 )
             )
             distance = float(raw_distance)
             if math.isfinite(distance) and _projections:
                 eligible_distance = distance
+        except (RoutingTimeout, RoutingCancelled):
+            raise
         except Exception:
             # Diagnostics must not mask the planner's existing no-route path.
             eligible_distance = None
@@ -1030,17 +1176,24 @@ def _endpoint_snap_diagnostics(
                     graph.find_nearest_edge_positions_with_distance(
                         *point,
                         excluded_road_types=frozenset(),
+                        check_cancelled=check_cancelled,
                     )
                 )
                 distance = float(raw_distance)
                 if math.isfinite(distance) and all_projections:
                     all_road_distance = distance
+            except (RoutingTimeout, RoutingCancelled):
+                raise
             except Exception:
                 all_road_distance = None
         try:
-            diagnostics[f"{endpoint}_node_id"] = str(
-                graph.find_nearest_node(*point).id
+            nearest_node, _ = graph.find_nearest_node_with_distance(
+                *point,
+                check_cancelled=check_cancelled,
             )
+            diagnostics[f"{endpoint}_node_id"] = str(nearest_node.id)
+        except (RoutingTimeout, RoutingCancelled):
+            raise
         except Exception:
             pass
 
@@ -1056,7 +1209,12 @@ def _objective_components(
     request: RouteRequest,
     scenic_route: Route,
     baseline_route: Route | None,
+    *,
+    deadline: RoutingDeadline | None = None,
 ) -> dict[str, Any]:
+    if deadline is not None:
+        deadline.check()
+
     scenic_duration = float(scenic_route.estimated_duration_minutes)
     scenic_raw = float(scenic_route.average_scenic_score)
     fastest_duration = (
@@ -1095,18 +1253,17 @@ def _objective_components(
         if absolute_delta is not None and baseline_raw != 0.0
         else None
     )
-    scenic_edges = tuple(
-        _segment_identity(segment, i)
-        for i, segment in enumerate(scenic_route.segments)
-    )
-    baseline_edges = (
-        tuple(
-            _segment_identity(segment, i)
-            for i, segment in enumerate(baseline_route.segments)
-        )
-        if baseline_route is not None
-        else None
-    )
+    scenic_edges = []
+    for i, segment in enumerate(scenic_route.segments):
+        _maybe_check_deadline(deadline, i, interval=64)
+        scenic_edges.append(_segment_identity(segment, i))
+    scenic_edges = tuple(scenic_edges)
+    baseline_edges = []
+    if baseline_route is not None:
+        for i, segment in enumerate(baseline_route.segments):
+            _maybe_check_deadline(deadline, i, interval=64)
+            baseline_edges.append(_segment_identity(segment, i))
+    baseline_edges = tuple(baseline_edges) if baseline_edges else None
     same_route = baseline_edges is not None and scenic_edges == baseline_edges
     no_better_reason = None
     certified = bool(getattr(scenic_route, "exact", False)) or (
@@ -1146,8 +1303,15 @@ def _objective_components(
     }
 
 
-def plan_routes(request: RouteRequest) -> dict[str, Any]:
+def plan_routes(
+    request: RouteRequest,
+    *,
+    deadline: RoutingDeadline | None = None,
+) -> dict[str, Any]:
     started_at = perf_counter()
+    if deadline is not None:
+        deadline.check()
+
     graph_path = Path(request.graph_geojson)
     if not graph_path.exists():
         raise FileNotFoundError(f"Graph GeoJSON not found: {graph_path}")
@@ -1186,7 +1350,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
             tile_path_key,
             tile_signature,
             tile_score_cache_hit,
-        ) = _load_cached_tile_scores(score_path)
+        ) = _load_cached_tile_scores(score_path, deadline=deadline)
         tile_score_load_elapsed_ms = (perf_counter() - tile_load_started) * 1000.0
         zoom = (
             request.tile_score_zoom
@@ -1220,6 +1384,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
     graph, graph_path_key, graph_signature, graph_cache_hit = _load_cached_graph(
         graph_path,
         scored_cache_key=scored_cache_key,
+        deadline=deadline,
     )
     graph_load_elapsed_ms = (perf_counter() - graph_load_started) * 1000.0
     score_mapping["graph_signature"] = _signature_digest(
@@ -1241,6 +1406,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
             score_map=score_map,
             zoom=zoom,
             fallback=fallback,
+            deadline=deadline,
         )
         score_application_elapsed_ms = (
             perf_counter() - score_application_started
@@ -1264,7 +1430,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
             "matched_ratio": float(matched / max(total, 1)),
         }
 
-    snap_diagnostics = _endpoint_snap_diagnostics(graph, request)
+    snap_diagnostics = _endpoint_snap_diagnostics(graph, request, deadline=deadline)
     max_snap_distance_km = request.max_snap_distance_km
     if max_snap_distance_km is not None:
         for endpoint in ("start", "end"):
@@ -1323,6 +1489,9 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
         "score_application_elapsed_ms": score_application_elapsed_ms,
     }
 
+    if deadline is not None:
+        deadline.check()
+
     frontier_time_limit_seconds = _frontier_time_limit_from_env()
     if frontier_time_limit_seconds is None:
         planner = ScenicRoutePlanner(graph=graph)
@@ -1338,6 +1507,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
         avoid_highways=request.avoid_highways,
         max_detour_factor=request.max_detour_factor,
         scenic_priority=True,
+        deadline=deadline,
     )
 
     baseline_route: Route | None = None
@@ -1347,9 +1517,13 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
             start=request.start,
             end=request.end,
             avoid_highways=request.avoid_highways,
+            deadline=deadline,
         )
 
-    objective = _objective_components(request, scenic_route, baseline_route)
+    if deadline is not None:
+        deadline.check()
+
+    objective = _objective_components(request, scenic_route, baseline_route, deadline=deadline)
     scenic_feature = route_to_feature(
         scenic_route,
         "scenic",
@@ -1357,6 +1531,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
         score_provenance=score_mapping,
         requested_start=request.start,
         requested_end=request.end,
+        deadline=deadline,
     )
     features = [scenic_feature]
     routes = [{"route_kind": "scenic", "metrics": scenic_feature["properties"]}]
@@ -1388,6 +1563,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
             score_provenance=score_mapping,
             requested_start=request.start,
             requested_end=request.end,
+            deadline=deadline,
         )
         features.append(baseline_feature)
         routes.append(
@@ -1445,7 +1621,7 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
             "scenic_score_delta_relative": objective["scenic_score_delta_relative"],
             "same_route": objective["same_route"],
             "no_better_route_reason": objective["no_better_route_reason"],
-            "hard_highway_count": _route_highway_count(scenic_route),
+            "hard_highway_count": _route_highway_count(scenic_route, deadline=deadline),
             "exactness_status": getattr(
                 scenic_route, "exactness_status", "unknown"
             ),
@@ -1455,6 +1631,8 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
         getattr(scenic_route, "search_diagnostics", None)
     )
     diagnostics["planning_elapsed_ms"] = (perf_counter() - started_at) * 1000.0
+    if deadline is not None:
+        deadline.check()
     return {
         "request": request.to_dict(),
         "diagnostics": diagnostics,
