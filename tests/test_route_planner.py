@@ -813,6 +813,193 @@ def test_nearest_node_ties_keep_node_insertion_order() -> None:
 
     assert graph.find_nearest_node(42.0, -71.0).id == "first"
 
+
+def test_nearest_node_cancellation_before_work_preserves_exception_and_cache() -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="node", lat=42.0, lon=-72.0))
+    error = RuntimeError("cancelled")
+
+    def check_cancelled() -> None:
+        raise error
+
+    with pytest.raises(RuntimeError) as raised:
+        graph.find_nearest_node(42.0, -72.0, check_cancelled=check_cancelled)
+
+    assert raised.value is error
+    assert graph._nearest_spatial_index is None
+
+
+def test_nearest_index_build_cancellation_does_not_publish_partial_cache() -> None:
+    graph = RoadGraph()
+    for index in range(2048):
+        graph.add_node(Node(id=f"node-{index}", lat=float(index), lon=float(index)))
+    error = RuntimeError("cancelled")
+    calls = 0
+
+    def check_cancelled() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 5:
+            raise error
+
+    with pytest.raises(RuntimeError) as raised:
+        graph.find_nearest_node_with_distance(
+            0.0,
+            0.0,
+            check_cancelled=check_cancelled,
+        )
+
+    assert raised.value is error
+    assert graph._nearest_spatial_index is None
+    assert graph.find_nearest_node(0.0, 0.0).id == "node-0"
+    assert graph._nearest_spatial_index is not None
+
+
+def test_nearest_edge_projection_cancellation_before_work_preserves_exception() -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="a", lat=0.0, lon=0.0))
+    graph.add_node(Node(id="b", lat=0.0, lon=1.0))
+    graph.add_edge(
+        Edge(
+            id="ab",
+            start_node_id="a",
+            end_node_id="b",
+            distance_km=1.0,
+            scenic_score=5.0,
+        )
+    )
+    error = RuntimeError("cancelled")
+
+    def check_cancelled() -> None:
+        raise error
+
+    with pytest.raises(RuntimeError) as raised:
+        graph.find_nearest_edge_positions_with_distance(
+            0.0,
+            0.5,
+            check_cancelled=check_cancelled,
+        )
+
+    assert raised.value is error
+    assert graph._nearest_edge_projection_index is None
+
+
+def test_nearest_edge_index_build_cancellation_does_not_publish_partial_cache() -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="a", lat=0.0, lon=0.0))
+    graph.add_node(Node(id="b", lat=0.0, lon=1.0))
+    for index in range(2048):
+        graph.add_edge(
+            Edge(
+                id=f"edge-{index}",
+                start_node_id="a",
+                end_node_id="b",
+                distance_km=1.0,
+                scenic_score=5.0,
+            )
+        )
+    error = RuntimeError("cancelled")
+    calls = 0
+
+    def check_cancelled() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            raise error
+
+    with pytest.raises(RuntimeError) as raised:
+        graph.find_nearest_edge_positions_with_distance(
+            0.0,
+            0.5,
+            check_cancelled=check_cancelled,
+        )
+
+    assert raised.value is error
+    assert graph._nearest_edge_projection_index is None
+    projections, distance = graph.find_nearest_edge_positions_with_distance(0.0, 0.5)
+    assert len(projections) == 2048
+    assert distance == pytest.approx(0.0)
+    assert graph._nearest_edge_projection_index is not None
+
+
+def test_nearest_edge_projection_cancellation_after_numpy_chunk_keeps_cache(
+    monkeypatch,
+) -> None:
+    import src.route_planner.graph as graph_module
+
+    graph = RoadGraph()
+    graph.add_node(Node(id="a", lat=0.0, lon=0.0))
+    graph.add_node(Node(id="b", lat=0.0, lon=1.0))
+    for index in range(4):
+        graph.add_edge(
+            Edge(
+                id=f"edge-{index}",
+                start_node_id="a",
+                end_node_id="b",
+                distance_km=1.0,
+                scenic_score=5.0,
+            )
+        )
+    graph.find_nearest_edge_positions_with_distance(0.0, 0.5)
+    cached_index = graph._nearest_edge_projection_index
+    original_chunk_size = graph_module._EDGE_PROJECTION_CHUNK_SIZE
+    monkeypatch.setattr(graph_module, "_EDGE_PROJECTION_CHUNK_SIZE", 2)
+    original_project = graph._project_edge_chunk
+    chunks = 0
+    error = RuntimeError("cancelled")
+
+    def project_chunk(*args, **kwargs):
+        nonlocal chunks
+        chunks += 1
+        return original_project(*args, **kwargs)
+
+    def check_cancelled() -> None:
+        if chunks >= 1:
+            raise error
+
+    monkeypatch.setattr(graph, "_project_edge_chunk", project_chunk)
+    with pytest.raises(RuntimeError) as raised:
+        graph.find_nearest_edge_positions_with_distance(
+            0.0,
+            0.5,
+            check_cancelled=check_cancelled,
+        )
+
+    assert raised.value is error
+    assert chunks == 1
+    assert graph._nearest_edge_projection_index is cached_index
+    assert original_chunk_size > 0
+
+
+def test_nearest_edge_projection_ties_remain_deterministic() -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="a", lat=0.0, lon=0.0))
+    graph.add_node(Node(id="b", lat=0.0, lon=1.0))
+    graph.add_edge(
+        Edge(
+            id="second",
+            start_node_id="a",
+            end_node_id="b",
+            distance_km=1.0,
+            scenic_score=5.0,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="first",
+            start_node_id="a",
+            end_node_id="b",
+            distance_km=1.0,
+            scenic_score=5.0,
+        )
+    )
+
+    projections, distance = graph.find_nearest_edge_positions_with_distance(0.0, 0.5)
+
+    assert [projection.edge.id for projection in projections] == ["first", "second"]
+    assert [projection.fraction for projection in projections] == [0.5, 0.5]
+    assert distance == pytest.approx(0.0)
+
 def test_nearest_node_kd_matches_seeded_bruteforce_with_duplicate_coordinates() -> None:
     rng = random.Random(20260710)
     graph = RoadGraph()

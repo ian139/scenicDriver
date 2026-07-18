@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import sqlite3
 import tempfile
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -18,6 +18,7 @@ import numpy as np
 _KD_SMALL_SUBTREE_CUTOFF = 32
 _EDGE_PROJECTION_CHUNK_SIZE = 65_536
 _EDGE_PROJECTION_TIE_TOLERANCE_KM = 1e-9
+_CANCELLATION_CHECK_INTERVAL = 1024
 
 
 class _NodeRow(msgspec.Struct):
@@ -305,8 +306,14 @@ class RoadGraph:
         self._nearest_edge_projection_index = None
 
 
-    def _build_nearest_edge_projection_index(self) -> Tuple[Any, ...]:
+    def _build_nearest_edge_projection_index(
+        self,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> Tuple[Any, ...]:
         """Build compact primitive arrays for canonical finite edge segments."""
+        if check_cancelled is not None:
+            check_cancelled()
         stamp = self._heuristic_cache_stamp()
         edge_ids: List[str] = []
         edge_keys: List[str] = []
@@ -317,7 +324,12 @@ class RoadGraph:
         end_longitudes: List[float] = []
         road_type_index: Dict[str, int] = {}
 
-        for edge_key, edge in self.edges.items():
+        for edge_index, (edge_key, edge) in enumerate(self.edges.items()):
+            if (
+                check_cancelled is not None
+                and edge_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+            ):
+                check_cancelled()
             start = self.nodes.get(edge.start_node_id)
             end = self.nodes.get(edge.end_node_id)
             if start is None or end is None:
@@ -347,7 +359,9 @@ class RoadGraph:
             end_latitudes.append(end_lat)
             end_longitudes.append(end_lon)
 
-        return (
+        if check_cancelled is not None:
+            check_cancelled()
+        index = (
             stamp,
             tuple(edge_ids),
             tuple(edge_keys),
@@ -358,6 +372,9 @@ class RoadGraph:
             np.asarray(end_latitudes, dtype=np.float64),
             np.asarray(end_longitudes, dtype=np.float64),
         )
+        if check_cancelled is not None:
+            check_cancelled()
+        return index
 
     @staticmethod
     def _project_edge_chunk(
@@ -406,6 +423,8 @@ class RoadGraph:
 
     def _build_nearest_spatial_index(
         self,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> Tuple[int, Tuple[str, ...], array, array, array, array, array, array]:
         """Build a compact balanced 2-D kd-tree over the current nodes.
 
@@ -413,10 +432,22 @@ class RoadGraph:
         index has two coordinate arrays and four integer arrays, plus a tuple
         of IDs; it does not create per-node wrapper objects.
         """
+        if check_cancelled is not None:
+            check_cancelled()
         coordinate_epoch = Node._coordinate_mutation_epoch
         node_ids = tuple(self.nodes)
-        latitudes = array("d", (self.nodes[node_id].lat for node_id in node_ids))
-        longitudes = array("d", (self.nodes[node_id].lon for node_id in node_ids))
+        if check_cancelled is not None:
+            check_cancelled()
+        latitudes = array("d")
+        longitudes = array("d")
+        for node_index, node_id in enumerate(node_ids):
+            if (
+                check_cancelled is not None
+                and node_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+            ):
+                check_cancelled()
+            latitudes.append(self.nodes[node_id].lat)
+            longitudes.append(self.nodes[node_id].lon)
         order = array("i", range(len(node_ids)))
         # NumPy views let partitioning reorder the existing rank buffer in C
         order_view = np.frombuffer(order, dtype=np.intc)
@@ -443,10 +474,22 @@ class RoadGraph:
             segment = order_view[lo:hi]
             # Indexing by ``segment`` creates only a temporary coordinate
             # copy; argpartition itself performs selection in NumPy's C loop.
+            if check_cancelled is not None:
+                check_cancelled()
             permutation = np.argpartition(values[segment], target - lo)
+            if check_cancelled is not None:
+                check_cancelled()
             segment[:] = segment[permutation]
 
+        build_calls = 0
+
         def build(lo: int, hi: int, depth: int) -> int:
+            nonlocal build_calls
+            if check_cancelled is not None and build_calls & (
+                _CANCELLATION_CHECK_INTERVAL - 1
+            ) == 0:
+                check_cancelled()
+            build_calls += 1
             if lo >= hi:
                 return -1
             axis = depth & 1
@@ -471,6 +514,8 @@ class RoadGraph:
             return position
 
         build(0, len(order), 0)
+        if check_cancelled is not None:
+            check_cancelled()
         return (
             coordinate_epoch,
             node_ids,
@@ -596,16 +641,40 @@ class RoadGraph:
             yield reverse_view
 
 
-    def find_nearest_node(self, lat: float, lon: float) -> Node:
-        return self.find_nearest_node_with_distance(lat, lon)[0]
+    def find_nearest_node(
+        self,
+        lat: float,
+        lon: float,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> Node:
+        if check_cancelled is not None:
+            check_cancelled()
+        return self.find_nearest_node_with_distance(
+            lat,
+            lon,
+            check_cancelled=check_cancelled,
+        )[0]
 
-    def find_nearest_node_with_distance(self, lat: float, lon: float) -> tuple[Node, float]:
+    def find_nearest_node_with_distance(
+        self,
+        lat: float,
+        lon: float,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> tuple[Node, float]:
+        if check_cancelled is not None:
+            check_cancelled()
         if not self.nodes:
             raise ValueError("Road graph has no nodes")
 
         index = self._nearest_spatial_index
         if index is None or index[0] != Node._coordinate_mutation_epoch:
-            index = self._build_nearest_spatial_index()
+            index = self._build_nearest_spatial_index(
+                check_cancelled=check_cancelled,
+            )
+            if check_cancelled is not None:
+                check_cancelled()
             self._nearest_spatial_index = index
         (
             _coordinate_epoch,
@@ -628,7 +697,14 @@ class RoadGraph:
         best_dist = float("inf")
         best_found = False
         stack: List[Tuple[int, int]] = [(0, 0)]
+        search_steps = 0
         while stack:
+            if (
+                check_cancelled is not None
+                and search_steps & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+            ):
+                check_cancelled()
+            search_steps += 1
             position, depth = stack.pop()
             if position < 0:
                 continue
@@ -665,8 +741,15 @@ class RoadGraph:
                 stack.append((near, depth + 1))
 
         assert best_found
+        if check_cancelled is not None:
+            check_cancelled()
         best = self.nodes[node_ids[best_rank]]
-        return best, _haversine_km(query_lat, query_lon, best.lat, best.lon)
+        if check_cancelled is not None:
+            check_cancelled()
+        snap_distance = _haversine_km(query_lat, query_lon, best.lat, best.lon)
+        if check_cancelled is not None:
+            check_cancelled()
+        return best, snap_distance
 
     def find_nearest_edge_positions_with_distance(
         self,
@@ -674,8 +757,11 @@ class RoadGraph:
         lon: float,
         *,
         excluded_road_types: frozenset = frozenset(),
+        check_cancelled: Callable[[], None] | None = None,
     ) -> tuple[list[EdgeProjection], float]:
         """Return canonical edge projections tied at the nearest segment."""
+        if check_cancelled is not None:
+            check_cancelled()
         query_lat = float(lat)
         query_lon = float(lon)
         if not math.isfinite(query_lat) or not math.isfinite(query_lon):
@@ -684,7 +770,11 @@ class RoadGraph:
         stamp = self._heuristic_cache_stamp()
         index = self._nearest_edge_projection_index
         if index is None or index[0] != stamp:
-            index = self._build_nearest_edge_projection_index()
+            index = self._build_nearest_edge_projection_index(
+                check_cancelled=check_cancelled,
+            )
+            if check_cancelled is not None:
+                check_cancelled()
             self._nearest_edge_projection_index = index
         (
             _stamp,
@@ -704,10 +794,14 @@ class RoadGraph:
             str(road_type).strip().lower()
             for road_type in (excluded_road_types or ())
         }
+        if check_cancelled is not None:
+            check_cancelled()
         allowed_types = np.asarray(
             [road_type not in excluded for road_type in road_type_names],
             dtype=np.bool_,
         )
+        if check_cancelled is not None:
+            check_cancelled()
         if not np.any(allowed_types):
             raise ValueError("Road graph has no eligible finite segment")
 
@@ -716,6 +810,8 @@ class RoadGraph:
         edge_count = len(edge_ids)
         for start in range(0, edge_count, _EDGE_PROJECTION_CHUNK_SIZE):
             stop = min(start + _EDGE_PROJECTION_CHUNK_SIZE, edge_count)
+            if check_cancelled is not None:
+                check_cancelled()
             _fractions, _projected_latitudes, _projected_longitudes, distances = (
                 self._project_edge_chunk(
                     query_lat,
@@ -729,6 +825,8 @@ class RoadGraph:
                     stop,
                 )
             )
+            if check_cancelled is not None:
+                check_cancelled()
             eligible = allowed_types[road_type_codes[start:stop]]
             finite = eligible & np.isfinite(distances)
             if np.any(finite):
@@ -741,6 +839,8 @@ class RoadGraph:
         projections: List[Tuple[str, str, EdgeProjection]] = []
         for start in range(0, edge_count, _EDGE_PROJECTION_CHUNK_SIZE):
             stop = min(start + _EDGE_PROJECTION_CHUNK_SIZE, edge_count)
+            if check_cancelled is not None:
+                check_cancelled()
             fractions, projected_latitudes, projected_longitudes, distances = (
                 self._project_edge_chunk(
                     query_lat,
@@ -754,9 +854,18 @@ class RoadGraph:
                     stop,
                 )
             )
+            if check_cancelled is not None:
+                check_cancelled()
             eligible = allowed_types[road_type_codes[start:stop]]
             tied = eligible & np.isfinite(distances) & (distances <= cutoff)
-            for local_index in np.flatnonzero(tied):
+            if check_cancelled is not None:
+                check_cancelled()
+            for projection_index, local_index in enumerate(np.flatnonzero(tied)):
+                if (
+                    check_cancelled is not None
+                    and projection_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+                ):
+                    check_cancelled()
                 index_in_cache = start + int(local_index)
                 projections.append(
                     (
@@ -771,7 +880,11 @@ class RoadGraph:
                         ),
                     )
                 )
+        if check_cancelled is not None:
+            check_cancelled()
         projections.sort(key=lambda item: (item[0], item[1]))
+        if check_cancelled is not None:
+            check_cancelled()
         return [projection for _edge_id, _edge_key, projection in projections], best_distance
     def save(
         self,
