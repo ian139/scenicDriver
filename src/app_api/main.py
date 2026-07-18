@@ -13,7 +13,7 @@ import re
 import sys
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from scalar_fastapi import get_scalar_api_reference
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +36,10 @@ from src.route_planner.service import (
     preload_route_assets,
     validate_route_configuration,
 )
+from src.route_planner.supervisor import (
+    PreloadedRouteSupervisor,
+    SupervisorError,
+)
 
 from .contrib_repo import ContribRepo
 from .schemas import (
@@ -52,7 +56,16 @@ ROAD_GRAPHS_DIR = PROJECT_ROOT / "data/processed/road_graphs"
 RUNS_DIR = PROJECT_ROOT / "data/processed/heuristic_runs"
 MODEL_REGISTRY_PATH = PROJECT_ROOT / "data/processed/regression/model_registry.json"
 APP_REGIONS_PATH = PROJECT_ROOT / "config/app_regions.json"
+
 _LOGGER = logging.getLogger(__name__)
+
+
+def _plan_routes_worker(
+    deadline: RoutingDeadline, request: RouteRequest
+) -> dict[str, Any]:
+    """Run route planning in the persistent hard-stop worker."""
+    return plan_routes(request, deadline=deadline)
+
 
 _SAFE_REGION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SAFE_RUN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -471,6 +484,7 @@ def _preload_configured_route_assets(
 
 @asynccontextmanager
 async def _api_lifespan(app: FastAPI):
+    app.state.route_supervisor = None
     validate_route_configuration()
     mode = _route_preload_mode()
     if mode != "off":
@@ -489,7 +503,27 @@ async def _api_lifespan(app: FastAPI):
             mode,
         )
     app.state.route_preload_diagnostics = preload_diagnostics
-    yield
+    if mode != "off" and preload_diagnostics.get("loaded_regions"):
+        try:
+            app.state.route_supervisor = PreloadedRouteSupervisor.start(
+                preload_marker=preload_diagnostics,
+                default_deadline_seconds=None,
+                default_grace_seconds=0.5,
+            )
+        except SupervisorError:
+            if mode == "required":
+                raise
+            _LOGGER.exception(
+                "Route hard-stop supervisor unavailable; "
+                "using cooperative route planning fallback"
+            )
+    try:
+        yield
+    finally:
+        supervisor = app.state.route_supervisor
+        app.state.route_supervisor = None
+        if supervisor is not None:
+            supervisor.close()
 
 
 def _list_regions() -> list[dict[str, Any]]:
@@ -1585,7 +1619,9 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/v1/route/compare")
-    def route_compare(payload: RouteCompareRequest) -> dict[str, Any]:
+    def route_compare(
+        request: Request, payload: RouteCompareRequest
+    ) -> dict[str, Any]:
         configured = _app_region(payload.region)
         _safe_asset_name(payload.region, kind="region")
         try:
@@ -1629,10 +1665,25 @@ def create_app() -> FastAPI:
         )
         deadline = RoutingDeadline.after(_deadline_seconds_from_env())
         try:
-            result = plan_routes(req, deadline=deadline)
+            supervisor = getattr(request.app.state, "route_supervisor", None)
+            if supervisor is not None:
+                result = supervisor.run_job(
+                    _plan_routes_worker, req, deadline=deadline
+                )
+            else:
+                result = plan_routes(req, deadline=deadline)
             diagnostics, routes = _validate_route_contract(
                 result, request=req, deadline=deadline
             )
+        except SupervisorError as exc:
+            _LOGGER.error("Route planning supervisor unavailable: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "routing_supervisor_unavailable",
+                    "message": "The routing service is temporarily unavailable.",
+                },
+            ) from exc
         except RouteConfigurationError as exc:
             _LOGGER.error("Invalid route configuration: %s", exc)
             raise HTTPException(
