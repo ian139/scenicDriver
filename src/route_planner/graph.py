@@ -544,15 +544,24 @@ class RoadGraph:
         self,
         nodes: Iterable[_NodeRow],
         edges: Iterable[_EdgeRow],
+        *,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> tuple[bool, bool]:
         """Populate rows without firing mapping mutation hooks per item."""
+        if check_cancelled is not None:
+            check_cancelled()
         saw_nodes = False
         saw_edges = False
         # The graph is private to ``load`` until this method returns, so
         # normalize and insert directly.  Base-dict calls bypass per-row
         # nearest-index/heuristic hooks while preserving normal dict order and
         # add_node's duplicate overwrite behavior.
-        for row in nodes:
+        for node_index, row in enumerate(nodes):
+            if (
+                check_cancelled is not None
+                and node_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+            ):
+                check_cancelled()
             saw_nodes = True
             node_id = str(row.id)
             dict.__setitem__(
@@ -566,8 +575,14 @@ class RoadGraph:
             )
             self.adjacency.setdefault(node_id, [])
 
-        for row in edges:
-            saw_edges = True
+        if check_cancelled is not None:
+            check_cancelled()
+        for edge_index, row in enumerate(edges):
+            if (
+                check_cancelled is not None
+                and edge_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+            ):
+                check_cancelled()
             edge_id = str(row.id)
             start_node_id = str(row.start_node_id)
             end_node_id = str(row.end_node_id)
@@ -597,10 +612,14 @@ class RoadGraph:
             if not edge.one_way:
                 self.adjacency.setdefault(end_node_id, []).append((edge_id, True))
 
+        if check_cancelled is not None:
+            check_cancelled()
         if saw_nodes:
             self._invalidate_nearest_spatial_index()
         if saw_nodes or saw_edges:
             self._advance_heuristic_epoch()
+        if check_cancelled is not None:
+            check_cancelled()
         return saw_nodes, saw_edges
 
     def get_node(self, node_id: str) -> Node:
@@ -928,21 +947,50 @@ class RoadGraph:
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     @classmethod
-    def load(cls, path: Path) -> "RoadGraph":
+    def load(
+        cls,
+        path: Path,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> "RoadGraph":
+        if check_cancelled is not None:
+            check_cancelled()
         path = Path(path)
+        if check_cancelled is not None:
+            check_cancelled()
         if path.suffix.lower() == ".sqlite3":
-            return _load_sqlite_graph(path)
+            return _load_sqlite_graph(path, check_cancelled=check_cancelled)
         # Decode bytes directly into compact typed rows.  This avoids a
         # temporary dict for every node and edge while retaining the legacy
         # JSON object/array schema.
-        rows = msgspec.json.decode(path.read_bytes(), type=_GraphRows, strict=True)
+        if check_cancelled is not None:
+            check_cancelled()
+        payload = path.read_bytes()
+        if check_cancelled is not None:
+            check_cancelled()
+        rows = msgspec.json.decode(payload, type=_GraphRows, strict=True)
+        if check_cancelled is not None:
+            check_cancelled()
         graph = cls()
-        graph._bulk_load(rows.nodes, rows.edges)
+        graph._bulk_load(rows.nodes, rows.edges, check_cancelled=check_cancelled)
+        if check_cancelled is not None:
+            check_cancelled()
         return graph
-
     @classmethod
-    def from_geojson(cls, path: Path) -> "RoadGraph":
-        data = json.loads(path.read_text(encoding="utf-8"))
+    def from_geojson(
+        cls,
+        path: Path,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> "RoadGraph":
+        if check_cancelled is not None:
+            check_cancelled()
+        raw = path.read_text(encoding="utf-8")
+        if check_cancelled is not None:
+            check_cancelled()
+        data = json.loads(raw)
+        if check_cancelled is not None:
+            check_cancelled()
         if data.get("type") != "FeatureCollection":
             raise ValueError("GeoJSON must be a FeatureCollection")
 
@@ -958,8 +1006,12 @@ class RoadGraph:
             node_index[key] = nid
             graph.add_node(Node(id=nid, lat=float(lat), lon=float(lon)))
             return nid
-
-        for feat in data.get("features", []):
+        for feature_index, feat in enumerate(data.get("features", [])):
+            if (
+                check_cancelled is not None
+                and feature_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+            ):
+                check_cancelled()
             geom = feat.get("geometry", {}) or {}
             if geom.get("type") != "LineString":
                 continue
@@ -976,8 +1028,12 @@ class RoadGraph:
             one_way = _parse_one_way(props.get("one_way", props.get("oneway")), default=True)
             if "bidirectional" in props:
                 one_way = not _parse_bool(props.get("bidirectional"), default=False)
-
-            for idx in range(len(coords) - 1):
+            for segment_index, idx in enumerate(range(len(coords) - 1)):
+                if (
+                    check_cancelled is not None
+                    and segment_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+                ):
+                    check_cancelled()
                 lon1, lat1 = coords[idx]
                 lon2, lat2 = coords[idx + 1]
                 start = node_id(lat1, lon1)
@@ -998,9 +1054,10 @@ class RoadGraph:
                         one_way=one_way,
                     )
                 )
-
         if not graph.nodes or not graph.edges:
             raise ValueError(f"No usable LineString edges found in {path}")
+        if check_cancelled is not None:
+            check_cancelled()
         return graph
 
     @classmethod
@@ -1407,13 +1464,28 @@ def _write_sqlite_graph(
     return node_count, edge_count
 
 
-def _sqlite_metadata(connection: sqlite3.Connection) -> dict[str, Any]:
+def _sqlite_metadata(
+    connection: sqlite3.Connection,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    if check_cancelled is not None:
+        check_cancelled()
     try:
+        if check_cancelled is not None:
+            check_cancelled()
         rows = connection.execute("SELECT key, value FROM metadata").fetchall()
+        if check_cancelled is not None:
+            check_cancelled()
     except sqlite3.DatabaseError as exc:
         raise ValueError("SQLite graph metadata table is unavailable") from exc
     metadata: dict[str, Any] = {}
-    for key, value in rows:
+    for row_index, (key, value) in enumerate(rows):
+        if (
+            check_cancelled is not None
+            and row_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+        ):
+            check_cancelled()
         if not isinstance(key, str) or key in metadata:
             raise ValueError("SQLite graph metadata contains duplicate keys")
         try:
@@ -1431,18 +1503,42 @@ def _sqlite_metadata(connection: sqlite3.Connection) -> dict[str, Any]:
         )
     return metadata
 
-
-def _iter_sqlite_nodes(connection: sqlite3.Connection) -> Iterator[_NodeRow]:
+def _iter_sqlite_nodes(
+    connection: sqlite3.Connection,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> Iterator[_NodeRow]:
+    if check_cancelled is not None:
+        check_cancelled()
     cursor = connection.execute("SELECT id, lat, lon FROM nodes ORDER BY rowid")
+    if check_cancelled is not None:
+        check_cancelled()
+    row_index = 0
     while True:
+        if check_cancelled is not None:
+            check_cancelled()
         batch = cursor.fetchmany(_SQLITE_BATCH_SIZE)
+        if check_cancelled is not None:
+            check_cancelled()
         if not batch:
             return
         for node_id, lat, lon in batch:
+            if (
+                check_cancelled is not None
+                and row_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+            ):
+                check_cancelled()
+            row_index += 1
             yield _NodeRow(id=node_id, lat=lat, lon=lon)
 
 
-def _iter_sqlite_edges(connection: sqlite3.Connection) -> Iterator[_EdgeRow]:
+def _iter_sqlite_edges(
+    connection: sqlite3.Connection,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> Iterator[_EdgeRow]:
+    if check_cancelled is not None:
+        check_cancelled()
     cursor = connection.execute(
         """
         SELECT id, start_node_id, end_node_id, distance_km,
@@ -1451,11 +1547,24 @@ def _iter_sqlite_edges(connection: sqlite3.Connection) -> Iterator[_EdgeRow]:
         ORDER BY rowid
         """
     )
+    if check_cancelled is not None:
+        check_cancelled()
+    row_index = 0
     while True:
+        if check_cancelled is not None:
+            check_cancelled()
         batch = cursor.fetchmany(_SQLITE_BATCH_SIZE)
+        if check_cancelled is not None:
+            check_cancelled()
         if not batch:
             return
         for row in batch:
+            if (
+                check_cancelled is not None
+                and row_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+            ):
+                check_cancelled()
+            row_index += 1
             yield _EdgeRow(
                 id=row[0],
                 start_node_id=row[1],
@@ -1469,24 +1578,41 @@ def _iter_sqlite_edges(connection: sqlite3.Connection) -> Iterator[_EdgeRow]:
             )
 
 
-def _load_sqlite_graph(path: Path) -> RoadGraph:
+def _load_sqlite_graph(
+    path: Path,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> RoadGraph:
     from urllib.parse import quote
 
+    if check_cancelled is not None:
+        check_cancelled()
     resolved = Path(path).expanduser().resolve()
     uri = f"file:{quote(str(resolved), safe='/')}?mode=ro"
     try:
+        if check_cancelled is not None:
+            check_cancelled()
         connection = sqlite3.connect(uri, uri=True)
+        if check_cancelled is not None:
+            check_cancelled()
     except sqlite3.DatabaseError as exc:
         raise ValueError(f"Invalid SQLite road graph: {path}") from exc
     try:
+        if check_cancelled is not None:
+            check_cancelled()
         connection.execute("PRAGMA query_only=ON")
-        metadata = _sqlite_metadata(connection)
+        if check_cancelled is not None:
+            check_cancelled()
+        metadata = _sqlite_metadata(connection, check_cancelled=check_cancelled)
         graph = RoadGraph()
         graph._bulk_load(
-            _iter_sqlite_nodes(connection),
-            _iter_sqlite_edges(connection),
+            _iter_sqlite_nodes(connection, check_cancelled=check_cancelled),
+            _iter_sqlite_edges(connection, check_cancelled=check_cancelled),
+            check_cancelled=check_cancelled,
         )
         graph.artifact_metadata = metadata
+        if check_cancelled is not None:
+            check_cancelled()
         return graph
     except sqlite3.DatabaseError as exc:
         raise ValueError(f"Invalid SQLite road graph: {path}") from exc

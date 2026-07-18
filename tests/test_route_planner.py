@@ -271,6 +271,90 @@ def test_geojson_bidirectional_override(tmp_path: Path) -> None:
     assert len(start_edges) == 1
     assert len(end_edges) == 1
 
+
+
+def test_graph_load_cancellation_before_file_decode_preserves_exception(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "graph.json"
+    path.write_text(json.dumps({"nodes": [], "edges": []}), encoding="utf-8")
+    error = RuntimeError("cancelled")
+
+    def check_cancelled() -> None:
+        raise error
+
+    with pytest.raises(RuntimeError) as raised:
+        RoadGraph.load(path, check_cancelled=check_cancelled)
+    assert raised.value is error
+
+    with pytest.raises(RuntimeError) as raised:
+        RoadGraph.from_geojson(path, check_cancelled=check_cancelled)
+    assert raised.value is error
+
+
+def test_geojson_load_mid_build_cancellation_returns_no_partial_graph(
+    tmp_path: Path,
+) -> None:
+    coordinates = [[float(index), float(index)] for index in range(2049)]
+    payload = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {"type": "LineString", "coordinates": coordinates},
+            }
+        ],
+    }
+    path = tmp_path / "large.geojson"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    error = RuntimeError("cancelled")
+    calls = 0
+
+    def check_cancelled() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 7:
+            raise error
+
+    with pytest.raises(RuntimeError) as raised:
+        RoadGraph.from_geojson(path, check_cancelled=check_cancelled)
+
+    assert raised.value is error
+    assert calls == 7
+
+
+def test_sqlite_load_mid_build_cancellation_returns_no_partial_graph(
+    tmp_path: Path,
+) -> None:
+    source = RoadGraph()
+    for index in range(2048):
+        source.add_node(Node(id=f"node-{index}", lat=float(index), lon=float(index)))
+    source.add_edge(
+        Edge(
+            id="edge",
+            start_node_id="node-0",
+            end_node_id="node-1",
+            distance_km=1.0,
+            scenic_score=5.0,
+        )
+    )
+    path = tmp_path / "large.sqlite3"
+    source.save(path)
+    error = RuntimeError("cancelled")
+    calls = 0
+
+    def check_cancelled() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 18:
+            raise error
+
+    with pytest.raises(RuntimeError) as raised:
+        RoadGraph.load(path, check_cancelled=check_cancelled)
+
+    assert raised.value is error
+    assert calls == 18
 def test_constrained_search_keeps_feasible_pareto_label() -> None:
     """A cheap long label can reach X but becomes infeasible only on its final edge."""
     graph = RoadGraph()
