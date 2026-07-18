@@ -4,9 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from threading import Event
 import time
-from typing import Callable
+from typing import Callable, Protocol, runtime_checkable
+
+
+@runtime_checkable
+class CancelToken(Protocol):
+    """Minimal protocol for anything that can report cancellation."""
+
+    def is_set(self) -> bool:
+        ...
 
 
 class RoutingCancelled(RuntimeError):
@@ -16,13 +23,12 @@ class RoutingCancelled(RuntimeError):
 class RoutingTimeout(TimeoutError):
     """Raised when a routing request exhausts its monotonic deadline."""
 
-
 @dataclass(frozen=True, slots=True)
 class RoutingDeadline:
     """One absolute monotonic deadline shared by every routing stage."""
 
     expires_at: float | None = None
-    cancel_event: Event | None = None
+    cancel_event: CancelToken | None = None
     clock: Callable[[], float] = time.monotonic
 
     @classmethod
@@ -30,7 +36,7 @@ class RoutingDeadline:
         cls,
         seconds: float | None,
         *,
-        cancel_event: Event | None = None,
+        cancel_event: CancelToken | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> "RoutingDeadline":
         if seconds is None:

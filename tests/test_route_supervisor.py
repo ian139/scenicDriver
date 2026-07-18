@@ -3,12 +3,17 @@ from __future__ import annotations
 import multiprocessing
 import os
 import signal
+import threading
 import time
 from typing import Any
 
 import pytest
 
-from src.route_planner.cancellation import RoutingDeadline, RoutingTimeout
+from src.route_planner.cancellation import (
+    RoutingCancelled,
+    RoutingDeadline,
+    RoutingTimeout,
+)
 from src.route_planner import supervisor as supervisor_module
 from src.route_planner.supervisor import (
     PreloadedRouteSupervisor,
@@ -84,6 +89,31 @@ def _job_large_response(deadline) -> bytes:
 def _job_large_response_with_deadline(deadline, prefix: str) -> dict:
     # Return a large payload nested in a dict to exercise pickle framing.
     return {"prefix": prefix, "payload": b"y" * _LARGE_PAYLOAD_SIZE}
+
+
+def _job_uncooperative_until_cancelled(deadline) -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    while deadline.cancel_event is None or not deadline.cancel_event.is_set():
+        time.sleep(0.02)
+
+
+def _job_late_success(deadline) -> str:
+    # Ignore SIGTERM so the supervisor has to hard-stop or reject the late result.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    remaining = deadline.remaining_seconds()
+    if remaining is not None:
+        time.sleep(remaining + 0.1)
+    return "late"
+
+
+def _job_late_error(deadline) -> str:
+    # Return a non-timeout error after expires_at; the supervisor must still
+    # convert the late response to RoutingTimeout and dispose the worker.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    remaining = deadline.remaining_seconds()
+    if remaining is not None:
+        time.sleep(remaining + 0.1)
+    raise ValueError("this should not win over the deadline")
 
 
 def _wait_for_process_exit(pid: int, timeout: float = 2.0) -> None:
@@ -176,6 +206,78 @@ def test_deadline_and_deadline_seconds_are_mutually_exclusive() -> None:
                 deadline_seconds=5.0,
             )
 
+def test_cancellation_set_after_dispatch_stops_work_and_replaces_worker() -> None:
+    """A cancel_event set after dispatch is mirrored to the worker and supervisor."""
+    cancel_event = threading.Event()
+    deadline = RoutingDeadline.after(10.0, cancel_event=cancel_event)
+
+    with PreloadedRouteSupervisor.start() as sup:
+        pid1 = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+
+        def _trigger() -> None:
+            time.sleep(0.1)
+            cancel_event.set()
+
+        trigger = threading.Thread(target=_trigger)
+        trigger.start()
+        try:
+            with pytest.raises(RoutingCancelled, match="was cancelled") as exc_info:
+                sup.run_job(
+                    _job_uncooperative_until_cancelled,
+                    deadline=deadline,
+                    grace_seconds=0.5,
+                )
+        finally:
+            trigger.join(timeout=2.0)
+
+        # After cancellation the worker must be replaced; the next request still works.
+        result = sup.run_job(_job_success, "after-cancel", deadline_seconds=5.0)
+        pid2 = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+
+    assert result["token"] == "after-cancel"
+    assert pid1 != pid2
+
+    worker_pid = getattr(exc_info.value, "worker_pid", None)
+    assert worker_pid is not None
+    _wait_for_process_exit(worker_pid)
+
+
+def test_late_response_at_expiry_rejected() -> None:
+    """A success response received after expires_at must be rejected as a timeout."""
+    with PreloadedRouteSupervisor.start() as sup:
+        start = time.monotonic()
+        with pytest.raises(RoutingTimeout, match="deadline exceeded") as exc_info:
+            sup.run_job(
+                _job_late_success,
+                deadline_seconds=0.1,
+                grace_seconds=0.3,
+            )
+        elapsed = time.monotonic() - start
+
+    # Result arrives after expiry (0.1 + 0.1 sleep) but before hard kill (0.4).
+    assert 0.15 <= elapsed <= 0.35, f"unexpected elapsed {elapsed}"
+    worker_pid = getattr(exc_info.value, "worker_pid", None)
+    assert worker_pid is not None
+    _wait_for_process_exit(worker_pid)
+
+
+def test_late_non_timeout_error_still_becomes_timeout() -> None:
+    """A ValueError raised after expires_at must be overridden by RoutingTimeout."""
+    with PreloadedRouteSupervisor.start() as sup:
+        start = time.monotonic()
+        with pytest.raises(RoutingTimeout, match="deadline exceeded") as exc_info:
+            sup.run_job(
+                _job_late_error,
+                deadline_seconds=0.1,
+                grace_seconds=0.3,
+            )
+        elapsed = time.monotonic() - start
+
+    # The late error is discarded as a timeout; the worker is disposed.
+    assert 0.15 <= elapsed <= 0.35, f"unexpected elapsed {elapsed}"
+    worker_pid = getattr(exc_info.value, "worker_pid", None)
+    assert worker_pid is not None
+    _wait_for_process_exit(worker_pid)
 
 def test_uncooperative_child_hard_killed_within_bounded_wall_time() -> None:
     deadline_seconds = 0.1

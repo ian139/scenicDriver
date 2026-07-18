@@ -1,4 +1,5 @@
 from threading import Event
+from typing import Any
 
 import pytest
 import src.route_planner.planner as planner_module
@@ -8,10 +9,22 @@ from src.route_planner.graph import Edge, Node, RoadGraph
 from src.route_planner.planner import ScenicRoutePlanner
 
 from src.route_planner.cancellation import (
+    CancelToken,
     RoutingCancelled,
     RoutingDeadline,
     RoutingTimeout,
 )
+
+
+class _CustomCancelToken:
+    def __init__(self, value: bool = False) -> None:
+        self._value = value
+
+    def is_set(self) -> bool:
+        return self._value
+
+    def set(self) -> None:
+        self._value = True
 
 
 def test_deadline_rejects_already_expired_budget() -> None:
@@ -163,3 +176,15 @@ def test_path_scoring_stops_consuming_edges_after_cancellation() -> None:
         )
 
     assert consumed == 1_025
+def test_deadline_accepts_cancel_token_protocol() -> None:
+    token = _CustomCancelToken()
+    deadline = RoutingDeadline.after(10.0, cancel_event=token)
+    assert deadline.remaining_seconds() is not None
+    token.set()
+    with pytest.raises(RoutingCancelled, match="was cancelled"):
+        deadline.check()
+
+
+def test_cancel_token_protocol_is_runtime_checkable() -> None:
+    assert isinstance(_CustomCancelToken(), CancelToken)
+    assert not isinstance(object(), CancelToken)
