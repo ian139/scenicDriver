@@ -169,6 +169,7 @@ def test_deadline_object_exact_expiry_observed_by_worker() -> None:
     assert deadline.expires_at is not None
     assert child_now <= deadline.expires_at + budget
 
+
 def test_queued_delay_does_not_extend_deadline() -> None:
     """A RoutingDeadline passed before queue/IPC keeps its original budget."""
     budget = 0.5
@@ -188,6 +189,7 @@ def test_queued_delay_does_not_extend_deadline() -> None:
     assert child_expires == expected_expires
     assert child_expires - sent_at < budget
 
+
 def test_already_expired_deadline_fails_before_send() -> None:
     """Caller-side check rejects an expired deadline before any IPC."""
     deadline = RoutingDeadline(expires_at=time.monotonic() - 0.01)
@@ -205,6 +207,7 @@ def test_deadline_and_deadline_seconds_are_mutually_exclusive() -> None:
                 deadline=RoutingDeadline.after(5.0),
                 deadline_seconds=5.0,
             )
+
 
 def test_cancellation_set_after_dispatch_stops_work_and_replaces_worker() -> None:
     """A cancel_event set after dispatch is mirrored to the worker and supervisor."""
@@ -278,6 +281,65 @@ def test_late_non_timeout_error_still_becomes_timeout() -> None:
     worker_pid = getattr(exc_info.value, "worker_pid", None)
     assert worker_pid is not None
     _wait_for_process_exit(worker_pid)
+
+
+def test_parent_deadline_overrides_error_delayed_in_final_ipc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with PreloadedRouteSupervisor.start() as sup:
+        original_worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+        original_recv = supervisor_module._recv_object
+
+        def delayed_recv(conn: Any, timeout: float | None = None) -> Any:
+            result = original_recv(conn, timeout)
+            if isinstance(result, supervisor_module._JobResult):
+                time.sleep(0.08)
+            return result
+
+        monkeypatch.setattr(supervisor_module, "_recv_object", delayed_recv)
+        with pytest.raises(RoutingTimeout, match="deadline exceeded") as exc_info:
+            sup.run_job(
+                _job_raise_value_error,
+                "worker error must not win",
+                deadline_seconds=0.05,
+            )
+        replacement_worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+
+    discarded_worker_pid = getattr(exc_info.value, "worker_pid", None)
+    assert discarded_worker_pid == original_worker_pid
+    assert replacement_worker_pid != original_worker_pid
+    _wait_for_process_exit(original_worker_pid)
+
+
+def test_parent_cancellation_overrides_error_in_final_ipc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancel_event = threading.Event()
+    deadline = RoutingDeadline.after(5.0, cancel_event=cancel_event)
+    with PreloadedRouteSupervisor.start() as sup:
+        original_worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+        original_recv = supervisor_module._recv_object
+
+        def cancelling_recv(conn: Any, timeout: float | None = None) -> Any:
+            result = original_recv(conn, timeout)
+            if isinstance(result, supervisor_module._JobResult):
+                cancel_event.set()
+            return result
+
+        monkeypatch.setattr(supervisor_module, "_recv_object", cancelling_recv)
+        with pytest.raises(RoutingCancelled, match="was cancelled") as exc_info:
+            sup.run_job(
+                _job_raise_value_error,
+                "worker error must not win",
+                deadline=deadline,
+            )
+        replacement_worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+
+    discarded_worker_pid = getattr(exc_info.value, "worker_pid", None)
+    assert discarded_worker_pid == original_worker_pid
+    assert replacement_worker_pid != original_worker_pid
+    _wait_for_process_exit(original_worker_pid)
+
 
 def test_uncooperative_child_hard_killed_within_bounded_wall_time() -> None:
     deadline_seconds = 0.1

@@ -74,6 +74,16 @@ class _Stop:
 
 
 @dataclass(frozen=True)
+class _DiscardWorker:
+    pass
+
+
+@dataclass(frozen=True)
+class _Discarded:
+    pass
+
+
+@dataclass(frozen=True)
 class _Job:
     """Job sent from the caller to the supervisor."""
 
@@ -311,6 +321,7 @@ class _WorkerHandle:
             self._proc.join(timeout=1.0)
         self._shutdown_worker()
         return _JobResult(value=None, error=error, worker_pid=worker_pid)
+
     def run_job(self, job: _Job) -> _JobResult:
         """Forward a job to the persistent child and enforce its deadline."""
         self._ensure_worker()
@@ -425,6 +436,10 @@ def _supervisor_entry(
                 break
             if msg is None or isinstance(msg, _Stop):
                 break
+            if isinstance(msg, _DiscardWorker):
+                _send_object(cmd_conn, _Discarded())
+                worker.shutdown()
+                continue
             if isinstance(msg, _Job):
                 result = worker.run_job(msg)
                 _send_object(cmd_conn, result)
@@ -513,9 +528,7 @@ class PreloadedRouteSupervisor:
             if not cmd_parent.poll(timeout=start_timeout):
                 proc.terminate()
                 proc.join(timeout=5.0)
-                raise SupervisorError(
-                    "supervisor process did not become ready"
-                )
+                raise SupervisorError("supervisor process did not become ready")
             ready = _recv_object(cmd_parent)
             if not isinstance(ready, _Ready):
                 raise SupervisorError(
@@ -553,19 +566,20 @@ class PreloadedRouteSupervisor:
             return RoutingDeadline.after(float(effective_seconds))
         return RoutingDeadline()
 
-    def _check_parent_deadline(
-        self, parent_deadline: RoutingDeadline
-    ) -> None:
-        """Mirror a caller-side cancellation into the shared fork event.
+    def _discard_worker(self) -> None:
+        """Dispose the idle planning child before another job can start."""
+        try:
+            _send_object(self._cmd, _DiscardWorker())
+            response = _recv_object(self._cmd)
+        except (BrokenPipeError, EOFError, OSError) as exc:
+            raise SupervisorError(
+                "supervisor process closed while discarding worker"
+            ) from exc
+        if not isinstance(response, _Discarded):
+            raise SupervisorError(
+                f"unexpected discard response from supervisor: {response!r}"
+            )
 
-        Absolute expiry and hard-kill are enforced by the supervisor so the
-        parent does not override the supervisor's result and lose worker_pid.
-        """
-        if (
-            parent_deadline.cancel_event is not None
-            and parent_deadline.cancel_event.is_set()
-        ):
-            self._cancel_event.set()
     def run_job(
         self,
         func: Callable[..., Any],
@@ -633,9 +647,7 @@ class PreloadedRouteSupervisor:
             try:
                 _send_object(self._cmd, job)
             except (BrokenPipeError, EOFError, OSError) as exc:
-                raise SupervisorError(
-                    "supervisor process closed unexpectedly"
-                ) from exc
+                raise SupervisorError("supervisor process closed unexpectedly") from exc
 
             while True:
                 # Propagate a caller-side cancellation to the supervisor; let
@@ -657,21 +669,24 @@ class PreloadedRouteSupervisor:
                         "supervisor process closed unexpectedly"
                     ) from exc
 
-        if not isinstance(result, _JobResult):
-            raise SupervisorError(
-                f"unexpected result from supervisor: {result!r}"
-            )
-        if result.error is not None:
-            if result.worker_pid is not None:
-                result.error.worker_pid = result.worker_pid  # type: ignore[attr-defined]
-            raise result.error
-
-        # Success path: verify the caller's deadline has not been exceeded while
-        # we were waiting, in case the response crossed expires_at without the
-        # supervisor detecting it (e.g. a non-deadline-aware job).
-        parent_deadline.check()
-        return result.value
-
+            if not isinstance(result, _JobResult):
+                raise SupervisorError(f"unexpected result from supervisor: {result!r}")
+            if isinstance(result.error, (RoutingCancelled, RoutingTimeout)):
+                if result.worker_pid is not None:
+                    result.error.worker_pid = result.worker_pid  # type: ignore[attr-defined]
+                raise result.error
+            try:
+                parent_deadline.check()
+            except (RoutingCancelled, RoutingTimeout) as exc:
+                if result.worker_pid is not None:
+                    exc.worker_pid = result.worker_pid  # type: ignore[attr-defined]
+                self._discard_worker()
+                raise
+            if result.error is not None:
+                if result.worker_pid is not None:
+                    result.error.worker_pid = result.worker_pid  # type: ignore[attr-defined]
+                raise result.error
+            return result.value
 
     def health(self) -> dict[str, Any]:
         """Return a small health snapshot."""
