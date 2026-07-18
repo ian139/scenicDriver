@@ -199,3 +199,53 @@ def test_streamed_osm_rows_match_roadgraph_conversion(tmp_path: Path) -> None:
         assert loaded.road_type == edge.road_type
         assert loaded.one_way is edge.one_way
         assert actual.nodes[loaded.start_node_id].coords == expected.nodes[edge.start_node_id].coords
+
+
+def test_graph_replaced_during_load_marks_sidecar_stale(tmp_path: Path) -> None:
+    import os
+
+    from src.route_planner import graph as graph_module
+
+    path = tmp_path / "road_graph.sqlite3"
+    graph = _basic_graph()
+    graph.save(path)
+
+    replacement = tmp_path / "replacement.sqlite3"
+    replacement_graph = RoadGraph()
+    replacement_graph.add_node(Node(id="C", lat=10.0, lon=10.0))
+    replacement_graph.add_node(Node(id="D", lat=10.1, lon=10.0))
+    replacement_graph.add_edge(
+        Edge(
+            id="CD",
+            start_node_id="C",
+            end_node_id="D",
+            distance_km=12.0,
+            scenic_score=5.0,
+        )
+    )
+    replacement_graph.save(replacement)
+
+    original_stat = graph_module._path_identity(path.resolve())
+
+    def swap_after_read_identity(*args, **kwargs):
+        os.replace(replacement, path)
+        return original_stat
+
+    import unittest.mock as mock
+
+    with mock.patch.object(
+        graph_module, "_path_identity", side_effect=swap_after_read_identity
+    ):
+        loaded = RoadGraph.load(path)
+
+    assert loaded.edge_projection_index_status["state"] == "invalid"
+    assert (
+        loaded.edge_projection_index_status["invalid_reason"]
+        == "graph_replaced_during_load"
+    )
+    projections, _distance = loaded.find_nearest_edge_positions_with_distance(
+        10.05,
+        10.0,
+    )
+    assert [projection.edge.id for projection in projections] == ["CD"]
+    assert loaded.edge_projection_index_status["state"] == "rebuilt"

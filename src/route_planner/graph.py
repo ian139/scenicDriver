@@ -18,6 +18,7 @@ from ._edge_projection import (
     EdgeProjectionIndex,
     _EPI_VERSION,
     _SidecarCorruptError,
+    _SidecarCancellation,
     _SidecarMissingError,
     _SidecarStaleError,
     _SidecarTruncatedError,
@@ -323,10 +324,17 @@ class RoadGraph:
 
     def _invalidate_nearest_spatial_index(self) -> None:
         self._nearest_spatial_index = None
-        self._nearest_edge_projection_index = None
+        self._invalidate_nearest_edge_projection_index()
 
     def _invalidate_nearest_edge_projection_index(self) -> None:
+        if (
+            self._nearest_edge_projection_index is not None
+            or self._edge_projection_index_status in ("saved", "loaded", "memory")
+        ):
+            self._edge_projection_index_status = "stale"
+            self._edge_projection_index_invalid_reason = "graph_mutated"
         self._nearest_edge_projection_index = None
+        self._edge_projection_index_stamp = None
 
 
     def _build_nearest_edge_projection_index(
@@ -400,12 +408,17 @@ class RoadGraph:
         """Attempt a compatible sidecar load; fall back to lazy rebuild."""
         sidecar_path = EdgeProjectionIndex.sidecar_path(path)
         self._edge_projection_index_path = str(sidecar_path)
-        self._edge_projection_index_payload_size = (
-            sidecar_path.stat().st_size if sidecar_path.exists() else None
-        )
-        if not sidecar_path.exists():
+        try:
+            self._edge_projection_index_payload_size = sidecar_path.stat().st_size
+        except FileNotFoundError:
             self._edge_projection_index_status = "missing"
             self._edge_projection_index_invalid_reason = None
+            self._nearest_edge_projection_index = None
+            self._edge_projection_index_stamp = None
+            return self._edge_projection_index_status
+        except OSError as exc:
+            self._edge_projection_index_status = "corrupt"
+            self._edge_projection_index_invalid_reason = f"os_error: {exc}"
             self._nearest_edge_projection_index = None
             self._edge_projection_index_stamp = None
             return self._edge_projection_index_status
@@ -419,6 +432,8 @@ class RoadGraph:
             self._edge_projection_index_status = "loaded"
             self._edge_projection_index_invalid_reason = None
             self._edge_projection_index_payload_size = sidecar_path.stat().st_size
+        except _SidecarCancellation as exc:
+            raise exc.error
         except _SidecarMissingError:
             self._edge_projection_index_status = "missing"
             self._edge_projection_index_invalid_reason = "missing"
@@ -434,6 +449,11 @@ class RoadGraph:
         except _SidecarCorruptError:
             self._edge_projection_index_status = "corrupt"
             self._edge_projection_index_invalid_reason = "corrupt"
+        except ValueError as exc:
+            self._edge_projection_index_status = "corrupt"
+            self._edge_projection_index_invalid_reason = (
+                f"attachment_error: {exc}"
+            )
         except OSError as exc:
             self._edge_projection_index_status = "corrupt"
             self._edge_projection_index_invalid_reason = f"os_error: {exc}"
@@ -449,6 +469,12 @@ class RoadGraph:
     @property
     def edge_projection_index_status(self) -> Mapping[str, Any]:
         """Machine-readable sidecar status: state, path, version, algorithm, and health."""
+        if (
+            self._nearest_edge_projection_index is not None
+            and self._edge_projection_index_stamp
+            != self._edge_projection_stamp()
+        ):
+            self._invalidate_nearest_edge_projection_index()
         internal_state = self._edge_projection_index_status
         if internal_state in ("saved", "loaded"):
             state = "loaded"
@@ -473,7 +499,7 @@ class RoadGraph:
                 "state": state,
                 "path": path,
                 "format_version": _EPI_VERSION if index is not None else None,
-                "algorithm": "bvh-lat-lb" if index is not None else None,
+                "algorithm": "bvh-spherical-lb" if index is not None else None,
                 "mmap_read_only": (
                     index is not None and index._mmap is not None
                 ),
@@ -1763,6 +1789,17 @@ def _iter_sqlite_edges(
             )
 
 
+def _path_identity(path: Path) -> tuple[int, int, int, int, int]:
+    stat = path.stat()
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
 def _load_sqlite_graph(
     path: Path,
     *,
@@ -1773,6 +1810,7 @@ def _load_sqlite_graph(
     if check_cancelled is not None:
         check_cancelled()
     resolved = Path(path).expanduser().resolve()
+    initial_path_identity = _path_identity(resolved)
     uri = f"file:{quote(str(resolved), safe='/')}?mode=ro"
     try:
         if check_cancelled is not None:
@@ -1798,7 +1836,34 @@ def _load_sqlite_graph(
         graph.artifact_metadata = metadata
         if check_cancelled is not None:
             check_cancelled()
-        graph._try_load_edge_projection_index(path, check_cancelled=check_cancelled)
+        try:
+            current_path_identity = _path_identity(resolved)
+        except OSError:
+            current_path_identity = None
+        if current_path_identity == initial_path_identity:
+            graph._try_load_edge_projection_index(
+                resolved,
+                check_cancelled=check_cancelled,
+            )
+        else:
+            graph._edge_projection_index_path = str(
+                EdgeProjectionIndex.sidecar_path(resolved)
+            )
+            graph._edge_projection_index_status = "stale"
+            graph._edge_projection_index_invalid_reason = (
+                "graph_replaced_during_load"
+            )
+        try:
+            final_path_identity = _path_identity(resolved)
+        except OSError:
+            final_path_identity = None
+        if final_path_identity != initial_path_identity:
+            graph._nearest_edge_projection_index = None
+            graph._edge_projection_index_stamp = None
+            graph._edge_projection_index_status = "stale"
+            graph._edge_projection_index_invalid_reason = (
+                "graph_replaced_during_load"
+            )
         if check_cancelled is not None:
             check_cancelled()
         return graph

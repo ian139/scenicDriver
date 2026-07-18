@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import tempfile
-
 import hashlib
 import heapq
 import math
 import mmap
 import os
 import struct
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Tuple
@@ -80,12 +79,33 @@ class _SidecarCorruptError(_SidecarError):
     pass
 
 
+class _SidecarCancellation(BaseException):
+    """Carry a caller cancellation through corruption-recovery boundaries."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+
 def _normalize_road_type(raw: Any) -> str:
     if isinstance(raw, list) and raw:
         value = str(raw[0]).strip().lower()
     else:
         value = str(raw).strip().lower() if raw is not None else ""
     return value if value else "secondary"
+
+
+def _sha256_buffer(
+    payload: memoryview,
+    check_cancelled: Callable[[], None] | None = None,
+) -> bytes:
+    digest = hashlib.sha256()
+    for start in range(0, len(payload), 8 * 1024 * 1024):
+        if check_cancelled is not None:
+            check_cancelled()
+        digest.update(payload[start : start + 8 * 1024 * 1024])
+    if check_cancelled is not None:
+        check_cancelled()
+    return digest.digest()
 
 
 @dataclass(frozen=True)
@@ -95,6 +115,8 @@ class EdgeProjection:
     lat: float
     lon: float
     snap_distance_km: float
+
+
 class EdgeProjectionIndex:
     """Typed, immutable spatial index for nearest finite edge-segment queries."""
 
@@ -120,6 +142,7 @@ class EdgeProjectionIndex:
         "_mmap",
         "_file",
         "_canonical_keys",
+        "_canonical_keys_owner",
     )
 
     def __init__(
@@ -165,15 +188,21 @@ class EdgeProjectionIndex:
         self._mmap = mmap_ref
         self._file = file_ref
         self._canonical_keys: tuple[str, ...] | None = None
+        self._canonical_keys_owner: int | None = None
         self.total_edge_count = total_edge_count
 
     def attach(self, graph: Any) -> None:
-        """Bind the index to the graph's current canonical edge-key order."""
-        if self._canonical_keys is None:
-            self._canonical_keys = tuple(graph.edges)
-            if len(self._canonical_keys) != self.total_edge_count:
-                self._canonical_keys = None
-                raise ValueError("Graph edge count does not match sidecar total edge count")
+        """Bind once to the graph's canonical edge-key order."""
+        owner = id(graph)
+        if self._canonical_keys is not None:
+            if self._canonical_keys_owner != owner:
+                raise ValueError("Edge projection index is attached to another graph")
+            return
+        canonical_keys = tuple(graph.edges)
+        if len(canonical_keys) != self.total_edge_count:
+            raise ValueError("Graph edge count does not match sidecar total edge count")
+        self._canonical_keys = canonical_keys
+        self._canonical_keys_owner = owner
 
     @property
     def edge_count(self) -> int:
@@ -195,7 +224,7 @@ class EdgeProjectionIndex:
             check_cancelled()
 
         total_edge_count = len(graph.edges)
-        edge_ranks: list[int] = []
+        edge_rank_values: list[int] | np.ndarray = []
         road_type_codes: list[int] = []
         road_type_index: dict[str, int] = {}
         start_latitudes: list[float] = []
@@ -230,7 +259,7 @@ class EdgeProjectionIndex:
             if code is None:
                 code = len(road_type_index)
                 road_type_index[road_type] = code
-            edge_ranks.append(edge_index)
+            edge_rank_values.append(edge_index)
             road_type_codes.append(code)
             start_latitudes.append(start_lat)
             start_longitudes.append(start_lon)
@@ -240,8 +269,10 @@ class EdgeProjectionIndex:
         if check_cancelled is not None:
             check_cancelled()
 
-        if not edge_ranks:
-            return cls._empty(total_edge_count=total_edge_count)
+        if not edge_rank_values:
+            index = cls._empty(total_edge_count=total_edge_count)
+            index.attach(graph)
+            return index
 
         road_type_names = tuple(road_type_index.keys())
         codes = np.asarray(road_type_codes, dtype=np.int32)
@@ -250,7 +281,7 @@ class EdgeProjectionIndex:
         elat = np.asarray(end_latitudes, dtype=np.float64)
         elon = np.asarray(end_longitudes, dtype=np.float64)
 
-        order = np.arange(len(edge_ranks), dtype=np.int64)
+        order = np.arange(len(edge_rank_values), dtype=np.int64)
 
         bvh_min_lat: list[float] = []
         bvh_min_lon: list[float] = []
@@ -297,13 +328,38 @@ class EdgeProjectionIndex:
                 bvh_stop.append(hi)
                 return pos
 
-            axis = depth & 1
+            segment = order[lo:hi]
+            min_lat = min(
+                float(np.min(slat[segment])),
+                float(np.min(elat[segment])),
+            )
+            max_lat = max(
+                float(np.max(slat[segment])),
+                float(np.max(elat[segment])),
+            )
+            min_lon = min(
+                float(np.min(slon[segment])),
+                float(np.min(elon[segment])),
+            )
+            max_lon = max(
+                float(np.max(slon[segment])),
+                float(np.max(elon[segment])),
+            )
+            longitude_scale = max(
+                0.0,
+                math.cos(math.radians((min_lat + max_lat) * 0.5)),
+            )
+            axis = (
+                1
+                if (max_lon - min_lon) * longitude_scale
+                > max_lat - min_lat
+                else 0
+            )
             mid = (lo + hi) // 2
             if axis == 0:
-                # Split by latitude bbox center.
-                centers = (slat[order[lo:hi]] + elat[order[lo:hi]]) * 0.5
+                centers = (slat[segment] + elat[segment]) * 0.5
             else:
-                centers = (slon[order[lo:hi]] + elon[order[lo:hi]]) * 0.5
+                centers = (slon[segment] + elon[segment]) * 0.5
             kth = mid - lo
             permutation = np.argpartition(centers, kth)
             order[lo:hi] = order[lo:hi][permutation]
@@ -322,13 +378,13 @@ class EdgeProjectionIndex:
             bvh_stop.append(-1)
             return pos
 
-        root = build_bvh(0, len(edge_ranks), 0)
+        root = build_bvh(0, len(edge_rank_values), 0)
 
         if check_cancelled is not None:
             check_cancelled()
 
         # Reorder arrays to match the BVH edge order so leaf ranges are contiguous.
-        edge_ranks = np.asarray([edge_ranks[i] for i in order], dtype=np.int64)
+        edge_rank_values = np.asarray([edge_rank_values[i] for i in order], dtype=np.int64)  # type: ignore[assignment]
         codes = codes[order]
         slat = slat[order]
         slon = slon[order]
@@ -338,8 +394,8 @@ class EdgeProjectionIndex:
         if check_cancelled is not None:
             check_cancelled()
 
-        return cls(
-            edge_ranks=edge_ranks,
+        index = cls(
+            edge_ranks=edge_rank_values,
             total_edge_count=total_edge_count,
             road_type_names=road_type_names,
             road_type_codes=codes,
@@ -358,6 +414,8 @@ class EdgeProjectionIndex:
             leaf_size=_EDGE_PROJECTION_BVH_LEAF_SIZE,
             root_node=root,
         )
+        index.attach(graph)
+        return index
 
     @classmethod
     def _empty(cls, total_edge_count: int = 0) -> "EdgeProjectionIndex":
@@ -407,8 +465,12 @@ class EdgeProjectionIndex:
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
             np.divide(numerator, denominator, out=fractions, where=denominator > 0.0)
         np.clip(fractions, 0.0, 1.0, out=fractions)
-        projected_latitudes = start_lat + fractions * (end_latitudes[start:stop] - start_lat)
-        projected_longitudes = start_lon + fractions * (end_longitudes[start:stop] - start_lon)
+        projected_latitudes = start_lat + fractions * (
+            end_latitudes[start:stop] - start_lat
+        )
+        projected_longitudes = start_lon + fractions * (
+            end_longitudes[start:stop] - start_lon
+        )
 
         with np.errstate(over="ignore", invalid="ignore"):
             dlat = np.radians(projected_latitudes - query_lat)
@@ -425,14 +487,61 @@ class EdgeProjectionIndex:
             haversine *= 2.0 * _EARTH_RADIUS_KM
         return fractions, projected_latitudes, projected_longitudes, haversine
 
-    def _bvh_lower_bound(self, query_lat: float, query_lon: float, node: int) -> float:
-        """Certified spherical lower bound using latitude separation."""
-        min_lat = self.bvh_min_lat[node]
-        max_lat = self.bvh_max_lat[node]
-        if min_lat <= query_lat <= max_lat:
+    def _bvh_lower_bound(
+        self,
+        query_lat: float,
+        query_lon: float,
+        node: int,
+    ) -> float:
+        """Certified great-circle lower bound to a latitude/longitude box."""
+        min_lat = float(self.bvh_min_lat[node])
+        max_lat = float(self.bvh_max_lat[node])
+        min_lon = float(self.bvh_min_lon[node])
+        max_lon = float(self.bvh_max_lon[node])
+        if not (
+            -90.0 <= query_lat <= 90.0
+            and -90.0 <= min_lat <= max_lat <= 90.0
+        ):
             return 0.0
-        delta_deg = max(0.0, min_lat - query_lat, query_lat - max_lat)
-        return math.radians(delta_deg) * _EARTH_RADIUS_KM
+
+        latitude_delta = max(
+            0.0,
+            min_lat - query_lat,
+            query_lat - max_lat,
+        )
+        longitude_span = max_lon - min_lon
+        if longitude_span >= 360.0:
+            longitude_delta = 0.0
+        else:
+            center = min_lon + longitude_span * 0.5
+            normalized_delta = math.remainder(query_lon, 360.0)
+            normalized_delta -= math.remainder(center, 360.0)
+            shifted_query_lon = center + math.remainder(
+                normalized_delta,
+                360.0,
+            )
+            longitude_delta = max(
+                0.0,
+                min_lon - shifted_query_lon,
+                shifted_query_lon - max_lon,
+            )
+            longitude_delta = min(longitude_delta, 180.0)
+
+        latitude_term = math.sin(math.radians(latitude_delta) * 0.5) ** 2
+        minimum_box_cosine = min(
+            math.cos(math.radians(min_lat)),
+            math.cos(math.radians(max_lat)),
+        )
+        longitude_term = (
+            max(0.0, math.cos(math.radians(query_lat)) * minimum_box_cosine)
+            * math.sin(math.radians(longitude_delta) * 0.5) ** 2
+        )
+        haversine = min(1.0, max(0.0, latitude_term + longitude_term))
+        return (
+            2.0
+            * _EARTH_RADIUS_KM
+            * math.asin(math.sqrt(haversine))
+        )
 
     def query(
         self,
@@ -443,7 +552,10 @@ class EdgeProjectionIndex:
         *,
         check_cancelled: Callable[[], None] | None = None,
         with_stats: bool = False,
-    ) -> tuple[list[EdgeProjection], float] | tuple[tuple[list[EdgeProjection], float], dict[str, Any]]:
+    ) -> (
+        tuple[list[EdgeProjection], float]
+        | tuple[tuple[list[EdgeProjection], float], dict[str, Any]]
+    ):
         """Best-first BVH query; exact-refine leaves, apply exclusions, return ties."""
         if check_cancelled is not None:
             check_cancelled()
@@ -457,8 +569,7 @@ class EdgeProjectionIndex:
             raise ValueError("Road graph has no eligible finite segment")
 
         excluded = {
-            str(road_type).strip().lower()
-            for road_type in (excluded_road_types or ())
+            str(road_type).strip().lower() for road_type in (excluded_road_types or ())
         }
         allowed = np.asarray(
             [road_type not in excluded for road_type in self.road_type_names],
@@ -552,10 +663,8 @@ class EdgeProjectionIndex:
             raise ValueError("Road graph has no eligible finite segment")
 
         canonical_keys = self._canonical_keys
-        if canonical_keys is None:
-            canonical_keys = tuple(graph.edges)
-        if len(canonical_keys) != self.total_edge_count:
-            raise ValueError("Graph edge count does not match sidecar total edge count")
+        if canonical_keys is None or self._canonical_keys_owner != id(graph):
+            raise RuntimeError("Edge projection index is not attached to this graph")
 
         cutoff = best_distance + tol
         keyed_projections: list[tuple[tuple[str, str], EdgeProjection]] = []
@@ -597,9 +706,12 @@ class EdgeProjectionIndex:
             return (projections, best_distance), stats
         return projections, best_distance
 
-    def _write_sections(self) -> list[tuple[bytes, int, int, int, bytes]]:
-        """Pack all arrays into deterministic, little-endian, aligned sections."""
-        # Pack canonical edge ranks.
+    def _write_sections(
+        self,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> list[tuple[memoryview, int, int, int, bytes]]:
+        """Expose deterministic little-endian section buffers without copies."""
         type_data = b"".join(name.encode("utf-8") for name in self.road_type_names)
         type_offsets = np.empty(len(self.road_type_names) + 1, dtype=np.int64)
         offset = 0
@@ -608,64 +720,48 @@ class EdgeProjectionIndex:
             offset += len(name.encode("utf-8"))
         type_offsets[-1] = offset
 
-        def as_section(arr: np.ndarray, dtype_name: str) -> tuple[bytes, int, int, int, bytes]:
+        def as_section(
+            arr: np.ndarray,
+            dtype_name: str,
+        ) -> tuple[memoryview, int, int, int, bytes]:
             target = np.dtype(dtype_name)
             if arr.dtype != target:
                 arr = arr.astype(target)
             if not arr.flags.c_contiguous:
                 arr = np.ascontiguousarray(arr, dtype=target)
-            payload = arr.tobytes()
-            sha = hashlib.sha256(payload).digest()
+            payload = memoryview(bytes(arr)).cast("B")
             return (
                 payload,
                 len(payload),
                 int(arr.size),
                 _DTYPE_NAME_TO_CODE[dtype_name],
-                sha,
+                _sha256_buffer(payload, check_cancelled),
             )
 
-        s_codes = as_section(self.road_type_codes, "<i4")
-        s_slat = as_section(self.start_latitudes, "<f8")
-        s_slon = as_section(self.start_longitudes, "<f8")
-        s_elat = as_section(self.end_latitudes, "<f8")
-        s_elon = as_section(self.end_longitudes, "<f8")
-        s_min_lat = as_section(self.bvh_min_lat, "<f8")
-        s_min_lon = as_section(self.bvh_min_lon, "<f8")
-        s_max_lat = as_section(self.bvh_max_lat, "<f8")
-        s_max_lon = as_section(self.bvh_max_lon, "<f8")
-        s_left = as_section(self.bvh_left, "<i8")
-        s_right = as_section(self.bvh_right, "<i8")
-        s_start = as_section(self.bvh_start, "<i8")
-        s_stop = as_section(self.bvh_stop, "<i8")
-
-        s_ranks = as_section(self.edge_ranks, "<i8")
-        type_offsets_sec = as_section(type_offsets, "<i8")
-
-        raw_types = (
-            type_data,
-            len(type_data),
-            len(type_data),
-            0,
-            hashlib.sha256(type_data).digest(),
-        )
-
+        raw_types = memoryview(type_data)
         return [
-            s_ranks,
-            raw_types,
-            type_offsets_sec,
-            s_codes,
-            s_slat,
-            s_slon,
-            s_elat,
-            s_elon,
-            s_min_lat,
-            s_min_lon,
-            s_max_lat,
-            s_max_lon,
-            s_left,
-            s_right,
-            s_start,
-            s_stop,
+            as_section(self.edge_ranks, "<i8"),
+            (
+                raw_types,
+                len(raw_types),
+                len(raw_types),
+                0,
+                _sha256_buffer(raw_types, check_cancelled),
+            ),
+            as_section(type_offsets, "<i8"),
+            as_section(self.road_type_codes, "<i4"),
+            as_section(self.start_latitudes, "<f8"),
+            as_section(self.start_longitudes, "<f8"),
+            as_section(self.end_latitudes, "<f8"),
+            as_section(self.end_longitudes, "<f8"),
+            as_section(self.bvh_min_lat, "<f8"),
+            as_section(self.bvh_min_lon, "<f8"),
+            as_section(self.bvh_max_lat, "<f8"),
+            as_section(self.bvh_max_lon, "<f8"),
+            as_section(self.bvh_left, "<i8"),
+            as_section(self.bvh_right, "<i8"),
+            as_section(self.bvh_start, "<i8"),
+            as_section(self.bvh_stop, "<i8"),
         ]
 
     @staticmethod
@@ -704,7 +800,7 @@ class EdgeProjectionIndex:
         if check_cancelled is not None:
             check_cancelled()
 
-        descriptors = index._write_sections()
+        descriptors = index._write_sections(check_cancelled=check_cancelled)
         if check_cancelled is not None:
             check_cancelled()
 
@@ -716,9 +812,7 @@ class EdgeProjectionIndex:
         final_descriptors: list[tuple[int, int, int, int, bytes]] = []
         for payload, size, count, dtype_code, sha in descriptors:
             desc_size = cls._aligned_size(size)
-            final_descriptors.append(
-                (current_offset, size, count, dtype_code, sha)
-            )
+            final_descriptors.append((current_offset, size, count, dtype_code, sha))
             current_offset += desc_size
 
         buffer = bytearray()
@@ -750,24 +844,36 @@ class EdgeProjectionIndex:
             )
         buffer.extend(b"\x00" * (header_size - len(buffer)))
 
-        for payload, _size, _count, _dtype, _sha in descriptors:
-            buffer.extend(payload)
-            padding = cls._aligned_size(len(payload)) - len(payload)
-            buffer.extend(b"\x00" * padding)
-
         file_descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{sidecar_path.name}.",
             suffix=".tmp",
             dir=sidecar_path.parent,
         )
-        os.close(file_descriptor)
         temporary_path = Path(temporary_name)
         try:
-            temporary_path.write_bytes(bytes(buffer))
+            with os.fdopen(file_descriptor, "wb") as stream:
+                stream.write(buffer)
+                for payload, _size, _count, _dtype, _sha in descriptors:
+                    for start in range(0, len(payload), 8 * 1024 * 1024):
+                        if check_cancelled is not None:
+                            check_cancelled()
+                        stream.write(payload[start : start + 8 * 1024 * 1024])
+                    padding = cls._aligned_size(len(payload)) - len(payload)
+                    if padding:
+                        stream.write(b"\x00" * padding)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if check_cancelled is not None:
+                check_cancelled()
             os.replace(temporary_path, sidecar_path)
-        except Exception:
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_fd = os.open(sidecar_path.parent, directory_flags)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
             temporary_path.unlink(missing_ok=True)
-            raise
 
     @classmethod
     def load(
@@ -778,6 +884,16 @@ class EdgeProjectionIndex:
         check_cancelled: Callable[[], None] | None = None,
     ) -> "EdgeProjectionIndex":
         """Load and validate a sidecar, raising on any inconsistency."""
+        callback = check_cancelled
+        if callback is not None:
+
+            def checked_cancelled() -> None:
+                try:
+                    callback()
+                except BaseException as exc:
+                    raise _SidecarCancellation(exc) from exc
+
+            check_cancelled = checked_cancelled
         sidecar_path = Path(sidecar_path)
         graph_path = Path(graph_path)
         if not sidecar_path.exists():
@@ -810,7 +926,9 @@ class EdgeProjectionIndex:
                 if magic != _EPI_MAGIC:
                     raise _SidecarCorruptError("Sidecar magic mismatch")
                 if version != _EPI_VERSION:
-                    raise _SidecarVersionError(f"Unsupported sidecar version: {version}")
+                    raise _SidecarVersionError(
+                        f"Unsupported sidecar version: {version}"
+                    )
 
                 expected_header_size = cls._aligned_size(
                     _EPI_HEADER_SIZE + _NUM_SECTIONS * _EPI_SECTION_DESCRIPTOR_SIZE
@@ -850,10 +968,34 @@ class EdgeProjectionIndex:
                 for i in range(_NUM_SECTIONS):
                     offset = _EPI_HEADER_SIZE + i * _EPI_SECTION_DESCRIPTOR_SIZE
                     desc = mm[offset : offset + _EPI_SECTION_DESCRIPTOR_SIZE]
-                    section_offset, section_size, section_count, dtype_code, sha = struct.unpack(
-                        "<QQQB7x32s", desc
+                    section_offset, section_size, section_count, dtype_code, sha = (
+                        struct.unpack("<QQQB7x32s", desc)
                     )
-                    directory.append((section_offset, section_size, section_count, dtype_code, sha))
+                    directory.append(
+                        (section_offset, section_size, section_count, dtype_code, sha)
+                    )
+
+                expected_section_offset = header_size
+                for section_index, (
+                    section_offset,
+                    section_size,
+                    _section_count,
+                    dtype_code,
+                    _sha,
+                ) in enumerate(directory):
+                    if section_offset != expected_section_offset:
+                        raise _SidecarCorruptError(
+                            f"Section {section_index} offset mismatch"
+                        )
+                    if dtype_code not in _DTYPE_CODE_TO_NAME:
+                        raise _SidecarCorruptError(
+                            f"Section {section_index} dtype code is unknown"
+                        )
+                    expected_section_offset += cls._aligned_size(section_size)
+                if expected_section_offset > file_size:
+                    raise _SidecarTruncatedError("Sidecar payload is truncated")
+                if expected_section_offset != file_size:
+                    raise _SidecarCorruptError("Sidecar has trailing payload bytes")
 
                 if check_cancelled is not None:
                     check_cancelled()
@@ -871,8 +1013,8 @@ class EdgeProjectionIndex:
                         raise _SidecarCorruptError(f"Section {idx} size mismatch")
                     if offset + size > len(mm):
                         raise _SidecarTruncatedError(f"Section {idx} extends past file")
-                    payload = mm[offset : offset + size]
-                    if hashlib.sha256(payload).digest() != sha:
+                    payload = memoryview(mm)[offset : offset + size]
+                    if _sha256_buffer(payload, check_cancelled) != sha:
                         raise _SidecarCorruptError(f"Section {idx} SHA-256 mismatch")
                     arr = np.frombuffer(
                         mm, dtype=np.dtype(expected_dtype), count=count, offset=offset
@@ -888,10 +1030,10 @@ class EdgeProjectionIndex:
                         raise _SidecarCorruptError(f"Section {idx} raw count mismatch")
                     if offset + size > len(mm):
                         raise _SidecarTruncatedError(f"Section {idx} extends past file")
-                    payload = mm[offset : offset + size]
-                    if hashlib.sha256(payload).digest() != sha:
+                    payload = memoryview(mm)[offset : offset + size]
+                    if _sha256_buffer(payload, check_cancelled) != sha:
                         raise _SidecarCorruptError(f"Section {idx} SHA-256 mismatch")
-                    return memoryview(mm)[offset : offset + size]
+                    return payload
 
                 def validate_offsets(offsets: np.ndarray, data_size: int) -> None:
                     if offsets.dtype.kind not in ("i", "u"):
@@ -902,16 +1044,22 @@ class EdgeProjectionIndex:
                         raise _SidecarCorruptError("Offsets must start at zero")
                     if len(offsets) == 1:
                         if data_size != 0:
-                            raise _SidecarCorruptError("Single offset must span empty data")
+                            raise _SidecarCorruptError(
+                                "Single offset must span empty data"
+                            )
                         return
-                    if not all(offsets[i] <= offsets[i + 1] for i in range(len(offsets) - 1)):
+                    if not all(
+                        offsets[i] <= offsets[i + 1] for i in range(len(offsets) - 1)
+                    ):
                         raise _SidecarCorruptError("Offsets must be nondecreasing")
                     if offsets[-1] > data_size:
                         raise _SidecarCorruptError("Final offset exceeds data size")
                     if offsets[-1] != data_size:
                         raise _SidecarCorruptError("Final offset must match data size")
 
-                def decode_strings(data: memoryview, offsets: np.ndarray) -> tuple[str, ...]:
+                def decode_strings(
+                    data: memoryview, offsets: np.ndarray
+                ) -> tuple[str, ...]:
                     validate_offsets(offsets, len(data))
                     if len(offsets) == 1:
                         return ()
@@ -954,18 +1102,157 @@ class EdgeProjectionIndex:
                 type_count = len(road_type_names)
                 if type_count == 0 and edge_count > 0:
                     raise _SidecarCorruptError("Missing road type names")
-                if edge_count > 0 and road_type_codes.max() >= type_count:
+                if edge_count > 0 and (
+                    road_type_codes.min() < 0 or road_type_codes.max() >= type_count
+                ):
                     raise _SidecarCorruptError("Road type code out of range")
 
+                if not (
+                    np.all(np.isfinite(start_latitudes))
+                    and np.all(np.isfinite(start_longitudes))
+                    and np.all(np.isfinite(end_latitudes))
+                    and np.all(np.isfinite(end_longitudes))
+                ):
+                    raise _SidecarCorruptError(
+                        "Indexed segment coordinates must be finite"
+                    )
+                if edge_count > total_edge_count:
+                    raise _SidecarCorruptError(
+                        "Indexed edge count exceeds total graph edge count"
+                    )
                 if edge_count > 0:
                     if edge_ranks.min() < 0 or edge_ranks.max() >= total_edge_count:
                         raise _SidecarCorruptError("Edge rank out of bounds")
                     if len(np.unique(edge_ranks)) != edge_count:
                         raise _SidecarCorruptError("Edge ranks must be unique")
 
-                if edge_count > 0 and (root_node < 0 or root_node >= bvh_node_count):
-                    raise _SidecarCorruptError("Invalid BVH root node index")
+                if edge_count == 0:
+                    if bvh_node_count != 0 or root_node != -1:
+                        raise _SidecarCorruptError(
+                            "Empty index has inconsistent BVH metadata"
+                        )
+                else:
+                    if leaf_size != _EDGE_PROJECTION_BVH_LEAF_SIZE:
+                        raise _SidecarVersionError(
+                            f"Unsupported BVH leaf size: {leaf_size}"
+                        )
+                    if root_node < 0 or root_node >= bvh_node_count:
+                        raise _SidecarCorruptError("Invalid BVH root node index")
+                    if not (
+                        np.all(np.isfinite(bvh_min_lat))
+                        and np.all(np.isfinite(bvh_min_lon))
+                        and np.all(np.isfinite(bvh_max_lat))
+                        and np.all(np.isfinite(bvh_max_lon))
+                        and np.all(bvh_min_lat <= bvh_max_lat)
+                        and np.all(bvh_min_lon <= bvh_max_lon)
+                    ):
+                        raise _SidecarCorruptError("Invalid BVH bounds")
+                    leaves = (bvh_left == -1) & (bvh_right == -1)
+                    internals = (
+                        (bvh_left >= 0)
+                        & (bvh_left < bvh_node_count)
+                        & (bvh_right >= 0)
+                        & (bvh_right < bvh_node_count)
+                    )
+                    if not np.all(leaves | internals):
+                        raise _SidecarCorruptError("Invalid BVH child indices")
+                    if not np.all(
+                        (bvh_start[leaves] >= 0)
+                        & (bvh_stop[leaves] > bvh_start[leaves])
+                        & (bvh_stop[leaves] <= edge_count)
+                    ):
+                        raise _SidecarCorruptError("Invalid BVH leaf range")
+                    if not np.all(
+                        (bvh_start[internals] == -1) & (bvh_stop[internals] == -1)
+                    ):
+                        raise _SidecarCorruptError(
+                            "Internal BVH nodes contain leaf ranges"
+                        )
 
+                    visit_state = np.zeros(bvh_node_count, dtype=np.uint8)
+                    stack = [(int(root_node), False)]
+                    visits = 0
+                    while stack:
+                        node, exiting = stack.pop()
+                        if exiting:
+                            visit_state[node] = 2
+                            continue
+                        if visit_state[node] != 0:
+                            raise _SidecarCorruptError(
+                                "BVH contains a cycle or shared child"
+                            )
+                        visit_state[node] = 1
+                        visits += 1
+                        if (
+                            check_cancelled is not None
+                            and visits
+                            & (_CANCELLATION_CHECK_INTERVAL - 1)
+                            == 0
+                        ):
+                            check_cancelled()
+                        stack.append((node, True))
+                        if internals[node]:
+                            stack.append((int(bvh_right[node]), False))
+                            stack.append((int(bvh_left[node]), False))
+                    if not np.all(visit_state == 2):
+                        raise _SidecarCorruptError(
+                            "BVH contains unreachable nodes"
+                        )
+
+                    leaf_starts = bvh_start[leaves]
+                    leaf_stops = bvh_stop[leaves]
+                    leaf_order = np.argsort(leaf_starts)
+                    sorted_starts = leaf_starts[leaf_order]
+                    sorted_stops = leaf_stops[leaf_order]
+                    if (
+                        sorted_starts[0] != 0
+                        or sorted_stops[-1] != edge_count
+                        or np.any(sorted_stops[:-1] != sorted_starts[1:])
+                    ):
+                        raise _SidecarCorruptError(
+                            "BVH leaves do not partition indexed edges"
+                        )
+
+                    internal_nodes = np.flatnonzero(internals)
+                    left_nodes = bvh_left[internal_nodes]
+                    right_nodes = bvh_right[internal_nodes]
+                    if not (
+                        np.all(
+                            bvh_min_lat[internal_nodes]
+                            <= bvh_min_lat[left_nodes]
+                        )
+                        and np.all(
+                            bvh_min_lat[internal_nodes]
+                            <= bvh_min_lat[right_nodes]
+                        )
+                        and np.all(
+                            bvh_min_lon[internal_nodes]
+                            <= bvh_min_lon[left_nodes]
+                        )
+                        and np.all(
+                            bvh_min_lon[internal_nodes]
+                            <= bvh_min_lon[right_nodes]
+                        )
+                        and np.all(
+                            bvh_max_lat[internal_nodes]
+                            >= bvh_max_lat[left_nodes]
+                        )
+                        and np.all(
+                            bvh_max_lat[internal_nodes]
+                            >= bvh_max_lat[right_nodes]
+                        )
+                        and np.all(
+                            bvh_max_lon[internal_nodes]
+                            >= bvh_max_lon[left_nodes]
+                        )
+                        and np.all(
+                            bvh_max_lon[internal_nodes]
+                            >= bvh_max_lon[right_nodes]
+                        )
+                    ):
+                        raise _SidecarCorruptError(
+                            "BVH parent bounds do not contain children"
+                        )
                 if check_cancelled is not None:
                     check_cancelled()
 
@@ -994,9 +1281,9 @@ class EdgeProjectionIndex:
             except _SidecarError:
                 raise
             except (struct.error, ValueError, TypeError, KeyError, OSError) as exc:
-                raise _SidecarCorruptError("Sidecar payload could not be parsed") from exc
-            except Exception as exc:
-                raise _SidecarCorruptError(f"Sidecar payload could not be parsed: {exc}") from exc
+                raise _SidecarCorruptError(
+                    "Sidecar payload could not be parsed"
+                ) from exc
 
     @staticmethod
     def sidecar_path(graph_path: Path) -> Path:
