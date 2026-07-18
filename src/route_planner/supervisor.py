@@ -24,6 +24,8 @@ import builtins
 from dataclasses import dataclass
 import math
 import multiprocessing
+from multiprocessing.context import ForkContext
+from multiprocessing.process import BaseProcess
 import os
 import pickle
 import sys
@@ -226,7 +228,7 @@ def _persistent_worker_entry(work_conn) -> None:
             pass
 
 
-def _reap_process(process: multiprocessing.Process, timeout: float = 5.0) -> None:
+def _reap_process(process: BaseProcess, timeout: float = 5.0) -> None:
     """Join a process; escalate to SIGTERM/SIGKILL if necessary."""
     if process.is_alive():
         process.join(timeout=timeout)
@@ -241,9 +243,9 @@ def _reap_process(process: multiprocessing.Process, timeout: float = 5.0) -> Non
 class _WorkerHandle:
     """One persistent disposable child of the supervisor."""
 
-    def __init__(self, ctx: multiprocessing.context.BaseContext) -> None:
+    def __init__(self, ctx: ForkContext) -> None:
         self._ctx = ctx
-        self._proc: multiprocessing.Process | None = None
+        self._proc: BaseProcess | None = None
         self._work_conn: Any | None = None
 
     def _ensure_worker(self) -> None:
@@ -378,12 +380,10 @@ class _WorkerHandle:
 def _supervisor_entry(
     cmd_conn,
     preload_marker: Any,
-    default_deadline_seconds: float | None,
-    default_grace_seconds: float,
 ) -> None:
     """Main loop of the long-lived supervisor process."""
     _set_preload_marker(preload_marker)
-    ctx = multiprocessing.get_context("fork")
+    ctx: ForkContext = multiprocessing.get_context("fork")
     worker = _WorkerHandle(ctx)
     try:
         _send_object(cmd_conn, _Ready())
@@ -436,7 +436,7 @@ class PreloadedRouteSupervisor:
 
     def __init__(
         self,
-        process: multiprocessing.Process,
+        process: BaseProcess,
         cmd_conn: Any,
         default_deadline_seconds: float | None,
         default_grace_seconds: float,
@@ -464,16 +464,11 @@ class PreloadedRouteSupervisor:
                 "hard-stop and inherited read-only caches"
             )
 
-        ctx = multiprocessing.get_context("fork")
+        ctx: ForkContext = multiprocessing.get_context("fork")
         cmd_parent, cmd_child = ctx.Pipe(duplex=True)
         proc = ctx.Process(
             target=_supervisor_entry,
-            args=(
-                cmd_child,
-                preload_marker,
-                default_deadline_seconds,
-                default_grace_seconds,
-            ),
+            args=(cmd_child, preload_marker),
             daemon=False,
         )
         proc.start()
@@ -614,5 +609,5 @@ class PreloadedRouteSupervisor:
     def __enter__(self) -> "PreloadedRouteSupervisor":
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *args: object) -> None:
         self.close()
