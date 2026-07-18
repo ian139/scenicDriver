@@ -1190,6 +1190,7 @@ class EndpointRoadGraph(RoadGraph):
         self._local_nodes: Dict[str, Node] = {}
         self._local_edges: Dict[str, Edge] = {}
         self._local_adjacency: Dict[str, List[_TraversalRef]] = {}
+        self._local_predecessors: Dict[str, List[_TraversalRef]] = {}
         self._local_structure_epoch = 0
         self._frozen = False
         self._route_endpoint_node_ids: Tuple[str, str] | None = None
@@ -1249,6 +1250,25 @@ class EndpointRoadGraph(RoadGraph):
             self._local_adjacency.setdefault(edge.end_node_id, []).append(
                 (edge.id, True)
             )
+        target_id = edge.end_node_id
+        self._local_predecessors.setdefault(target_id, []).append(
+            (edge.id, False)
+        )
+        if not edge.one_way:
+            self._local_predecessors.setdefault(edge.start_node_id, []).append(
+                (edge.id, True)
+            )
+        self._advance_heuristic_epoch()
+    def iter_local_edges(self, node_id: str) -> Iterator[_TraversalRef]:
+        """Yield request-local outgoing refs without exposing mutable lists."""
+        return iter(self._local_adjacency.get(node_id, ()))
+
+    def iter_local_predecessors(
+        self, node_id: str
+    ) -> Iterator[_TraversalRef]:
+        """Yield request-local incoming refs without exposing mutable lists."""
+        return iter(self._local_predecessors.get(node_id, ()))
+
         self._advance_heuristic_epoch()
 
     def freeze(self) -> None:
