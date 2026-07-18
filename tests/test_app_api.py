@@ -11,6 +11,11 @@ from fastapi.testclient import TestClient
 
 import src.app_api.main as app_api
 
+from src.route_planner.cancellation import (
+    RoutingCancelled,
+    RoutingDeadline,
+    RoutingTimeout,
+)
 from src.app_api.main import create_app
 
 
@@ -606,7 +611,7 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
         route_kind="baseline",
     )
 
-    def fake_plan(request):
+    def fake_plan(request, **kwargs):
         plan_calls.append(request)
         return {
             "routes": [
@@ -618,7 +623,7 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
             "geojson": _strict_geojson(scenic_metrics, baseline_metrics),
         }
 
-    def fake_diagnose(request):
+    def fake_diagnose(request, **kwargs):
         diagnosis_calls.append(request)
         return {"planner": "diagnosed"}
 
@@ -852,11 +857,11 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
     )
     monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
 
-    def fake_plan(request):
+    def fake_plan(request, **kwargs):
         plan_calls.append(request)
         raise ValueError("detour cap is too tight")
 
-    def fake_diagnose(request):
+    def fake_diagnose(request, **kwargs):
         diagnosis_calls.append(request)
         return {"graph_nodes": 4, "graph_edges": 3}
 
@@ -904,7 +909,7 @@ def test_route_compare_reports_endpoint_coverage_error(monkeypatch) -> None:
     )
     plan_calls: list[object] = []
 
-    def fake_plan(request):
+    def fake_plan(request, **kwargs):
         plan_calls.append(request)
         raise app_api.RouteCoverageError("start", 1.234, 1.0)
 
@@ -940,7 +945,7 @@ def test_route_compare_reports_invalid_route_configuration(monkeypatch) -> None:
     )
     monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
 
-    def fake_plan(request):
+    def fake_plan(request, **kwargs):
         raise app_api.RouteConfigurationError("invalid frontier budget")
 
     monkeypatch.setattr(app_api, "plan_routes", fake_plan)
@@ -981,7 +986,7 @@ def test_route_compare_rejects_incomplete_service_response(monkeypatch) -> None:
     monkeypatch.setattr(
         app_api,
         "plan_routes",
-        lambda request: {
+        lambda request, **kwargs: {
             "routes": [{"route_kind": "scenic", "metrics": scenic_metrics}],
             "diagnostics": _strict_diagnostics(),
             "score_mapping": _strict_score_mapping(),
@@ -1083,7 +1088,7 @@ def test_route_compare_rejects_inconsistent_certified_bound(monkeypatch) -> None
     monkeypatch.setattr(
         app_api,
         "plan_routes",
-        lambda request: {
+        lambda request, **kwargs: {
             "routes": [{"route_kind": "scenic", "metrics": scenic_metrics}],
             "diagnostics": diagnostics,
             "score_mapping": _strict_score_mapping(),
@@ -1120,7 +1125,7 @@ def test_route_compare_rejects_per_route_weight_mismatch(monkeypatch) -> None:
     monkeypatch.setattr(
         app_api,
         "plan_routes",
-        lambda request: {
+        lambda request, **kwargs: {
             "routes": [{"route_kind": "scenic", "metrics": scenic_metrics}],
             "diagnostics": _strict_diagnostics(),
             "score_mapping": _strict_score_mapping(),
@@ -1165,7 +1170,7 @@ def test_route_compare_redacts_private_asset_paths(monkeypatch) -> None:
     monkeypatch.setattr(
         app_api,
         "plan_routes",
-        lambda request: {
+        lambda request, **kwargs: {
             "routes": [{"route_kind": "scenic", "metrics": scenic_metrics}],
             "diagnostics": diagnostics,
             "score_mapping": score_mapping,
@@ -1422,3 +1427,160 @@ def test_route_preload_required_fails_for_missing_default(tmp_path, monkeypatch)
     with pytest.raises(RuntimeError, match="default.*missing"):
         with TestClient(create_app()):
             pass
+
+
+def test_route_compare_maps_routing_timeout_to_504(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+
+    def fake_plan(request, **kwargs):
+        raise RoutingTimeout("deadline exceeded")
+
+    monkeypatch.setattr(app_api, "plan_routes", fake_plan)
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 44.4, "lon": -70.2},
+            "end": {"lat": 44.5, "lon": -70.1},
+            "scenic_weight": 0.8,
+            "region": "new_england_north",
+            "max_detour_factor": 1.8,
+            "avoid_highways": False,
+            "include_baseline": False,
+        },
+    )
+    assert response.status_code == 504
+    assert response.json()["detail"]["error"] == "routing_deadline_exceeded"
+
+
+def test_route_compare_maps_routing_cancelled_to_non_no_route(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+
+    def fake_plan(request, **kwargs):
+        raise RoutingCancelled("cancelled")
+
+    monkeypatch.setattr(app_api, "plan_routes", fake_plan)
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 44.4, "lon": -70.2},
+            "end": {"lat": 44.5, "lon": -70.1},
+            "scenic_weight": 0.8,
+            "region": "new_england_north",
+            "max_detour_factor": 1.8,
+            "avoid_highways": False,
+            "include_baseline": False,
+        },
+    )
+    assert response.status_code != 422
+    assert response.json()["detail"]["error"] == "routing_cancelled"
+
+
+def test_route_compare_passes_one_deadline_to_plan_routes_and_diagnostics(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+
+    captured: list[tuple[object, RoutingDeadline | None]] = []
+    diagnosis_captured: list[tuple[object, RoutingDeadline | None]] = []
+
+    def fake_plan(request, **kwargs):
+        captured.append((request, kwargs.get("deadline")))
+        raise ValueError("no route")
+
+    def fake_diagnose(request, **kwargs):
+        diagnosis_captured.append((request, kwargs.get("deadline")))
+        return {"graph_nodes": 4, "graph_edges": 3}
+
+    monkeypatch.setattr(app_api, "plan_routes", fake_plan)
+    monkeypatch.setattr(app_api, "diagnose_route_request", fake_diagnose)
+
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 44.4, "lon": -70.2},
+            "end": {"lat": 44.5, "lon": -70.1},
+            "scenic_weight": 0.8,
+            "region": "new_england_north",
+            "max_detour_factor": 1.8,
+            "avoid_highways": False,
+            "include_baseline": False,
+        },
+    )
+
+    assert response.status_code == 422
+    assert len(captured) == 1
+    request, deadline = captured[0]
+    assert isinstance(deadline, RoutingDeadline)
+    assert len(diagnosis_captured) == 1
+    assert diagnosis_captured[0][1] is deadline
+
+
+def test_route_compare_fallback_diagnose_maps_routing_timeout_to_504(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+
+    def fake_plan(request, **kwargs):
+        raise ValueError("no route")
+
+    def fake_diagnose(request, **kwargs):
+        raise RoutingTimeout("deadline exceeded during fallback diagnostics")
+
+    monkeypatch.setattr(app_api, "plan_routes", fake_plan)
+    monkeypatch.setattr(app_api, "diagnose_route_request", fake_diagnose)
+
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 44.4, "lon": -70.2},
+            "end": {"lat": 44.5, "lon": -70.1},
+            "scenic_weight": 0.8,
+            "region": "new_england_north",
+            "max_detour_factor": 1.8,
+            "avoid_highways": False,
+            "include_baseline": False,
+        },
+    )
+    assert response.status_code == 504
+    assert response.json()["detail"]["error"] == "routing_deadline_exceeded"
+
+
+def test_route_compare_fallback_diagnose_maps_routing_cancelled_to_non_no_route(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+
+    def fake_plan(request, **kwargs):
+        raise ValueError("no route")
+
+    def fake_diagnose(request, **kwargs):
+        raise RoutingCancelled("cancelled during fallback diagnostics")
+
+    monkeypatch.setattr(app_api, "plan_routes", fake_plan)
+    monkeypatch.setattr(app_api, "diagnose_route_request", fake_diagnose)
+
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 44.4, "lon": -70.2},
+            "end": {"lat": 44.5, "lon": -70.1},
+            "scenic_weight": 0.8,
+            "region": "new_england_north",
+            "max_detour_factor": 1.8,
+            "avoid_highways": False,
+            "include_baseline": False,
+        },
+    )
+    assert response.status_code != 422
+    assert response.json()["detail"]["error"] == "routing_cancelled"

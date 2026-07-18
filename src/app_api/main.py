@@ -21,10 +21,16 @@ import os
 import requests
 from urllib.parse import quote
 
+from src.route_planner.cancellation import (
+    RoutingCancelled,
+    RoutingDeadline,
+    RoutingTimeout,
+)
 from src.route_planner.service import (
     RouteCoverageError,
     RouteConfigurationError,
     RouteRequest,
+    _deadline_seconds_from_env,
     diagnose_route_request,
     plan_routes,
     preload_route_assets,
@@ -56,6 +62,30 @@ def _safe_asset_name(value: str, *, kind: str) -> str:
     pattern = _SAFE_REGION_RE if kind == "region" else _SAFE_RUN_RE
     if not pattern.fullmatch(value):
         raise HTTPException(status_code=422, detail=f"Invalid {kind}")
+    return value
+
+
+def _raise_routing_http_exception(exc: BaseException) -> NoReturn:
+    """Map routing timeout/cancellation to explicit HTTP responses."""
+    if isinstance(exc, RoutingTimeout):
+        _LOGGER.error("Routing deadline exceeded: %s", exc)
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "error": "routing_deadline_exceeded",
+                "message": "The route planning deadline was exceeded.",
+            },
+        ) from exc
+    if isinstance(exc, RoutingCancelled):
+        _LOGGER.error("Routing request cancelled: %s", exc)
+        raise HTTPException(
+            status_code=499,
+            detail={
+                "error": "routing_cancelled",
+                "message": "The route planning request was cancelled.",
+            },
+        ) from exc
+    raise exc
     return value
 
 def _run_report_path(run_name: str) -> Path:
@@ -1138,14 +1168,16 @@ def _validate_route_geometry(
         )
     return validated
 
-
 def _validate_route_contract(
     result: dict[str, Any],
     *,
     request: RouteRequest,
+    deadline: RoutingDeadline | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Validate the single service response schema before exposing it."""
 
+    if deadline is not None:
+        deadline.check()
     if not isinstance(result, dict):
         raise HTTPException(
             status_code=502,
@@ -1595,9 +1627,12 @@ def create_app() -> FastAPI:
                 else None
             ),
         )
+        deadline = RoutingDeadline.after(_deadline_seconds_from_env())
         try:
-            result = plan_routes(req)
-            diagnostics, routes = _validate_route_contract(result, request=req)
+            result = plan_routes(req, deadline=deadline)
+            diagnostics, routes = _validate_route_contract(
+                result, request=req, deadline=deadline
+            )
         except RouteConfigurationError as exc:
             _LOGGER.error("Invalid route configuration: %s", exc)
             raise HTTPException(
@@ -1625,9 +1660,13 @@ def create_app() -> FastAPI:
                     "max_snap_distance_km": float(exc.max_snap_distance_km),
                 },
             ) from exc
+        except (RoutingTimeout, RoutingCancelled) as exc:
+            _raise_routing_http_exception(exc)
         except ValueError as exc:
             try:
-                diagnostics = diagnose_route_request(req)
+                diagnostics = diagnose_route_request(req, deadline=deadline)
+            except (RoutingTimeout, RoutingCancelled) as routing_exc:
+                _raise_routing_http_exception(routing_exc)
             except Exception:
                 diagnostics = {}
             if req.avoid_highways:
