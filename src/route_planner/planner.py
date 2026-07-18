@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 import heapq
 import math
+from threading import RLock
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -35,7 +36,7 @@ from .cost import (
     is_highway_road_type,
     resolve_routing_policy,
 )
-from .graph import Edge, EdgeProjection, Node, RoadGraph
+from .graph import Edge, EdgeProjection, EndpointRoadGraph, Node, RoadGraph
 
 _ORIGINAL_SCENIC_CALCULATE = ScenicCostFunction.calculate
 _ORIGINAL_SCENIC_ROAD_TYPE_ADJUSTMENT = (
@@ -356,6 +357,7 @@ class ScenicRoutePlanner:
             )
         )
         self._monotonic = time.monotonic
+        self._request_lock = RLock()
         self.graph = graph
         self.cost_function = cost_function or ScenicCostFunction()
         # Heuristic scans are graph-state dependent.  Keep the graph reference
@@ -3108,23 +3110,10 @@ class ScenicRoutePlanner:
         )
 
     @staticmethod
-    def _copy_endpoint_overlay(base: RoadGraph) -> RoadGraph:
-        """Clone mutable endpoint state with cooperative cancellation."""
-        overlay = RoadGraph()
-        overlay.nodes = {}
-        for index, (node_id, node) in enumerate(base.nodes.items()):
-            _check_active_deadline_at(index)
-            overlay.nodes[node_id] = node
-        overlay.edges = {}
-        for index, (edge_id, edge) in enumerate(base.edges.items()):
-            _check_active_deadline_at(index)
-            overlay.edges[edge_id] = edge
-        overlay.adjacency = {}
-        for index, (node_id, adjacencies) in enumerate(base.adjacency.items()):
-            _check_active_deadline_at(index)
-            overlay.adjacency[node_id] = list(adjacencies)
-        overlay._heuristic_structure_epoch = base._heuristic_structure_epoch
-        overlay._reverse_edge_views = {}
+    def _copy_endpoint_overlay(base: RoadGraph) -> EndpointRoadGraph:
+        """Create an O(endpoint additions) structural view over the base graph."""
+        _check_active_deadline()
+        overlay = EndpointRoadGraph(base)
         _check_active_deadline()
         return overlay
 
@@ -3165,6 +3154,7 @@ class ScenicRoutePlanner:
                 raise ValueError("No route found between the given coordinates.")
             overlay = self._copy_endpoint_overlay(base)
             overlay._route_endpoint_node_ids = (start_node.id, end_node.id)
+            overlay.freeze()
             return overlay
         overlay = self._copy_endpoint_overlay(base)
 
@@ -3368,6 +3358,7 @@ class ScenicRoutePlanner:
                         )
                     )
         overlay._route_endpoint_node_ids = (start_id, end_id)
+        overlay.freeze()
         _check_active_deadline()
         return overlay
 
@@ -3628,7 +3619,7 @@ class ScenicRoutePlanner:
         deadline: RoutingDeadline | None = None,
     ) -> Route:
         """Optimize scenic score within one shared request deadline."""
-        with _routing_deadline_scope(deadline):
+        with self._request_lock, _routing_deadline_scope(deadline):
             return self._find_scenic_route(
                 start,
                 end,
@@ -3841,7 +3832,7 @@ class ScenicRoutePlanner:
         deadline: RoutingDeadline | None = None,
     ) -> Route:
         """Return the minimum-duration route within one request deadline."""
-        with _routing_deadline_scope(deadline):
+        with self._request_lock, _routing_deadline_scope(deadline):
             return self._find_fastest_route(
                 start,
                 end,

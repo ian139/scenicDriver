@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from array import array
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 import json
 import math
 import os
@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import sqlite3
 import tempfile
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, Generic, List, Optional, Tuple, TypeVar, overload
 
 import msgspec
 import numpy as np
@@ -1074,6 +1074,186 @@ class RoadGraph:
         else:
             G = ox.graph_from_xml(osm_path)
         return _graph_from_osmnx(G, scenic_scores)
+
+
+_T = TypeVar("_T")
+_TraversalRef = Tuple[str, bool]
+
+
+class _StructuralOverlayMapping(Mapping[str, _T], Generic[_T]):
+    """Read-only merged view with base entries ordered before local entries."""
+
+    __slots__ = ("_base", "_local")
+
+    def __init__(self, base: Mapping[str, _T], local: Dict[str, _T]) -> None:
+        self._base = base
+        self._local = local
+
+    def __getitem__(self, key: str) -> _T:
+        try:
+            return self._local[key]
+        except KeyError:
+            return self._base[key]
+
+    def __iter__(self) -> Iterator[str]:
+        yield from self._base
+        for key in self._local:
+            if key not in self._base:
+                yield key
+
+    def __len__(self) -> int:
+        return len(self._base) + sum(
+            1 for key in self._local if key not in self._base
+        )
+
+
+class _TraversalSequence(Sequence[_TraversalRef]):
+    """Read-only concatenation of base and request-local traversal refs."""
+
+    __slots__ = ("_base", "_local")
+
+    def __init__(
+        self,
+        base: Sequence[_TraversalRef],
+        local: Sequence[_TraversalRef],
+    ) -> None:
+        self._base = base
+        self._local = local
+
+    def __iter__(self) -> Iterator[_TraversalRef]:
+        yield from self._base
+        yield from self._local
+
+    def __len__(self) -> int:
+        return len(self._base) + len(self._local)
+
+    @overload
+    def __getitem__(self, index: int) -> _TraversalRef: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[_TraversalRef]: ...
+
+    def __getitem__(
+        self, index: int | slice
+    ) -> _TraversalRef | Sequence[_TraversalRef]:
+        if isinstance(index, slice):
+            return tuple(self)[index]
+        length = len(self)
+        if index < 0:
+            index += length
+        if index < 0 or index >= length:
+            raise IndexError(index)
+        base_length = len(self._base)
+        if index < base_length:
+            return self._base[index]
+        return self._local[index - base_length]
+
+
+class _StructuralAdjacencyMapping(Mapping[str, _TraversalSequence]):
+    """Read-only adjacency view that never exposes mutable base lists."""
+
+    __slots__ = ("_base", "_local")
+
+    def __init__(
+        self,
+        base: Mapping[str, List[_TraversalRef]],
+        local: Dict[str, List[_TraversalRef]],
+    ) -> None:
+        self._base = base
+        self._local = local
+
+    def __getitem__(self, key: str) -> _TraversalSequence:
+        if key not in self._base and key not in self._local:
+            raise KeyError(key)
+        return _TraversalSequence(
+            self._base.get(key, ()),
+            self._local.get(key, ()),
+        )
+
+    def __iter__(self) -> Iterator[str]:
+        yield from self._base
+        for key in self._local:
+            if key not in self._base:
+                yield key
+
+    def __len__(self) -> int:
+        return len(self._base) + sum(
+            1 for key in self._local if key not in self._base
+        )
+
+
+class EndpointRoadGraph(RoadGraph):
+    """Request-local endpoint additions over an immutable shared base graph."""
+
+    def __init__(self, base: RoadGraph) -> None:
+        self.base_graph = base
+        self._local_nodes: Dict[str, Node] = {}
+        self._local_edges: Dict[str, Edge] = {}
+        self._local_adjacency: Dict[str, List[_TraversalRef]] = {}
+        self._local_structure_epoch = 0
+        self._frozen = False
+        self._route_endpoint_node_ids: Tuple[str, str] | None = None
+        self.nodes = _StructuralOverlayMapping(  # type: ignore[assignment]
+            base.nodes, self._local_nodes
+        )
+        self.edges = _StructuralOverlayMapping(  # type: ignore[assignment]
+            base.edges, self._local_edges
+        )
+        self.adjacency = _StructuralAdjacencyMapping(  # type: ignore[assignment]
+            base.adjacency, self._local_adjacency
+        )
+        self._reverse_edge_views: Dict[str, _ReverseEdgeView] = {}
+        self._nearest_spatial_index = None
+        self._nearest_edge_projection_index = None
+        self.artifact_metadata = base.artifact_metadata
+
+    def _ensure_mutable(self) -> None:
+        if self._frozen:
+            raise RuntimeError("endpoint graph is frozen")
+
+    def _advance_heuristic_epoch(self) -> None:
+        self._local_structure_epoch += 1
+        self._reverse_edge_views.clear()
+
+    def _heuristic_cache_stamp(self) -> Tuple[int, int, int]:
+        base_structure, node_epoch, edge_epoch = (
+            self.base_graph._heuristic_cache_stamp()
+        )
+        return (
+            base_structure + self._local_structure_epoch,
+            node_epoch,
+            edge_epoch,
+        )
+
+    def add_node(self, node: Node) -> None:
+        self._ensure_mutable()
+        if node.id in self.nodes:
+            raise ValueError(f"Duplicate node id: {node.id}")
+        self._local_nodes[node.id] = node
+        self._local_adjacency.setdefault(node.id, [])
+        self._advance_heuristic_epoch()
+
+    def add_edge(self, edge: Edge) -> None:
+        self._ensure_mutable()
+        if edge.start_node_id not in self.nodes:
+            raise ValueError(f"Unknown start node: {edge.start_node_id}")
+        if edge.end_node_id not in self.nodes:
+            raise ValueError(f"Unknown end node: {edge.end_node_id}")
+        if edge.id in self.edges:
+            raise ValueError(f"Duplicate edge id: {edge.id}")
+        self._local_edges[edge.id] = edge
+        self._local_adjacency.setdefault(edge.start_node_id, []).append(
+            (edge.id, False)
+        )
+        if not edge.one_way:
+            self._local_adjacency.setdefault(edge.end_node_id, []).append(
+                (edge.id, True)
+            )
+        self._advance_heuristic_epoch()
+
+    def freeze(self) -> None:
+        """Reject subsequent endpoint collection mutation."""
+        self._frozen = True
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

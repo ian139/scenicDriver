@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import gc
 import math
+from threading import Lock
+import time
+import tracemalloc
 
 import pytest
 
 from src.route_planner.cost import evaluate_path, resolve_routing_policy
-from src.route_planner.graph import Edge, Node, RoadGraph
+from src.route_planner.graph import Edge, EndpointRoadGraph, Node, RoadGraph
 from src.route_planner.planner import _FrontierLabel, ScenicRoutePlanner
 
 _SEARCH_DIAGNOSTIC_KEYS = {
@@ -216,6 +221,154 @@ def test_scenic_endpoint_overlay_keeps_all_tied_boundary_projections() -> None:
         baseline.estimated_duration_minutes
     )
     assert scenic.estimated_duration_minutes <= scenic.duration_cap_minutes
+
+
+def _endpoint_overlay_graph(extra_nodes: int = 0) -> RoadGraph:
+    graph = RoadGraph()
+    graph.add_node(Node(id="A", lat=0.0, lon=0.0))
+    graph.add_node(Node(id="B", lat=0.0, lon=1.0))
+    graph.add_edge(
+        Edge(
+            id="base-edge",
+            start_node_id="A",
+            end_node_id="B",
+            distance_km=10.0,
+            scenic_score=7.0,
+            speed_limit_kmh=60,
+            one_way=False,
+        )
+    )
+    for index in range(extra_nodes):
+        graph.add_node(
+            Node(id=f"unused-{index}", lat=20.0 + index, lon=20.0)
+        )
+    graph.find_nearest_edge_positions_with_distance(0.0, 0.25)
+    return graph
+
+
+def test_endpoint_overlay_structurally_shares_frozen_base_graph() -> None:
+    graph = _endpoint_overlay_graph(extra_nodes=32)
+    planner = ScenicRoutePlanner(graph)
+    nodes_id = id(graph.nodes)
+    edges_id = id(graph.edges)
+    adjacency_id = id(graph.adjacency)
+    adjacency_lists = {
+        node_id: id(traversals)
+        for node_id, traversals in graph.adjacency.items()
+    }
+    stamp = graph._heuristic_cache_stamp()
+
+    overlay = planner._endpoint_graph((0.0, 0.25), (0.0, 0.75))
+
+    assert isinstance(overlay, EndpointRoadGraph)
+    assert overlay.base_graph is graph
+    assert overlay.nodes["A"] is graph.nodes["A"]
+    assert overlay.edges["base-edge"] is graph.edges["base-edge"]
+    assert id(graph.nodes) == nodes_id
+    assert id(graph.edges) == edges_id
+    assert id(graph.adjacency) == adjacency_id
+    assert {
+        node_id: id(traversals)
+        for node_id, traversals in graph.adjacency.items()
+    } == adjacency_lists
+    assert graph._heuristic_cache_stamp() == stamp
+    assert not hasattr(overlay.adjacency["A"], "append")
+    with pytest.raises(RuntimeError, match="frozen"):
+        overlay.add_node(Node(id="late", lat=1.0, lon=1.0))
+    with pytest.raises(TypeError):
+        overlay.nodes["late"] = Node(id="late", lat=1.0, lon=1.0)  # type: ignore[index]
+
+
+def _endpoint_setup_peak_bytes(graph: RoadGraph) -> int:
+    gc.collect()
+    tracemalloc.start()
+    try:
+        overlay = ScenicRoutePlanner(graph)._endpoint_graph(
+            (0.0, 0.25), (0.0, 0.75)
+        )
+        assert isinstance(overlay, EndpointRoadGraph)
+        _, peak = tracemalloc.get_traced_memory()
+        return peak
+    finally:
+        tracemalloc.stop()
+
+
+def test_endpoint_overlay_allocation_does_not_scale_with_base_nodes() -> None:
+    small_peak = _endpoint_setup_peak_bytes(_endpoint_overlay_graph())
+    large_peak = _endpoint_setup_peak_bytes(
+        _endpoint_overlay_graph(extra_nodes=10_000)
+    )
+
+    assert large_peak <= small_peak + 128 * 1024
+
+
+def test_scenic_hot_path_uses_structural_endpoint_overlay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = ScenicRoutePlanner(_endpoint_overlay_graph())
+    original = planner._endpoint_graph
+    observed: list[EndpointRoadGraph] = []
+
+    def capture(*args, **kwargs):
+        overlay = original(*args, **kwargs)
+        observed.append(overlay)
+        return overlay
+
+    monkeypatch.setattr(planner, "_endpoint_graph", capture)
+    route = planner.find_scenic_route(
+        (0.0, 0.25),
+        (0.0, 0.75),
+        q=0.0,
+        kappa=1.0,
+    )
+
+    assert route.edge_ids == ("base-edge",)
+    assert len(observed) == 1
+    assert observed[0].base_graph is planner.graph
+
+
+def test_same_planner_serializes_concurrent_endpoint_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _endpoint_overlay_graph()
+    planner = ScenicRoutePlanner(graph)
+    original = planner._path_to_route
+    state_lock = Lock()
+    active = 0
+    max_active = 0
+
+    def observed_path_to_route(*args, **kwargs):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.02)
+            return original(*args, **kwargs)
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(planner, "_path_to_route", observed_path_to_route)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        routes = list(
+            executor.map(
+                lambda _: planner.find_scenic_route(
+                    (0.0, 0.25),
+                    (0.0, 0.75),
+                    q=0.0,
+                    kappa=1.0,
+                ),
+                range(2),
+            )
+        )
+
+    assert [route.edge_ids for route in routes] == [
+        ("base-edge",),
+        ("base-edge",),
+    ]
+    assert max_active == 1
+    assert planner.graph is graph
 
 def _route(planner: ScenicRoutePlanner, q: float, kappa: float):
     return planner.find_scenic_route(
