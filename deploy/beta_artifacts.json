@@ -4,11 +4,11 @@
   "artifacts": [
     {
       "name": "graph",
-      "destination": "data/processed/road_graphs/new_england_north_burlington_bangor_corridor35/road_graph.json",
-      "source_key": "data/processed/road_graphs/new_england_north_burlington_bangor_corridor35/road_graph.json.gz",
+      "destination": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3",
+      "source_key": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3.gz",
       "compression": "gzip",
-      "sha256": "ad5fcddc464622464789ed0b9265055a3db0edfcf49c89958d2075d6e226fa7e",
-      "size_bytes": 490042661
+      "sha256": "48c5b052deaf23a5e0fee29262fd384caec859a6317f6f7eb7a90eef07ae09b8",
+      "size_bytes": 3049209856
     },
     {
       "name": "report",
@@ -23,16 +23,16 @@
       "destination": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route.geojson",
       "source_key": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route.geojson.gz",
       "compression": "gzip",
-      "sha256": "f3c85a1e23dbc2735f584352efaf9594e22ab93cf7057666e4538aab8b5c89b9",
-      "size_bytes": 14385648
+      "sha256": "43f2ac155515e89b2e2588f28d2c08f6cab2fe3aee6d72ec96efbb7cedfc7d30",
+      "size_bytes": 17785927
     },
     {
       "name": "route_metrics.json",
       "destination": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route_metrics.json",
       "source_key": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route_metrics.json.gz",
       "compression": "gzip",
-      "sha256": "42dd172a402faff22a87704467049ce98733d5d1177952fbd5b1053e97dfbcfd",
-      "size_bytes": 11775361
+      "sha256": "fdb48a9eda04dc9fba188f152ffa21097a71b079545b420465b9918b3a05c701",
+      "size_bytes": 14667661
     },
     {
       "name": "model_registry.json",

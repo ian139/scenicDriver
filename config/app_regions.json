@@ -4,9 +4,10 @@
     {
       "region": "new_england_north",
       "display_name": "New England North",
-      "description": "Canonical learned coverage and Burlington-to-Bangor validated corridor.",
-      "graph": "data/processed/road_graphs/new_england_north_burlington_bangor_corridor35/road_graph.json",
+      "description": "Canonical learned coverage across the New England North full-bbox road network.",
+      "graph": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3",
       "run_name": "new_england_north_z14_v6_learned",
+      "max_route_snap_km": 1.0,
       "model_checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt",
       "bbox": {
         "min_lat": 42.488301979602255,

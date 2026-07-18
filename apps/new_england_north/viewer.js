@@ -57,6 +57,8 @@ const HEATMAP_FILL = "scenic-heatmap-fill";
 const ROUTE_SOURCE = "route-source";
 const ROUTE_BASELINE = "route-baseline";
 const ROUTE_SCENIC = "route-scenic";
+const ROUTE_ENDPOINT_SOURCE = "route-endpoint-source";
+const ROUTE_ENDPOINT_CONNECTORS = "route-endpoint-connectors";
 
 // Element lookups are null-safe: removed sections simply yield null and are
 // guarded by the helpers below (setText, etc.). Core route IDs must exist.
@@ -619,6 +621,21 @@ function routeLayer(filterKind, color, width, opacity) {
     paint,
   };
 }
+function routeEndpointConnectorLayer() {
+  return {
+    id: ROUTE_ENDPOINT_CONNECTORS,
+    type: "line",
+    source: ROUTE_ENDPOINT_SOURCE,
+    layout: { "line-join": "round", "line-cap": "round" },
+    paint: {
+      "line-color": "#f5c66b",
+      "line-width": 3,
+      "line-opacity": 0.9,
+      "line-dasharray": [1.5, 1.5],
+    },
+  };
+}
+
 function routeCoordinatesMatch(first, second) {
   return first.every((value, index) => {
     const difference = Math.abs(value - second[index]);
@@ -640,8 +657,45 @@ function validateRouteCoordinate(value, label) {
   }
   return [lon, lat];
 }
+function routeRequestCoordinate(request, endpoint) {
+  const value = request?.[endpoint];
+  if (Array.isArray(value)) {
+    if (value.length !== 2) {
+      throw new Error(`requested ${endpoint} must be a finite coordinate pair`);
+    }
+    return validateRouteCoordinate([value[1], value[0]], `requested ${endpoint}`);
+  }
+  return validateRouteCoordinate(
+    [value?.lon, value?.lat],
+    `requested ${endpoint}`
+  );
+}
 
-function validateRouteGeojson(geojson, endpoints = null) {
+function buildRouteEndpointConnectors(geojson, request) {
+  const connectors = { type: "FeatureCollection", features: [] };
+  if (request === null || request === undefined) return connectors;
+  const requestedStart = routeRequestCoordinate(request, "start");
+  const requestedEnd = routeRequestCoordinate(request, "end");
+  const scenicFeature = geojson.features.find(
+    (feature) => feature.properties?.route_kind === "scenic"
+  );
+  const snappedStart = scenicFeature.geometry.coordinates[0];
+  const snappedEnd = scenicFeature.geometry.coordinates.at(-1);
+  const addConnector = (connectorKind, coordinates) => {
+    if (routeCoordinatesMatch(coordinates[0], coordinates[1])) return;
+    connectors.features.push({
+      type: "Feature",
+      properties: { connector_kind: connectorKind },
+      geometry: { type: "LineString", coordinates },
+    });
+  };
+  addConnector("start", [requestedStart, snappedStart]);
+  addConnector("end", [snappedEnd, requestedEnd]);
+  return connectors;
+}
+
+
+function validateRouteGeojson(geojson) {
   if (
     !geojson ||
     geojson.type !== "FeatureCollection" ||
@@ -651,18 +705,6 @@ function validateRouteGeojson(geojson, endpoints = null) {
   }
   const expectedKinds = new Set(["scenic", "baseline"]);
   const seenKinds = new Set();
-  const requested = endpoints
-    ? {
-        start: validateRouteCoordinate(
-          [endpoints.start?.lon, endpoints.start?.lat],
-          "requested start"
-        ),
-        end: validateRouteCoordinate(
-          [endpoints.end?.lon, endpoints.end?.lat],
-          "requested end"
-        ),
-      }
-    : null;
   for (const [index, feature] of geojson.features.entries()) {
     const properties = feature?.properties;
     const routeKind = properties?.route_kind;
@@ -694,14 +736,7 @@ function validateRouteGeojson(geojson, endpoints = null) {
         `${routeKind} geometry coordinate ${coordinateIndex}`
       )
     );
-    if (requested) {
-      if (!routeCoordinatesMatch(coordinates[0], requested.start)) {
-        throw new Error(`${routeKind} route geometry does not start at the request`);
-      }
-      if (!routeCoordinatesMatch(coordinates.at(-1), requested.end)) {
-        throw new Error(`${routeKind} route geometry does not end at the request`);
-      }
-    }
+    // Road geometry starts and ends at the feature's snapped road positions.
   }
   for (const routeKind of expectedKinds) {
     if (!seenKinds.has(routeKind)) {
@@ -711,8 +746,9 @@ function validateRouteGeojson(geojson, endpoints = null) {
   return geojson;
 }
 
-function renderRoute(geojson, endpoints = null) {
-  validateRouteGeojson(geojson, endpoints);
+function renderRoute(geojson, request = null) {
+  validateRouteGeojson(geojson);
+  const connectors = buildRouteEndpointConnectors(geojson, request);
   if (
     !map ||
     (typeof mapReady !== "undefined" && !mapReady) ||
@@ -733,7 +769,25 @@ function renderRoute(geojson, endpoints = null) {
       map.addLayer(routeLayer("scenic", "#62c58a", 5.5, 0.96));
     }
   }
-  fitToGeojson(geojson, { maxZoom: 12 });
+  const connectorSource = map.getSource(ROUTE_ENDPOINT_SOURCE);
+  if (connectors.features.length) {
+    if (connectorSource && typeof connectorSource.setData === "function") {
+      connectorSource.setData(connectors);
+    } else {
+      if (connectorSource) removeSource(ROUTE_ENDPOINT_SOURCE);
+      map.addSource(ROUTE_ENDPOINT_SOURCE, { type: "geojson", data: connectors });
+    }
+    if (!map.getLayer(ROUTE_ENDPOINT_CONNECTORS)) {
+      map.addLayer(routeEndpointConnectorLayer());
+    }
+  } else {
+    removeLayer(ROUTE_ENDPOINT_CONNECTORS);
+    removeSource(ROUTE_ENDPOINT_SOURCE);
+  }
+  fitToGeojson(
+    { type: "FeatureCollection", features: [...geojson.features, ...connectors.features] },
+    { maxZoom: 12 }
+  );
 }
 
 function clearRoute() {
@@ -742,8 +796,10 @@ function clearRoute() {
   pendingRouteRender = null;
   activeRouteRequest = null;
   latestRoutePayload = null;
+  removeLayer(ROUTE_ENDPOINT_CONNECTORS);
   removeLayer(ROUTE_SCENIC);
   removeLayer(ROUTE_BASELINE);
+  removeSource(ROUTE_ENDPOINT_SOURCE);
   removeSource(ROUTE_SOURCE);
   if (el.submitRoute) {
     el.submitRoute.disabled =
@@ -791,6 +847,12 @@ function getSearchDiagnostics(diagnostics) {
 function routeFailurePresentation(code) {
   if (code === "no_route_found") {
     return { status: "API: no route found", title: "No route found" };
+  }
+  if (code === "route_endpoint_outside_coverage") {
+    return {
+      status: "API: outside route coverage",
+      title: "Outside route coverage",
+    };
   }
   return { status: "API: route failed", title: "Route failed" };
 }
@@ -929,7 +991,11 @@ function routeOutputMarkup(payload) {
     snappedEnd.length === 2
       ? ` Road-snapped endpoints: ${formatNumber(snappedStart[0], 5)}, ${formatNumber(snappedStart[1], 5)} → ${formatNumber(snappedEnd[0], 5)}, ${formatNumber(snappedEnd[1], 5)}.`
       : "";
-  const status = `Scenic and baseline routes are shown on the map.${snapped}`;
+  const connectors = buildRouteEndpointConnectors(payload.geojson, payload.request);
+  const connectorCopy = connectors.features.length
+    ? " Dashed lines connect selected points to the road network."
+    : "";
+  const status = `Scenic and baseline routes are shown on the map.${connectorCopy}${snapped}`;
   return verboseRouteResults ? `${status}${routeDiagnosticsMarkup(payload)}` : status;
 }
 
@@ -1395,9 +1461,9 @@ async function planRoute(event) {
     }
     const routeGeojson = validateRouteGeojson(payload.geojson);
     if (mapReady && map?.isStyleLoaded?.()) {
-      renderRoute(routeGeojson);
+      renderRoute(routeGeojson, payload.request);
     } else {
-      pendingRouteRender = { requestId, geojson: routeGeojson };
+      pendingRouteRender = { requestId, geojson: routeGeojson, request: payload.request };
     }
     renderRouteComparison(payload);
     latestRoutePayload = payload;
@@ -1576,11 +1642,22 @@ async function main() {
   const style = cartoVoyagerStyle();
 
   if (validatedRoute) {
+    const validatedConnectors = buildRouteEndpointConnectors(
+      validatedRoute.geojson,
+      validatedRoute.request
+    );
     style.sources[ROUTE_SOURCE] = { type: "geojson", data: validatedRoute.geojson };
     style.layers.push(
       routeLayer("baseline", "#ffffff", 4, 0.62),
       routeLayer("scenic", "#62c58a", 5.5, 0.96)
     );
+    if (validatedConnectors.features.length) {
+      style.sources[ROUTE_ENDPOINT_SOURCE] = {
+        type: "geojson",
+        data: validatedConnectors,
+      };
+      style.layers.push(routeEndpointConnectorLayer());
+    }
   }
 
   const camera = regionCamera(selectedRegionMetadata);
@@ -1601,7 +1678,7 @@ async function main() {
     const pending = pendingRouteRender;
     pendingRouteRender = null;
     if (pending?.requestId === routeRequestSequence) {
-      renderRoute(pending.geojson);
+      renderRoute(pending.geojson, pending.request);
     }
     syncZoomElasticity();
     el.submitRoute.disabled =

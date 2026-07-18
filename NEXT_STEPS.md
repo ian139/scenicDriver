@@ -42,7 +42,7 @@ Address search also requires a runtime `MAPBOX_ACCESS_TOKEN`.
 The hosted beta uses read-only mounts from `data/processed/` and `models/`.
 These paths are ignored by Git and must be supplied out of band:
 
-- `data/processed/road_graphs/new_england_north_burlington_bangor_corridor35/road_graph.json`
+- `data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3`
 - `data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json`
 - `data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route.geojson`
 - `data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route_metrics.json`
@@ -72,11 +72,39 @@ SHA-256 and byte size for every artifact. Keep AWS credentials and the `.env.bet
 file out of Git; provide credentials through the runtime environment or an
 external credentials file.
 
-The four largest JSON/GeoJSON objects are stored as `.gz` in S3 to make
-bootstrap transfer practical; the script decompresses them and verifies the
-uncompressed destination digest and size recorded in the manifest.
+The large SQLite graph and JSON/GeoJSON objects are stored as `.gz` in S3
+to make bootstrap transfer practical; the script decompresses them and
+verifies the uncompressed destination digest and size recorded in the manifest.
 The plain checksum list is also checked in at `deploy/beta_artifacts.sha256`
 for standard `sha256sum` tooling; keep it synchronized with the JSON manifest.
+
+## Remote full-bbox benchmark
+
+The canonical benchmark can run on a high-memory Vast CPU host with durable
+JSONL checkpoints. Keep `.secrets/aws.env` outside Git and set the S3
+destination before using the state-backed runner:
+
+```bash
+chmod 600 .secrets/aws.env
+export SCENIC_S3_BUCKET=scenicdriver-data
+export SCENIC_S3_PREFIX=outputs/vast/new-england-north-full-bbox-v1
+
+uv run python scripts/remote/vast_route_benchmark.py run full-bbox-v1 \
+  --s3-bucket "$SCENIC_S3_BUCKET" \
+  --s3-prefix "$SCENIC_S3_PREFIX" \
+  --local-secrets-env-file .secrets/aws.env \
+  --workers 2 --group-size 64
+uv run python scripts/remote/vast_route_benchmark.py status full-bbox-v1
+uv run python scripts/remote/vast_route_benchmark.py recover full-bbox-v1
+uv run python scripts/remote/vast_route_benchmark.py cleanup full-bbox-v1 \
+  --destroy --yes
+```
+
+The runner validates the canonical graph/report artifacts before launch,
+uploads only validated checkpoint snapshots, resumes by a content fingerprint,
+and refuses final S3 publication unless all planned case IDs are unique and
+persisted. See [`docs/setup/vast-training.md`](docs/setup/vast-training.md) for
+resource sizing, dry-run syntax, and interruption recovery.
 
 ## Hosted beta deployment
 

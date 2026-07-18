@@ -14,6 +14,9 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import tempfile
 from pathlib import Path
 import signal
 import sys
@@ -38,11 +41,19 @@ DEFAULT_OUTPUT = Path(
     "data/processed/routing_benchmarks/production_artifact_benchmark.json"
 )
 DEFAULT_GRAPH = Path(
-    "data/processed/road_graphs/new_england_north_burlington_bangor_corridor35/road_graph.json"
+    "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3"
 )
 DEFAULT_REPORT = Path(
     "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json"
 )
+
+_BENCHMARK_IMPLEMENTATION_PATHS = {
+    "production_benchmark": Path(__file__).resolve(),
+    "route_cost": PROJECT_ROOT / "src/route_planner/cost.py",
+    "route_graph": PROJECT_ROOT / "src/route_planner/graph.py",
+    "route_planner": PROJECT_ROOT / "src/route_planner/planner.py",
+    "route_service": PROJECT_ROOT / "src/route_planner/service.py",
+}
 Q_VALUES = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
 KAPPA_VALUES = (1.0, 1.1, 1.2, 1.4, 1.8, 2.2, 3.0)
 HIGHWAY_TYPES = frozenset(
@@ -119,6 +130,68 @@ def _json_digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _path_identity(path: Path) -> dict[str, Any]:
+    try:
+        before = path.stat()
+    except OSError:
+        return {"exists": False}
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(8 * 1024 * 1024):
+            digest.update(chunk)
+            size_bytes += len(chunk)
+    after = path.stat()
+    if (
+        int(before.st_size) != int(after.st_size)
+        or int(before.st_mtime_ns) != int(after.st_mtime_ns)
+    ):
+        raise RuntimeError(f"artifact changed while fingerprinting: {path}")
+    return {
+        "exists": True,
+        "size_bytes": size_bytes,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _checkpoint_fingerprint(
+    *,
+    corpus_path: Path,
+    corpus: Mapping[str, Any],
+    graph_path: Path,
+    report_path: Path,
+    case_timeout_seconds: float,
+    strict_service_full: bool,
+    workers: int,
+    group_size: int,
+) -> str:
+    return _json_digest(
+        {
+            "fingerprint_schema_version": 2,
+            "corpus": corpus,
+            "graph": _path_identity(graph_path),
+            "report": _path_identity(report_path),
+            "implementation": {
+                name: _path_identity(path)
+                for name, path in _BENCHMARK_IMPLEMENTATION_PATHS.items()
+            },
+            "case_timeout_seconds": float(case_timeout_seconds),
+            "strict_service_full": bool(strict_service_full),
+            "workers": int(workers),
+            "group_size": int(group_size),
+            "q_values": list(Q_VALUES),
+            "kappa_values": list(KAPPA_VALUES),
+            "strict_service_case_ids": sorted(STRICT_SERVICE_CASE_IDS),
+            "required_activation_case_ids": sorted(
+                REQUIRED_ACTIVATION_CASE_IDS
+            ),
+            "activation_case_timeout_seconds": (
+                ACTIVATION_CASE_TIMEOUT_SECONDS
+            ),
+        }
+    )
+
+
 def _haversine_km(first: tuple[float, float], second: tuple[float, float]) -> float:
     lat1, lon1, lat2, lon2 = map(math.radians, (*first, *second))
     dlat = lat2 - lat1
@@ -167,13 +240,256 @@ def _dedupe_geometry_coordinates(
     return result
 
 
+def _metadata_coordinate(value: Any) -> tuple[float, float] | None:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 2
+        or any(
+            isinstance(item, bool) or not isinstance(item, (int, float))
+            for item in value
+        )
+    ):
+        return None
+    latitude = float(value[0])
+    longitude = float(value[1])
+    if (
+        not math.isfinite(latitude)
+        or not math.isfinite(longitude)
+        or not -90.0 <= latitude <= 90.0
+        or not -180.0 <= longitude <= 180.0
+    ):
+        return None
+    return latitude, longitude
+
+
+def _geojson_coordinate(value: Any) -> tuple[float, float] | None:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 2
+        or any(
+            isinstance(item, bool) or not isinstance(item, (int, float))
+            for item in value
+        )
+    ):
+        return None
+    longitude = float(value[0])
+    latitude = float(value[1])
+    if (
+        not math.isfinite(latitude)
+        or not math.isfinite(longitude)
+        or not -90.0 <= latitude <= 90.0
+        or not -180.0 <= longitude <= 180.0
+    ):
+        return None
+    return longitude, latitude
+
+
+def _latlon_geojson_match(
+    metadata: tuple[float, float] | None,
+    geometry: tuple[float, float] | None,
+) -> bool:
+    return (
+        metadata is not None
+        and geometry is not None
+        and _close_enough(metadata[0], geometry[1])
+        and _close_enough(metadata[1], geometry[0])
+    )
+
+
+def _edge_row_is_partial(row: Mapping[str, Any], edge: Any) -> bool:
+    """Return whether an emitted row describes less than a canonical edge."""
+    source_edge_id = row.get("source_edge_id")
+    source_fraction = row.get("source_fraction")
+    row_distance = _as_float(row.get("distance_km"))
+    edge_distance = _as_float(getattr(edge, "distance_km", None))
+    return (
+        source_edge_id is not None
+        or source_fraction is not None
+        or not _close_enough(row_distance, edge_distance)
+    )
+
+
+def _edge_partial_metrics_consistent(
+    row: Mapping[str, Any],
+    edge: Any,
+) -> bool:
+    """Validate emitted partial metrics against a canonical edge."""
+    row_distance = _as_float(row.get("distance_km"))
+    edge_distance = _as_float(getattr(edge, "distance_km", None))
+    if (
+        row_distance is None
+        or row_distance < 0.0
+        or edge_distance is None
+        or edge_distance < 0.0
+    ):
+        return False
+    canonical_id = str(getattr(edge, "id", ""))
+    source_edge_id = row.get("source_edge_id")
+    if source_edge_id is not None and str(source_edge_id) != canonical_id:
+        return False
+    raw_fraction = row.get("source_fraction")
+    fraction = _as_float(raw_fraction)
+    if raw_fraction is not None and fraction is None:
+        return False
+    if fraction is None:
+        if edge_distance > 0.0:
+            fraction = row_distance / edge_distance
+        elif row_distance == 0.0:
+            fraction = 0.0
+        else:
+            return False
+    if fraction < 0.0 or fraction > 1.0:
+        return False
+    if not _close_enough(row_distance, edge_distance * fraction):
+        return False
+    row_duration = _as_float(row.get("duration_minutes"))
+    edge_duration = _as_float(
+        getattr(edge, "travel_time_minutes", None)
+    )
+    return (
+        row_duration is not None
+        and row_duration >= 0.0
+        and edge_duration is not None
+        and edge_duration >= 0.0
+        and _close_enough(row_duration, edge_duration * fraction)
+    )
+
+
+def _segment_parameter(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> float | None:
+    """Locate a latitude/longitude point on one canonical edge segment."""
+    lon_scale = math.cos(math.radians((start[0] + end[0]) / 2.0))
+    delta_lat = end[0] - start[0]
+    delta_lon = (end[1] - start[1]) * lon_scale
+    denominator = delta_lat * delta_lat + delta_lon * delta_lon
+    if denominator <= 1e-24:
+        if _close_enough(point[0], start[0]) and _close_enough(
+            point[1], start[1]
+        ):
+            return 0.0
+        return None
+    point_lat = point[0] - start[0]
+    point_lon = (point[1] - start[1]) * lon_scale
+    fraction = (
+        point_lat * delta_lat + point_lon * delta_lon
+    ) / denominator
+    if fraction < -1e-8 or fraction > 1.0 + 1e-8:
+        return None
+    fraction = min(1.0, max(0.0, fraction))
+    projected_lat = start[0] + fraction * (end[0] - start[0])
+    projected_lon = start[1] + fraction * (end[1] - start[1])
+    if not _close_enough(point[0], projected_lat) or not _close_enough(
+        point[1], projected_lon
+    ):
+        return None
+    return fraction
+
+
+def _partial_edge_geometry_consistent(
+    row: Mapping[str, Any],
+    edge: Any,
+    start_node: Any,
+    end_node: Any,
+    direction: str,
+) -> bool:
+    row_start = _metadata_coordinate(row.get("start"))
+    row_end = _metadata_coordinate(row.get("end"))
+    if row_start is None or row_end is None:
+        return False
+    canonical_start = (float(start_node.lat), float(start_node.lon))
+    canonical_end = (float(end_node.lat), float(end_node.lon))
+    edge_distance = _as_float(getattr(edge, "distance_km", None))
+    row_distance = _as_float(row.get("distance_km"))
+    if edge_distance == 0.0 and row_distance == 0.0:
+        return (
+            _close_enough(canonical_start[0], canonical_end[0])
+            and _close_enough(canonical_start[1], canonical_end[1])
+            and _close_enough(row_start[0], canonical_start[0])
+            and _close_enough(row_start[1], canonical_start[1])
+            and _close_enough(row_end[0], canonical_start[0])
+            and _close_enough(row_end[1], canonical_start[1])
+        )
+    start_fraction = _segment_parameter(
+        row_start, canonical_start, canonical_end
+    )
+    end_fraction = _segment_parameter(row_end, canonical_start, canonical_end)
+    if start_fraction is None or end_fraction is None:
+        return False
+    source_fraction = _as_float(row.get("source_fraction"))
+    if source_fraction is None:
+        if edge_distance is None or edge_distance <= 0.0 or row_distance is None:
+            source_fraction = 0.0 if row_distance == 0.0 else None
+        else:
+            source_fraction = row_distance / edge_distance
+    if source_fraction is None or not _close_enough(
+        abs(end_fraction - start_fraction), source_fraction
+    ):
+        return False
+    if direction == "reverse":
+        return end_fraction <= start_fraction + 1e-8
+    return start_fraction <= end_fraction + 1e-8
+
+
+
+def _topology_point_key(
+    point: tuple[float, float],
+    start_node: Any,
+    end_node: Any,
+) -> str:
+    if _close_enough(point[0], float(start_node.lat)) and _close_enough(
+        point[1], float(start_node.lon)
+    ):
+        return str(start_node.id)
+    if _close_enough(point[0], float(end_node.lat)) and _close_enough(
+        point[1], float(end_node.lon)
+    ):
+        return str(end_node.id)
+    return f"@{point[0]:.12f},{point[1]:.12f}"
+
+
+def _edge_topology_pair(
+    row: Mapping[str, Any],
+    edge: Any,
+    node_index: Mapping[str, Any] | None,
+) -> tuple[str, str] | None:
+    reverse = str(row.get("direction", "forward")).lower() == "reverse"
+    canonical_pair = (
+        (str(edge.end_node_id), str(edge.start_node_id))
+        if reverse
+        else (str(edge.start_node_id), str(edge.end_node_id))
+    )
+    if not _edge_row_is_partial(row, edge) or node_index is None:
+        return canonical_pair
+    start_node = node_index.get(str(edge.start_node_id))
+    end_node = node_index.get(str(edge.end_node_id))
+    row_start = _metadata_coordinate(row.get("start"))
+    row_end = _metadata_coordinate(row.get("end"))
+    if (
+        start_node is None
+        or end_node is None
+        or row_start is None
+        or row_end is None
+    ):
+        return None
+    return (
+        _topology_point_key(row_start, start_node, end_node),
+        _topology_point_key(row_end, start_node, end_node),
+    )
+
 def _edge_segment_consistent(
     edge_id: str,
     row: Mapping[str, Any],
     edge: Any,
     node_index: Mapping[str, Any] | None,
 ) -> bool:
-    if not _close_enough(
+    partial = _edge_row_is_partial(row, edge)
+    if partial:
+        if not _edge_partial_metrics_consistent(row, edge):
+            return False
+    elif not _close_enough(
         _as_float(row.get("distance_km")),
         _as_float(getattr(edge, "distance_km", None)),
     ):
@@ -188,8 +504,11 @@ def _edge_segment_consistent(
         getattr(edge, "travel_time_minutes", None)
     )
     if row_duration is None:
-        if node_index is not None:
+        if partial or node_index is not None:
             return False
+    elif partial:
+        # The proportional check above validates this duration.
+        pass
     elif not _close_enough(row_duration, edge_duration_value):
         return False
     if str(row.get("road_type", "")).lower() != str(
@@ -201,13 +520,21 @@ def _edge_segment_consistent(
         return False
     if node_index is None:
         return True
-    reverse = direction == "reverse"
-    start_id = getattr(edge, "end_node_id" if reverse else "start_node_id", None)
-    end_id = getattr(edge, "start_node_id" if reverse else "end_node_id", None)
-    start_node = node_index.get(str(start_id))
-    end_node = node_index.get(str(end_id))
-    if start_node is None or end_node is None:
+    canonical_start_node = node_index.get(str(getattr(edge, "start_node_id", None)))
+    canonical_end_node = node_index.get(str(getattr(edge, "end_node_id", None)))
+    if canonical_start_node is None or canonical_end_node is None:
         return False
+    if partial:
+        return _partial_edge_geometry_consistent(
+            row,
+            edge,
+            canonical_start_node,
+            canonical_end_node,
+            direction,
+        )
+    reverse = direction == "reverse"
+    start_node = canonical_end_node if reverse else canonical_start_node
+    end_node = canonical_start_node if reverse else canonical_end_node
     row_start = row.get("start")
     row_end = row.get("end")
     return (
@@ -278,17 +605,62 @@ def recompute_feature_metrics(
         else 0.0
     )
     segment_normalized_score = _normalise_score(segment_raw_score)
-    zero_edge_equal_endpoint = (
-        not rows
-        and requested_start is not None
-        and requested_end is not None
-        and requested_start == requested_end
+    geometry_value = feature.get("geometry", {})
+    geometry_coordinates = (
+        geometry_value.get("coordinates", [])
+        if isinstance(geometry_value, Mapping)
+        else []
     )
+    geometry_points = (
+        [_geojson_coordinate(coordinate) for coordinate in geometry_coordinates]
+        if isinstance(geometry_coordinates, list)
+        else []
+    )
+    actual_snapped_start = (
+        _metadata_coordinate(properties.get("snapped_start"))
+    )
+    actual_snapped_end = _metadata_coordinate(properties.get("snapped_end"))
+    snapped_endpoints_ok = (
+        len(geometry_points) >= 2
+        and all(point is not None for point in geometry_points)
+        and _latlon_geojson_match(actual_snapped_start, geometry_points[0])
+        and _latlon_geojson_match(actual_snapped_end, geometry_points[-1])
+    )
+    expected_requested_start = _metadata_coordinate(requested_start)
+    expected_requested_end = _metadata_coordinate(requested_end)
+    actual_requested_start = _metadata_coordinate(
+        properties.get("requested_start")
+    )
+    actual_requested_end = _metadata_coordinate(properties.get("requested_end"))
+    if requested_start is None and requested_end is None:
+        requested_endpoints_ok = (
+            actual_requested_start is not None
+            and actual_requested_end is not None
+        )
+    else:
+        requested_endpoints_ok = (
+            expected_requested_start is not None
+            and expected_requested_end is not None
+            and actual_requested_start == expected_requested_start
+            and actual_requested_end == expected_requested_end
+        )
+    zero_edge_geometry_ok = (
+        not rows
+        and len(geometry_points) == 2
+        and all(point is not None for point in geometry_points)
+        and _close_enough(
+            geometry_points[0][0], geometry_points[1][0]
+        )
+        and _close_enough(
+            geometry_points[0][1], geometry_points[1][1]
+        )
+    )
+    zero_edge_route = zero_edge_geometry_ok
     segment_durations = [
         _as_float(row.get("duration_minutes")) for row in rows
     ]
     segment_duration_available = (
-        zero_edge_equal_endpoint
+        zero_edge_route
         or (
             bool(rows)
             and all(
@@ -298,7 +670,7 @@ def recompute_feature_metrics(
     )
     segment_duration = (
         0.0
-        if zero_edge_equal_endpoint
+        if zero_edge_route
         else (
             sum(float(duration) for duration in segment_durations)
             if segment_duration_available
@@ -317,26 +689,34 @@ def recompute_feature_metrics(
     edge_metrics_available = bool(edge_ids) and all(
         edge is not None for edge in canonical_edges
     )
-    topology_available = edge_metrics_available and all(
+    topology_declared = edge_metrics_available and all(
         hasattr(edge, "start_node_id") and hasattr(edge, "end_node_id")
         for edge in canonical_edges
     )
-    oriented_node_pairs = [
-        (
-            (str(edge.end_node_id), str(edge.start_node_id))
-            if str(row.get("direction", "forward")) == "reverse"
-            else (str(edge.start_node_id), str(edge.end_node_id))
-        )
-        for row, edge in zip(rows, canonical_edges)
-    ] if topology_available else []
-    route_nodes = (
-        [oriented_node_pairs[0][0]]
-        + [end_node for _, end_node in oriented_node_pairs]
-        if oriented_node_pairs
+    topology_pairs = (
+        [
+            _edge_topology_pair(row, edge, node_index)
+            for row, edge in zip(rows, canonical_edges)
+        ]
+        if topology_declared
         else []
     )
+    topology_available = topology_declared and all(
+        pair is not None for pair in topology_pairs
+    )
+    oriented_node_pairs = (
+        [pair for pair in topology_pairs if pair is not None]
+        if topology_available
+        else []
+    )
+    route_nodes: list[str] = []
+    if oriented_node_pairs:
+        route_nodes.append(oriented_node_pairs[0][0])
+        for _, end_node in oriented_node_pairs:
+            if route_nodes[-1] != end_node:
+                route_nodes.append(end_node)
     continuity_ok = not topology_available or all(
-        previous[1] == current[0]
+        previous[1] == current[0] and not previous[1].startswith("@")
         for previous, current in zip(oriented_node_pairs, oriented_node_pairs[1:])
     )
     simple_path_ok = not topology_available or len(route_nodes) == len(set(route_nodes))
@@ -344,12 +724,6 @@ def recompute_feature_metrics(
         str(row.get("traversal_id", ""))
         == f"{index}:{str(row.get('direction', 'forward'))}:{canonical_id}"
         for index, (row, canonical_id) in enumerate(zip(rows, canonical_ids))
-    )
-    geometry_value = feature.get("geometry", {})
-    geometry_coordinates = (
-        geometry_value.get("coordinates", [])
-        if isinstance(geometry_value, Mapping)
-        else []
     )
     segment_geometry = (
         [
@@ -369,23 +743,21 @@ def recompute_feature_metrics(
         )
         else []
     )
-    if requested_start is not None and requested_end is not None:
-        requested_geometry = [
-            [float(requested_start[1]), float(requested_start[0])],
-            *segment_geometry,
-            [float(requested_end[1]), float(requested_end[0])],
-        ]
-        expected_geometry = (
-            requested_geometry
-            if zero_edge_equal_endpoint
-            else _dedupe_geometry_coordinates(requested_geometry)
+    segment_start_continuity_ok = all(
+        (
+            (previous_end := _metadata_coordinate(previous.get("end")))
+            is not None
         )
-    else:
-        expected_geometry = segment_geometry
-    geometry_sequence_coordinates = (
-        geometry_coordinates
-        if zero_edge_equal_endpoint
-        else (
+        and (
+            (current_start := _metadata_coordinate(current.get("start")))
+            is not None
+        )
+        and _close_enough(previous_end[0], current_start[0])
+        and _close_enough(previous_end[1], current_start[1])
+        for previous, current in zip(rows, rows[1:])
+    )
+    if rows:
+        geometry_sequence_coordinates = (
             _dedupe_geometry_coordinates(geometry_coordinates)
             if isinstance(geometry_coordinates, list)
             and all(
@@ -394,8 +766,13 @@ def recompute_feature_metrics(
             )
             else geometry_coordinates
         )
-    )
-    geometry_sequence_ok = geometry_sequence_coordinates == expected_geometry
+        expected_geometry = _dedupe_geometry_coordinates(segment_geometry)
+        geometry_sequence_ok = (
+            segment_start_continuity_ok
+            and geometry_sequence_coordinates == expected_geometry
+        )
+    else:
+        geometry_sequence_ok = zero_edge_geometry_ok
     edge_segment_consistency = (
         all(
             _edge_segment_consistent(
@@ -408,39 +785,69 @@ def recompute_feature_metrics(
         if edge_metrics_available
         else False
     )
+    partial_rows = (
+        edge_metrics_available
+        and any(
+            _edge_row_is_partial(row, edge)
+            for row, edge in zip(rows, canonical_edges)
+        )
+    )
+    emitted_partial_metrics_trusted = (
+        bool(partial_rows) and edge_segment_consistency
+    )
     edge_distance = (
-        sum(max(0.0, float(edge.distance_km)) for edge in canonical_edges)
-        if edge_metrics_available
-        else None
+        segment_distance
+        if emitted_partial_metrics_trusted
+        else (
+            sum(max(0.0, float(edge.distance_km)) for edge in canonical_edges)
+            if edge_metrics_available
+            else None
+        )
     )
     edge_scenic_distance = (
-        sum(
-            max(0.0, float(edge.distance_km)) * float(edge.scenic_score)
-            for edge in canonical_edges
+        segment_scenic_distance
+        if emitted_partial_metrics_trusted
+        else (
+            sum(
+                max(0.0, float(edge.distance_km)) * float(edge.scenic_score)
+                for edge in canonical_edges
+            )
+            if edge_metrics_available
+            else None
         )
-        if edge_metrics_available
-        else None
     )
     edge_raw_score = (
         edge_scenic_distance / edge_distance
         if edge_scenic_distance is not None
         and edge_distance is not None
         and edge_distance > 0.0
-        else None
+        else (
+            0.0
+            if edge_scenic_distance == 0.0 and edge_distance == 0.0
+            else None
+        )
     )
     edge_duration = (
-        sum(float(edge.travel_time_minutes) for edge in canonical_edges)
-        if edge_metrics_available
-        else None
+        segment_duration
+        if emitted_partial_metrics_trusted and segment_duration_available
+        else (
+            sum(float(edge.travel_time_minutes) for edge in canonical_edges)
+            if edge_metrics_available
+            else None
+        )
     )
     edge_highway_count = (
-        sum(
-            1
-            for edge in canonical_edges
-            if str(edge.road_type).lower() in HIGHWAY_TYPES
+        segment_highway_count
+        if emitted_partial_metrics_trusted
+        else (
+            sum(
+                1
+                for edge in canonical_edges
+                if str(edge.road_type).lower() in HIGHWAY_TYPES
+            )
+            if edge_metrics_available
+            else None
         )
-        if edge_metrics_available
-        else None
     )
     declared_distance = _as_float(properties.get("total_distance_km"))
     declared_raw_score = _as_float(properties.get("raw_scenic_score"))
@@ -467,6 +874,8 @@ def recompute_feature_metrics(
         and _close_enough(segment_duration, declared_duration),
         "highway_count": segment_highway_count == declared_highway_count,
         "geometry_sequence": geometry_sequence_ok,
+        "requested_endpoints": requested_endpoints_ok,
+        "snapped_endpoints": snapped_endpoints_ok,
     }
     if edge_metrics_available:
         edge_consistency = {
@@ -476,6 +885,8 @@ def recompute_feature_metrics(
             "simple_path": simple_path_ok,
             "traversal_identity": traversal_identity_ok,
             "geometry_sequence": geometry_sequence_ok,
+            "requested_endpoints": requested_endpoints_ok,
+            "snapped_endpoints": snapped_endpoints_ok,
             "distance": segment_consistency["distance"]
             and _close_enough(edge_distance, segment_distance),
             "raw_scenic_score": segment_consistency["raw_scenic_score"]
@@ -510,6 +921,8 @@ def recompute_feature_metrics(
                     edge_duration, declared_duration
                 ),
                 "highway_count": bool(edge_consistency["highway_count"]),
+                "requested_endpoints": requested_endpoints_ok,
+                "snapped_endpoints": snapped_endpoints_ok,
             }
     else:
         edge_consistency = segment_consistency
@@ -558,6 +971,8 @@ def recompute_feature_metrics(
         "duration_minutes": duration,
         "highway_count_declared": declared_highway_count,
         "edge_metric_consistency": edge_consistency,
+        "requested_endpoints": requested_endpoints_ok,
+        "snapped_endpoints": snapped_endpoints_ok,
         "exactness_status": properties.get("exactness_status"),
         "objective_value_declared": _as_float(properties.get("objective_value")),
         "optimality_gap": _as_float(properties.get("optimality_gap")),
@@ -1400,18 +1815,28 @@ def _invariant_summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
     return {name: dict(values) for name, values in sorted(counts.items())}
 
 
-def _case_specs(corpus: Mapping[str, Any]) -> list[CaseSpec]:
-    specs: list[CaseSpec] = []
-    for pair in corpus["pairs"]:
-        start = tuple(float(value) for value in pair["start"])
-        end = tuple(float(value) for value in pair["end"])
-        for avoid in (False, True):
-            for kappa in KAPPA_VALUES:
-                for q in Q_VALUES:
-                    specs.append(CaseSpec(str(pair["id"]), start, end, q, kappa, avoid))
-        if str(pair["id"]) == "checked_in_default_reproduction":
-            specs.append(CaseSpec(str(pair["id"]), start, end, 0.8, 1.8, False))
-    return specs
+def _row_within_case_deadline(
+    row: Mapping[str, Any],
+    configured_deadline_seconds: float,
+) -> bool:
+    deadline = _as_float(
+        row.get("case_timeout_seconds"), configured_deadline_seconds
+    )
+    return (
+        deadline is not None
+        and deadline > 0.0
+        and float(row["wall_ms"]) < deadline * 1000.0
+        and row.get("reason") != "timeout"
+    )
+
+
+ACTIVATION_CASE_TIMEOUT_SECONDS = 1_800.0
+REQUIRED_ACTIVATION_CASE_IDS = frozenset(
+    {"full_bbox_rutland_lisbon|q=0.8|kappa=1.8|avoid=false"}
+)
+EXTRA_Q08_PAIR_IDS = frozenset(
+    {"checked_in_default_reproduction", "full_bbox_rutland_lisbon"}
+)
 STRICT_SERVICE_CASE_IDS = frozenset(
     {
         "short_burlington_01|q=0|kappa=1|avoid=false",
@@ -1422,7 +1847,30 @@ STRICT_SERVICE_CASE_IDS = frozenset(
         "checked_in_default_reproduction|q=0.9|kappa=1.8|avoid=false",
         "checked_in_default_reproduction|q=0.8|kappa=1.8|avoid=false",
     }
-)
+) | REQUIRED_ACTIVATION_CASE_IDS
+
+
+def _case_specs(corpus: Mapping[str, Any]) -> list[CaseSpec]:
+    specs: list[CaseSpec] = []
+    for pair in corpus["pairs"]:
+        pair_id = str(pair["id"])
+        start = tuple(float(value) for value in pair["start"])
+        end = tuple(float(value) for value in pair["end"])
+        for avoid in (False, True):
+            for kappa in KAPPA_VALUES:
+                for q in Q_VALUES:
+                    specs.append(CaseSpec(pair_id, start, end, q, kappa, avoid))
+        if pair_id in EXTRA_Q08_PAIR_IDS:
+            specs.append(CaseSpec(pair_id, start, end, 0.8, 1.8, False))
+    return specs
+
+
+def _case_deadline_seconds(case_id: str, configured_seconds: float) -> float:
+    if configured_seconds <= 0.0:
+        return configured_seconds
+    if case_id in REQUIRED_ACTIVATION_CASE_IDS:
+        return max(configured_seconds, ACTIVATION_CASE_TIMEOUT_SECONDS)
+    return configured_seconds
 
 
 def _direct_planner_response(
@@ -1552,6 +2000,379 @@ def _direct_planner_response(
 
 
 
+def _case_id(spec: CaseSpec) -> str:
+    return (
+        f"{spec.pair_id}|q={spec.q:g}|kappa={spec.kappa:g}|"
+        f"avoid={str(spec.avoid_highways).lower()}"
+    )
+
+
+def _validate_execution_options(workers: int, group_size: int) -> None:
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ValueError("workers must be a positive integer")
+    if (
+        isinstance(group_size, bool)
+        or not isinstance(group_size, int)
+        or group_size < 0
+    ):
+        raise ValueError("group_size must be a positive integer or zero")
+
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _group_size_arg(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or a positive integer")
+    return parsed
+
+def _repair_checkpoint_tail(jsonl_path: Path) -> None:
+    if not jsonl_path.exists():
+        return
+    with jsonl_path.open("rb+") as stream:
+        valid_offset = 0
+        while True:
+            line = stream.readline()
+            if not line:
+                return
+            if not line.endswith(b"\n"):
+                stream.seek(valid_offset)
+                stream.truncate()
+                stream.flush()
+                os.fsync(stream.fileno())
+                return
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                stream.seek(valid_offset)
+                stream.truncate()
+                stream.flush()
+                os.fsync(stream.fileno())
+                return
+            if not isinstance(row, Mapping) or not isinstance(row.get("case_id"), str):
+                stream.seek(valid_offset)
+                stream.truncate()
+                stream.flush()
+                os.fsync(stream.fileno())
+                return
+            valid_offset = stream.tell()
+
+
+def _read_persisted_rows(jsonl_path: Path) -> dict[str, dict[str, Any]]:
+    persisted: dict[str, dict[str, Any]] = {}
+    if not jsonl_path.exists():
+        return persisted
+    with jsonl_path.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            case_id = row.get("case_id") if isinstance(row, Mapping) else None
+            if isinstance(case_id, str) and case_id not in persisted:
+                persisted[case_id] = dict(row)
+    return persisted
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = stream.name
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def _prepare_benchmark_context(
+    graph_path: Path, report_path: Path
+) -> tuple[
+    dict[str, Any],
+    float,
+    ScenicRoutePlanner,
+    dict[str, Any],
+    dict[str, Any],
+    Any,
+]:
+    clear_route_caches()
+    preload_started = perf_counter()
+    preload = preload_route_assets(
+        graph_path,
+        report_path,
+        exclusive_scoring=True,
+    )
+    preload_wall_ms = (perf_counter() - preload_started) * 1000.0
+    scored_graph = next(iter(route_service._SCORED_GRAPH_CACHE.values()), None)
+    if scored_graph is None:
+        raise RuntimeError("preload did not publish a scored graph variant")
+    matrix_planner = ScenicRoutePlanner(graph=scored_graph)
+    planner_preload = matrix_planner.prewarm_routing_cache()
+    edge_index = {str(edge_id): edge for edge_id, edge in scored_graph.edges.items()}
+    node_index = {str(node_id): node for node_id, node in scored_graph.nodes.items()}
+    return (
+        preload,
+        preload_wall_ms,
+        matrix_planner,
+        edge_index,
+        node_index,
+        planner_preload,
+    )
+
+
+def _execute_case(
+    *,
+    spec: CaseSpec,
+    index: int,
+    graph_path: Path,
+    report_path: Path,
+    case_timeout_seconds: float,
+    strict_service_full: bool,
+    context: tuple[dict[str, Any], ScenicRoutePlanner, dict[str, Any], dict[str, Any]],
+    route_error_cache: dict[tuple[str, bool], tuple[str, str]],
+) -> dict[str, Any]:
+    preload, matrix_planner, edge_index, node_index = context
+    request = RouteRequest(
+        graph_geojson=str(graph_path),
+        start=spec.start,
+        end=spec.end,
+        scenic_weight=spec.q,
+        max_detour_factor=spec.kappa,
+        avoid_highways=spec.avoid_highways,
+        include_baseline=True,
+        tile_scores_json=str(report_path),
+    )
+    started = perf_counter()
+    case_id = _case_id(spec)
+    case_deadline_seconds = _case_deadline_seconds(
+        case_id, case_timeout_seconds
+    )
+    strict_service = strict_service_full or case_id in STRICT_SERVICE_CASE_IDS
+    row: dict[str, Any] = {
+        "case_index": index,
+        "case_id": case_id,
+        "execution_mode": "strict_service" if strict_service else "direct_planner",
+        "pair_id": spec.pair_id,
+        "start": list(spec.start),
+        "end": list(spec.end),
+        "geodesic_distance_km": _haversine_km(spec.start, spec.end),
+        "q": spec.q,
+        "kappa": spec.kappa,
+        "avoid_highways": spec.avoid_highways,
+        "case_timeout_seconds": case_deadline_seconds,
+    }
+    route_error_key = (spec.pair_id, spec.avoid_highways)
+    cached_error = route_error_cache.get(route_error_key)
+    if cached_error is not None and not strict_service:
+        row["evaluation"] = {"status": "error"}
+        row["reason"], row["error"] = cached_error
+        row["route_error_cache_hit"] = True
+    else:
+        try:
+            with _case_deadline(case_deadline_seconds):
+                if strict_service:
+                    response = plan_routes(request)
+                else:
+                    planning_started = perf_counter()
+                    response = _direct_planner_response(
+                        matrix_planner,
+                        request,
+                        score_mapping=preload["score_mapping"],
+                    )
+                    response["diagnostics"]["planning_elapsed_ms"] = (
+                        perf_counter() - planning_started
+                    ) * 1000.0
+            row["evaluation"] = evaluate_service_response(
+                response,
+                q=spec.q,
+                kappa=spec.kappa,
+                avoid_highways=spec.avoid_highways,
+                edge_index=edge_index,
+                node_index=node_index,
+                requested_start=spec.start,
+                requested_end=spec.end,
+                scenic_priority=True,
+            )
+            row["reason"] = (
+                None
+                if row["evaluation"].get("status") == "ok"
+                else "invalid:"
+                + ",".join(row["evaluation"].get("failed_invariants", []))
+            )
+            row["route_error_cache_hit"] = False
+            if (
+                spec.pair_id == "checked_in_default_reproduction"
+                and spec.q == 0.8
+                and spec.kappa == 1.8
+                and not spec.avoid_highways
+                and row["evaluation"].get("status") == "ok"
+            ):
+                with _case_deadline(case_timeout_seconds):
+                    direct_response = _direct_planner_response(
+                        matrix_planner,
+                        request,
+                        score_mapping=preload["score_mapping"],
+                    )
+                direct_evaluation = evaluate_service_response(
+                    direct_response,
+                    q=spec.q,
+                    kappa=spec.kappa,
+                    avoid_highways=spec.avoid_highways,
+                    edge_index=edge_index,
+                    node_index=node_index,
+                    requested_start=spec.start,
+                    requested_end=spec.end,
+                    scenic_priority=True,
+                )
+                parity = _evaluations_match(row["evaluation"], direct_evaluation)
+                row["ui_reproduction_parity"] = {
+                    "strict_service": row["evaluation"],
+                    "direct_planner": direct_evaluation,
+                    "checks": parity,
+                    "pass": bool(parity) and all(parity.values()),
+                }
+                if not row["ui_reproduction_parity"]["pass"]:
+                    row["evaluation"]["status"] = "invalid"
+                    row["evaluation"].setdefault("failed_invariants", []).append(
+                        "strict_direct_parity"
+                    )
+                    row["reason"] = "invalid:strict_direct_parity"
+        except Exception as error:
+            row["evaluation"] = {"status": "error"}
+            row["reason"] = _error_reason(error)
+            row["error"] = str(error)
+            row["route_error_cache_hit"] = False
+            if row["reason"] == "no_route":
+                route_error_cache[route_error_key] = (
+                    str(row["reason"]),
+                    str(row["error"]),
+                )
+    row["wall_ms"] = (perf_counter() - started) * 1000.0
+    evaluation = row["evaluation"]
+    if evaluation.get("status") == "ok":
+        diagnostics = evaluation.get("diagnostics", {})
+        row["phase_ms"] = {
+            "graph_load": diagnostics.get("graph_load_elapsed_ms"),
+            "tile_score_load": diagnostics.get("tile_score_load_elapsed_ms"),
+            "score_application": diagnostics.get("score_application_elapsed_ms"),
+            "planning": diagnostics.get("planning_elapsed_ms"),
+        }
+        row["cache"] = {
+            "graph_cache_hit": diagnostics.get("graph_cache_hit"),
+            "tile_score_cache_hit": diagnostics.get("tile_score_cache_hit"),
+            "scored_graph_cache_hit": diagnostics.get("scored_graph_cache_hit"),
+            "report_signature": evaluation.get("score_mapping", {}).get("report_signature"),
+            "graph_signature": evaluation.get("score_mapping", {}).get("graph_signature"),
+        }
+    else:
+        row["phase_ms"] = {}
+        row["cache"] = {"route_error_cache_hit": bool(row.get("route_error_cache_hit"))}
+    return row
+
+
+_WORKER_CONTEXT: tuple[
+    dict[str, Any], ScenicRoutePlanner, dict[str, Any], dict[str, Any]
+] | None = None
+_WORKER_ERRORS: dict[tuple[str, bool], tuple[str, str]] = {}
+_WORKER_PRELOAD: dict[str, Any] = {}
+_WORKER_PRELOAD_WALL_MS = 0.0
+_WORKER_PLANNER_PRELOAD: dict[str, Any] = {}
+
+
+def _init_case_worker(graph_path: Path, report_path: Path) -> None:
+    global _WORKER_CONTEXT, _WORKER_ERRORS, _WORKER_PRELOAD, _WORKER_PRELOAD_WALL_MS, _WORKER_PLANNER_PRELOAD
+    (
+        preload,
+        preload_wall_ms,
+        planner,
+        edges,
+        nodes,
+        planner_preload,
+    ) = _prepare_benchmark_context(graph_path, report_path)
+    _WORKER_CONTEXT = (preload, planner, edges, nodes)
+    _WORKER_ERRORS = {}
+    _WORKER_PRELOAD = preload
+    _WORKER_PRELOAD_WALL_MS = preload_wall_ms
+    _WORKER_PLANNER_PRELOAD = planner_preload
+
+
+def _worker_context_snapshot() -> dict[str, Any]:
+    if _WORKER_CONTEXT is None:
+        raise RuntimeError("case worker was not initialized")
+    return {
+        "preload": _WORKER_PRELOAD,
+        "preload_wall_ms": _WORKER_PRELOAD_WALL_MS,
+        "planner_matrix_preload": _WORKER_PLANNER_PRELOAD,
+    }
+
+
+def _run_case_worker(
+    args: tuple[int, CaseSpec, Path, Path, float, bool]
+) -> dict[str, Any]:
+    if _WORKER_CONTEXT is None:
+        raise RuntimeError("case worker was not initialized")
+    index, spec, graph_path, report_path, timeout, strict_full = args
+    return _execute_case(
+        spec=spec,
+        index=index,
+        graph_path=graph_path,
+        report_path=report_path,
+        case_timeout_seconds=timeout,
+        strict_service_full=strict_full,
+        context=_WORKER_CONTEXT,
+        route_error_cache=_WORKER_ERRORS,
+    )
+
+
+def _worker_failure_row(
+    index: int, spec: CaseSpec, error: BaseException, strict_full: bool
+) -> dict[str, Any]:
+    return {
+        "case_index": index,
+        "case_id": _case_id(spec),
+        "execution_mode": (
+            "strict_service"
+            if strict_full or _case_id(spec) in STRICT_SERVICE_CASE_IDS
+            else "direct_planner"
+        ),
+        "pair_id": spec.pair_id,
+        "start": list(spec.start),
+        "end": list(spec.end),
+        "geodesic_distance_km": _haversine_km(spec.start, spec.end),
+        "q": spec.q,
+        "kappa": spec.kappa,
+        "avoid_highways": spec.avoid_highways,
+        "evaluation": {"status": "error"},
+        "reason": "worker_error",
+        "error": str(error),
+        "route_error_cache_hit": False,
+        "wall_ms": 0.0,
+        "phase_ms": {},
+        "cache": {"route_error_cache_hit": False},
+    }
+
 def run_benchmark(
     *,
     corpus_path: Path = DEFAULT_CORPUS,
@@ -1560,180 +2381,144 @@ def run_benchmark(
     output_path: Path = DEFAULT_OUTPUT,
     case_timeout_seconds: float = 10.0,
     strict_service_full: bool = False,
+    resume: bool = False,
+    workers: int = 1,
+    group_size: int = 0,
 ) -> dict[str, Any]:
+    _validate_execution_options(workers, group_size)
     corpus = _load_corpus(corpus_path)
     graph_path = Path(graph_path)
     report_path = Path(report_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_path.with_suffix(".jsonl")
-    clear_route_caches()
-    preload_started = perf_counter()
-    preload = preload_route_assets(graph_path, report_path)
-    preload_wall_ms = (perf_counter() - preload_started) * 1000.0
+    checkpoint_fingerprint = _checkpoint_fingerprint(
+        corpus_path=Path(corpus_path),
+        corpus=corpus,
+        graph_path=graph_path,
+        report_path=report_path,
+        case_timeout_seconds=case_timeout_seconds,
+        strict_service_full=strict_service_full,
+        workers=workers,
+        group_size=group_size,
+    )
+    if resume:
+        _repair_checkpoint_tail(jsonl_path)
+        persisted = _read_persisted_rows(jsonl_path)
+        incompatible = [
+            case_id
+            for case_id, row in persisted.items()
+            if row.get("checkpoint_fingerprint") != checkpoint_fingerprint
+        ]
+        if incompatible:
+            raise ValueError(
+                "benchmark checkpoint fingerprint mismatch; use a new output path "
+                "or rerun without --resume"
+            )
+    else:
+        persisted = {}
     specs = _case_specs(corpus)
-    # ``preload_route_assets`` publishes the one scored graph variant.  Keep a
-    # single planner for the matrix; repeated strict service calls below are
-    # only a compact API/cache boundary subset.
-    scored_graph = next(iter(route_service._SCORED_GRAPH_CACHE.values()), None)
-    if scored_graph is None:
-        raise RuntimeError("preload did not publish a scored graph variant")
-    matrix_planner = ScenicRoutePlanner(graph=scored_graph)
-    planner_preload = matrix_planner.prewarm_routing_cache()
-    # One canonical edge lookup powers independent segment metric
-    # recomputation for both direct and strict-service responses.
-    edge_index = {
-        str(edge_id): edge
-        for edge_id, edge in scored_graph.edges.items()
-    }
-    node_index = {
-        str(node_id): node
-        for node_id, node in scored_graph.nodes.items()
-    }
-    route_error_cache: dict[tuple[str, bool], tuple[str, str]] = {}
-    rows: list[dict[str, Any]] = []
-    with jsonl_path.open("w", encoding="utf-8") as stream:
-        for index, spec in enumerate(specs):
-            request = RouteRequest(
-                graph_geojson=str(graph_path),
-                start=spec.start,
-                end=spec.end,
-                scenic_weight=spec.q,
-                max_detour_factor=spec.kappa,
-                avoid_highways=spec.avoid_highways,
-                include_baseline=True,
-                tile_scores_json=str(report_path),
-            )
-            started = perf_counter()
-            case_id = (
-                f"{spec.pair_id}|q={spec.q:g}|kappa={spec.kappa:g}|"
-                f"avoid={str(spec.avoid_highways).lower()}"
-            )
-            strict_service = strict_service_full or case_id in STRICT_SERVICE_CASE_IDS
-            row: dict[str, Any] = {
-                "case_index": index,
-                "case_id": case_id,
-                "execution_mode": "strict_service" if strict_service else "direct_planner",
-                "pair_id": spec.pair_id,
-                "start": list(spec.start),
-                "end": list(spec.end),
-                "geodesic_distance_km": _haversine_km(spec.start, spec.end),
-                "q": spec.q,
-                "kappa": spec.kappa,
-                "avoid_highways": spec.avoid_highways,
-            }
-            route_error_key = (spec.pair_id, spec.avoid_highways)
-            cached_error = route_error_cache.get(route_error_key)
-            if cached_error is not None and not strict_service:
-                row["evaluation"] = {"status": "error"}
-                row["reason"], row["error"] = cached_error
-                row["route_error_cache_hit"] = True
-            else:
-                try:
-                    with _case_deadline(case_timeout_seconds):
-                        if strict_service:
-                            response = plan_routes(request)
-                        else:
-                            planning_started = perf_counter()
-                            response = _direct_planner_response(
-                                matrix_planner,
-                                request,
-                                score_mapping=preload["score_mapping"],
-                            )
-                            response["diagnostics"]["planning_elapsed_ms"] = (
-                                perf_counter() - planning_started
-                            ) * 1000.0
-                    row["evaluation"] = evaluate_service_response(
-                        response,
-                        q=spec.q,
-                        kappa=spec.kappa,
-                        avoid_highways=spec.avoid_highways,
-                        edge_index=edge_index,
-                        node_index=node_index,
-                        requested_start=spec.start,
-                        requested_end=spec.end,
-                        scenic_priority=True,
-                    )
-                    row["reason"] = (
-                        None
-                        if row["evaluation"].get("status") == "ok"
-                        else "invalid:"
-                        + ",".join(row["evaluation"].get("failed_invariants", []))
-                    )
-                    row["route_error_cache_hit"] = False
-                    if (
-                        spec.pair_id == "checked_in_default_reproduction"
-                        and spec.q == 0.8
-                        and spec.kappa == 1.8
-                        and not spec.avoid_highways
-                        and row["evaluation"].get("status") == "ok"
-                    ):
-                        with _case_deadline(case_timeout_seconds):
-                            direct_response = _direct_planner_response(
-                                matrix_planner,
-                                request,
-                                score_mapping=preload["score_mapping"],
-                            )
-                        direct_evaluation = evaluate_service_response(
-                            direct_response,
-                            q=spec.q,
-                            kappa=spec.kappa,
-                            avoid_highways=spec.avoid_highways,
-                            edge_index=edge_index,
-                            node_index=node_index,
-                            requested_start=spec.start,
-                            requested_end=spec.end,
-                            scenic_priority=True,
-                        )
-                        parity = _evaluations_match(
-                            row["evaluation"], direct_evaluation
-                        )
-                        row["ui_reproduction_parity"] = {
-                            "strict_service": row["evaluation"],
-                            "direct_planner": direct_evaluation,
-                            "checks": parity,
-                            "pass": bool(parity) and all(parity.values()),
-                        }
-                        if not row["ui_reproduction_parity"]["pass"]:
-                            row["evaluation"]["status"] = "invalid"
-                            row["evaluation"].setdefault(
-                                "failed_invariants", []
-                            ).append("strict_direct_parity")
-                            row["reason"] = "invalid:strict_direct_parity"
-                except BaseException as error:  # every matrix point is persisted
-                    row["evaluation"] = {"status": "error"}
-                    row["reason"] = _error_reason(error)
-                    row["error"] = str(error)
-                    row["route_error_cache_hit"] = False
-                    if row["reason"] == "no_route":
-                        route_error_cache[route_error_key] = (
-                            str(row["reason"]),
-                            str(row["error"]),
-                        )
-            row["wall_ms"] = (perf_counter() - started) * 1000.0
-            evaluation = row["evaluation"]
-            if evaluation.get("status") == "ok":
-                diagnostics = evaluation.get("diagnostics", {})
-                row["phase_ms"] = {
-                    "graph_load": diagnostics.get("graph_load_elapsed_ms"),
-                    "tile_score_load": diagnostics.get("tile_score_load_elapsed_ms"),
-                    "score_application": diagnostics.get("score_application_elapsed_ms"),
-                    "planning": diagnostics.get("planning_elapsed_ms"),
-                }
-                row["cache"] = {
-                    "graph_cache_hit": diagnostics.get("graph_cache_hit"),
-                    "tile_score_cache_hit": diagnostics.get("tile_score_cache_hit"),
-                    "scored_graph_cache_hit": diagnostics.get("scored_graph_cache_hit"),
-                    "report_signature": evaluation.get("score_mapping", {}).get("report_signature"),
-                    "graph_signature": evaluation.get("score_mapping", {}).get("graph_signature"),
-                }
-            else:
-                row["phase_ms"] = {}
-                row["cache"] = {
-                    "route_error_cache_hit": bool(row.get("route_error_cache_hit"))
-                }
+    planned_ids = [_case_id(spec) for spec in specs]
+    rows: list[dict[str, Any]] = [
+        persisted[case_id] for case_id in planned_ids if case_id in persisted
+    ]
+    if workers == 1:
+        (
+            preload,
+            preload_wall_ms,
+            matrix_planner,
+            edge_index,
+            node_index,
+            planner_preload,
+        ) = _prepare_benchmark_context(graph_path, report_path)
+        context = (preload, matrix_planner, edge_index, node_index)
+        route_error_cache: dict[tuple[str, bool], tuple[str, str]] = {}
+    else:
+        preload = {}
+        preload_wall_ms = 0.0
+        planner_preload = {"isolated_workers": workers}
+        context = None
+    if workers == 1:
+        pending_cases = (
+            (index, spec)
+            for index, spec in enumerate(specs)
+            if _case_id(spec) not in persisted
+        )
+        groups: list[list[tuple[int, CaseSpec]]] = []
+    else:
+        remaining = [
+            (index, spec)
+            for index, spec in enumerate(specs)
+            if _case_id(spec) not in persisted
+        ]
+        effective_group_size = group_size or workers
+        groups = [
+            remaining[start : start + effective_group_size]
+            for start in range(0, len(remaining), effective_group_size)
+        ]
+    stream_mode = "a" if resume and jsonl_path.exists() else "w"
+    with jsonl_path.open(stream_mode, encoding="utf-8") as stream:
+        def persist(row: dict[str, Any]) -> None:
+            row = dict(row)
+            row["checkpoint_fingerprint"] = checkpoint_fingerprint
             rows.append(row)
             stream.write(json.dumps(row, sort_keys=True) + "\n")
             stream.flush()
+            os.fsync(stream.fileno())
+
+        if workers == 1:
+            for index, spec in pending_cases:
+                persist(
+                    _execute_case(
+                        spec=spec,
+                        index=index,
+                        graph_path=graph_path,
+                        report_path=report_path,
+                        case_timeout_seconds=case_timeout_seconds,
+                        strict_service_full=strict_service_full,
+                        context=context,
+                        route_error_cache=route_error_cache,
+                    )
+                )
+        else:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_case_worker,
+                initargs=(graph_path, report_path),
+            ) as pool:
+                worker_metadata = pool.submit(_worker_context_snapshot).result()
+                preload = dict(worker_metadata["preload"])
+                preload_wall_ms = float(worker_metadata["preload_wall_ms"])
+                planner_preload = {
+                    **dict(worker_metadata["planner_matrix_preload"]),
+                    "isolated_workers": workers,
+                }
+                for group in groups:
+                    for window_start in range(0, len(group), workers):
+                        window = group[window_start : window_start + workers]
+                        futures = {
+                            pool.submit(
+                                _run_case_worker,
+                                (
+                                    index,
+                                    spec,
+                                    graph_path,
+                                    report_path,
+                                    case_timeout_seconds,
+                                    strict_service_full,
+                                ),
+                            ): (index, spec)
+                            for index, spec in window
+                        }
+                        for future in as_completed(futures):
+                            index, spec = futures[future]
+                            try:
+                                row = future.result()
+                            except Exception as error:
+                                row = _worker_failure_row(
+                                    index, spec, error, strict_service_full
+                                )
+                            persist(row)
+    rows.sort(key=lambda row: planned_ids.index(str(row["case_id"])))
     discovered, missing = _classify_pairs(corpus, rows)
     completed = [row for row in rows if row["evaluation"].get("status") == "ok"]
     wall_values = [float(row["wall_ms"]) for row in rows]
@@ -1794,8 +2579,7 @@ def run_benchmark(
     invariant_summary = _invariant_summary(rows)
     if case_timeout_seconds > 0.0:
         latency_pass = all(
-            float(row["wall_ms"]) < case_timeout_seconds * 1000.0
-            and row.get("reason") != "timeout"
+            _row_within_case_deadline(row, case_timeout_seconds)
             for row in rows
         )
         invariant_summary["all_case_latency_sla"] = {
@@ -1809,6 +2593,7 @@ def run_benchmark(
         "corpus_path": str(corpus_path),
         "graph_path": str(graph_path),
         "report_path": str(report_path),
+        "checkpoint_fingerprint": checkpoint_fingerprint,
         "historical_screenshot_coordinates": corpus.get("historical_screenshot_coordinates"),
         "historical_screenshot_blocker": corpus.get("historical_screenshot_blocker"),
         "matrix": {
@@ -1821,7 +2606,10 @@ def run_benchmark(
             "failed_cases": len(specs) - len(completed),
             "case_timeout_seconds": case_timeout_seconds,
             "strict_service_full": bool(strict_service_full),
-            "all_cases_persisted": len(rows) == len(specs),
+            "all_cases_persisted": (
+                len(rows) == len(specs)
+                and {str(row.get("case_id")) for row in rows} == set(planned_ids)
+            ),
             "execution_mode_counts": {
                 "direct_planner": sum(
                     1 for row in rows if row.get("execution_mode") == "direct_planner"
@@ -1831,11 +2619,19 @@ def run_benchmark(
                 ),
             },
             "strict_service_case_ids": sorted(STRICT_SERVICE_CASE_IDS),
+            "required_activation_case_ids": sorted(
+                REQUIRED_ACTIVATION_CASE_IDS
+            ),
+            "activation_case_timeout_seconds": (
+                ACTIVATION_CASE_TIMEOUT_SECONDS
+            ),
         },
         "preload": {
             **preload,
             "preload_wall_ms": preload_wall_ms,
             "planner_matrix_preload": planner_preload,
+            "preload_scope": "parent" if workers == 1 else "isolated_worker",
+            "preload_worker_count": workers,
         },
         "categories": {
             "required": list(REQUIRED_CATEGORIES),
@@ -1875,7 +2671,15 @@ def run_benchmark(
         "ui_reproduction_parity": ui_reproduction_parity,
         "results_jsonl": str(jsonl_path),
     }
-    output_path.write_text(json.dumps({**payload, "results": rows}, indent=2, sort_keys=True), encoding="utf-8")
+    if payload["matrix"]["all_cases_persisted"]:
+        jsonl_text = "".join(
+            json.dumps(row, sort_keys=True) + "\n" for row in rows
+        )
+        _atomic_write_text(jsonl_path, jsonl_text)
+        _atomic_write_text(
+            output_path,
+            json.dumps({**payload, "results": rows}, indent=2, sort_keys=True),
+        )
     return payload
 
 
@@ -1900,6 +2704,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Execute every matrix case through plan_routes instead of the direct planner adapter.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from the sibling JSONL checkpoint, skipping persisted case IDs.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=_positive_int,
+        default=1,
+        help="Bounded isolated worker processes (default: 1).",
+    )
+    parser.add_argument(
+        "--group-size",
+        type=_group_size_arg,
+        default=0,
+        help="Cases per checkpoint window; zero uses one worker-width window.",
+    )
     return parser.parse_args()
 
 
@@ -1912,6 +2733,9 @@ def main() -> None:
         output_path=args.output,
         case_timeout_seconds=args.case_timeout_seconds,
         strict_service_full=args.strict_service_full,
+        resume=args.resume,
+        workers=args.workers,
+        group_size=args.group_size,
     )
     print(json.dumps({key: value for key, value in payload.items() if key != "results"}, indent=2, sort_keys=True))
     print(f"Wrote {args.output}")

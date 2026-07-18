@@ -22,6 +22,7 @@ import requests
 from urllib.parse import quote
 
 from src.route_planner.service import (
+    RouteCoverageError,
     RouteConfigurationError,
     RouteRequest,
     diagnose_route_request,
@@ -199,8 +200,10 @@ def _region_to_graph(region: str) -> Path:
     candidates = [
         ROAD_GRAPHS_DIR / f"{key}_core/road_graph.geojson",
         ROAD_GRAPHS_DIR / f"{key}_core/road_graph.json",
+        ROAD_GRAPHS_DIR / f"{key}_core/road_graph.sqlite3",
         ROAD_GRAPHS_DIR / key / "road_graph.geojson",
         ROAD_GRAPHS_DIR / key / "road_graph.json",
+        ROAD_GRAPHS_DIR / key / "road_graph.sqlite3",
     ]
     for c in candidates:
         if c.exists():
@@ -386,7 +389,8 @@ def _preload_configured_route_assets(
                 graph_path,
                 tile_path,
                 item.get("tile_score_zoom"),
-                item.get("tile_score_fallback", 1.0),
+                None,
+                exclusive_scoring=True,
             )
             if not isinstance(preload_result, dict):
                 preload_result = {}
@@ -521,10 +525,19 @@ def _list_regions() -> list[dict[str, Any]]:
     if not ROAD_GRAPHS_DIR.exists():
         return regions
     for d in sorted([x for x in ROAD_GRAPHS_DIR.iterdir() if x.is_dir()]):
-        graph_geojson = d / "road_graph.geojson"
-        graph_json = d / "road_graph.json"
-        graph = graph_geojson if graph_geojson.exists() else graph_json
-        if not graph.exists():
+        graph = next(
+            (
+                candidate
+                for candidate in (
+                    d / "road_graph.geojson",
+                    d / "road_graph.json",
+                    d / "road_graph.sqlite3",
+                )
+                if candidate.exists()
+            ),
+            None,
+        )
+        if graph is None:
             continue
         region = d.name.replace("_core", "")
         if region.lower() in configured_keys:
@@ -540,7 +553,7 @@ def _list_regions() -> list[dict[str, Any]]:
                 bbox = payload.get("bbox")
             except Exception:
                 bbox = None
-        if bbox is None:
+        if bbox is None and graph.suffix != ".sqlite3":
             bbox = _compute_geojson_bbox(graph)
         regions.append(
             {
@@ -1002,15 +1015,56 @@ def _validate_route_geometry(
             _invalid_route_geometry(
                 f"{route_kind} route geometry has fewer than two coordinates"
             )
-        coordinates = _dedupe_route_coordinates(
-            [
-                _route_coordinate(
-                    coordinate,
-                    label=f"{route_kind} geometry coordinate {coordinate_index}",
-                )
-                for coordinate_index, coordinate in enumerate(raw_coordinates)
-            ]
+        parsed_raw_coordinates = [
+            _route_coordinate(
+                coordinate,
+                label=f"{route_kind} geometry coordinate {coordinate_index}",
+            )
+            for coordinate_index, coordinate in enumerate(raw_coordinates)
+        ]
+
+        requested_start = _route_coordinate(
+            properties.get("requested_start"),
+            label=f"{route_kind} requested_start",
+            latitude_first=True,
         )
+        requested_end = _route_coordinate(
+            properties.get("requested_end"),
+            label=f"{route_kind} requested_end",
+            latitude_first=True,
+        )
+        expected_requested_start = (float(request.start[1]), float(request.start[0]))
+        expected_requested_end = (float(request.end[1]), float(request.end[0]))
+        if not _route_coordinates_match(
+            requested_start, expected_requested_start
+        ):
+            _invalid_route_geometry(
+                f"{route_kind} requested_start does not match the route request"
+            )
+        if not _route_coordinates_match(requested_end, expected_requested_end):
+            _invalid_route_geometry(
+                f"{route_kind} requested_end does not match the route request"
+            )
+
+        snapped_start = _route_coordinate(
+            properties.get("snapped_start"),
+            label=f"{route_kind} snapped_start",
+            latitude_first=True,
+        )
+        snapped_end = _route_coordinate(
+            properties.get("snapped_end"),
+            label=f"{route_kind} snapped_end",
+            latitude_first=True,
+        )
+        if not _route_coordinates_match(snapped_start, parsed_raw_coordinates[0]):
+            _invalid_route_geometry(
+                f"{route_kind} snapped_start does not match route geometry"
+            )
+        if not _route_coordinates_match(snapped_end, parsed_raw_coordinates[-1]):
+            _invalid_route_geometry(
+                f"{route_kind} snapped_end does not match route geometry"
+            )
+
         rows = properties.get("segment_identity")
         if not isinstance(rows, list):
             _invalid_route_geometry(
@@ -1024,6 +1078,22 @@ def _validate_route_geometry(
             _invalid_route_geometry(
                 f"{route_kind} segment identity does not match route metrics"
             )
+
+        if not rows:
+            if (
+                len(parsed_raw_coordinates) != 2
+                or not _route_coordinates_match(
+                    parsed_raw_coordinates[0], parsed_raw_coordinates[1]
+                )
+            ):
+                _invalid_route_geometry(
+                    f"{route_kind} zero-edge route geometry must contain "
+                    "exactly two equal positions"
+                )
+            validated[route_kind] = feature
+            continue
+
+        coordinates = _dedupe_route_coordinates(parsed_raw_coordinates)
         segment_coordinates: list[tuple[float, float]] = []
         previous_end: tuple[float, float] | None = None
         for row_index, row in enumerate(rows):
@@ -1052,18 +1122,13 @@ def _validate_route_geometry(
                 segment_coordinates.append(segment_start)
             segment_coordinates.append(segment_end)
             previous_end = segment_end
-        if segment_coordinates:
-            expected_coordinates = _dedupe_route_coordinates(segment_coordinates)
-            if len(coordinates) != len(expected_coordinates) or any(
-                not _route_coordinates_match(actual, expected)
-                for actual, expected in zip(coordinates, expected_coordinates)
-            ):
-                _invalid_route_geometry(
-                    f"{route_kind} route geometry omits or reorders scored segments"
-                )
-        elif len(coordinates) < 2:
+        expected_coordinates = _dedupe_route_coordinates(segment_coordinates)
+        if len(coordinates) != len(expected_coordinates) or any(
+            not _route_coordinates_match(actual, expected)
+            for actual, expected in zip(coordinates, expected_coordinates)
+        ):
             _invalid_route_geometry(
-                f"{route_kind} zero-edge route geometry is not renderable"
+                f"{route_kind} route geometry omits or reorders scored segments"
             )
         validated[route_kind] = feature
     if set(validated) != expected_kinds:
@@ -1489,6 +1554,7 @@ def create_app() -> FastAPI:
 
     @app.post("/v1/route/compare")
     def route_compare(payload: RouteCompareRequest) -> dict[str, Any]:
+        configured = _app_region(payload.region)
         _safe_asset_name(payload.region, kind="region")
         try:
             graph_path = _region_to_graph(payload.region)
@@ -1523,6 +1589,11 @@ def create_app() -> FastAPI:
             include_baseline=payload.include_baseline,
             tile_scores_json=str(report_json),
             tile_score_fallback=None,
+            max_snap_distance_km=(
+                configured.get("max_route_snap_km")
+                if configured is not None
+                else None
+            ),
         )
         try:
             result = plan_routes(req)
@@ -1534,6 +1605,24 @@ def create_app() -> FastAPI:
                 detail={
                     "error": "route_configuration_invalid",
                     "message": "Route planning configuration is invalid.",
+                },
+            ) from exc
+        except RouteCoverageError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "route_endpoint_outside_coverage",
+                    "message": (
+                        f"The {exc.endpoint} point is too far from the "
+                        "supported road network."
+                    ),
+                    "hint": (
+                        "Choose a point within the selected region's route "
+                        "coverage."
+                    ),
+                    "endpoint": exc.endpoint,
+                    "snap_distance_km": float(exc.snap_distance_km),
+                    "max_snap_distance_km": float(exc.max_snap_distance_km),
                 },
             ) from exc
         except ValueError as exc:

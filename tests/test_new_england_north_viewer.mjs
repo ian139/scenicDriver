@@ -42,11 +42,24 @@ assert.ok(outputStart >= 0 && outputEnd > outputStart);
 const outputSource = viewerSource.slice(outputStart, outputEnd);
 
 function makeRouteOutputHarness() {
-  const context = { Number, String, Array, Object, Math };
+  const context = {
+    Number,
+    String,
+    Array,
+    Object,
+    Math,
+    Set,
+    ROUTE_SOURCE: "route-source",
+    ROUTE_BASELINE: "route-baseline",
+    ROUTE_SCENIC: "route-scenic",
+    ROUTE_ENDPOINT_SOURCE: "route-endpoint-source",
+    ROUTE_ENDPOINT_CONNECTORS: "route-endpoint-connectors",
+  };
   vm.runInNewContext(
     `${formatterSource}
 ${displaySource}
 ${diagnosticsSource}
+${routeSource}
 let verboseRouteResults = false;
 ${outputSource}
 globalThis.routeOutputMarkup = routeOutputMarkup;
@@ -408,34 +421,21 @@ function makeHarness() {
 }
 
 function makeRouteGeojson() {
+  const coordinates = Array.from({ length: 3001 }, (_, index) => [
+    -75.2 + index * 0.000001,
+    40.04 + index * 0.000001,
+  ]);
   return {
     type: "FeatureCollection",
-    features: [
-      {
-        type: "Feature",
-        properties: { route_kind: "scenic" },
-        geometry: {
-          type: "LineString",
-          coordinates: [
-            [-75.22, 40.03],
-            [-75.21, 40.04],
-            [-75.19, 40.065],
-          ],
-        },
+    features: ["scenic", "baseline"].map((routeKind) => ({
+      type: "Feature",
+      properties: {
+        route_kind: routeKind,
+        snapped_start: [40.04, -75.2],
+        snapped_end: [40.043, -75.197],
       },
-      {
-        type: "Feature",
-        properties: { route_kind: "baseline" },
-        geometry: {
-          type: "LineString",
-          coordinates: [
-            [-75.22, 40.03],
-            [-75.2, 40.045],
-            [-75.19, 40.065],
-          ],
-        },
-      },
-    ],
+      geometry: { type: "LineString", coordinates: coordinates.map((point) => [...point]) },
+    })),
   };
 }
 
@@ -478,6 +478,8 @@ function makeRouteHarness() {
     ROUTE_SOURCE: "route-source",
     ROUTE_BASELINE: "route-baseline",
     ROUTE_SCENIC: "route-scenic",
+    ROUTE_ENDPOINT_SOURCE: "route-endpoint-source",
+    ROUTE_ENDPOINT_CONNECTORS: "route-endpoint-connectors",
     map,
     removeLayer: (id) => {
       if (map.getLayer(id)) map.removeLayer(id);
@@ -490,46 +492,140 @@ function makeRouteHarness() {
   vm.runInNewContext(
     `${routeSource}
 globalThis.renderRoute = renderRoute;
-globalThis.validateRouteGeojson = validateRouteGeojson;`,
+globalThis.validateRouteGeojson = validateRouteGeojson;
+globalThis.buildRouteEndpointConnectors = buildRouteEndpointConnectors;`,
     context
   );
   return { context, layers, sources, operations, fitted, previousSource };
 }
 
-test("route rendering validates complete endpoint geometry before replacing source", () => {
+test("route rendering preserves long road geometry and installs separate endpoint connectors", () => {
   const harness = makeRouteHarness();
-  const endpoints = {
+  const request = {
     start: { lat: 40.03, lon: -75.22 },
     end: { lat: 40.065, lon: -75.19 },
   };
   const geojson = makeRouteGeojson();
-  harness.context.renderRoute(geojson, endpoints);
+  harness.context.renderRoute(geojson, request);
 
   const installed = harness.sources.get("route-source");
   assert.deepEqual(installed.data, geojson);
-  assert.equal(harness.layers.size, 2);
-  assert.deepEqual(harness.fitted, [geojson]);
-  assert.ok(
-    installed.data.features.every(
-      (feature) =>
-        feature.geometry.type === "LineString" &&
-        feature.geometry.coordinates[0][0] === endpoints.start.lon &&
-        feature.geometry.coordinates[0][1] === endpoints.start.lat &&
-        feature.geometry.coordinates.at(-1)[0] === endpoints.end.lon &&
-        feature.geometry.coordinates.at(-1)[1] === endpoints.end.lat
-    )
+  assert.equal(installed.data.features[0].geometry.coordinates.length, 3001);
+  assert.deepEqual(
+    installed.data.features[0].geometry.coordinates.at(-1),
+    [-75.197, 40.043]
   );
+  const connectorSource = harness.sources.get("route-endpoint-source");
+  assert.deepEqual(JSON.parse(JSON.stringify(connectorSource.data.features)), [
+    {
+      type: "Feature",
+      properties: { connector_kind: "start" },
+      geometry: {
+        type: "LineString",
+        coordinates: [[-75.22, 40.03], [-75.2, 40.04]],
+      },
+    },
+    {
+      type: "Feature",
+      properties: { connector_kind: "end" },
+      geometry: {
+        type: "LineString",
+        coordinates: [[-75.197, 40.043], [-75.19, 40.065]],
+      },
+    },
+  ]);
+  assert.equal(harness.layers.size, 3);
+  assert.equal(harness.layers.get("route-endpoint-connectors").paint["line-color"], "#f5c66b");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(harness.fitted[0].features.slice(-2))),
+    JSON.parse(JSON.stringify(connectorSource.data.features))
+  );
+});
 
-  const sourceBeforeInvalid = installed;
-  const invalid = JSON.parse(JSON.stringify(geojson));
-  invalid.features[0].geometry.coordinates[0] = [-75.23, 40.03];
+test("connector builder accepts artifact arrays and omits zero-length connectors", () => {
+  const harness = makeRouteHarness();
+  const geojson = makeRouteGeojson();
+  const connectors = harness.context.buildRouteEndpointConnectors(geojson, {
+    start: [40.04, -75.2],
+    end: [40.065, -75.19],
+  });
+  assert.equal(connectors.features.length, 1);
+  assert.equal(connectors.features[0].properties.connector_kind, "end");
+  assert.deepEqual(
+    Array.from(connectors.features[0].geometry.coordinates.at(-1)),
+    [-75.19, 40.065]
+  );
+});
+
+test("malformed request coordinates cannot replace an installed route", () => {
+  const harness = makeRouteHarness();
+  const geojson = makeRouteGeojson();
+  harness.context.renderRoute(geojson, {
+    start: { lat: 40.03, lon: -75.22 },
+    end: { lat: 40.065, lon: -75.19 },
+  });
+  const sourceBeforeInvalid = harness.sources.get("route-source");
+  const fitCount = harness.fitted.length;
   assert.throws(
-    () => harness.context.renderRoute(invalid, endpoints),
-    /does not start at the request/
+    () => harness.context.renderRoute(makeRouteGeojson(), {
+      start: { lat: Number.NaN, lon: -75.22 },
+      end: { lat: 40.065, lon: -75.19 },
+    }),
+    /requested start must be a finite coordinate pair/
   );
   assert.strictEqual(harness.sources.get("route-source"), sourceBeforeInvalid);
-  assert.equal(harness.fitted.length, 1);
+  assert.equal(harness.fitted.length, fitCount);
 });
+
+test("array requests with extra coordinates cannot replace an installed route", () => {
+  const harness = makeRouteHarness();
+  const geojson = makeRouteGeojson();
+  harness.context.renderRoute(geojson, {
+    start: { lat: 40.03, lon: -75.22 },
+    end: { lat: 40.065, lon: -75.19 },
+  });
+  const sourcesBeforeInvalid = new Map(harness.sources);
+  const layersBeforeInvalid = new Map(harness.layers);
+  const operationCount = harness.operations.length;
+  const fitCount = harness.fitted.length;
+
+  assert.throws(
+    () => harness.context.renderRoute(makeRouteGeojson(), {
+      start: [40.03, -75.22, 123],
+      end: [40.065, -75.19],
+    }),
+    /requested start must be a finite coordinate pair/
+  );
+  assert.deepEqual(new Map(harness.sources), sourcesBeforeInvalid);
+  assert.deepEqual(new Map(harness.layers), layersBeforeInvalid);
+  assert.equal(harness.operations.length, operationCount);
+  assert.equal(harness.fitted.length, fitCount);
+});
+
+test("rendering snapped endpoints removes stale connector source and layer", () => {
+  const harness = makeRouteHarness();
+  const geojson = makeRouteGeojson();
+  harness.context.renderRoute(geojson, {
+    start: { lat: 40.03, lon: -75.22 },
+    end: { lat: 40.065, lon: -75.19 },
+  });
+  harness.context.renderRoute(geojson, {
+    start: [40.04, -75.2],
+    end: [40.043, -75.197],
+  });
+  assert.equal(harness.sources.has("route-endpoint-source"), false);
+  assert.equal(harness.layers.has("route-endpoint-connectors"), false);
+});
+test("pending renders retain their request and clear removes both route sources", () => {
+  assert.match(
+    viewerSource,
+    /pendingRouteRender = \{ requestId, geojson: routeGeojson, request: payload\.request \}/
+  );
+  assert.match(viewerSource, /renderRoute\(pending\.geojson, pending\.request\)/);
+  assert.match(viewerSource, /removeLayer\(ROUTE_ENDPOINT_CONNECTORS\)/);
+  assert.match(viewerSource, /removeSource\(ROUTE_ENDPOINT_SOURCE\)/);
+});
+
 
 const response = (payload) => ({ ok: true, json: async () => payload });
 const tick = (ms = 230) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -543,6 +639,11 @@ test("route failure presentation distinguishes no-route constraints", () => {
   const noRoute = context.routeFailurePresentation("no_route_found");
   assert.equal(noRoute.status, "API: no route found");
   assert.equal(noRoute.title, "No route found");
+  const outside = context.routeFailurePresentation(
+    "route_endpoint_outside_coverage"
+  );
+  assert.equal(outside.status, "API: outside route coverage");
+  assert.equal(outside.title, "Outside route coverage");
   const other = context.routeFailurePresentation("server_error");
   assert.equal(other.status, "API: route failed");
   assert.equal(other.title, "Route failed");

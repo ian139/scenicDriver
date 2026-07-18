@@ -30,7 +30,7 @@ from .cost import (
     is_highway_road_type,
     resolve_routing_policy,
 )
-from .graph import Edge, Node, RoadGraph
+from .graph import Edge, EdgeProjection, Node, RoadGraph
 
 _ORIGINAL_SCENIC_CALCULATE = ScenicCostFunction.calculate
 _ORIGINAL_SCENIC_ROAD_TYPE_ADJUSTMENT = (
@@ -3092,21 +3092,31 @@ class ScenicRoutePlanner:
         overlay._heuristic_structure_epoch = base._heuristic_structure_epoch
         overlay._reverse_edge_views = {}
 
+        epsilon = 1e-12
+
+        def endpoint_node_id(
+            projections: List[EdgeProjection], virtual_id: str
+        ) -> str:
+            """Collapse an endpoint only when every tied projection agrees."""
+            boundary_node_ids: set[str] = set()
+            for projection in projections:
+                fraction = float(projection.fraction)
+                if fraction <= epsilon:
+                    boundary_node_ids.add(str(projection.edge.start_node_id))
+                elif fraction >= 1.0 - epsilon:
+                    boundary_node_ids.add(str(projection.edge.end_node_id))
+                else:
+                    return virtual_id
+            if len(boundary_node_ids) == 1:
+                return next(iter(boundary_node_ids))
+            return virtual_id
+
         start_projection = start_projections[0]
         end_projection = end_projections[0]
-        epsilon = 1e-12
-        start_fraction = float(start_projection.fraction)
-        end_fraction = float(end_projection.fraction)
-        start_id = "__route_request_start__"
-        end_id = "__route_request_end__"
-        if start_fraction <= epsilon:
-            start_id = str(start_projection.edge.start_node_id)
-        elif start_fraction >= 1.0 - epsilon:
-            start_id = str(start_projection.edge.end_node_id)
-        if end_fraction <= epsilon:
-            end_id = str(end_projection.edge.start_node_id)
-        elif end_fraction >= 1.0 - epsilon:
-            end_id = str(end_projection.edge.end_node_id)
+        start_id = endpoint_node_id(
+            start_projections, "__route_request_start__"
+        )
+        end_id = endpoint_node_id(end_projections, "__route_request_end__")
         while start_id in overlay.nodes and start_id.startswith("__route_request_start__"):
             start_id += "_"
         while (
@@ -3142,6 +3152,9 @@ class ScenicRoutePlanner:
             from_node: str,
             to_node: str,
             fraction: float,
+            *,
+            start_coordinate: Tuple[float, float] | None = None,
+            end_coordinate: Tuple[float, float] | None = None,
         ) -> Edge:
             fraction = min(1.0, max(0.0, float(fraction)))
             value = Edge(
@@ -3160,6 +3173,10 @@ class ScenicRoutePlanner:
                 "reverse" if ":reverse" in edge_id else "forward"
             )
             value.source_fraction = fraction
+            if start_coordinate is not None:
+                value.route_start_coordinate = start_coordinate
+            if end_coordinate is not None:
+                value.route_end_coordinate = end_coordinate
             return value
 
         if start_is_virtual:
@@ -3173,6 +3190,10 @@ class ScenicRoutePlanner:
                         start_id,
                         edge.end_node_id,
                         1.0 - fraction,
+                        start_coordinate=(
+                            float(projection.lat),
+                            float(projection.lon),
+                        ),
                     )
                 )
                 if not edge.one_way:
@@ -3183,6 +3204,10 @@ class ScenicRoutePlanner:
                             start_id,
                             edge.start_node_id,
                             fraction,
+                            start_coordinate=(
+                                float(projection.lat),
+                                float(projection.lon),
+                            ),
                         )
                     )
 
@@ -3197,6 +3222,10 @@ class ScenicRoutePlanner:
                         edge.start_node_id,
                         end_id,
                         fraction,
+                        end_coordinate=(
+                            float(projection.lat),
+                            float(projection.lon),
+                        ),
                     )
                 )
                 if not edge.one_way:
@@ -3207,6 +3236,10 @@ class ScenicRoutePlanner:
                             edge.end_node_id,
                             end_id,
                             1.0 - fraction,
+                            end_coordinate=(
+                                float(projection.lat),
+                                float(projection.lon),
+                            ),
                         )
                     )
 
@@ -3230,6 +3263,14 @@ class ScenicRoutePlanner:
                             start_id,
                             end_id,
                             end_fraction - start_fraction,
+                            start_coordinate=(
+                                float(projection.lat),
+                                float(projection.lon),
+                            ),
+                            end_coordinate=(
+                                float(end_projection.lat),
+                                float(end_projection.lon),
+                            ),
                         )
                     )
                 if not edge.one_way and start_fraction >= end_fraction:
@@ -3240,6 +3281,14 @@ class ScenicRoutePlanner:
                             start_id,
                             end_id,
                             start_fraction - end_fraction,
+                            start_coordinate=(
+                                float(projection.lat),
+                                float(projection.lon),
+                            ),
+                            end_coordinate=(
+                                float(end_projection.lat),
+                                float(end_projection.lon),
+                            ),
                         )
                     )
         overlay._route_endpoint_node_ids = (start_id, end_id)
@@ -3407,12 +3456,6 @@ class ScenicRoutePlanner:
             raise ValueError("No route found between the given coordinates.")
         _, best_edges, start_projection, end_projection = best
         render_graph = RoadGraph()
-        render_graph.nodes = dict(base.nodes)
-        render_graph.edges = dict(base.edges)
-        render_graph.adjacency = {
-            node_id: list(adjacencies)
-            for node_id, adjacencies in base.adjacency.items()
-        }
         render_graph.add_node(
             Node(start_id, float(start_projection.lat), float(start_projection.lon))
         )
@@ -3420,8 +3463,9 @@ class ScenicRoutePlanner:
             Node(end_id, float(end_projection.lat), float(end_projection.lon))
         )
         for edge in best_edges:
-            if edge.id not in render_graph.edges:
-                render_graph.add_edge(edge)
+            for node_id in (str(edge.start_node_id), str(edge.end_node_id)):
+                if node_id not in render_graph.nodes:
+                    render_graph.add_node(base.get_node(node_id))
         policy = resolve_routing_policy(
             scenic_weight=0.0,
             kappa=1.0,
@@ -5024,6 +5068,16 @@ class ScenicRoutePlanner:
         for index, edge in enumerate(edges):
             start_node = self.graph.get_node(edge.start_node_id)
             end_node = self.graph.get_node(edge.end_node_id)
+            start_coordinate = getattr(
+                edge,
+                "route_start_coordinate",
+                (start_node.lat, start_node.lon),
+            )
+            end_coordinate = getattr(
+                edge,
+                "route_end_coordinate",
+                (end_node.lat, end_node.lon),
+            )
             direction = str(
                 getattr(
                     edge,
@@ -5045,8 +5099,14 @@ class ScenicRoutePlanner:
             traversal_ids.append(traversal_id)
             normalized_score_run.append((traversal_id, score_values[index]))
             segment = RouteSegment(
-                start=(start_node.lat, start_node.lon),
-                end=(end_node.lat, end_node.lon),
+                start=(
+                    float(start_coordinate[0]),
+                    float(start_coordinate[1]),
+                ),
+                end=(
+                    float(end_coordinate[0]),
+                    float(end_coordinate[1]),
+                ),
                 distance_km=float(edge.distance_km),
                 scenic_score=score_values[index],
                 road_name=edge.road_name,
@@ -5060,8 +5120,12 @@ class ScenicRoutePlanner:
             segment.source_fraction = getattr(edge, "source_fraction", None)
             segments.append(segment)
             if not waypoints:
-                waypoints.append((start_node.lat, start_node.lon))
-            waypoints.append((end_node.lat, end_node.lon))
+                waypoints.append(
+                    (float(start_coordinate[0]), float(start_coordinate[1]))
+                )
+            waypoints.append(
+                (float(end_coordinate[0]), float(end_coordinate[1]))
+            )
 
         edge_ids = tuple(canonical_edge_ids)
         score_run = tuple(normalized_score_run)

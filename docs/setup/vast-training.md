@@ -160,6 +160,79 @@ Validation checklist:
 - [ ] `aws s3 sync` uploads the output directory to the output prefix.
 - [ ] No long training command starts before every item above passes.
 
+## Large CPU route and graph runs
+
+OSM graph conversion and the production routing benchmark are CPU/memory
+workloads; they do not need a GPU. Use a verified Vast CPU offer with at least
+32 GB RAM (64 GB preferred), four vCPUs, 64 GB disk, and direct SSH access.
+The local preload measured about 5.8 GB peak RSS, but live isolated workers on
+the 64 GB Vast host reached roughly 15–20 GB each. The wrapper therefore
+reserves 24,576 MiB per worker plus 8,192 MiB for the OS and parent process.
+
+The state-backed runner derives workers as:
+
+```text
+min(nproc, floor((MemTotal_MiB - 8192) / 24576), 32)
+```
+
+Set `--workers` explicitly when a smaller, predictable footprint is preferred.
+`--group-size` bounds the number of cases submitted in each checkpoint window.
+The graph, learned report, corpus, and output defaults are the canonical
+full-bbox paths; override them only for a deliberate artifact variant.
+
+First verify the generated remote script without allocating a host:
+
+```bash
+uv run python scripts/remote/vast_route_benchmark.py run full-bbox-v1 \
+  --dry-run \
+  --s3-bucket "$SCENIC_S3_BUCKET" \
+  --s3-prefix "$SCENIC_S3_PREFIX" |
+  bash -n
+```
+
+Create `.secrets/aws.env` outside Git with the remote S3 credentials, then
+launch the resumable run:
+
+```bash
+export SCENIC_S3_BUCKET=scenicdriver-data
+export SCENIC_S3_PREFIX=outputs/vast/new-england-north-full-bbox-v1
+chmod 600 .secrets/aws.env
+
+uv run python scripts/remote/vast_route_benchmark.py run full-bbox-v1 \
+  --s3-bucket "$SCENIC_S3_BUCKET" \
+  --s3-prefix "$SCENIC_S3_PREFIX" \
+  --local-secrets-env-file .secrets/aws.env \
+  --workers 2 \
+  --group-size 64
+```
+
+The runner records the Vast instance, SSH endpoint, remote PID, resource
+probe, checkpoint path, and S3 keys in
+`.cmux-vast/state/full-bbox-v1.json`. It snapshots the JSONL checkpoint before
+each S3 upload and resumes only when the stored checkpoint fingerprint matches
+the graph, report, corpus, timeout, worker, and grouping configuration. The
+final JSON is uploaded only when every planned case has a unique persisted row
+and a consistent fingerprint.
+
+Monitor or recover without destroying the host:
+
+```bash
+uv run python scripts/remote/vast_route_benchmark.py status full-bbox-v1
+uv run python scripts/remote/vast_route_benchmark.py recover full-bbox-v1
+```
+
+After validating the recovered checkpoint and final JSON, recover once more and
+destroy the host:
+
+```bash
+uv run python scripts/remote/vast_route_benchmark.py cleanup full-bbox-v1 \
+  --destroy --yes
+```
+
+On interruption, run `recover` before `cleanup`; cleanup always attempts
+recovery first. Never reuse a task name with an incompatible graph, report,
+corpus, worker, or group configuration.
+
 ## State-backed train-and-close lifecycle
 
 For a normal run, use the repository wrapper. It allocates a host, copies the
@@ -245,3 +318,4 @@ For repository workspace and orchestration conventions, see [`../internal/cmux-w
 - [`../../compose.remote-training.yml`](../../compose.remote-training.yml) — local GPU/container smoke service
 - [`../../scripts/remote/provision_vast.sh`](../../scripts/remote/provision_vast.sh) — fail-fast validation script
 - [`../../scripts/remote/vast_train.py`](../../scripts/remote/vast_train.py) — state-backed lifecycle implementation
+- [`../../scripts/remote/vast_route_benchmark.py`](../../scripts/remote/vast_route_benchmark.py) — resumable full-bbox CPU benchmark lifecycle

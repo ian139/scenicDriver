@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from array import array
+from collections.abc import Iterable, Iterator, Mapping
 import json
 import math
+import os
 from pathlib import Path
 import re
+import sqlite3
+import tempfile
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 import msgspec
@@ -278,6 +282,7 @@ class RoadGraph:
             Tuple[int, Tuple[str, ...], array, array, array, array, array, array]
         ] = None
         self._nearest_edge_projection_index: Optional[Tuple[Any, ...]] = None
+        self.artifact_metadata: dict[str, Any] = {}
 
     def _advance_heuristic_epoch(self) -> None:
         self._heuristic_structure_epoch += 1
@@ -490,19 +495,20 @@ class RoadGraph:
         self.adjacency.setdefault(edge.start_node_id, []).append((edge.id, False))
         if not edge.one_way:
             self.adjacency.setdefault(edge.end_node_id, []).append((edge.id, True))
-    def _bulk_load(self, nodes: List[_NodeRow], edges: List[_EdgeRow]) -> None:
-        """Populate rows without firing mapping mutation hooks per item.
-
-        The graph is private to ``load`` while rows are normalized and
-        inserted sequentially.  Node assignment retains ``add_node``'s
-        overwrite behavior: duplicate IDs replace the node while preserving
-        insertion position and existing adjacency.
-        """
+    def _bulk_load(
+        self,
+        nodes: Iterable[_NodeRow],
+        edges: Iterable[_EdgeRow],
+    ) -> tuple[bool, bool]:
+        """Populate rows without firing mapping mutation hooks per item."""
+        saw_nodes = False
+        saw_edges = False
         # The graph is private to ``load`` until this method returns, so
         # normalize and insert directly.  Base-dict calls bypass per-row
         # nearest-index/heuristic hooks while preserving normal dict order and
         # add_node's duplicate overwrite behavior.
         for row in nodes:
+            saw_nodes = True
             node_id = str(row.id)
             dict.__setitem__(
                 self.nodes,
@@ -516,6 +522,7 @@ class RoadGraph:
             self.adjacency.setdefault(node_id, [])
 
         for row in edges:
+            saw_edges = True
             edge_id = str(row.id)
             start_node_id = str(row.start_node_id)
             end_node_id = str(row.end_node_id)
@@ -545,10 +552,11 @@ class RoadGraph:
             if not edge.one_way:
                 self.adjacency.setdefault(end_node_id, []).append((edge_id, True))
 
-        if nodes:
+        if saw_nodes:
             self._invalidate_nearest_spatial_index()
-        if nodes or edges:
+        if saw_nodes or saw_edges:
             self._advance_heuristic_epoch()
+        return saw_nodes, saw_edges
 
     def get_node(self, node_id: str) -> Node:
         return self.nodes[node_id]
@@ -765,8 +773,24 @@ class RoadGraph:
                 )
         projections.sort(key=lambda item: (item[0], item[1]))
         return [projection for _edge_id, _edge_key, projection in projections], best_distance
+    def save(
+        self,
+        path: Path,
+        *,
+        metadata: Mapping[str, object] | None = None,
+    ) -> None:
+        path = Path(path)
+        if path.suffix.lower() == ".sqlite3":
+            metadata_values = dict(self.artifact_metadata)
+            if metadata is not None:
+                metadata_values.update(metadata)
+            _write_sqlite_graph(
+                path,
+                _iter_graph_rows(self.nodes.values(), self.edges.values()),
+                metadata=metadata_values,
+            )
+            return
 
-    def save(self, path: Path) -> None:
         data = {
             "nodes": [
                 {"id": n.id, "lat": n.lat, "lon": n.lon}
@@ -792,6 +816,9 @@ class RoadGraph:
 
     @classmethod
     def load(cls, path: Path) -> "RoadGraph":
+        path = Path(path)
+        if path.suffix.lower() == ".sqlite3":
+            return _load_sqlite_graph(path)
         # Decode bytes directly into compact typed rows.  This avoids a
         # temporary dict for every node and edge while retaining the legacy
         # JSON object/array schema.
@@ -903,125 +930,467 @@ def _parse_osmnx_length_km(raw_length: Any) -> Optional[float]:
     if not math.isfinite(length_m) or length_m <= 0.0:
         return None
     return length_m / 1000.0
+def _stable_osm_sort_key(value: Any) -> tuple[int, object, str]:
+    """Sort OSM identifiers deterministically without assuming one ID type."""
+    if isinstance(value, bool):
+        return (1, str(value), "")
+    try:
+        return (0, int(value), "")
+    except (TypeError, ValueError, OverflowError):
+        return (1, type(value).__name__, str(value))
 
 
-def _graph_from_osmnx(G: Any, scenic_scores: Dict[str, float]) -> RoadGraph:
-    graph = RoadGraph()
+def _osmnx_node_data(G: Any) -> Mapping[Any, Any]:
+    nodes = getattr(G, "nodes")
+    if hasattr(nodes, "__getitem__"):
+        return nodes
+    return {node_id: data for node_id, data in nodes(data=True)}
 
-    for node_id, data in G.nodes(data=True):
-        graph.add_node(
-            Node(
+
+def _iter_osmnx_base_nodes(G: Any) -> Iterator[Node]:
+    nodes = getattr(G, "nodes")
+    if callable(nodes) and not hasattr(nodes, "__getitem__"):
+        rows = sorted(nodes(data=True), key=lambda row: _stable_osm_sort_key(row[0]))
+        for node_id, data in rows:
+            yield Node(
                 id=str(node_id),
                 lat=float(data.get("y")),
                 lon=float(data.get("x")),
             )
+        return
+
+    for node_id in sorted(nodes, key=_stable_osm_sort_key):
+        data = nodes[node_id]
+        yield Node(
+            id=str(node_id),
+            lat=float(data.get("y")),
+            lon=float(data.get("x")),
         )
 
-    for u, v, key, data in G.edges(keys=True, data=True):
-        edge_id = f"{u}-{v}-{key}"
-        total_length_km = _parse_osmnx_length_km(data.get("length"))
-        scenic_score = float(scenic_scores.get(str(data.get("osmid", edge_id)), 5.0))
-        road_name = data.get("name")
-        road_type = _normalize_road_type(data.get("highway", "secondary"))
-        speed_kmh = _parse_speed_limit_kmh(data.get("maxspeed"), road_type)
-        # osmnx graphs are directed. Keep this edge as directed by default
-        # and only synthesize reverse traversal when we are sure it's needed.
-        one_way = _parse_one_way(data.get("oneway"), default=True)
-        if not one_way and G.has_edge(v, u):
-            one_way = True
 
-        start_id = str(u)
-        end_id = str(v)
-        start_node = graph.get_node(start_id)
-        end_node = graph.get_node(end_id)
+def _iter_osmnx_edge_triples(
+    G: Any,
+) -> Iterator[tuple[Any, Any, Any, Mapping[str, Any]]]:
+    successors = getattr(G, "succ", None)
+    if successors is not None and hasattr(successors, "__getitem__"):
+        for start_id in sorted(successors, key=_stable_osm_sort_key):
+            neighbours = successors[start_id]
+            for end_id in sorted(neighbours, key=_stable_osm_sort_key):
+                keyed_edges = neighbours[end_id]
+                for key in sorted(keyed_edges, key=_stable_osm_sort_key):
+                    yield start_id, end_id, key, keyed_edges[key]
+        return
 
-        # OSMnx stores LineString coordinates as (lon, lat).  Keep the original
-        # graph endpoints and add deterministic nodes for each interior point.
-        geometry = data.get("geometry")
-        geometry_coords: List[Tuple[float, float]] = []
-        if geometry is not None:
-            try:
-                raw_coords = list(geometry.coords)
-            except (AttributeError, NotImplementedError, TypeError):
-                raw_coords = geometry if isinstance(geometry, (list, tuple)) else []
-            for point in raw_coords:
-                if len(point) >= 2:
-                    geometry_coords.append((float(point[0]), float(point[1])))
+    rows = list(G.edges(keys=True, data=True))
+    rows.sort(
+        key=lambda row: (
+            _stable_osm_sort_key(row[0]),
+            _stable_osm_sort_key(row[1]),
+            _stable_osm_sort_key(row[2]),
+        )
+    )
+    yield from rows
 
-        if len(geometry_coords) >= 2:
-            start_xy = (start_node.lon, start_node.lat)
-            end_xy = (end_node.lon, end_node.lat)
-            forward_error = (
-                (geometry_coords[0][0] - start_xy[0]) ** 2
-                + (geometry_coords[0][1] - start_xy[1]) ** 2
-                + (geometry_coords[-1][0] - end_xy[0]) ** 2
-                + (geometry_coords[-1][1] - end_xy[1]) ** 2
-            )
-            reverse_error = (
-                (geometry_coords[-1][0] - start_xy[0]) ** 2
-                + (geometry_coords[-1][1] - start_xy[1]) ** 2
-                + (geometry_coords[0][0] - end_xy[0]) ** 2
-                + (geometry_coords[0][1] - end_xy[1]) ** 2
-            )
-            if reverse_error < forward_error:
-                geometry_coords.reverse()
-            interior_coords = geometry_coords[1:-1]
+
+def _convert_osmnx_edge(
+    G: Any,
+    node_data: Mapping[Any, Any],
+    u: Any,
+    v: Any,
+    key: Any,
+    data: Mapping[str, Any],
+    scenic_scores: Mapping[str, float],
+) -> tuple[tuple[Node, ...], tuple[Edge, ...]]:
+    edge_id = f"{u}-{v}-{key}"
+    total_length_km = _parse_osmnx_length_km(data.get("length"))
+    scenic_score = float(scenic_scores.get(str(data.get("osmid", edge_id)), 5.0))
+    road_name = data.get("name")
+    if road_name is not None and not isinstance(road_name, str):
+        road_name = str(road_name)
+    road_type = _normalize_road_type(data.get("highway", "secondary"))
+    speed_kmh = _parse_speed_limit_kmh(data.get("maxspeed"), road_type)
+    one_way = _parse_one_way(data.get("oneway"), default=True)
+    if not one_way and G.has_edge(v, u):
+        one_way = True
+
+    start_id = str(u)
+    end_id = str(v)
+    start_data = node_data[u]
+    end_data = node_data[v]
+    start_node = Node(
+        id=start_id,
+        lat=float(start_data.get("y")),
+        lon=float(start_data.get("x")),
+    )
+    end_node = Node(
+        id=end_id,
+        lat=float(end_data.get("y")),
+        lon=float(end_data.get("x")),
+    )
+
+    geometry = data.get("geometry")
+    geometry_coords: list[tuple[float, float]] = []
+    if geometry is not None:
+        try:
+            raw_coords = list(geometry.coords)
+        except (AttributeError, NotImplementedError, TypeError):
+            raw_coords = geometry if isinstance(geometry, (list, tuple)) else []
+        for point in raw_coords:
+            if len(point) >= 2:
+                geometry_coords.append((float(point[0]), float(point[1])))
+
+    if len(geometry_coords) >= 2:
+        start_xy = (start_node.lon, start_node.lat)
+        end_xy = (end_node.lon, end_node.lat)
+        forward_error = (
+            (geometry_coords[0][0] - start_xy[0]) ** 2
+            + (geometry_coords[0][1] - start_xy[1]) ** 2
+            + (geometry_coords[-1][0] - end_xy[0]) ** 2
+            + (geometry_coords[-1][1] - end_xy[1]) ** 2
+        )
+        reverse_error = (
+            (geometry_coords[-1][0] - start_xy[0]) ** 2
+            + (geometry_coords[-1][1] - start_xy[1]) ** 2
+            + (geometry_coords[0][0] - end_xy[0]) ** 2
+            + (geometry_coords[0][1] - end_xy[1]) ** 2
+        )
+        if reverse_error < forward_error:
+            geometry_coords.reverse()
+        interior_coords = geometry_coords[1:-1]
+    else:
+        interior_coords = []
+
+    interior_nodes = tuple(
+        Node(
+            id=f"{u}-{v}-{key}-coord-{coordinate_index}",
+            lat=lat,
+            lon=lon,
+        )
+        for coordinate_index, (lon, lat) in enumerate(interior_coords, start=1)
+    )
+    coordinate_nodes = (start_node, *interior_nodes, end_node)
+    node_ids = [node.id for node in coordinate_nodes]
+    chord_distances_km = [
+        _haversine_km(
+            segment_start.lat,
+            segment_start.lon,
+            segment_end.lat,
+            segment_end.lon,
+        )
+        for segment_start, segment_end in zip(
+            coordinate_nodes, coordinate_nodes[1:]
+        )
+    ]
+    chord_total_km = math.fsum(chord_distances_km)
+    if total_length_km is not None:
+        if math.isfinite(chord_total_km) and chord_total_km > 0.0:
+            segment_distances_km = [
+                total_length_km * chord / chord_total_km
+                for chord in chord_distances_km
+            ]
         else:
-            interior_coords = []
+            segment_distances_km = [
+                total_length_km / len(chord_distances_km)
+                for _ in chord_distances_km
+            ]
+    else:
+        segment_distances_km = chord_distances_km
 
-        node_ids = [start_id]
-        for coordinate_index, (lon, lat) in enumerate(interior_coords, start=1):
-            intermediate_id = f"{u}-{v}-{key}-coord-{coordinate_index}"
-            graph.add_node(Node(id=intermediate_id, lat=lat, lon=lon))
-            node_ids.append(intermediate_id)
-        node_ids.append(end_id)
-
-        chord_distances_km: List[float] = []
-        for segment_start, segment_end in zip(node_ids, node_ids[1:]):
-            segment_start_node = graph.get_node(segment_start)
-            segment_end_node = graph.get_node(segment_end)
-            chord_distances_km.append(
-                _haversine_km(
-                    segment_start_node.lat,
-                    segment_start_node.lon,
-                    segment_end_node.lat,
-                    segment_end_node.lon,
-                )
-            )
-
-        chord_total_km = math.fsum(chord_distances_km)
-        if total_length_km is not None:
-            if math.isfinite(chord_total_km) and chord_total_km > 0.0:
-                segment_distances_km = [
-                    total_length_km * chord / chord_total_km
-                    for chord in chord_distances_km
-                ]
-            else:
-                segment_distances_km = [
-                    total_length_km / len(chord_distances_km)
-                    for _ in chord_distances_km
-                ]
-        else:
-            segment_distances_km = chord_distances_km
-
+    edges = tuple(
+        Edge(
+            id=f"{u}-{v}-{key}-segment-{coordinate_index}",
+            start_node_id=segment_start,
+            end_node_id=segment_end,
+            distance_km=float(segment_distances_km[coordinate_index]),
+            scenic_score=float(max(0.0, min(10.0, scenic_score))),
+            road_name=road_name,
+            road_type=road_type,
+            speed_limit_kmh=speed_kmh,
+            one_way=one_way,
+        )
         for coordinate_index, (segment_start, segment_end) in enumerate(
             zip(node_ids, node_ids[1:])
-        ):
-            graph.add_edge(
-                Edge(
-                    id=f"{u}-{v}-{key}-segment-{coordinate_index}",
-                    start_node_id=segment_start,
-                    end_node_id=segment_end,
-                    distance_km=float(segment_distances_km[coordinate_index]),
-                    scenic_score=float(max(0.0, min(10.0, scenic_score))),
-                    road_name=road_name,
-                    road_type=road_type,
-                    speed_limit_kmh=speed_kmh,
-                    one_way=one_way,
-                )
+        )
+    )
+    return interior_nodes, edges
+
+
+def _iter_osmnx_edge_conversions(
+    G: Any,
+    scenic_scores: Mapping[str, float],
+) -> Iterator[tuple[tuple[Node, ...], tuple[Edge, ...]]]:
+    node_data = _osmnx_node_data(G)
+    for u, v, key, data in _iter_osmnx_edge_triples(G):
+        yield _convert_osmnx_edge(G, node_data, u, v, key, data, scenic_scores)
+
+
+def _iter_osmnx_graph_rows(
+    G: Any,
+    scenic_scores: Mapping[str, float],
+) -> Iterator[tuple[str, Node | Edge]]:
+    for node in _iter_osmnx_base_nodes(G):
+        yield "node", node
+    for interior_nodes, edges in _iter_osmnx_edge_conversions(G, scenic_scores):
+        for node in interior_nodes:
+            yield "node", node
+        for edge in edges:
+            yield "edge", edge
+
+
+def _iter_graph_rows(
+    nodes: Iterable[Node],
+    edges: Iterable[Edge],
+) -> Iterator[tuple[str, Node | Edge]]:
+    for node in nodes:
+        yield "node", node
+    for edge in edges:
+        yield "edge", edge
+
+
+_SQLITE_GRAPH_FORMAT = "scenic-roadgraph-sqlite"
+_SQLITE_SCHEMA_VERSION = 1
+_SQLITE_BATCH_SIZE = 100_000
+
+
+def _json_metadata_value(value: object) -> str:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SQLite graph metadata must be JSON-serializable") from exc
+
+
+def _write_sqlite_graph(
+    path: Path,
+    rows: Iterable[tuple[str, Node | Edge]],
+    *,
+    metadata: Mapping[str, object] | None = None,
+) -> tuple[int, int]:
+    """Write graph rows to a sibling temporary SQLite database atomically."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    metadata_values = dict(metadata or {})
+    existing_format = metadata_values.get("graph_format", _SQLITE_GRAPH_FORMAT)
+    existing_version = metadata_values.get("schema_version", _SQLITE_SCHEMA_VERSION)
+    if existing_format != _SQLITE_GRAPH_FORMAT:
+        raise ValueError(f"Unsupported SQLite graph format: {existing_format!r}")
+    if isinstance(existing_version, bool) or existing_version != _SQLITE_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported SQLite graph schema version: {existing_version!r}"
+        )
+    metadata_values["graph_format"] = _SQLITE_GRAPH_FORMAT
+    metadata_values["schema_version"] = _SQLITE_SCHEMA_VERSION
+
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    node_count = 0
+    edge_count = 0
+    node_batch: list[tuple[str, float, float]] = []
+    edge_batch: list[tuple[object, ...]] = []
+
+    def flush_nodes(connection: sqlite3.Connection) -> None:
+        if node_batch:
+            connection.executemany(
+                "INSERT INTO nodes(id, lat, lon) VALUES (?, ?, ?)",
+                node_batch,
+            )
+            node_batch.clear()
+
+    def flush_edges(connection: sqlite3.Connection) -> None:
+        if edge_batch:
+            connection.executemany(
+                """
+                INSERT INTO edges(
+                    id, start_node_id, end_node_id, distance_km,
+                    scenic_score, road_name, road_type, speed_limit_kmh, one_way
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                edge_batch,
+            )
+            edge_batch.clear()
+
+    try:
+        with sqlite3.connect(temporary_path) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE metadata(
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE nodes(
+                    id TEXT PRIMARY KEY,
+                    lat REAL NOT NULL,
+                    lon REAL NOT NULL
+                );
+                CREATE TABLE edges(
+                    id TEXT PRIMARY KEY,
+                    start_node_id TEXT NOT NULL,
+                    end_node_id TEXT NOT NULL,
+                    distance_km REAL NOT NULL,
+                    scenic_score REAL NOT NULL,
+                    road_name TEXT,
+                    road_type TEXT NOT NULL,
+                    speed_limit_kmh REAL,
+                    one_way INTEGER NOT NULL CHECK(one_way IN (0, 1))
+                );
+                """
+            )
+            for kind, row in rows:
+                if kind == "node" and isinstance(row, Node):
+                    node_batch.append((str(row.id), float(row.lat), float(row.lon)))
+                    node_count += 1
+                    if len(node_batch) >= _SQLITE_BATCH_SIZE:
+                        flush_nodes(connection)
+                elif kind == "edge" and isinstance(row, Edge):
+                    edge_batch.append(
+                        (
+                            str(row.id),
+                            str(row.start_node_id),
+                            str(row.end_node_id),
+                            float(row.distance_km),
+                            float(row.scenic_score),
+                            None if row.road_name is None else str(row.road_name),
+                            str(row.road_type),
+                            None
+                            if row.speed_limit_kmh is None
+                            else float(row.speed_limit_kmh),
+                            int(bool(row.one_way)),
+                        )
+                    )
+                    edge_count += 1
+                    if len(edge_batch) >= _SQLITE_BATCH_SIZE:
+                        flush_edges(connection)
+                else:
+                    raise ValueError(f"Invalid graph row kind or value: {kind!r}")
+            flush_nodes(connection)
+            flush_edges(connection)
+            metadata_values["node_count"] = node_count
+            metadata_values["edge_count"] = edge_count
+            metadata_values["counts"] = {"nodes": node_count, "edges": edge_count}
+            connection.executemany(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                [
+                    (str(key), _json_metadata_value(value))
+                    for key, value in sorted(metadata_values.items())
+                ],
+            )
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or integrity[0] != "ok":
+                raise ValueError(f"SQLite integrity check failed: {integrity!r}")
+            connection.commit()
+        os.replace(temporary_path, destination)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return node_count, edge_count
+
+
+def _sqlite_metadata(connection: sqlite3.Connection) -> dict[str, Any]:
+    try:
+        rows = connection.execute("SELECT key, value FROM metadata").fetchall()
+    except sqlite3.DatabaseError as exc:
+        raise ValueError("SQLite graph metadata table is unavailable") from exc
+    metadata: dict[str, Any] = {}
+    for key, value in rows:
+        if not isinstance(key, str) or key in metadata:
+            raise ValueError("SQLite graph metadata contains duplicate keys")
+        try:
+            metadata[key] = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid SQLite graph metadata value for {key!r}") from exc
+    if metadata.get("graph_format") != _SQLITE_GRAPH_FORMAT:
+        raise ValueError(
+            f"Unsupported SQLite graph format: {metadata.get('graph_format')!r}"
+        )
+    schema_version = metadata.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != _SQLITE_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported SQLite graph schema version: {schema_version!r}"
+        )
+    return metadata
+
+
+def _iter_sqlite_nodes(connection: sqlite3.Connection) -> Iterator[_NodeRow]:
+    cursor = connection.execute("SELECT id, lat, lon FROM nodes ORDER BY rowid")
+    while True:
+        batch = cursor.fetchmany(_SQLITE_BATCH_SIZE)
+        if not batch:
+            return
+        for node_id, lat, lon in batch:
+            yield _NodeRow(id=node_id, lat=lat, lon=lon)
+
+
+def _iter_sqlite_edges(connection: sqlite3.Connection) -> Iterator[_EdgeRow]:
+    cursor = connection.execute(
+        """
+        SELECT id, start_node_id, end_node_id, distance_km,
+               scenic_score, road_name, road_type, speed_limit_kmh, one_way
+        FROM edges
+        ORDER BY rowid
+        """
+    )
+    while True:
+        batch = cursor.fetchmany(_SQLITE_BATCH_SIZE)
+        if not batch:
+            return
+        for row in batch:
+            yield _EdgeRow(
+                id=row[0],
+                start_node_id=row[1],
+                end_node_id=row[2],
+                distance_km=row[3],
+                scenic_score=row[4],
+                road_name=row[5],
+                road_type=row[6],
+                speed_limit_kmh=row[7],
+                one_way=row[8],
             )
 
+
+def _load_sqlite_graph(path: Path) -> RoadGraph:
+    from urllib.parse import quote
+
+    resolved = Path(path).expanduser().resolve()
+    uri = f"file:{quote(str(resolved), safe='/')}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+    except sqlite3.DatabaseError as exc:
+        raise ValueError(f"Invalid SQLite road graph: {path}") from exc
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        metadata = _sqlite_metadata(connection)
+        graph = RoadGraph()
+        graph._bulk_load(
+            _iter_sqlite_nodes(connection),
+            _iter_sqlite_edges(connection),
+        )
+        graph.artifact_metadata = metadata
+        return graph
+    except sqlite3.DatabaseError as exc:
+        raise ValueError(f"Invalid SQLite road graph: {path}") from exc
+    finally:
+        connection.close()
+
+
+def _graph_from_osmnx(G: Any, scenic_scores: Dict[str, float]) -> RoadGraph:
+    graph = RoadGraph()
+    for kind, row in _iter_osmnx_graph_rows(G, scenic_scores):
+        if kind == "node":
+            graph.add_node(row)  # type: ignore[arg-type]
+        else:
+            graph.add_edge(row)  # type: ignore[arg-type]
     return graph
+
+
 
 
 _ROAD_TYPE_SPEED_KMH = {

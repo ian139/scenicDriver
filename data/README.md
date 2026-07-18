@@ -70,6 +70,27 @@ Generate combined overlay directly:
 
 - `uv run python scripts/routing/route_compare_service.py --start 42.40 -72.70 --end 42.48 -72.62 --scenic-weight 0.8 --run-name <run_name> --graph-geojson <graph>`
 
+## Canonical Full-Bbox Road Graph
+
+The deployed New England North graph is the ignored SQLite artifact
+`data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3`.
+Its source extracts are cached under
+`cache/osm-pbf/new_england_north_full_bbox_v1/`, conversion intermediates under
+`cache/osmnx/new_england_north_full_bbox_v1/`, and build metadata beside the
+graph. These paths stay outside Git; beta bootstrap downloads the compressed
+artifact from the deployment manifest.
+
+Build it with the canonical full-bbox command in the root README, then run:
+
+```bash
+uv run python scripts/routing/check_beta_artifacts.py --project-root .
+```
+
+The checker validates the SQLite format/schema, configured bbox, row counts,
+coverage probes, and integrity before startup. Keep the previous corridor
+artifact and manifest for rollback: restore its graph/config/manifest paths,
+rerun the checker, and restart only after the rollback artifact passes.
+
 ## Git Policy
 
 Large datasets and generated artifacts are ignored via `.gitignore`.

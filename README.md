@@ -192,6 +192,50 @@ uv run python scripts/routing/route_compare_service.py \
 
 The viewer accepts `route.geojson`, or the fallback pair `route_scenic.geojson` and `route_fast.geojson`, and renders distance/time/scenic deltas when overlay data is available.
 
+#### Canonical New England North full-bbox graph
+
+The active New England North route artifact is the ignored SQLite graph
+`data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3`.
+It covers the configured bbox (`42.488301979602255..47.50235895196859`,
+`-73.5205078125..-66.796875`). Source PBFs and OSMnx intermediates remain in
+`cache/osm-pbf/new_england_north_full_bbox_v1/` and
+`cache/osmnx/new_england_north_full_bbox_v1/`; generated graph and run metadata
+remain under `data/processed/` and are not committed.
+
+Build the canonical artifact from the dated, checksum-verified extracts:
+
+```bash
+uv run --with 'osmnx==2.1.0' python scripts/routing/build_graph_from_osm.py \
+  --min-lat 42.488301979602255 --min-lon -73.5205078125 \
+  --max-lat 47.50235895196859 --max-lon -66.796875 \
+  --network drive --run-name new_england_north_full_bbox_v1 \
+  --graph-format sqlite3 \
+  --cache-folder cache/osmnx/new_england_north_full_bbox_v1 \
+  --require-source-checksums \
+  --source-pbf cache/osm-pbf/new_england_north_full_bbox_v1/new-york-260716.osm.pbf \
+  --source-pbf cache/osm-pbf/new_england_north_full_bbox_v1/vermont-260716.osm.pbf \
+  --source-pbf cache/osm-pbf/new_england_north_full_bbox_v1/new-hampshire-260716.osm.pbf \
+  --source-pbf cache/osm-pbf/new_england_north_full_bbox_v1/maine-260716.osm.pbf \
+  --source-pbf cache/osm-pbf/new_england_north_full_bbox_v1/massachusetts-260716.osm.pbf \
+  --source-pbf cache/osm-pbf/new_england_north_full_bbox_v1/quebec-260716.osm.pbf \
+  --source-pbf cache/osm-pbf/new_england_north_full_bbox_v1/new-brunswick-260716.osm.pbf \
+  --coverage-probe rutland_usps 43.60784414 -72.98226538 \
+  --coverage-probe lisbon_police 44.02516775 -70.10003245 \
+  --coverage-probe burlington 44.475884 -73.214003 \
+  --coverage-probe bangor 44.801616 -68.771305
+```
+
+Validate before activation and after bootstrap:
+
+```bash
+uv run python scripts/routing/check_beta_artifacts.py --project-root .
+```
+
+For rollback, keep the prior corridor graph and manifest objects, restore the
+previous graph/config paths, rerun the checker, and only then restart the beta
+API. Do not delete the old artifact until the new deployment passes its smoke
+probes.
+
 ### Remote GPU workflow
 
 Use [`docs/setup/vast-training.md`](docs/setup/vast-training.md) for the complete Vast.ai runbook: canonical GPU image build/publish, S3 and GPU smoke gates, minimal inference, state-backed training, monitoring, artifact recovery, and destroy/cleanup commands. The reusable image is `Dockerfile.remote-training`; S3 remains the source for data and model weights. Do not start a long job until the validation gates pass.

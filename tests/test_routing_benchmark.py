@@ -2,12 +2,16 @@ from __future__ import annotations
 
 
 from copy import deepcopy
+import json
 import math
+from pathlib import Path
+import sys
 import pytest
-
 from types import SimpleNamespace
 
+import scripts.routing.production_benchmark as production_benchmark
 from scripts.routing.production_benchmark import (
+    CaseSpec,
     KAPPA_VALUES,
     Q_VALUES,
     _case_specs,
@@ -15,6 +19,7 @@ from scripts.routing.production_benchmark import (
     _invariant_summary,
     _evaluations_match,
     evaluate_service_response,
+    parse_args,
     recompute_feature_metrics,
 )
 from scripts.routing.benchmark_scenic_routing import (
@@ -65,6 +70,10 @@ def _feature(
         "exactness_status": "exact",
         "optimality_gap": 0.0,
         "certified_upper_bound": None,
+        "requested_start": [42.0, -72.0],
+        "requested_end": [42.0 + len(segments) * 0.01, -72.0],
+        "snapped_start": [42.0, -72.0],
+        "snapped_end": [42.0 + len(segments) * 0.01, -72.0],
     }
     if objective is not None:
         properties["objective_value"] = objective
@@ -209,7 +218,8 @@ def test_recompute_feature_metrics_includes_requested_endpoints() -> None:
         requested_end=(42.02, -72.0),
     )
 
-    assert metrics["edge_metric_consistency"]["geometry_sequence"] is False
+    assert metrics["edge_metric_consistency"]["geometry_sequence"] is True
+    assert metrics["edge_metric_consistency"]["requested_endpoints"] is False
 
 
 
@@ -272,6 +282,10 @@ def _zero_edge_response(
                 "estimated_duration_minutes": 0.0,
                 "duration_utility": 1.0,
                 "actual_duration_ratio": 1.0,
+                "requested_start": [42.0, -72.0],
+                "requested_end": [42.0, -72.0],
+                "snapped_start": [42.0, -72.0],
+                "snapped_end": [42.0, -72.0],
                 "scenic_score_delta_absolute": 0.0,
                 "scenic_score_delta_relative": None,
                 "same_route": True,
@@ -331,9 +345,20 @@ def test_evaluate_service_response_validates_zero_edge_geometry(
 
 
 
-def test_evaluate_service_response_rejects_zero_edge_distinct_endpoints() -> None:
+def test_evaluate_service_response_accepts_zero_edge_distinct_endpoints() -> None:
+    response = _zero_edge_response(
+        [[-72.0, 42.0], [-72.0, 42.0]]
+    )
+    features = response["geojson"]["features"]
+    assert isinstance(features, list)
+    for feature in features:
+        assert isinstance(feature, dict)
+        properties = feature["properties"]
+        assert isinstance(properties, dict)
+        properties["requested_end"] = [42.0, -71.99]
+
     evaluation = evaluate_service_response(
-        _zero_edge_response([[-72.0, 42.0], [-71.99, 42.0]]),
+        response,
         q=0.5,
         kappa=1.8,
         avoid_highways=False,
@@ -341,8 +366,8 @@ def test_evaluate_service_response_rejects_zero_edge_distinct_endpoints() -> Non
         requested_end=(42.0, -71.99),
     )
 
-    assert evaluation["status"] == "invalid"
-    assert "edge_metric_recomputation" in evaluation["failed_invariants"]
+    assert evaluation["status"] == "ok"
+    assert evaluation["failed_invariants"] == []
 
 def test_recompute_feature_metrics_uses_canonical_edge_duration() -> None:
     feature = _feature(
@@ -376,6 +401,8 @@ def test_recompute_feature_metrics_uses_canonical_edge_duration() -> None:
         "simple_path": True,
         "traversal_identity": True,
         "geometry_sequence": True,
+        "requested_endpoints": True,
+        "snapped_endpoints": True,
         "distance": True,
         "raw_scenic_score": True,
         "average_scenic_score": True,
@@ -383,6 +410,256 @@ def test_recompute_feature_metrics_uses_canonical_edge_duration() -> None:
         "duration": True,
         "highway_count": True,
     }
+
+
+def test_recompute_feature_metrics_uses_trusted_partial_edge_metrics() -> None:
+    feature = _feature(
+        "scenic",
+        score=7.0,
+        duration=2.5,
+        edge_ids=("e0", "e1"),
+        road_types=("trunk", "secondary"),
+    )
+    rows = feature["properties"]["segment_identity"]
+    assert isinstance(rows, list)
+    rows[0].update(
+        {
+            "source_edge_id": "e0",
+            "source_fraction": 0.0,
+            "distance_km": 0.0,
+            "duration_minutes": 0.0,
+        }
+    )
+    rows[1].update(
+        {
+            "source_edge_id": "e1",
+            "source_fraction": 0.25,
+            "distance_km": 2.5,
+            "duration_minutes": 2.5,
+        }
+    )
+    rows[0]["end"] = list(rows[0]["start"])
+    rows[1]["start"] = list(rows[0]["end"])
+    rows[1]["end"] = [41.995, -72.0]
+    feature["geometry"]["coordinates"] = [
+        [-72.0, 42.0],
+        [-72.0, 41.995],
+    ]
+    feature["properties"].update(
+        {
+            "total_distance_km": 2.5,
+            "estimated_duration_minutes": 2.5,
+            "highway_count": 1,
+            "requested_end": [41.995, -72.0],
+            "snapped_end": [41.995, -72.0],
+        }
+    )
+    edge_index = {
+        "e0": SimpleNamespace(
+            id="e0",
+            distance_km=10.0,
+            scenic_score=7.0,
+            travel_time_minutes=10.0,
+            start_node_id="A",
+            end_node_id="B",
+            road_type="trunk",
+        ),
+        "e1": SimpleNamespace(
+            id="e1",
+            distance_km=10.0,
+            scenic_score=7.0,
+            travel_time_minutes=10.0,
+            road_type="secondary",
+            start_node_id="B",
+            end_node_id="A",
+        ),
+    }
+    node_index = {
+        "A": SimpleNamespace(id="A", lat=41.98, lon=-72.0),
+        "B": SimpleNamespace(id="B", lat=42.0, lon=-72.0),
+    }
+
+    metrics = recompute_feature_metrics(
+        feature, edge_index=edge_index, node_index=node_index
+    )
+
+    assert metrics["distance_km"] == pytest.approx(2.5)
+    assert metrics["raw_scenic_score"] == pytest.approx(7.0)
+    assert metrics["duration_minutes_recomputed"] == pytest.approx(2.5)
+    assert metrics["highway_count"] == 1
+    assert all(metrics["edge_metric_consistency"].values())
+
+    discontinuous = deepcopy(feature)
+    discontinuous_rows = discontinuous["properties"]["segment_identity"]
+    assert isinstance(discontinuous_rows, list)
+    discontinuous_rows[1]["start"] = [41.99, -71.99]
+    invalid = recompute_feature_metrics(
+        discontinuous, edge_index=edge_index, node_index=node_index
+    )
+    assert invalid["edge_metric_consistency"]["segments"] is False
+    assert invalid["edge_metric_consistency"]["geometry_sequence"] is False
+
+def test_zero_distance_partial_edge_accepts_full_source_fraction() -> None:
+    feature = _feature(
+        "scenic",
+        score=0.0,
+        duration=0.0,
+        edge_ids=("e0",),
+        road_types=("secondary",),
+    )
+    row = feature["properties"]["segment_identity"][0]
+    row.update(
+        {
+            "source_edge_id": "e0",
+            "source_fraction": 1.0,
+            "distance_km": 0.0,
+            "duration_minutes": 0.0,
+            "start": [42.0, -72.0],
+            "end": [42.0, -72.0],
+        }
+    )
+    feature["geometry"]["coordinates"] = [
+        [-72.0, 42.0],
+        [-72.0, 42.0],
+    ]
+    feature["properties"].update(
+        {
+            "total_distance_km": 0.0,
+            "requested_end": [42.0, -72.0],
+            "snapped_end": [42.0, -72.0],
+        }
+    )
+    edge_index = {
+        "e0": SimpleNamespace(
+            id="e0",
+            distance_km=0.0,
+            scenic_score=0.0,
+            travel_time_minutes=0.0,
+            road_type="secondary",
+            start_node_id="A",
+            end_node_id="B",
+        )
+    }
+    node_index = {
+        "A": SimpleNamespace(id="A", lat=42.0, lon=-72.0),
+        "B": SimpleNamespace(id="B", lat=42.0, lon=-72.0),
+    }
+
+    metrics = recompute_feature_metrics(
+        feature, edge_index=edge_index, node_index=node_index
+    )
+
+    assert all(metrics["edge_metric_consistency"].values())
+
+
+
+def test_partial_rows_cannot_join_at_unconnected_edge_intersections() -> None:
+    feature = _feature(
+        "scenic",
+        score=7.0,
+        duration=10.0,
+        edge_ids=("e0", "e1"),
+        road_types=("secondary", "secondary"),
+    )
+    rows = feature["properties"]["segment_identity"]
+    assert isinstance(rows, list)
+    rows[0].update(
+        {
+            "source_edge_id": "e0",
+            "source_fraction": 0.5,
+            "distance_km": 2.0,
+            "duration_minutes": 5.0,
+            "start": [41.98, -72.0],
+            "end": [41.99, -72.0],
+        }
+    )
+    rows[1].update(
+        {
+            "source_edge_id": "e1",
+            "source_fraction": 0.5,
+            "distance_km": 2.0,
+            "duration_minutes": 5.0,
+            "start": [41.99, -72.0],
+            "end": [42.0, -72.0],
+        }
+    )
+    feature["geometry"]["coordinates"] = [
+        [-72.0, 41.98],
+        [-72.0, 41.99],
+        [-72.0, 42.0],
+    ]
+    feature["properties"].update(
+        {
+            "requested_start": [41.98, -72.0],
+            "requested_end": [42.0, -72.0],
+            "snapped_start": [41.98, -72.0],
+            "snapped_end": [42.0, -72.0],
+        }
+    )
+    edge_index = {
+        edge_id: SimpleNamespace(
+            id=edge_id,
+            distance_km=4.0,
+            scenic_score=7.0,
+            travel_time_minutes=10.0,
+            road_type="secondary",
+            start_node_id=start_id,
+            end_node_id=end_id,
+        )
+        for edge_id, start_id, end_id in (
+            ("e0", "A", "B"),
+            ("e1", "C", "D"),
+        )
+    }
+    node_index = {
+        "A": SimpleNamespace(id="A", lat=41.98, lon=-72.0),
+        "B": SimpleNamespace(id="B", lat=42.0, lon=-72.0),
+        "C": SimpleNamespace(id="C", lat=41.98, lon=-72.0),
+        "D": SimpleNamespace(id="D", lat=42.0, lon=-72.0),
+    }
+
+    metrics = recompute_feature_metrics(
+        feature, edge_index=edge_index, node_index=node_index
+    )
+
+    assert metrics["edge_metric_consistency"]["segments"] is True
+    assert metrics["edge_metric_consistency"]["geometry_sequence"] is True
+    assert metrics["edge_metric_consistency"]["continuity"] is False
+
+
+def test_recompute_feature_metrics_keeps_full_edges_strict() -> None:
+    feature = _feature(
+        "scenic",
+        score=7.0,
+        duration=3.0,
+        edge_ids=("e0", "e1"),
+        road_types=("trunk", "secondary"),
+    )
+    rows = feature["properties"]["segment_identity"]
+    assert isinstance(rows, list)
+    rows[0]["distance_km"] = 1.0
+    edge_index = {
+        "e0": SimpleNamespace(
+            id="e0",
+            distance_km=2.0,
+            scenic_score=7.0,
+            travel_time_minutes=1.5,
+            road_type="trunk",
+        ),
+        "e1": SimpleNamespace(
+            id="e1",
+            distance_km=2.0,
+            scenic_score=7.0,
+            travel_time_minutes=1.5,
+            road_type="secondary",
+        ),
+    }
+
+    metrics = recompute_feature_metrics(feature, edge_index=edge_index)
+
+    assert metrics["distance_km"] == pytest.approx(4.0)
+    assert metrics["edge_metric_consistency"]["segments"] is False
+    assert metrics["edge_metric_consistency"]["distance"] is False
 
 
 
@@ -452,6 +729,61 @@ def test_case_matrix_is_explicit_for_all_pairs_and_settings() -> None:
     assert {spec.q for spec in specs} == set(Q_VALUES)
     assert {spec.kappa for spec in specs} == set(KAPPA_VALUES)
     assert {spec.avoid_highways for spec in specs} == {False, True}
+
+
+def test_case_matrix_includes_required_full_bbox_activation_probe() -> None:
+    pair = {
+        "id": "full_bbox_rutland_lisbon",
+        "start": [43.60784414, -72.98226538],
+        "end": [44.02516775, -70.10003245],
+    }
+    specs = _case_specs({"pairs": [pair]})
+    activation = [
+        spec
+        for spec in specs
+        if production_benchmark._case_id(spec)
+        in production_benchmark.REQUIRED_ACTIVATION_CASE_IDS
+    ]
+
+    assert len(specs) == len(Q_VALUES) * len(KAPPA_VALUES) * 2 + 1
+    assert len(activation) == 1
+    assert activation[0].q == pytest.approx(0.8)
+    assert activation[0].kappa == pytest.approx(1.8)
+    assert activation[0].avoid_highways is False
+    case_id = production_benchmark._case_id(activation[0])
+    assert case_id in production_benchmark.STRICT_SERVICE_CASE_IDS
+    assert production_benchmark._case_deadline_seconds(case_id, 10.0) == 1_800.0
+    assert production_benchmark._case_deadline_seconds(case_id, 0.0) == 0.0
+    assert (
+        production_benchmark._case_deadline_seconds(
+            "short_burlington_01|q=0.1|kappa=1|avoid=false",
+            10.0,
+        )
+        == 10.0
+    )
+
+
+def test_activation_case_uses_its_own_timeout_for_latency_sla() -> None:
+    assert production_benchmark._row_within_case_deadline(
+        {
+            "wall_ms": 249_000.0,
+            "case_timeout_seconds": 1_800.0,
+            "reason": None,
+        },
+        10.0,
+    )
+    assert not production_benchmark._row_within_case_deadline(
+        {"wall_ms": 11_000.0, "reason": None},
+        10.0,
+    )
+    assert not production_benchmark._row_within_case_deadline(
+        {
+            "wall_ms": 249_000.0,
+            "case_timeout_seconds": 1_800.0,
+            "reason": "timeout",
+        },
+        10.0,
+    )
 
 
 def test_categories_are_empirical_and_screenshot_is_not_fabricated() -> None:
@@ -648,3 +980,235 @@ def test_frontier_extended_stress_beats_recorded_baseline() -> None:
     assert math.isfinite(duration_ratio)
     assert normalized_score >= 0.18672137028069238 - 1e-12
     assert duration_ratio <= 1.1 + 1e-12
+
+
+def _checkpoint_specs() -> list[CaseSpec]:
+    return [
+        CaseSpec(f"pair-{index}", (1.0, 2.0), (1.1, 2.1), 0.0, 1.0, False)
+        for index in range(3)
+    ]
+
+
+def _checkpoint_row(index: int, spec: CaseSpec) -> dict[str, object]:
+    return {
+        "case_index": index,
+        "case_id": production_benchmark._case_id(spec),
+        "pair_id": spec.pair_id,
+        "evaluation": {
+            "status": "ok",
+            "uplift_absolute": 0.0,
+            "uplift_relative": 0.0,
+            "optimality_gap": None,
+            "exactness_status": "exact",
+            "objective": {"recomputed": 1.0},
+        },
+        "wall_ms": 1.0,
+        "reason": None,
+        "execution_mode": "direct_planner",
+    }
+
+
+def _patch_checkpoint_runtime(monkeypatch: pytest.MonkeyPatch) -> list[CaseSpec]:
+    specs = _checkpoint_specs()
+    monkeypatch.setattr(production_benchmark, "_load_corpus", lambda path: {"pairs": []})
+    monkeypatch.setattr(production_benchmark, "_case_specs", lambda corpus: specs)
+    monkeypatch.setattr(
+        production_benchmark,
+        "_prepare_benchmark_context",
+        lambda graph, report: (
+            {"score_mapping": {}},
+            0.0,
+            SimpleNamespace(),
+            {},
+            {},
+            {"prewarmed": True},
+        ),
+    )
+    monkeypatch.setattr(production_benchmark, "_classify_pairs", lambda corpus, rows: ({}, {}))
+    monkeypatch.setattr(production_benchmark, "_invariant_summary", lambda rows: {})
+    return specs
+
+
+def test_benchmark_resume_skips_stable_case_keys_and_orders_results(
+    tmp_path, monkeypatch
+) -> None:
+    specs = _patch_checkpoint_runtime(monkeypatch)
+    calls: list[str] = []
+
+    def execute(**kwargs):
+        calls.append(kwargs["spec"].pair_id)
+        return _checkpoint_row(kwargs["index"], kwargs["spec"])
+
+    monkeypatch.setattr(production_benchmark, "_execute_case", execute)
+    output = tmp_path / "benchmark.json"
+    first = production_benchmark.run_benchmark(
+        corpus_path=tmp_path / "corpus.json",
+        graph_path=tmp_path / "graph",
+        report_path=tmp_path / "report",
+        output_path=output,
+        group_size=1,
+    )
+    assert first["matrix"]["all_cases_persisted"] is True
+    assert [row["pair_id"] for row in json.loads(output.read_text())["results"]] == [
+        spec.pair_id for spec in specs
+    ]
+    calls.clear()
+    second = production_benchmark.run_benchmark(
+        corpus_path=tmp_path / "corpus.json",
+        graph_path=tmp_path / "graph",
+        report_path=tmp_path / "report",
+        output_path=output,
+        resume=True,
+        group_size=1,
+    )
+    assert calls == []
+    assert second["matrix"]["all_cases_persisted"] is True
+
+
+def test_benchmark_interruption_preserves_checkpoint_and_final_json(
+    tmp_path, monkeypatch
+) -> None:
+    specs = _patch_checkpoint_runtime(monkeypatch)
+    output = tmp_path / "benchmark.json"
+    output.write_text("valid-final")
+    calls = 0
+
+    def interrupting(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        return _checkpoint_row(kwargs["index"], kwargs["spec"])
+
+    monkeypatch.setattr(production_benchmark, "_execute_case", interrupting)
+    with pytest.raises(KeyboardInterrupt):
+        production_benchmark.run_benchmark(
+            corpus_path=tmp_path / "corpus.json",
+            graph_path=tmp_path / "graph",
+            report_path=tmp_path / "report",
+            output_path=output,
+            group_size=1,
+        )
+    assert output.read_text() == "valid-final"
+    checkpoint_rows = output.with_suffix(".jsonl").read_text().splitlines()
+    assert len(checkpoint_rows) == 1
+    assert json.loads(checkpoint_rows[0])["case_id"] == production_benchmark._case_id(
+        specs[0]
+    )
+
+
+def test_checkpoint_fingerprint_includes_routing_implementation(
+    tmp_path, monkeypatch
+) -> None:
+    fingerprinted: list[Path] = []
+
+    def record_identity(path: Path) -> dict[str, object]:
+        fingerprinted.append(path.resolve())
+        return {"exists": True, "size_bytes": 1, "sha256": str(path)}
+
+    monkeypatch.setattr(
+        production_benchmark, "_path_identity", record_identity
+    )
+    production_benchmark._checkpoint_fingerprint(
+        corpus_path=tmp_path / "corpus.json",
+        corpus={"pairs": []},
+        graph_path=tmp_path / "graph",
+        report_path=tmp_path / "report",
+        case_timeout_seconds=10.0,
+        strict_service_full=False,
+        workers=1,
+        group_size=1,
+    )
+
+    assert {
+        path.resolve()
+        for path in production_benchmark._BENCHMARK_IMPLEMENTATION_PATHS.values()
+    } <= set(fingerprinted)
+
+
+def test_benchmark_resume_rejects_incompatible_checkpoint(
+    tmp_path, monkeypatch
+) -> None:
+    _patch_checkpoint_runtime(monkeypatch)
+    monkeypatch.setattr(
+        production_benchmark,
+        "_execute_case",
+        lambda **kwargs: _checkpoint_row(kwargs["index"], kwargs["spec"]),
+    )
+    output = tmp_path / "benchmark.json"
+    production_benchmark.run_benchmark(
+        corpus_path=tmp_path / "corpus.json",
+        graph_path=tmp_path / "graph",
+        report_path=tmp_path / "report",
+        output_path=output,
+        group_size=1,
+    )
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        production_benchmark.run_benchmark(
+            corpus_path=tmp_path / "corpus.json",
+            graph_path=tmp_path / "graph",
+            report_path=tmp_path / "report",
+            output_path=output,
+            resume=True,
+            group_size=2,
+        )
+
+
+def test_benchmark_resume_repairs_partial_checkpoint_tail(
+    tmp_path, monkeypatch
+) -> None:
+    specs = _patch_checkpoint_runtime(monkeypatch)
+    calls = 0
+
+    def interrupting(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        return _checkpoint_row(kwargs["index"], kwargs["spec"])
+
+    monkeypatch.setattr(production_benchmark, "_execute_case", interrupting)
+    output = tmp_path / "benchmark.json"
+    with pytest.raises(KeyboardInterrupt):
+        production_benchmark.run_benchmark(
+            corpus_path=tmp_path / "corpus.json",
+            graph_path=tmp_path / "graph",
+            report_path=tmp_path / "report",
+            output_path=output,
+            group_size=1,
+        )
+    checkpoint = output.with_suffix(".jsonl")
+    with checkpoint.open("ab") as stream:
+        stream.write(b'{"case_id":"partial')
+
+    monkeypatch.setattr(
+        production_benchmark,
+        "_execute_case",
+        lambda **kwargs: _checkpoint_row(kwargs["index"], kwargs["spec"]),
+    )
+    result = production_benchmark.run_benchmark(
+        corpus_path=tmp_path / "corpus.json",
+        graph_path=tmp_path / "graph",
+        report_path=tmp_path / "report",
+        output_path=output,
+        resume=True,
+        group_size=1,
+    )
+    assert result["matrix"]["all_cases_persisted"] is True
+    rows = [json.loads(line) for line in checkpoint.read_text().splitlines()]
+    assert [row["case_id"] for row in rows] == [
+        production_benchmark._case_id(spec) for spec in specs
+    ]
+
+
+@pytest.mark.parametrize(
+    ("args", "attribute"),
+    [
+        (["--workers", "0"], "workers"),
+        (["--group-size", "-1"], "group_size"),
+    ],
+)
+def test_benchmark_cli_rejects_invalid_bounds(args, attribute, monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["production_benchmark", *args])
+    with pytest.raises(SystemExit):
+        parse_args()

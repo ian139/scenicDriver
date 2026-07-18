@@ -135,6 +135,32 @@ def test_regions_list() -> None:
     assert "regions" in payload
     assert isinstance(payload["regions"], list)
 
+
+def test_region_graph_fallback_and_discovery_support_sqlite(
+    tmp_path, monkeypatch
+) -> None:
+    graph_dir = tmp_path / "sqlite_region"
+    graph_dir.mkdir()
+    sqlite_graph = graph_dir / "road_graph.sqlite3"
+    sqlite_graph.write_bytes(b"sqlite")
+    monkeypatch.setattr(app_api, "ROAD_GRAPHS_DIR", tmp_path)
+    monkeypatch.setattr(app_api, "_configured_regions", lambda: [])
+    monkeypatch.setattr(app_api, "_default_region_key", lambda: None)
+
+    assert app_api._region_to_graph("sqlite_region") == sqlite_graph
+    discovered = app_api._list_regions()
+    assert discovered == [
+        {
+            "region": "sqlite_region",
+            "display_name": "sqlite_region",
+            "graph_exists": True,
+            "latest_run_name": None,
+            "bbox": None,
+            "is_default": False,
+            "source": "discovered",
+        }
+    ]
+
 def test_training_results_projects_active_record(tmp_path, monkeypatch) -> None:
     registry = tmp_path / "model_registry.json"
     registry.write_text(
@@ -486,6 +512,10 @@ def _strict_route_metrics(
         "score_coverage": 1.0,
         "score_run": [[edge_id, raw_score]],
         "zero_improvement_reason": None,
+        "requested_start": [40.03, -75.22],
+        "requested_end": [40.065, -75.19],
+        "snapped_start": [40.03, -75.22],
+        "snapped_end": [40.065, -75.19],
         "no_route_reason": None,
     }
 
@@ -494,10 +524,13 @@ def _strict_geojson(*metrics: dict[str, object]) -> dict[str, object]:
         "type": "FeatureCollection",
         "features": [
             {
-                "type": "Feature",
                 "properties": {
                     "route_kind": route_metrics["route_kind"],
                     "segment_identity": route_metrics["segment_identity"],
+                    "requested_start": route_metrics["requested_start"],
+                    "requested_end": route_metrics["requested_end"],
+                    "snapped_start": route_metrics["snapped_start"],
+                    "snapped_end": route_metrics["snapped_end"],
                 },
                 "geometry": {
                     "type": "LineString",
@@ -743,13 +776,73 @@ def test_route_geometry_rejects_discontinuous_segments_and_wrong_endpoint() -> N
         -75.18,
         40.065,
     ]
-    with pytest.raises(app_api.HTTPException, match="omits or reorders"):
+    with pytest.raises(app_api.HTTPException, match="snapped_end"):
         app_api._validate_route_geometry(
             endpoint_geojson,
             request=_strict_geometry_request(),
             routes={"scenic": endpoint_metrics},
         )
     
+
+
+def test_route_geometry_rejects_requested_metadata_mismatch() -> None:
+    metrics = _strict_route_metrics(
+        distance_km=10.0,
+        duration_min=20.0,
+        raw_score=0.8,
+        edge_id="scenic-edge",
+    )
+    geojson = _strict_geojson(metrics)
+    geojson["features"][0]["properties"]["requested_start"] = [40.04, -75.22]
+
+    with pytest.raises(app_api.HTTPException) as raised:
+        app_api._validate_route_geometry(
+            geojson,
+            request=_strict_geometry_request(),
+            routes={"scenic": metrics},
+        )
+
+    assert raised.value.status_code == 502
+    assert raised.value.detail == {
+        "error": "invalid_route_service_response",
+        "message": "scenic requested_start does not match the route request",
+    }
+
+
+def test_route_geometry_accepts_zero_edge_with_distinct_requested_points() -> None:
+    request = app_api.RouteRequest(
+        graph_geojson="test-graph",
+        start=(40.03, -75.22),
+        end=(40.065, -75.19),
+        include_baseline=False,
+    )
+    properties = {
+        "route_kind": "scenic",
+        "requested_start": [40.03, -75.22],
+        "requested_end": [40.065, -75.19],
+        "snapped_start": [40.04, -75.21],
+        "snapped_end": [40.04, -75.21],
+        "segment_identity": [],
+    }
+    geojson = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": properties,
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[-75.21, 40.04], [-75.21, 40.04]],
+                },
+            }
+        ],
+    }
+
+    assert app_api._validate_route_geometry(
+        geojson,
+        request=request,
+        routes={"scenic": {"segment_identity": []}},
+    )["scenic"] == geojson["features"][0]
     
 def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
     plan_calls: list[object] = []
@@ -796,6 +889,50 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
         "Turn off Avoid highways, choose different points, or increase max detour."
     )
 
+
+def test_route_compare_reports_endpoint_coverage_error(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api,
+        "_region_to_graph",
+        lambda region: Path("/tmp/fake-road-graph.sqlite3"),
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+    monkeypatch.setattr(
+        app_api,
+        "_app_region",
+        lambda region: {"region": region, "max_route_snap_km": 1.0},
+    )
+    plan_calls: list[object] = []
+
+    def fake_plan(request):
+        plan_calls.append(request)
+        raise app_api.RouteCoverageError("start", 1.234, 1.0)
+
+    monkeypatch.setattr(app_api, "plan_routes", fake_plan)
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 44.4, "lon": -70.2},
+            "end": {"lat": 44.5, "lon": -70.1},
+            "scenic_weight": 0.8,
+            "region": "new_england_north",
+            "max_detour_factor": 1.8,
+            "avoid_highways": False,
+            "include_baseline": True,
+        },
+    )
+
+    assert response.status_code == 422
+    assert len(plan_calls) == 1
+    assert plan_calls[0].max_snap_distance_km == pytest.approx(1.0)
+    assert response.json()["detail"] == {
+        "error": "route_endpoint_outside_coverage",
+        "message": "The start point is too far from the supported road network.",
+        "hint": "Choose a point within the selected region's route coverage.",
+        "endpoint": "start",
+        "snap_distance_km": 1.234,
+        "max_snap_distance_km": 1.0,
+    }
 
 def test_route_compare_reports_invalid_route_configuration(monkeypatch) -> None:
     monkeypatch.setattr(
@@ -1134,10 +1271,12 @@ def test_route_preload_lifespan_calls_once_and_skips_missing_optional(
     monkeypatch.setattr(app_api, "_configured_regions", lambda: rows)
     monkeypatch.setattr(app_api, "_default_region_key", lambda: "default")
     monkeypatch.setenv("SCENIC_ROUTE_PRELOAD", "required")
-    preload_calls: list[tuple[Path, Path, object, object]] = []
+    preload_calls: list[tuple[Path, Path, object, object, bool]] = []
 
-    def fake_preload(graph_path, tile_path, zoom, fallback):
-        preload_calls.append((graph_path, tile_path, zoom, fallback))
+    def fake_preload(graph_path, tile_path, zoom, fallback, *, exclusive_scoring):
+        preload_calls.append(
+            (graph_path, tile_path, zoom, fallback, exclusive_scoring)
+        )
         return {
             "graph_cache_hit": False,
             "tile_score_cache_hit": False,
@@ -1150,7 +1289,7 @@ def test_route_preload_lifespan_calls_once_and_skips_missing_optional(
         assert health.status_code == 200
         payload = health.json()["route_preload"]
 
-    assert preload_calls == [(default_graph, default_report, None, 1.0)]
+    assert preload_calls == [(default_graph, default_report, None, None, True)]
     assert payload["loaded_regions"] == ["default"]
     assert payload["skipped_regions"] == ["optional"]
     assert payload["regions"][0]["region"] == "optional"

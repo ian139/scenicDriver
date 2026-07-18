@@ -158,6 +158,65 @@ def test_large_graph_fastest_checks_all_tied_edge_projections() -> None:
 
     assert route.edge_ids == ("z-good",)
     assert route.estimated_duration_minutes == pytest.approx(3.6)
+
+
+def test_scenic_endpoint_overlay_keeps_all_tied_boundary_projections() -> None:
+    graph = RoadGraph()
+    for node_id in ("A", "B", "C", "D"):
+        graph.add_node(
+            Node(
+                id=node_id,
+                lat=0.0 if node_id in ("A", "B") else 0.002,
+                lon=0.0 if node_id in ("A", "C") else 1.0,
+            )
+        )
+    graph.add_edge(
+        Edge(
+            id="a-slow",
+            start_node_id="A",
+            end_node_id="B",
+            distance_km=10.0,
+            scenic_score=1.0,
+            speed_limit_kmh=10,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="z-fast",
+            start_node_id="C",
+            end_node_id="D",
+            distance_km=10.0,
+            scenic_score=1.0,
+            speed_limit_kmh=100,
+            one_way=True,
+        )
+    )
+    for index in range(2_001):
+        graph.add_node(
+            Node(id=f"isolated-{index}", lat=10.0 + index, lon=10.0)
+        )
+
+    coordinate_epoch = Node._coordinate_mutation_epoch
+    planner = ScenicRoutePlanner(graph)
+    scenic = planner.find_scenic_route(
+        (0.001, 0.0),
+        (0.001, 1.0),
+        q=0.0,
+        kappa=1.0,
+        scenic_priority=True,
+    )
+    baseline = planner.find_fastest_route((0.001, 0.0), (0.001, 1.0))
+
+    assert scenic.edge_ids == baseline.edge_ids == ("z-fast",)
+    assert scenic.waypoints[0] == pytest.approx((0.002, 0.0))
+    assert scenic.waypoints[-1] == pytest.approx((0.002, 1.0))
+    assert Node._coordinate_mutation_epoch == coordinate_epoch
+    assert scenic.estimated_duration_minutes == pytest.approx(
+        baseline.estimated_duration_minutes
+    )
+    assert scenic.estimated_duration_minutes <= scenic.duration_cap_minutes
+
 def _route(planner: ScenicRoutePlanner, q: float, kappa: float):
     return planner.find_scenic_route(
         (0.0, 0.0),

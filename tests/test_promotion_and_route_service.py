@@ -291,6 +291,32 @@ def test_route_request_rejects_nonfinite_and_out_of_contract_values(
         route_service.RouteRequest.from_dict(payload)
 
 
+def test_route_request_snap_limit_serializes_and_validates() -> None:
+    request = route_service.RouteRequest(
+        graph_geojson="graph.geojson",
+        start=(42.0, -72.0),
+        end=(42.1, -72.0),
+        max_snap_distance_km=1.25,
+    )
+    payload = request.to_dict()
+    assert payload["max_snap_distance_km"] == pytest.approx(1.25)
+    restored = route_service.RouteRequest.from_dict(payload)
+    assert restored.max_snap_distance_km == pytest.approx(1.25)
+
+    for value in (float("nan"), float("inf"), -1.0):
+        with pytest.raises(
+            ValueError, match="max_snap_distance_km must be finite and nonnegative"
+        ):
+            route_service.RouteRequest(
+                graph_geojson="graph.geojson",
+                start=(42.0, -72.0),
+                end=(42.1, -72.0),
+                max_snap_distance_km=value,
+            )
+
+
+
+
 def test_service_uses_canonical_normalization_version() -> None:
     assert route_service._NORMALIZATION_VERSION == "linear-v1"
 
@@ -348,6 +374,29 @@ def _write_cache_graph(path: Path, scenic_score: float = 1.0) -> None:
         ],
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_endpoint_snap_diagnostics_use_edge_projections(
+    tmp_path: Path,
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+    graph = route_service._load_graph(graph_path)
+    request = route_service.RouteRequest(
+        graph_geojson=str(graph_path),
+        start=(42.05, -72.001),
+        end=(42.05, -72.001),
+        max_snap_distance_km=1.0,
+    )
+
+    diagnostics = route_service._endpoint_snap_diagnostics(graph, request)
+
+    assert diagnostics["start_snap_km"] == pytest.approx(0.08257, rel=1e-3)
+    assert diagnostics["end_snap_km"] == pytest.approx(0.08257, rel=1e-3)
+    assert diagnostics["start_snap_km"] < 1.0
+    assert diagnostics["start_all_road_snap_km"] is None
+
+
 
 
 def _write_cache_tiles(path: Path, score: float) -> None:
@@ -681,6 +730,183 @@ def test_preload_route_assets_populates_cache_before_first_request(
     assert diagnostics["tile_score_cache_hit"] is True
     assert diagnostics["scored_graph_cache_hit"] is True
     assert result["routes"][0]["metrics"]["average_scenic_score"] == pytest.approx(8.0)
+
+def test_diagnose_reuses_exclusive_scored_graph_after_control_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    tile_path = tmp_path / "tiles.json"
+    _write_cache_graph(graph_path)
+    _write_cache_tiles(tile_path, 8.0)
+    route_service.clear_route_caches()
+
+    preload = route_service.preload_route_assets(
+        graph_path,
+        tile_path,
+        None,
+        None,
+        exclusive_scoring=True,
+    )
+    assert preload["score_mapping"]["matched_ratio"] == pytest.approx(1.0)
+
+    def fail_raw_load(_path: Path) -> object:
+        pytest.fail("diagnostics reloaded the raw graph")
+
+    monkeypatch.setattr(route_service, "_load_graph", fail_raw_load)
+    diagnostics = route_service.diagnose_route_request(
+        route_service.RouteRequest(
+            graph_geojson=str(graph_path),
+            start=(42.0, -72.0),
+            end=(42.1, -72.0),
+            include_baseline=False,
+            tile_scores_json=str(tile_path),
+        )
+    )
+    assert diagnostics["graph_edges"] == 1
+
+
+
+def test_scored_graph_default_clone_and_exclusive_source_modes(
+    tmp_path: Path,
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+    tile = route_service.lat_lon_to_tile(42.05, -72.0, 14)
+    score_map = {(14, tile[0], tile[1]): 8.0}
+    graph_key = (
+        route_service._resolved_path_key(graph_path),
+        route_service._file_signature(graph_path),
+    )
+    tile_key = ("tiles", (1, 2, 3, 4, 5))
+
+    route_service.clear_route_caches()
+    raw_graph = route_service._load_graph(graph_path)
+    cloned_graph, *_ = route_service._get_scored_graph(
+        raw_graph,
+        graph_key=graph_key,
+        tile_key=tile_key,
+        score_map=score_map,
+        zoom=14,
+        fallback=None,
+    )
+    assert cloned_graph is not raw_graph
+    assert next(iter(raw_graph.edges.values())).scenic_score == pytest.approx(1.0)
+    assert next(iter(cloned_graph.edges.values())).scenic_score == pytest.approx(8.0)
+
+    route_service.clear_route_caches()
+    exclusive_graph = route_service._load_graph(graph_path)
+    scored_graph, *_ = route_service._get_scored_graph(
+        exclusive_graph,
+        graph_key=graph_key,
+        tile_key=tile_key,
+        score_map=score_map,
+        zoom=14,
+        fallback=None,
+        exclusive_source=True,
+    )
+    assert scored_graph is exclusive_graph
+    assert next(iter(exclusive_graph.edges.values())).scenic_score == pytest.approx(
+        8.0
+    )
+    route_service.clear_route_caches()
+
+def test_plan_routes_accepts_snap_limit_boundary_and_rejects_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+    snap_values = {
+        "start_snap_km": 1.0,
+        "end_snap_km": 0.25,
+        "start_all_road_snap_km": None,
+        "end_all_road_snap_km": None,
+        "start_node_id": "n0",
+        "end_node_id": "n1",
+    }
+    monkeypatch.setattr(
+        route_service,
+        "_endpoint_snap_diagnostics",
+        lambda graph, request: dict(snap_values),
+    )
+
+    class FakePlanner:
+        def __init__(self, *, graph: object) -> None:
+            del graph
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            del kwargs
+            return _cache_test_route(1.0)
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
+    accepted = route_service.plan_routes(
+        route_service.RouteRequest(
+            graph_geojson=str(graph_path),
+            start=(42.0, -72.0),
+            end=(42.1, -72.0),
+            include_baseline=False,
+            max_snap_distance_km=1.0,
+        )
+    )
+    assert accepted["diagnostics"]["start_snap_km"] == pytest.approx(1.0)
+
+    over_limit = dict(snap_values)
+    over_limit["start_snap_km"] = 1.000001
+    over_limit["start_all_road_snap_km"] = 1.000001
+    monkeypatch.setattr(
+        route_service,
+        "_endpoint_snap_diagnostics",
+        lambda graph, request: dict(over_limit),
+    )
+    with pytest.raises(route_service.RouteCoverageError) as caught:
+        route_service.plan_routes(
+            route_service.RouteRequest(
+                graph_geojson=str(graph_path),
+                start=(42.0, -72.0),
+                end=(42.1, -72.0),
+                include_baseline=False,
+                max_snap_distance_km=1.0,
+            )
+        )
+    assert caught.value.endpoint == "start"
+    assert caught.value.snap_distance_km == pytest.approx(1.000001)
+    assert caught.value.max_snap_distance_km == pytest.approx(1.0)
+
+
+
+def test_plan_routes_keeps_control_constrained_snap_failure_as_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+    monkeypatch.setattr(
+        route_service,
+        "_endpoint_snap_diagnostics",
+        lambda graph, request: {
+            "start_snap_km": 2.0,
+            "end_snap_km": 2.0,
+            "start_all_road_snap_km": 0.5,
+            "end_all_road_snap_km": 0.5,
+            "start_node_id": "n0",
+            "end_node_id": "n1",
+        },
+    )
+
+    class UnexpectedPlanner:
+        def __init__(self, *, graph: object) -> None:
+            raise AssertionError("control-constrained route should fail before search")
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", UnexpectedPlanner)
+    with pytest.raises(ValueError, match="No route found"):
+        route_service.plan_routes(
+            route_service.RouteRequest(
+                graph_geojson=str(graph_path),
+                start=(42.0, -72.0),
+                end=(42.1, -72.0),
+                avoid_highways=True,
+                include_baseline=False,
+                max_snap_distance_km=1.0,
+            )
+        )
 
 
 def test_concurrent_report_builds_publish_isolated_native_variants(

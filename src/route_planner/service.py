@@ -38,6 +38,25 @@ class RouteConfigurationError(RuntimeError):
     """Raised when deployment-supplied route configuration is invalid."""
 
 
+class RouteCoverageError(ValueError):
+    """Raised when a requested endpoint is outside configured route coverage."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        snap_distance_km: float,
+        max_snap_distance_km: float,
+    ) -> None:
+        self.endpoint = str(endpoint)
+        self.snap_distance_km = float(snap_distance_km)
+        self.max_snap_distance_km = float(max_snap_distance_km)
+        super().__init__(
+            f"The {self.endpoint} point is too far from the supported road network."
+        )
+
+
+
+
 def _frontier_time_limit_from_env() -> float | None:
     raw_value = os.environ.get("SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS")
     if raw_value is None or not raw_value.strip():
@@ -69,6 +88,7 @@ class RouteRequest:
     tile_scores_json: str | None = None
     tile_score_zoom: int | None = None
     tile_score_fallback: float | None = None
+    max_snap_distance_km: float | None = None
 
     def __post_init__(self) -> None:
         self.start = _parse_point(self.start, field_name="start")
@@ -85,6 +105,17 @@ class RouteRequest:
             or not 1.0 <= self.max_detour_factor <= 3.0
         ):
             raise ValueError("max_detour_factor must be finite and between 1 and 3")
+        if self.max_snap_distance_km is not None:
+            self.max_snap_distance_km = float(self.max_snap_distance_km)
+            if (
+                not math.isfinite(self.max_snap_distance_km)
+                or self.max_snap_distance_km < 0.0
+            ):
+                raise ValueError(
+                    "max_snap_distance_km must be finite and nonnegative"
+                )
+        else:
+            self.max_snap_distance_km = None
         self.avoid_highways = _parse_bool(
             self.avoid_highways, field_name="avoid_highways"
         )
@@ -130,6 +161,11 @@ class RouteRequest:
                 if payload.get("tile_score_fallback") is not None
                 else None
             ),
+            max_snap_distance_km=(
+                float(payload["max_snap_distance_km"])
+                if payload.get("max_snap_distance_km") is not None
+                else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -144,6 +180,7 @@ class RouteRequest:
             "tile_scores_json": self.tile_scores_json,
             "tile_score_zoom": self.tile_score_zoom,
             "tile_score_fallback": self.tile_score_fallback,
+            "max_snap_distance_km": self.max_snap_distance_km,
         }
 
 
@@ -434,14 +471,15 @@ def _get_scored_graph(
     score_map: Mapping[tuple[int, int, int], float],
     zoom: int,
     fallback: float | None,
+    exclusive_source: bool = False,
 ) -> tuple[RoadGraph, int, int, bool]:
     """Atomically get or build one immutable native-edge score variant.
 
-    The cache lock covers the private clone, score materialization, and
-    publication.  A same-key caller therefore observes a completed variant
-    instead of starting a duplicate build, while a different key receives a
-    separate clone and can never mutate a graph already used by another
-    request.
+    The cache lock covers score materialization and publication.  Normal
+    request callers receive a private native-edge clone so score writes cannot
+    mutate a graph already used by another request.  Startup can explicitly
+    opt into scoring its just-loaded source graph in place to avoid retaining
+    a second full graph during preload.
     """
 
     global _ACTIVE_GRAPH_VARIANT_KEY
@@ -477,9 +515,11 @@ def _get_scored_graph(
             _clear_scored_variant_locked()
 
         # ``graph`` is the canonical raw graph (or a private raw reference
-        # fetched before this lock).  Never score it: callers may still be
-        # planning against that object while this variant is built.
-        scored_graph = _clone_graph_for_scoring(graph)
+        # fetched before this lock).  Normal requests always score a clone;
+        # startup may explicitly score this source graph in place.
+        scored_graph = (
+            graph if exclusive_source else _clone_graph_for_scoring(graph)
+        )
         matched, total = _apply_tile_scores_to_graph_native(
             scored_graph,
             score_map,
@@ -509,6 +549,7 @@ def preload_route_assets(
     tile_scores_path: str | Path | None = None,
     tile_score_zoom: int | None = None,
     tile_score_fallback: float | None = None,
+    exclusive_scoring: bool = False,
 ) -> dict[str, Any]:
     """Load and materialize one route graph without planning a route.
 
@@ -617,6 +658,7 @@ def preload_route_assets(
             score_map=score_map,
             zoom=zoom,
             fallback=fallback,
+            exclusive_source=bool(exclusive_scoring),
         )
         mapping_meta = getattr(
             graph,
@@ -895,18 +937,119 @@ def diagnose_route_request(request: RouteRequest) -> dict[str, Any]:
     if not graph_path.exists():
         raise FileNotFoundError(f"Graph GeoJSON not found: {graph_path}")
 
-    graph = _load_cached_graph(graph_path)[0]
+    graph_path_key = _resolved_path_key(graph_path)
+    graph_signature_hint = _file_signature(graph_path)
+    scored_cache_key: _ScoredGraphCacheKey | None = None
+    if request.tile_scores_json:
+        tile_file = Path(request.tile_scores_json)
+        if tile_file.exists():
+            (
+                _score_map,
+                inferred_zoom,
+                tile_path_key,
+                tile_signature,
+                _tile_cache_hit,
+            ) = _load_cached_tile_scores(tile_file)
+            zoom = (
+                int(request.tile_score_zoom)
+                if request.tile_score_zoom is not None
+                else int(inferred_zoom)
+            )
+            scored_cache_key = (
+                (graph_path_key, graph_signature_hint),
+                (tile_path_key, tile_signature),
+                zoom,
+                request.tile_score_fallback,
+                _NORMALIZATION_VERSION,
+            )
 
-    start_node, start_snap_km = graph.find_nearest_node_with_distance(*request.start)
-    end_node, end_snap_km = graph.find_nearest_node_with_distance(*request.end)
-    return {
+    # Reuse the active scored variant when diagnostics follow a failed
+    # request.  Reloading the raw graph here defeats exclusive startup
+    # scoring and forces the next request to materialize another full copy.
+    graph = _load_cached_graph(
+        graph_path,
+        scored_cache_key=scored_cache_key,
+    )[0]
+    diagnostics = {
         "graph_nodes": int(len(graph.nodes)),
         "graph_edges": int(len(graph.edges)),
-        "start_snap_km": float(start_snap_km),
-        "end_snap_km": float(end_snap_km),
-        "start_node_id": start_node.id,
-        "end_node_id": end_node.id,
     }
+    diagnostics.update(_endpoint_snap_diagnostics(graph, request))
+    return diagnostics
+
+
+def _endpoint_snap_diagnostics(
+    graph: RoadGraph,
+    request: RouteRequest,
+) -> dict[str, Any]:
+    """Return non-raising edge-projection diagnostics for both endpoints.
+
+    ``start_snap_km`` and ``end_snap_km`` always describe the nearest edge
+    allowed by the request's highway policy.  When that eligible projection
+    is beyond the configured coverage limit, the corresponding all-road
+    projection is also recorded for distinguishing missing coverage from a
+    control-constrained route.
+    """
+
+    excluded_road_types = (
+        HIGHWAY_ROAD_TYPES if request.avoid_highways else frozenset()
+    )
+    diagnostics: dict[str, Any] = {
+        "start_snap_km": None,
+        "end_snap_km": None,
+        "start_all_road_snap_km": None,
+        "end_all_road_snap_km": None,
+        "start_node_id": None,
+        "end_node_id": None,
+    }
+    max_snap_distance_km = request.max_snap_distance_km
+
+    for endpoint, point in (("start", request.start), ("end", request.end)):
+        eligible_distance: float | None = None
+        try:
+            _projections, raw_distance = (
+                graph.find_nearest_edge_positions_with_distance(
+                    *point,
+                    excluded_road_types=excluded_road_types,
+                )
+            )
+            distance = float(raw_distance)
+            if math.isfinite(distance) and _projections:
+                eligible_distance = distance
+        except Exception:
+            # Diagnostics must not mask the planner's existing no-route path.
+            eligible_distance = None
+
+        all_road_distance: float | None = None
+        if max_snap_distance_km is not None and (
+            eligible_distance is None
+            or eligible_distance > max_snap_distance_km
+        ):
+            try:
+                all_projections, raw_distance = (
+                    graph.find_nearest_edge_positions_with_distance(
+                        *point,
+                        excluded_road_types=frozenset(),
+                    )
+                )
+                distance = float(raw_distance)
+                if math.isfinite(distance) and all_projections:
+                    all_road_distance = distance
+            except Exception:
+                all_road_distance = None
+        try:
+            diagnostics[f"{endpoint}_node_id"] = str(
+                graph.find_nearest_node(*point).id
+            )
+        except Exception:
+            pass
+
+        diagnostics[f"{endpoint}_snap_km"] = eligible_distance
+        diagnostics[f"{endpoint}_all_road_snap_km"] = all_road_distance
+
+    return diagnostics
+
+
 
 
 def _objective_components(
@@ -1121,15 +1264,48 @@ def plan_routes(request: RouteRequest) -> dict[str, Any]:
             "matched_ratio": float(matched / max(total, 1)),
         }
 
-    start_node, start_snap_km = graph.find_nearest_node_with_distance(*request.start)
-    end_node, end_snap_km = graph.find_nearest_node_with_distance(*request.end)
+    snap_diagnostics = _endpoint_snap_diagnostics(graph, request)
+    max_snap_distance_km = request.max_snap_distance_km
+    if max_snap_distance_km is not None:
+        for endpoint in ("start", "end"):
+            eligible_distance = snap_diagnostics.get(f"{endpoint}_snap_km")
+            all_road_distance = snap_diagnostics.get(
+                f"{endpoint}_all_road_snap_km"
+            )
+            eligible_exceeds = (
+                eligible_distance is None
+                or float(eligible_distance) > max_snap_distance_km
+            )
+            all_road_exceeds = (
+                all_road_distance is not None
+                and float(all_road_distance) > max_snap_distance_km
+            )
+            if eligible_exceeds and all_road_exceeds:
+                snap_distance = (
+                    eligible_distance
+                    if eligible_distance is not None
+                    else all_road_distance
+                )
+                assert snap_distance is not None
+                raise RouteCoverageError(
+                    endpoint=endpoint,
+                    snap_distance_km=float(snap_distance),
+                    max_snap_distance_km=float(max_snap_distance_km),
+                )
+            if (
+                eligible_exceeds
+                and request.avoid_highways
+                and (
+                    all_road_distance is None
+                    or float(all_road_distance) <= max_snap_distance_km
+                )
+            ):
+                raise ValueError("No route found between the given coordinates.")
+
     diagnostics = {
         "graph_nodes": int(len(graph.nodes)),
         "graph_edges": int(len(graph.edges)),
-        "start_snap_km": float(start_snap_km),
-        "end_snap_km": float(end_snap_km),
-        "start_node_id": start_node.id,
-        "end_node_id": end_node.id,
+        **snap_diagnostics,
         "requested_max_detour_factor": float(request.max_detour_factor),
         "requested_scenic_weight": float(request.scenic_weight),
         "applied_scenic_weight": float(request.scenic_weight),

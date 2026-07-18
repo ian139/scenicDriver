@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "description": "Deterministic production-artifact routing benchmark endpoints. Coordinates are graph-node coordinates except the checked-in UI default reproduction, which intentionally preserves its historical request values. Categories are assigned only from completed response metrics by the runner.",
-  "graph": "data/processed/road_graphs/new_england_north_burlington_bangor_corridor35/road_graph.json",
+  "graph": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3",
   "report": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json",
   "historical_screenshot_coordinates": null,
   "historical_screenshot_blocker": "Historical screenshot coordinates were not available in the checked-in repository or request context.",
@@ -27,6 +27,7 @@
     {"id":"long_bar_harbor_augusta","start":[44.6679197,-68.5218583],"end":[44.3958091,-69.7691961]},
     {"id":"long_burlington_st_johnsbury","start":[44.4758836,-73.2140035],"end":[44.4193575,-72.0150333]},
     {"id":"long_rutland_bangor","start":[44.063961,-72.772322],"end":[44.8016129,-68.7713352]},
-    {"id":"checked_in_default_reproduction","start":[44.475884,-73.214003],"end":[44.801616,-68.771305]}
+    {"id":"checked_in_default_reproduction","start":[44.475884,-73.214003],"end":[44.801616,-68.771305]},
+    {"id":"full_bbox_rutland_lisbon","start":[43.60784414,-72.98226538],"end":[44.02516775,-70.10003245]}
   ]
 }
