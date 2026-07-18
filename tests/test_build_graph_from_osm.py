@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.routing import build_graph_from_osm as builder
+from src.route_planner._edge_projection import EdgeProjectionIndex
+from src.route_planner.graph import Edge, Node, RoadGraph
 
 
 def _args(**overrides):
@@ -340,3 +342,104 @@ def test_sqlite_publication_failure_does_not_replace_existing_output(
             [],
         )
     assert output.read_bytes() == b"old-artifact"
+
+
+def test_sqlite_publication_emits_loadable_edge_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "road_graph.sqlite3"
+    rows = (
+        ("node", Node(id="a", lat=42.0, lon=-72.0)),
+        ("node", Node(id="b", lat=42.1, lon=-72.0)),
+        (
+            "edge",
+            Edge(
+                id="ab",
+                start_node_id="a",
+                end_node_id="b",
+                distance_km=12.0,
+                scenic_score=5.0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        builder,
+        "_iter_osmnx_graph_rows",
+        lambda _graph, _scores: iter(rows),
+    )
+
+    node_count, edge_count, probes = builder._publish_sqlite_graph(
+        output,
+        tmp_path,
+        object(),
+        {},
+        {},
+        [],
+    )
+
+    assert (node_count, edge_count, probes) == (2, 1, {})
+    assert EdgeProjectionIndex.sidecar_path(output).is_file()
+    loaded = RoadGraph.load(output)
+    assert loaded.edge_projection_index_status["state"] == "loaded"
+    projections, _distance = loaded.find_nearest_edge_positions_with_distance(
+        42.05,
+        -72.0,
+    )
+    assert [projection.edge.id for projection in projections] == ["ab"]
+
+
+def test_sqlite_sidecar_publication_failure_recovers_without_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "road_graph.sqlite3"
+    output_sidecar = EdgeProjectionIndex.sidecar_path(output)
+    rows = (
+        ("node", Node(id="a", lat=42.0, lon=-72.0)),
+        ("node", Node(id="b", lat=42.1, lon=-72.0)),
+        (
+            "edge",
+            Edge(
+                id="ab",
+                start_node_id="a",
+                end_node_id="b",
+                distance_km=12.0,
+                scenic_score=5.0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        builder,
+        "_iter_osmnx_graph_rows",
+        lambda _graph, _scores: iter(rows),
+    )
+    replace = builder.os.replace
+
+    def fail_output_sidecar(source: object, destination: object) -> None:
+        if Path(destination) == output_sidecar:
+            raise OSError("sidecar publication failed")
+        replace(source, destination)
+
+    monkeypatch.setattr(builder.os, "replace", fail_output_sidecar)
+    with pytest.raises(OSError, match="sidecar publication failed"):
+        builder._publish_sqlite_graph(
+            output,
+            tmp_path,
+            object(),
+            {},
+            {},
+            [],
+        )
+
+    candidate = tmp_path / ".road_graph.candidate.sqlite3"
+    assert not candidate.exists()
+    assert not EdgeProjectionIndex.sidecar_path(candidate).exists()
+    loaded = RoadGraph.load(output)
+    assert loaded.edge_projection_index_status["state"] == "missing"
+    projections, _distance = loaded.find_nearest_edge_positions_with_distance(
+        42.05,
+        -72.0,
+    )
+    assert [projection.edge.id for projection in projections] == ["ab"]
+    assert loaded.edge_projection_index_status["state"] == "rebuilt"

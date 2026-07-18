@@ -648,7 +648,6 @@ def test_osm_linestring_intermediate_coordinates_survive_route_feature() -> None
 
 
 def test_zero_edge_route_feature_uses_snapped_road_geometry() -> None:
-    from src.route_planner.service import route_to_feature
 
     graph = RoadGraph()
     graph.add_node(Node(id="only", lat=42.0, lon=-72.0))

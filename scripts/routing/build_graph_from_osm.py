@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.route_planner.graph import (  # noqa: E402
+    EdgeProjectionIndex,
     RoadGraph,
     _graph_from_osmnx,
     _iter_osmnx_graph_rows,
@@ -643,23 +644,32 @@ def _publish_sqlite_graph(
     probes: list[dict[str, float | str]],
 ) -> tuple[int, int, dict[str, Any]]:
     candidate = run_dir / f".{output_path.stem}.candidate.sqlite3"
+    candidate_sidecar = EdgeProjectionIndex.sidecar_path(candidate)
     candidate.unlink(missing_ok=True)
-    counts = _write_sqlite_graph(
-        candidate,
-        _iter_osmnx_graph_rows(G, scenic_scores),
-        metadata=metadata,
-    )
-    clear_graph = getattr(G, "clear", None)
-    if callable(clear_graph):
-        clear_graph()
-    del G
-    gc.collect()
-    loaded = RoadGraph.load(candidate)
-    probe_metadata = _coverage_metadata(loaded, probes)
-    _update_sqlite_metadata(candidate, {"coverage_probes": probe_metadata})
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(candidate, output_path)
-    return counts[0], counts[1], probe_metadata
+    candidate_sidecar.unlink(missing_ok=True)
+    try:
+        counts = _write_sqlite_graph(
+            candidate,
+            _iter_osmnx_graph_rows(G, scenic_scores),
+            metadata=metadata,
+        )
+        clear_graph = getattr(G, "clear", None)
+        if callable(clear_graph):
+            clear_graph()
+        del G
+        gc.collect()
+        loaded = RoadGraph.load(candidate)
+        probe_metadata = _coverage_metadata(loaded, probes)
+        _update_sqlite_metadata(candidate, {"coverage_probes": probe_metadata})
+        loaded.persist_edge_projection_index(candidate)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_sidecar = EdgeProjectionIndex.sidecar_path(output_path)
+        os.replace(candidate, output_path)
+        os.replace(candidate_sidecar, output_sidecar)
+        return counts[0], counts[1], probe_metadata
+    finally:
+        candidate.unlink(missing_ok=True)
+        candidate_sidecar.unlink(missing_ok=True)
 
 
 def _load_overpass_graph(ox: Any, args: argparse.Namespace) -> tuple[Any, list[dict[str, Any]]]:
