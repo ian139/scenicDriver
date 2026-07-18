@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.route_planner.graph import (  # noqa: E402
+    EdgeProjectionIndex,
     RoadGraph,
     _graph_from_osmnx,
     _iter_osmnx_graph_rows,
@@ -657,8 +658,13 @@ def _publish_sqlite_graph(
     loaded = RoadGraph.load(candidate)
     probe_metadata = _coverage_metadata(loaded, probes)
     _update_sqlite_metadata(candidate, {"coverage_probes": probe_metadata})
+    loaded.persist_edge_projection_index(candidate)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    candidate_sidecar = EdgeProjectionIndex.sidecar_path(candidate)
+    output_sidecar = EdgeProjectionIndex.sidecar_path(output_path)
     os.replace(candidate, output_path)
+    if candidate_sidecar.exists():
+        os.replace(candidate_sidecar, output_sidecar)
     return counts[0], counts[1], probe_metadata
 
 

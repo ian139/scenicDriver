@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from array import array
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from types import MappingProxyType
 import json
 import math
 import os
@@ -11,6 +12,17 @@ import re
 import sqlite3
 import tempfile
 from typing import Any, Callable, ClassVar, Dict, Generic, List, Optional, Tuple, TypeVar, overload
+
+from ._edge_projection import (
+    EdgeProjection,
+    EdgeProjectionIndex,
+    _EPI_VERSION,
+    _SidecarCorruptError,
+    _SidecarMissingError,
+    _SidecarStaleError,
+    _SidecarTruncatedError,
+    _SidecarVersionError,
+)
 
 import msgspec
 import numpy as np
@@ -79,25 +91,24 @@ class Edge:
     speed_limit_kmh: int = 50
     one_way: bool = False
     _mutation_epoch: ClassVar[int] = 0
+    _projection_epoch: ClassVar[int] = 0
 
     def __setattr__(self, name: str, value: Any) -> None:
         public_field_was_present = not name.startswith("_") and name in self.__dict__
+        projection_field_was_present = (
+            public_field_was_present and name in ("start_node_id", "end_node_id", "road_type")
+        )
         object.__setattr__(self, name, value)
         if public_field_was_present:
             Edge._mutation_epoch += 1
+        if projection_field_was_present:
+            Edge._projection_epoch += 1
 
     @property
     def travel_time_minutes(self) -> float:
         speed = max(float(self.speed_limit_kmh), 1.0)
         return (self.distance_km / speed) * 60.0
 
-@dataclass(frozen=True)
-class EdgeProjection:
-    edge: Edge
-    fraction: float
-    lat: float
-    lon: float
-    snap_distance_km: float
 
 
 class _ReverseEdgeView:
@@ -282,7 +293,12 @@ class RoadGraph:
         self._nearest_spatial_index: Optional[
             Tuple[int, Tuple[str, ...], array, array, array, array, array, array]
         ] = None
-        self._nearest_edge_projection_index: Optional[Tuple[Any, ...]] = None
+        self._nearest_edge_projection_index: EdgeProjectionIndex | None = None
+        self._edge_projection_index_status: str = "missing"
+        self._edge_projection_index_invalid_reason: str | None = None
+        self._edge_projection_index_stamp: Tuple[int, int, int] | None = None
+        self._edge_projection_index_path: str | None = None
+        self._edge_projection_index_payload_size: int | None = None
         self.artifact_metadata: dict[str, Any] = {}
 
     def _advance_heuristic_epoch(self) -> None:
@@ -298,6 +314,13 @@ class RoadGraph:
             Edge._mutation_epoch,
         )
 
+    def _edge_projection_stamp(self) -> Tuple[int, int, int]:
+        return (
+            self._heuristic_structure_epoch,
+            Node._coordinate_mutation_epoch,
+            Edge._projection_epoch,
+        )
+
     def _invalidate_nearest_spatial_index(self) -> None:
         self._nearest_spatial_index = None
         self._nearest_edge_projection_index = None
@@ -310,71 +333,9 @@ class RoadGraph:
         self,
         *,
         check_cancelled: Callable[[], None] | None = None,
-    ) -> Tuple[Any, ...]:
-        """Build compact primitive arrays for canonical finite edge segments."""
-        if check_cancelled is not None:
-            check_cancelled()
-        stamp = self._heuristic_cache_stamp()
-        edge_ids: List[str] = []
-        edge_keys: List[str] = []
-        road_type_codes: List[int] = []
-        start_latitudes: List[float] = []
-        start_longitudes: List[float] = []
-        end_latitudes: List[float] = []
-        end_longitudes: List[float] = []
-        road_type_index: Dict[str, int] = {}
-
-        for edge_index, (edge_key, edge) in enumerate(self.edges.items()):
-            if (
-                check_cancelled is not None
-                and edge_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
-            ):
-                check_cancelled()
-            start = self.nodes.get(edge.start_node_id)
-            end = self.nodes.get(edge.end_node_id)
-            if start is None or end is None:
-                continue
-            try:
-                start_lat = float(start.lat)
-                start_lon = float(start.lon)
-                end_lat = float(end.lat)
-                end_lon = float(end.lon)
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if not all(
-                math.isfinite(value)
-                for value in (start_lat, start_lon, end_lat, end_lon)
-            ):
-                continue
-            road_type = _normalize_road_type(edge.road_type)
-            code = road_type_index.get(road_type)
-            if code is None:
-                code = len(road_type_index)
-                road_type_index[road_type] = code
-            edge_ids.append(str(edge.id))
-            edge_keys.append(edge_key)
-            road_type_codes.append(code)
-            start_latitudes.append(start_lat)
-            start_longitudes.append(start_lon)
-            end_latitudes.append(end_lat)
-            end_longitudes.append(end_lon)
-
-        if check_cancelled is not None:
-            check_cancelled()
-        index = (
-            stamp,
-            tuple(edge_ids),
-            tuple(edge_keys),
-            tuple(road_type_index),
-            np.asarray(road_type_codes, dtype=np.int32),
-            np.asarray(start_latitudes, dtype=np.float64),
-            np.asarray(start_longitudes, dtype=np.float64),
-            np.asarray(end_latitudes, dtype=np.float64),
-            np.asarray(end_longitudes, dtype=np.float64),
-        )
-        if check_cancelled is not None:
-            check_cancelled()
-        return index
+    ) -> EdgeProjectionIndex:
+        """Build a typed, immutable nearest-edge projection index."""
+        return EdgeProjectionIndex.build(self, check_cancelled=check_cancelled)
 
     @staticmethod
     def _project_edge_chunk(
@@ -388,38 +349,139 @@ class RoadGraph:
         start: int,
         stop: int,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        start_lat = start_latitudes[start:stop]
-        start_lon = start_longitudes[start:stop]
-        delta_lat = end_latitudes[start:stop] - start_lat
-        delta_lon = (end_longitudes[start:stop] - start_lon) * longitude_scale
-        query_delta_lat = query_lat - start_lat
-        query_delta_lon = (query_lon - start_lon) * longitude_scale
-        denominator = delta_lat * delta_lat + delta_lon * delta_lon
-        numerator = query_delta_lat * delta_lat + query_delta_lon * delta_lon
-        fractions = np.zeros_like(denominator)
-        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            np.divide(numerator, denominator, out=fractions, where=denominator > 0.0)
-        np.clip(fractions, 0.0, 1.0, out=fractions)
-        projected_latitudes = start_lat + fractions * (end_latitudes[start:stop] - start_lat)
-        projected_longitudes = start_lon + fractions * (end_longitudes[start:stop] - start_lon)
+        """Project a query point onto a finite segment chunk."""
+        return EdgeProjectionIndex._project_edge_chunk(
+            query_lat,
+            query_lon,
+            longitude_scale,
+            start_latitudes,
+            start_longitudes,
+            end_latitudes,
+            end_longitudes,
+            start,
+            stop,
+        )
 
-        with np.errstate(over="ignore", invalid="ignore"):
-            dlat = np.radians(projected_latitudes - query_lat)
-            dlon = np.radians(projected_longitudes - query_lon)
-            haversine = np.sin(dlat / 2.0) ** 2
-            haversine += (
-                np.cos(np.radians(query_lat))
-                * np.cos(np.radians(projected_latitudes))
-                * np.sin(dlon / 2.0) ** 2
+    def persist_edge_projection_index(
+        self,
+        path: Path,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> str:
+        """Generate or upgrade the edge-projection sidecar for a SQLite graph."""
+        sidecar_path = EdgeProjectionIndex.sidecar_path(path)
+        self._edge_projection_index_path = str(sidecar_path)
+        stamp = self._edge_projection_stamp()
+        if (
+            self._nearest_edge_projection_index is None
+            or self._edge_projection_index_stamp != stamp
+        ):
+            self._nearest_edge_projection_index = self._build_nearest_edge_projection_index(
+                check_cancelled=check_cancelled,
             )
-            np.clip(haversine, 0.0, 1.0, out=haversine)
-            np.sqrt(haversine, out=haversine)
-            np.arcsin(haversine, out=haversine)
-            haversine *= 2.0 * 6371.0
-        return fractions, projected_latitudes, projected_longitudes, haversine
+            self._edge_projection_index_stamp = stamp
+        EdgeProjectionIndex.write(
+            self._nearest_edge_projection_index,
+            graph_path=path,
+            sidecar_path=sidecar_path,
+            check_cancelled=check_cancelled,
+        )
+        self._edge_projection_index_status = "saved"
+        self._edge_projection_index_invalid_reason = None
+        self._edge_projection_index_payload_size = sidecar_path.stat().st_size
+        return self._edge_projection_index_status
+
+    def _try_load_edge_projection_index(
+        self,
+        path: Path,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> str:
+        """Attempt a compatible sidecar load; fall back to lazy rebuild."""
+        sidecar_path = EdgeProjectionIndex.sidecar_path(path)
+        self._edge_projection_index_path = str(sidecar_path)
+        self._edge_projection_index_payload_size = (
+            sidecar_path.stat().st_size if sidecar_path.exists() else None
+        )
+        if not sidecar_path.exists():
+            self._edge_projection_index_status = "missing"
+            self._edge_projection_index_invalid_reason = None
+            self._nearest_edge_projection_index = None
+            self._edge_projection_index_stamp = None
+            return self._edge_projection_index_status
+        try:
+            index = EdgeProjectionIndex.load(
+                sidecar_path, path, check_cancelled=check_cancelled
+            )
+            index.attach(self)
+            self._nearest_edge_projection_index = index
+            self._edge_projection_index_stamp = self._edge_projection_stamp()
+            self._edge_projection_index_status = "loaded"
+            self._edge_projection_index_invalid_reason = None
+            self._edge_projection_index_payload_size = sidecar_path.stat().st_size
+        except _SidecarMissingError:
+            self._edge_projection_index_status = "missing"
+            self._edge_projection_index_invalid_reason = "missing"
+        except _SidecarVersionError:
+            self._edge_projection_index_status = "version_mismatch"
+            self._edge_projection_index_invalid_reason = "version_mismatch"
+        except _SidecarStaleError:
+            self._edge_projection_index_status = "stale"
+            self._edge_projection_index_invalid_reason = "stale"
+        except _SidecarTruncatedError:
+            self._edge_projection_index_status = "truncated"
+            self._edge_projection_index_invalid_reason = "truncated"
+        except _SidecarCorruptError:
+            self._edge_projection_index_status = "corrupt"
+            self._edge_projection_index_invalid_reason = "corrupt"
+        except OSError as exc:
+            self._edge_projection_index_status = "corrupt"
+            self._edge_projection_index_invalid_reason = f"os_error: {exc}"
+        if self._edge_projection_index_status != "loaded":
+            self._nearest_edge_projection_index = None
+            self._edge_projection_index_stamp = None
+        return self._edge_projection_index_status
+
     def add_node(self, node: Node) -> None:
         self.nodes[node.id] = node
         self.adjacency.setdefault(node.id, [])
+
+    @property
+    def edge_projection_index_status(self) -> Mapping[str, Any]:
+        """Machine-readable sidecar status: state, path, version, algorithm, and health."""
+        internal_state = self._edge_projection_index_status
+        if internal_state in ("saved", "loaded"):
+            state = "loaded"
+        elif internal_state == "memory":
+            state = "rebuilt"
+        elif internal_state == "missing":
+            state = "missing"
+        else:
+            state = "invalid"
+
+        index = self._nearest_edge_projection_index
+        path = self._edge_projection_index_path
+        payload_size = self._edge_projection_index_payload_size
+        if payload_size is None and path is not None:
+            try:
+                payload_size = Path(path).stat().st_size
+            except OSError:
+                payload_size = None
+
+        return MappingProxyType(
+            {
+                "state": state,
+                "path": path,
+                "format_version": _EPI_VERSION if index is not None else None,
+                "algorithm": "bvh-lat-lb" if index is not None else None,
+                "mmap_read_only": (
+                    index is not None and index._mmap is not None
+                ),
+                "edge_count": index.edge_count if index is not None else 0,
+                "payload_size_bytes": payload_size,
+                "invalid_reason": self._edge_projection_index_invalid_reason,
+            }
+        )
 
     def _build_nearest_spatial_index(
         self,
@@ -786,125 +848,33 @@ class RoadGraph:
         if not math.isfinite(query_lat) or not math.isfinite(query_lon):
             raise ValueError("Query coordinates must be finite")
 
-        stamp = self._heuristic_cache_stamp()
+        stamp = self._edge_projection_stamp()
         index = self._nearest_edge_projection_index
-        if index is None or index[0] != stamp:
+        if index is None or self._edge_projection_index_stamp != stamp:
             index = self._build_nearest_edge_projection_index(
                 check_cancelled=check_cancelled,
             )
             if check_cancelled is not None:
                 check_cancelled()
             self._nearest_edge_projection_index = index
-        (
-            _stamp,
-            edge_ids,
-            edge_keys,
-            road_type_names,
-            road_type_codes,
-            start_latitudes,
-            start_longitudes,
-            end_latitudes,
-            end_longitudes,
-        ) = index
-        if not edge_ids:
+            self._edge_projection_index_stamp = stamp
+            self._edge_projection_index_status = "memory"
+            self._edge_projection_index_invalid_reason = None
+            self._edge_projection_index_payload_size = None
+
+        if index.edge_count == 0:
             raise ValueError("Road graph has no eligible finite segment")
 
-        excluded = {
-            str(road_type).strip().lower()
-            for road_type in (excluded_road_types or ())
-        }
-        if check_cancelled is not None:
-            check_cancelled()
-        allowed_types = np.asarray(
-            [road_type not in excluded for road_type in road_type_names],
-            dtype=np.bool_,
+        index.attach(self)
+
+        return index.query(
+            self,
+            query_lat,
+            query_lon,
+            excluded_road_types=excluded_road_types,
+            check_cancelled=check_cancelled,
         )
-        if check_cancelled is not None:
-            check_cancelled()
-        if not np.any(allowed_types):
-            raise ValueError("Road graph has no eligible finite segment")
 
-        longitude_scale = math.cos(math.radians(query_lat))
-        best_distance = float("inf")
-        edge_count = len(edge_ids)
-        for start in range(0, edge_count, _EDGE_PROJECTION_CHUNK_SIZE):
-            stop = min(start + _EDGE_PROJECTION_CHUNK_SIZE, edge_count)
-            if check_cancelled is not None:
-                check_cancelled()
-            _fractions, _projected_latitudes, _projected_longitudes, distances = (
-                self._project_edge_chunk(
-                    query_lat,
-                    query_lon,
-                    longitude_scale,
-                    start_latitudes,
-                    start_longitudes,
-                    end_latitudes,
-                    end_longitudes,
-                    start,
-                    stop,
-                )
-            )
-            if check_cancelled is not None:
-                check_cancelled()
-            eligible = allowed_types[road_type_codes[start:stop]]
-            finite = eligible & np.isfinite(distances)
-            if np.any(finite):
-                best_distance = min(best_distance, float(np.min(distances[finite])))
-
-        if not math.isfinite(best_distance):
-            raise ValueError("Road graph has no eligible finite segment")
-
-        cutoff = best_distance + _EDGE_PROJECTION_TIE_TOLERANCE_KM
-        projections: List[Tuple[str, str, EdgeProjection]] = []
-        for start in range(0, edge_count, _EDGE_PROJECTION_CHUNK_SIZE):
-            stop = min(start + _EDGE_PROJECTION_CHUNK_SIZE, edge_count)
-            if check_cancelled is not None:
-                check_cancelled()
-            fractions, projected_latitudes, projected_longitudes, distances = (
-                self._project_edge_chunk(
-                    query_lat,
-                    query_lon,
-                    longitude_scale,
-                    start_latitudes,
-                    start_longitudes,
-                    end_latitudes,
-                    end_longitudes,
-                    start,
-                    stop,
-                )
-            )
-            if check_cancelled is not None:
-                check_cancelled()
-            eligible = allowed_types[road_type_codes[start:stop]]
-            tied = eligible & np.isfinite(distances) & (distances <= cutoff)
-            if check_cancelled is not None:
-                check_cancelled()
-            for projection_index, local_index in enumerate(np.flatnonzero(tied)):
-                if (
-                    check_cancelled is not None
-                    and projection_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
-                ):
-                    check_cancelled()
-                index_in_cache = start + int(local_index)
-                projections.append(
-                    (
-                        edge_ids[index_in_cache],
-                        str(edge_keys[index_in_cache]),
-                        EdgeProjection(
-                            edge=self.edges[edge_keys[index_in_cache]],
-                            fraction=float(fractions[local_index]),
-                            lat=float(projected_latitudes[local_index]),
-                            lon=float(projected_longitudes[local_index]),
-                            snap_distance_km=float(distances[local_index]),
-                        ),
-                    )
-                )
-        if check_cancelled is not None:
-            check_cancelled()
-        projections.sort(key=lambda item: (item[0], item[1]))
-        if check_cancelled is not None:
-            check_cancelled()
-        return [projection for _edge_id, _edge_key, projection in projections], best_distance
     def save(
         self,
         path: Path,
@@ -921,6 +891,7 @@ class RoadGraph:
                 _iter_graph_rows(self.nodes.values(), self.edges.values()),
                 metadata=metadata_values,
             )
+            self.persist_edge_projection_index(path)
             return
 
         data = {
@@ -1206,6 +1177,11 @@ class EndpointRoadGraph(RoadGraph):
         self._reverse_edge_views: Dict[str, _ReverseEdgeView] = {}
         self._nearest_spatial_index = None
         self._nearest_edge_projection_index = None
+        self._edge_projection_index_status = "missing"
+        self._edge_projection_index_invalid_reason = None
+        self._edge_projection_index_stamp = None
+        self._edge_projection_index_path = None
+        self._edge_projection_index_payload_size = None
         self.artifact_metadata = base.artifact_metadata
 
     def _ensure_mutable(self) -> None:
@@ -1215,6 +1191,7 @@ class EndpointRoadGraph(RoadGraph):
     def _advance_heuristic_epoch(self) -> None:
         self._local_structure_epoch += 1
         self._reverse_edge_views.clear()
+        self._invalidate_nearest_edge_projection_index()
 
     def _heuristic_cache_stamp(self) -> Tuple[int, int, int]:
         base_structure, node_epoch, edge_epoch = (
@@ -1224,6 +1201,14 @@ class EndpointRoadGraph(RoadGraph):
             base_structure + self._local_structure_epoch,
             node_epoch,
             edge_epoch,
+        )
+
+    def _edge_projection_stamp(self) -> Tuple[int, int, int]:
+        base_stamp = self.base_graph._edge_projection_stamp()
+        return (
+            base_stamp[0] + self._local_structure_epoch,
+            base_stamp[1],
+            base_stamp[2],
         )
 
     def add_node(self, node: Node) -> None:
@@ -1811,6 +1796,9 @@ def _load_sqlite_graph(
             check_cancelled=check_cancelled,
         )
         graph.artifact_metadata = metadata
+        if check_cancelled is not None:
+            check_cancelled()
+        graph._try_load_edge_projection_index(path, check_cancelled=check_cancelled)
         if check_cancelled is not None:
             check_cancelled()
         return graph
