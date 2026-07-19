@@ -182,12 +182,25 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   `bvh-spherical-lb`, 10,792,528 edges, 508,427,024 bytes, `state=loaded`, and
   read-only mmap with no invalid reason. The fresh manifest bootstrap log
   contains no fallback build.
-- [ ] Evaluate CCH or MLD. A targeted 60-second profile of a timed-out
-  Burlington→Montpelier fastest-route query spent 59.78 seconds in 24
-  `_cached_fastest_edges` searches and 55.15 seconds in target-bounded
-  bidirectional traversal, versus 0.15 seconds in both edge projections. The
-  next decision must account for repeated legal endpoint-access combinations,
-  not treat aggregate planning time alone as proof for a hierarchy.
+- [x] Evaluated CCH versus MLD; neither is justified yet. A targeted
+  60-second profile of a timed-out Burlington→Montpelier fastest-route query
+  spent 59.78 seconds across 24 legal endpoint-access pair searches and
+  55.15 seconds in target-bounded bidirectional traversal (4.60 million heap
+  pops), while direct start/end projections took 0.70/0.23 ms. This measures
+  multiplicative dispatch in `_large_graph_fastest_route`, not one irreducibly
+  slow scalar query. CCH would favor static or preload-customized scalar
+  metrics and faster queries, but requires shortcut preprocessing, storage,
+  customization, deterministic unpacking, and persisted invalidation. MLD
+  better accommodates frequent localized metric updates, but needs
+  partition/overlay infrastructure; both hierarchies can accept query-local
+  multi-access endpoints only if current tie, direction, and reconstruction
+  semantics remain explicit. Neither solves the non-additive duration-capped
+  scenic frontier, and frequent-update requirements are not present.
+  First collapse tied access states into one exact ranked
+  multi-access query, preserving current projection/direction/tie semantics,
+  then rerun the fixed benchmark. Reconsider CCH only if that single scalar
+  traversal still dominates; reconsider MLD if frequent live weight updates or
+  many customized metrics become a measured requirement.
 
 ## Ordered next steps
 
