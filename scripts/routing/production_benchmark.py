@@ -18,6 +18,7 @@ import pickle
 import struct
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import resource
 import select
 import signal
 import sys
@@ -60,6 +61,7 @@ DEFAULT_REPORT = Path(
 _BENCHMARK_IMPLEMENTATION_PATHS = {
     "production_benchmark": Path(__file__).resolve(),
     "route_cost": PROJECT_ROOT / "src/route_planner/cost.py",
+    "route_edge_projection": PROJECT_ROOT / "src/route_planner/_edge_projection.py",
     "route_graph": PROJECT_ROOT / "src/route_planner/graph.py",
     "route_planner": PROJECT_ROOT / "src/route_planner/planner.py",
     "route_service": PROJECT_ROOT / "src/route_planner/service.py",
@@ -106,6 +108,11 @@ class CaseTimeout(TimeoutError):
 
 _SUPERVISOR_GRACE_SECONDS = 2.0
 _HAS_POSIX_FORK = hasattr(os, "fork")
+
+def _process_peak_rss_bytes() -> int:
+    """Return this process's peak resident set in platform-independent bytes."""
+    peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return peak if sys.platform == "darwin" else peak * 1024
 
 
 @contextmanager
@@ -2390,6 +2397,7 @@ def _prepare_benchmark_context(
     planner_preload = matrix_planner.prewarm_routing_cache()
     edge_index = {str(edge_id): edge for edge_id, edge in scored_graph.edges.items()}
     node_index = {str(node_id): node for node_id, node in scored_graph.nodes.items()}
+    preload["process_peak_rss_bytes"] = _process_peak_rss_bytes()
     return (
         preload,
         preload_wall_ms,

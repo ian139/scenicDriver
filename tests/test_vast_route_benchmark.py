@@ -69,6 +69,9 @@ def test_remote_script_has_checkpoint_resume_and_final_guard() -> None:
     assert "production_benchmark.py" in script
     assert "--workers 3" in script
     assert "--group-size 6" in script
+    assert "persist_edge_projection_index" in script
+    assert "spatial_index_setup" in script
+    assert "sidecar_size_bytes" in script
     assert "--resume" in script
     assert "aws s3 cp \"$CHECKPOINT\"" in script or "aws s3 cp \"$tmp\"" in script
     assert "matrix.all_cases_persisted" in script

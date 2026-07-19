@@ -11,6 +11,14 @@
       "size_bytes": 3049209856
     },
     {
+      "name": "graph.edge_projection_index",
+      "destination": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3.edge_projection_index",
+      "source_key": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3.edge_projection_index.gz",
+      "compression": "gzip",
+      "sha256": "a2e271c78fcb4791067bff804161f72df575283a672d3e448eed98d602fdbd08",
+      "size_bytes": 508427024
+    },
+    {
       "name": "report",
       "destination": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json",
       "source_key": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json.gz",

@@ -292,6 +292,40 @@ def build_remote_script(config: VastRouteConfig, *, workers: int, group_size: in
     script = quote(paths["script"])
     graph_arg = f"--graph {graph}" if graph else ""
     strict_service_arg = "--strict-service-full" if config.strict_service_full else ""
+    spatial_index_setup = (
+        f"""if [[ ! -f {graph}.edge_projection_index ]]; then
+  uv run python - {graph} <<'PY'
+import json
+from pathlib import Path
+import resource
+import sys
+from time import perf_counter
+
+from src.route_planner.graph import RoadGraph
+
+path = Path(sys.argv[1])
+started = perf_counter()
+graph = RoadGraph.load(path)
+load_elapsed_ms = (perf_counter() - started) * 1000.0
+started = perf_counter()
+graph.persist_edge_projection_index(path)
+persist_elapsed_ms = (perf_counter() - started) * 1000.0
+sidecar = Path(f"{{path}}.edge_projection_index")
+print(json.dumps({{
+    "spatial_index_setup": {{
+        "source": "built",
+        "graph_load_elapsed_ms": load_elapsed_ms,
+        "persist_elapsed_ms": persist_elapsed_ms,
+        "sidecar_size_bytes": sidecar.stat().st_size,
+        "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+        "status": dict(graph.edge_projection_index_status),
+    }}
+}}, sort_keys=True))
+PY
+fi"""
+        if graph
+        else ""
+    )
     return f"""#!/usr/bin/env bash
 set -Eeuo pipefail
 # Probe raw host capacity before depending on the project, env, or uv.
@@ -305,6 +339,7 @@ set -a
 source {env}
 set +a
 mkdir -p {quote(str(PurePosixPath(paths['log']).parent))} "$(dirname {output})"
+{spatial_index_setup}
 CHECKPOINT={checkpoint}
 OUTPUT={output}
 CHECKPOINT_S3={checkpoint_s3}
