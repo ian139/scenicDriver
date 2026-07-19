@@ -69,6 +69,28 @@ def test_select_offer_id_at_returns_indexed_offer(monkeypatch: pytest.MonkeyPatc
         cmux_vast_host.select_offer_id_at("num_gpus=1", 2)
 
 
+def test_endpoint_wait_fails_fast_for_stopped_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cmux_vast_host,
+        "show_instance",
+        lambda _instance_id: {
+            "actual_status": None,
+            "cur_state": "stopped",
+            "intended_status": "stopped",
+        },
+    )
+    monkeypatch.setattr(
+        cmux_vast_host,
+        "ssh_url_for_instance",
+        lambda _instance_id: ("ssh2.vast.ai", 10022),
+    )
+
+    with pytest.raises(RuntimeError, match="stopped before SSH"):
+        cmux_vast_host.wait_for_instance_endpoint(123, 60)
+
+
 def test_do_up_retries_destroying_failed_ssh_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
     args = make_up_args()
     created = iter([111, 222])

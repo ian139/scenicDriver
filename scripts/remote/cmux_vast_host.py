@@ -307,6 +307,17 @@ def instance_is_running(payload: dict) -> bool:
     return bool(values & {"running", "loaded", "started"})
 
 
+def instance_is_terminal(payload: dict) -> bool:
+    intended = str(payload.get("intended_status", "")).lower()
+    current = {
+        str(payload.get("actual_status", "")).lower(),
+        str(payload.get("cur_state", "")).lower(),
+    }
+    return intended in {"stopped", "destroyed"} and not (
+        current & {"running", "loaded", "started"}
+    )
+
+
 def wait_for_instance_endpoint(instance_id: int, timeout_seconds: int) -> tuple[str, int]:
     deadline = time.monotonic() + timeout_seconds
     last_error = ""
@@ -314,11 +325,21 @@ def wait_for_instance_endpoint(instance_id: int, timeout_seconds: int) -> tuple[
         try:
             payload = show_instance(instance_id)
             endpoint = ssh_url_for_instance(instance_id) or host_port_from_show(payload)
+        except Exception as exc:  # noqa: BLE001 - preserve retries around Vast API flakiness.
+            last_error = str(exc)
+        else:
+            status = {
+                "actual_status": payload.get("actual_status"),
+                "cur_state": payload.get("cur_state"),
+                "intended_status": payload.get("intended_status"),
+            }
+            if instance_is_terminal(payload):
+                raise RuntimeError(
+                    f"Vast instance stopped before SSH became ready: {json.dumps(status)}"
+                )
             if instance_is_running(payload) and endpoint is not None:
                 return endpoint
-            last_error = json.dumps({"actual_status": payload.get("actual_status"), "cur_state": payload.get("cur_state")})
-        except Exception as exc:  # noqa: BLE001 - preserve retry behavior around Vast flakiness.
-            last_error = str(exc)
+            last_error = json.dumps(status)
         time.sleep(10)
     raise RuntimeError(f"Timed out waiting for Vast SSH endpoint: {last_error}")
 
