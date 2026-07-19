@@ -1100,6 +1100,30 @@ def test_benchmark_interruption_preserves_checkpoint_and_final_json(
     )
 
 
+def test_sqlite_benchmark_requires_mmap_loaded_edge_projection_index() -> None:
+    loaded = {
+        "edge_projection_index": {
+            "state": "loaded",
+            "mmap_read_only": True,
+        }
+    }
+    production_benchmark._require_loaded_edge_projection_index(
+        Path("graph.sqlite3"),
+        loaded,
+    )
+
+    with pytest.raises(RuntimeError, match="mmap-loaded"):
+        production_benchmark._require_loaded_edge_projection_index(
+            Path("graph.sqlite3"),
+            {
+                "edge_projection_index": {
+                    "state": "rebuilt",
+                    "mmap_read_only": False,
+                }
+            },
+        )
+
+
 def test_checkpoint_fingerprint_includes_routing_implementation(
     tmp_path, monkeypatch
 ) -> None:

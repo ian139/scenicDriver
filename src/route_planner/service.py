@@ -788,6 +788,7 @@ def preload_route_assets(
         "graph_cache_hit": bool(graph_cache_hit),
         "tile_score_cache_hit": bool(tile_score_cache_hit),
         "scored_graph_cache_hit": bool(scored_graph_cache_hit),
+        "edge_projection_index": dict(graph.edge_projection_index_status),
         "score_mapping": score_mapping,
         "planner_preload": planner_preload,
         "preload_elapsed_ms": (perf_counter() - started_at) * 1000.0,

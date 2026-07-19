@@ -709,6 +709,7 @@ def test_preload_route_assets_populates_cache_before_first_request(
     assert preload["graph_cache_hit"] is False
     assert preload["tile_score_cache_hit"] is False
     assert preload["scored_graph_cache_hit"] is False
+    assert preload["edge_projection_index"]["state"] == "missing"
     assert preload["score_mapping"]["matched_ratio"] == pytest.approx(1.0)
 
     class FakePlanner:

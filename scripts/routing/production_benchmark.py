@@ -2372,6 +2372,25 @@ def _atomic_write_text(path: Path, text: str) -> None:
                 pass
 
 
+def _require_loaded_edge_projection_index(
+    graph_path: Path,
+    preload: Mapping[str, Any],
+) -> None:
+    """Reject production SQLite runs that did not mmap the persisted sidecar."""
+    if graph_path.suffix.lower() != ".sqlite3":
+        return
+    status = preload.get("edge_projection_index")
+    if (
+        not isinstance(status, Mapping)
+        or status.get("state") != "loaded"
+        or status.get("mmap_read_only") is not True
+    ):
+        raise RuntimeError(
+            "production benchmark requires a compatible mmap-loaded edge "
+            f"projection index; observed {dict(status) if isinstance(status, Mapping) else status!r}"
+        )
+
+
 def _prepare_benchmark_context(
     graph_path: Path, report_path: Path
 ) -> tuple[
@@ -2389,6 +2408,7 @@ def _prepare_benchmark_context(
         report_path,
         exclusive_scoring=True,
     )
+    _require_loaded_edge_projection_index(graph_path, preload)
     preload_wall_ms = (perf_counter() - preload_started) * 1000.0
     scored_graph = next(iter(route_service._SCORED_GRAPH_CACHE.values()), None)
     if scored_graph is None:
