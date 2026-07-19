@@ -155,9 +155,17 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   and prewarmed endpoint behavior are covered. Gate: `284 passed` across the
   integrated routing/service/API suite, Ruff passed, and an independent review
   found no correctness blocker.
-- [ ] Versioned persisted spatial edge index with corruption recovery — next.
+- [x] Versioned persisted spatial edge index with corruption recovery —
+  integrated at `d3d7872a`; the canonical beta sidecar was published and added
+  to the artifact manifest at `76572f20`. The version-2 `SCENEDGE` sidecar is
+  graph-hash bound, mmap read-only, projection-stamp invalidated, and rebuilt
+  lazily after missing, stale, truncated, or corrupt loads. The 10,792,528-edge
+  production sidecar is 508,427,024 bytes; generation took 56.4 seconds after a
+  147.2-second graph load and peaked at 7,476,871,168 resident bytes. Gate:
+  `178 passed`, focused artifact/benchmark coverage passed, Pyright was clean
+  for the index implementation, and independent review found no blocker.
 - [ ] Re-run the unchanged 10-second production benchmark after the persisted
-  index gate.
+  index gate — next.
 - [ ] Evaluate CCH or MLD only if that integrated benchmark still misses the
   latency target and graph traversal remains the measured bottleneck.
 
