@@ -164,10 +164,30 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   147.2-second graph load and peaked at 7,476,871,168 resident bytes. Gate:
   `178 passed`, focused artifact/benchmark coverage passed, Pyright was clean
   for the index implementation, and independent review found no blocker.
-- [ ] Re-run the unchanged 10-second production benchmark after the persisted
-  index gate — next.
-- [ ] Evaluate CCH or MLD only if that integrated benchmark still misses the
-  latency target and graph traversal remains the measured bottleneck.
+- [x] Re-ran the unchanged 10-second production benchmark from implementation
+  revision `bb78048b` as Vast run `full-bbox-v1-r7`: 2 isolated workers,
+  group size 64, 23 pairs/2,256 cases, the canonical graph/report, and the
+  original q/kappa/highway matrix. Command:
+  `uv run python scripts/remote/vast_route_benchmark.py run full-bbox-v1-r7
+  --offer-id 44333585 --s3-bucket scenicdriver-data --s3-prefix
+  outputs/vast/new-england-north-full-bbox-v1-r7/ --output
+  data/processed/routing_benchmarks/production_artifact_benchmark_r7.json
+  --workers 2 --group-size 64 --case-timeout-seconds 10`.
+  Against revision `75ee0431`/run r5, completed cases rose 3→1,281 and timeouts
+  fell 2,253→975; fixed-denominator median fell 10,546.3→5,611.5 ms (46.8%)
+  and p95 fell 14,956.5→11,551.4 ms (22.8%). All 1,281 completed cases stayed
+  below 10 seconds (median 5.21 ms), but only 56.8% of all cases did, so the
+  all-case SLA still failed. Cold isolated-worker preload was 207.6 seconds and
+  peak RSS was 16,935,841,792 bytes; the sidecar reported version 2,
+  `bvh-spherical-lb`, 10,792,528 edges, 508,427,024 bytes, `state=loaded`, and
+  read-only mmap with no invalid reason. The fresh manifest bootstrap log
+  contains no fallback build.
+- [ ] Evaluate CCH or MLD. A targeted 60-second profile of a timed-out
+  Burlington→Montpelier fastest-route query spent 59.78 seconds in 24
+  `_cached_fastest_edges` searches and 55.15 seconds in target-bounded
+  bidirectional traversal, versus 0.15 seconds in both edge projections. The
+  next decision must account for repeated legal endpoint-access combinations,
+  not treat aggregate planning time alone as proof for a hierarchy.
 
 ## Ordered next steps
 
