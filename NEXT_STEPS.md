@@ -197,9 +197,11 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   semantics remain explicit. Neither solves the non-additive duration-capped
   scenic frontier, and frequent-update requirements are not present.
   The exact ranked multi-access query is now implemented and covered by the
-  routing oracle/API tests. The fixed production benchmark remains pending a
-  reachable Vast host; do not reconsider CCH/MLD until that unchanged matrix
-  is rerun and profiling shows one scalar traversal is still dominant.
+  The fixed production benchmark remains pending a reachable Vast host. The
+  2026-07-20 r8h retry selected verified offer `39026204` (32 effective CPU
+  cores, 252 GiB RAM, 1.24 TB disk, 750 MB/s disk bandwidth), but provisioning
+  stalled with no SSH endpoint and produced no benchmark artifact. Do not
+  reconsider CCH/MLD until the unchanged matrix is rerun successfully.
 
 ## Ordered next steps
 
