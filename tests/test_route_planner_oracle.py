@@ -522,6 +522,12 @@ def _pairwise_large_fastest_oracle(
                     best = (duration, [direct], start_projection, end_projection)
     return best
 
+def _edge_direction(edge: Edge) -> str:
+    direction = getattr(edge, "direction", None)
+    if direction is not None:
+        return str(direction)
+    return "reverse" if getattr(edge, "_is_reverse_traversal", False) else "forward"
+
 
 def _route_signature(route):
     return (
@@ -557,6 +563,7 @@ def test_multi_access_matches_pairwise_oracle_for_tied_mixed_access(
     )
     planner = ScenicRoutePlanner(graph)
     monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
     start = (0.002, 0.0)
     end = (0.048, 0.0)
     oracle = _pairwise_large_fastest_oracle(planner, start, end)
@@ -566,7 +573,7 @@ def test_multi_access_matches_pairwise_oracle_for_tied_mixed_access(
         str(getattr(edge, "canonical_edge_id", edge.id)) for edge in oracle[1]
     )
     expected_directions = tuple(
-        getattr(edge, "direction", "forward") for edge in oracle[1]
+        _edge_direction(edge) for edge in oracle[1]
     )
     assert actual.estimated_duration_minutes == pytest.approx(oracle[0])
     assert actual.edge_ids == expected_ids
@@ -588,6 +595,7 @@ def test_multi_access_matches_pairwise_oracle_with_highway_exclusion(
         )
     planner = ScenicRoutePlanner(graph)
     monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
     start = (0.001, 0.0)
     end = (0.029, 0.0)
     oracle = _pairwise_large_fastest_oracle(
@@ -613,24 +621,24 @@ def test_multi_access_preserves_unreachable_access_behavior(
     graph.add_edge(Edge("right", "2", "3", 1.0, 0.0, speed_limit_kmh=60))
     planner = ScenicRoutePlanner(graph)
     monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
     assert _pairwise_large_fastest_oracle(planner, (0.002, 0.0), (0.028, 0.0)) is None
     with pytest.raises(ValueError, match="No route found"):
         planner.find_fastest_route((0.002, 0.0), (0.028, 0.0))
 
 
 @pytest.mark.parametrize(
-    ("start", "end", "direction"),
+    ("start", "end"),
     [
-        ((0.0, 0.0), (0.01, 0.0), "forward"),
-        ((0.01, 0.0), (0.0, 0.0), "forward"),
-        ((0.005, 0.0), (0.005, 0.0), "forward"),
+        ((0.0, 0.0), (0.01, 0.0)),
+        ((0.01, 0.0), (0.0, 0.0)),
+        ((0.005, 0.0), (0.005, 0.0)),
     ],
 )
 def test_multi_access_boundary_and_zero_length_routes(
     monkeypatch: pytest.MonkeyPatch,
     start: tuple[float, float],
     end: tuple[float, float],
-    direction: str,
 ) -> None:
     graph = RoadGraph()
     graph.add_node(Node("A", 0.0, 0.0))
@@ -640,9 +648,28 @@ def test_multi_access_boundary_and_zero_length_routes(
     )
     planner = ScenicRoutePlanner(graph)
     monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
+    oracle = _pairwise_large_fastest_oracle(planner, start, end)
+    assert oracle is not None
     route = planner.find_fastest_route(start, end)
-    assert route.segments[0].direction == direction
-    assert route.estimated_duration_minutes >= 0.0
+    assert route.estimated_duration_minutes == pytest.approx(oracle[0])
+    if oracle[0] == 0.0:
+        assert route.segments
+        return
+    oracle_edges = [edge for edge in oracle[1] if edge.distance_km > 1e-12]
+    expected = [
+        (
+            str(getattr(edge, "canonical_edge_id", edge.id)),
+            _edge_direction(edge),
+        )
+        for edge in oracle_edges
+    ]
+    actual = [
+        (edge_id, segment.direction)
+        for edge_id, segment in zip(route.edge_ids, route.segments)
+        if segment.duration_minutes > 1e-12
+    ]
+    assert actual == expected
 
 def test_large_graph_fastest_route_uses_one_ranked_access_search(
     monkeypatch: pytest.MonkeyPatch,
@@ -664,6 +691,7 @@ def test_large_graph_fastest_route_uses_one_ranked_access_search(
             )
     planner = ScenicRoutePlanner(graph)
     monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
     calls = 0
     original = planner._multi_access_builtin_path
 
@@ -703,6 +731,7 @@ def test_large_graph_multi_access_preserves_reverse_direct_metadata(
     )
     planner = ScenicRoutePlanner(graph)
     monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
     route = planner.find_fastest_route((0.008, 0.0), (0.002, 0.0))
     assert route.edge_ids == ("two-way",)
     assert route.traversal_ids == ("0:reverse:two-way",)

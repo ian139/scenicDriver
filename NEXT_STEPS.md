@@ -196,11 +196,10 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   multi-access endpoints only if current tie, direction, and reconstruction
   semantics remain explicit. Neither solves the non-additive duration-capped
   scenic frontier, and frequent-update requirements are not present.
-  First collapse tied access states into one exact ranked
-  multi-access query, preserving current projection/direction/tie semantics,
-  then rerun the fixed benchmark. Reconsider CCH only if that single scalar
-  traversal still dominates; reconsider MLD if frequent live weight updates or
-  many customized metrics become a measured requirement.
+  The exact ranked multi-access query is now implemented and covered by the
+  routing oracle/API tests. The fixed production benchmark remains pending a
+  reachable Vast host; do not reconsider CCH/MLD until that unchanged matrix
+  is rerun and profiling shows one scalar traversal is still dominant.
 
 ## Ordered next steps
 

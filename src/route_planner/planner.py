@@ -1842,20 +1842,17 @@ class ScenicRoutePlanner:
                         else:
                             consider(other_id, new_id)
 
-        if best is None:
-            if graph is not self.graph:
-                if strict_mutation:
-                    raise RuntimeError("road graph changed during fastest-path search")
-                return None
-            return None
-        if (
+        invalidated = (
             graph is not self.graph
             or graph._heuristic_cache_stamp() != active_stamp
             or topology.graph._heuristic_cache_stamp() != topology.stamp
             or self._built_in_cost_signature(cost_function) != signature
-        ):
+        )
+        if invalidated:
             if strict_mutation:
                 raise RuntimeError("road graph changed during fastest-path search")
+            return None
+        if best is None:
             return None
 
         _, forward_id, reverse_id, rank_key = best
