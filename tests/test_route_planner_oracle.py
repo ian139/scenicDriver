@@ -418,6 +418,30 @@ def test_large_graph_fastest_route_uses_one_ranked_access_search(
         "3:forward:edge-3",
     )
 
+
+def test_large_graph_multi_access_preserves_reverse_direct_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    graph.add_node(Node("A", 0.0, 0.0))
+    graph.add_node(Node("B", 0.01, 0.0))
+    graph.add_edge(
+        Edge(
+            "two-way",
+            "A",
+            "B",
+            10.0,
+            0.0,
+            speed_limit_kmh=60.0,
+            one_way=False,
+        )
+    )
+    planner = ScenicRoutePlanner(graph)
+    monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    route = planner.find_fastest_route((0.008, 0.0), (0.002, 0.0))
+    assert route.edge_ids == ("two-way",)
+    assert route.traversal_ids == ("0:reverse:two-way",)
+    assert route.segments[0].direction == "reverse"
 def test_oracle_fastest_and_scenic_differ_and_detour_unlocks() -> None:
     planner = ScenicRoutePlanner(_tradeoff_graph())
     fastest = _route(planner, q=0.0, kappa=4.0)

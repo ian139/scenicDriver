@@ -3823,10 +3823,13 @@ class ScenicRoutePlanner:
                         "direction": direction,
                     }
                 )
-        if best is None:
-            return None
         if base._heuristic_cache_stamp() != active_stamp:
-            return None
+            raise RuntimeError("road graph changed during fastest-path search")
+        if (
+            overlay is not self.graph
+            or self._built_in_cost_signature(cost_function) != signature
+        ):
+            raise RuntimeError("road graph changed during fastest-path search")
         return best
 
     def _large_graph_fastest_route(
@@ -3839,6 +3842,7 @@ class ScenicRoutePlanner:
         """Solve all legal projected endpoint accesses in one traversal."""
         base = self.graph
         assert base is not None
+        active_stamp = base._heuristic_cache_stamp()
         _check_active_deadline()
         excluded = HIGHWAY_ROAD_TYPES if avoid_highways else frozenset()
         starts, _ = base.find_nearest_edge_positions_with_distance(
@@ -4039,6 +4043,8 @@ class ScenicRoutePlanner:
             if best is None:
                 raise ValueError("No route found between the given coordinates.")
             _, best_edges, start_index, end_index, _ = best
+            if base._heuristic_cache_stamp() != active_stamp:
+                raise RuntimeError("road graph changed during fastest-path search")
             start_projection = starts[start_index]
             end_projection = ends[end_index]
             render_graph = RoadGraph()
