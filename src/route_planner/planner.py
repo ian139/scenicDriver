@@ -3791,6 +3791,7 @@ class ScenicRoutePlanner:
                 while cursor["parent"] is not None:
                     tokens.append(cursor["token"])
                     cursor = labels[int(cursor["parent"])]
+                tokens.reverse()
                 path: List[Edge] = [cursor["prefix"]]
                 path.extend(edge_for_token(token) for token in tokens)
                 path.append(suffix)
