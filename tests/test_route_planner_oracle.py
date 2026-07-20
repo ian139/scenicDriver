@@ -379,6 +379,50 @@ def _route(planner: ScenicRoutePlanner, q: float, kappa: float):
     )
 
 
+def test_large_graph_fastest_route_uses_one_ranked_access_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    for node_id, lat in (("A", 0.0), ("B", 0.01), ("C", 0.02)):
+        graph.add_node(Node(node_id, lat, 0.0))
+    graph.add_edge(
+        Edge(
+            "ab",
+            "A",
+            "B",
+            1.0,
+            0.0,
+            speed_limit_kmh=60.0,
+            one_way=False,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            "bc",
+            "B",
+            "C",
+            1.0,
+            0.0,
+            speed_limit_kmh=60.0,
+            one_way=False,
+        )
+    )
+    planner = ScenicRoutePlanner(graph)
+    monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    calls = 0
+    original = planner._multi_access_builtin_path
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(planner, "_multi_access_builtin_path", counted)
+    route = planner.find_fastest_route((0.002, 0.0), (0.018, 0.0))
+    assert calls == 1
+    assert route.edge_ids == ("ab", "bc")
+    assert route.traversal_ids == ("0:forward:ab", "1:forward:bc")
+
 def test_oracle_fastest_and_scenic_differ_and_detour_unlocks() -> None:
     planner = ScenicRoutePlanner(_tradeoff_graph())
     fastest = _route(planner, q=0.0, kappa=4.0)
