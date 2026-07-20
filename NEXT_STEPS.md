@@ -218,6 +218,13 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   and 1,281 under 10 seconds (56.78%). The latency target therefore failed;
   the new run improved completion rate but worsened fixed-denominator median
   by 8.21%. Artifact: `.cmux-vast/artifacts/full-bbox-v1-r8k/final.json`.
+- The 884th failed case was not a timeout: case index 1610
+  (`medium_bangor_presque_isle|q=0|kappa=3|avoid=false`) returned
+  `reason=invalid:q0_fastest`. Its baseline route duration was 1.0x, but the
+  returned q=0 route duration was 2.989863x, so the q=0 fastest invariant
+  failed. The r7 counterpart timed out, so this is not a direct route-result
+  regression comparison; it remains an unresolved correctness finding and the
+  benchmark is not a clean correctness pass.
 - Final preload diagnostics passed: sidecar `loaded`, read-only mmap,
   format 2, `bvh-spherical-lb`, 10,792,528 edges, 508,427,024-byte payload,
   and null invalid reason. Do not reconsider CCH/MLD yet: this run did not
