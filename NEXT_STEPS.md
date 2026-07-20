@@ -202,34 +202,36 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   RAM, 64 GiB allocated disk (2 workers, group size 64), with no repository
   MLPERF utility; classify this graph-scale, multi-worker, long-preload workload
   as **intensive**. Measured peak RSS was 15.77 GiB; the offer reported
-  1.34 TB host disk and 2,951 MB/s disk bandwidth. Remote command:
+  1.34 TB host disk and 2,951 MB/s disk bandwidth. Corrected remote command:
   `uv run python scripts/routing/production_benchmark.py --corpus
   scripts/routing/production_benchmark_pairs.json --graph
   data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3
   --report data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json
-  --output /workspace/scenic-artifacts/vast-route/full-bbox-v1-r8k/
-  production_artifact_benchmark_r8k.json --case-timeout-seconds 10 --workers 2
-  --group-size 64`.
-- The canonical 2,256-case matrix used the unchanged graph/report/corpus and
-  persisted sidecar. All-case median/p95/max were 6,072.237/11,714.490/
-  909,740.830 ms; 1,372 routes completed, 883 timed out, and 1,373 cases
-  (60.86%) completed under 10 seconds. Baseline r7 was
+  --output /workspace/scenic-artifacts/vast-route/full-bbox-v1-r8k-corrected/
+  production_artifact_benchmark_r8k_corrected.json --case-timeout-seconds 10
+  --workers 2 --group-size 64`.
+- The corrected canonical 2,256-case matrix used the unchanged
+  graph/report/corpus and persisted sidecar. All-case median/p95/max were
+  5,951.247/11,715.040/372,308.189 ms; 1,375 routes completed, 881 timed
+  out, and 1,375 cases (60.95%) completed under 10 seconds. Baseline r7 was
   5,611.533/11,551.359/179,210.040 ms, with 1,281 completed, 975 timeouts,
-  and 1,281 under 10 seconds (56.78%). The latency target therefore failed;
-  the new run improved completion rate but worsened fixed-denominator median
-  by 8.21%. Artifact: `.cmux-vast/artifacts/full-bbox-v1-r8k/final.json`.
+  and 1,281 under 10 seconds (56.78%). The latency target failed; completion
+  improved while fixed-denominator median worsened by 6.05%. Artifact:
+  `.cmux-vast/artifacts/full-bbox-v1-r8k-corrected/final.json`.
+- Corrected artifact checkpoint fingerprint is
+  `7f8025f65ac3b1605c7bbd0a2d430a8b9c50d03f71dafdedf6ef9a483d338dfb`;
+  benchmark source revision is `d274f8fa`. Preload wall time was 291,986.018
+  ms and peak RSS was 15.764 GiB.
 - [x] The q=0 finding was a benchmark-validator defect, not a planner
   route-selection defect: canonical service calls use `scenic_priority=True`,
   which intentionally overrides the zero-weight duration shortcut. The
   evaluator now gates `q0_fastest` on that actual mode. Focused regression
   coverage passes for both priority modes, including the 12-vs-10-minute,
   `kappa=3.0` case with an `ok` evaluation.
-- The historical r8k artifact recorded case index 1610
-  (`medium_bangor_presque_isle|q=0|kappa=3|avoid=false`) as
-  `invalid:q0_fastest`; its baseline timed out in r7, so the old row was not
-  a route-result comparison. Regenerate the canonical aggregate with the
-  corrected evaluator before release; do not treat the historical artifact as
-  a clean correctness pass.
+- [x] The corrected aggregate has `q0_fastest: pass=1375`, no invalid
+  `q0_fastest` rows, and `no_route_reasons: timeout=881` only. Case index 1610
+  is now a valid scenic-priority response; the historical invalid row remains
+  preserved only for audit provenance.
 - Final preload diagnostics passed: sidecar `loaded`, read-only mmap,
   format 2, `bvh-spherical-lb`, 10,792,528 edges, 508,427,024-byte payload,
   and null invalid reason. Do not reconsider CCH/MLD yet: this run did not
@@ -238,17 +240,23 @@ docker compose --env-file .env.beta -f compose.beta.yml down
 
 ## Ordered next steps
 
-1. Keep the complete, versioned beta artifact set in the private artifact store;
+1. [x] Resolve the benchmark-only q=0 invariant mismatch, run focused
+   priority-mode regressions, and regenerate the corrected canonical aggregate
+   before artifact deployment.
+2. Keep the complete, versioned beta artifact set in the private artifact store;
    the current checked-in manifest uses
    `releases/routeOptimizer/75ee0431/` as its S3 prefix.
-2. On the intended host, run the bootstrap download command and then repeat it
+3. On the intended host, run the bootstrap download command and then repeat it
    with `--check-only` before building Docker images.
-3. Run the strict-preload beta smoke check, including API health, heatmap data,
+4. Run the strict-preload beta smoke check, including API health, heatmap data,
    route comparison, and address search with a valid Mapbox token.
-4. Keep model/token credentials and all generated artifacts in external secret
+5. Keep model/token credentials and all generated artifacts in external secret
    and artifact stores; rotate tokens independently of source releases.
-5. Treat `.github/workflows/ci.yml` as the clean-runner gate: it installs the
+6. Treat `.github/workflows/ci.yml` as the clean-runner gate: it installs the
    frozen project plus locked `dev` extra, then runs both required test commands.
-6. Before any broader release, obtain explicit distribution permission and
+7. Keep the fixed-denominator latency SLA/profile follow-up explicit; do not
+   reconsider CCH/MLD without targeted evidence that one scalar traversal
+   remains the material bottleneck.
+8. Before any broader release, obtain explicit distribution permission and
    replace this private preview boundary with an approved license and artifact
    publication policy.
