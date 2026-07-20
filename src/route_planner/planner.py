@@ -1574,15 +1574,15 @@ class ScenicRoutePlanner:
         reverse_edge._is_reverse_traversal = True
         return reverse_edge
 
-    def _bidirectional_builtin_path(
+    def _bidirectional_search_core(
         self,
-        start: Node,
-        goal: Node,
         cost_function: ScenicCostFunction,
-    ) -> Optional[List[Edge]]:
-        """Run target-bounded Dijkstra over compact base plus local edges."""
-        if start.id == goal.id:
-            return []
+        forward_seeds: List[Tuple[str, float, Tuple[object, ...], Optional[Edge]]],
+        reverse_seeds: List[Tuple[str, float, Tuple[object, ...], Optional[Edge]]],
+        *,
+        strict_mutation: bool = False,
+    ) -> Optional[Tuple[List[Edge], Tuple[object, ...]]]:
+        """Shared ranked bidirectional search over compact CSR and local edges."""
         graph = self.graph
         assert graph is not None
         active_stamp = graph._heuristic_cache_stamp()
@@ -1598,29 +1598,45 @@ class ScenicRoutePlanner:
             if data is not None and data.topology is topology
             else self._vectorized_builtin_weights(topology, signature)
         )
-        if weights is None:
-            return None
         base_index = topology.node_index
-        start_id = str(start.id)
-        goal_id = str(goal.id)
-        if start_id not in graph.nodes or goal_id not in graph.nodes:
-            return None
+        topology_graph = topology.graph
 
-        def local_edge_cost(edge_id: str, reverse: bool) -> float:
+        def local_cost(edge_id: str, reverse: bool) -> float:
             edge = graph.edges[edge_id]
-            if reverse:
-                edge = self._edge_from_reverse_index(edge_id, True)
+            traversed = (
+                self._edge_from_reverse_index(edge_id, True) if reverse else edge
+            )
             return self._validated_nonnegative(
-                cost_function.calculate(edge), "edge calculated cost"
+                cost_function.calculate(traversed), "edge calculated cost"
             )
 
-        def forward_steps(node_id: str):
+        def base_cost(position: int) -> float:
+            if weights is not None:
+                return float(weights[position])
+            edge_id, reverse = topology.edge_refs[position]
+            edge = topology_graph.edges[edge_id]
+            if self._avoids_highways(cost_function) and is_highway_road_type(
+                edge.road_type
+            ):
+                return float("inf")
+            return self._validated_nonnegative(
+                cost_function.calculate(
+                    self._edge_from_reverse_index(edge_id, reverse)
+                    if reverse
+                    else edge
+                ),
+                "edge calculated cost",
+            )
+
+        def forward_steps(
+            node_id: str,
+        ) -> Iterator[Tuple[str, float, Tuple[object, ...]]]:
             base_node_index = base_index.get(node_id)
             if base_node_index is not None:
                 row_start = int(topology.indptr[base_node_index])
                 row_end = int(topology.indptr[base_node_index + 1])
                 for position in range(row_start, row_end):
-                    edge_cost = float(weights[position])
+                    edge_cost = base_cost(position)
                     if math.isfinite(edge_cost):
                         yield (
                             str(topology.node_ids[int(topology.indices[position])]),
@@ -1630,22 +1646,21 @@ class ScenicRoutePlanner:
             if isinstance(graph, EndpointRoadGraph):
                 for edge_id, reverse in graph.iter_local_edges(node_id):
                     edge = graph.edges[edge_id]
-                    neighbor = (
-                        edge.start_node_id if reverse else edge.end_node_id
-                    )
                     if self._avoids_highways(cost_function) and is_highway_road_type(
                         edge.road_type
                     ):
                         continue
-                    edge_cost = local_edge_cost(edge_id, bool(reverse))
+                    edge_cost = local_cost(str(edge_id), bool(reverse))
                     if math.isfinite(edge_cost):
                         yield (
-                            str(neighbor),
+                            str(edge.start_node_id if reverse else edge.end_node_id),
                             edge_cost,
                             ("local", str(edge_id), bool(reverse)),
                         )
 
-        def reverse_steps(node_id: str):
+        def reverse_steps(
+            node_id: str,
+        ) -> Iterator[Tuple[str, float, Tuple[object, ...]]]:
             base_node_index = base_index.get(node_id)
             if base_node_index is not None:
                 row_start = int(topology.reverse_indptr[base_node_index])
@@ -1655,7 +1670,7 @@ class ScenicRoutePlanner:
                         topology.reverse_indices[reverse_position]
                     )
                     position = int(topology.reverse_positions[reverse_position])
-                    edge_cost = float(weights[position])
+                    edge_cost = base_cost(position)
                     if math.isfinite(edge_cost):
                         yield (
                             str(topology.node_ids[predecessor_index]),
@@ -1665,17 +1680,14 @@ class ScenicRoutePlanner:
             if isinstance(graph, EndpointRoadGraph):
                 for edge_id, reverse in graph.iter_local_predecessors(node_id):
                     edge = graph.edges[edge_id]
-                    predecessor = (
-                        edge.end_node_id if reverse else edge.start_node_id
-                    )
                     if self._avoids_highways(cost_function) and is_highway_road_type(
                         edge.road_type
                     ):
                         continue
-                    edge_cost = local_edge_cost(edge_id, bool(reverse))
+                    edge_cost = local_cost(str(edge_id), bool(reverse))
                     if math.isfinite(edge_cost):
                         yield (
-                            str(predecessor),
+                            str(edge.end_node_id if reverse else edge.start_node_id),
                             edge_cost,
                             ("local", str(edge_id), bool(reverse)),
                         )
@@ -1685,136 +1697,6 @@ class ScenicRoutePlanner:
                 return str(topology.edge_refs[int(str(token[1]))][0])
             return str(token[1])
 
-        forward_costs: Dict[str, float] = {start_id: 0.0}
-        reverse_costs: Dict[str, float] = {goal_id: 0.0}
-        forward_keys: Dict[str, Tuple[str, ...]] = {start_id: ()}
-        reverse_keys: Dict[str, Tuple[str, ...]] = {goal_id: ()}
-        forward_parent: Dict[str, Tuple[str, Tuple[object, ...]]] = {}
-        reverse_parent: Dict[str, Tuple[str, Tuple[object, ...]]] = {}
-        forward_frontier: List[Tuple[float, Tuple[str, ...], str]] = [
-            (0.0, (), start_id)
-        ]
-        reverse_frontier: List[Tuple[float, Tuple[str, ...], str]] = [
-            (0.0, (), goal_id)
-        ]
-        incumbent = float("inf")
-        meeting_id: Optional[str] = None
-        meeting_key: Optional[Tuple[str, ...]] = None
-        expanded = 0
-
-        def consider(node_id: str, candidate: float) -> None:
-            nonlocal incumbent, meeting_id, meeting_key
-            forward_key = forward_keys.get(node_id)
-            reverse_key = reverse_keys.get(node_id)
-            if forward_key is None or reverse_key is None:
-                return
-            candidate_key = forward_key + reverse_key
-            if candidate < incumbent or (
-                candidate == incumbent
-                and (meeting_key is None or candidate_key < meeting_key)
-            ):
-                incumbent = candidate
-                meeting_id = node_id
-                meeting_key = candidate_key
-
-        while forward_frontier and reverse_frontier:
-            _check_active_deadline_at(expanded)
-            expanded += 1
-            if (
-                incumbent != float("inf")
-                and forward_frontier[0][0] + reverse_frontier[0][0]
-                > incumbent
-            ):
-                break
-            expand_forward = (
-                forward_frontier[0][0] <= reverse_frontier[0][0]
-            )
-            if expand_forward:
-                current_cost, current_key, current_id = heapq.heappop(
-                    forward_frontier
-                )
-                if (
-                    current_cost != forward_costs.get(current_id, float("inf"))
-                    or current_key != forward_keys.get(current_id)
-                ):
-                    continue
-                reverse_cost = reverse_costs.get(current_id)
-                if reverse_cost is not None:
-                    consider(current_id, current_cost + reverse_cost)
-                for neighbor_id, edge_cost, token in forward_steps(current_id):
-                    next_cost = current_cost + edge_cost
-                    next_key = current_key + (token_edge_id(token),)
-                    if not math.isfinite(next_cost):
-                        raise ValueError(
-                            "cumulative calculated cost must be finite and non-negative"
-                        )
-                    previous_cost = forward_costs.get(
-                        neighbor_id, float("inf")
-                    )
-                    previous_key = forward_keys.get(neighbor_id)
-                    if next_cost > previous_cost or (
-                        next_cost == previous_cost
-                        and previous_key is not None
-                        and next_key >= previous_key
-                    ):
-                        continue
-                    forward_costs[neighbor_id] = next_cost
-                    forward_keys[neighbor_id] = next_key
-                    forward_parent[neighbor_id] = (current_id, token)
-                    heapq.heappush(
-                        forward_frontier, (next_cost, next_key, neighbor_id)
-                    )
-                    reverse_cost = reverse_costs.get(neighbor_id)
-                    if reverse_cost is not None:
-                        consider(neighbor_id, next_cost + reverse_cost)
-            else:
-                current_cost, current_key, current_id = heapq.heappop(
-                    reverse_frontier
-                )
-                if (
-                    current_cost != reverse_costs.get(current_id, float("inf"))
-                    or current_key != reverse_keys.get(current_id)
-                ):
-                    continue
-                forward_cost = forward_costs.get(current_id)
-                if forward_cost is not None:
-                    consider(current_id, current_cost + forward_cost)
-                for predecessor_id, edge_cost, token in reverse_steps(current_id):
-                    next_cost = current_cost + edge_cost
-                    next_key = (token_edge_id(token),) + current_key
-                    if not math.isfinite(next_cost):
-                        raise ValueError(
-                            "cumulative calculated cost must be finite and non-negative"
-                        )
-                    previous_cost = reverse_costs.get(
-                        predecessor_id, float("inf")
-                    )
-                    previous_key = reverse_keys.get(predecessor_id)
-                    if next_cost > previous_cost or (
-                        next_cost == previous_cost
-                        and previous_key is not None
-                        and next_key >= previous_key
-                    ):
-                        continue
-                    reverse_costs[predecessor_id] = next_cost
-                    reverse_keys[predecessor_id] = next_key
-                    reverse_parent[predecessor_id] = (current_id, token)
-                    heapq.heappush(
-                        reverse_frontier, (next_cost, next_key, predecessor_id)
-                    )
-                    forward_cost = forward_costs.get(predecessor_id)
-                    if forward_cost is not None:
-                        consider(predecessor_id, next_cost + forward_cost)
-
-        if (
-            meeting_id is None
-            or graph is not self.graph
-            or graph._heuristic_cache_stamp() != active_stamp
-            or topology.graph._heuristic_cache_stamp() != topology.stamp
-            or self._built_in_cost_signature(cost_function) != signature
-        ):
-            return None
-
         def edge_for_token(token: Tuple[object, ...]) -> Edge:
             if token[0] == "base":
                 edge_id, reverse = topology.edge_refs[int(str(token[1]))]
@@ -1822,29 +1704,196 @@ class ScenicRoutePlanner:
                 edge_id, reverse = str(token[1]), bool(token[2])
             return self._edge_from_reverse_index(edge_id, reverse)
 
-        path_reversed: List[Edge] = []
-        current_id = meeting_id
-        visited = {current_id}
-        while current_id != start_id:
-            parent = forward_parent.get(current_id)
-            if parent is None or parent[0] in visited:
+        labels: Dict[str, Dict[int, Dict[str, Any]]] = {"f": {}, "r": {}}
+        best_at_node: Dict[str, Dict[str, int]] = {"f": {}, "r": {}}
+        frontiers: Dict[str, List[Tuple[float, Any, str, int]]] = {
+            "f": [],
+            "r": [],
+        }
+        next_ids = {"f": 0, "r": 0}
+
+        def add_label(
+            side: str,
+            node_id: str,
+            cost: float,
+            key: Tuple[object, ...],
+            parent: Optional[int],
+            token: Optional[Tuple[object, ...]],
+            seed_edge: Optional[Edge],
+            rank: Tuple[object, ...],
+        ) -> Optional[int]:
+            old_id = best_at_node[side].get(node_id)
+            if old_id is not None:
+                old = labels[side][old_id]
+                if (cost, key) >= (float(old["cost"]), old["key"]):
+                    return None
+            label_id = next_ids[side]
+            next_ids[side] += 1
+            labels[side][label_id] = {
+                "node": node_id,
+                "cost": cost,
+                "key": key,
+                "parent": parent,
+                "token": token,
+                "seed_edge": seed_edge,
+                "rank": rank,
+            }
+            best_at_node[side][node_id] = label_id
+            heapq.heappush(
+                frontiers[side], (cost, key, node_id, label_id)
+            )
+            return label_id
+
+        for node_id, cost, rank, seed_edge in forward_seeds:
+            add_label("f", node_id, cost, (rank, ()), None, None, seed_edge, rank)
+        for node_id, cost, rank, seed_edge in reverse_seeds:
+            add_label("r", node_id, cost, (rank, ()), None, None, seed_edge, rank)
+
+        best: Optional[Tuple[float, int, int, Tuple[object, ...]]] = None
+
+        def consider(forward_id: int, reverse_id: int) -> None:
+            nonlocal best
+            forward = labels["f"][forward_id]
+            reverse = labels["r"][reverse_id]
+            middle_key = tuple(forward["key"][1]) + tuple(reverse["key"][1])
+            forward_rank = tuple(forward["rank"])
+            reverse_rank = tuple(reverse["rank"])
+            rank_key = (
+                (forward_rank[0], reverse_rank[0], forward_rank[1], reverse_rank[1], middle_key)
+                if forward_rank and reverse_rank
+                else (middle_key,)
+            )
+            candidate = (
+                float(forward["cost"]) + float(reverse["cost"]),
+                forward_id,
+                reverse_id,
+                rank_key,
+            )
+            if best is None or (candidate[0], candidate[3]) < (
+                best[0],
+                best[3],
+            ):
+                best = candidate
+
+        expanded = 0
+        while frontiers["f"] and frontiers["r"]:
+            _check_active_deadline_at(expanded)
+            expanded += 1
+            if (
+                best is not None
+                and frontiers["f"][0][0] + frontiers["r"][0][0] > best[0]
+            ):
+                break
+            expand_side = (
+                "f"
+                if frontiers["f"][0][0] <= frontiers["r"][0][0]
+                else "r"
+            )
+            current_cost, current_key, current_node, label_id = heapq.heappop(
+                frontiers[expand_side]
+            )
+            label = labels[expand_side].get(label_id)
+            if (
+                label is None
+                or best_at_node[expand_side].get(current_node) != label_id
+                or label["cost"] != current_cost
+                or label["key"] != current_key
+            ):
+                continue
+            other_id = best_at_node["r" if expand_side == "f" else "f"].get(
+                current_node
+            )
+            if other_id is not None:
+                if expand_side == "f":
+                    consider(label_id, other_id)
+                else:
+                    consider(other_id, label_id)
+            steps = forward_steps(current_node) if expand_side == "f" else reverse_steps(current_node)
+            for neighbor, edge_cost, token in steps:
+                next_cost = current_cost + edge_cost
+                if not math.isfinite(next_cost):
+                    raise ValueError(
+                        "cumulative calculated cost must be finite and non-negative"
+                    )
+                rank = tuple(label["rank"])
+                middle_key = tuple(label["key"][1])
+                next_key = (
+                    (rank, middle_key + (token_edge_id(token),))
+                    if expand_side == "f"
+                    else (rank, (token_edge_id(token),) + middle_key)
+                )
+                new_id = add_label(
+                    expand_side,
+                    neighbor,
+                    next_cost,
+                    next_key,
+                    label_id,
+                    token,
+                    label["seed_edge"],
+                    rank,
+                )
+                if new_id is not None:
+                    other_id = best_at_node[
+                        "r" if expand_side == "f" else "f"
+                    ].get(neighbor)
+                    if other_id is not None:
+                        if expand_side == "f":
+                            consider(new_id, other_id)
+                        else:
+                            consider(other_id, new_id)
+
+        if best is None:
+            if graph is not self.graph:
+                if strict_mutation:
+                    raise RuntimeError("road graph changed during fastest-path search")
                 return None
-            previous_id, token = parent
-            path_reversed.append(edge_for_token(token))
-            current_id = previous_id
-            visited.add(current_id)
-        path_reversed.reverse()
-        current_id = meeting_id
-        visited = {current_id}
-        while current_id != goal_id:
-            parent = reverse_parent.get(current_id)
-            if parent is None or parent[0] in visited:
-                return None
-            next_id, token = parent
-            path_reversed.append(edge_for_token(token))
-            current_id = next_id
-            visited.add(current_id)
-        return path_reversed
+            return None
+        if (
+            graph is not self.graph
+            or graph._heuristic_cache_stamp() != active_stamp
+            or topology.graph._heuristic_cache_stamp() != topology.stamp
+            or self._built_in_cost_signature(cost_function) != signature
+        ):
+            if strict_mutation:
+                raise RuntimeError("road graph changed during fastest-path search")
+            return None
+
+        _, forward_id, reverse_id, rank_key = best
+        forward = labels["f"][forward_id]
+        reverse = labels["r"][reverse_id]
+        forward_tokens: List[Tuple[object, ...]] = []
+        cursor = forward
+        while cursor["parent"] is not None:
+            forward_tokens.append(cursor["token"])
+            cursor = labels["f"][int(cursor["parent"])]
+        forward_tokens.reverse()
+        path: List[Edge] = []
+        if cursor["seed_edge"] is not None:
+            path.append(cursor["seed_edge"])
+        path.extend(edge_for_token(token) for token in forward_tokens)
+        cursor = reverse
+        while cursor["parent"] is not None:
+            path.append(edge_for_token(cursor["token"]))
+            cursor = labels["r"][int(cursor["parent"])]
+        if cursor["seed_edge"] is not None:
+            path.append(cursor["seed_edge"])
+        return path, rank_key
+
+    def _bidirectional_builtin_path(
+        self,
+        start: Node,
+        goal: Node,
+        cost_function: ScenicCostFunction,
+    ) -> Optional[List[Edge]]:
+        """Run target-bounded Dijkstra over compact base plus local edges."""
+        if start.id == goal.id:
+            return []
+        result = self._bidirectional_search_core(
+            cost_function,
+            [(str(start.id), 0.0, (), None)],
+            [(str(goal.id), 0.0, (), None)],
+        )
+        return None if result is None else result[0]
 
 
     @staticmethod
@@ -3600,246 +3649,75 @@ class ScenicRoutePlanner:
         ends: List[EdgeProjection],
         cost_function: ScenicCostFunction,
     ) -> Optional[Tuple[float, List[Edge], int, int, Tuple[object, ...]]]:
-        """Search all projected accesses in one compact-CSR traversal."""
-        base = overlay.base_graph
-        active_stamp = overlay._heuristic_cache_stamp()
-        topology = self._csr_topology(owner=base)
-        if topology is None:
-            return None
-        signature = self._built_in_cost_signature(cost_function)
-        if signature is None:
-            return None
-        data = self._csr_data(cost_function, signature)
-        weights = (
-            data.weights
-            if data is not None and data.topology is topology
-            else self._vectorized_builtin_weights(topology, signature)
-        )
-        base_index = topology.node_index
-
-        def base_cost(position: int) -> float:
-            if weights is not None:
-                return float(weights[position])
-            edge_id, reverse = topology.edge_refs[position]
-            edge = base.edges[edge_id]
-            if self._avoids_highways(cost_function) and is_highway_road_type(
-                edge.road_type
-            ):
-                return float("inf")
-            return local_cost(edge, reverse)
-
-        def local_cost(edge: Edge, reverse: bool = False) -> float:
-            traversed = (
-                self._edge_from_reverse_index(str(edge.id), True)
-                if reverse
-                else edge
-            )
+        """Run the shared bidirectional core for ranked endpoint accesses."""
+        def access_cost(edge: Edge) -> float:
             return self._validated_nonnegative(
-                cost_function.calculate(traversed), "edge calculated cost"
+                cost_function.calculate(edge), "edge calculated cost"
             )
 
-        def steps(
-            node_id: str,
-        ) -> Iterator[Tuple[str, float, Tuple[object, ...]]]:
-            base_node_index = base_index.get(node_id)
-            if base_node_index is not None:
-                row_start = int(topology.indptr[base_node_index])
-                row_end = int(topology.indptr[base_node_index + 1])
-                for position in range(row_start, row_end):
-                    edge_cost = base_cost(position)
-                    if math.isfinite(edge_cost):
-                        yield (
-                            str(topology.node_ids[int(topology.indices[position])]),
-                            edge_cost,
-                            ("base", position),
-                        )
-            for edge_id, reverse in overlay.iter_local_edges(node_id):
-                edge = overlay.edges[edge_id]
-                if self._avoids_highways(cost_function) and is_highway_road_type(
-                    edge.road_type
-                ):
-                    continue
-                edge_cost = local_cost(edge, bool(reverse))
-                if math.isfinite(edge_cost):
-                    neighbor = edge.start_node_id if reverse else edge.end_node_id
-                    yield (
-                        str(neighbor),
-                        edge_cost,
-                        ("local", str(edge_id), bool(reverse)),
-                    )
-
-        def token_edge_id(token: Tuple[object, ...]) -> str:
-            if token[0] == "base":
-                return str(topology.edge_refs[int(str(token[1]))][0])
-            return str(token[1])
-
-        def edge_for_token(token: Tuple[object, ...]) -> Edge:
-            if token[0] == "base":
-                edge_id, reverse = topology.edge_refs[int(str(token[1]))]
-            else:
-                edge_id, reverse = str(token[1]), bool(token[2])
-            return self._edge_from_reverse_index(edge_id, reverse)
-
-        prefixes: List[Tuple[str, Edge, int, int, float]] = []
-        suffixes: Dict[str, List[Tuple[Edge, int, int, float]]] = {}
+        forward_seeds: List[
+            Tuple[str, float, Tuple[object, ...], Optional[Edge]]
+        ] = []
+        reverse_seeds: List[
+            Tuple[str, float, Tuple[object, ...], Optional[Edge]]
+        ] = []
         for index in range(len(starts)):
-            forward = overlay.edges[f"__route_start__:{index}:forward"]
-            prefixes.append(
+            _check_active_deadline_at(index)
+            prefix = overlay.edges[f"__route_start__:{index}:forward"]
+            forward_seeds.append(
                 (
-                    str(forward.end_node_id),
-                    forward,
-                    index,
-                    0,
-                    local_cost(forward),
+                    str(prefix.end_node_id),
+                    access_cost(prefix),
+                    (index, 0),
+                    prefix,
                 )
             )
             reverse_id = f"__route_start__:{index}:reverse"
             if reverse_id in overlay.edges:
-                reverse = overlay.edges[reverse_id]
-                prefixes.append(
+                prefix = overlay.edges[reverse_id]
+                forward_seeds.append(
                     (
-                        str(reverse.end_node_id),
-                        reverse,
-                        index,
-                        1,
-                        local_cost(reverse),
+                        str(prefix.end_node_id),
+                        access_cost(prefix),
+                        (index, 1),
+                        prefix,
                     )
                 )
         for index in range(len(ends)):
-            forward = overlay.edges[f"__route_end__:{index}:forward"]
-            suffixes.setdefault(str(forward.start_node_id), []).append(
-                (forward, index, 0, local_cost(forward))
+            _check_active_deadline_at(len(starts) + index)
+            suffix = overlay.edges[f"__route_end__:{index}:forward"]
+            reverse_seeds.append(
+                (
+                    str(suffix.start_node_id),
+                    access_cost(suffix),
+                    (index, 0),
+                    suffix,
+                )
             )
             reverse_id = f"__route_end__:{index}:reverse"
             if reverse_id in overlay.edges:
-                reverse = overlay.edges[reverse_id]
-                suffixes.setdefault(str(reverse.start_node_id), []).append(
-                    (reverse, index, 1, local_cost(reverse))
-                )
-
-        # Labels retain the winning start access and middle-path key.  A
-        # replaced label remains in ``labels`` because active descendants may
-        # still reference it during reconstruction.
-        labels: Dict[int, Dict[str, Any]] = {}
-        node_best: Dict[str, int] = {}
-        frontier: List[Tuple[float, Any, str, int]] = []
-        next_label_id = 0
-
-        def add_label(label: Dict[str, Any]) -> None:
-            nonlocal next_label_id
-            node_id = str(label["node"])
-            old_id = node_best.get(node_id)
-            if old_id is not None:
-                old = labels[old_id]
-                if (float(label["cost"]), label["key"]) >= (
-                    float(old["cost"]),
-                    old["key"],
-                ):
-                    return
-            label_id = next_label_id
-            next_label_id += 1
-            labels[label_id] = label
-            node_best[node_id] = label_id
-            heapq.heappush(
-                frontier,
-                (float(label["cost"]), label["key"], node_id, label_id),
-            )
-
-
-        for node_id, prefix, projection_index, direction, prefix_cost in prefixes:
-            add_label(
-                {
-                    "node": node_id,
-                    "cost": prefix_cost,
-                    "key": (projection_index, direction, ()),
-                    "parent": None,
-                    "token": None,
-                    "prefix": prefix,
-                    "start_index": projection_index,
-                    "direction": direction,
-                }
-            )
-
-        best: Optional[
-            Tuple[float, List[Edge], int, int, Tuple[object, ...]]
-        ] = None
-        expanded = 0
-        while frontier:
-            if best is not None and frontier[0][0] > best[0]:
-                break
-            _check_active_deadline_at(expanded)
-            expanded += 1
-            current_cost, current_key, current_node, label_id = heapq.heappop(
-                frontier
-            )
-            label = labels.get(label_id)
-            if (
-                label is None
-                or node_best.get(current_node) != label_id
-                or label["node"] != current_node
-                or label["cost"] != current_cost
-                or label["key"] != current_key
-            ):
-                continue
-            start_index = int(label["start_index"])
-            direction = int(label["direction"])
-            middle_key = tuple(current_key[2])
-            for suffix, end_index, suffix_direction, suffix_cost in suffixes.get(
-                current_node, ()
-            ):
-                duration = current_cost + suffix_cost
-                candidate_key = (
-                    start_index,
-                    end_index,
-                    direction,
-                    suffix_direction,
-                    middle_key,
-                )
-                tokens: List[Tuple[object, ...]] = []
-                cursor = label
-                while cursor["parent"] is not None:
-                    tokens.append(cursor["token"])
-                    cursor = labels[int(cursor["parent"])]
-                tokens.reverse()
-                path: List[Edge] = [cursor["prefix"]]
-                path.extend(edge_for_token(token) for token in tokens)
-                path.append(suffix)
-                candidate = (duration, path, start_index, end_index, candidate_key)
-                if best is None or (duration, candidate_key) < (
-                    best[0],
-                    best[4],
-                ):
-                    best = candidate
-            for neighbor, edge_cost, token in steps(current_node):
-                next_cost = current_cost + edge_cost
-                if not math.isfinite(next_cost):
-                    raise ValueError(
-                        "cumulative calculated cost must be finite and non-negative"
+                suffix = overlay.edges[reverse_id]
+                reverse_seeds.append(
+                    (
+                        str(suffix.start_node_id),
+                        access_cost(suffix),
+                        (index, 1),
+                        suffix,
                     )
-                add_label(
-                    {
-                        "node": neighbor,
-                        "cost": next_cost,
-                        "key": (
-                            start_index,
-                            direction,
-                            middle_key + (token_edge_id(token),),
-                        ),
-                        "parent": label_id,
-                        "token": token,
-                        "prefix": label["prefix"],
-                        "start_index": start_index,
-                        "direction": direction,
-                    }
                 )
-        if overlay._heuristic_cache_stamp() != active_stamp:
-            raise RuntimeError("road graph changed during fastest-path search")
-        if (
-            overlay is not self.graph
-            or self._built_in_cost_signature(cost_function) != signature
-        ):
-            raise RuntimeError("road graph changed during fastest-path search")
-        return best
+        result = self._bidirectional_search_core(
+            cost_function,
+            forward_seeds,
+            reverse_seeds,
+            strict_mutation=True,
+        )
+        if result is None:
+            return None
+        path, rank_key = result
+        if len(rank_key) != 5:
+            raise RuntimeError("multi-access search lost endpoint rank")
+        duration = self._path_duration_minutes(path)
+        return duration, path, int(str(rank_key[0])), int(str(rank_key[1])), rank_key
 
     def _large_graph_fastest_route(
         self,

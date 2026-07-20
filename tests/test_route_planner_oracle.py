@@ -379,6 +379,271 @@ def _route(planner: ScenicRoutePlanner, q: float, kappa: float):
     )
 
 
+def _pairwise_large_fastest_oracle(
+    planner: ScenicRoutePlanner,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    *,
+    avoid_highways: bool = False,
+):
+    """Test-only copy of the former endpoint-access candidate enumeration."""
+    base = planner.graph
+    assert base is not None
+    excluded = (
+        frozenset({"motorway", "trunk", "primary", "secondary", "tertiary"})
+        if avoid_highways
+        else frozenset()
+    )
+    planner.cost_function.strict_highways = bool(avoid_highways)
+    planner.cost_function.avoid_highways = bool(avoid_highways)
+    planner.cost_function.highway_preference = 0.0
+    starts, _ = base.find_nearest_edge_positions_with_distance(
+        *start, excluded_road_types=excluded
+    )
+    ends, _ = base.find_nearest_edge_positions_with_distance(
+        *end, excluded_road_types=excluded
+    )
+
+    def partial(source, edge_id, from_id, to_id, fraction, direction):
+        edge = Edge(
+            edge_id,
+            from_id,
+            to_id,
+            float(source.distance_km) * max(0.0, min(1.0, float(fraction))),
+            float(source.scenic_score),
+            road_name=source.road_name,
+            road_type=source.road_type,
+            speed_limit_kmh=source.speed_limit_kmh,
+            one_way=True,
+        )
+        edge.canonical_edge_id = str(source.id)
+        edge.direction = direction
+        edge.source_fraction = float(fraction)
+        return edge
+
+    best = None
+    for start_index, start_projection in enumerate(starts):
+        prefixes = [
+            (
+                str(start_projection.edge.end_node_id),
+                partial(
+                    start_projection.edge,
+                    f"oracle-start:{start_index}:forward",
+                    "__oracle-start__",
+                    str(start_projection.edge.end_node_id),
+                    1.0 - float(start_projection.fraction),
+                    "forward",
+                ),
+            )
+        ]
+        if not start_projection.edge.one_way:
+            prefixes.append(
+                (
+                    str(start_projection.edge.start_node_id),
+                    partial(
+                        start_projection.edge,
+                        f"oracle-start:{start_index}:reverse",
+                        "__oracle-start__",
+                        str(start_projection.edge.start_node_id),
+                        float(start_projection.fraction),
+                        "reverse",
+                    ),
+                )
+            )
+        for end_index, end_projection in enumerate(ends):
+            suffixes = [
+                (
+                    str(end_projection.edge.start_node_id),
+                    partial(
+                        end_projection.edge,
+                        f"oracle-end:{end_index}:forward",
+                        str(end_projection.edge.start_node_id),
+                        "__oracle-end__",
+                        float(end_projection.fraction),
+                        "forward",
+                    ),
+                )
+            ]
+            if not end_projection.edge.one_way:
+                suffixes.append(
+                    (
+                        str(end_projection.edge.end_node_id),
+                        partial(
+                            end_projection.edge,
+                            f"oracle-end:{end_index}:reverse",
+                            str(end_projection.edge.end_node_id),
+                            "__oracle-end__",
+                            1.0 - float(end_projection.fraction),
+                            "reverse",
+                        ),
+                    )
+                )
+            for prefix_node, prefix in prefixes:
+                for suffix_node, suffix in suffixes:
+                    middle = planner._cached_fastest_edges(
+                        base.get_node(prefix_node),
+                        base.get_node(suffix_node),
+                        avoid_highways,
+                        0.0,
+                    )
+                    if middle is None:
+                        continue
+                    candidate = [prefix, *middle, suffix]
+                    duration = planner._path_duration_minutes(candidate)
+                    if best is None or duration < best[0]:
+                        best = (duration, candidate, start_projection, end_projection)
+            if str(start_projection.edge.id) != str(end_projection.edge.id):
+                continue
+            start_fraction = float(start_projection.fraction)
+            end_fraction = float(end_projection.fraction)
+            if start_fraction <= end_fraction:
+                direct = partial(
+                    start_projection.edge,
+                    f"oracle-direct:{start_index}:{end_index}:forward",
+                    "__oracle-start__",
+                    "__oracle-end__",
+                    end_fraction - start_fraction,
+                    "forward",
+                )
+                duration = planner._path_duration_minutes([direct])
+                if best is None or duration < best[0]:
+                    best = (duration, [direct], start_projection, end_projection)
+            if not start_projection.edge.one_way and start_fraction >= end_fraction:
+                direct = partial(
+                    start_projection.edge,
+                    f"oracle-direct:{start_index}:{end_index}:reverse",
+                    "__oracle-start__",
+                    "__oracle-end__",
+                    start_fraction - end_fraction,
+                    "reverse",
+                )
+                duration = planner._path_duration_minutes([direct])
+                if best is None or duration < best[0]:
+                    best = (duration, [direct], start_projection, end_projection)
+    return best
+
+
+def _route_signature(route):
+    return (
+        route.estimated_duration_minutes,
+        route.edge_ids,
+        route.traversal_ids,
+        tuple(segment.direction for segment in route.segments),
+    )
+
+def test_multi_access_matches_pairwise_oracle_for_tied_mixed_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    for index in range(6):
+        graph.add_node(Node(str(index), index * 0.01, 0.0))
+    graph.add_edge(
+        Edge("a-fast", "0", "1", 1.0, 0.0, speed_limit_kmh=60, one_way=False)
+    )
+    graph.add_edge(
+        Edge("z-slow", "0", "1", 1.0, 0.0, speed_limit_kmh=60, one_way=False)
+    )
+    graph.add_edge(
+        Edge("one-way", "1", "2", 1.0, 0.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge("two-way", "2", "3", 1.0, 0.0, speed_limit_kmh=60, one_way=False)
+    )
+    graph.add_edge(
+        Edge("out", "3", "4", 1.0, 0.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge("last", "4", "5", 1.0, 0.0, speed_limit_kmh=60, one_way=False)
+    )
+    planner = ScenicRoutePlanner(graph)
+    monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    start = (0.002, 0.0)
+    end = (0.048, 0.0)
+    oracle = _pairwise_large_fastest_oracle(planner, start, end)
+    assert oracle is not None
+    actual = planner.find_fastest_route(start, end)
+    expected_ids = tuple(
+        str(getattr(edge, "canonical_edge_id", edge.id)) for edge in oracle[1]
+    )
+    expected_directions = tuple(
+        getattr(edge, "direction", "forward") for edge in oracle[1]
+    )
+    assert actual.estimated_duration_minutes == pytest.approx(oracle[0])
+    assert actual.edge_ids == expected_ids
+    assert tuple(segment.direction for segment in actual.segments) == expected_directions
+
+
+def test_multi_access_matches_pairwise_oracle_with_highway_exclusion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    for index in range(4):
+        graph.add_node(Node(str(index), index * 0.01, 0.0))
+    graph.add_edge(
+        Edge("highway", "0", "3", 1.0, 0.0, road_type="motorway", speed_limit_kmh=120)
+    )
+    for start_id, end_id, edge_id in (("0", "1", "r1"), ("1", "2", "r2"), ("2", "3", "r3")):
+        graph.add_edge(
+            Edge(edge_id, start_id, end_id, 1.0, 0.0, road_type="residential", speed_limit_kmh=30)
+        )
+    planner = ScenicRoutePlanner(graph)
+    monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    start = (0.001, 0.0)
+    end = (0.029, 0.0)
+    oracle = _pairwise_large_fastest_oracle(
+        planner, start, end, avoid_highways=True
+    )
+    assert oracle is not None
+    actual = planner.find_fastest_route(start, end, avoid_highways=True)
+    assert actual.edge_ids == tuple(
+        str(getattr(edge, "canonical_edge_id", edge.id)) for edge in oracle[1]
+    )
+    assert "highway" not in actual.edge_ids
+
+
+def test_multi_access_preserves_unreachable_access_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    graph.add_node(Node("0", 0.0, 0.0))
+    graph.add_node(Node("1", 0.01, 0.0))
+    graph.add_node(Node("2", 0.02, 0.0))
+    graph.add_node(Node("3", 0.03, 0.0))
+    graph.add_edge(Edge("left", "0", "1", 1.0, 0.0, speed_limit_kmh=60))
+    graph.add_edge(Edge("right", "2", "3", 1.0, 0.0, speed_limit_kmh=60))
+    planner = ScenicRoutePlanner(graph)
+    monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    assert _pairwise_large_fastest_oracle(planner, (0.002, 0.0), (0.028, 0.0)) is None
+    with pytest.raises(ValueError, match="No route found"):
+        planner.find_fastest_route((0.002, 0.0), (0.028, 0.0))
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "direction"),
+    [
+        ((0.0, 0.0), (0.01, 0.0), "forward"),
+        ((0.01, 0.0), (0.0, 0.0), "forward"),
+        ((0.005, 0.0), (0.005, 0.0), "forward"),
+    ],
+)
+def test_multi_access_boundary_and_zero_length_routes(
+    monkeypatch: pytest.MonkeyPatch,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    direction: str,
+) -> None:
+    graph = RoadGraph()
+    graph.add_node(Node("A", 0.0, 0.0))
+    graph.add_node(Node("B", 0.01, 0.0))
+    graph.add_edge(
+        Edge("boundary", "A", "B", 1.0, 0.0, speed_limit_kmh=60, one_way=False)
+    )
+    planner = ScenicRoutePlanner(graph)
+    monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    route = planner.find_fastest_route(start, end)
+    assert route.segments[0].direction == direction
+    assert route.estimated_duration_minutes >= 0.0
+
 def test_large_graph_fastest_route_uses_one_ranked_access_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
