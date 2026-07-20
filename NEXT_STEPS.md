@@ -196,12 +196,31 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   multi-access endpoints only if current tie, direction, and reconstruction
   semantics remain explicit. Neither solves the non-additive duration-capped
   scenic frontier, and frequent-update requirements are not present.
-  The exact ranked multi-access query is now implemented and covered by the
-  The fixed production benchmark remains pending a reachable Vast host. The
-  2026-07-20 r8h retry selected verified offer `39026204` (32 effective CPU
-  cores, 252 GiB RAM, 1.24 TB disk, 750 MB/s disk bandwidth), but provisioning
-  stalled with no SSH endpoint and produced no benchmark artifact. Do not
-  reconsider CCH/MLD until the unchanged matrix is rerun successfully.
+- The exact ranked multi-access query is implemented and covered by the
+  routing oracle/API tests. The fixed production matrix has now completed on
+  Vast offer `45142171`: Xeon E5-2686 v4, 72 effective CPU cores, 125.7 GiB
+  RAM, 64 GiB allocated disk (2 workers, group size 64), with no repository
+  MLPERF utility; classify this graph-scale, multi-worker, long-preload workload
+  as **intensive**. Measured peak RSS was 15.77 GiB; the offer reported
+  1.34 TB host disk and 2,951 MB/s disk bandwidth. Command:
+  `uv run python scripts/remote/vast_route_benchmark.py run full-bbox-v1-r8k
+  --offer-id 45142171 --s3-bucket scenicdriver-data --s3-prefix
+  outputs/vast/full-bbox-v1-r8k/ --output
+  data/processed/routing_benchmarks/production_artifact_benchmark_r8k.json
+  --workers 2 --group-size 64 --case-timeout-seconds 10`.
+- The canonical 2,256-case matrix used the unchanged graph/report/corpus and
+  persisted sidecar. All-case median/p95/max were 6,072.237/11,714.490/
+  909,740.830 ms; 1,372 routes completed, 883 timed out, and 1,373 cases
+  (60.86%) completed under 10 seconds. Baseline r7 was
+  5,611.533/11,551.359/179,210.040 ms, with 1,281 completed, 975 timeouts,
+  and 1,281 under 10 seconds (56.78%). The latency target therefore failed;
+  the new run improved completion rate but worsened fixed-denominator median
+  by 8.21%. Artifact: `.cmux-vast/artifacts/full-bbox-v1-r8k/final.json`.
+- Final preload diagnostics passed: sidecar `loaded`, read-only mmap,
+  format 2, `bvh-spherical-lb`, 10,792,528 edges, 508,427,024-byte payload,
+  and null invalid reason. Do not reconsider CCH/MLD yet: this run did not
+  include a targeted post-change profile proving that one scalar traversal
+  remains the material bottleneck.
 
 ## Ordered next steps
 
