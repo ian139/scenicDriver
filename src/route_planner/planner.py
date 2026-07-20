@@ -3622,6 +3622,10 @@ class ScenicRoutePlanner:
                 return float(weights[position])
             edge_id, reverse = topology.edge_refs[position]
             edge = base.edges[edge_id]
+            if self._avoids_highways(cost_function) and is_highway_road_type(
+                edge.road_type
+            ):
+                return float("inf")
             return local_cost(edge, reverse)
 
         def local_cost(edge: Edge, reverse: bool = False) -> float:
