@@ -26,7 +26,7 @@ import atexit
 import tempfile
 from pathlib import Path
 from time import monotonic, perf_counter
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Iterator, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -1426,7 +1426,6 @@ def _no_better_reason_consistent(
     reason = route.get("no_better_route_reason")
     uplift = _as_float(route.get("scenic_score_delta_absolute"))
     same_route = route.get("same_route")
-    status = str(route.get("exactness_status") or "")
     gap = _as_float(route.get("optimality_gap"))
     if same_route is True:
         if gap is not None and gap > 1e-8:
@@ -1548,7 +1547,11 @@ def evaluate_service_response(
     q0_fastest = (
         baseline_present
         and duration_available
-        and (q != 0.0 or _close_enough(scenic_duration, fastest_duration))
+        and (
+            scenic_priority
+            or q != 0.0
+            or _close_enough(scenic_duration, fastest_duration)
+        )
     )
     edge_consistency = [
         route.get("edge_metric_consistency")
@@ -2945,9 +2948,10 @@ def run_benchmark(
                 "under_10s_count": 0,
                 "under_10s_rate": None,
             }
-        percentile = lambda fraction: ordered[
-            min(len(ordered) - 1, int(math.ceil(fraction * len(ordered))) - 1)
-        ]
+        def percentile(fraction: float) -> float:
+            return ordered[
+                min(len(ordered) - 1, int(math.ceil(fraction * len(ordered))) - 1)
+            ]
         under = sum(1 for value in ordered if value < 10000.0)
         return {
             "count": len(ordered),

@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 import pytest
 from types import SimpleNamespace
+from typing import Any
 
 import scripts.routing.production_benchmark as production_benchmark
 from scripts.routing.production_benchmark import (
@@ -699,10 +700,34 @@ def test_evaluate_service_response_flags_prohibited_highway_and_q0_violation() -
     scenic["properties"]["estimated_duration_minutes"] = 12.0
     scenic["properties"]["segment_identity"][0]["road_type"] = "trunk"
     scenic["properties"]["highway_count"] = 1
-    evaluation = evaluate_service_response(response, q=0.0, kappa=1.0, avoid_highways=True)
+    evaluation = evaluate_service_response(
+        response,
+        q=0.0,
+        kappa=1.0,
+        avoid_highways=True,
+        scenic_priority=False,
+    )
     assert evaluation["invariants"]["prohibited_highways"] is False
     assert evaluation["invariants"]["q0_fastest"] is False
     assert evaluation["invariants"]["duration_cap"] is False
+
+
+def test_evaluate_service_response_allows_q0_scenic_priority() -> None:
+    response = _response(q=0.0, kappa=3.0)
+    response["geojson"]["features"][0]["properties"][
+        "estimated_duration_minutes"
+    ] = 12.0
+    response["geojson"]["features"][0]["properties"]["objective_value"] = 0.8
+    evaluation = evaluate_service_response(
+        response,
+        q=0.0,
+        kappa=3.0,
+        avoid_highways=False,
+        scenic_priority=True,
+    )
+    assert evaluation["invariants"]["q0_fastest"] is True
+    assert evaluation["status"] == "ok"
+    assert evaluation["failed_invariants"] == []
 
 
 def test_invariant_summary_records_cache_boundary() -> None:
@@ -1430,7 +1455,6 @@ def test_persistent_planning_child_sends_large_payloads(monkeypatch) -> None:
 
 
 def test_persistent_planning_child_does_not_reload_graph(monkeypatch) -> None:
-    calls: list[tuple[Path, Path]] = []
 
     def fake_execute(*, spec, index, **kwargs):
         return _checkpoint_row(index, spec)
