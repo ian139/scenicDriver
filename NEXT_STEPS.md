@@ -202,12 +202,14 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   RAM, 64 GiB allocated disk (2 workers, group size 64), with no repository
   MLPERF utility; classify this graph-scale, multi-worker, long-preload workload
   as **intensive**. Measured peak RSS was 15.77 GiB; the offer reported
-  1.34 TB host disk and 2,951 MB/s disk bandwidth. Command:
-  `uv run python scripts/remote/vast_route_benchmark.py run full-bbox-v1-r8k
-  --offer-id 45142171 --s3-bucket scenicdriver-data --s3-prefix
-  outputs/vast/full-bbox-v1-r8k/ --output
-  data/processed/routing_benchmarks/production_artifact_benchmark_r8k.json
-  --workers 2 --group-size 64 --case-timeout-seconds 10`.
+  1.34 TB host disk and 2,951 MB/s disk bandwidth. Remote command:
+  `uv run python scripts/routing/production_benchmark.py --corpus
+  scripts/routing/production_benchmark_pairs.json --graph
+  data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3
+  --report data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json
+  --output /workspace/scenic-artifacts/vast-route/full-bbox-v1-r8k/
+  production_artifact_benchmark_r8k.json --case-timeout-seconds 10 --workers 2
+  --group-size 64`.
 - The canonical 2,256-case matrix used the unchanged graph/report/corpus and
   persisted sidecar. All-case median/p95/max were 6,072.237/11,714.490/
   909,740.830 ms; 1,372 routes completed, 883 timed out, and 1,373 cases
