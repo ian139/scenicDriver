@@ -3907,6 +3907,7 @@ class ScenicRoutePlanner:
             return value
 
         for index, projection in enumerate(starts):
+            _check_active_deadline_at(index)
             coordinate = (float(projection.lat), float(projection.lon))
             overlay.add_edge(
                 partial(
@@ -3932,6 +3933,7 @@ class ScenicRoutePlanner:
                     )
                 )
         for index, projection in enumerate(ends):
+            _check_active_deadline_at(len(starts) + index)
             coordinate = (float(projection.lat), float(projection.lon))
             overlay.add_edge(
                 partial(
@@ -3976,7 +3978,11 @@ class ScenicRoutePlanner:
             ] = middle
 
             for start_index, start_projection in enumerate(starts):
+                _check_active_deadline_at(start_index)
                 for end_index, end_projection in enumerate(ends):
+                    _check_active_deadline_at(
+                        len(starts) + start_index * max(1, len(ends)) + end_index
+                    )
                     if str(start_projection.edge.id) != str(end_projection.edge.id):
                         continue
                     start_fraction = float(start_projection.fraction)
