@@ -3615,9 +3615,14 @@ class ScenicRoutePlanner:
             if data is not None and data.topology is topology
             else self._vectorized_builtin_weights(topology, signature)
         )
-        if weights is None:
-            return None
         base_index = topology.node_index
+
+        def base_cost(position: int) -> float:
+            if weights is not None:
+                return float(weights[position])
+            edge_id, reverse = topology.edge_refs[position]
+            edge = base.edges[edge_id]
+            return local_cost(edge, reverse)
 
         def local_cost(edge: Edge, reverse: bool = False) -> float:
             traversed = (
@@ -3637,7 +3642,7 @@ class ScenicRoutePlanner:
                 row_start = int(topology.indptr[base_node_index])
                 row_end = int(topology.indptr[base_node_index + 1])
                 for position in range(row_start, row_end):
-                    edge_cost = float(weights[position])
+                    edge_cost = base_cost(position)
                     if math.isfinite(edge_cost):
                         yield (
                             str(topology.node_ids[int(topology.indices[position])]),
