@@ -3602,7 +3602,7 @@ class ScenicRoutePlanner:
     ) -> Optional[Tuple[float, List[Edge], int, int, Tuple[object, ...]]]:
         """Search all projected accesses in one compact-CSR traversal."""
         base = overlay.base_graph
-        active_stamp = base._heuristic_cache_stamp()
+        active_stamp = overlay._heuristic_cache_stamp()
         topology = self._csr_topology(owner=base)
         if topology is None:
             return None
@@ -3832,7 +3832,7 @@ class ScenicRoutePlanner:
                         "direction": direction,
                     }
                 )
-        if base._heuristic_cache_stamp() != active_stamp:
+        if overlay._heuristic_cache_stamp() != active_stamp:
             raise RuntimeError("road graph changed during fastest-path search")
         if (
             overlay is not self.graph
@@ -3956,6 +3956,7 @@ class ScenicRoutePlanner:
                         end_coordinate=coordinate,
                     )
                 )
+        overlay.freeze()
 
         policy = resolve_routing_policy(
             scenic_weight=0.0,
