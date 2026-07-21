@@ -326,6 +326,28 @@ def test_scenic_hot_path_uses_structural_endpoint_overlay(
     assert len(observed) == 1
     assert observed[0].base_graph is planner.graph
 
+def test_large_scenic_and_baseline_reuse_endpoint_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _endpoint_overlay_graph(extra_nodes=2_001)
+    planner = ScenicRoutePlanner(graph)
+    original = graph.find_nearest_edge_positions_with_distance
+    calls = 0
+
+    def capture(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(graph, "find_nearest_edge_positions_with_distance", capture)
+    scenic = planner.find_scenic_route(
+        (0.0, 0.25), (0.0, 0.75), q=0.0, kappa=1.0
+    )
+    baseline = planner.find_fastest_route((0.0, 0.25), (0.0, 0.75))
+
+    assert scenic.edge_ids == baseline.edge_ids == ("base-edge",)
+    assert calls == 2
+
 
 def test_same_planner_serializes_concurrent_endpoint_routes(
     monkeypatch: pytest.MonkeyPatch,

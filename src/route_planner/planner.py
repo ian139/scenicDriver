@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import heapq
 import math
 from threading import RLock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 
@@ -279,6 +279,21 @@ class _CSRData:
     matrix: object
     weights: np.ndarray
 
+@dataclass
+class _EndpointAccessRequest:
+    """One projected endpoint request and its frozen route-local overlay."""
+
+    start: Tuple[float, float]
+    end: Tuple[float, float]
+    start_projections: List[EdgeProjection]
+    end_projections: List[EdgeProjection]
+    overlay: EndpointRoadGraph
+    start_node_id: str
+    end_node_id: str
+    start_accesses: Tuple[Tuple[int, int, Optional[Edge]], ...]
+    end_accesses: Tuple[Tuple[int, int, Optional[Edge]], ...]
+    direct_candidates: Tuple[Tuple[int, int, int, Edge], ...]
+    graph_stamp: object
 
 class ScenicRoutePlanner:
     _MINIMUM_COST_CACHE_CAPACITY = 8
@@ -393,6 +408,9 @@ class ScenicRoutePlanner:
         self._fastest_path_cache = type(self)._FASTEST_PATH_SHARED_CACHE
         self._csr_topology_cache = type(self)._CSR_TOPOLOGY_CACHE
         self._csr_data_cache = type(self)._CSR_DATA_CACHE
+        self._last_endpoint_access_request: Optional[
+            _EndpointAccessRequest
+        ] = None
     def _make_cost_function(self, scenic_weight: float) -> ScenicCostFunction:
         strict = bool(
             getattr(
@@ -3554,69 +3572,52 @@ class ScenicRoutePlanner:
                         ),
                     )
                 )
-                if not edge.one_way:
-                    overlay.add_edge(
-                        partial_edge(
-                            edge,
-                            f"__route_end__:{projection_index}:reverse",
-                            edge.end_node_id,
-                            end_id,
-                            1.0 - fraction,
-                            end_coordinate=(
-                                float(projection.lat),
-                                float(projection.lon),
-                            ),
-                        )
-                    )
-
-        end_by_edge = {
-            str(projection.edge.id): projection
-            for projection in end_projections
-        }
         if start_is_virtual and end_is_virtual:
-            for projection_index, projection in enumerate(start_projections):
+            for start_index, projection in enumerate(start_projections):
                 edge = projection.edge
-                end_projection = end_by_edge.get(str(edge.id))
-                if end_projection is None:
-                    continue
                 start_fraction = float(projection.fraction)
-                end_fraction = float(end_projection.fraction)
-                if start_fraction <= end_fraction:
-                    overlay.add_edge(
-                        partial_edge(
-                            edge,
-                            f"__route_direct__:{projection_index}:forward",
-                            start_id,
-                            end_id,
-                            end_fraction - start_fraction,
-                            start_coordinate=(
-                                float(projection.lat),
-                                float(projection.lon),
-                            ),
-                            end_coordinate=(
-                                float(end_projection.lat),
-                                float(end_projection.lon),
-                            ),
+                for end_index, end_projection in enumerate(end_projections):
+                    if str(edge.id) != str(end_projection.edge.id):
+                        continue
+                    end_fraction = float(end_projection.fraction)
+                    if start_fraction <= end_fraction:
+                        overlay.add_edge(
+                            partial_edge(
+                                edge,
+                                f"__route_direct__:{start_index}:{end_index}:forward",
+                                start_id,
+                                end_id,
+                                end_fraction - start_fraction,
+                                start_coordinate=(
+                                    float(projection.lat),
+                                    float(projection.lon),
+                                ),
+                                end_coordinate=(
+                                    float(end_projection.lat),
+                                    float(end_projection.lon),
+                                ),
+                            )
                         )
-                    )
-                if not edge.one_way and start_fraction >= end_fraction:
-                    overlay.add_edge(
-                        partial_edge(
-                            edge,
-                            f"__route_direct__:{projection_index}:reverse",
-                            start_id,
-                            end_id,
-                            start_fraction - end_fraction,
-                            start_coordinate=(
-                                float(projection.lat),
-                                float(projection.lon),
-                            ),
-                            end_coordinate=(
-                                float(end_projection.lat),
-                                float(end_projection.lon),
-                            ),
+                    if not edge.one_way and start_fraction >= end_fraction:
+                        overlay.add_edge(
+                            partial_edge(
+                                edge,
+                                f"__route_direct__:{start_index}:{end_index}:reverse",
+                                start_id,
+                                end_id,
+                                start_fraction - end_fraction,
+                                start_coordinate=(
+                                    float(projection.lat),
+                                    float(projection.lon),
+                                ),
+                                end_coordinate=(
+                                    float(end_projection.lat),
+                                    float(end_projection.lon),
+                                ),
+                            )
                         )
-                    )
+        setattr(overlay, "_route_start_projections", tuple(start_projections))
+        setattr(overlay, "_route_end_projections", tuple(end_projections))
         overlay._route_endpoint_node_ids = (start_id, end_id)
         overlay.freeze()
         _check_active_deadline()
@@ -3639,17 +3640,134 @@ class ScenicRoutePlanner:
                 *end, check_cancelled=_check_active_deadline
             ),
         )
+
+    def _build_endpoint_access_request(
+        self,
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+        *,
+        avoid_highways: bool = False,
+    ) -> _EndpointAccessRequest:
+        """Project both endpoints and freeze one reusable local overlay."""
+        base = self.graph
+        if base is None:
+            raise RuntimeError("Road graph not loaded")
+        active_stamp = base._heuristic_cache_stamp()
+        overlay = cast(
+            EndpointRoadGraph,
+            self._endpoint_graph(
+                start,
+                end,
+                avoid_highways=avoid_highways,
+            ),
+        )
+        start_projections: List[EdgeProjection] = list(
+            getattr(overlay, "_route_start_projections", ())
+        )
+        end_projections: List[EdgeProjection] = list(
+            getattr(overlay, "_route_end_projections", ())
+        )
+        endpoint_ids = getattr(overlay, "_route_endpoint_node_ids", None)
+        if endpoint_ids is None:
+            raise RuntimeError("endpoint overlay lost endpoint nodes")
+        start_id, end_id = (str(endpoint_ids[0]), str(endpoint_ids[1]))
+        start_accesses = tuple(
+            (index, direction, overlay.edges[edge_id])
+            for index in range(len(start_projections))
+            for direction, edge_id in (
+                (0, f"__route_start__:{index}:forward"),
+                (1, f"__route_start__:{index}:reverse"),
+            )
+            if edge_id in overlay.edges
+        )
+        end_accesses = tuple(
+            (index, direction, overlay.edges[edge_id])
+            for index in range(len(end_projections))
+            for direction, edge_id in (
+                (0, f"__route_end__:{index}:forward"),
+                (1, f"__route_end__:{index}:reverse"),
+            )
+            if edge_id in overlay.edges
+        )
+        if not start_accesses:
+            start_accesses = ((0, 0, None),)
+        if not end_accesses:
+            end_accesses = ((0, 0, None),)
+        direct_candidates = tuple(
+            (start_index, end_index, direction, edge)
+            for start_index in range(len(start_projections))
+            for end_index in range(len(end_projections))
+            for direction, edge_id in (
+                (
+                    0,
+                    f"__route_direct__:{start_index}:{end_index}:forward",
+                ),
+                (
+                    1,
+                    f"__route_direct__:{start_index}:{end_index}:reverse",
+                ),
+            )
+            if (edge := overlay.edges.get(edge_id)) is not None
+        )
+        if (
+            base is not self.graph
+            or base._heuristic_cache_stamp() != active_stamp
+        ):
+            raise RuntimeError("road graph changed during endpoint setup")
+        request = _EndpointAccessRequest(
+            start=start,
+            end=end,
+            start_projections=start_projections,
+            end_projections=end_projections,
+            overlay=overlay,
+            start_node_id=start_id,
+            end_node_id=end_id,
+            start_accesses=start_accesses,
+            end_accesses=end_accesses,
+            direct_candidates=direct_candidates,
+            graph_stamp=active_stamp,
+        )
+        self._last_endpoint_access_request = request
+        return request
+
     def _multi_access_builtin_path(
         self,
         overlay: EndpointRoadGraph,
         starts: List[EdgeProjection],
         ends: List[EdgeProjection],
         cost_function: ScenicCostFunction,
+        direct_candidates: Tuple[Tuple[int, int, int, Edge], ...] = (),
     ) -> Optional[Tuple[float, List[Edge], int, int, Tuple[object, ...]]]:
-        """Run the shared bidirectional core for ranked endpoint accesses."""
+        """Run one ranked search, including all direct endpoint candidates."""
         def access_cost(edge: Edge) -> float:
             return self._validated_nonnegative(
                 cost_function.calculate(edge), "edge calculated cost"
+            )
+
+        if (
+            not starts
+            or not ends
+            or "__route_start__:0:forward" not in overlay.edges
+            or "__route_end__:0:forward" not in overlay.edges
+        ):
+            endpoint_ids = getattr(overlay, "_route_endpoint_node_ids", None)
+            if endpoint_ids is None:
+                return None
+            result = self._bidirectional_search_core(
+                cost_function,
+                [(str(endpoint_ids[0]), 0.0, (0, 0), None)],
+                [(str(endpoint_ids[1]), 0.0, (0, 0), None)],
+                strict_mutation=True,
+            )
+            if result is None:
+                return None
+            path, rank_key = result
+            return (
+                self._path_duration_minutes(path),
+                path,
+                0,
+                0,
+                rank_key,
             )
 
         forward_seeds: List[
@@ -3708,13 +3826,21 @@ class ScenicRoutePlanner:
             reverse_seeds,
             strict_mutation=True,
         )
-        if result is None:
-            return None
-        path, rank_key = result
-        if len(rank_key) != 5:
-            raise RuntimeError("multi-access search lost endpoint rank")
-        duration = self._path_duration_minutes(path)
-        return duration, path, int(str(rank_key[0])), int(str(rank_key[1])), rank_key
+        best = None if result is None else (
+            self._path_duration_minutes(result[0]),
+            result[0],
+            int(str(result[1][0])),
+            int(str(result[1][1])),
+            result[1],
+        )
+        for start_index, end_index, direction, edge in direct_candidates:
+            _check_active_deadline_at(start_index + end_index)
+            duration = self._path_duration_minutes([edge])
+            rank_key = (start_index, end_index, 2, direction, ())
+            candidate = (duration, [edge], start_index, end_index, rank_key)
+            if best is None or (duration, rank_key) < (best[0], best[4]):
+                best = candidate
+        return best
 
     def _large_graph_fastest_route(
         self,
@@ -3726,229 +3852,43 @@ class ScenicRoutePlanner:
         """Solve all legal projected endpoint accesses in one traversal."""
         base = self.graph
         assert base is not None
-        active_stamp = base._heuristic_cache_stamp()
-        _check_active_deadline()
-        excluded = HIGHWAY_ROAD_TYPES if avoid_highways else frozenset()
-        starts, _ = base.find_nearest_edge_positions_with_distance(
-            *start,
-            excluded_road_types=excluded,
-            check_cancelled=_check_active_deadline,
-        )
-        ends, _ = base.find_nearest_edge_positions_with_distance(
-            *end,
-            excluded_road_types=excluded,
-            check_cancelled=_check_active_deadline,
-        )
-        start_id = "__route_large_start__"
-        end_id = "__route_large_end__"
-        overlay = self._copy_endpoint_overlay(base)
-        while start_id in overlay.nodes:
-            start_id += "_"
-        while end_id in overlay.nodes or end_id == start_id:
-            end_id += "_"
-        overlay.add_node(Node(start_id, float(starts[0].lat), float(starts[0].lon)))
-        overlay.add_node(Node(end_id, float(ends[0].lat), float(ends[0].lon)))
-
-        def partial(
-            source: Edge,
-            edge_id: str,
-            from_id: str,
-            to_id: str,
-            fraction: float,
-            direction: str,
-            *,
-            start_coordinate: Tuple[float, float] | None = None,
-            end_coordinate: Tuple[float, float] | None = None,
-        ) -> Edge:
-            value = Edge(
-                id=edge_id,
-                start_node_id=from_id,
-                end_node_id=to_id,
-                distance_km=float(source.distance_km)
-                * max(0.0, min(1.0, float(fraction))),
-                scenic_score=float(source.scenic_score),
-                road_name=source.road_name,
-                road_type=source.road_type,
-                speed_limit_kmh=source.speed_limit_kmh,
-                one_way=True,
-            )
-            value.canonical_edge_id = str(source.id)
-            value.direction = direction
-            value.source_fraction = float(fraction)
-            if start_coordinate is not None:
-                value.route_start_coordinate = start_coordinate
-            if end_coordinate is not None:
-                value.route_end_coordinate = end_coordinate
-            return value
-
-        for index, projection in enumerate(starts):
-            _check_active_deadline_at(index)
-            coordinate = (float(projection.lat), float(projection.lon))
-            overlay.add_edge(
-                partial(
-                    projection.edge,
-                    f"__route_start__:{index}:forward",
-                    start_id,
-                    str(projection.edge.end_node_id),
-                    1.0 - float(projection.fraction),
-                    "forward",
-                    start_coordinate=coordinate,
-                )
-            )
-            if not projection.edge.one_way:
-                overlay.add_edge(
-                    partial(
-                        projection.edge,
-                        f"__route_start__:{index}:reverse",
-                        start_id,
-                        str(projection.edge.start_node_id),
-                        float(projection.fraction),
-                        "reverse",
-                        start_coordinate=coordinate,
-                    )
-                )
-        for index, projection in enumerate(ends):
-            _check_active_deadline_at(len(starts) + index)
-            coordinate = (float(projection.lat), float(projection.lon))
-            overlay.add_edge(
-                partial(
-                    projection.edge,
-                    f"__route_end__:{index}:forward",
-                    str(projection.edge.start_node_id),
-                    end_id,
-                    float(projection.fraction),
-                    "forward",
-                    end_coordinate=coordinate,
-                )
-            )
-            if not projection.edge.one_way:
-                overlay.add_edge(
-                    partial(
-                        projection.edge,
-                        f"__route_end__:{index}:reverse",
-                        str(projection.edge.end_node_id),
-                        end_id,
-                        1.0 - float(projection.fraction),
-                        "reverse",
-                        end_coordinate=coordinate,
-                    )
-                )
-        overlay.freeze()
-
-        policy = resolve_routing_policy(
-            scenic_weight=0.0,
-            kappa=1.0,
+        request = self._build_endpoint_access_request(
+            start,
+            end,
             avoid_highways=avoid_highways,
         )
-        self.cost_function.strict_highways = policy.strict_highways
-        self.cost_function.avoid_highways = policy.strict_highways
-        self.cost_function.highway_preference = 0.0
-        self.graph = overlay
+        self.graph = request.overlay
         try:
+            policy = resolve_routing_policy(
+                scenic_weight=0.0,
+                kappa=1.0,
+                avoid_highways=avoid_highways,
+            )
+            self.cost_function.strict_highways = policy.strict_highways
+            self.cost_function.avoid_highways = policy.strict_highways
+            self.cost_function.highway_preference = 0.0
             middle = self._multi_access_builtin_path(
-                overlay, starts, ends, self._make_fastest_cost_function()
+                request.overlay,
+                request.start_projections,
+                request.end_projections,
+                self._make_fastest_cost_function(),
+                request.direct_candidates,
             )
-            best: Optional[
-                Tuple[float, List[Edge], int, int, Tuple[object, ...]]
-            ] = middle
-
-            for start_index, start_projection in enumerate(starts):
-                _check_active_deadline_at(start_index)
-                for end_index, end_projection in enumerate(ends):
-                    _check_active_deadline_at(
-                        len(starts) + start_index * max(1, len(ends)) + end_index
-                    )
-                    if str(start_projection.edge.id) != str(end_projection.edge.id):
-                        continue
-                    start_fraction = float(start_projection.fraction)
-                    end_fraction = float(end_projection.fraction)
-                    direct_candidates: List[Tuple[Edge, int]] = []
-                    if start_fraction <= end_fraction:
-                        direct_candidates.append(
-                            (
-                                partial(
-                                    start_projection.edge,
-                                    f"{start_id}:{start_index}:{end_index}:direct-forward",
-                                    start_id,
-                                    end_id,
-                                    end_fraction - start_fraction,
-                                    "forward",
-                                    start_coordinate=(
-                                        float(start_projection.lat),
-                                        float(start_projection.lon),
-                                    ),
-                                    end_coordinate=(
-                                        float(end_projection.lat),
-                                        float(end_projection.lon),
-                                    ),
-                                ),
-                                0,
-                            )
-                        )
-                    if (
-                        not start_projection.edge.one_way
-                        and start_fraction >= end_fraction
-                    ):
-                        direct_candidates.append(
-                            (
-                                partial(
-                                    start_projection.edge,
-                                    f"{start_id}:{start_index}:{end_index}:direct-reverse",
-                                    start_id,
-                                    end_id,
-                                    start_fraction - end_fraction,
-                                    "reverse",
-                                    start_coordinate=(
-                                        float(start_projection.lat),
-                                        float(start_projection.lon),
-                                    ),
-                                    end_coordinate=(
-                                        float(end_projection.lat),
-                                        float(end_projection.lon),
-                                    ),
-                                ),
-                                1,
-                            )
-                        )
-                    for direct, direction in direct_candidates:
-                        direct_duration = self._path_duration_minutes([direct])
-                        direct_key = (
-                            start_index,
-                            end_index,
-                            2,
-                            direction,
-                            (),
-                        )
-                        candidate = (
-                            direct_duration,
-                            [direct],
-                            start_index,
-                            end_index,
-                            direct_key,
-                        )
-                        if best is None or (
-                            direct_duration,
-                            direct_key,
-                        ) < (best[0], best[4]):
-                            best = candidate
-            if best is None:
+            if middle is None:
                 raise ValueError("No route found between the given coordinates.")
-            _, best_edges, start_index, end_index, _ = best
-            if base._heuristic_cache_stamp() != active_stamp:
+            _, best_edges, start_index, end_index, _ = middle
+            if base._heuristic_cache_stamp() != request.graph_stamp:
                 raise RuntimeError("road graph changed during fastest-path search")
-            start_projection = starts[start_index]
-            end_projection = ends[end_index]
             render_graph = RoadGraph()
-            render_graph.add_node(
-                Node(start_id, float(start_projection.lat), float(start_projection.lon))
-            )
-            render_graph.add_node(
-                Node(end_id, float(end_projection.lat), float(end_projection.lon))
-            )
+            for node_id in (request.start_node_id, request.end_node_id):
+                render_graph.add_node(request.overlay.nodes[node_id])
             for edge in best_edges:
                 for node_id in (str(edge.start_node_id), str(edge.end_node_id)):
-                    if node_id not in render_graph.nodes:
-                        render_graph.add_node(base.get_node(node_id))
+                    if node_id in render_graph.nodes:
+                        continue
+                    render_graph.add_node(
+                        request.overlay.nodes.get(node_id, base.get_node(node_id))
+                    )
             duration = self._path_duration_minutes(best_edges)
             evaluation = evaluate_path(
                 best_edges,
@@ -3962,8 +3902,8 @@ class ScenicRoutePlanner:
             try:
                 return self._path_to_route(
                     best_edges,
-                    start_node=render_graph.get_node(start_id),
-                    goal_node=render_graph.get_node(end_id),
+                    start_node=render_graph.get_node(request.start_node_id),
+                    goal_node=render_graph.get_node(request.end_node_id),
                     evaluation=evaluation,
                     fastest_duration_minutes=duration,
                     requested_max_detour_factor=1.0,
@@ -3972,7 +3912,7 @@ class ScenicRoutePlanner:
                     algorithm="endpoint-access-duration-dijkstra",
                 )
             finally:
-                self.graph = overlay
+                self.graph = request.overlay
         finally:
             self.graph = base
 
@@ -4054,7 +3994,7 @@ class ScenicRoutePlanner:
             raise RuntimeError("Road graph not loaded")
         if not _endpoint_graph:
             base_graph = self.graph
-            self.graph = self._endpoint_graph(
+            request = self._build_endpoint_access_request(
                 start,
                 end,
                 avoid_highways=(
@@ -4063,8 +4003,10 @@ class ScenicRoutePlanner:
                     else bool(avoid_highways)
                 ),
             )
+            setattr(request.overlay, "_route_access_request", request)
+            self.graph = request.overlay
             try:
-                return self.find_scenic_route(
+                return self._find_scenic_route(
                     start,
                     end,
                     scenic_weight,
@@ -4105,11 +4047,27 @@ class ScenicRoutePlanner:
                 start_node, end_node, policy.strict_highways
             )
         else:
-            # The compiled exact duration solver reuses prewarmed CSR data and
-            # avoids scanning every Python adjacency row on production graphs.
-            shortest_edges = self._cached_fastest_edges(
-                start_node, end_node, policy.strict_highways, policy.highway_preference
-            )
+            request = getattr(self.graph, "_route_access_request", None)
+            if (
+                request is not None
+                and len(request.overlay.base_graph.nodes)
+                > self._ENDPOINT_OVERLAY_MAX_NODES
+            ):
+                ranked = self._multi_access_builtin_path(
+                    request.overlay,
+                    request.start_projections,
+                    request.end_projections,
+                    self._make_fastest_cost_function(),
+                    request.direct_candidates,
+                )
+                shortest_edges = None if ranked is None else ranked[1]
+            else:
+                shortest_edges = self._cached_fastest_edges(
+                    start_node,
+                    end_node,
+                    policy.strict_highways,
+                    policy.highway_preference,
+                )
         if shortest_edges is None:
             raise ValueError("No route found between the given coordinates.")
         fastest_duration = self._path_duration_minutes(shortest_edges)
@@ -4252,17 +4210,39 @@ class ScenicRoutePlanner:
             raise RuntimeError("Road graph not loaded")
         if not _endpoint_graph:
             base_graph = self.graph
+            cached_request = self._last_endpoint_access_request
+            reusable = (
+                cached_request is not None
+                and cached_request.overlay.base_graph is base_graph
+                and cached_request.start == start
+                and cached_request.end == end
+                and cached_request.graph_stamp
+                == base_graph._heuristic_cache_stamp()
+            )
+            if reusable:
+                self.graph = cached_request.overlay
+                try:
+                    return self.find_fastest_route(
+                        start,
+                        end,
+                        avoid_highways=avoid_highways,
+                        _endpoint_graph=True,
+                    )
+                finally:
+                    self.graph = base_graph
             if len(base_graph.nodes) > self._ENDPOINT_OVERLAY_MAX_NODES:
                 return self._large_graph_fastest_route(
                     start,
                     end,
                     avoid_highways=avoid_highways,
                 )
-            self.graph = self._endpoint_graph(
+            request = self._build_endpoint_access_request(
                 start,
                 end,
                 avoid_highways=bool(avoid_highways),
             )
+            setattr(request.overlay, "_route_access_request", request)
+            self.graph = request.overlay
             try:
                 return self.find_fastest_route(
                     start,
@@ -4287,9 +4267,24 @@ class ScenicRoutePlanner:
                 start_node, end_node, policy.strict_highways
             )
         else:
-            shortest_edges = self._cached_fastest_edges(
-                start_node, end_node, policy.strict_highways, 0.0
-            )
+            request = getattr(self.graph, "_route_access_request", None)
+            if (
+                request is not None
+                and len(request.overlay.base_graph.nodes)
+                > self._ENDPOINT_OVERLAY_MAX_NODES
+            ):
+                ranked = self._multi_access_builtin_path(
+                    request.overlay,
+                    request.start_projections,
+                    request.end_projections,
+                    self._make_fastest_cost_function(),
+                    request.direct_candidates,
+                )
+                shortest_edges = None if ranked is None else ranked[1]
+            else:
+                shortest_edges = self._cached_fastest_edges(
+                    start_node, end_node, policy.strict_highways, 0.0
+                )
         if shortest_edges is None:
             raise ValueError("No route found between the given coordinates.")
         fastest_duration = self._path_duration_minutes(shortest_edges)
