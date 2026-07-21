@@ -37,6 +37,7 @@ def test_make_overlay_tarball_excludes_git_and_generated_paths(tmp_path: Path) -
     write_file(source / ".secrets/aws.env")
     write_file(source / "src/__pycache__/module.pyc")
     write_file(source / "ordinary/project_file.py")
+    write_file(source / ".worktrees/full-checkout/src/module.py")
 
     tarball = cmux_vast_host.make_overlay_tarball(source)
     try:
@@ -57,6 +58,7 @@ def test_make_overlay_tarball_excludes_git_and_generated_paths(tmp_path: Path) -
     assert not any(".venv" in path_components(name) for name in names)
     assert not any(".cmux-vast" in path_components(name) for name in names)
     assert not any(".orca-vast" in path_components(name) for name in names)
+    assert not any(".worktrees" in path_components(name) for name in names)
     assert not any(".secrets" in path_components(name) for name in names)
     assert any(name.endswith("ordinary/project_file.py") for name in names)
 

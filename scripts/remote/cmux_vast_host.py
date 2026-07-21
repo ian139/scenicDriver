@@ -46,6 +46,7 @@ EXCLUDED_ROOTS = {
     ".git",
     ".venv",
     ".cmux-vast",
+    ".worktrees",
     # Keep legacy state out of remote overlays during migration.
     ".orca-vast",
     ".secrets",
