@@ -238,7 +238,7 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   include a targeted post-change profile proving that one scalar traversal
   remains the material bottleneck.
 
-- [x] Unified endpoint-aware routing — integrated at `1d990b7b`, superseding `dc820d58`.
+- [x] Unified endpoint-aware routing — integrated at `6a103d21` (routing implementation at `1d990b7b`), superseding `dc820d58`.
   request-local endpoint overlay now preserves every tied projection,
   legal direction, rank, partial-edge metadata, and direct same-edge
   candidate for both fastest and scenic planning. Large-graph fastest
@@ -250,11 +250,12 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   endpoint boundaries now seed the large CSR search with zero-cost labels, and
   endpoint duration bounds require validated graph geometry/speed invariants,
   use a bounded shared cache, and are warmed during asset preloading.
-  Gate: `518 passed` in the full integrated Python suite, `103 passed` in the
-  API/service regression suites, clean changed-file Ruff checks, and a fresh
-  Caribou→Concord API smoke returned HTTP 200 in 9.53 seconds (7.90 seconds
-  warm), with scenic and baseline routes, ratio `1.0`, 4,688 segments, and
-  deterministic traversal identity `d69ef6c19f4dd991`.
+  Gate: `518 passed` in the full integrated Python suite, `297 passed` in the
+  focused planner/API/cancellation suite, clean changed-file Ruff checks, and
+  a fresh Caribou→Concord API smoke returned HTTP 200 with planning elapsed
+  below the 10-second deadline (8.88 seconds cold, 7.52 seconds warm), with
+  scenic and baseline routes, ratio `1.0`, 4,688 segments, and deterministic
+  traversal identity `d69ef6c19f4dd991`.
   Full-repository Ruff still reports ten pre-existing unused-import errors
   outside the changed files.
 - [ ] Corrected full 2,256-case Vast benchmark — blocked. The recorded r13 task
@@ -262,7 +263,7 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   and recovery found no remote checkpoint, log, or final artifact. There is no
   local artifact or current-source provenance. Do not treat it as acceptance
   evidence or claim a fixed-denominator latency result until a fresh run from
-  `1d990b7b` completes.
+  `6a103d21` completes.
 
 ## Ordered next steps
 
