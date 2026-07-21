@@ -810,6 +810,44 @@ def _segment_identity(segment: Any, index: int) -> str:
     if str(edge_id) == "":
         raise ValueError("Route segment edge_id must not be empty")
     return str(edge_id)
+def _route_comparison_identity(
+    route: Route,
+    deadline: RoutingDeadline | None = None,
+) -> tuple[tuple[str, str, str], ...]:
+    """Return canonical and traversal identity for objective comparisons.
+
+    ``edge_id`` is the canonical road identity exposed by route responses,
+    while ``traversal_id`` and ``direction`` identify which way that road was
+    traversed.  Comparing all three prevents forward and reverse traversals
+    from being treated as one route merely because they share an edge.
+    """
+
+    route_traversal_ids = getattr(route, "traversal_ids", None)
+    traversal_ids = (
+        tuple(route_traversal_ids)
+        if route_traversal_ids is not None
+        else ()
+    )
+    identities: list[tuple[str, str, str]] = []
+    for index, segment in enumerate(route.segments):
+        _maybe_check_deadline(deadline, index, interval=64)
+        canonical_id = _segment_identity(segment, index)
+        traversal_id = (
+            traversal_ids[index]
+            if index < len(traversal_ids)
+            else getattr(segment, "traversal_id", None)
+        )
+        if traversal_id is None or str(traversal_id) == "":
+            traversal_id = ""
+        direction = getattr(segment, "direction", None)
+        if direction is None:
+            direction = ""
+        identities.append(
+            (canonical_id, str(traversal_id), str(direction))
+        )
+    return tuple(identities)
+
+
 
 
 def _route_highway_count(
@@ -1142,7 +1180,6 @@ def _endpoint_snap_diagnostics(
         if deadline is not None:
             deadline.check()
         eligible_distance: float | None = None
-        projection_found = False
         try:
             _projections, raw_distance = (
                 graph.find_nearest_edge_positions_with_distance(
@@ -1154,7 +1191,6 @@ def _endpoint_snap_diagnostics(
             distance = float(raw_distance)
             if math.isfinite(distance) and _projections:
                 eligible_distance = distance
-                projection_found = True
         except (RoutingTimeout, RoutingCancelled):
             raise
         except Exception:
@@ -1177,7 +1213,6 @@ def _endpoint_snap_diagnostics(
                 distance = float(raw_distance)
                 if math.isfinite(distance) and all_projections:
                     all_road_distance = distance
-                    projection_found = True
             except (RoutingTimeout, RoutingCancelled):
                 raise
             except Exception:
@@ -1185,10 +1220,7 @@ def _endpoint_snap_diagnostics(
         # Routing already uses the edge-projection index.  Building the
         # nearest-node index here only to populate optional diagnostics is
         # prohibitive for production graphs with millions of nodes.
-        if (
-            not projection_found
-            or len(graph.nodes) <= _ENDPOINT_NODE_DIAGNOSTIC_MAX_NODES
-        ):
+        if len(graph.nodes) <= _ENDPOINT_NODE_DIAGNOSTIC_MAX_NODES:
             try:
                 nearest_node, _ = graph.find_nearest_node_with_distance(
                     *point,
@@ -1256,19 +1288,17 @@ def _objective_components(
         if absolute_delta is not None and baseline_raw != 0.0
         else None
     )
-    scenic_edges = []
-    for i, segment in enumerate(scenic_route.segments):
-        _maybe_check_deadline(deadline, i, interval=64)
-        scenic_edges.append(_segment_identity(segment, i))
-    scenic_edges = tuple(scenic_edges)
-    baseline_edges = None
-    if baseline_route is not None:
-        baseline_edges_list = []
-        for i, segment in enumerate(baseline_route.segments):
-            _maybe_check_deadline(deadline, i, interval=64)
-            baseline_edges_list.append(_segment_identity(segment, i))
-        baseline_edges = tuple(baseline_edges_list)
-    same_route = baseline_edges is not None and scenic_edges == baseline_edges
+    scenic_identity = _route_comparison_identity(
+        scenic_route, deadline=deadline
+    )
+    baseline_identity = (
+        _route_comparison_identity(baseline_route, deadline=deadline)
+        if baseline_route is not None
+        else None
+    )
+    same_route = (
+        baseline_identity is not None and scenic_identity == baseline_identity
+    )
     no_better_reason = None
     certified = bool(getattr(scenic_route, "exact", False)) or (
         getattr(scenic_route, "optimality_gap", None) == 0.0

@@ -258,11 +258,16 @@ class _EndpointGeodesicBounds(dict[str, float]):
     ) -> None:
         super().__init__()
         self._graph = graph
+        self._base_graph = (
+            graph.base_graph if isinstance(graph, EndpointRoadGraph) else graph
+        )
         self._targets = targets
         self._max_speed_kmh = max_speed_kmh
 
     def get(self, key: str, default: object = None) -> float:
         _check_active_deadline()
+        if str(key) not in self._base_graph.nodes:
+            return 0.0
         node = self._graph.nodes.get(str(key))
         fallback = (
             float(default)
@@ -270,7 +275,7 @@ class _EndpointGeodesicBounds(dict[str, float]):
             else float("inf")
         )
         if node is None:
-            return fallback
+            return 0.0
         best = float("inf")
         for target_id, suffix_minutes in self._targets:
             target = self._graph.nodes.get(target_id)
@@ -378,9 +383,6 @@ class ScenicRoutePlanner:
     _LARGE_GRAPH_EDGE_THRESHOLD = 100_000
     _COLLAPSED_ACCESS_NODE_THRESHOLD = 100_000
     _COMPILED_SCENIC_MIN_NODES = 100_000
-    # Production artifact edge rows cap speed limits at 121 km/h.  Keep a
-    # small margin while avoiding a graph-wide speed scan per request.
-    _LARGE_GRAPH_HEURISTIC_MAX_SPEED_KMH = 130.0
     _SHORT_ROUTE_CAP_KM = 5.0
     # Exhaustive simple-path enumeration is intentionally reserved for
     # bounded oracle-sized graphs. Production graphs use the complete
@@ -415,6 +417,10 @@ class ScenicRoutePlanner:
     ] = OrderedDict()
     _FASTEST_PATH_SHARED_GRAPH: Optional[RoadGraph] = None
     _FASTEST_PATH_SHARED_STAMP: object = None
+    _ENDPOINT_GEODESIC_SPEED_CACHE_CAPACITY = 8
+    _ENDPOINT_GEODESIC_SPEED_SHARED_CACHE: OrderedDict[
+        Tuple[RoadGraph, object, bool], Optional[float]
+    ] = OrderedDict()
 
     @classmethod
     def clear_shared_caches(cls) -> None:
@@ -429,6 +435,7 @@ class ScenicRoutePlanner:
         cls._FASTEST_PATH_SHARED_CACHE.clear()
         cls._FASTEST_PATH_SHARED_GRAPH = None
         cls._FASTEST_PATH_SHARED_STAMP = None
+        cls._ENDPOINT_GEODESIC_SPEED_SHARED_CACHE.clear()
 
     @classmethod
     def validate_frontier_time_limit_seconds(cls, value: object) -> float:
@@ -568,6 +575,7 @@ class ScenicRoutePlanner:
             if signature is None or self._csr_data(cost, signature) is None:
                 continue
             variants += 1
+        self._endpoint_geodesic_bound_speed(self.graph, False)
         return {
             "available": True,
             "topology_built": True,
@@ -2218,8 +2226,10 @@ class ScenicRoutePlanner:
             isinstance(graph, EndpointRoadGraph)
             and len(graph.base_graph.edges) > self._LARGE_GRAPH_EDGE_THRESHOLD
         ):
+            target_pairs: List[Tuple[str, float]] = []
+            if str(goal.id) in graph.base_graph.nodes:
+                target_pairs.append((str(goal.id), 0.0))
             request = getattr(graph, "_route_access_request", None)
-            target_pairs: List[Tuple[str, float]] = [(str(goal.id), 0.0)]
             if request is not None:
                 for _index, _direction, edge in request.end_accesses:
                     _check_active_deadline()
@@ -2233,12 +2243,17 @@ class ScenicRoutePlanner:
                             self._edge_duration_minutes(edge),
                         )
                     )
-            if len(target_pairs) > 1:
-                return _EndpointGeodesicBounds(
-                    graph,
-                    tuple(target_pairs),
-                    self._LARGE_GRAPH_HEURISTIC_MAX_SPEED_KMH,
+            if target_pairs:
+                bound_speed = self._endpoint_geodesic_bound_speed(
+                    graph.base_graph,
+                    avoid_highways,
                 )
+                if bound_speed is not None:
+                    return _EndpointGeodesicBounds(
+                        graph,
+                        tuple(target_pairs),
+                        bound_speed,
+                    )
             return zero_bounds()
         topology = self._csr_topology()
         if topology is None:
@@ -3968,7 +3983,7 @@ class ScenicRoutePlanner:
                 value, "edge calculated cost"
             )
 
-        source_accesses: List[Tuple[int, int, Edge, float]] = []
+        source_accesses: List[Tuple[int, int, Optional[Edge], float]] = []
         for index in range(len(starts)):
             _check_active_deadline_at(index)
             for direction, edge_id in (
@@ -3986,7 +4001,17 @@ class ScenicRoutePlanner:
                     (index, direction, edge, edge_cost(edge))
                 )
 
-        target_accesses: List[Tuple[int, int, Edge, float]] = []
+        endpoint_ids = getattr(overlay, "_route_endpoint_node_ids", None)
+        collapsed_start_id = (
+            None if endpoint_ids is None else str(endpoint_ids[0])
+        )
+        collapsed_end_id = (
+            None if endpoint_ids is None else str(endpoint_ids[1])
+        )
+        if not source_accesses and collapsed_start_id in overlay.base_graph.nodes:
+            source_accesses.append((0, 0, None, 0.0))
+
+        target_accesses: List[Tuple[int, int, Optional[Edge], float]] = []
         for index in range(len(ends)):
             _check_active_deadline_at(len(starts) + index)
             for direction, edge_id in (
@@ -4003,9 +4028,10 @@ class ScenicRoutePlanner:
                 target_accesses.append(
                     (index, direction, edge, edge_cost(edge))
                 )
+        if not target_accesses and collapsed_end_id in overlay.base_graph.nodes:
+            target_accesses.append((0, 0, None, 0.0))
         if not source_accesses or not target_accesses:
             return None
-
         best: Optional[
             Tuple[float, List[Edge], int, int, Tuple[object, ...]]
         ] = None
@@ -4046,7 +4072,7 @@ class ScenicRoutePlanner:
 
             base_matrix: Any = matrix
             node_count = len(topology.node_ids)
-            source_rows: List[Tuple[float, int, int, Edge]] = []
+            source_rows: List[Tuple[float, int, int, Optional[Edge]]] = []
             source_targets: List[int] = []
             for (
                 start_index,
@@ -4055,9 +4081,14 @@ class ScenicRoutePlanner:
                 prefix_cost,
             ) in source_accesses:
                 _check_active_deadline_at(start_index)
-                source_node_index = topology.node_index.get(
+                source_node_id = (
                     str(prefix.end_node_id)
+                    if prefix is not None
+                    else collapsed_start_id
                 )
+                if source_node_id is None:
+                    continue
+                source_node_index = topology.node_index.get(source_node_id)
                 if source_node_index is None:
                     continue
                 source_rows.append(
@@ -4074,9 +4105,25 @@ class ScenicRoutePlanner:
             source_count = len(source_rows)
             target_node_count = len(
                 {
-                    str(suffix.start_node_id)
+                    (
+                        str(suffix.start_node_id)
+                        if suffix is not None
+                        else collapsed_end_id
+                    )
                     for _, _, suffix, _ in target_accesses
-                    if topology.node_index.get(str(suffix.start_node_id))
+                    if (
+                        str(suffix.start_node_id)
+                        if suffix is not None
+                        else collapsed_end_id
+                    )
+                    is not None
+                    and topology.node_index.get(
+                        (
+                            str(suffix.start_node_id)
+                            if suffix is not None
+                            else collapsed_end_id
+                        )
+                    )
                     is not None
                 }
             )
@@ -4136,7 +4183,7 @@ class ScenicRoutePlanner:
                 distances: np.ndarray,
                 predecessors: np.ndarray,
             ) -> Optional[
-                Tuple[Tuple[float, int, int, Edge], List[Edge]]
+                Tuple[Tuple[float, int, int, Optional[Edge]], List[Edge]]
             ]:
                 path_reversed: List[Edge] = []
                 current_index = int(goal_index)
@@ -4198,7 +4245,7 @@ class ScenicRoutePlanner:
                 target_index: int,
                 reverse_distances: np.ndarray,
             ) -> Optional[
-                Tuple[Tuple[float, int, int, Edge], List[Edge]]
+                Tuple[Tuple[float, int, int, Optional[Edge]], List[Edge]]
             ]:
                 path: List[Edge] = []
                 current_index = int(source_targets[source_row])
@@ -4402,9 +4449,14 @@ class ScenicRoutePlanner:
             reverse_target_nodes: List[int] = []
             for target_offset, (_, _, suffix, _) in enumerate(target_accesses):
                 _check_active_deadline_at(len(starts) + target_offset)
-                target_node_index = topology.node_index.get(
+                target_node_id = (
                     str(suffix.start_node_id)
+                    if suffix is not None
+                    else collapsed_end_id
                 )
+                if target_node_id is None:
+                    continue
+                target_node_index = topology.node_index.get(target_node_id)
                 if target_node_index is None:
                     continue
                 target_node_index = int(target_node_index)
@@ -4443,11 +4495,6 @@ class ScenicRoutePlanner:
             distances = np.asarray(distances)
             if distances.ndim == 1:
                 distances = distances[np.newaxis, :]
-            if not use_min_only:
-                predecessors = np.asarray(predecessors)
-                if predecessors.ndim == 1:
-                    predecessors = predecessors[np.newaxis, :]
-
             for (
                 end_index,
                 end_direction,
@@ -4455,9 +4502,14 @@ class ScenicRoutePlanner:
                 suffix_cost,
             ) in target_accesses:
                 _check_active_deadline_at(end_index)
-                target_node_index = topology.node_index.get(
+                target_node_id = (
                     str(suffix.start_node_id)
+                    if suffix is not None
+                    else collapsed_end_id
                 )
+                if target_node_id is None:
+                    continue
+                target_node_index = topology.node_index.get(target_node_id)
                 if target_node_index is None:
                     continue
                 target_node_index = int(target_node_index)
@@ -4558,7 +4610,11 @@ class ScenicRoutePlanner:
                             reverse_distances,
                             middle,
                         )
-                    candidate_path = [prefix, *middle, suffix]
+                    candidate_path = [
+                        edge
+                        for edge in (prefix, *middle, suffix)
+                        if edge is not None
+                    ]
                     duration = self._path_duration_minutes(candidate_path)
                     if use_duration_metric:
                         metric = duration
@@ -4641,32 +4697,8 @@ class ScenicRoutePlanner:
             return self._validated_nonnegative(
                 cost_function.calculate(edge), "edge calculated cost"
             )
+        endpoint_ids = getattr(overlay, "_route_endpoint_node_ids", None)
 
-        if (
-            not starts
-            or not ends
-            or "__route_start__:0:forward" not in overlay.edges
-            or "__route_end__:0:forward" not in overlay.edges
-        ):
-            endpoint_ids = getattr(overlay, "_route_endpoint_node_ids", None)
-            if endpoint_ids is None:
-                return None
-            result = self._bidirectional_search_core(
-                cost_function,
-                [(str(endpoint_ids[0]), 0.0, (0, 0), None)],
-                [(str(endpoint_ids[1]), 0.0, (0, 0), None)],
-                strict_mutation=True,
-            )
-            if result is None:
-                return None
-            path, rank_key = result
-            return (
-                self._path_duration_minutes(path),
-                path,
-                0,
-                0,
-                rank_key,
-            )
 
         forward_seeds: List[
             Tuple[str, float, Tuple[object, ...], Optional[Edge]]
@@ -4676,15 +4708,16 @@ class ScenicRoutePlanner:
         ] = []
         for index in range(len(starts)):
             _check_active_deadline_at(index)
-            prefix = overlay.edges[f"__route_start__:{index}:forward"]
-            forward_seeds.append(
-                (
-                    str(prefix.end_node_id),
-                    access_cost(prefix),
-                    (index, 0),
-                    prefix,
+            prefix = overlay.edges.get(f"__route_start__:{index}:forward")
+            if prefix is not None:
+                forward_seeds.append(
+                    (
+                        str(prefix.end_node_id),
+                        access_cost(prefix),
+                        (index, 0),
+                        prefix,
+                    )
                 )
-            )
             reverse_id = f"__route_start__:{index}:reverse"
             if reverse_id in overlay.edges:
                 prefix = overlay.edges[reverse_id]
@@ -4698,15 +4731,16 @@ class ScenicRoutePlanner:
                 )
         for index in range(len(ends)):
             _check_active_deadline_at(len(starts) + index)
-            suffix = overlay.edges[f"__route_end__:{index}:forward"]
-            reverse_seeds.append(
-                (
-                    str(suffix.start_node_id),
-                    access_cost(suffix),
-                    (index, 0),
-                    suffix,
+            suffix = overlay.edges.get(f"__route_end__:{index}:forward")
+            if suffix is not None:
+                reverse_seeds.append(
+                    (
+                        str(suffix.start_node_id),
+                        access_cost(suffix),
+                        (index, 0),
+                        suffix,
+                    )
                 )
-            )
             reverse_id = f"__route_end__:{index}:reverse"
             if reverse_id in overlay.edges:
                 suffix = overlay.edges[reverse_id]
@@ -4717,6 +4751,15 @@ class ScenicRoutePlanner:
                         (index, 1),
                         suffix,
                     )
+                )
+        if endpoint_ids is not None:
+            if not forward_seeds and str(endpoint_ids[0]) in overlay.base_graph.nodes:
+                forward_seeds.append(
+                    (str(endpoint_ids[0]), 0.0, (0, 0), None)
+                )
+            if not reverse_seeds and str(endpoint_ids[1]) in overlay.base_graph.nodes:
+                reverse_seeds.append(
+                    (str(endpoint_ids[1]), 0.0, (0, 0), None)
                 )
         large_graph_search = len(
             overlay.base_graph.edges
@@ -5659,6 +5702,70 @@ class ScenicRoutePlanner:
             raise ValueError(f"{name} must be finite and non-negative") from exc
         if not math.isfinite(result) or result < 0.0:
             raise ValueError(f"{name} must be finite and non-negative")
+        return result
+
+    def _endpoint_geodesic_bound_speed(
+        self,
+        graph: RoadGraph,
+        avoid_highways: bool,
+    ) -> Optional[float]:
+        """Return a validated effective speed for endpoint duration bounds."""
+        stamp = graph._heuristic_cache_stamp()
+        cache = type(self)._ENDPOINT_GEODESIC_SPEED_SHARED_CACHE
+        cache_key = (graph, stamp, bool(avoid_highways))
+        if cache_key in cache:
+            cache.move_to_end(cache_key)
+            if graph._heuristic_cache_stamp() == stamp:
+                return cache[cache_key]
+            del cache[cache_key]
+
+        maximum_speed = 1.0
+        valid = True
+        for index, edge in enumerate(graph.edges.values()):
+            _check_active_deadline_at(index)
+            if avoid_highways and is_highway_road_type(edge.road_type):
+                continue
+            try:
+                distance_km = float(edge.distance_km)
+                raw_speed = float(edge.speed_limit_kmh)
+                start = graph.get_node(edge.start_node_id)
+                end = graph.get_node(edge.end_node_id)
+                endpoint_km = self._haversine(
+                    float(start.lat),
+                    float(start.lon),
+                    float(end.lat),
+                    float(end.lon),
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                valid = False
+                break
+            if (
+                not math.isfinite(distance_km)
+                or distance_km < 0.0
+                or not math.isfinite(raw_speed)
+                or not math.isfinite(endpoint_km)
+                or endpoint_km < 0.0
+                or distance_km < endpoint_km
+            ):
+                valid = False
+                break
+            maximum_speed = max(maximum_speed, raw_speed, 1.0)
+
+        final_stamp = graph._heuristic_cache_stamp()
+        if final_stamp != stamp:
+            return None
+        result = maximum_speed if valid else None
+        cache[cache_key] = result
+        cache.move_to_end(cache_key)
+        if not avoid_highways:
+            highway_key = (graph, stamp, True)
+            cache[highway_key] = result
+            cache.move_to_end(highway_key)
+        while (
+            len(cache)
+            > type(self)._ENDPOINT_GEODESIC_SPEED_CACHE_CAPACITY
+        ):
+            cache.popitem(last=False)
         return result
 
     def _edge_distances_are_geodesic_lower_bounds(self) -> bool:

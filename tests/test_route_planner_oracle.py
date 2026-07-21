@@ -1763,6 +1763,50 @@ def _force_production(graph: RoadGraph) -> RoadGraph:
     return graph
 
 
+def test_endpoint_duration_bound_validates_speed_and_virtual_nodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    for node_id, lon in (("S", -0.01), ("A", 0.0), ("B", 0.01)):
+        graph.add_node(Node(id=node_id, lat=0.0, lon=lon))
+    planner = ScenicRoutePlanner(graph)
+    edge_km = planner._haversine(0.0, -0.01, 0.0, 0.0)
+    for edge_id, start_node_id, end_node_id in (
+        ("sa", "S", "A"),
+        ("ab", "A", "B"),
+    ):
+        graph.add_edge(
+            Edge(
+                edge_id,
+                start_node_id,
+                end_node_id,
+                edge_km,
+                1.0,
+                speed_limit_kmh=140,
+                one_way=True,
+            )
+        )
+
+    request = planner._build_endpoint_access_request(
+        (0.0, -0.01),
+        (0.0, 0.005),
+    )
+    setattr(request.overlay, "_route_access_request", request)
+    planner.graph = request.overlay
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
+
+    goal = planner.graph.get_node(request.end_node_id)
+    bounds = planner._frontier_reverse_duration_lower_bounds(
+        goal,
+        False,
+        10.0,
+    )
+
+    expected = edge_km * 1.5 * 60.0 / 140.0
+    assert bounds.get("S") == pytest.approx(expected)
+    assert bounds.get(request.end_node_id) == 0.0
+
+
 def _production_side_road_graph() -> RoadGraph:
     graph = RoadGraph()
     for node_id, lat in (
@@ -2367,6 +2411,39 @@ def test_compiled_endpoint_scenic_priority_searches_scenic_accesses(
     assert route.algorithm == "compiled-lagrangian-endpoint-search"
     assert route.average_scenic_score == pytest.approx(10.0)
     assert route.estimated_duration_minutes <= route.duration_cap_minutes
+
+
+def test_compiled_endpoint_collapsed_boundaries_preserve_fastest_and_scenic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = ScenicRoutePlanner(_force_production(_tradeoff_graph()))
+    monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
+    monkeypatch.setattr(planner, "_COLLAPSED_ACCESS_NODE_THRESHOLD", 0)
+
+    fastest = planner.find_fastest_route((0.0, 0.0), (0.03, 0.0))
+    assert fastest.edge_ids == ("fast",)
+    assert fastest.traversal_ids == ("0:forward:fast",)
+    assert fastest.waypoints == [(0.0, 0.0), (0.03, 0.0)]
+
+    scenic = planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.03, 0.0),
+        q=0.0,
+        kappa=4.0,
+        scenic_priority=True,
+    )
+    assert scenic.edge_ids == ("scenic-1", "scenic-2")
+    assert scenic.traversal_ids == (
+        "0:forward:scenic-1",
+        "1:forward:scenic-2",
+    )
+    assert scenic.waypoints == [
+        (0.0, 0.0),
+        (0.02, 0.0),
+        (0.03, 0.0),
+    ]
+    assert scenic.estimated_duration_minutes <= scenic.duration_cap_minutes
 
 def test_scenic_priority_overrides_zero_weight_shortcut() -> None:
     route = ScenicRoutePlanner(_tradeoff_graph()).find_scenic_route(

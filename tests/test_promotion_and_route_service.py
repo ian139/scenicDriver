@@ -381,6 +381,48 @@ def test_empty_route_comparison_preserves_same_route_identity() -> None:
     )
 
     assert objective["same_route"] is True
+
+
+def test_objective_route_identity_includes_traversal_direction() -> None:
+    request = route_service.RouteRequest(
+        graph_geojson="unused",
+        start=(42.0, -72.0),
+        end=(42.1, -72.0),
+    )
+
+    def route(direction: str, traversal_id: str) -> Route:
+        segment = RouteSegment(
+            edge_id="two-way-road",
+            traversal_id=traversal_id,
+            direction=direction,
+            start=(42.0, -72.0),
+            end=(42.1, -72.0),
+            distance_km=10.0,
+            scenic_score=5.0,
+            road_name=None,
+            road_type="secondary",
+        )
+        return Route(
+            segments=[segment],
+            total_distance_km=10.0,
+            average_scenic_score=5.0,
+            estimated_duration_minutes=10.0,
+            waypoints=[segment.start, segment.end],
+            edge_ids=("two-way-road",),
+            traversal_ids=(traversal_id,),
+            exact=True,
+        )
+
+    objective = route_service._objective_components(
+        request,
+        route("forward", "0:forward:two-way-road"),
+        route("reverse", "0:reverse:two-way-road"),
+    )
+
+    assert objective["same_route"] is False
+    assert objective["no_better_route_reason"] == "no_better_route"
+
+
 def _write_cache_graph(path: Path, scenic_score: float = 1.0) -> None:
     payload = {
         "type": "FeatureCollection",
@@ -449,6 +491,53 @@ def test_endpoint_snap_diagnostics_skip_large_nearest_node_index() -> None:
 
     assert diagnostics["start_snap_km"] == pytest.approx(0.25)
     assert diagnostics["end_snap_km"] == pytest.approx(0.25)
+    assert diagnostics["start_node_id"] is None
+    assert diagnostics["end_node_id"] is None
+
+
+def test_endpoint_snap_diagnostics_bound_large_projection_failure() -> None:
+    class _LargeNodes:
+        def __len__(self) -> int:
+            return route_service._ENDPOINT_NODE_DIAGNOSTIC_MAX_NODES + 1
+
+    class _LargeGraph:
+        nodes = _LargeNodes()
+        edge_queries: list[frozenset[str]] = []
+
+        def find_nearest_edge_positions_with_distance(
+            self, *args: object, **kwargs: object
+        ):
+            del args
+            self.edge_queries.append(kwargs["excluded_road_types"])
+            return [], float("inf")
+
+        def find_nearest_node_with_distance(
+            self, *args: object, **kwargs: object
+        ):
+            raise AssertionError(
+                "large projection failure must not build node index"
+            )
+
+    graph = _LargeGraph()
+    request = route_service.RouteRequest(
+        graph_geojson="unused",
+        start=(42.05, -72.001),
+        end=(42.05, -72.001),
+        avoid_highways=True,
+        max_snap_distance_km=1.0,
+    )
+
+    diagnostics = route_service._endpoint_snap_diagnostics(graph, request)  # type: ignore[arg-type]
+
+    assert len(graph.edge_queries) == 4
+    assert graph.edge_queries[0] == route_service.HIGHWAY_ROAD_TYPES
+    assert graph.edge_queries[1] == frozenset()
+    assert graph.edge_queries[2] == route_service.HIGHWAY_ROAD_TYPES
+    assert graph.edge_queries[3] == frozenset()
+    assert diagnostics["start_snap_km"] is None
+    assert diagnostics["end_snap_km"] is None
+    assert diagnostics["start_all_road_snap_km"] is None
+    assert diagnostics["end_all_road_snap_km"] is None
     assert diagnostics["start_node_id"] is None
     assert diagnostics["end_node_id"] is None
 
