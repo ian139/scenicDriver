@@ -7,16 +7,12 @@ remote shell script only references the remote environment file copied by SSH.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
-import math
 import os
 from pathlib import Path, PurePosixPath
-import re
 import shlex
-import subprocess
 import sys
-import tempfile
 import time
 from typing import Any
 
@@ -43,7 +39,6 @@ from scripts.remote.cmux_vast_host import (  # noqa: E402
     validate_task_name,
     wait_for_instance_endpoint,
     wait_for_ssh,
-    write_state as cmux_write_state,
 )
 
 STATE_DIR = PROJECT_ROOT / ".cmux-vast" / "state"
@@ -286,10 +281,8 @@ def build_remote_script(config: VastRouteConfig, *, workers: int, group_size: in
     report = quote(str(PurePosixPath(config.remote_repo_dir) / config.report))
     output = quote(paths["output"])
     checkpoint = quote(paths["checkpoint"])
-    log = quote(paths["log"])
     checkpoint_s3 = quote(paths["checkpoint_s3"])
     final_s3 = quote(paths["final_s3"])
-    script = quote(paths["script"])
     graph_arg = f"--graph {graph}" if graph else ""
     strict_service_arg = "--strict-service-full" if config.strict_service_full else ""
     spatial_index_guard = (
@@ -325,18 +318,23 @@ path = pathlib.Path(sys.argv[1])
 if not path.is_file() or path.stat().st_size == 0:
     raise SystemExit(1)
 seen: set[str] = set()
-fingerprints: set[str] = set()
+fingerprint = None
 for line in path.open(encoding="utf-8"):
     if line.strip():
         row = json.loads(line)
         if not isinstance(row, dict) or not row.get("case_id"):
             raise SystemExit(1)
+        row_fingerprint = row.get("checkpoint_fingerprint")
+        if not isinstance(row_fingerprint, str) or not row_fingerprint:
+            raise SystemExit(1)
+        if fingerprint is None:
+            fingerprint = row_fingerprint
+        elif row_fingerprint != fingerprint:
+            raise SystemExit(1)
         seen.add(str(row["case_id"]))
-        if row.get("checkpoint_fingerprint"):
-            fingerprints.add(str(row["checkpoint_fingerprint"]))
-if len(seen) != sum(1 for _ in path.open(encoding="utf-8") if _.strip()):
+if fingerprint is None:
     raise SystemExit(1)
-if len(fingerprints) != 1:
+if len(seen) != sum(1 for _ in path.open(encoding="utf-8") if _.strip()):
     raise SystemExit(1)
 PY
 }}
@@ -378,12 +376,23 @@ rows = payload.get("results")
 if not isinstance(matrix, dict) or not isinstance(rows, list):
     raise SystemExit("refusing final upload: malformed benchmark payload")
 expected = matrix.get("planned_cases")
-ids = [str(row.get("case_id")) for row in rows if isinstance(row, dict)]
-fingerprints = {{str(row.get("checkpoint_fingerprint")) for row in rows if isinstance(row, dict) and row.get("checkpoint_fingerprint")}}
 if not isinstance(expected, int) or len(rows) != expected:
     raise SystemExit("refusing final upload: unexpected planned case count")
+if any(
+    not isinstance(row, dict) or not row.get("case_id")
+    for row in rows
+):
+    raise SystemExit("refusing final upload: duplicate or missing case IDs")
+ids = [str(row["case_id"]) for row in rows]
 if len(ids) != len(set(ids)) or len(ids) != expected:
     raise SystemExit("refusing final upload: duplicate or missing case IDs")
+if any(
+    not isinstance(row.get("checkpoint_fingerprint"), str)
+    or not row["checkpoint_fingerprint"]
+    for row in rows
+):
+    raise SystemExit("refusing final upload: checkpoint fingerprints are inconsistent")
+fingerprints = {{str(row["checkpoint_fingerprint"]) for row in rows}}
 if len(fingerprints) != 1 or fingerprints != {{str(payload.get("checkpoint_fingerprint"))}}:
     raise SystemExit("refusing final upload: checkpoint fingerprints are inconsistent")
 if matrix.get("all_cases_persisted") is not True:

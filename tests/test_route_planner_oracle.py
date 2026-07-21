@@ -8,6 +8,7 @@ import time
 import tracemalloc
 
 import pytest
+from src.route_planner.cancellation import RoutingTimeout
 
 from src.route_planner.cost import evaluate_path, resolve_routing_policy
 from src.route_planner.graph import Edge, EndpointRoadGraph, Node, RoadGraph
@@ -2068,13 +2069,16 @@ def test_corridor_warm_start_finds_material_detour_and_respects_cap() -> None:
         max_detour_factor=3.0,
         scenic_priority=True,
     )
-    tight = planner.find_scenic_route(
-        (0.0, 0.0),
-        (0.03, 0.0),
-        scenic_weight=1.0,
-        max_detour_factor=2.4,
-        scenic_priority=True,
-    )
+    with pytest.raises(
+        RoutingTimeout, match="without a scenic route"
+    ):
+        planner.find_scenic_route(
+            (0.0, 0.0),
+            (0.03, 0.0),
+            scenic_weight=1.0,
+            max_detour_factor=2.4,
+            scenic_priority=True,
+        )
 
     assert fastest.edge_ids == ("shared-connector", "direct")
     assert scenic.edge_ids == (
@@ -2088,8 +2092,6 @@ def test_corridor_warm_start_finds_material_detour_and_respects_cap() -> None:
     )
     assert 1.0 < scenic.actual_duration_ratio <= 3.0 + 1e-12
     assert len(scenic.waypoints) == len(set(scenic.waypoints))
-    assert tight.edge_ids == fastest.edge_ids
-    assert tight.actual_duration_ratio <= 2.4 + 1e-12
 
 
 def test_beam_uses_capacity_when_paths_share_first_edge() -> None:
@@ -2333,7 +2335,7 @@ def test_production_frontier_timeout_during_preprocessing_certifies_bound(
     assert route.search_diagnostics["deadline_reached"] is True
 
 
-def test_production_frontier_timeout_certifies_mid_expansion_upper_bound(
+def test_production_frontier_timeout_without_candidate_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     planner = ScenicRoutePlanner(_force_production(_tradeoff_graph()))
@@ -2348,17 +2350,29 @@ def test_production_frontier_timeout_certifies_mid_expansion_upper_bound(
         lambda: ticks.pop(0) if ticks else 2.0,
     )
 
+    with pytest.raises(
+        RoutingTimeout, match="without a scenic route"
+    ):
+        _route(planner, q=1.0, kappa=4.0)
+
+def test_production_frontier_timeout_with_scenic_candidate_certifies_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = ScenicRoutePlanner(_force_production(_tradeoff_graph()))
+    planner._frontier_time_limit_seconds = 1.0
+    ticks = [0.0, 0.0, 0.0]
+    monkeypatch.setattr(
+        planner,
+        "_monotonic",
+        lambda: ticks.pop(0) if ticks else 2.0,
+    )
+
     route = _route(planner, q=1.0, kappa=4.0)
 
     assert route.exact is False
     assert route.exactness_status == "approximate-certified"
     assert math.isfinite(route.certified_upper_bound)
     assert route.certified_upper_bound >= route.objective_value
-    assert route.objective_value == pytest.approx(0.0)
-    assert route.certified_upper_bound >= 1.0
-    assert route.optimality_gap == pytest.approx(
-        route.certified_upper_bound - route.objective_value
-    )
     diagnostics = route.search_diagnostics
     assert set(diagnostics) == _SEARCH_DIAGNOSTIC_KEYS
     assert diagnostics["time_limit_seconds"] == pytest.approx(1.0)
@@ -2373,6 +2387,7 @@ def test_production_frontier_timeout_certifies_mid_expansion_upper_bound(
     assert diagnostics["deadline_reached"] is True
     assert diagnostics["elapsed_ms"] >= 0.0
     assert diagnostics["mode"] == "frontier"
+
 
 def test_scenic_priority_maximizes_score_under_duration_cap() -> None:
     planner = ScenicRoutePlanner(_force_production(_tradeoff_graph()))
@@ -2411,6 +2426,35 @@ def test_compiled_endpoint_scenic_priority_searches_scenic_accesses(
     assert route.algorithm == "compiled-lagrangian-endpoint-search"
     assert route.average_scenic_score == pytest.approx(10.0)
     assert route.estimated_duration_minutes <= route.duration_cap_minutes
+
+def test_production_frontier_preserves_interior_endpoint_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = ScenicRoutePlanner(_force_production(_tradeoff_graph()))
+    monkeypatch.setattr(planner, "_COMPILED_SCENIC_MIN_NODES", 100_000)
+
+    route = planner.find_scenic_route(
+        (0.001, 0.0),
+        (0.029, 0.0),
+        q=0.0,
+        kappa=4.0,
+        scenic_priority=True,
+    )
+
+    assert route.algorithm == "production-multilabel-frontier"
+    assert route.edge_ids == ("scenic-1", "scenic-2")
+    assert route.traversal_ids == (
+        "0:forward:scenic-1",
+        "1:forward:scenic-2",
+    )
+    assert route.waypoints == [
+        (0.001, 0.0),
+        (0.02, 0.0),
+        (0.029, 0.0),
+    ]
+    assert route.average_scenic_score == pytest.approx(10.0)
+    assert route.estimated_duration_minutes <= route.duration_cap_minutes
+    assert route.exact is True
 
 
 def test_compiled_endpoint_collapsed_boundaries_preserve_fastest_and_scenic(

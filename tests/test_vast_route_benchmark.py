@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -78,6 +80,118 @@ def test_remote_script_has_checkpoint_resume_and_final_guard() -> None:
     assert "refusing final upload" in script
     assert "s3://scenic-test/outputs/vast/bbox-test-run/checkpoints/bbox-test/bbox-test.jsonl" in script
     assert "s3://scenic-test/outputs/vast/bbox-test-run/bbox-test.json" in script
+
+def test_generated_checkpoint_validators_reject_missing_fingerprint(
+    tmp_path: Path,
+) -> None:
+    script = benchmark.build_remote_script(config(), workers=1, group_size=1)
+
+    checkpoint_marker = (
+        "  python - \"${1:-$CHECKPOINT}\" <<'PY'\n"
+    )
+    checkpoint_start = script.index(checkpoint_marker) + len(
+        checkpoint_marker
+    )
+    checkpoint_validator = script[
+        checkpoint_start : script.index("\nPY\n", checkpoint_start)
+    ]
+    valid_checkpoint = tmp_path / "valid-checkpoint.jsonl"
+    valid_checkpoint.write_text(
+        "\n".join(
+            (
+                json.dumps(
+                    {
+                        "case_id": "a",
+                        "checkpoint_fingerprint": "fp",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "case_id": "b",
+                        "checkpoint_fingerprint": "fp",
+                    }
+                ),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    valid_checkpoint_result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            checkpoint_validator,
+            str(valid_checkpoint),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert valid_checkpoint_result.returncode == 0
+
+    checkpoint = tmp_path / "checkpoint.jsonl"
+    checkpoint.write_text(
+        "\n".join(
+            (
+                json.dumps(
+                    {
+                        "case_id": "a",
+                        "checkpoint_fingerprint": "fp",
+                    }
+                ),
+                json.dumps({"case_id": "b"}),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    checkpoint_result = subprocess.run(
+        [sys.executable, "-c", checkpoint_validator, str(checkpoint)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert checkpoint_result.returncode != 0
+
+    final_marker = "python - \"$OUTPUT\" <<'PY'\n"
+    final_start = script.index(final_marker) + len(final_marker)
+    final_validator = script[final_start : script.index("\nPY\n", final_start)]
+    output = tmp_path / "output.json"
+    valid_payload = {
+        "checkpoint_fingerprint": "fp",
+        "matrix": {
+            "planned_cases": 2,
+            "all_cases_persisted": True,
+        },
+        "results": [
+            {
+                "case_id": "a",
+                "checkpoint_fingerprint": "fp",
+            },
+            {
+                "case_id": "b",
+                "checkpoint_fingerprint": "fp",
+            },
+        ],
+    }
+    output.write_text(json.dumps(valid_payload), encoding="utf-8")
+    valid_final_result = subprocess.run(
+        [sys.executable, "-c", final_validator, str(output)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert valid_final_result.returncode == 0
+
+    valid_payload["results"][1] = {"case_id": "b"}
+    output.write_text(json.dumps(valid_payload), encoding="utf-8")
+    final_result = subprocess.run(
+        [sys.executable, "-c", final_validator, str(output)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert final_result.returncode != 0
 
 
 def test_remote_script_propagates_strict_service_mode() -> None:

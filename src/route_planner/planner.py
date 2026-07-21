@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover - exercised only without optional runtim
     _scipy_csr_matrix = None
     _scipy_shortest_path = None
 
-from .cancellation import RoutingDeadline
+from .cancellation import RoutingDeadline, RoutingTimeout
 
 from .cost import (
     CostWeights,
@@ -5304,6 +5304,21 @@ class ScenicRoutePlanner:
             fastest_edges=shortest_edges,
             fastest_evaluation=fastest_evaluation,
         )
+        if bool(search_diagnostics.get("deadline_reached")):
+            has_usable_scenic_candidate = (
+                self._has_scenic_improvement(
+                    best_evaluation, fastest_evaluation
+                )
+                if policy.scenic_priority
+                else is_better_path(
+                    cast(PathEvaluation, best_evaluation),
+                    fastest_evaluation,
+                )
+            )
+            if not has_usable_scenic_candidate:
+                raise RoutingTimeout(
+                    "scenic frontier timed out without a scenic route"
+                )
         no_scenic_improvement = not self._has_scenic_improvement(
             best_evaluation, fastest_evaluation
         )
