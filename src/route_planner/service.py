@@ -40,6 +40,8 @@ _DEFAULT_INCLUDE_BASELINE = True
 
 _DEFAULT_SCENIC_ROUTE_DEADLINE_SECONDS = 10.0
 _DEADLINE_CHECK_INTERVAL = 256
+_ENDPOINT_NODE_DIAGNOSTIC_MAX_NODES = 1_000_000
+"""Avoid materializing a full nearest-node index for production graphs."""
 
 
 def _maybe_check_deadline(
@@ -1140,6 +1142,7 @@ def _endpoint_snap_diagnostics(
         if deadline is not None:
             deadline.check()
         eligible_distance: float | None = None
+        projection_found = False
         try:
             _projections, raw_distance = (
                 graph.find_nearest_edge_positions_with_distance(
@@ -1151,6 +1154,7 @@ def _endpoint_snap_diagnostics(
             distance = float(raw_distance)
             if math.isfinite(distance) and _projections:
                 eligible_distance = distance
+                projection_found = True
         except (RoutingTimeout, RoutingCancelled):
             raise
         except Exception:
@@ -1173,20 +1177,28 @@ def _endpoint_snap_diagnostics(
                 distance = float(raw_distance)
                 if math.isfinite(distance) and all_projections:
                     all_road_distance = distance
+                    projection_found = True
             except (RoutingTimeout, RoutingCancelled):
                 raise
             except Exception:
                 all_road_distance = None
-        try:
-            nearest_node, _ = graph.find_nearest_node_with_distance(
-                *point,
-                check_cancelled=check_cancelled,
-            )
-            diagnostics[f"{endpoint}_node_id"] = str(nearest_node.id)
-        except (RoutingTimeout, RoutingCancelled):
-            raise
-        except Exception:
-            pass
+        # Routing already uses the edge-projection index.  Building the
+        # nearest-node index here only to populate optional diagnostics is
+        # prohibitive for production graphs with millions of nodes.
+        if (
+            not projection_found
+            or len(graph.nodes) <= _ENDPOINT_NODE_DIAGNOSTIC_MAX_NODES
+        ):
+            try:
+                nearest_node, _ = graph.find_nearest_node_with_distance(
+                    *point,
+                    check_cancelled=check_cancelled,
+                )
+                diagnostics[f"{endpoint}_node_id"] = str(nearest_node.id)
+            except (RoutingTimeout, RoutingCancelled):
+                raise
+            except Exception:
+                pass
 
         diagnostics[f"{endpoint}_snap_km"] = eligible_distance
         diagnostics[f"{endpoint}_all_road_snap_km"] = all_road_distance
@@ -1249,12 +1261,13 @@ def _objective_components(
         _maybe_check_deadline(deadline, i, interval=64)
         scenic_edges.append(_segment_identity(segment, i))
     scenic_edges = tuple(scenic_edges)
-    baseline_edges = []
+    baseline_edges = None
     if baseline_route is not None:
+        baseline_edges_list = []
         for i, segment in enumerate(baseline_route.segments):
             _maybe_check_deadline(deadline, i, interval=64)
-            baseline_edges.append(_segment_identity(segment, i))
-    baseline_edges = tuple(baseline_edges) if baseline_edges else None
+            baseline_edges_list.append(_segment_identity(segment, i))
+        baseline_edges = tuple(baseline_edges_list)
     same_route = baseline_edges is not None and scenic_edges == baseline_edges
     no_better_reason = None
     certified = bool(getattr(scenic_route, "exact", False)) or (

@@ -596,6 +596,7 @@ def test_multi_access_matches_pairwise_oracle_for_tied_mixed_access(
     planner = ScenicRoutePlanner(graph)
     monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
     monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
+    monkeypatch.setattr(planner, "_COLLAPSED_ACCESS_NODE_THRESHOLD", 0)
     start = (0.002, 0.0)
     end = (0.048, 0.0)
     oracle = _pairwise_large_fastest_oracle(planner, start, end)
@@ -681,6 +682,7 @@ def test_multi_access_boundary_and_zero_length_routes(
     planner = ScenicRoutePlanner(graph)
     monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
     monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
+    monkeypatch.setattr(planner, "_COLLAPSED_ACCESS_NODE_THRESHOLD", 0)
     oracle = _pairwise_large_fastest_oracle(planner, start, end)
     assert oracle is not None
     route = planner.find_fastest_route(start, end)
@@ -768,6 +770,182 @@ def test_large_graph_multi_access_preserves_reverse_direct_metadata(
     assert route.edge_ids == ("two-way",)
     assert route.traversal_ids == ("0:reverse:two-way",)
     assert route.segments[0].direction == "reverse"
+def test_large_graph_tie_breaks_middle_by_canonical_edge_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    for node_id, lat, lon in (
+        ("S", 0.0, 0.0),
+        ("A", 0.01, 0.0),
+        ("B", 0.02, 0.01),
+        ("C", 0.02, -0.01),
+        ("D", 0.03, 0.0),
+        ("G", 0.04, 0.0),
+    ):
+        graph.add_node(Node(node_id, lat, lon))
+    for index in range(25):
+        graph.add_node(Node(f"tie-isolated-{index}", 30.0 + index, 30.0))
+    graph.add_edge(
+        Edge("start", "S", "A", 1.0, 0.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge("z-diamond", "A", "B", 1.5, 0.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge("a-diamond", "A", "C", 1.5, 0.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge("z-merge", "B", "D", 1.5, 0.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge("a-merge", "C", "D", 1.5, 0.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge("finish", "D", "G", 1.0, 0.0, speed_limit_kmh=60, one_way=True)
+    )
+    planner = ScenicRoutePlanner(graph)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
+
+    route = planner.find_fastest_route((0.005, 0.0), (0.035, 0.0))
+
+    assert route.edge_ids == ("start", "a-diamond", "a-merge", "finish")
+
+
+def test_collapsed_ties_rank_by_canonical_edge_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    for node_id, lat, lon in (
+        ("S", 0.0, 0.0),
+        ("A", 0.01, 0.0),
+        ("B", 0.02, 0.01),
+        ("C", 0.02, -0.01),
+        ("D", 0.03, 0.0),
+        ("G", 0.04, 0.0),
+    ):
+        graph.add_node(Node(node_id, lat, lon))
+    graph.add_edge(
+        Edge("start", "S", "A", 1.0, 0.0, speed_limit_kmh=60, one_way=False)
+    )
+    z_diamond = Edge(
+        "z-storage", "A", "B", 1.5, 0.0, speed_limit_kmh=60, one_way=True
+    )
+    z_diamond.canonical_edge_id = "a-canonical"
+    graph.add_edge(z_diamond)
+    a_diamond = Edge(
+        "a-storage", "A", "C", 1.5, 0.0, speed_limit_kmh=60, one_way=True
+    )
+    a_diamond.canonical_edge_id = "z-canonical"
+    graph.add_edge(a_diamond)
+    z_merge = Edge(
+        "z-merge-storage", "B", "D", 1.5, 0.0, speed_limit_kmh=60, one_way=True
+    )
+    z_merge.canonical_edge_id = "a-merge-canonical"
+    graph.add_edge(z_merge)
+    a_merge = Edge(
+        "a-merge-storage", "C", "D", 1.5, 0.0, speed_limit_kmh=60, one_way=True
+    )
+    a_merge.canonical_edge_id = "z-merge-canonical"
+    graph.add_edge(a_merge)
+    graph.add_edge(
+        Edge("finish", "D", "G", 1.0, 0.0, speed_limit_kmh=60, one_way=False)
+    )
+    planner = ScenicRoutePlanner(graph)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
+    monkeypatch.setattr(planner, "_COLLAPSED_ACCESS_NODE_THRESHOLD", 0)
+    monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+
+    route = planner.find_fastest_route((0.005, 0.0), (0.035, 0.0))
+
+    assert route.edge_ids == (
+        "start",
+        "a-canonical",
+        "a-merge-canonical",
+        "finish",
+    )
+def test_forward_large_access_ties_use_canonical_edge_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    for node_id, lat, lon in (
+        ("S", 0.0, 0.0),
+        ("X", 0.01, 0.0),
+        ("A", 0.02, 0.0),
+        ("B", 0.02, 0.0),
+        ("G", 0.03, 0.0),
+    ):
+        graph.add_node(Node(node_id, lat, lon))
+    graph.add_edge(
+        Edge("start", "S", "X", 1.0, 0.0, speed_limit_kmh=60, one_way=True)
+    )
+    z_storage = Edge(
+        "z-storage", "X", "A", 1.0, 0.0, speed_limit_kmh=60, one_way=True
+    )
+    z_storage.canonical_edge_id = "a-canonical"
+    graph.add_edge(z_storage)
+    a_storage = Edge(
+        "a-storage", "X", "A", 1.0, 0.0, speed_limit_kmh=60, one_way=True
+    )
+    a_storage.canonical_edge_id = "z-canonical"
+    graph.add_edge(a_storage)
+    graph.add_edge(
+        Edge("x-b", "X", "B", 1.0, 0.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge("a-g", "A", "G", 1.0, 0.0, speed_limit_kmh=60, one_way=False)
+    )
+    graph.add_edge(
+        Edge("b-g", "B", "G", 1.0, 0.0, speed_limit_kmh=60, one_way=False)
+    )
+    planner = ScenicRoutePlanner(graph)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
+    monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+
+    route = planner.find_fastest_route((0.005, 0.0), (0.025, 0.0))
+
+    assert route.edge_ids == ("start", "a-canonical", "a-g")
+
+
+def test_large_graph_tie_breaks_reversed_parallel_edges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    for node_id, lat in (("S", 0.0), ("A", 0.01), ("G", 0.03)):
+        graph.add_node(Node(node_id, lat, 0.0))
+    for index in range(25):
+        graph.add_node(Node(f"parallel-isolated-{index}", 30.0 + index, 30.0))
+    graph.add_edge(
+        Edge("start", "S", "A", 1.0, 0.0, speed_limit_kmh=60, one_way=True)
+    )
+    graph.add_edge(
+        Edge(
+            "z-parallel",
+            "A",
+            "G",
+            2.0,
+            0.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            "a-parallel",
+            "A",
+            "G",
+            2.0,
+            0.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    planner = ScenicRoutePlanner(graph)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
+
+    route = planner.find_fastest_route((0.005, 0.0), (0.02, 0.0))
+
+    assert route.edge_ids == ("start", "a-parallel")
+
 def test_oracle_fastest_and_scenic_differ_and_detour_unlocks() -> None:
     planner = ScenicRoutePlanner(_tradeoff_graph())
     fastest = _route(planner, q=0.0, kappa=4.0)
@@ -968,6 +1146,62 @@ def test_primary_shortcut_is_excluded_by_checked_filter() -> None:
     assert scenic.edge_ids == ("secondary-detour", "residential-detour")
     assert all(segment.road_type != "primary" for segment in scenic.segments)
     assert scenic.highway_count == 0
+
+def test_large_search_fallback_preserves_highway_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    for node_id, lat in (("S", 0.0), ("R", 0.01), ("G", 0.02)):
+        graph.add_node(Node(id=node_id, lat=lat, lon=0.0))
+    graph.add_edge(
+        Edge(
+            id="primary-shortcut",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=2.0,
+            scenic_score=0.0,
+            road_type="primary",
+            speed_limit_kmh=100,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="residential-detour",
+            start_node_id="S",
+            end_node_id="R",
+            distance_km=1.0,
+            scenic_score=0.0,
+            road_type="residential",
+            speed_limit_kmh=40,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="residential-finish",
+            start_node_id="R",
+            end_node_id="G",
+            distance_km=1.0,
+            scenic_score=0.0,
+            road_type="residential",
+            speed_limit_kmh=40,
+            one_way=True,
+        )
+    )
+    planner = ScenicRoutePlanner(graph)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
+    monkeypatch.setattr(
+        planner,
+        "_large_graph_multi_access_path",
+        lambda *args, **kwargs: None,
+    )
+
+    route = planner.find_fastest_route(
+        (0.0, 0.0), (0.02, 0.0), avoid_highways=True
+    )
+
+    assert route.edge_ids == ("residential-detour", "residential-finish")
 
 
 @pytest.mark.parametrize("road_type", ["motorway", "primary"])
@@ -2113,6 +2347,26 @@ def test_scenic_priority_maximizes_score_under_duration_cap() -> None:
         segment.end[0] for segment in route.segments
     ]
     assert len(node_ids) == len(set(node_ids))
+
+def test_compiled_endpoint_scenic_priority_searches_scenic_accesses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner = ScenicRoutePlanner(_force_production(_tradeoff_graph()))
+    monkeypatch.setattr(planner, "_COMPILED_SCENIC_MIN_NODES", 0)
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
+    monkeypatch.setattr(planner, "_COLLAPSED_ACCESS_NODE_THRESHOLD", 0)
+
+    route = planner.find_scenic_route(
+        (0.001, 0.0),
+        (0.029, 0.0),
+        q=0.0,
+        kappa=4.0,
+        scenic_priority=True,
+    )
+
+    assert route.algorithm == "compiled-lagrangian-endpoint-search"
+    assert route.average_scenic_score == pytest.approx(10.0)
+    assert route.estimated_duration_minutes <= route.duration_cap_minutes
 
 def test_scenic_priority_overrides_zero_weight_shortcut() -> None:
     route = ScenicRoutePlanner(_tradeoff_graph()).find_scenic_route(

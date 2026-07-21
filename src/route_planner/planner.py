@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import heapq
 import math
 from threading import RLock
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 
@@ -25,6 +25,7 @@ from .cancellation import RoutingDeadline
 from .cost import (
     CostWeights,
     HIGHWAY_ROAD_TYPES,
+    PathEvaluation,
     RoutingPolicy,
     ScenicCostFunction,
     SCENIC_NORMALIZATION_VERSION,
@@ -246,6 +247,50 @@ class _ZeroBounds(dict[str, float]):
         return 0.0
 
 
+class _EndpointGeodesicBounds(dict[str, float]):
+    """Lazy duration lower bounds from base nodes to endpoint suffixes."""
+
+    def __init__(
+        self,
+        graph: RoadGraph,
+        targets: Tuple[Tuple[str, float], ...],
+        max_speed_kmh: float,
+    ) -> None:
+        super().__init__()
+        self._graph = graph
+        self._targets = targets
+        self._max_speed_kmh = max_speed_kmh
+
+    def get(self, key: str, default: object = None) -> float:
+        _check_active_deadline()
+        node = self._graph.nodes.get(str(key))
+        fallback = (
+            float(default)
+            if isinstance(default, (int, float))
+            else float("inf")
+        )
+        if node is None:
+            return fallback
+        best = float("inf")
+        for target_id, suffix_minutes in self._targets:
+            target = self._graph.nodes.get(target_id)
+            if target is None:
+                continue
+            distance_km = ScenicRoutePlanner._haversine(
+                float(node.lat),
+                float(node.lon),
+                float(target.lat),
+                float(target.lon),
+            )
+            candidate = (
+                distance_km * 60.0 / self._max_speed_kmh
+                + suffix_minutes
+            )
+            if candidate < best:
+                best = candidate
+        return best if math.isfinite(best) else fallback
+
+
 @dataclass(frozen=True)
 class _CSRTopology:
     """Immutable compact directed traversal topology for one graph epoch."""
@@ -280,6 +325,24 @@ class _CSRData:
     weights: np.ndarray
 
 @dataclass(frozen=True)
+class _PersistentPathKey:
+    """Lazy lexicographic edge sequence used by large-graph tie checks."""
+
+    parent: Optional["_PersistentPathKey"]
+    token: str
+    prepend: bool
+
+    def as_tuple(self) -> Tuple[str, ...]:
+        tokens: List[str] = []
+        current: Optional["_PersistentPathKey"] = self
+        while current is not None:
+            tokens.append(current.token)
+            current = current.parent
+        if self.prepend:
+            return tuple(tokens)
+        tokens.reverse()
+        return tuple(tokens)
+@dataclass(frozen=True)
 class _EndpointRankedResult:
     duration_minutes: float
     edges: Tuple[Edge, ...]
@@ -313,6 +376,11 @@ class ScenicRoutePlanner:
     _ENDPOINT_OVERLAY_MAX_NODES = 2_000
     _REVERSE_PREPROCESS_EDGE_THRESHOLD = 256
     _LARGE_GRAPH_EDGE_THRESHOLD = 100_000
+    _COLLAPSED_ACCESS_NODE_THRESHOLD = 100_000
+    _COMPILED_SCENIC_MIN_NODES = 100_000
+    # Production artifact edge rows cap speed limits at 121 km/h.  Keep a
+    # small margin while avoiding a graph-wide speed scan per request.
+    _LARGE_GRAPH_HEURISTIC_MAX_SPEED_KMH = 130.0
     _SHORT_ROUTE_CAP_KM = 5.0
     # Exhaustive simple-path enumeration is intentionally reserved for
     # bounded oracle-sized graphs. Production graphs use the complete
@@ -1734,11 +1802,32 @@ class ScenicRoutePlanner:
 
         labels: Dict[str, Dict[int, Dict[str, Any]]] = {"f": {}, "r": {}}
         best_at_node: Dict[str, Dict[str, int]] = {"f": {}, "r": {}}
-        frontiers: Dict[str, List[Tuple[float, Any, str, int]]] = {
-            "f": [],
-            "r": [],
-        }
+        frontiers: Dict[
+            str, List[Tuple[float, Tuple[object, ...], int, str, int]]
+        ] = {"f": [], "r": []}
         next_ids = {"f": 0, "r": 0}
+        compact_rank_keys = (
+            len(topology.edge_refs) > 100_000
+            or len(topology.node_ids) > 100_000
+        )
+        heap_sequence = 0
+
+        def path_tokens(value: object) -> Tuple[str, ...]:
+            if isinstance(value, _PersistentPathKey):
+                return value.as_tuple()
+            if value is None:
+                return ()
+            if isinstance(value, tuple):
+                return tuple(str(token) for token in value)
+            raise RuntimeError("invalid compact path key")
+
+        def key_order(key: Tuple[object, ...]) -> Tuple[object, ...]:
+            if compact_rank_keys:
+                rank = key[0]
+                if not isinstance(rank, tuple):
+                    raise RuntimeError("invalid compact rank key")
+                return (rank, path_tokens(key[1]))
+            return key
 
         def add_label(
             side: str,
@@ -1750,11 +1839,16 @@ class ScenicRoutePlanner:
             seed_edge: Optional[Edge],
             rank: Tuple[object, ...],
         ) -> Optional[int]:
+            nonlocal heap_sequence
             old_id = best_at_node[side].get(node_id)
             if old_id is not None:
                 old = labels[side][old_id]
-                if (cost, key) >= (float(old["cost"]), old["key"]):
+                old_cost = float(old["cost"])
+                if cost > old_cost:
                     return None
+                if cost == old_cost:
+                    if key_order(key) >= key_order(old["key"]):
+                        return None
             label_id = next_ids[side]
             next_ids[side] += 1
             labels[side][label_id] = {
@@ -1768,14 +1862,38 @@ class ScenicRoutePlanner:
             }
             best_at_node[side][node_id] = label_id
             heapq.heappush(
-                frontiers[side], (cost, key, node_id, label_id)
+                frontiers[side],
+                (cost, tuple(rank), heap_sequence, node_id, label_id),
             )
+            heap_sequence += 1
             return label_id
 
+        empty_path_key: object = None
+        if compact_rank_keys:
+            empty_path_key = None
         for node_id, cost, rank, seed_edge in forward_seeds:
-            add_label("f", node_id, cost, (rank, ()), None, None, seed_edge, rank)
+            add_label(
+                "f",
+                node_id,
+                cost,
+                (rank, empty_path_key if compact_rank_keys else ()),
+                None,
+                None,
+                seed_edge,
+                rank,
+            )
         for node_id, cost, rank, seed_edge in reverse_seeds:
-            add_label("r", node_id, cost, (rank, ()), None, None, seed_edge, rank)
+            add_label(
+                "r",
+                node_id,
+                cost,
+                (rank, empty_path_key if compact_rank_keys else ()),
+                None,
+                None,
+                seed_edge,
+                rank,
+            )
+
 
         best: Optional[Tuple[float, int, int, Tuple[object, ...]]] = None
 
@@ -1783,7 +1901,9 @@ class ScenicRoutePlanner:
             nonlocal best
             forward = labels["f"][forward_id]
             reverse = labels["r"][reverse_id]
-            middle_key = tuple(forward["key"][1]) + tuple(reverse["key"][1])
+            middle_key = path_tokens(forward["key"][1]) + path_tokens(
+                reverse["key"][1]
+            )
             forward_rank = tuple(forward["rank"])
             reverse_rank = tuple(reverse["rank"])
             rank_key = (
@@ -1817,15 +1937,14 @@ class ScenicRoutePlanner:
                 if frontiers["f"][0][0] <= frontiers["r"][0][0]
                 else "r"
             )
-            current_cost, current_key, current_node, label_id = heapq.heappop(
-                frontiers[expand_side]
+            current_cost, _heap_rank, _heap_order, current_node, label_id = (
+                heapq.heappop(frontiers[expand_side])
             )
             label = labels[expand_side].get(label_id)
             if (
                 label is None
                 or best_at_node[expand_side].get(current_node) != label_id
                 or label["cost"] != current_cost
-                or label["key"] != current_key
             ):
                 continue
             other_id = best_at_node["r" if expand_side == "f" else "f"].get(
@@ -1844,12 +1963,26 @@ class ScenicRoutePlanner:
                         "cumulative calculated cost must be finite and non-negative"
                     )
                 rank = tuple(label["rank"])
-                middle_key = tuple(label["key"][1])
-                next_key = (
-                    (rank, middle_key + (token_edge_id(token),))
-                    if expand_side == "f"
-                    else (rank, (token_edge_id(token),) + middle_key)
-                )
+                token_id = token_edge_id(token)
+                if compact_rank_keys:
+                    current_path = label["key"][1]
+                    if current_path is not None and not isinstance(
+                        current_path, _PersistentPathKey
+                    ):
+                        raise RuntimeError("invalid compact path key")
+                    next_path = _PersistentPathKey(
+                        current_path,
+                        token_id,
+                        expand_side == "r",
+                    )
+                    next_key = (rank, next_path)
+                else:
+                    middle_key = tuple(label["key"][1])
+                    next_key = (
+                        (rank, middle_key + (token_id,))
+                        if expand_side == "f"
+                        else (rank, (token_id,) + middle_key)
+                    )
                 new_id = add_label(
                     expand_side,
                     neighbor,
@@ -2081,6 +2214,32 @@ class ScenicRoutePlanner:
         if graph is None or signature is None or expired():
             return zero_bounds()
         active_stamp = graph._heuristic_cache_stamp()
+        if (
+            isinstance(graph, EndpointRoadGraph)
+            and len(graph.base_graph.edges) > self._LARGE_GRAPH_EDGE_THRESHOLD
+        ):
+            request = getattr(graph, "_route_access_request", None)
+            target_pairs: List[Tuple[str, float]] = [(str(goal.id), 0.0)]
+            if request is not None:
+                for _index, _direction, edge in request.end_accesses:
+                    _check_active_deadline()
+                    if edge is None:
+                        continue
+                    if avoid_highways and is_highway_road_type(edge.road_type):
+                        continue
+                    target_pairs.append(
+                        (
+                            str(edge.start_node_id),
+                            self._edge_duration_minutes(edge),
+                        )
+                    )
+            if len(target_pairs) > 1:
+                return _EndpointGeodesicBounds(
+                    graph,
+                    tuple(target_pairs),
+                    self._LARGE_GRAPH_HEURISTIC_MAX_SPEED_KMH,
+                )
+            return zero_bounds()
         topology = self._csr_topology()
         if topology is None:
             return zero_bounds()
@@ -2549,6 +2708,14 @@ class ScenicRoutePlanner:
             return deadline is not None and self._monotonic() >= deadline
 
         if expired():
+            return []
+        if (
+            isinstance(self.graph, EndpointRoadGraph)
+            and len(self.graph.base_graph.nodes)
+            > self._COMPILED_SCENIC_MIN_NODES
+        ):
+            # Production-sized endpoint overlays use lazy target-bounded
+            # routing; constructing a warm-start CSR would defeat that path.
             return []
         topology = self._csr_topology(False)
         if topology is None:
@@ -3081,7 +3248,15 @@ class ScenicRoutePlanner:
 
         max_distance_per_minute: Optional[float] = None
         zero_duration_distance = 0.0
-        topology = self._csr_topology(False)
+        topology = (
+            None
+            if (
+                isinstance(self.graph, EndpointRoadGraph)
+                and len(self.graph.base_graph.nodes)
+                > self._COMPILED_SCENIC_MIN_NODES
+            )
+            else self._csr_topology(False)
+        )
         if (
             topology is not None
             and topology.graph is self.graph
@@ -3535,6 +3710,7 @@ class ScenicRoutePlanner:
 
         if start_is_virtual:
             for projection_index, projection in enumerate(start_projections):
+                _check_active_deadline_at(projection_index)
                 edge = projection.edge
                 fraction = float(projection.fraction)
                 overlay.add_edge(
@@ -3567,6 +3743,7 @@ class ScenicRoutePlanner:
 
         if end_is_virtual:
             for projection_index, projection in enumerate(end_projections):
+                _check_active_deadline_at(len(start_projections) + projection_index)
                 edge = projection.edge
                 fraction = float(projection.fraction)
                 overlay.add_edge(
@@ -3598,9 +3775,13 @@ class ScenicRoutePlanner:
                     )
         if start_is_virtual and end_is_virtual:
             for start_index, projection in enumerate(start_projections):
+                _check_active_deadline_at(start_index)
                 edge = projection.edge
                 start_fraction = float(projection.fraction)
                 for end_index, end_projection in enumerate(end_projections):
+                    _check_active_deadline_at(
+                        len(start_projections) + end_index
+                    )
                     if str(edge.id) != str(end_projection.edge.id):
                         continue
                     end_fraction = float(end_projection.fraction)
@@ -3704,6 +3885,7 @@ class ScenicRoutePlanner:
             )
             if edge_id in overlay.edges
         )
+        _check_active_deadline()
         end_accesses = tuple(
             (index, direction, overlay.edges[edge_id])
             for index in range(len(end_projections))
@@ -3713,6 +3895,7 @@ class ScenicRoutePlanner:
             )
             if edge_id in overlay.edges
         )
+        _check_active_deadline()
         if not start_accesses:
             start_accesses = ((0, 0, None),)
         if not end_accesses:
@@ -3733,6 +3916,7 @@ class ScenicRoutePlanner:
             )
             if (edge := overlay.edges.get(edge_id)) is not None
         )
+        _check_active_deadline()
         if (
             base is not self.graph
             or base._heuristic_cache_stamp() != active_stamp
@@ -3754,6 +3938,695 @@ class ScenicRoutePlanner:
         )
         self._last_endpoint_access_request = request
         return request
+
+
+    def _large_graph_multi_access_path(
+        self,
+        overlay: EndpointRoadGraph,
+        starts: List[EdgeProjection],
+        ends: List[EdgeProjection],
+        cost_function: ScenicCostFunction,
+        *,
+        direct_candidates: Tuple[Tuple[int, int, int, Edge], ...] = (),
+        weights: Optional[np.ndarray] = None,
+        scalar_edge_cost: Optional[Callable[[Edge], float]] = None,
+    ) -> Optional[Tuple[float, List[Edge], int, int, Tuple[object, ...]]]:
+        """Solve ranked endpoint access through the immutable base CSR."""
+        if _scipy_shortest_path is None or _scipy_csr_matrix is None:
+            return None
+        base = overlay.base_graph
+        active_graph = self.graph
+        active_stamp = base._heuristic_cache_stamp()
+
+        def edge_cost(edge: Edge) -> float:
+            value = (
+                scalar_edge_cost(edge)
+                if scalar_edge_cost is not None
+                else cost_function.calculate(edge)
+            )
+            return self._validated_nonnegative(
+                value, "edge calculated cost"
+            )
+
+        source_accesses: List[Tuple[int, int, Edge, float]] = []
+        for index in range(len(starts)):
+            _check_active_deadline_at(index)
+            for direction, edge_id in (
+                (0, f"__route_start__:{index}:forward"),
+                (1, f"__route_start__:{index}:reverse"),
+            ):
+                edge = overlay.edges.get(edge_id)
+                if edge is None:
+                    continue
+                if self._avoids_highways(cost_function) and is_highway_road_type(
+                    edge.road_type
+                ):
+                    continue
+                source_accesses.append(
+                    (index, direction, edge, edge_cost(edge))
+                )
+
+        target_accesses: List[Tuple[int, int, Edge, float]] = []
+        for index in range(len(ends)):
+            _check_active_deadline_at(len(starts) + index)
+            for direction, edge_id in (
+                (0, f"__route_end__:{index}:forward"),
+                (1, f"__route_end__:{index}:reverse"),
+            ):
+                edge = overlay.edges.get(edge_id)
+                if edge is None:
+                    continue
+                if self._avoids_highways(cost_function) and is_highway_road_type(
+                    edge.road_type
+                ):
+                    continue
+                target_accesses.append(
+                    (index, direction, edge, edge_cost(edge))
+                )
+        if not source_accesses or not target_accesses:
+            return None
+
+        best: Optional[
+            Tuple[float, List[Edge], int, int, Tuple[object, ...]]
+        ] = None
+        best_metric = float("inf")
+        use_duration_metric = (
+            weights is None and scalar_edge_cost is None
+        )
+
+        self.graph = base
+        try:
+            topology = self._csr_topology(owner=base)
+            if topology is None:
+                return None
+            signature = self._built_in_cost_signature(cost_function)
+            data = (
+                self._csr_data(cost_function, signature)
+                if weights is None and signature is not None
+                else None
+            )
+            if weights is None:
+                if data is None or data.topology is not topology:
+                    return None
+                matrix = data.matrix
+                matrix_weights = data.weights
+            else:
+                matrix_weights = np.asarray(weights, dtype=np.float64)
+                if matrix_weights.shape != topology.indices.shape:
+                    raise ValueError("compiled edge weights have invalid shape")
+                matrix = _scipy_csr_matrix(
+                    (
+                        matrix_weights,
+                        topology.indices,
+                        topology.indptr,
+                    ),
+                    shape=(len(topology.node_ids), len(topology.node_ids)),
+                    copy=False,
+                )
+
+            base_matrix: Any = matrix
+            node_count = len(topology.node_ids)
+            source_rows: List[Tuple[float, int, int, Edge]] = []
+            source_targets: List[int] = []
+            for (
+                start_index,
+                start_direction,
+                prefix,
+                prefix_cost,
+            ) in source_accesses:
+                _check_active_deadline_at(start_index)
+                source_node_index = topology.node_index.get(
+                    str(prefix.end_node_id)
+                )
+                if source_node_index is None:
+                    continue
+                source_rows.append(
+                    (
+                        float(prefix_cost),
+                        int(start_index),
+                        int(start_direction),
+                        prefix,
+                    )
+                )
+                source_targets.append(int(source_node_index))
+            if not source_rows:
+                return None
+            source_count = len(source_rows)
+            target_node_count = len(
+                {
+                    str(suffix.start_node_id)
+                    for _, _, suffix, _ in target_accesses
+                    if topology.node_index.get(str(suffix.start_node_id))
+                    is not None
+                }
+            )
+            matrix_weights = np.asarray(matrix_weights, dtype=np.float64)
+            use_min_only = (
+                node_count > self._COLLAPSED_ACCESS_NODE_THRESHOLD
+                and source_count > 1
+                and _scipy_shortest_path is not None
+                and target_node_count <= source_count
+            )
+            source_order = np.arange(source_count, dtype=np.int64)
+            source_targets_array = np.asarray(
+                [source_targets[int(index)] for index in source_order],
+                dtype=topology.indices.dtype,
+            )
+            source_weights = np.asarray(
+                [
+                    source_rows[int(index)][0]
+                    for index in source_order
+                ],
+                dtype=np.float64,
+            )
+            source_virtual_indices = np.arange(
+                node_count,
+                node_count + source_count,
+                dtype=topology.indices.dtype,
+            )
+            augmented_indices = np.concatenate(
+                (topology.indices, source_targets_array)
+            )
+            augmented_weights = np.concatenate(
+                (matrix_weights, source_weights)
+            )
+            augmented_indptr = np.empty(
+                node_count + source_count + 1,
+                dtype=np.int64,
+            )
+            augmented_indptr[: node_count + 1] = topology.indptr
+            base_nnz = int(topology.indptr[-1])
+            for source_offset in range(source_count):
+                augmented_indptr[node_count + 1 + source_offset] = (
+                    base_nnz + source_offset + 1
+                )
+            matrix = _scipy_csr_matrix(
+                (
+                    augmented_weights,
+                    augmented_indices,
+                    augmented_indptr,
+                ),
+                shape=(node_count + source_count, node_count + source_count),
+                copy=False,
+            )
+
+            def reconstruct(
+                source_row: int,
+                goal_index: int,
+                distances: np.ndarray,
+                predecessors: np.ndarray,
+            ) -> Optional[
+                Tuple[Tuple[float, int, int, Edge], List[Edge]]
+            ]:
+                path_reversed: List[Edge] = []
+                current_index = int(goal_index)
+                visited = {current_index}
+                while True:
+                    _check_active_deadline()
+                    predecessor = int(
+                        predecessors[source_row, current_index]
+                    )
+                    if predecessor >= node_count:
+                        source_offset = predecessor - node_count
+                        if source_offset != source_row:
+                            return None
+                        source = source_rows[int(source_order[source_offset])]
+                        path_reversed.reverse()
+                        return source, path_reversed
+                    if (
+                        predecessor < 0
+                        or predecessor >= node_count
+                        or predecessor in visited
+                    ):
+                        return None
+                    row_start = int(topology.indptr[predecessor])
+                    row_end = int(topology.indptr[predecessor + 1])
+                    predecessor_distance = float(
+                        distances[source_row, predecessor]
+                    )
+                    current_distance = float(
+                        distances[source_row, current_index]
+                    )
+                    best_position: Optional[int] = None
+                    best_key: Optional[Tuple[float, int]] = None
+                    for position in range(row_start, row_end):
+                        if int(topology.indices[position]) != current_index:
+                            continue
+                        residual = abs(
+                            predecessor_distance
+                            + float(matrix_weights[position])
+                            - current_distance
+                        )
+                        if residual > max(
+                            1e-9, abs(current_distance) * 1e-10
+                        ):
+                            continue
+                        key = (residual, position)
+                        if best_key is None or key < best_key:
+                            best_key = key
+                            best_position = position
+                    if best_position is None:
+                        return None
+                    edge_id, reverse = topology.edge_refs[best_position]
+                    path_reversed.append(
+                        self._edge_from_reverse_index(edge_id, reverse)
+                    )
+                    current_index = predecessor
+                    visited.add(current_index)
+            def reconstruct_reverse(
+                source_row: int,
+                target_index: int,
+                reverse_distances: np.ndarray,
+            ) -> Optional[
+                Tuple[Tuple[float, int, int, Edge], List[Edge]]
+            ]:
+                path: List[Edge] = []
+                current_index = int(source_targets[source_row])
+                visited = {current_index}
+                while current_index != target_index:
+                    _check_active_deadline()
+                    current_distance = float(reverse_distances[current_index])
+                    if not math.isfinite(current_distance):
+                        return None
+                    row_start = int(topology.indptr[current_index])
+                    row_end = int(topology.indptr[current_index + 1])
+                    choices: List[Tuple[str, bool, int, int, Edge]] = []
+                    for position in range(row_start, row_end):
+                        next_index = int(topology.indices[position])
+                        if next_index in visited:
+                            continue
+                        remaining_distance = float(
+                            reverse_distances[next_index]
+                        )
+                        if not math.isfinite(remaining_distance):
+                            continue
+                        residual = abs(
+                            float(matrix_weights[position])
+                            + remaining_distance
+                            - current_distance
+                        )
+                        if residual > max(
+                            1e-9, abs(current_distance) * 1e-10
+                        ):
+                            continue
+                        edge_id, reverse = topology.edge_refs[position]
+                        edge = self._edge_from_reverse_index(edge_id, reverse)
+                        canonical_id = str(
+                            getattr(
+                                edge,
+                                "canonical_edge_id",
+                                getattr(edge, "_canonical_edge_id", edge.id),
+                            )
+                        )
+                        choices.append(
+                            (
+                                canonical_id,
+                                bool(reverse),
+                                position,
+                                next_index,
+                                edge,
+                            )
+                        )
+                    if not choices:
+                        return None
+                    choices.sort(key=lambda item: (item[0], item[1], item[2]))
+                    _, reverse, position, next_index, edge = choices[0]
+                    del reverse, position
+                    path.append(edge)
+                    visited.add(next_index)
+                    current_index = next_index
+                return source_rows[source_row], path
+
+
+            def path_has_tie(
+                source_row: int, middle: List[Edge]
+            ) -> bool:
+                current_index = source_targets[source_row]
+                for edge in middle:
+                    next_index = topology.node_index.get(
+                        str(edge.end_node_id)
+                    )
+                    if next_index is None:
+                        return False
+                    next_index = int(next_index)
+                    row_start = int(topology.indptr[current_index])
+                    row_end = int(topology.indptr[current_index + 1])
+                    edge_id = str(edge.id)
+                    reverse = bool(
+                        getattr(edge, "_is_reverse_traversal", False)
+                    )
+                    if reverse:
+                        edge_id = str(
+                            getattr(edge, "_canonical_edge_id", edge_id)
+                        )
+                    chosen_position: Optional[int] = None
+                    for position in range(row_start, row_end):
+                        ref_edge_id, ref_reverse = topology.edge_refs[
+                            position
+                        ]
+                        if (
+                            str(ref_edge_id) == edge_id
+                            and bool(ref_reverse) == reverse
+                            and int(topology.indices[position]) == next_index
+                        ):
+                            chosen_position = position
+                            break
+                    if chosen_position is None:
+                        return True
+                    next_distance = float(
+                        distances[source_row, next_index]
+                    )
+                    current_distance = float(
+                        distances[source_row, current_index]
+                    )
+                    tolerance = 1e-9 * max(
+                        1.0, abs(current_distance), abs(next_distance)
+                    )
+                    reverse_start = int(
+                        topology.reverse_indptr[next_index]
+                    )
+                    reverse_end = int(
+                        topology.reverse_indptr[next_index + 1]
+                    )
+                    for reverse_position in range(
+                        reverse_start, reverse_end
+                    ):
+                        position = int(
+                            topology.reverse_positions[reverse_position]
+                        )
+                        if position == chosen_position:
+                            continue
+                        predecessor_index = int(
+                            topology.reverse_indices[reverse_position]
+                        )
+                        predecessor_distance = float(
+                            distances[source_row, predecessor_index]
+                        )
+                        if not math.isfinite(predecessor_distance):
+                            continue
+                        residual = abs(
+                            predecessor_distance
+                            + float(matrix_weights[position])
+                            - next_distance
+                        )
+                        if residual <= tolerance:
+                            return True
+                    current_index = next_index
+                return False
+
+            def canonical_middle_path(
+                source_row: int,
+                target_index: int,
+                target_distance: float,
+                reverse_distances: np.ndarray,
+                fallback: List[Edge],
+            ) -> List[Edge]:
+                current_index = source_targets[source_row]
+                visited = {current_index}
+                path: List[Edge] = []
+                tolerance = 1e-9 * max(1.0, abs(target_distance))
+                while current_index != target_index:
+                    current_distance = float(
+                        distances[source_row, current_index]
+                    )
+                    row_start = int(topology.indptr[current_index])
+                    row_end = int(topology.indptr[current_index + 1])
+                    choices: List[Tuple[str, bool, int, int, Edge]] = []
+                    for position in range(row_start, row_end):
+                        next_index = int(topology.indices[position])
+                        if next_index in visited:
+                            continue
+                        edge_weight = float(matrix_weights[position])
+                        remaining_distance = float(
+                            reverse_distances[next_index]
+                        )
+                        if not math.isfinite(remaining_distance):
+                            continue
+                        residual = abs(
+                            current_distance
+                            + edge_weight
+                            + remaining_distance
+                            - target_distance
+                        )
+                        if residual > tolerance:
+                            continue
+                        edge_id, reverse = topology.edge_refs[position]
+                        edge = self._edge_from_reverse_index(edge_id, reverse)
+                        canonical_id = str(
+                            getattr(
+                                edge,
+                                "canonical_edge_id",
+                                getattr(edge, "_canonical_edge_id", edge.id),
+                            )
+                        )
+                        choices.append(
+                            (
+                                canonical_id,
+                                bool(reverse),
+                                position,
+                                next_index,
+                                edge,
+                            )
+                        )
+                    if not choices:
+                        return fallback
+                    choices.sort(key=lambda item: (item[0], item[1], item[2]))
+                    _, _reverse, _position, next_index, edge = choices[0]
+                    path.append(edge)
+                    visited.add(next_index)
+                    current_index = next_index
+                return path
+
+            reverse_distance_cache: Dict[int, np.ndarray] = {}
+            reverse_target_rows: Dict[int, int] = {}
+            reverse_target_nodes: List[int] = []
+            for target_offset, (_, _, suffix, _) in enumerate(target_accesses):
+                _check_active_deadline_at(len(starts) + target_offset)
+                target_node_index = topology.node_index.get(
+                    str(suffix.start_node_id)
+                )
+                if target_node_index is None:
+                    continue
+                target_node_index = int(target_node_index)
+                if target_node_index not in reverse_target_rows:
+                    reverse_target_rows[target_node_index] = len(
+                        reverse_target_nodes
+                    )
+                    reverse_target_nodes.append(target_node_index)
+            _check_active_deadline()
+            if use_min_only:
+                if reverse_target_nodes:
+                    distances = _scipy_shortest_path(
+                        base_matrix.transpose(),
+                        directed=True,
+                        indices=reverse_target_nodes,
+                        return_predecessors=False,
+                        unweighted=False,
+                        method="D",
+                    )
+                else:
+                    distances = np.empty((0, node_count), dtype=np.float64)
+            else:
+                distances, predecessors = _scipy_shortest_path(
+                    matrix,
+                    directed=True,
+                    indices=source_virtual_indices,
+                    return_predecessors=True,
+                    unweighted=False,
+                    method="D",
+                )
+            _check_active_deadline()
+            if base._heuristic_cache_stamp() != active_stamp:
+                raise RuntimeError(
+                    "road graph changed during fastest-path search"
+                )
+            distances = np.asarray(distances)
+            if distances.ndim == 1:
+                distances = distances[np.newaxis, :]
+            if not use_min_only:
+                predecessors = np.asarray(predecessors)
+                if predecessors.ndim == 1:
+                    predecessors = predecessors[np.newaxis, :]
+
+            for (
+                end_index,
+                end_direction,
+                suffix,
+                suffix_cost,
+            ) in target_accesses:
+                _check_active_deadline_at(end_index)
+                target_node_index = topology.node_index.get(
+                    str(suffix.start_node_id)
+                )
+                if target_node_index is None:
+                    continue
+                target_node_index = int(target_node_index)
+                source_candidates: List[Tuple[int, Any, float, Any]] = []
+                if use_min_only:
+                    reverse_row = reverse_target_rows.get(target_node_index)
+                    if reverse_row is not None:
+                        reverse_distances = distances[reverse_row]
+                        for source_row, source in enumerate(source_rows):
+                            _check_active_deadline_at(source_row + end_index)
+                            middle_distance = float(
+                                reverse_distances[source_targets[source_row]]
+                            )
+                            if not math.isfinite(middle_distance):
+                                continue
+                            target_distance = (
+                                float(source[0]) + middle_distance
+                            )
+                            reconstructed = reconstruct_reverse(
+                                source_row,
+                                target_node_index,
+                                reverse_distances,
+                            )
+                            if reconstructed is not None:
+                                source_candidates.append(
+                                    (
+                                        source_row,
+                                        source,
+                                        target_distance,
+                                        reconstructed,
+                                    )
+                                )
+                else:
+                    for source_row, source in enumerate(source_rows):
+                        _check_active_deadline_at(source_row + end_index)
+                        target_distance = float(
+                            distances[source_row, target_node_index]
+                        )
+                        if not math.isfinite(target_distance):
+                            continue
+                        reconstructed = reconstruct(
+                            source_row,
+                            target_node_index,
+                            distances,
+                            predecessors,
+                        )
+                        if reconstructed is not None:
+                            source_candidates.append(
+                                (
+                                    source_row,
+                                    source,
+                                    target_distance,
+                                    reconstructed,
+                                )
+                            )
+                for (
+                    source_row,
+                    source,
+                    target_distance,
+                    reconstructed,
+                ) in source_candidates:
+                    _check_active_deadline_at(source_row + end_index)
+                    prefix_cost, start_index, start_direction, prefix = (
+                        source
+                    )
+                    _, middle = reconstructed
+                    if (
+                        not use_min_only
+                        and path_has_tie(source_row, middle)
+                    ):
+                        reverse_distances = reverse_distance_cache.get(
+                            target_node_index
+                        )
+                        if reverse_distances is None:
+                            _check_active_deadline()
+                            reverse_distances = np.asarray(
+                                _scipy_shortest_path(
+                                    base_matrix.transpose(),
+                                    directed=True,
+                                    indices=target_node_index,
+                                    return_predecessors=False,
+                                    unweighted=False,
+                                    method="D",
+                                )
+                            )
+                            _check_active_deadline()
+                            if base._heuristic_cache_stamp() != active_stamp:
+                                raise RuntimeError(
+                                    "road graph changed during fastest-path search"
+                                )
+                            reverse_distance_cache[
+                                target_node_index
+                            ] = reverse_distances
+                        middle = canonical_middle_path(
+                            source_row,
+                            target_node_index,
+                            target_distance,
+                            reverse_distances,
+                            middle,
+                        )
+                    candidate_path = [prefix, *middle, suffix]
+                    duration = self._path_duration_minutes(candidate_path)
+                    if use_duration_metric:
+                        metric = duration
+                    else:
+                        metric = target_distance + suffix_cost
+                    if not math.isfinite(metric):
+                        raise ValueError(
+                            "compiled endpoint cost must be finite and non-negative"
+                        )
+                    del prefix_cost
+                    middle_tokens = tuple(
+                        str(
+                            getattr(
+                                edge,
+                                "canonical_edge_id",
+                                getattr(edge, "_canonical_edge_id", edge.id),
+                            )
+                        )
+                        for edge in middle
+                    )
+                    rank_key = (
+                        start_index,
+                        end_index,
+                        start_direction,
+                        end_direction,
+                        middle_tokens,
+                    )
+                    candidate = (
+                        duration,
+                        candidate_path,
+                        start_index,
+                        end_index,
+                        rank_key,
+                    )
+                    if (metric, rank_key) < (
+                        best_metric,
+                        best[4] if best else (),
+                    ):
+                        best = candidate
+                        best_metric = metric
+
+
+            for start_index, end_index, direction, edge in direct_candidates:
+                _check_active_deadline_at(start_index + end_index)
+                if self._avoids_highways(cost_function) and is_highway_road_type(
+                    edge.road_type
+                ):
+                    continue
+                duration = self._path_duration_minutes([edge])
+                metric = duration if use_duration_metric else edge_cost(edge)
+                rank_key = (start_index, end_index, 2, direction, ())
+                candidate = (duration, [edge], start_index, end_index, rank_key)
+                if (metric, rank_key) < (
+                    best_metric,
+                    best[4] if best else (),
+                ):
+                    best = candidate
+                    best_metric = metric
+            if (
+                base._heuristic_cache_stamp() != active_stamp
+                or base is not overlay.base_graph
+            ):
+                raise RuntimeError(
+                    "road graph changed during fastest-path search"
+                )
+            return best
+        finally:
+            self.graph = active_graph
 
     def _multi_access_builtin_path(
         self,
@@ -3845,6 +4718,19 @@ class ScenicRoutePlanner:
                         suffix,
                     )
                 )
+        large_graph_search = len(
+            overlay.base_graph.edges
+        ) > self._LARGE_GRAPH_EDGE_THRESHOLD
+        if large_graph_search:
+            result = self._large_graph_multi_access_path(
+                overlay,
+                starts,
+                ends,
+                cost_function,
+                direct_candidates=direct_candidates,
+            )
+            if result is not None:
+                return result
         result = self._bidirectional_search_core(
             cost_function,
             forward_seeds,
@@ -3858,14 +4744,153 @@ class ScenicRoutePlanner:
             int(str(result[1][1])),
             result[1],
         )
+        best_metric = float("inf")
+        if best is not None:
+            best_metric = sum(access_cost(edge) for edge in best[1])
         for start_index, end_index, direction, edge in direct_candidates:
             _check_active_deadline_at(start_index + end_index)
+            if self._avoids_highways(cost_function) and is_highway_road_type(
+                edge.road_type
+            ):
+                continue
             duration = self._path_duration_minutes([edge])
+            metric = access_cost(edge)
             rank_key = (start_index, end_index, 2, direction, ())
-            candidate = (duration, [edge], start_index, end_index, rank_key)
-            if best is None or (duration, rank_key) < (best[0], best[4]):
+            candidate = (
+                duration,
+                [edge],
+                start_index,
+                end_index,
+                rank_key,
+            )
+            if (metric, rank_key) < (best_metric, best[4] if best else ()):
                 best = candidate
+                best_metric = metric
         return best
+    def _large_graph_scenic_search(
+        self,
+        request: _EndpointAccessRequest,
+        *,
+        q: float,
+        kappa: float,
+        fastest_duration_minutes: float,
+        duration_cap_minutes: float,
+        policy: RoutingPolicy,
+        fastest_edges: List[Edge],
+        fastest_evaluation: PathEvaluation,
+    ) -> Tuple[List[Edge], PathEvaluation, Dict[str, object]]:
+        """Search a bounded set of scenic Lagrangian paths on base CSR."""
+        started_at = time.monotonic()
+        search_scenic_weight = 1.0 if policy.scenic_priority else q
+        base = request.overlay.base_graph
+        scenic_cost = ScenicCostFunction(
+            scenic_weight=search_scenic_weight,
+            avoid_highways=policy.strict_highways,
+            strict_highways=policy.strict_highways,
+            highway_preference=policy.highway_preference,
+            weights=self.cost_function.weights,
+        )
+        active_graph = self.graph
+        self.graph = base
+        try:
+            topology = self._csr_topology(owner=base)
+            signature = self._built_in_cost_signature(scenic_cost)
+            data = (
+                self._csr_data(scenic_cost, signature)
+                if signature is not None
+                else None
+            )
+        finally:
+            self.graph = active_graph
+        if topology is None or data is None or data.topology is not topology:
+            raise RuntimeError("compiled scenic routing is unavailable")
+        if (
+            base._heuristic_cache_stamp() != request.graph_stamp
+            or topology.stamp != request.graph_stamp
+        ):
+            raise RuntimeError(
+                "road graph changed during compiled scenic search"
+            )
+
+        def check_graph() -> None:
+            _check_active_deadline()
+            if base._heuristic_cache_stamp() != request.graph_stamp:
+                raise RuntimeError(
+                    "road graph changed during compiled scenic search"
+                )
+
+        candidates: List[Tuple[List[Edge], PathEvaluation]] = [
+            (list(fastest_edges), fastest_evaluation)
+        ]
+        # Increasing duration multipliers trace a small, deterministic
+        # Lagrangian frontier without retaining a label for every base node.
+        multipliers = (0.0, 0.25, 0.75, 1.5)
+        for multiplier in multipliers:
+            check_graph()
+            with np.errstate(over="ignore", invalid="ignore"):
+                weights = (
+                    data.weights
+                    + float(multiplier) * topology.travel_time_minutes
+                )
+            weights = np.where(
+                np.isfinite(data.weights),
+                np.maximum(weights, 0.0),
+                np.inf,
+            )
+
+            def scalar_edge_cost(edge: Edge, value=multiplier) -> float:
+                return (
+                    scenic_cost.calculate(edge)
+                    + float(value) * self._edge_duration_minutes(edge)
+                )
+
+            result = self._large_graph_multi_access_path(
+                request.overlay,
+                request.start_projections,
+                request.end_projections,
+                scenic_cost,
+                direct_candidates=request.direct_candidates,
+                weights=weights,
+                scalar_edge_cost=scalar_edge_cost,
+            )
+            check_graph()
+            if result is None:
+                continue
+            duration, path, _start_rank, _end_rank, _rank_key = result
+            if not self._duration_within_cap(
+                duration, duration_cap_minutes
+            ):
+                continue
+            evaluation = evaluate_path(
+                path,
+                q=q,
+                kappa=kappa,
+                fastest_duration_minutes=fastest_duration_minutes,
+                policy=policy,
+                check_cancelled=_check_active_deadline,
+            )
+            candidates.append((path, evaluation))
+
+        check_graph()
+        best_edges, best_evaluation = candidates[0]
+        for candidate_edges, candidate_evaluation in candidates[1:]:
+            if is_better_path(candidate_evaluation, best_evaluation):
+                best_edges = candidate_edges
+                best_evaluation = candidate_evaluation
+        elapsed_ms = (time.monotonic() - started_at) * 1000.0
+        diagnostics = {
+            "time_limit_seconds": 0.0,
+            "labels_generated": len(multipliers),
+            "labels_expanded": len(candidates),
+            "labels_pruned": len(multipliers) - len(candidates) + 1,
+            "max_frontier_size": len(candidates),
+            "remaining_frontier_size": 0,
+            "deadline_reached": False,
+            "elapsed_ms": elapsed_ms,
+            "mode": "compiled-lagrangian",
+        }
+        return list(best_edges), best_evaluation, diagnostics
+
 
     def _large_graph_fastest_route(
         self,
@@ -4067,35 +5092,38 @@ class ScenicRoutePlanner:
         kappa_value = policy.kappa
         start_node, end_node = self._routing_endpoint_nodes(start, end)
         bounded_graph = self._is_bounded_oracle_graph()
+        endpoint_request: Optional[_EndpointAccessRequest] = None
         if bounded_graph:
             shortest_edges = self._canonical_fastest_edges(
                 start_node, end_node, policy.strict_highways
             )
         else:
-            request = getattr(self.graph, "_route_access_request", None)
+            endpoint_request = getattr(
+                self.graph, "_route_access_request", None
+            )
             if (
-                request is not None
-                and len(request.overlay.base_graph.nodes)
+                endpoint_request is not None
+                and len(endpoint_request.overlay.base_graph.nodes)
                 > self._ENDPOINT_OVERLAY_MAX_NODES
             ):
                 ranked = self._multi_access_builtin_path(
-                    request.overlay,
-                    request.start_projections,
-                    request.end_projections,
+                    endpoint_request.overlay,
+                    endpoint_request.start_projections,
+                    endpoint_request.end_projections,
                     self._make_fastest_cost_function(),
-                    request.direct_candidates,
+                    endpoint_request.direct_candidates,
                 )
                 if ranked is None:
                     shortest_edges = None
                 else:
-                    request.fastest_result = _EndpointRankedResult(
+                    endpoint_request.fastest_result = _EndpointRankedResult(
                         ranked[0],
                         tuple(ranked[1]),
                         ranked[2],
                         ranked[3],
                         ranked[4],
                     )
-                    shortest_edges = list(request.fastest_result.edges)
+                    shortest_edges = list(endpoint_request.fastest_result.edges)
             else:
                 shortest_edges = self._cached_fastest_edges(
                     start_node,
@@ -4138,6 +5166,53 @@ class ScenicRoutePlanner:
                     else "compiled-duration-dijkstra"
                 ),
             )
+        if (
+            not bounded_graph
+            and endpoint_request is not None
+            and len(endpoint_request.overlay.base_graph.nodes)
+            > self._COMPILED_SCENIC_MIN_NODES
+        ):
+            (
+                best_edges,
+                best_evaluation,
+                search_diagnostics,
+            ) = self._large_graph_scenic_search(
+                endpoint_request,
+                q=q_value,
+                kappa=kappa_value,
+                fastest_duration_minutes=fastest_duration,
+                duration_cap_minutes=duration_cap,
+                policy=policy,
+                fastest_edges=shortest_edges,
+                fastest_evaluation=fastest_evaluation,
+            )
+            no_scenic_improvement = not self._has_scenic_improvement(
+                best_evaluation, fastest_evaluation
+            )
+            certified_upper_bound = 1.0
+            objective_value = float(getattr(best_evaluation, "objective"))
+            return self._path_to_route(
+                best_edges,
+                start_node=start_node,
+                goal_node=end_node,
+                evaluation=best_evaluation,
+                fastest_duration_minutes=fastest_duration,
+                requested_max_detour_factor=kappa_value,
+                exact=False,
+                exactness_status="approximate-certified",
+                optimality_gap=max(
+                    0.0, certified_upper_bound - objective_value
+                ),
+                certified_upper_bound=certified_upper_bound,
+                search_diagnostics=search_diagnostics,
+                algorithm="compiled-lagrangian-endpoint-search",
+                zero_improvement_reason=(
+                    "no_feasible_scenic_improvement"
+                    if no_scenic_improvement
+                    else None
+                ),
+            )
+
 
         if bounded_graph:
             path_edges, evaluation = self._enumerate_simple_optimum(

@@ -360,6 +360,27 @@ def test_plan_routes_without_baseline_uses_route_fastest_duration(
     assert result["routes"][0]["metrics"]["actual_duration_ratio"] == pytest.approx(
         1.2
     )
+def test_empty_route_comparison_preserves_same_route_identity() -> None:
+    request = route_service.RouteRequest(
+        graph_geojson="unused",
+        start=(42.0, -72.0),
+        end=(42.0, -72.0),
+    )
+    empty_route = Route(
+        segments=[],
+        total_distance_km=0.0,
+        average_scenic_score=0.0,
+        estimated_duration_minutes=0.0,
+        waypoints=[request.start, request.end],
+    )
+
+    objective = route_service._objective_components(
+        request,
+        empty_route,
+        empty_route,
+    )
+
+    assert objective["same_route"] is True
 def _write_cache_graph(path: Path, scenic_score: float = 1.0) -> None:
     payload = {
         "type": "FeatureCollection",
@@ -403,6 +424,33 @@ def test_endpoint_snap_diagnostics_use_edge_projections(
     assert diagnostics["start_all_road_snap_km"] is None
 
 
+def test_endpoint_snap_diagnostics_skip_large_nearest_node_index() -> None:
+    class _LargeNodes:
+        def __len__(self) -> int:
+            return route_service._ENDPOINT_NODE_DIAGNOSTIC_MAX_NODES + 1
+
+    class _LargeGraph:
+        nodes = _LargeNodes()
+
+        def find_nearest_edge_positions_with_distance(self, *args: object, **kwargs: object):
+            return [object()], 0.25
+
+        def find_nearest_node_with_distance(self, *args: object, **kwargs: object):
+            raise AssertionError("large diagnostic graph must not build node index")
+
+    graph = _LargeGraph()
+    request = route_service.RouteRequest(
+        graph_geojson="unused",
+        start=(42.05, -72.001),
+        end=(42.05, -72.001),
+    )
+
+    diagnostics = route_service._endpoint_snap_diagnostics(graph, request)  # type: ignore[arg-type]
+
+    assert diagnostics["start_snap_km"] == pytest.approx(0.25)
+    assert diagnostics["end_snap_km"] == pytest.approx(0.25)
+    assert diagnostics["start_node_id"] is None
+    assert diagnostics["end_node_id"] is None
 
 
 def _write_cache_tiles(path: Path, score: float) -> None:

@@ -99,7 +99,6 @@ def _raise_routing_http_exception(exc: BaseException) -> NoReturn:
             },
         ) from exc
     raise exc
-    return value
 
 def _run_report_path(run_name: str) -> Path:
     safe_run = _safe_asset_name(run_name, kind="run_name")
