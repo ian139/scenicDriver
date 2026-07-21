@@ -238,6 +238,26 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   include a targeted post-change profile proving that one scalar traversal
   remains the material bottleneck.
 
+- [x] Unified endpoint-aware routing — integrated at `dc820d58`. One
+  request-local endpoint overlay now preserves every tied projection,
+  legal direction, rank, partial-edge metadata, and direct same-edge
+  candidate for both fastest and scenic planning. Large-graph fastest
+  selection uses exact reverse-target CSR distances when that orientation
+  is smaller, canonicalizes equal-cost paths by `canonical_edge_id`, and
+  retains the validated bidirectional fallback with highway filtering.
+  Scenic frontier initialization reuses the exact fastest endpoint request
+  and remains deadline-, cancellation-, and mutation-safe. Gate: `514
+  passed` in the integrated Python suite, `14 passed` in the viewer suite,
+  clean scoped Ruff checks, and a fresh Caribou→Concord API smoke returned
+  HTTP 200 with scenic and baseline routes in 9.47 seconds; planning
+  diagnostics reported 8.53 seconds, duration ratio `1.0`, 4,688 segments,
+  and deterministic traversal identity `d69ef6c19f4dd991`.
+- [ ] Corrected full 2,256-case Vast benchmark — blocked. New allocations
+  were refused with `Your account lacks credit`; the historical r13 state
+  has no local artifact or current-source provenance. Do not treat it as
+  acceptance evidence or claim a fixed-denominator latency result until a
+  fresh run completes.
+
 ## Ordered next steps
 
 1. [x] Resolve the benchmark-only q=0 invariant mismatch, run focused
