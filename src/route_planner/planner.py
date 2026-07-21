@@ -3572,6 +3572,20 @@ class ScenicRoutePlanner:
                         ),
                     )
                 )
+                if not edge.one_way:
+                    overlay.add_edge(
+                        partial_edge(
+                            edge,
+                            f"__route_end__:{projection_index}:reverse",
+                            edge.end_node_id,
+                            end_id,
+                            1.0 - fraction,
+                            end_coordinate=(
+                                float(projection.lat),
+                                float(projection.lon),
+                            ),
+                        )
+                    )
         if start_is_virtual and end_is_virtual:
             for start_index, projection in enumerate(start_projections):
                 edge = projection.edge
