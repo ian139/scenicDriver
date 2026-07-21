@@ -340,6 +340,15 @@ def test_large_scenic_and_baseline_reuse_endpoint_request(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(graph, "find_nearest_edge_positions_with_distance", capture)
+    original_search = planner._multi_access_builtin_path
+    searches = 0
+
+    def capture_search(*args, **kwargs):
+        nonlocal searches
+        searches += 1
+        return original_search(*args, **kwargs)
+
+    monkeypatch.setattr(planner, "_multi_access_builtin_path", capture_search)
     scenic = planner.find_scenic_route(
         (0.0, 0.25), (0.0, 0.75), q=0.0, kappa=1.0
     )
@@ -347,6 +356,7 @@ def test_large_scenic_and_baseline_reuse_endpoint_request(
 
     assert scenic.edge_ids == baseline.edge_ids == ("base-edge",)
     assert calls == 2
+    assert searches == 1
 
 
 def test_same_planner_serializes_concurrent_endpoint_routes(

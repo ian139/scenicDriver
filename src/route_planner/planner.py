@@ -279,6 +279,14 @@ class _CSRData:
     matrix: object
     weights: np.ndarray
 
+@dataclass(frozen=True)
+class _EndpointRankedResult:
+    duration_minutes: float
+    edges: Tuple[Edge, ...]
+    start_rank: int
+    end_rank: int
+    rank_key: Tuple[object, ...]
+
 @dataclass
 class _EndpointAccessRequest:
     """One projected endpoint request and its frozen route-local overlay."""
@@ -294,6 +302,8 @@ class _EndpointAccessRequest:
     end_accesses: Tuple[Tuple[int, int, Optional[Edge]], ...]
     direct_candidates: Tuple[Tuple[int, int, int, Edge], ...]
     graph_stamp: object
+    avoid_highways: bool
+    fastest_result: Optional[_EndpointRankedResult] = None
 
 class ScenicRoutePlanner:
     _MINIMUM_COST_CACHE_CAPACITY = 8
@@ -3740,6 +3750,7 @@ class ScenicRoutePlanner:
             end_accesses=end_accesses,
             direct_candidates=direct_candidates,
             graph_stamp=active_stamp,
+            avoid_highways=bool(avoid_highways),
         )
         self._last_endpoint_access_request = request
         return request
@@ -4074,7 +4085,17 @@ class ScenicRoutePlanner:
                     self._make_fastest_cost_function(),
                     request.direct_candidates,
                 )
-                shortest_edges = None if ranked is None else ranked[1]
+                if ranked is None:
+                    shortest_edges = None
+                else:
+                    request.fastest_result = _EndpointRankedResult(
+                        ranked[0],
+                        tuple(ranked[1]),
+                        ranked[2],
+                        ranked[3],
+                        ranked[4],
+                    )
+                    shortest_edges = list(request.fastest_result.edges)
             else:
                 shortest_edges = self._cached_fastest_edges(
                     start_node,
@@ -4230,6 +4251,7 @@ class ScenicRoutePlanner:
                 and cached_request.overlay.base_graph is base_graph
                 and cached_request.start == start
                 and cached_request.end == end
+                and cached_request.avoid_highways == bool(avoid_highways)
                 and cached_request.graph_stamp
                 == base_graph._heuristic_cache_stamp()
             )
@@ -4287,14 +4309,27 @@ class ScenicRoutePlanner:
                 and len(request.overlay.base_graph.nodes)
                 > self._ENDPOINT_OVERLAY_MAX_NODES
             ):
-                ranked = self._multi_access_builtin_path(
-                    request.overlay,
-                    request.start_projections,
-                    request.end_projections,
-                    self._make_fastest_cost_function(),
-                    request.direct_candidates,
-                )
-                shortest_edges = None if ranked is None else ranked[1]
+                if request.fastest_result is not None:
+                    shortest_edges = list(request.fastest_result.edges)
+                else:
+                    ranked = self._multi_access_builtin_path(
+                        request.overlay,
+                        request.start_projections,
+                        request.end_projections,
+                        self._make_fastest_cost_function(),
+                        request.direct_candidates,
+                    )
+                    if ranked is None:
+                        shortest_edges = None
+                    else:
+                        request.fastest_result = _EndpointRankedResult(
+                            ranked[0],
+                            tuple(ranked[1]),
+                            ranked[2],
+                            ranked[3],
+                            ranked[4],
+                        )
+                        shortest_edges = list(request.fastest_result.edges)
             else:
                 shortest_edges = self._cached_fastest_edges(
                     start_node, end_node, policy.strict_highways, 0.0
