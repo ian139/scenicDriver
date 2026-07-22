@@ -2239,6 +2239,87 @@ def test_production_frontier_finds_optimum_and_completes_exactly() -> None:
     assert route.optimality_gap == pytest.approx(0.0)
 
 
+@pytest.mark.parametrize(
+    ("compiled_threshold", "expected_algorithm"),
+    [
+        (0, "compiled-lagrangian-endpoint-search"),
+        (100_000, "production-multilabel-frontier"),
+    ],
+)
+def test_production_routes_support_multiple_divergences_and_rejoins(
+    monkeypatch: pytest.MonkeyPatch,
+    compiled_threshold: int,
+    expected_algorithm: str,
+) -> None:
+    graph = RoadGraph()
+    for node_id, lat, lon in (
+        ("S", 0.0, 0.00),
+        ("A", 0.0, 0.01),
+        ("X", 0.01, 0.015),
+        ("B", 0.0, 0.02),
+        ("C", 0.0, 0.03),
+        ("Y", 0.01, 0.035),
+        ("D", 0.0, 0.04),
+        ("G", 0.0, 0.05),
+    ):
+        graph.add_node(Node(id=node_id, lat=lat, lon=lon))
+
+    def add_edge(
+        edge_id: str,
+        start: str,
+        end: str,
+        *,
+        scenic_score: float = 0.0,
+    ) -> None:
+        graph.add_edge(
+            Edge(
+                id=edge_id,
+                start_node_id=start,
+                end_node_id=end,
+                distance_km=1.0,
+                scenic_score=scenic_score,
+                speed_limit_kmh=60.0,
+                one_way=True,
+            )
+        )
+
+    add_edge("main-s-a", "S", "A")
+    add_edge("main-a-b", "A", "B")
+    add_edge("main-b-c", "B", "C")
+    add_edge("main-c-d", "C", "D")
+    add_edge("main-d-g", "D", "G")
+    add_edge("scenic-a-x", "A", "X", scenic_score=10.0)
+    add_edge("scenic-x-b", "X", "B", scenic_score=10.0)
+    add_edge("scenic-c-y", "C", "Y", scenic_score=10.0)
+    add_edge("scenic-y-d", "Y", "D", scenic_score=10.0)
+
+    planner = ScenicRoutePlanner(_force_production(graph))
+    monkeypatch.setattr(
+        planner, "_COMPILED_SCENIC_MIN_NODES", compiled_threshold
+    )
+    monkeypatch.setattr(planner, "_LARGE_GRAPH_EDGE_THRESHOLD", 0)
+    monkeypatch.setattr(planner, "_COLLAPSED_ACCESS_NODE_THRESHOLD", 0)
+    route = planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.0, 0.05),
+        scenic_weight=1.0,
+        max_detour_factor=1.4,
+        scenic_priority=True,
+    )
+
+    assert route.edge_ids == (
+        "main-s-a",
+        "scenic-a-x",
+        "scenic-x-b",
+        "main-b-c",
+        "scenic-c-y",
+        "scenic-y-d",
+        "main-d-g",
+    )
+    assert route.algorithm == expected_algorithm
+    assert route.exact is (expected_algorithm == "production-multilabel-frontier")
+
+
 def _label(
     *,
     visited: set[str],
