@@ -21,3 +21,4 @@
 ## Phase 3: Routing
 
 - [ ] Expand annotations to 1000+ and rerun benchmark + mixed training from the active registry model.
+- [x] Retain the bounded scenic scalar traversal; see the [routing performance autoresearch log](research/routing-performance-autoresearch.md) for fixed-workload metrics, correctness evidence, rejected trials, and durable artifact locations.
