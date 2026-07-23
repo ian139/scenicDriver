@@ -273,6 +273,11 @@ docker compose --env-file .env.beta -f compose.beta.yml down
   42 highway segments versus 719 on the unrestricted baseline, and all
   production-benchmark response invariants passed. See the policy boundary in
   `docs/research/routing-performance-autoresearch.md`.
+  Launch preflight on 2026-07-22 found no available Vast capacity for this
+  account (`balance=-$0.1971`, `can_pay=false`, no billing method); four
+  same-class EPYC 9655 offers therefore returned no instance contract and no
+  benchmark state was created. Add Vast credit or billing before retrying the
+  exact command.
 
 ## Ordered next steps
 
