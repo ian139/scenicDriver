@@ -1511,6 +1511,7 @@ def plan_routes(
         "applied_scenic_weight": float(request.scenic_weight),
         "applied_max_detour_factor": float(request.max_detour_factor),
         "avoid_highways_applied": bool(request.avoid_highways),
+        "baseline_avoid_highways_applied": False,
         "graph_cache_hit": bool(graph_cache_hit),
         "graph_load_elapsed_ms": graph_load_elapsed_ms,
         "score_mapping_coverage": float(score_mapping["matched_ratio"]),
@@ -1546,11 +1547,11 @@ def plan_routes(
 
     baseline_route: Route | None = None
     if request.include_baseline:
-        # Baseline uses the identical hard highway eligibility filter.
+        # Baseline remains the unconstrained fastest route for comparison.
         baseline_route = planner.find_fastest_route(
             start=request.start,
             end=request.end,
-            avoid_highways=request.avoid_highways,
+            avoid_highways=False,
             deadline=deadline,
         )
 

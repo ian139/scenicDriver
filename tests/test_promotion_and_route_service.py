@@ -228,12 +228,13 @@ def test_plan_routes_uses_requested_filter_for_baseline_and_reports_constraints(
     result = route_service.plan_routes(request)
     diagnostics = result["diagnostics"]
 
-    assert FakePlanner.calls == [("scenic", True), ("fastest", True)]
+    assert FakePlanner.calls == [("scenic", True), ("fastest", False)]
     assert diagnostics["requested_max_detour_factor"] == pytest.approx(1.5)
     assert diagnostics["applied_max_detour_factor"] == pytest.approx(1.5)
     assert diagnostics["scenic_fastest_duration_ratio"] == pytest.approx(1.2)
     assert diagnostics["scenic_fastest_distance_ratio"] == pytest.approx(1.25)
     assert diagnostics["avoid_highways_applied"] is True
+    assert diagnostics["baseline_avoid_highways_applied"] is False
     assert diagnostics["score_mapping_coverage"] == pytest.approx(
         result["score_mapping"]["matched_ratio"]
     )

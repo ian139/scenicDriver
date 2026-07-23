@@ -968,7 +968,13 @@ function routeDiagnosticsMarkup(payload) {
     append("Score run", `${scenic.score_run.length} edges`);
   }
   if (typeof diagnostics.avoid_highways_applied === "boolean") {
-    append("Avoid highways", diagnostics.avoid_highways_applied ? "on" : "off");
+    append("Scenic avoids highways", diagnostics.avoid_highways_applied ? "on" : "off");
+  }
+  if (typeof diagnostics.baseline_avoid_highways_applied === "boolean") {
+    append(
+      "Baseline avoids highways",
+      diagnostics.baseline_avoid_highways_applied ? "on" : "off",
+    );
   }
   if (scoreMapping.normalization) {
     append("Normalization", String(scoreMapping.normalization));
