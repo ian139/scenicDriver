@@ -301,8 +301,7 @@ class _PersistentPlanningChild:
         case_timeout_seconds: float,
         strict_service_full: bool,
     ) -> dict[str, Any]:
-        case_id = _case_id(spec)
-        case_deadline_seconds = _case_deadline_seconds(case_id, case_timeout_seconds)
+        case_deadline_seconds = case_timeout_seconds
         request = {
             "spec": spec,
             "index": index,
@@ -414,7 +413,7 @@ def _checkpoint_fingerprint(
 ) -> str:
     return _json_digest(
         {
-            "fingerprint_schema_version": 2,
+            "fingerprint_schema_version": 3,
             "corpus": corpus,
             "graph": _path_identity(graph_path),
             "report": _path_identity(report_path),
@@ -429,12 +428,6 @@ def _checkpoint_fingerprint(
             "q_values": list(Q_VALUES),
             "kappa_values": list(KAPPA_VALUES),
             "strict_service_case_ids": sorted(STRICT_SERVICE_CASE_IDS),
-            "required_activation_case_ids": sorted(
-                REQUIRED_ACTIVATION_CASE_IDS
-            ),
-            "activation_case_timeout_seconds": (
-                ACTIVATION_CASE_TIMEOUT_SECONDS
-            ),
         }
     )
 
@@ -2071,21 +2064,13 @@ def _row_within_case_deadline(
     row: Mapping[str, Any],
     configured_deadline_seconds: float,
 ) -> bool:
-    deadline = _as_float(
-        row.get("case_timeout_seconds"), configured_deadline_seconds
-    )
     return (
-        deadline is not None
-        and deadline > 0.0
-        and float(row["wall_ms"]) < deadline * 1000.0
+        configured_deadline_seconds > 0.0
+        and float(row["wall_ms"]) < configured_deadline_seconds * 1000.0
         and row.get("reason") != "timeout"
     )
 
 
-ACTIVATION_CASE_TIMEOUT_SECONDS = 1_800.0
-REQUIRED_ACTIVATION_CASE_IDS = frozenset(
-    {"full_bbox_rutland_lisbon|q=0.8|kappa=1.8|avoid=false"}
-)
 EXTRA_Q08_PAIR_IDS = frozenset(
     {"checked_in_default_reproduction", "full_bbox_rutland_lisbon"}
 )
@@ -2098,8 +2083,9 @@ STRICT_SERVICE_CASE_IDS = frozenset(
         "checked_in_default_reproduction|q=0|kappa=1|avoid=false",
         "checked_in_default_reproduction|q=0.9|kappa=1.8|avoid=false",
         "checked_in_default_reproduction|q=0.8|kappa=1.8|avoid=false",
+        "full_bbox_rutland_lisbon|q=0.8|kappa=1.8|avoid=false",
     }
-) | REQUIRED_ACTIVATION_CASE_IDS
+)
 
 
 def _case_specs(corpus: Mapping[str, Any]) -> list[CaseSpec]:
@@ -2117,12 +2103,6 @@ def _case_specs(corpus: Mapping[str, Any]) -> list[CaseSpec]:
     return specs
 
 
-def _case_deadline_seconds(case_id: str, configured_seconds: float) -> float:
-    if configured_seconds <= 0.0:
-        return configured_seconds
-    if case_id in REQUIRED_ACTIVATION_CASE_IDS:
-        return max(configured_seconds, ACTIVATION_CASE_TIMEOUT_SECONDS)
-    return configured_seconds
 
 
 def _direct_planner_response(
@@ -2455,9 +2435,7 @@ def _execute_case(
     )
     started = perf_counter()
     case_id = _case_id(spec)
-    case_deadline_seconds = _case_deadline_seconds(
-        case_id, case_timeout_seconds
-    )
+    case_deadline_seconds = case_timeout_seconds
     strict_service = strict_service_full or case_id in STRICT_SERVICE_CASE_IDS
     row: dict[str, Any] = {
         "case_index": index,
@@ -2657,8 +2635,7 @@ def _run_case_worker(
             )
         except TimeoutError:
             wall_ms = (perf_counter() - started) * 1000.0
-            case_id = _case_id(spec)
-            case_deadline_seconds = _case_deadline_seconds(case_id, timeout)
+            case_deadline_seconds = timeout
             return _timeout_row(
                 index, spec, case_deadline_seconds, strict_full, wall_ms
             )
@@ -2856,10 +2833,7 @@ def run_benchmark(
                             )
                     except TimeoutError:
                         wall_ms = (perf_counter() - started) * 1000.0
-                        case_id = _case_id(spec)
-                        case_deadline_seconds = _case_deadline_seconds(
-                            case_id, case_timeout_seconds
-                        )
+                        case_deadline_seconds = case_timeout_seconds
                         row = _timeout_row(
                             index,
                             spec,
@@ -3020,12 +2994,6 @@ def run_benchmark(
                 ),
             },
             "strict_service_case_ids": sorted(STRICT_SERVICE_CASE_IDS),
-            "required_activation_case_ids": sorted(
-                REQUIRED_ACTIVATION_CASE_IDS
-            ),
-            "activation_case_timeout_seconds": (
-                ACTIVATION_CASE_TIMEOUT_SECONDS
-            ),
         },
         "preload": {
             **preload,

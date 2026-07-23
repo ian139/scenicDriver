@@ -15,9 +15,11 @@ import numpy as np
 
 try:
     from scipy.sparse import csr_matrix as _scipy_csr_matrix
+    from scipy.sparse.csgraph import dijkstra as _scipy_dijkstra
     from scipy.sparse.csgraph import shortest_path as _scipy_shortest_path
 except ImportError:  # pragma: no cover - exercised only without optional runtime
     _scipy_csr_matrix = None
+    _scipy_dijkstra = None
     _scipy_shortest_path = None
 
 from .cancellation import RoutingDeadline, RoutingTimeout
@@ -3965,10 +3967,25 @@ class ScenicRoutePlanner:
         direct_candidates: Tuple[Tuple[int, int, int, Edge], ...] = (),
         weights: Optional[np.ndarray] = None,
         scalar_edge_cost: Optional[Callable[[Edge], float]] = None,
+        cost_limit: Optional[float] = None,
     ) -> Optional[Tuple[float, List[Edge], int, int, Tuple[object, ...]]]:
         """Solve ranked endpoint access through the immutable base CSR."""
         if _scipy_shortest_path is None or _scipy_csr_matrix is None:
             return None
+        traversal = _scipy_shortest_path
+        traversal_kwargs: Dict[str, object] = {"method": "D"}
+        if cost_limit is not None:
+            if _scipy_dijkstra is None:
+                return None
+            validated_limit = self._validated_nonnegative(
+                float(cost_limit), "compiled path cost limit"
+            )
+            tie_margin = 1e-9 * max(1.0, abs(validated_limit))
+            bounded_limit = validated_limit + tie_margin
+            if math.isfinite(bounded_limit):
+                bounded_limit = float(np.nextafter(bounded_limit, math.inf))
+            traversal = _scipy_dijkstra
+            traversal_kwargs = {"limit": bounded_limit}
         base = overlay.base_graph
         active_graph = self.graph
         active_stamp = base._heuristic_cache_stamp()
@@ -4468,24 +4485,24 @@ class ScenicRoutePlanner:
             _check_active_deadline()
             if use_min_only:
                 if reverse_target_nodes:
-                    distances = _scipy_shortest_path(
+                    distances = traversal(
                         base_matrix.transpose(),
                         directed=True,
                         indices=reverse_target_nodes,
                         return_predecessors=False,
                         unweighted=False,
-                        method="D",
+                        **traversal_kwargs,
                     )
                 else:
                     distances = np.empty((0, node_count), dtype=np.float64)
             else:
-                distances, predecessors = _scipy_shortest_path(
+                distances, predecessors = traversal(
                     matrix,
                     directed=True,
                     indices=source_virtual_indices,
                     return_predecessors=True,
                     unweighted=False,
-                    method="D",
+                    **traversal_kwargs,
                 )
             _check_active_deadline()
             if base._heuristic_cache_stamp() != active_stamp:
@@ -4586,13 +4603,13 @@ class ScenicRoutePlanner:
                         if reverse_distances is None:
                             _check_active_deadline()
                             reverse_distances = np.asarray(
-                                _scipy_shortest_path(
+                                traversal(
                                     base_matrix.transpose(),
                                     directed=True,
                                     indices=target_node_index,
                                     return_predecessors=False,
                                     unweighted=False,
-                                    method="D",
+                                    **traversal_kwargs,
                                 )
                             )
                             _check_active_deadline()
@@ -4887,6 +4904,11 @@ class ScenicRoutePlanner:
                     + float(value) * self._edge_duration_minutes(edge)
                 )
 
+            scalar_cost_limit = sum(
+                scalar_edge_cost(edge) for edge in fastest_edges
+            )
+            if not math.isfinite(scalar_cost_limit):
+                scalar_cost_limit = None
             result = self._large_graph_multi_access_path(
                 request.overlay,
                 request.start_projections,
@@ -4895,6 +4917,7 @@ class ScenicRoutePlanner:
                 direct_candidates=request.direct_candidates,
                 weights=weights,
                 scalar_edge_cost=scalar_edge_cost,
+                cost_limit=scalar_cost_limit,
             )
             check_graph()
             if result is None:

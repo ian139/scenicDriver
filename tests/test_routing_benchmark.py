@@ -759,40 +759,37 @@ def test_case_matrix_is_explicit_for_all_pairs_and_settings() -> None:
     assert {spec.avoid_highways for spec in specs} == {False, True}
 
 
-def test_case_matrix_includes_required_full_bbox_activation_probe() -> None:
+def test_case_matrix_includes_required_full_bbox_strict_service_probe() -> None:
     pair = {
         "id": "full_bbox_rutland_lisbon",
         "start": [43.60784414, -72.98226538],
         "end": [44.02516775, -70.10003245],
     }
     specs = _case_specs({"pairs": [pair]})
-    activation = [
+    probes = [
         spec
         for spec in specs
-        if production_benchmark._case_id(spec)
-        in production_benchmark.REQUIRED_ACTIVATION_CASE_IDS
+        if spec.q == pytest.approx(0.8)
+        and spec.kappa == pytest.approx(1.8)
+        and spec.avoid_highways is False
     ]
 
     assert len(specs) == len(Q_VALUES) * len(KAPPA_VALUES) * 2 + 1
-    assert len(activation) == 1
-    assert activation[0].q == pytest.approx(0.8)
-    assert activation[0].kappa == pytest.approx(1.8)
-    assert activation[0].avoid_highways is False
-    case_id = production_benchmark._case_id(activation[0])
+    assert len(probes) == 1
+    case_id = production_benchmark._case_id(probes[0])
     assert case_id in production_benchmark.STRICT_SERVICE_CASE_IDS
-    assert production_benchmark._case_deadline_seconds(case_id, 10.0) == 1_800.0
-    assert production_benchmark._case_deadline_seconds(case_id, 0.0) == 0.0
-    assert (
-        production_benchmark._case_deadline_seconds(
-            "short_burlington_01|q=0.1|kappa=1|avoid=false",
-            10.0,
-        )
-        == 10.0
-    )
 
 
-def test_activation_case_uses_its_own_timeout_for_latency_sla() -> None:
+def test_latency_sla_uses_configured_timeout_for_every_case() -> None:
     assert production_benchmark._row_within_case_deadline(
+        {
+            "wall_ms": 9_000.0,
+            "case_timeout_seconds": 1_800.0,
+            "reason": None,
+        },
+        10.0,
+    )
+    assert not production_benchmark._row_within_case_deadline(
         {
             "wall_ms": 249_000.0,
             "case_timeout_seconds": 1_800.0,
@@ -801,15 +798,7 @@ def test_activation_case_uses_its_own_timeout_for_latency_sla() -> None:
         10.0,
     )
     assert not production_benchmark._row_within_case_deadline(
-        {"wall_ms": 11_000.0, "reason": None},
-        10.0,
-    )
-    assert not production_benchmark._row_within_case_deadline(
-        {
-            "wall_ms": 249_000.0,
-            "case_timeout_seconds": 1_800.0,
-            "reason": "timeout",
-        },
+        {"wall_ms": 9_000.0, "reason": "timeout"},
         10.0,
     )
 
