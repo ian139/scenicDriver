@@ -5199,7 +5199,7 @@ class ScenicRoutePlanner:
                     start_node,
                     end_node,
                     policy.strict_highways,
-                    policy.highway_preference,
+                    0.0,
                 )
         if shortest_edges is None:
             raise ValueError("No route found between the given coordinates.")
@@ -5343,12 +5343,15 @@ class ScenicRoutePlanner:
             fastest_edges=shortest_edges,
             fastest_evaluation=fastest_evaluation,
         )
+        pure_scenic_priority = (
+            policy.scenic_priority and policy.highway_preference == 0.0
+        )
         if bool(search_diagnostics.get("deadline_reached")):
             has_usable_scenic_candidate = (
                 self._has_scenic_improvement(
                     best_evaluation, fastest_evaluation
                 )
-                if policy.scenic_priority
+                if pure_scenic_priority
                 else is_better_path(
                     cast(PathEvaluation, best_evaluation),
                     fastest_evaluation,
@@ -5358,8 +5361,15 @@ class ScenicRoutePlanner:
                 raise RoutingTimeout(
                     "scenic frontier timed out without a scenic route"
                 )
-        no_scenic_improvement = not self._has_scenic_improvement(
-            best_evaluation, fastest_evaluation
+        no_scenic_improvement = not (
+            self._has_scenic_improvement(
+                best_evaluation, fastest_evaluation
+            )
+            if pure_scenic_priority
+            else is_better_path(
+                cast(PathEvaluation, best_evaluation),
+                fastest_evaluation,
+            )
         )
         return self._path_to_route(
             best_edges,

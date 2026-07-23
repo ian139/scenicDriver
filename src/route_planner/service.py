@@ -1265,6 +1265,7 @@ def _objective_components(
     baseline_route: Route | None,
     *,
     deadline: RoutingDeadline | None = None,
+    highway_avoidance_fallback: bool = False,
 ) -> dict[str, Any]:
     if deadline is not None:
         deadline.check()
@@ -1284,10 +1285,18 @@ def _objective_components(
         duration_component(scenic_duration, fastest_duration, kappa)
     )
     normalized = _normalized_score(scenic_raw)
-    # The route planner already enforces the hard cap and selects the highest
-    # normalized scenic score. Keep the response objective aligned with that
-    # primary metric instead of reintroducing a duration trade-off here.
-    objective = normalized
+    if highway_avoidance_fallback:
+        objective = float(
+            getattr(scenic_route, "objective_value", normalized)
+        )
+        highway_cost = max(0.0, normalized - objective)
+        optimization_mode = (
+            "scenic_score_with_best_effort_highway_avoidance_under_duration_cap"
+        )
+    else:
+        objective = normalized
+        highway_cost = 0.0
+        optimization_mode = "scenic_score_under_duration_cap"
     baseline_raw = (
         float(baseline_route.average_scenic_score)
         if baseline_route is not None
@@ -1334,7 +1343,13 @@ def _objective_components(
         "duration_utility": float(duration_utility),
         "scenic_utility": float(normalized),
         "objective_value": float(objective),
-        "optimization_mode": "scenic_score_under_duration_cap",
+        "optimization_mode": optimization_mode,
+        "highway_avoidance_cost": highway_cost,
+        "highway_preference": (
+            _BEST_EFFORT_HIGHWAY_PREFERENCE
+            if highway_avoidance_fallback
+            else 0.0
+        ),
         "normalized_scenic_score": normalized,
         "requested_scenic_weight": float(request.scenic_weight),
         "applied_scenic_weight": float(request.scenic_weight),
@@ -1346,6 +1361,60 @@ def _objective_components(
         "same_route": same_route,
         "no_better_route_reason": no_better_reason,
     }
+
+
+_BEST_EFFORT_HIGHWAY_PREFERENCE = 2.0
+
+
+def _find_scenic_route_with_best_effort_avoidance(
+    planner: ScenicRoutePlanner,
+    request: RouteRequest,
+    *,
+    detour_reference_duration_minutes: float | None,
+    deadline: RoutingDeadline | None,
+    strict_avoidance_skip_reason: str | None = None,
+) -> tuple[Route, bool, str | None]:
+    """Prefer a highway-free route, falling back only when none is feasible."""
+    fallback_reason = strict_avoidance_skip_reason
+    if not request.avoid_highways or fallback_reason is None:
+        try:
+            route = planner.find_scenic_route(
+                start=request.start,
+                end=request.end,
+                scenic_weight=request.scenic_weight,
+                avoid_highways=request.avoid_highways,
+                max_detour_factor=request.max_detour_factor,
+                scenic_priority=True,
+                detour_reference_duration_minutes=(
+                    detour_reference_duration_minutes
+                ),
+                deadline=deadline,
+            )
+            return route, bool(request.avoid_highways), None
+        except ValueError as exc:
+            if not request.avoid_highways or str(exc) not in {
+                "No route found between the given coordinates.",
+                "No route satisfies the requested duration cap.",
+            }:
+                raise
+            fallback_reason = (
+                "strict_no_route"
+                if str(exc) == "No route found between the given coordinates."
+                else "strict_over_unrestricted_cap"
+            )
+
+    route = planner.find_scenic_route(
+        start=request.start,
+        end=request.end,
+        scenic_weight=request.scenic_weight,
+        avoid_highways=False,
+        max_detour_factor=request.max_detour_factor,
+        highway_preference=_BEST_EFFORT_HIGHWAY_PREFERENCE,
+        scenic_priority=True,
+        detour_reference_duration_minutes=detour_reference_duration_minutes,
+        deadline=deadline,
+    )
+    return route, False, fallback_reason
 
 
 def plan_routes(
@@ -1477,6 +1546,7 @@ def plan_routes(
 
     snap_diagnostics = _endpoint_snap_diagnostics(graph, request, deadline=deadline)
     max_snap_distance_km = request.max_snap_distance_km
+    strict_highway_avoidance_skip_reason: str | None = None
     if max_snap_distance_km is not None:
         for endpoint in ("start", "end"):
             eligible_distance = snap_diagnostics.get(f"{endpoint}_snap_km")
@@ -1491,6 +1561,17 @@ def plan_routes(
                 all_road_distance is not None
                 and float(all_road_distance) > max_snap_distance_km
             )
+            if (
+                eligible_exceeds
+                and request.avoid_highways
+                and (
+                    all_road_distance is None
+                    or float(all_road_distance) <= max_snap_distance_km
+                )
+            ):
+                strict_highway_avoidance_skip_reason = (
+                    "strict_snap_outside_limit"
+                )
             if eligible_exceeds and all_road_exceeds:
                 snap_distance = (
                     eligible_distance
@@ -1503,15 +1584,6 @@ def plan_routes(
                     snap_distance_km=float(snap_distance),
                     max_snap_distance_km=float(max_snap_distance_km),
                 )
-            if (
-                eligible_exceeds
-                and request.avoid_highways
-                and (
-                    all_road_distance is None
-                    or float(all_road_distance) <= max_snap_distance_km
-                )
-            ):
-                raise ValueError("No route found between the given coordinates.")
 
     diagnostics = {
         "graph_nodes": int(len(graph.nodes)),
@@ -1562,21 +1634,49 @@ def plan_routes(
         if request.include_baseline:
             baseline_route = unrestricted_baseline
 
-    scenic_route = planner.find_scenic_route(
-        start=request.start,
-        end=request.end,
-        scenic_weight=request.scenic_weight,
-        avoid_highways=request.avoid_highways,
-        max_detour_factor=request.max_detour_factor,
-        scenic_priority=True,
-        detour_reference_duration_minutes=detour_reference_duration_minutes,
-        deadline=deadline,
+    (
+        scenic_route,
+        strict_highway_avoidance_applied,
+        highway_avoidance_fallback_reason,
+    ) = (
+        _find_scenic_route_with_best_effort_avoidance(
+            planner,
+            request,
+            detour_reference_duration_minutes=(
+                detour_reference_duration_minutes
+            ),
+            strict_avoidance_skip_reason=(
+                strict_highway_avoidance_skip_reason
+            ),
+            deadline=deadline,
+        )
+    )
+    highway_avoidance_fallback = (
+        request.avoid_highways and not strict_highway_avoidance_applied
+    )
+    diagnostics["avoid_highways_applied"] = (
+        strict_highway_avoidance_applied
+    )
+    diagnostics["highway_avoidance_fallback"] = highway_avoidance_fallback
+    diagnostics["highway_avoidance_fallback_reason"] = (
+        highway_avoidance_fallback_reason
+    )
+    diagnostics["highway_avoidance_mode"] = (
+        "best_effort_fallback"
+        if highway_avoidance_fallback
+        else ("strict" if request.avoid_highways else "off")
     )
 
     if deadline is not None:
         deadline.check()
 
-    objective = _objective_components(request, scenic_route, baseline_route, deadline=deadline)
+    objective = _objective_components(
+        request,
+        scenic_route,
+        baseline_route,
+        deadline=deadline,
+        highway_avoidance_fallback=highway_avoidance_fallback,
+    )
     scenic_feature = route_to_feature(
         scenic_route,
         "scenic",
@@ -1667,6 +1767,10 @@ def plan_routes(
                 "optimization_mode",
                 getattr(scenic_route, "optimization_mode", "distance_weighted_scenic"),
             ),
+            "highway_preference": objective["highway_preference"],
+            "highway_avoidance_cost": objective[
+                "highway_avoidance_cost"
+            ],
             "optimization_status": getattr(
                 scenic_route, "status", "ok" if baseline_route is not None else "uncertified"
             ),

@@ -567,6 +567,15 @@ def _strict_diagnostics() -> dict[str, object]:
         "same_route": False,
         "no_better_route_reason": None,
         "avoid_highways_applied": True,
+        "highway_avoidance_fallback": False,
+        "highway_avoidance_fallback_reason": None,
+        "highway_avoidance_mode": "strict",
+        "highway_preference": 0.0,
+        "highway_avoidance_cost": 0.0,
+        "hard_highway_count": 0,
+        "detour_reference_duration_minutes": 16.0,
+        "duration_cap_minutes": 28.8,
+        "duration_cap_satisfied": True,
         "score_mapping_coverage": 1.0,
         "planning_elapsed_ms": 0.1,
     }
@@ -889,9 +898,13 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
     assert diagnosis_calls == [request]
     detail = response.json()["detail"]
     assert detail["diagnostics"] == {"graph_nodes": 4, "graph_edges": 3}
-    assert detail["message"] == "No route satisfies the avoid-highways constraint."
+    assert detail["message"] == (
+        "No route satisfies the requested controls, including best-effort "
+        "highway avoidance."
+    )
     assert detail["hint"] == (
-        "Turn off Avoid highways, choose different points, or increase max detour."
+        "Choose different points or increase max detour; highway use is "
+        "already allowed when required."
     )
 
 

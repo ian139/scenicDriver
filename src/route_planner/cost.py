@@ -330,11 +330,7 @@ def evaluate_path(
         * highway_duration
         / max(fastest, MIN_EDGE_COST)
     )
-    objective = (
-        base_objective
-        if resolved.scenic_priority
-        else base_objective - highway_cost
-    )
+    objective = base_objective - highway_cost
     return PathEvaluation(
         edge_ids=tuple(edge_ids),
         total_distance_km=total_distance,
@@ -360,16 +356,35 @@ def compare_path_evaluations(
         candidate.policy is not None and candidate.policy.scenic_priority
     )
     if scenic_priority:
-        candidate_key = (
-            candidate.normalized_scenic_score,
-            -candidate.duration_minutes,
-            -candidate.total_distance_km,
+        highway_preference = float(
+            candidate.policy.highway_preference
+            if candidate.policy is not None
+            else 0.0
         )
-        incumbent_key = (
-            incumbent.normalized_scenic_score,
-            -incumbent.duration_minutes,
-            -incumbent.total_distance_km,
-        )
+        if highway_preference > 0.0:
+            candidate_key = (
+                candidate.objective,
+                candidate.normalized_scenic_score,
+                -candidate.duration_minutes,
+                -candidate.total_distance_km,
+            )
+            incumbent_key = (
+                incumbent.objective,
+                incumbent.normalized_scenic_score,
+                -incumbent.duration_minutes,
+                -incumbent.total_distance_km,
+            )
+        else:
+            candidate_key = (
+                candidate.normalized_scenic_score,
+                -candidate.duration_minutes,
+                -candidate.total_distance_km,
+            )
+            incumbent_key = (
+                incumbent.normalized_scenic_score,
+                -incumbent.duration_minutes,
+                -incumbent.total_distance_km,
+            )
     else:
         candidate_key = (
             candidate.objective,

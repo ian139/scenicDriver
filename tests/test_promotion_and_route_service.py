@@ -245,6 +245,8 @@ def test_plan_routes_uses_unrestricted_baseline_for_filtered_scenic_cap(
     assert diagnostics["duration_cap_satisfied"] is True
     assert diagnostics["scenic_fastest_distance_ratio"] == pytest.approx(1.25)
     assert diagnostics["avoid_highways_applied"] is True
+    assert diagnostics["highway_avoidance_fallback"] is False
+    assert diagnostics["highway_avoidance_mode"] == "strict"
     assert diagnostics["baseline_avoid_highways_applied"] is False
     assert diagnostics["score_mapping_coverage"] == pytest.approx(
         result["score_mapping"]["matched_ratio"]
@@ -283,6 +285,129 @@ def test_plan_routes_uses_unrestricted_baseline_for_filtered_scenic_cap(
         result["geojson"]["features"][1]["properties"]["search_diagnostics"]
         == baseline_metrics["search_diagnostics"]
     )
+
+
+def test_best_effort_avoidance_retries_with_highway_penalty() -> None:
+    segment = RouteSegment(
+        edge_id="required-trunk",
+        traversal_id="required-trunk::forward",
+        direction="forward",
+        start=(42.0, -72.0),
+        end=(42.1, -72.0),
+        distance_km=10.0,
+        scenic_score=8.0,
+        road_name="Required road",
+        road_type="trunk",
+        duration_minutes=10.0,
+    )
+    fallback_route = Route(
+        segments=[segment],
+        total_distance_km=10.0,
+        average_scenic_score=8.0,
+        estimated_duration_minutes=12.0,
+        waypoints=[segment.start, segment.end],
+        objective_value=-1.2,
+        fastest_duration_minutes=10.0,
+        duration_cap_minutes=18.0,
+        highway_count=1,
+    )
+
+    class FakePlanner:
+        calls: list[dict[str, object]] = []
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            self.calls.append(dict(kwargs))
+            if kwargs["avoid_highways"] is True:
+                raise ValueError("No route found between the given coordinates.")
+            return fallback_route
+
+    request = route_service.RouteRequest(
+        graph_geojson="unused.geojson",
+        start=(42.0, -72.0),
+        end=(42.1, -72.0),
+        scenic_weight=0.8,
+        avoid_highways=True,
+        max_detour_factor=1.8,
+    )
+    route, strict_applied, fallback_reason = (
+        route_service._find_scenic_route_with_best_effort_avoidance(
+            FakePlanner(),  # type: ignore[arg-type]
+            request,
+            detour_reference_duration_minutes=10.0,
+            deadline=None,
+        )
+    )
+    objective = route_service._objective_components(
+        request,
+        route,
+        None,
+        highway_avoidance_fallback=True,
+    )
+
+    assert strict_applied is False
+    assert fallback_reason == "strict_no_route"
+    assert route is fallback_route
+    assert [call["avoid_highways"] for call in FakePlanner.calls] == [
+        True,
+        False,
+    ]
+    assert FakePlanner.calls[1]["highway_preference"] == pytest.approx(2.0)
+    assert FakePlanner.calls[1]["scenic_priority"] is True
+    assert objective["objective_value"] == pytest.approx(-1.2)
+    assert objective["highway_avoidance_cost"] == pytest.approx(2.0)
+    assert objective["optimization_mode"] == (
+        "scenic_score_with_best_effort_highway_avoidance_under_duration_cap"
+    )
+
+
+def test_best_effort_avoidance_retries_strict_over_unrestricted_cap() -> None:
+    fallback_route = _cache_test_route(8.0)
+    deadline = RoutingDeadline.after(10.0)
+
+    class FakePlanner:
+        calls: list[dict[str, object]] = []
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            self.calls.append(dict(kwargs))
+            if kwargs["avoid_highways"] is True:
+                raise ValueError("No route satisfies the requested duration cap.")
+            return fallback_route
+
+    request = route_service.RouteRequest(
+        graph_geojson="unused.geojson",
+        start=(42.0, -72.0),
+        end=(42.1, -72.0),
+        scenic_weight=0.8,
+        avoid_highways=True,
+        max_detour_factor=1.8,
+    )
+
+    route, strict_applied, fallback_reason = (
+        route_service._find_scenic_route_with_best_effort_avoidance(
+            FakePlanner(),  # type: ignore[arg-type]
+            request,
+            detour_reference_duration_minutes=10.0,
+            deadline=deadline,
+        )
+    )
+
+    assert route is fallback_route
+    assert strict_applied is False
+    assert fallback_reason == "strict_over_unrestricted_cap"
+    assert [call["avoid_highways"] for call in FakePlanner.calls] == [
+        True,
+        False,
+    ]
+    assert all(call["deadline"] is deadline for call in FakePlanner.calls)
+    assert all(
+        call["detour_reference_duration_minutes"] == pytest.approx(10.0)
+        for call in FakePlanner.calls
+    )
+    assert all(
+        call["max_detour_factor"] == pytest.approx(1.8)
+        for call in FakePlanner.calls
+    )
+    assert FakePlanner.calls[1]["highway_preference"] == pytest.approx(2.0)
 
 
 @pytest.mark.parametrize(
@@ -1029,7 +1154,7 @@ def test_plan_routes_accepts_snap_limit_boundary_and_rejects_coverage(
 
 
 
-def test_plan_routes_keeps_control_constrained_snap_failure_as_value_error(
+def test_plan_routes_skips_strict_avoidance_when_only_all_road_snap_is_near(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     graph_path = tmp_path / "graph.geojson"
@@ -1047,22 +1172,49 @@ def test_plan_routes_keeps_control_constrained_snap_failure_as_value_error(
         },
     )
 
-    class UnexpectedPlanner:
-        def __init__(self, *, graph: object) -> None:
-            raise AssertionError("control-constrained route should fail before search")
+    class FakePlanner:
+        calls: list[tuple[str, bool]] = []
 
-    monkeypatch.setattr(route_service, "ScenicRoutePlanner", UnexpectedPlanner)
-    with pytest.raises(ValueError, match="No route found"):
-        route_service.plan_routes(
-            route_service.RouteRequest(
-                graph_geojson=str(graph_path),
-                start=(42.0, -72.0),
-                end=(42.1, -72.0),
-                avoid_highways=True,
-                include_baseline=False,
-                max_snap_distance_km=1.0,
-            )
+        def __init__(self, *, graph: object) -> None:
+            del graph
+
+        def find_fastest_route(self, **kwargs: object) -> Route:
+            self.calls.append(("fastest", bool(kwargs["avoid_highways"])))
+            return _cache_test_route(1.0)
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            self.calls.append(("scenic", bool(kwargs["avoid_highways"])))
+            assert kwargs["avoid_highways"] is False
+            assert kwargs["highway_preference"] == pytest.approx(2.0)
+            result = _cache_test_route(5.0)
+            result.fastest_duration_minutes = 12.0
+            result.duration_cap_minutes = 21.6
+            result.objective_value = 0.5
+            return result
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
+    result = route_service.plan_routes(
+        route_service.RouteRequest(
+            graph_geojson=str(graph_path),
+            start=(42.0, -72.0),
+            end=(42.1, -72.0),
+            avoid_highways=True,
+            include_baseline=False,
+            max_snap_distance_km=1.0,
         )
+    )
+
+    diagnostics = result["diagnostics"]
+    assert FakePlanner.calls == [("fastest", False), ("scenic", False)]
+    assert diagnostics["start_all_road_snap_km"] == pytest.approx(0.5)
+    assert diagnostics["end_all_road_snap_km"] == pytest.approx(0.5)
+    assert diagnostics["avoid_highways_applied"] is False
+    assert diagnostics["highway_avoidance_fallback"] is True
+    assert diagnostics["highway_avoidance_mode"] == "best_effort_fallback"
+    assert (
+        diagnostics["highway_avoidance_fallback_reason"]
+        == "strict_snap_outside_limit"
+    )
 
 
 def test_concurrent_report_builds_publish_isolated_native_variants(

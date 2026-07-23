@@ -1397,6 +1397,53 @@ def test_production_frontier_reports_exact_completion_certificate() -> None:
     assert route.optimality_gap == pytest.approx(0.0)
 
 
+def test_highway_preference_keeps_duration_fastest_feasibility_seed() -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="S", lat=0.0, lon=0.0))
+    graph.add_node(Node(id="G", lat=0.02, lon=0.0))
+    graph.add_edge(
+        Edge(
+            id="required-highway",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=10.0,
+            scenic_score=5.0,
+            road_type="motorway",
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="over-cap-residential",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=20.0,
+            scenic_score=10.0,
+            road_type="residential",
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    for index in range(25):
+        graph.add_node(
+            Node(id=f"isolated-{index}", lat=10.0 + index, lon=10.0)
+        )
+
+    route = ScenicRoutePlanner(graph).find_scenic_route(
+        (0.0, 0.0),
+        (0.02, 0.0),
+        q=1.0,
+        kappa=1.5,
+        highway_preference=2.0,
+        scenic_priority=True,
+    )
+
+    assert route.edge_ids == ("required-highway",)
+    assert route.estimated_duration_minutes == pytest.approx(10.0)
+    assert route.duration_cap_minutes == pytest.approx(15.0)
+
+
 def test_production_frontier_keeps_lower_highway_cost_label() -> None:
     graph = RoadGraph()
     for node_id, lat in (("S", 0.0), ("X", 0.01), ("G", 0.03)):
@@ -1448,6 +1495,38 @@ def test_production_frontier_keeps_lower_highway_cost_label() -> None:
     assert route.exactness_status == "exact"
     assert route.edge_ids == ("low-prefix", "suffix")
     assert route.certified_upper_bound == pytest.approx(route.objective_value)
+    pure_scenic = ScenicRoutePlanner(graph).find_scenic_route(
+        (0.0, 0.0),
+        (0.03, 0.0),
+        q=1.0,
+        kappa=4.0,
+        scenic_priority=True,
+    )
+    best_effort = ScenicRoutePlanner(graph).find_scenic_route(
+        (0.0, 0.0),
+        (0.03, 0.0),
+        q=1.0,
+        kappa=4.0,
+        highway_preference=2.0,
+        scenic_priority=True,
+    )
+    assert pure_scenic.edge_ids == ("high-prefix", "suffix")
+    assert best_effort.edge_ids == ("low-prefix", "suffix")
+    assert best_effort.highway_count == 0
+    timed_best_effort = ScenicRoutePlanner(
+        graph, frontier_time_limit_seconds=0.0
+    ).find_scenic_route(
+        (0.0, 0.0),
+        (0.03, 0.0),
+        q=1.0,
+        kappa=4.0,
+        highway_preference=2.0,
+        scenic_priority=True,
+    )
+    assert timed_best_effort.edge_ids == ("low-prefix", "suffix")
+    assert timed_best_effort.search_diagnostics["deadline_reached"] is True
+
+
 def test_reverse_collision_uses_canonical_and_positional_traversal_identity() -> None:
     graph = RoadGraph()
     for node_id, lat in (("S", 0.0), ("A", 0.01), ("G", 0.02)):

@@ -967,8 +967,12 @@ function routeDiagnosticsMarkup(payload) {
   if (Array.isArray(scenic.score_run)) {
     append("Score run", `${scenic.score_run.length} edges`);
   }
-  if (typeof diagnostics.avoid_highways_applied === "boolean") {
-    append("Scenic avoids highways", diagnostics.avoid_highways_applied ? "on" : "off");
+  if (diagnostics.highway_avoidance_fallback === true) {
+    append("Scenic highway avoidance", "best effort; major road required");
+  } else if (diagnostics.highway_avoidance_mode === "strict") {
+    append("Scenic highway avoidance", "strict");
+  } else if (typeof diagnostics.avoid_highways_applied === "boolean") {
+    append("Scenic highway avoidance", diagnostics.avoid_highways_applied ? "on" : "off");
   }
   if (typeof diagnostics.baseline_avoid_highways_applied === "boolean") {
     append(

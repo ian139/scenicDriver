@@ -152,6 +152,16 @@ def _response(*, q: float = 0.5, kappa: float = 1.8, avoid: bool = False) -> dic
             "requested_max_detour_factor": kappa,
             "applied_max_detour_factor": kappa,
             "avoid_highways_applied": avoid,
+            "highway_avoidance_fallback": False,
+            "highway_avoidance_fallback_reason": None,
+            "highway_avoidance_mode": "strict" if avoid else "off",
+            "highway_preference": 0.0,
+            "highway_avoidance_cost": 0.0,
+            "hard_highway_count": 0,
+            "optimization_mode": "scenic_score_under_duration_cap",
+            "detour_reference_duration_minutes": 10.0,
+            "duration_cap_minutes": 10.0 * kappa,
+            "duration_cap_satisfied": 12.0 <= 10.0 * kappa + 1e-9,
             "certified_upper_bound": None,
             "optimality_gap": 0.0,
             "exactness_status": "exact",
@@ -315,6 +325,9 @@ def _zero_edge_response(
             "scenic_score_delta_relative": None,
             "same_route": True,
             "no_better_route_reason": "same_route",
+            "detour_reference_duration_minutes": 0.0,
+            "duration_cap_minutes": 0.0,
+            "duration_cap_satisfied": True,
         }
     )
     return response
@@ -716,6 +729,42 @@ def test_avoid_highways_invariants_allow_unrestricted_baseline() -> None:
     assert evaluation["duration_ratio"] == pytest.approx(1.2)
 
 
+def test_best_effort_fallback_recomputes_highway_penalty() -> None:
+    response = _response(q=1.0, kappa=1.5, avoid=True)
+    scenic = response["geojson"]["features"][0]
+    scenic_properties = scenic["properties"]
+    for row in scenic_properties["segment_identity"]:
+        row["road_type"] = "trunk"
+    scenic_properties["highway_count"] = 2
+    scenic_properties["fastest_duration_minutes"] = 10.0
+    scenic_properties["duration_cap_minutes"] = 15.0
+    scenic_properties["objective_value"] = -1.6
+    diagnostics = response["diagnostics"]
+    diagnostics["avoid_highways_applied"] = False
+    diagnostics["highway_avoidance_fallback"] = True
+    diagnostics["highway_avoidance_fallback_reason"] = "strict_no_route"
+    diagnostics["highway_avoidance_mode"] = "best_effort_fallback"
+    diagnostics["highway_preference"] = 2.0
+    diagnostics["highway_avoidance_cost"] = 2.4
+    diagnostics["hard_highway_count"] = 2
+    diagnostics["optimization_mode"] = (
+        "scenic_score_with_best_effort_highway_avoidance_under_duration_cap"
+    )
+
+    evaluation = evaluate_service_response(
+        response,
+        q=1.0,
+        kappa=1.5,
+        avoid_highways=True,
+        scenic_priority=True,
+    )
+
+    assert evaluation["status"] == "ok", evaluation["failed_invariants"]
+    assert evaluation["invariants"]["highway_avoidance_reporting"] is True
+    assert evaluation["invariants"]["prohibited_highways"] is True
+    assert evaluation["objective"]["recomputed"] == pytest.approx(-1.6)
+
+
 def test_evaluate_service_response_flags_prohibited_highway_and_q0_violation() -> None:
     response = _response(q=0.0, kappa=1.0)
     scenic = response["geojson"]["features"][0]
@@ -847,6 +896,43 @@ def test_categories_are_empirical_and_screenshot_is_not_fabricated() -> None:
     assert corpus["historical_screenshot_coordinates"] is None
 
 
+def test_no_highway_free_category_accepts_successful_fallback() -> None:
+    pair = {"id": "p", "start": [44.0, -72.0], "end": [44.01, -72.0]}
+    corpus = {"pairs": [pair], "historical_screenshot_coordinates": None}
+    unrestricted = evaluate_service_response(
+        _response(), q=0.5, kappa=1.8, avoid_highways=False
+    )
+    fallback = deepcopy(unrestricted)
+    fallback["diagnostics"].update(
+        {
+            "highway_avoidance_fallback": True,
+            "highway_avoidance_fallback_reason": "strict_no_route",
+        }
+    )
+    rows = [
+        {
+            "pair_id": "p",
+            "q": 0.5,
+            "kappa": 1.8,
+            "avoid_highways": False,
+            "reason": None,
+            "evaluation": unrestricted,
+        },
+        {
+            "pair_id": "p",
+            "q": 0.5,
+            "kappa": 1.8,
+            "avoid_highways": True,
+            "reason": None,
+            "evaluation": fallback,
+        },
+    ]
+
+    discovered, _ = _classify_pairs(corpus, rows)
+
+    assert discovered["no-highway-free"] == ["p"]
+
+
 @pytest.mark.parametrize(
     ("mutate", "failed_invariant"),
     [
@@ -900,6 +986,30 @@ def test_categories_are_empirical_and_screenshot_is_not_fabricated() -> None:
         ),
         (
             lambda response: response["diagnostics"].update({"optimality_gap": 0.2}),
+            "diagnostics_consistency",
+        ),
+        (
+            lambda response: response["diagnostics"].update(
+                {"highway_preference": 2.0}
+            ),
+            "diagnostics_consistency",
+        ),
+        (
+            lambda response: response["diagnostics"].update(
+                {"highway_avoidance_cost": 1.0}
+            ),
+            "diagnostics_consistency",
+        ),
+        (
+            lambda response: response["diagnostics"].update(
+                {"hard_highway_count": 1}
+            ),
+            "diagnostics_consistency",
+        ),
+        (
+            lambda response: response["diagnostics"].update(
+                {"duration_cap_minutes": 999.0}
+            ),
             "diagnostics_consistency",
         ),
         (
@@ -1316,7 +1426,12 @@ def test_direct_planner_response_forwards_one_deadline_identity(monkeypatch) -> 
 
     def fake_objective(request, scenic, baseline, *, deadline=None, **kwargs):
         deadlines.append(("objective", deadline))
-        return {"objective_value": 0.5}
+        return {
+            "objective_value": 0.5,
+            "highway_preference": 0.0,
+            "highway_avoidance_cost": 0.0,
+            "optimization_mode": "scenic_score_under_duration_cap",
+        }
 
     def fake_route_to_feature(route, kind, *, deadline=None, **kwargs):
         deadlines.append((kind, deadline))

@@ -698,6 +698,16 @@ _REQUIRED_COMPARISON_DIAGNOSTICS = (
     "scenic_score_delta_relative",
     "same_route",
     "no_better_route_reason",
+    "avoid_highways_applied",
+    "highway_avoidance_fallback",
+    "highway_avoidance_fallback_reason",
+    "highway_avoidance_mode",
+    "highway_preference",
+    "highway_avoidance_cost",
+    "hard_highway_count",
+    "detour_reference_duration_minutes",
+    "duration_cap_minutes",
+    "duration_cap_satisfied",
 )
 
 _REQUIRED_ROUTE_METRICS = (
@@ -1720,10 +1730,13 @@ def create_app() -> FastAPI:
             except Exception:
                 diagnostics = {}
             if req.avoid_highways:
-                message = "No route satisfies the avoid-highways constraint."
+                message = (
+                    "No route satisfies the requested controls, including "
+                    "best-effort highway avoidance."
+                )
                 hint = (
-                    "Turn off Avoid highways, choose different points, "
-                    "or increase max detour."
+                    "Choose different points or increase max detour; highway "
+                    "use is already allowed when required."
                 )
             else:
                 message = "No route satisfies the requested controls."

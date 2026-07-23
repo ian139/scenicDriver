@@ -187,6 +187,27 @@ benchmark-validator, and API checks cover the new contract; performance
 retention requires a new fixed-denominator Vast run before making current
 2,256-case latency claims.
 
+### Best-effort highway-avoidance correction
+
+The route-control correction now treats highway avoidance as a preference:
+the planner first attempts a strict highway-free route under the
+unrestricted-fastest cap, then retries under the same cap and request deadline
+with a highway-exposure penalty when strict avoidance is infeasible. The
+unrestricted baseline remains unchanged. The benchmark validator independently
+recomputes the fallback penalty and verifies the reported fallback mode,
+trigger, highway count, preference, cap, and detour reference.
+
+Local verification passed 533 Python tests and 14 viewer tests. A
+live Augusta→Lewiston request that previously returned HTTP 422 now returns
+HTTP 200 in `best_effort_fallback` mode: the scenic route uses 42 highway
+segments versus 719 on the unrestricted baseline, stays within the
+unrestricted-fastest cap (`68.859 <= 99.403` minutes), and passes every
+production-benchmark response invariant after API-shape adaptation. Turning
+the preference off returns the 719-highway-segment baseline route, confirming
+that the control materially changes selection. This is correctness evidence,
+not fixed-denominator performance evidence; the 2,256-case revalidation gate
+remains open.
+
 
 ## Next research gate
 

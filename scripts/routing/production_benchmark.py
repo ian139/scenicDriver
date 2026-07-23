@@ -33,6 +33,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.route_planner import service as route_service  # noqa: E402
+from src.route_planner.cost import (  # noqa: E402
+    HIGHWAY_ROAD_TYPES,
+    MIN_EDGE_COST,
+)
 from src.route_planner.cancellation import (  # noqa: E402
     RoutingCancelled,
     RoutingDeadline,
@@ -68,17 +72,7 @@ _BENCHMARK_IMPLEMENTATION_PATHS = {
 }
 Q_VALUES = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
 KAPPA_VALUES = (1.0, 1.1, 1.2, 1.4, 1.8, 2.2, 3.0)
-HIGHWAY_TYPES = frozenset(
-    {
-        "highway",
-        "motorway",
-        "motorway_link",
-        "primary",
-        "primary_link",
-        "trunk",
-        "trunk_link",
-    }
-)
+HIGHWAY_TYPES = HIGHWAY_ROAD_TYPES
 REQUIRED_CATEGORIES = (
     "short urban",
     "medium regional",
@@ -1076,6 +1070,24 @@ def recompute_feature_metrics(
             else None
         )
     )
+    segment_highway_duration = sum(
+        float(_as_float(row.get("duration_minutes"), 0.0) or 0.0)
+        for row in rows
+        if str(row.get("road_type", "")).lower() in HIGHWAY_TYPES
+    )
+    edge_highway_duration = (
+        segment_highway_duration
+        if emitted_partial_metrics_trusted
+        else (
+            sum(
+                float(edge.travel_time_minutes)
+                for edge in canonical_edges
+                if str(edge.road_type).lower() in HIGHWAY_TYPES
+            )
+            if edge_metrics_available
+            else None
+        )
+    )
     edge_highway_count = (
         segment_highway_count
         if emitted_partial_metrics_trusted
@@ -1180,6 +1192,11 @@ def recompute_feature_metrics(
         if edge_duration is not None
         else segment_duration
     )
+    highway_duration = (
+        edge_highway_duration
+        if edge_highway_duration is not None
+        else segment_highway_duration
+    )
     geometry = feature.get("geometry", {})
     coordinates = (
         geometry.get("coordinates", [])
@@ -1193,6 +1210,7 @@ def recompute_feature_metrics(
         "raw_scenic_score_segments": float(segment_raw_score),
         "normalized_scenic_score": float(_normalise_score(raw_score)),
         "highway_count": int(highway_count),
+        "highway_duration_minutes": float(highway_duration),
         "segment_count": len(edge_ids),
         "segment_identity_sha256": _json_digest(edge_ids),
         "segment_identity_first": edge_ids[:3],
@@ -1277,6 +1295,7 @@ def recompute_objective(
     scenic: Mapping[str, Any],
     baseline: Mapping[str, Any] | None,
     scenic_priority: bool = False,
+    highway_preference: float = 0.0,
 ) -> dict[str, float | None]:
     """Recompute service objective components from independent path metrics."""
     scenic_duration = _as_float(scenic.get("duration_minutes_recomputed"))
@@ -1331,13 +1350,25 @@ def recompute_objective(
     duration_utility = _duration_utility(
         scenic_duration, fastest_duration, kappa
     )
-    objective = scenic_utility if scenic_priority else (
-        (1.0 - q) * duration_utility + q * scenic_utility
+    highway_duration = (
+        _as_float(scenic.get("highway_duration_minutes"), 0.0) or 0.0
     )
+    highway_cost = (
+        float(highway_preference)
+        * highway_duration
+        / max(fastest_duration, MIN_EDGE_COST)
+    )
+    base_objective = (
+        scenic_utility
+        if scenic_priority
+        else (1.0 - q) * duration_utility + q * scenic_utility
+    )
+    objective = base_objective - highway_cost
     return {
         "duration_utility": float(duration_utility),
         "scenic_utility": float(scenic_utility),
         "objective_value": float(objective),
+        "highway_avoidance_cost": float(highway_cost),
         "actual_duration_ratio": ratio,
         "scenic_score_delta_absolute": absolute,
         "scenic_score_delta_relative": relative,
@@ -1490,12 +1521,19 @@ def evaluate_service_response(
         if baseline_feature is not None
         else None
     )
+    diagnostics_payload = result.get("diagnostics", {})
+    highway_preference = (
+        _as_float(diagnostics_payload.get("highway_preference"), 0.0)
+        if isinstance(diagnostics_payload, Mapping)
+        else 0.0
+    ) or 0.0
     recomputed = recompute_objective(
         q=q,
         kappa=kappa,
         scenic=scenic,
         baseline=baseline,
         scenic_priority=scenic_priority,
+        highway_preference=highway_preference,
     )
     declared_properties = scenic_feature.get("properties", {})
     declared_objective = _as_float(
@@ -1549,11 +1587,63 @@ def evaluate_service_response(
         )
     else:
         ratio = None
+    avoidance_applied = (
+        isinstance(diagnostics_payload, Mapping)
+        and diagnostics_payload.get("avoid_highways_applied") is True
+    )
+    avoidance_fallback = (
+        isinstance(diagnostics_payload, Mapping)
+        and diagnostics_payload.get("highway_avoidance_fallback") is True
+    )
+    avoidance_mode = (
+        diagnostics_payload.get("highway_avoidance_mode")
+        if isinstance(diagnostics_payload, Mapping)
+        else None
+    )
+    avoidance_fallback_reason = (
+        diagnostics_payload.get("highway_avoidance_fallback_reason")
+        if isinstance(diagnostics_payload, Mapping)
+        else None
+    )
+    avoidance_reporting_ok = (
+        (
+            not avoid_highways
+            and not avoidance_applied
+            and not avoidance_fallback
+            and avoidance_mode == "off"
+            and avoidance_fallback_reason is None
+        )
+        or (
+            avoid_highways
+            and avoidance_applied
+            and not avoidance_fallback
+            and avoidance_mode == "strict"
+            and avoidance_fallback_reason is None
+        )
+        or (
+            avoid_highways
+            and not avoidance_applied
+            and avoidance_fallback
+            and avoidance_mode == "best_effort_fallback"
+            and avoidance_fallback_reason
+            in {
+                "strict_no_route",
+                "strict_over_unrestricted_cap",
+                "strict_snap_outside_limit",
+            }
+        )
+    )
     baseline_present = baseline is not None
+    baseline_duration = (
+        _as_float(baseline.get("duration_minutes"))
+        if baseline is not None
+        else None
+    )
     cap_ok = (
         baseline_present
         and duration_available
         and duration_cap is not None
+        and _close_enough(fastest_duration, baseline_duration)
         and _close_enough(duration_cap, fastest_duration * kappa)
         and scenic_duration <= duration_cap + 1e-9
     )
@@ -1561,7 +1651,11 @@ def evaluate_service_response(
         baseline_present
         and (
             not avoid_highways
-            or scenic["highway_count"] == 0
+            or avoidance_fallback
+            or (
+                avoidance_applied
+                and scenic["highway_count"] == 0
+            )
         )
     )
     q0_fastest = (
@@ -1590,7 +1684,6 @@ def evaluate_service_response(
             ("baseline", baseline_feature),
         )
     )
-    diagnostics_payload = result.get("diagnostics", {})
     request_payload = result.get("request", {})
     settings_ok = (
         isinstance(request_payload, Mapping)
@@ -1622,8 +1715,7 @@ def evaluate_service_response(
             _as_float(diagnostics_payload.get("applied_max_detour_factor")),
             kappa,
         )
-        and diagnostics_payload.get("avoid_highways_applied")
-        is bool(avoid_highways)
+        and avoidance_reporting_ok
     )
     derived_same_route = (
         baseline is not None
@@ -1669,6 +1761,12 @@ def evaluate_service_response(
     )
     reason_ok = _no_better_reason_consistent(
         scenic, recomputed_objective
+    )
+    expected_highway_preference = 2.0 if avoidance_fallback else 0.0
+    expected_optimization_mode = (
+        "scenic_score_with_best_effort_highway_avoidance_under_duration_cap"
+        if avoidance_fallback
+        else "scenic_score_under_duration_cap"
     )
     diagnostics_consistency = (
         isinstance(diagnostics_payload, Mapping)
@@ -1716,6 +1814,36 @@ def evaluate_service_response(
         == scenic.get("same_route")
         and diagnostics_payload.get("no_better_route_reason")
         == scenic.get("no_better_route_reason")
+        and _close_enough(
+            _as_float(diagnostics_payload.get("highway_preference")),
+            expected_highway_preference,
+        )
+        and _close_enough(
+            _as_float(diagnostics_payload.get("highway_avoidance_cost")),
+            _as_float(recomputed.get("highway_avoidance_cost")),
+        )
+        and diagnostics_payload.get("optimization_mode")
+        == expected_optimization_mode
+        and diagnostics_payload.get("hard_highway_count")
+        == scenic.get("highway_count")
+        and _close_enough(
+            _as_float(
+                diagnostics_payload.get(
+                    "detour_reference_duration_minutes"
+                )
+            ),
+            fastest_duration,
+        )
+        and _close_enough(
+            _as_float(diagnostics_payload.get("duration_cap_minutes")),
+            duration_cap,
+        )
+        and diagnostics_payload.get("duration_cap_satisfied")
+        is bool(
+            duration_available
+            and duration_cap is not None
+            and scenic_duration <= duration_cap + 1e-9
+        )
     )
     failed_invariants = [
         name
@@ -1723,6 +1851,7 @@ def evaluate_service_response(
             "baseline_present": baseline_present,
             "duration_cap": cap_ok,
             "prohibited_highways": highway_ok,
+            "highway_avoidance_reporting": avoidance_reporting_ok,
             "q0_fastest": q0_fastest,
             "objective_recomputation": objective_error is not None
             and objective_error <= 1e-8,
@@ -1764,6 +1893,9 @@ def evaluate_service_response(
             "baseline_present": bool(baseline_present),
             "duration_cap": bool(cap_ok),
             "prohibited_highways": bool(highway_ok),
+            "highway_avoidance_reporting": bool(
+                avoidance_reporting_ok
+            ),
             "q0_fastest": bool(q0_fastest),
             "objective_recomputation": objective_error is not None
             and objective_error <= 1e-8,
@@ -1939,10 +2071,26 @@ def _classify_pairs(
             }
             if false_ids != true_ids or any(row["evaluation"]["highway_count"] > 0 for row in false_rows):
                 discovered["highway-sensitive"].append(pair_id)
-        if any(
-            row["avoid_highways"] is False and row.get("evaluation", {}).get("status") == "ok"
+        unrestricted_succeeds = any(
+            row["avoid_highways"] is False
+            and row.get("evaluation", {}).get("status") == "ok"
             for row in pair_rows
-        ) and any(row["avoid_highways"] and row.get("reason") == "no_route" for row in pair_rows):
+        )
+        strict_no_route = any(
+            (
+                row["avoid_highways"]
+                and row.get("reason") == "no_route"
+            )
+            or (
+                row["avoid_highways"]
+                and row.get("evaluation", {})
+                .get("diagnostics", {})
+                .get("highway_avoidance_fallback_reason")
+                == "strict_no_route"
+            )
+            for row in pair_rows
+        )
+        if unrestricted_succeeds and strict_no_route:
             discovered["no-highway-free"].append(pair_id)
         scenic_improvement = any(
             row["q"] > 0.0
@@ -2165,19 +2313,30 @@ def _direct_planner_response(
         if request.include_baseline:
             baseline_route = unrestricted_baseline
     deadline.check()
-    scenic_route = planner.find_scenic_route(
-        start=request.start,
-        end=request.end,
-        scenic_weight=request.scenic_weight,
-        avoid_highways=request.avoid_highways,
-        max_detour_factor=request.max_detour_factor,
-        scenic_priority=True,
-        detour_reference_duration_minutes=detour_reference_duration_minutes,
-        deadline=deadline,
+    (
+        scenic_route,
+        strict_highway_avoidance_applied,
+        highway_avoidance_fallback_reason,
+    ) = (
+        route_service._find_scenic_route_with_best_effort_avoidance(
+            planner,
+            request,
+            detour_reference_duration_minutes=(
+                detour_reference_duration_minutes
+            ),
+            deadline=deadline,
+        )
+    )
+    highway_avoidance_fallback = (
+        request.avoid_highways and not strict_highway_avoidance_applied
     )
     deadline.check()
     objective = route_service._objective_components(
-        request, scenic_route, baseline_route, deadline=deadline
+        request,
+        scenic_route,
+        baseline_route,
+        deadline=deadline,
+        highway_avoidance_fallback=highway_avoidance_fallback,
     )
     deadline.check()
     scenic_feature = route_service.route_to_feature(
@@ -2256,7 +2415,24 @@ def _direct_planner_response(
             "applied_scenic_weight": float(request.scenic_weight),
             "requested_max_detour_factor": float(request.max_detour_factor),
             "applied_max_detour_factor": float(request.max_detour_factor),
-            "avoid_highways_applied": bool(request.avoid_highways),
+            "hard_highway_count": scenic_feature["properties"].get(
+                "highway_count"
+            ),
+            "avoid_highways_applied": strict_highway_avoidance_applied,
+            "highway_avoidance_fallback": highway_avoidance_fallback,
+            "highway_avoidance_fallback_reason": (
+                highway_avoidance_fallback_reason
+            ),
+            "highway_avoidance_mode": (
+                "best_effort_fallback"
+                if highway_avoidance_fallback
+                else ("strict" if request.avoid_highways else "off")
+            ),
+            "highway_preference": objective["highway_preference"],
+            "highway_avoidance_cost": objective[
+                "highway_avoidance_cost"
+            ],
+            "optimization_mode": objective["optimization_mode"],
             "baseline_avoid_highways_applied": (
                 False if baseline_route is not None else None
             ),
