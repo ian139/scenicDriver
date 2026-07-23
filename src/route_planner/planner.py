@@ -5071,6 +5071,7 @@ class ScenicRoutePlanner:
         highway_preference: Optional[float] = None,
         strict_highways: Optional[bool] = None,
         scenic_priority: bool = False,
+        detour_reference_duration_minutes: Optional[float] = None,
         _endpoint_graph: bool = False,
         deadline: RoutingDeadline | None = None,
     ) -> Route:
@@ -5087,6 +5088,7 @@ class ScenicRoutePlanner:
                 highway_preference=highway_preference,
                 strict_highways=strict_highways,
                 scenic_priority=scenic_priority,
+                detour_reference_duration_minutes=detour_reference_duration_minutes,
                 _endpoint_graph=_endpoint_graph,
             )
 
@@ -5103,6 +5105,7 @@ class ScenicRoutePlanner:
         highway_preference: Optional[float] = None,
         strict_highways: Optional[bool] = None,
         scenic_priority: bool = False,
+        detour_reference_duration_minutes: Optional[float] = None,
         _endpoint_graph: bool = False,
     ) -> Route:
         """Optimize scenic score within a hard duration cap when requested."""
@@ -5133,6 +5136,7 @@ class ScenicRoutePlanner:
                     highway_preference=highway_preference,
                     strict_highways=strict_highways,
                     scenic_priority=scenic_priority,
+                    detour_reference_duration_minutes=detour_reference_duration_minutes,
                     _endpoint_graph=True,
                 )
             finally:
@@ -5199,10 +5203,22 @@ class ScenicRoutePlanner:
                 )
         if shortest_edges is None:
             raise ValueError("No route found between the given coordinates.")
-        fastest_duration = self._path_duration_minutes(shortest_edges)
+        policy_fastest_duration = self._path_duration_minutes(shortest_edges)
+        fastest_duration = (
+            policy_fastest_duration
+            if detour_reference_duration_minutes is None
+            else self._validated_nonnegative(
+                float(detour_reference_duration_minutes),
+                "detour reference duration",
+            )
+        )
         duration_cap = fastest_duration * kappa_value
         if not math.isfinite(duration_cap):
             raise ValueError("kappa must produce a finite duration cap")
+        if not self._duration_within_cap(
+            policy_fastest_duration, duration_cap
+        ):
+            raise ValueError("No route satisfies the requested duration cap.")
         fastest_evaluation = evaluate_path(
             shortest_edges,
             q=q_value,

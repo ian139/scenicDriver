@@ -1122,9 +1122,10 @@ def test_primary_shortcut_is_excluded_by_checked_filter() -> None:
     )
     planner = ScenicRoutePlanner(graph)
 
-    assert planner.find_fastest_route(
+    unrestricted_fastest = planner.find_fastest_route(
         (0.0, 0.0), (0.02, 0.0), avoid_highways=False
-    ).edge_ids == ("primary-shortcut",)
+    )
+    assert unrestricted_fastest.edge_ids == ("primary-shortcut",)
     assert planner.find_scenic_route(
         (0.0, 0.0),
         (0.02, 0.0),
@@ -1132,16 +1133,43 @@ def test_primary_shortcut_is_excluded_by_checked_filter() -> None:
         kappa=1.0,
         avoid_highways=False,
     ).edge_ids == ("primary-shortcut",)
+    inclusive_scenic = planner.find_scenic_route(
+        (0.0, 0.0),
+        (0.02, 0.0),
+        q=1.0,
+        kappa=4.0,
+        avoid_highways=False,
+    )
+    assert inclusive_scenic.edge_ids == (
+        "secondary-detour",
+        "residential-detour",
+    )
 
     fastest = planner.find_fastest_route(
         (0.0, 0.0), (0.02, 0.0), avoid_highways=True
     )
+    with pytest.raises(
+        ValueError, match="No route satisfies the requested duration cap"
+    ):
+        planner.find_scenic_route(
+            (0.0, 0.0),
+            (0.02, 0.0),
+            q=1.0,
+            kappa=2.0,
+            avoid_highways=True,
+            detour_reference_duration_minutes=(
+                unrestricted_fastest.estimated_duration_minutes
+            ),
+        )
     scenic = planner.find_scenic_route(
         (0.0, 0.0),
         (0.02, 0.0),
         q=1.0,
         kappa=4.0,
         avoid_highways=True,
+        detour_reference_duration_minutes=(
+            unrestricted_fastest.estimated_duration_minutes
+        ),
     )
     assert fastest.edge_ids == ("secondary-detour", "residential-detour")
     assert scenic.edge_ids == ("secondary-detour", "residential-detour")

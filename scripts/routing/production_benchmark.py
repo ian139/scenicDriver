@@ -1209,6 +1209,12 @@ def recompute_feature_metrics(
         "duration_minutes_segments": segment_duration,
         "duration_minutes_recomputed": duration,
         "duration_minutes": duration,
+        "fastest_duration_minutes_declared": _as_float(
+            properties.get("fastest_duration_minutes")
+        ),
+        "duration_cap_minutes_declared": _as_float(
+            properties.get("duration_cap_minutes")
+        ),
         "highway_count_declared": declared_highway_count,
         "edge_metric_consistency": edge_consistency,
         "requested_endpoints": requested_endpoints_ok,
@@ -1274,12 +1280,21 @@ def recompute_objective(
 ) -> dict[str, float | None]:
     """Recompute service objective components from independent path metrics."""
     scenic_duration = _as_float(scenic.get("duration_minutes_recomputed"))
-    fastest_duration = None
-    if baseline is not None:
+    fastest_duration = _as_float(
+        scenic.get("fastest_duration_minutes_declared")
+    )
+    if (
+        fastest_duration is None
+        or (
+            fastest_duration <= 0.0
+            and scenic_duration is not None
+            and scenic_duration > 0.0
+        )
+    ) and baseline is not None:
         fastest_duration = _as_float(
             baseline.get("duration_minutes_recomputed")
         )
-    else:
+    if fastest_duration is None:
         fastest_duration = scenic_duration
     scenic_utility = _normalise_score(
         _as_float(scenic.get("raw_scenic_score"), 0.0) or 0.0
@@ -1496,11 +1511,28 @@ def evaluate_service_response(
         else None
     )
     scenic_duration = _as_float(scenic.get("duration_minutes"))
-    fastest_duration = (
-        _as_float(baseline.get("duration_minutes"))
-        if baseline is not None
-        else None
+    fastest_duration = _as_float(
+        scenic.get("fastest_duration_minutes_declared")
     )
+    duration_cap = _as_float(scenic.get("duration_cap_minutes_declared"))
+    if (
+        fastest_duration is None
+        or (
+            fastest_duration <= 0.0
+            and scenic_duration is not None
+            and scenic_duration > 0.0
+        )
+    ) and baseline is not None:
+        fastest_duration = _as_float(baseline.get("duration_minutes"))
+    if (
+        duration_cap is None
+        or (
+            duration_cap <= 0.0
+            and scenic_duration is not None
+            and scenic_duration > 0.0
+        )
+    ) and fastest_duration is not None:
+        duration_cap = fastest_duration * kappa
     duration_available = (
         scenic_duration is not None
         and fastest_duration is not None
@@ -1521,20 +1553,15 @@ def evaluate_service_response(
     cap_ok = (
         baseline_present
         and duration_available
-        and (
-            scenic_duration <= fastest_duration * kappa + 1e-9
-            if fastest_duration > 0.0
-            else scenic_duration == 0.0
-        )
+        and duration_cap is not None
+        and _close_enough(duration_cap, fastest_duration * kappa)
+        and scenic_duration <= duration_cap + 1e-9
     )
     highway_ok = (
         baseline_present
-        and not avoid_highways
-        or (
-            baseline_present
-            and avoid_highways
-            and scenic["highway_count"] == 0
-            and baseline["highway_count"] == 0
+        and (
+            not avoid_highways
+            or scenic["highway_count"] == 0
         )
     )
     q0_fastest = (
@@ -2123,6 +2150,21 @@ def _direct_planner_response(
     if deadline is None:
         deadline = RoutingDeadline()
     deadline.check()
+    baseline_route = None
+    detour_reference_duration_minutes = None
+    if request.include_baseline or request.avoid_highways:
+        unrestricted_baseline = planner.find_fastest_route(
+            start=request.start,
+            end=request.end,
+            avoid_highways=False,
+            deadline=deadline,
+        )
+        detour_reference_duration_minutes = float(
+            unrestricted_baseline.estimated_duration_minutes
+        )
+        if request.include_baseline:
+            baseline_route = unrestricted_baseline
+    deadline.check()
     scenic_route = planner.find_scenic_route(
         start=request.start,
         end=request.end,
@@ -2130,18 +2172,8 @@ def _direct_planner_response(
         avoid_highways=request.avoid_highways,
         max_detour_factor=request.max_detour_factor,
         scenic_priority=True,
+        detour_reference_duration_minutes=detour_reference_duration_minutes,
         deadline=deadline,
-    )
-    deadline.check()
-    baseline_route = (
-        planner.find_fastest_route(
-            start=request.start,
-            end=request.end,
-            avoid_highways=request.avoid_highways,
-            deadline=deadline,
-        )
-        if request.include_baseline
-        else None
     )
     deadline.check()
     objective = route_service._objective_components(
@@ -2196,6 +2228,21 @@ def _direct_planner_response(
         routes.append(
             {"route_kind": "baseline", "metrics": baseline_feature["properties"]}
         )
+    scenic_duration = float(scenic_route.estimated_duration_minutes)
+    fastest_duration = route_service._detour_reference_duration(
+        scenic_route, baseline_route
+    )
+    duration_cap = float(
+        getattr(scenic_route, "duration_cap_minutes", 0.0) or 0.0
+    )
+    if duration_cap <= 0.0:
+        duration_cap = fastest_duration * request.max_detour_factor
+    duration_cap_tolerance = 1e-12 * max(1.0, abs(duration_cap))
+    duration_ratio = (
+        scenic_duration / fastest_duration
+        if fastest_duration > 0.0
+        else (1.0 if scenic_duration == 0.0 else float("inf"))
+    )
     return {
         "request": request.to_dict(),
         "diagnostics": {
@@ -2210,6 +2257,15 @@ def _direct_planner_response(
             "requested_max_detour_factor": float(request.max_detour_factor),
             "applied_max_detour_factor": float(request.max_detour_factor),
             "avoid_highways_applied": bool(request.avoid_highways),
+            "baseline_avoid_highways_applied": (
+                False if baseline_route is not None else None
+            ),
+            "scenic_fastest_duration_ratio": duration_ratio,
+            "detour_reference_duration_minutes": fastest_duration,
+            "duration_cap_minutes": duration_cap,
+            "duration_cap_satisfied": (
+                scenic_duration <= duration_cap + duration_cap_tolerance
+            ),
             "score_mapping_coverage": score_mapping.get("matched_ratio", 0.0),
             "score_report_identity": score_mapping.get("score_run"),
             "score_report_signature": score_mapping.get("report_signature"),

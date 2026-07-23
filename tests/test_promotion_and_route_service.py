@@ -162,7 +162,7 @@ def test_route_compare_service_smoke(tmp_path: Path) -> None:
     assert "score_mapping" in metrics
 
 
-def test_plan_routes_uses_requested_filter_for_baseline_and_reports_constraints(
+def test_plan_routes_uses_unrestricted_baseline_for_filtered_scenic_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     graph = {
@@ -209,7 +209,13 @@ def test_plan_routes_uses_requested_filter_for_baseline_and_reports_constraints(
 
         def find_scenic_route(self, **kwargs: object) -> Route:
             self.calls.append(("scenic", bool(kwargs["avoid_highways"])))
-            return route(12.0, 10.0, 8.0)
+            assert kwargs["detour_reference_duration_minutes"] == pytest.approx(
+                10.0
+            )
+            result = route(12.0, 10.0, 8.0)
+            result.fastest_duration_minutes = 10.0
+            result.duration_cap_minutes = 15.0
+            return result
 
         def find_fastest_route(self, **kwargs: object) -> Route:
             self.calls.append(("fastest", bool(kwargs["avoid_highways"])))
@@ -228,10 +234,15 @@ def test_plan_routes_uses_requested_filter_for_baseline_and_reports_constraints(
     result = route_service.plan_routes(request)
     diagnostics = result["diagnostics"]
 
-    assert FakePlanner.calls == [("scenic", True), ("fastest", False)]
+    assert FakePlanner.calls == [("fastest", False), ("scenic", True)]
     assert diagnostics["requested_max_detour_factor"] == pytest.approx(1.5)
     assert diagnostics["applied_max_detour_factor"] == pytest.approx(1.5)
     assert diagnostics["scenic_fastest_duration_ratio"] == pytest.approx(1.2)
+    assert diagnostics["detour_reference_duration_minutes"] == pytest.approx(
+        10.0
+    )
+    assert diagnostics["duration_cap_minutes"] == pytest.approx(15.0)
+    assert diagnostics["duration_cap_satisfied"] is True
     assert diagnostics["scenic_fastest_distance_ratio"] == pytest.approx(1.25)
     assert diagnostics["avoid_highways_applied"] is True
     assert diagnostics["baseline_avoid_highways_applied"] is False

@@ -694,6 +694,28 @@ def test_evaluate_service_response_recomputes_objective_and_cap() -> None:
     assert evaluation["invariants"]["objective_recomputation"] is True
 
 
+def test_avoid_highways_invariants_allow_unrestricted_baseline() -> None:
+    response = _response(q=1.0, kappa=1.5, avoid=True)
+    scenic = response["geojson"]["features"][0]
+    baseline = response["geojson"]["features"][1]
+    scenic["properties"]["fastest_duration_minutes"] = 10.0
+    scenic["properties"]["duration_cap_minutes"] = 15.0
+    baseline["properties"]["estimated_duration_minutes"] = 8.0
+    baseline["properties"]["segment_identity"][0]["road_type"] = "trunk"
+    baseline["properties"]["highway_count"] = 1
+
+    evaluation = evaluate_service_response(
+        response,
+        q=1.0,
+        kappa=1.5,
+        avoid_highways=True,
+    )
+
+    assert evaluation["invariants"]["prohibited_highways"] is True
+    assert evaluation["invariants"]["duration_cap"] is True
+    assert evaluation["duration_ratio"] == pytest.approx(1.2)
+
+
 def test_evaluate_service_response_flags_prohibited_highway_and_q0_violation() -> None:
     response = _response(q=0.0, kappa=1.0)
     scenic = response["geojson"]["features"][0]
@@ -1278,12 +1300,14 @@ def test_direct_planner_response_forwards_one_deadline_identity(monkeypatch) -> 
 
     class FakeRoute:
         average_scenic_score = 5.0
+        estimated_duration_minutes = 10.0
 
     class FakePlanner:
         graph = SimpleNamespace(nodes={}, edges={})
 
         def find_scenic_route(self, **kwargs):
             deadlines.append(("scenic", kwargs.get("deadline")))
+            assert kwargs["detour_reference_duration_minutes"] == 10.0
             return FakeRoute()
 
         def find_fastest_route(self, **kwargs):
@@ -1337,7 +1361,22 @@ def test_direct_planner_response_forwards_one_deadline_identity(monkeypatch) -> 
     )
     assert response is not None
     assert len(deadlines) == 5
+    assert [label for label, _ in deadlines] == [
+        "baseline",
+        "scenic",
+        "objective",
+        "scenic",
+        "baseline",
+    ]
     assert all(d is deadline for _, d in deadlines)
+    diagnostics = response["diagnostics"]
+    assert diagnostics["baseline_avoid_highways_applied"] is False
+    assert diagnostics["scenic_fastest_duration_ratio"] == pytest.approx(1.0)
+    assert diagnostics["detour_reference_duration_minutes"] == pytest.approx(
+        10.0
+    )
+    assert diagnostics["duration_cap_minutes"] == pytest.approx(18.0)
+    assert diagnostics["duration_cap_satisfied"] is True
 
 
 def test_persistent_planning_child_reuses_context_and_survives_cache_mutation(

@@ -173,6 +173,21 @@ These records are saved but intentionally Git-ignored and are not portable repos
 
 The scripts, fixed corpus, validation logic, and this summary are tracked in Git. The large canonical results are durable in S3, not Git.
 
+## Detour-policy boundary
+
+The retained 2,256-case Vast evidence predates the route-control correction
+that defines the max-detour factor against the unrestricted fastest route,
+even when `avoid_highways=true`. That correction intentionally changes the
+1,128 avoid-highways cases: their displayed baseline remains unrestricted and
+their scenic route must satisfy the unrestricted-baseline duration cap. The
+published performance and exact-output comparisons remain valid historical
+evidence for the scalar-bound implementation under the prior policy, not
+validation of the corrected avoid-highways workload. Focused planner,
+benchmark-validator, and API checks cover the new contract; performance
+retention requires a new fixed-denominator Vast run before making current
+2,256-case latency claims.
+
+
 ## Next research gate
 
 The scalar incumbent bound removed the measured dominant traversal at production scale. Do not infer that frontier pruning, CCH, or MLD is now beneficial. Before another architectural optimization:
