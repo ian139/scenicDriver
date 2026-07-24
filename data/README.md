@@ -28,10 +28,14 @@ Report tooling defaults (unless overridden in env):
 - For S3 tile loading in annotator: `raw_dir = s3://<bucket>/raw`
 - Manual labels are appended/upserted to `data/raw/labels_human.csv`
 
-## Current Active Working Sets
+## Current Working Sets
 
-- `masswhites` at `z14` (primary region)
-- `amherst_ma` at `z16` (secondary/local validation)
+- `new_england_north` at `z14`: deployed regional imagery set
+  - bbox: `42.488301979602255, -73.5205078125` to `47.50235895196859, -66.796875`
+  - satellite tiles: `98,838`
+  - Terrain-RGB tiles: `98,838`
+- `masswhites` at `z14`: primary learned-model training set
+- `amherst_ma` at `z16`: secondary local validation set
 
 ## Regression Artifacts (Step 3)
 
@@ -80,7 +84,7 @@ Its source extracts are cached under
 graph. These paths stay outside Git; beta bootstrap downloads the compressed
 artifact from the deployment manifest.
 
-Build it with the canonical full-bbox command in the root README, then run:
+Build it with the canonical full-bbox command in the [deployment runbook](../docs/setup/deployment.md), then run:
 
 ```bash
 uv run python scripts/routing/check_beta_artifacts.py --project-root .

@@ -1,7 +1,5 @@
-# Scenic Score Module
-# Owner: progno-ml-vision agent
+"""Learned scenic scoring."""
 
-from .scorer import ScenicScorer
 from .regression import ScenicRegressionModel
 
-__all__ = ["ScenicScorer", "ScenicRegressionModel"]
+__all__ = ["ScenicRegressionModel"]

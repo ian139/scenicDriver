@@ -1,13 +1,13 @@
-# Terrain Analysis Module
-# Owner: progno-geospatial agent
+"""Terrain-RGB feature extraction."""
 
-from .analyzer import TerrainAnalyzer
-from .elevation import ElevationProcessor
-from .features import extract_terrain_features, extract_terrain_features_from_tile
+from .features import (
+    TerrainFeatures,
+    extract_terrain_features_from_tile,
+    repair_terrain_zero_seam,
+)
 
 __all__ = [
-    "TerrainAnalyzer",
-    "ElevationProcessor",
-    "extract_terrain_features",
+    "TerrainFeatures",
     "extract_terrain_features_from_tile",
+    "repair_terrain_zero_seam",
 ]

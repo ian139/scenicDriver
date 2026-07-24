@@ -47,7 +47,6 @@ Moved to `archive/notes/`:
 - `archive/notes/work-export-2026-04-20.md`
 - `archive/notes/coding-agent-session-mvp.md`
 - `archive/notes/archive-review-rebuild-guide.md`
-- `archive/notes/misplaced-job-application-AGENTS.md`
 - `archive/notes/cmux-workflow-legacy.md` — historical non-active workflow; current replacement is `docs/internal/cmux-workflow.md`.
 
 ## Notes

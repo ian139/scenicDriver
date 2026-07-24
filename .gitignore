@@ -47,7 +47,6 @@ notebooks/__marimo__/
 # Archive working snapshots (keep manifest and curated archive entries)
 archive/*
 !archive/archive.md
-!archive/archive_scan_summary.json
 !archive/scripts/
 !archive/scripts/**/*.py
 !archive/notebooks/

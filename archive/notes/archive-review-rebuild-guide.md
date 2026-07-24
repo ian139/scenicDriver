@@ -48,7 +48,6 @@ All files under `archive/` were scanned:
 - Binary files seen: `73,273`
 - Read errors: `0`
 
-Scan summary artifact: `archive/archive_scan_summary.json`
 
 Largest footprint drivers:
 
