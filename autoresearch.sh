@@ -15,4 +15,4 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-uv run --offline --frozen python scripts/routing/autoresearch_profile.py
+uv run --offline --frozen python scripts/routing/autoresearch_multidetour.py
