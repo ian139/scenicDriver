@@ -5193,7 +5193,6 @@ class ScenicRoutePlanner:
                 not repaired_scalar
                 and source_identity != fastest_evaluation.edge_ids
             ):
-                repaired_scalar = True
                 repaired = self._large_graph_detour_candidate(
                     fastest_edges,
                     path,
@@ -5207,6 +5206,7 @@ class ScenicRoutePlanner:
                 )
                 check_graph()
                 if repaired is not None:
+                    repaired_scalar = True
                     candidates.append(repaired)
 
         check_graph()
@@ -5218,9 +5218,9 @@ class ScenicRoutePlanner:
         elapsed_ms = (time.monotonic() - started_at) * 1000.0
         diagnostics = {
             "time_limit_seconds": 0.0,
-            "labels_generated": len(multipliers),
+            "labels_generated": len(multipliers) + int(repaired_scalar),
             "labels_expanded": len(candidates),
-            "labels_pruned": len(multipliers) - len(candidates) + 1,
+            "labels_pruned": len(multipliers) + int(repaired_scalar) - len(candidates) + 1,
             "max_frontier_size": len(candidates),
             "remaining_frontier_size": 0,
             "deadline_reached": False,
