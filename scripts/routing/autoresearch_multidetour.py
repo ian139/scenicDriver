@@ -48,6 +48,9 @@ _CONNECTOR_DURATION_MINUTES = 0.5
 class DetourSpec:
     duration_minutes: float
     scenic_score: float
+    main_scenic_score: float = 0.0
+    main_road_type: str = "secondary"
+    detour_road_type: str = "secondary"
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,9 @@ class FixtureSpec:
     detours: tuple[DetourSpec, ...]
     max_detour_factor: float
     expected_oracle_detours: int
+    scenic_weight: float = _SCENIC_WEIGHT
+    scenic_priority: bool = True
+    highway_preference: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -94,7 +100,7 @@ class _CompiledPlanner(ScenicRoutePlanner):
     _COMPILED_SCENIC_MIN_NODES = 0
 
 
-def _detours(*values: tuple[float, float]) -> tuple[DetourSpec, ...]:
+def _detours(*values: tuple[Any, ...]) -> tuple[DetourSpec, ...]:
     return tuple(DetourSpec(*value) for value in values)
 
 
@@ -171,6 +177,29 @@ _FIXTURES = (
         1.60,
         3,
     ),
+    FixtureSpec(
+        "route_gain_beats_absolute_segment_score",
+        _detours(
+            (1.05, 10.0, 9.0),
+            (1.05, 9.0, 0.0),
+            (1.05, 9.0, 0.0),
+        ),
+        1.025,
+        2,
+    ),
+    FixtureSpec(
+        "equal_scenery_highway_avoidance",
+        _detours(
+            (1.5, 5.0, 5.0, "motorway", "secondary"),
+            (1.5, 5.0, 5.0, "motorway", "secondary"),
+            (1.5, 5.0, 5.0, "motorway", "secondary"),
+        ),
+        1.25,
+        2,
+        scenic_weight=0.5,
+        scenic_priority=False,
+        highway_preference=2.0,
+    ),
 )
 
 
@@ -181,6 +210,8 @@ def _add_edge(
     end_node_id: str,
     duration_minutes: float,
     scenic_score: float,
+    *,
+    road_type: str = "secondary",
 ) -> None:
     graph.add_edge(
         Edge(
@@ -189,7 +220,7 @@ def _add_edge(
             end_node_id=end_node_id,
             distance_km=duration_minutes,
             scenic_score=scenic_score,
-            road_type="secondary",
+            road_type=road_type,
             speed_limit_kmh=60,
             one_way=True,
         )
@@ -211,7 +242,8 @@ def _build_graph(fixture: FixtureSpec) -> RoadGraph:
             f"A{index}",
             f"B{index}",
             _DIRECT_DURATION_MINUTES,
-            0.0,
+            detour.main_scenic_score,
+            road_type=detour.main_road_type,
         )
         half_duration = detour.duration_minutes / 2.0
         _add_edge(
@@ -221,6 +253,7 @@ def _build_graph(fixture: FixtureSpec) -> RoadGraph:
             f"X{index}",
             half_duration,
             detour.scenic_score,
+            road_type=detour.detour_road_type,
         )
         _add_edge(
             graph,
@@ -229,6 +262,7 @@ def _build_graph(fixture: FixtureSpec) -> RoadGraph:
             f"B{index}",
             half_duration,
             detour.scenic_score,
+            road_type=detour.detour_road_type,
         )
         if index + 1 < len(fixture.detours):
             _add_edge(
@@ -281,9 +315,10 @@ def _independent_oracle(fixture: FixtureSpec) -> OracleResult:
     fastest_duration = sum(edge.travel_time_minutes for edge in fastest_path)
     duration_cap = fastest_duration * fixture.max_detour_factor
     policy = resolve_routing_policy(
-        scenic_weight=_SCENIC_WEIGHT,
+        scenic_weight=fixture.scenic_weight,
         kappa=fixture.max_detour_factor,
-        scenic_priority=True,
+        highway_preference=fixture.highway_preference,
+        scenic_priority=fixture.scenic_priority,
     )
     best_path: list[Edge] | None = None
     best_evaluation: PathEvaluation | None = None
@@ -291,7 +326,7 @@ def _independent_oracle(fixture: FixtureSpec) -> OracleResult:
         path = _path_for_choices(graph, choices)
         evaluation = evaluate_path(
             path,
-            q=_SCENIC_WEIGHT,
+            q=fixture.scenic_weight,
             kappa=fixture.max_detour_factor,
             fastest_duration_minutes=fastest_duration,
             policy=policy,
@@ -341,9 +376,10 @@ def _run_mode(fixture: FixtureSpec, mode: str, oracle: OracleResult) -> RouteRes
     route = planner.find_scenic_route(
         start,
         end,
-        scenic_weight=_SCENIC_WEIGHT,
+        scenic_weight=fixture.scenic_weight,
         max_detour_factor=fixture.max_detour_factor,
-        scenic_priority=True,
+        highway_preference=fixture.highway_preference,
+        scenic_priority=fixture.scenic_priority,
     )
     process_us = (process_time_ns() - started) / 1_000.0
     metrics = recompute_route_metrics(
@@ -356,13 +392,14 @@ def _run_mode(fixture: FixtureSpec, mode: str, oracle: OracleResult) -> RouteRes
     edge_ids = tuple(str(edge_id) for edge_id in route.edge_ids)
     edges = [graph.edges[edge_id] for edge_id in edge_ids]
     policy = resolve_routing_policy(
-        scenic_weight=_SCENIC_WEIGHT,
+        scenic_weight=fixture.scenic_weight,
         kappa=fixture.max_detour_factor,
-        scenic_priority=True,
+        highway_preference=fixture.highway_preference,
+        scenic_priority=fixture.scenic_priority,
     )
     evaluation = evaluate_path(
         edges,
-        q=_SCENIC_WEIGHT,
+        q=fixture.scenic_weight,
         kappa=fixture.max_detour_factor,
         fastest_duration_minutes=oracle.fastest_duration_minutes,
         policy=policy,
@@ -435,9 +472,10 @@ def _fixture_digest() -> str:
 
 def main() -> None:
     total_started = perf_counter()
-    if len(_FIXTURES) != 12:
+    if len(_FIXTURES) != 14:
         raise RuntimeError("multi-detour fixture denominator changed")
 
+    objective_regrets_pp: list[float] = []
     scenic_regrets_pp: list[float] = []
     detour_recalls: list[float] = []
     compiled_oracle_matches = 0
@@ -475,6 +513,11 @@ def main() -> None:
             ):
                 raise RuntimeError(f"{fixture.name}: compiled route is nondeterministic")
 
+        objective_regret = max(
+            0.0,
+            oracle.evaluation.objective - compiled.evaluation.objective,
+        )
+        objective_regrets_pp.append(objective_regret * 100.0)
         scenic_regret = max(
             0.0,
             oracle.evaluation.normalized_scenic_score
@@ -496,8 +539,10 @@ def main() -> None:
         compiled_times_us.extend(result.process_us for result in compiled_runs)
 
     denominator = len(_FIXTURES)
-    mean_regret_pp = sum(scenic_regrets_pp) / denominator
-    worst_regret_pp = max(scenic_regrets_pp)
+    mean_objective_regret_pp = sum(objective_regrets_pp) / denominator
+    worst_objective_regret_pp = max(objective_regrets_pp)
+    mean_scenic_regret_pp = sum(scenic_regrets_pp) / denominator
+    worst_scenic_regret_pp = max(scenic_regrets_pp)
     oracle_match_rate = compiled_oracle_matches / denominator
     multi_detour_rate = compiled_multiple_detour_cases / denominator
     detour_recall_rate = sum(detour_recalls) / denominator
@@ -527,12 +572,27 @@ def main() -> None:
     print("ASI benchmark=staged_separated_multi_detour_oracle")
     print(f"ASI fixture_digest={_fixture_digest()}")
     print(f"ASI denominator={denominator}")
+    print("ASI policy_fixture_cases=2")
     print("ASI seed=none_no_rng")
     print("ASI workers=1")
     print(f"ASI compiled_repetitions={_COMPILED_REPETITIONS}")
     print("ASI cache_policy=fresh_graph_and_planner_clear_shared_caches_per_mode")
-    print(f"METRIC compiled_mean_scenic_regret_pp={mean_regret_pp:.12f}")
-    print(f"METRIC compiled_worst_scenic_regret_pp={worst_regret_pp:.12f}")
+    print(
+        "METRIC compiled_mean_objective_regret_pp="
+        f"{mean_objective_regret_pp:.12f}"
+    )
+    print(
+        "METRIC compiled_worst_objective_regret_pp="
+        f"{worst_objective_regret_pp:.12f}"
+    )
+    print(
+        "METRIC compiled_mean_scenic_regret_pp="
+        f"{mean_scenic_regret_pp:.12f}"
+    )
+    print(
+        "METRIC compiled_worst_scenic_regret_pp="
+        f"{worst_scenic_regret_pp:.12f}"
+    )
     print(f"METRIC compiled_oracle_match_rate={oracle_match_rate:.12f}")
     print(f"METRIC compiled_multi_detour_rate={multi_detour_rate:.12f}")
     print(f"METRIC compiled_detour_recall_rate={detour_recall_rate:.12f}")
