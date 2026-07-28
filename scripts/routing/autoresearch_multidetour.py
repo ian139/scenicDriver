@@ -1,16 +1,15 @@
-"""Deterministic oracle benchmark for separated scenic detours.
+"""Deterministic oracle benchmark for compiled multi-detour routing.
 
 The workload compares the production multi-label and compiled large-graph
-searches with an independent exhaustive oracle on fixed staged graphs.  Every
-oracle-optimal route contains multiple geographically separated divergences
-and rejoins under one shared duration cap.
+searches with an independent exhaustive oracle on fixed staged graphs plus
+distance-tie beam and crossing-recombination review adversaries. Every
+oracle-optimal route contains multiple divergences under one shared cap.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import hashlib
-import itertools
 import json
 import math
 from pathlib import Path
@@ -62,6 +61,7 @@ class FixtureSpec:
     scenic_weight: float = _SCENIC_WEIGHT
     scenic_priority: bool = True
     highway_preference: float = 0.0
+    topology: str = "staged"
 
 
 @dataclass(frozen=True)
@@ -79,6 +79,13 @@ class RouteResult:
     edge_ids: tuple[str, ...]
     detour_indices: frozenset[int]
     process_us: float
+
+
+class _ExactPlanner(ScenicRoutePlanner):
+    """Force every bounded fixture through the simple-path oracle."""
+
+    _EXACT_ORACLE_MAX_NODES = 32
+    _EXACT_ORACLE_MAX_EDGES = 128
 
 
 class _FrontierPlanner(ScenicRoutePlanner):
@@ -200,6 +207,20 @@ _FIXTURES = (
         scenic_priority=False,
         highway_preference=2.0,
     ),
+    FixtureSpec(
+        "distance_tie_beam_pruning",
+        (),
+        1.02,
+        7,
+        topology="distance_tie",
+    ),
+    FixtureSpec(
+        "crossing_recombination_fallback",
+        (),
+        1.325,
+        2,
+        topology="crossing",
+    ),
 )
 
 
@@ -211,23 +232,25 @@ def _add_edge(
     duration_minutes: float,
     scenic_score: float,
     *,
+    distance_km: float | None = None,
     road_type: str = "secondary",
 ) -> None:
+    distance = duration_minutes if distance_km is None else distance_km
     graph.add_edge(
         Edge(
             id=edge_id,
             start_node_id=start_node_id,
             end_node_id=end_node_id,
-            distance_km=duration_minutes,
+            distance_km=distance,
             scenic_score=scenic_score,
             road_type=road_type,
-            speed_limit_kmh=60,
+            speed_limit_kmh=round(distance * 60.0 / duration_minutes),
             one_way=True,
         )
     )
 
 
-def _build_graph(fixture: FixtureSpec) -> RoadGraph:
+def _build_staged_graph(fixture: FixtureSpec) -> RoadGraph:
     graph = RoadGraph()
     for index in range(len(fixture.detours)):
         longitude = index * 0.03
@@ -276,9 +299,160 @@ def _build_graph(fixture: FixtureSpec) -> RoadGraph:
     return graph
 
 
-def _endpoints(fixture: FixtureSpec) -> tuple[tuple[float, float], tuple[float, float]]:
-    last = len(fixture.detours) - 1
-    return (0.0, 0.0), (0.0, last * 0.03 + 0.01)
+def _build_distance_tie_graph() -> RoadGraph:
+    graph = RoadGraph()
+    for index in range(8):
+        longitude = index * 0.03
+        graph.add_node(Node(id=f"A{index}", lat=0.0, lon=longitude))
+        graph.add_node(Node(id=f"B{index}", lat=0.0, lon=longitude + 0.01))
+        graph.add_node(Node(id=f"X{index}", lat=0.01, lon=longitude + 0.005))
+
+    for index in range(8):
+        _add_edge(
+            graph,
+            f"a-main-{index}",
+            f"A{index}",
+            f"B{index}",
+            1.0,
+            4.0,
+            distance_km=1.0,
+        )
+        if index < 7:
+            _add_edge(
+                graph,
+                f"detour-{index}-in",
+                f"A{index}",
+                f"X{index}",
+                0.75,
+                8.0,
+                distance_km=0.25,
+            )
+            _add_edge(
+                graph,
+                f"detour-{index}-out",
+                f"X{index}",
+                f"B{index}",
+                0.25,
+                0.0,
+                distance_km=0.25,
+            )
+        else:
+            _add_edge(
+                graph,
+                "detour-7-in",
+                "A7",
+                "X7",
+                0.625,
+                10.0,
+                distance_km=0.5,
+            )
+            _add_edge(
+                graph,
+                "detour-7-out",
+                "X7",
+                "B7",
+                0.625,
+                10.0,
+                distance_km=0.5,
+            )
+        if index + 1 < 8:
+            _add_edge(
+                graph,
+                f"connector-{index}",
+                f"B{index}",
+                f"A{index + 1}",
+                0.25,
+                4.0,
+                distance_km=0.25,
+            )
+    return graph
+
+
+def _build_crossing_graph() -> RoadGraph:
+    graph = RoadGraph()
+    for node_id, lat, lon in (
+        ("P0", 0.0, 0.0),
+        ("PD", 0.01, 0.005),
+        ("S", 0.0, 0.01),
+        ("X", 0.0, 0.02),
+        ("Y", 0.01, 0.025),
+        ("Z", 0.01, 0.035),
+        ("G", 0.0, 0.04),
+    ):
+        graph.add_node(Node(id=node_id, lat=lat, lon=lon))
+
+    _add_edge(graph, "a-pre-main", "P0", "S", 1.0, 0.0, distance_km=1.0)
+    _add_edge(
+        graph,
+        "detour-0-in",
+        "P0",
+        "PD",
+        0.5,
+        10.0,
+        distance_km=0.5,
+    )
+    _add_edge(
+        graph,
+        "detour-0-out",
+        "PD",
+        "S",
+        0.5,
+        10.0,
+        distance_km=0.5,
+    )
+    _add_edge(graph, "a-fast-sx", "S", "X", 1.0, 0.0, distance_km=1.0)
+    _add_edge(graph, "a-fast-xy", "X", "Y", 1.0, 0.0, distance_km=1.0)
+    _add_edge(graph, "a-fast-yg", "Y", "G", 1.0, 0.0, distance_km=1.0)
+    _add_edge(graph, "z-cross-sy", "S", "Y", 2.0, 10.0, distance_km=0.1)
+    _add_edge(graph, "z-cross-yx", "Y", "X", 0.1, 10.0, distance_km=2.0)
+    _add_edge(
+        graph,
+        "detour-1-in",
+        "X",
+        "Z",
+        1.5,
+        8.0,
+        distance_km=0.5,
+    )
+    _add_edge(
+        graph,
+        "detour-1-out",
+        "Z",
+        "G",
+        1.5,
+        8.0,
+        distance_km=0.5,
+    )
+    return graph
+
+
+def _build_graph(fixture: FixtureSpec) -> RoadGraph:
+    if fixture.topology == "staged":
+        return _build_staged_graph(fixture)
+    if fixture.topology == "distance_tie":
+        return _build_distance_tie_graph()
+    if fixture.topology == "crossing":
+        return _build_crossing_graph()
+    raise RuntimeError(f"{fixture.name}: unknown topology {fixture.topology!r}")
+
+
+def _endpoint_node_ids(fixture: FixtureSpec) -> tuple[str, str]:
+    if fixture.topology == "staged":
+        return "A0", f"B{len(fixture.detours) - 1}"
+    if fixture.topology == "distance_tie":
+        return "A0", "B7"
+    if fixture.topology == "crossing":
+        return "P0", "G"
+    raise RuntimeError(f"{fixture.name}: unknown topology {fixture.topology!r}")
+
+
+def _endpoints(
+    fixture: FixtureSpec, graph: RoadGraph
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    start_id, goal_id = _endpoint_node_ids(fixture)
+    start = graph.nodes[start_id]
+    goal = graph.nodes[goal_id]
+    return (start.lat, start.lon), (goal.lat, goal.lon)
 
 
 def _path_for_choices(
@@ -309,10 +483,48 @@ def _detour_indices(edge_ids: tuple[str, ...]) -> frozenset[int]:
     return frozenset(indices)
 
 
+def _simple_paths(
+    graph: RoadGraph, start_node_id: str, goal_node_id: str
+) -> list[list[Edge]]:
+    paths: list[list[Edge]] = []
+    stack: list[tuple[str, list[Edge], frozenset[str]]] = [
+        (start_node_id, [], frozenset((start_node_id,)))
+    ]
+    while stack:
+        node_id, path, visited = stack.pop()
+        outgoing = sorted(
+            graph.iter_edges(node_id),
+            key=lambda edge: str(getattr(edge, "traversal_id", "") or edge.id),
+            reverse=True,
+        )
+        for edge in outgoing:
+            next_node_id = str(edge.end_node_id)
+            if next_node_id in visited:
+                continue
+            candidate = [*path, edge]
+            if next_node_id == goal_node_id:
+                paths.append(candidate)
+                continue
+            stack.append((next_node_id, candidate, visited | {next_node_id}))
+    return paths
+
+
 def _independent_oracle(fixture: FixtureSpec) -> OracleResult:
     graph = _build_graph(fixture)
-    fastest_path = _path_for_choices(graph, (False,) * len(fixture.detours))
-    fastest_duration = sum(edge.travel_time_minutes for edge in fastest_path)
+    start_node_id, goal_node_id = _endpoint_node_ids(fixture)
+    paths = _simple_paths(graph, start_node_id, goal_node_id)
+    if not paths:
+        raise RuntimeError(f"{fixture.name}: exhaustive oracle found no route")
+    fastest_path = min(
+        paths,
+        key=lambda path: (
+            sum(edge.travel_time_minutes for edge in path),
+            tuple(str(edge.id) for edge in path),
+        ),
+    )
+    fastest_duration = sum(
+        edge.travel_time_minutes for edge in fastest_path
+    )
     duration_cap = fastest_duration * fixture.max_detour_factor
     policy = resolve_routing_policy(
         scenic_weight=fixture.scenic_weight,
@@ -322,8 +534,7 @@ def _independent_oracle(fixture: FixtureSpec) -> OracleResult:
     )
     best_path: list[Edge] | None = None
     best_evaluation: PathEvaluation | None = None
-    for choices in itertools.product((False, True), repeat=len(fixture.detours)):
-        path = _path_for_choices(graph, choices)
+    for path in paths:
         evaluation = evaluate_path(
             path,
             q=fixture.scenic_weight,
@@ -340,7 +551,7 @@ def _independent_oracle(fixture: FixtureSpec) -> OracleResult:
             best_evaluation = evaluation
     if best_path is None or best_evaluation is None:
         raise RuntimeError(f"{fixture.name}: exhaustive oracle found no route")
-    edge_ids = tuple(edge.id for edge in best_path)
+    edge_ids = tuple(str(edge.id) for edge in best_path)
     detours = _detour_indices(edge_ids)
     if len(detours) != fixture.expected_oracle_detours:
         raise RuntimeError(
@@ -363,7 +574,7 @@ def _run_mode(fixture: FixtureSpec, mode: str, oracle: OracleResult) -> RouteRes
     ScenicRoutePlanner.clear_shared_caches()
     graph = _build_graph(fixture)
     if mode == "exact":
-        planner: ScenicRoutePlanner = ScenicRoutePlanner(graph)
+        planner: ScenicRoutePlanner = _ExactPlanner(graph)
     elif mode == "frontier":
         planner = _FrontierPlanner(graph, frontier_time_limit_seconds=60.0)
     elif mode == "compiled":
@@ -371,7 +582,7 @@ def _run_mode(fixture: FixtureSpec, mode: str, oracle: OracleResult) -> RouteRes
     else:  # pragma: no cover - internal harness misuse
         raise ValueError(f"unknown routing mode: {mode}")
 
-    start, end = _endpoints(fixture)
+    start, end = _endpoints(fixture, graph)
     started = process_time_ns()
     route = planner.find_scenic_route(
         start,
@@ -462,8 +673,25 @@ def _p95(values: list[float]) -> float:
 
 
 def _fixture_digest() -> str:
+    payload: list[dict[str, Any]] = []
+    for fixture in _FIXTURES:
+        graph = _build_graph(fixture)
+        payload.append(
+            {
+                "fixture": asdict(fixture),
+                "endpoint_node_ids": _endpoint_node_ids(fixture),
+                "nodes": [
+                    asdict(graph.nodes[node_id])
+                    for node_id in sorted(graph.nodes)
+                ],
+                "edges": [
+                    asdict(graph.edges[edge_id])
+                    for edge_id in sorted(graph.edges)
+                ],
+            }
+        )
     encoded = json.dumps(
-        [asdict(fixture) for fixture in _FIXTURES],
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
@@ -472,13 +700,14 @@ def _fixture_digest() -> str:
 
 def main() -> None:
     total_started = perf_counter()
-    if len(_FIXTURES) != 14:
+    if len(_FIXTURES) != 16:
         raise RuntimeError("multi-detour fixture denominator changed")
 
     objective_regrets_pp: list[float] = []
     scenic_regrets_pp: list[float] = []
     detour_recalls: list[float] = []
     compiled_oracle_matches = 0
+    compiled_review_oracle_matches = 0
     compiled_multiple_detour_cases = 0
     exact_oracle_matches = 0
     frontier_oracle_matches = 0
@@ -528,6 +757,8 @@ def main() -> None:
             compiled.evaluation, oracle.evaluation
         ) == 0:
             compiled_oracle_matches += 1
+            if fixture.topology != "staged":
+                compiled_review_oracle_matches += 1
         if len(compiled.detour_indices) >= 2:
             compiled_multiple_detour_cases += 1
         detour_recalls.append(
@@ -539,6 +770,9 @@ def main() -> None:
         compiled_times_us.extend(result.process_us for result in compiled_runs)
 
     denominator = len(_FIXTURES)
+    review_denominator = sum(
+        fixture.topology != "staged" for fixture in _FIXTURES
+    )
     mean_objective_regret_pp = sum(objective_regrets_pp) / denominator
     worst_objective_regret_pp = max(objective_regrets_pp)
     mean_scenic_regret_pp = sum(scenic_regrets_pp) / denominator
@@ -550,7 +784,7 @@ def main() -> None:
     # A non-scenic-priority q=0 request must retain the fastest identity.
     control_fixture = _FIXTURES[0]
     control_graph = _build_graph(control_fixture)
-    control_start, control_end = _endpoints(control_fixture)
+    control_start, control_end = _endpoints(control_fixture, control_graph)
     ScenicRoutePlanner.clear_shared_caches()
     control_planner = _CompiledPlanner(control_graph)
     control_route = control_planner.find_scenic_route(
@@ -569,10 +803,11 @@ def main() -> None:
     if tuple(control_route.edge_ids) != expected_fastest_ids:
         raise RuntimeError("q=0 control route changed from canonical fastest")
 
-    print("ASI benchmark=staged_separated_multi_detour_oracle")
+    print("ASI benchmark=fixed_multi_detour_review_oracle")
     print(f"ASI fixture_digest={_fixture_digest()}")
     print(f"ASI denominator={denominator}")
     print("ASI policy_fixture_cases=2")
+    print("ASI review_fixture_cases=2")
     print("ASI seed=none_no_rng")
     print("ASI workers=1")
     print(f"ASI compiled_repetitions={_COMPILED_REPETITIONS}")
@@ -594,6 +829,10 @@ def main() -> None:
         f"{worst_scenic_regret_pp:.12f}"
     )
     print(f"METRIC compiled_oracle_match_rate={oracle_match_rate:.12f}")
+    print(
+        "METRIC compiled_review_oracle_match_rate="
+        f"{compiled_review_oracle_matches / review_denominator:.12f}"
+    )
     print(f"METRIC compiled_multi_detour_rate={multi_detour_rate:.12f}")
     print(f"METRIC compiled_detour_recall_rate={detour_recall_rate:.12f}")
     print(f"METRIC exact_oracle_match_rate={exact_oracle_matches / denominator:.12f}")
