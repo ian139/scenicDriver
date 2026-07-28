@@ -4827,144 +4827,6 @@ class ScenicRoutePlanner:
                 best = candidate
                 best_metric = metric
         return best
-    def _large_graph_greedy_detour_candidate(
-        self,
-        fastest_edges: List[Edge],
-        scenic_edges: List[Edge],
-        duration_cap_minutes: float,
-    ) -> Optional[List[Edge]]:
-        """Keep the best ordered scenic islands that fit the shared cap."""
-        if not fastest_edges or not scenic_edges:
-            return None
-
-        def path_nodes(path: List[Edge]) -> Optional[List[str]]:
-            nodes = [str(path[0].start_node_id)]
-            for edge in path:
-                if str(edge.start_node_id) != nodes[-1]:
-                    return None
-                nodes.append(str(edge.end_node_id))
-            return nodes
-
-        def identity(path: List[Edge]) -> Tuple[str, ...]:
-            return tuple(
-                str(getattr(edge, "traversal_id", "") or edge.id)
-                for edge in path
-            )
-
-        fastest_nodes = path_nodes(fastest_edges)
-        scenic_nodes = path_nodes(scenic_edges)
-        if (
-            fastest_nodes is None
-            or scenic_nodes is None
-            or fastest_nodes[0] != scenic_nodes[0]
-            or fastest_nodes[-1] != scenic_nodes[-1]
-        ):
-            return None
-
-        scenic_positions = {
-            node_id: index for index, node_id in enumerate(scenic_nodes)
-        }
-        anchors: List[Tuple[int, int]] = []
-        last_scenic_index = -1
-        for fastest_index, node_id in enumerate(fastest_nodes):
-            scenic_index = scenic_positions.get(node_id)
-            if scenic_index is None or scenic_index <= last_scenic_index:
-                continue
-            anchors.append((fastest_index, scenic_index))
-            last_scenic_index = scenic_index
-        if (
-            not anchors
-            or anchors[0] != (0, 0)
-            or anchors[-1] != (len(fastest_edges), len(scenic_edges))
-        ):
-            return None
-
-        ranked: List[
-            Tuple[
-                float,
-                float,
-                Tuple[str, ...],
-                int,
-                int,
-                int,
-                int,
-            ]
-        ] = []
-        for (fast_start, scenic_start), (fast_end, scenic_end) in zip(
-            anchors, anchors[1:]
-        ):
-            fast_segment = fastest_edges[fast_start:fast_end]
-            scenic_segment = scenic_edges[scenic_start:scenic_end]
-            if identity(fast_segment) == identity(scenic_segment):
-                continue
-            fast_score = distance_weighted_scenic_score(fast_segment)
-            scenic_score = distance_weighted_scenic_score(scenic_segment)
-            if scenic_score <= fast_score + 1e-12:
-                continue
-            added_duration = (
-                self._path_duration_minutes(scenic_segment)
-                - self._path_duration_minutes(fast_segment)
-            )
-            ranked.append(
-                (
-                    -scenic_score,
-                    added_duration,
-                    identity(scenic_segment),
-                    fast_start,
-                    fast_end,
-                    scenic_start,
-                    scenic_end,
-                )
-            )
-        if not ranked or len(ranked) > 64:
-            return None
-
-        selected: set[int] = set()
-        duration = self._path_duration_minutes(fastest_edges)
-        for (
-            _negative_score,
-            added_duration,
-            _identity,
-            fast_start,
-            _fast_end,
-            _scenic_start,
-            _scenic_end,
-        ) in sorted(ranked):
-            next_duration = duration + added_duration
-            if self._duration_within_cap(
-                next_duration, duration_cap_minutes
-            ):
-                selected.add(fast_start)
-                duration = next_duration
-        if not selected:
-            return None
-
-        candidate: List[Edge] = []
-        cursor = 0
-        for (
-            _negative_score,
-            _added_duration,
-            _identity,
-            fast_start,
-            fast_end,
-            scenic_start,
-            scenic_end,
-        ) in sorted(ranked, key=lambda item: item[3]):
-            candidate.extend(fastest_edges[cursor:fast_start])
-            candidate.extend(
-                scenic_edges[scenic_start:scenic_end]
-                if fast_start in selected
-                else fastest_edges[fast_start:fast_end]
-            )
-            cursor = fast_end
-        candidate.extend(fastest_edges[cursor:])
-        if (
-            identity(candidate) == identity(fastest_edges)
-            or not self._simple_edge_path(candidate)
-        ):
-            return None
-        return candidate
-
     def _large_graph_scenic_search(
         self,
         request: _EndpointAccessRequest,
@@ -5061,15 +4923,10 @@ class ScenicRoutePlanner:
             if result is None:
                 continue
             duration, path, _start_rank, _end_rank, _rank_key = result
-            if not self._duration_within_cap(duration, duration_cap_minutes):
-                repaired = self._large_graph_greedy_detour_candidate(
-                    fastest_edges,
-                    path,
-                    duration_cap_minutes,
-                )
-                if repaired is None:
-                    continue
-                path = repaired
+            if not self._duration_within_cap(
+                duration, duration_cap_minutes
+            ):
+                continue
             evaluation = evaluate_path(
                 path,
                 q=q,
