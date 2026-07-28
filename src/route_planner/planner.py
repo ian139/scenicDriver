@@ -5131,6 +5131,7 @@ class ScenicRoutePlanner:
             (list(fastest_edges), fastest_evaluation)
         ]
         repaired_scalar = False
+        attempted_repair_ids: set[Tuple[str, ...]] = set()
         # Increasing duration multipliers trace a small, deterministic
         # Lagrangian frontier without retaining a label for every base node.
         multipliers = (0.0, 0.25, 0.75, 1.5)
@@ -5192,7 +5193,9 @@ class ScenicRoutePlanner:
             if (
                 not repaired_scalar
                 and source_identity != fastest_evaluation.edge_ids
+                and source_identity not in attempted_repair_ids
             ):
+                attempted_repair_ids.add(source_identity)
                 repaired = self._large_graph_detour_candidate(
                     fastest_edges,
                     path,
