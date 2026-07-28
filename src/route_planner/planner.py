@@ -27,7 +27,6 @@ from .cancellation import RoutingDeadline, RoutingTimeout
 from .cost import (
     CostWeights,
     HIGHWAY_ROAD_TYPES,
-    MIN_EDGE_COST,
     PathEvaluation,
     RoutingPolicy,
     ScenicCostFunction,
@@ -331,25 +330,6 @@ class _CSRData:
     signature: Tuple[object, ...]
     matrix: object
     weights: np.ndarray
-
-
-@dataclass(frozen=True)
-class _PathTotals:
-    distance: float
-    duration: float
-    weighted_scenic: float
-    highway_duration: float
-
-
-@dataclass(frozen=True)
-class _DetourIsland:
-    fast_start: int
-    fast_end: int
-    scenic_start: int
-    scenic_end: int
-    delta: _PathTotals
-
-
 
 @dataclass(frozen=True)
 class _PersistentPathKey:
@@ -4847,269 +4827,6 @@ class ScenicRoutePlanner:
                 best = candidate
                 best_metric = metric
         return best
-    def _large_graph_detour_candidate(
-        self,
-        fastest_edges: List[Edge],
-        scenic_edges: List[Edge],
-        scenic_identity: Tuple[str, ...],
-        *,
-        q: float,
-        kappa: float,
-        duration_cap_minutes: float,
-        fastest_duration_minutes: float,
-        policy: RoutingPolicy,
-        fastest_evaluation: PathEvaluation,
-    ) -> Optional[Tuple[List[Edge], PathEvaluation]]:
-        """Recombine ordered scalar-path islands in a bounded policy frontier."""
-        if not fastest_edges or not scenic_edges:
-            return None
-
-        def nodes(path: List[Edge]) -> List[str]:
-            result = [str(path[0].start_node_id)]
-            for position, edge in enumerate(path):
-                _check_active_deadline_at(position)
-                result.append(str(edge.end_node_id))
-            _check_active_deadline()
-            return result
-
-        def measure(path: List[Edge], start: int, end: int) -> _PathTotals:
-            distance = duration = weighted = highway_duration = 0.0
-            for position in range(start, end):
-                _check_active_deadline_at(position - start)
-                edge = path[position]
-                edge_distance = self._validated_nonnegative(
-                    edge.distance_km, "edge distance_km"
-                )
-                edge_duration = self._edge_duration_minutes(edge)
-                distance += edge_distance
-                duration += edge_duration
-                weighted += edge_distance * clamp_scenic_score(
-                    edge.scenic_score
-                )
-                if is_highway_road_type(edge.road_type):
-                    highway_duration += edge_duration
-            _check_active_deadline()
-            return _PathTotals(distance, duration, weighted, highway_duration)
-
-        state_type = Tuple[int, float, float, float, float]
-        highway_scale = policy.highway_preference / max(
-            fastest_duration_minutes,
-            MIN_EDGE_COST,
-        )
-
-        def state_rank(state: state_type) -> Tuple[float, ...]:
-            _, distance, duration, weighted, highway_duration = state
-            raw = weighted / distance if distance else 0.0
-            normalized = raw / 10.0
-            if policy.scenic_priority:
-                if policy.highway_preference > 0.0:
-                    objective = normalized - highway_scale * highway_duration
-                    return objective, normalized, -duration, -distance
-                return normalized, -duration, -distance
-            utility = duration_component(
-                duration,
-                fastest_duration_minutes,
-                policy.kappa,
-            )
-            objective = (
-                (1.0 - policy.scenic_weight) * utility
-                + policy.scenic_weight * normalized
-                - highway_scale * highway_duration
-            )
-            return objective, raw, -duration
-
-        def ranked_state_key(state: state_type) -> Tuple[object, ...]:
-            return (*state_rank(state), -state[0])
-
-        fastest_nodes = nodes(fastest_edges)
-        scenic_nodes = nodes(scenic_edges)
-        if (fastest_nodes[0], fastest_nodes[-1]) != (
-            scenic_nodes[0],
-            scenic_nodes[-1],
-        ):
-            return None
-        scenic_positions: Dict[str, int] = {}
-        for index, node_id in enumerate(scenic_nodes):
-            _check_active_deadline_at(index)
-            scenic_positions[node_id] = index
-        anchors: List[Tuple[int, int]] = []
-        last_scenic = -1
-        for fast_index, node_id in enumerate(fastest_nodes):
-            _check_active_deadline_at(fast_index)
-            scenic_index = scenic_positions.get(node_id)
-            if scenic_index is not None and scenic_index > last_scenic:
-                anchors.append((fast_index, scenic_index))
-                last_scenic = scenic_index
-        if (
-            not anchors
-            or anchors[0] != (0, 0)
-            or anchors[-1] != (len(fastest_edges), len(scenic_edges))
-        ):
-            return None
-
-        islands: List[_DetourIsland] = []
-        for (fast_start, scenic_start), (fast_end, scenic_end) in zip(
-            anchors, anchors[1:]
-        ):
-            if (
-                fastest_evaluation.edge_ids[fast_start:fast_end]
-                == scenic_identity[scenic_start:scenic_end]
-            ):
-                continue
-            fast = measure(fastest_edges, fast_start, fast_end)
-            scenic = measure(scenic_edges, scenic_start, scenic_end)
-            islands.append(
-                _DetourIsland(
-                    fast_start,
-                    fast_end,
-                    scenic_start,
-                    scenic_end,
-                    _PathTotals(
-                        scenic.distance - fast.distance,
-                        scenic.duration - fast.duration,
-                        scenic.weighted_scenic - fast.weighted_scenic,
-                        scenic.highway_duration - fast.highway_duration,
-                    ),
-                )
-            )
-        if not islands:
-            return None
-
-        remaining_savings = [0.0] * (len(islands) + 1)
-        for index in range(len(islands) - 1, -1, -1):
-            _check_active_deadline_at(len(islands) - index)
-            remaining_savings[index] = (
-                remaining_savings[index + 1]
-                + min(0.0, islands[index].delta.duration)
-            )
-
-        fastest_totals = measure(fastest_edges, 0, len(fastest_edges))
-        states: List[state_type] = [
-            (
-                0,
-                fastest_totals.distance,
-                fastest_totals.duration,
-                fastest_totals.weighted_scenic,
-                fastest_totals.highway_duration,
-            )
-        ]
-        within_cap = self._duration_within_cap
-        expanded = 0
-        for index, island in enumerate(islands):
-            possible_savings = remaining_savings[index + 1]
-            next_states: List[state_type] = []
-            delta = island.delta
-            bit = 1 << index
-            for state in states:
-                _check_active_deadline_at(expanded)
-                expanded += 1
-                selected, distance, duration, weighted, highway_duration = state
-                if within_cap(
-                    duration + possible_savings,
-                    duration_cap_minutes,
-                ):
-                    next_states.append(state)
-                scenic_duration = duration + delta.duration
-                if within_cap(
-                    scenic_duration + possible_savings,
-                    duration_cap_minutes,
-                ):
-                    next_states.append(
-                        (
-                            selected | bit,
-                            distance + delta.distance,
-                            scenic_duration,
-                            weighted + delta.weighted_scenic,
-                            highway_duration + delta.highway_duration,
-                        )
-                    )
-            states = next_states
-            if not states:
-                return None
-            if len(states) > 64:
-                ranked = sorted(
-                    states,
-                    key=ranked_state_key,
-                    reverse=True,
-                )
-                shortest = sorted(
-                    states,
-                    key=lambda state: (state[2], state[0]),
-                )
-                retained: Dict[int, state_type] = {}
-                for state in ranked[:48]:
-                    retained.setdefault(state[0], state)
-                for state in shortest[:16]:
-                    retained.setdefault(state[0], state)
-                states = list(retained.values())
-                _check_active_deadline()
-
-        ranked_states = sorted(
-            ((state_rank(state), state) for state in states),
-            key=lambda item: (*item[0], -item[1][0]),
-            reverse=True,
-        )
-        position = 0
-        while position < len(ranked_states):
-            group_rank = ranked_states[position][0]
-            group_best: Optional[Tuple[List[Edge], PathEvaluation]] = None
-            while (
-                position < len(ranked_states)
-                and ranked_states[position][0] == group_rank
-            ):
-                state = ranked_states[position][1]
-                position += 1
-                selected = state[0]
-                if not selected:
-                    continue
-                candidate: List[Edge] = []
-                cursor = 0
-                for index, island in enumerate(islands):
-                    segment = fastest_edges[cursor : island.fast_start]
-                    segment += (
-                        scenic_edges[island.scenic_start : island.scenic_end]
-                        if selected & (1 << index)
-                        else fastest_edges[
-                            island.fast_start : island.fast_end
-                        ]
-                    )
-                    for edge in segment:
-                        _check_active_deadline_at(len(candidate))
-                        candidate.append(edge)
-                    cursor = island.fast_end
-                for edge in fastest_edges[cursor:]:
-                    _check_active_deadline_at(len(candidate))
-                    candidate.append(edge)
-                if not self._simple_edge_path(candidate):
-                    continue
-                evaluation = evaluate_path(
-                    candidate,
-                    q=q,
-                    kappa=kappa,
-                    fastest_duration_minutes=fastest_duration_minutes,
-                    policy=policy,
-                    check_cancelled=_check_active_deadline,
-                )
-                if (
-                    not within_cap(
-                        evaluation.duration_minutes,
-                        duration_cap_minutes,
-                    )
-                    or not is_better_path(
-                        evaluation,
-                        fastest_evaluation,
-                    )
-                ):
-                    continue
-                if group_best is None or is_better_path(
-                    evaluation,
-                    group_best[1],
-                ):
-                    group_best = candidate, evaluation
-            if group_best is not None:
-                return group_best
-        return None
-
     def _large_graph_scenic_search(
         self,
         request: _EndpointAccessRequest,
@@ -5165,8 +4882,6 @@ class ScenicRoutePlanner:
         candidates: List[Tuple[List[Edge], PathEvaluation]] = [
             (list(fastest_edges), fastest_evaluation)
         ]
-        repaired_scalar = False
-        attempted_repair_ids: set[Tuple[str, ...]] = set()
         # Increasing duration multipliers trace a small, deterministic
         # Lagrangian frontier without retaining a label for every base node.
         multipliers = (0.0, 0.25, 0.75, 1.5)
@@ -5208,44 +4923,19 @@ class ScenicRoutePlanner:
             if result is None:
                 continue
             duration, path, _start_rank, _end_rank, _rank_key = result
-            source_tokens: List[str] = []
-            for position, edge in enumerate(path):
-                _check_active_deadline_at(position)
-                token = getattr(edge, "traversal_id", "")
-                source_tokens.append(str(token or edge.id))
-            source_identity = tuple(source_tokens)
-            if self._duration_within_cap(duration, duration_cap_minutes):
-                evaluation = evaluate_path(
-                    path,
-                    q=q,
-                    kappa=kappa,
-                    fastest_duration_minutes=fastest_duration_minutes,
-                    policy=policy,
-                    check_cancelled=_check_active_deadline,
-                )
-                candidates.append((path, evaluation))
-
-            if (
-                not repaired_scalar
-                and source_identity != fastest_evaluation.edge_ids
-                and source_identity not in attempted_repair_ids
+            if not self._duration_within_cap(
+                duration, duration_cap_minutes
             ):
-                attempted_repair_ids.add(source_identity)
-                repaired = self._large_graph_detour_candidate(
-                    fastest_edges,
-                    path,
-                    source_identity,
-                    q=q,
-                    kappa=kappa,
-                    duration_cap_minutes=duration_cap_minutes,
-                    fastest_duration_minutes=fastest_duration_minutes,
-                    policy=policy,
-                    fastest_evaluation=fastest_evaluation,
-                )
-                check_graph()
-                if repaired is not None:
-                    repaired_scalar = True
-                    candidates.append(repaired)
+                continue
+            evaluation = evaluate_path(
+                path,
+                q=q,
+                kappa=kappa,
+                fastest_duration_minutes=fastest_duration_minutes,
+                policy=policy,
+                check_cancelled=_check_active_deadline,
+            )
+            candidates.append((path, evaluation))
 
         check_graph()
         best_edges, best_evaluation = candidates[0]
@@ -5256,9 +4946,9 @@ class ScenicRoutePlanner:
         elapsed_ms = (time.monotonic() - started_at) * 1000.0
         diagnostics = {
             "time_limit_seconds": 0.0,
-            "labels_generated": len(multipliers) + int(repaired_scalar),
+            "labels_generated": len(multipliers),
             "labels_expanded": len(candidates),
-            "labels_pruned": len(multipliers) + int(repaired_scalar) - len(candidates) + 1,
+            "labels_pruned": len(multipliers) - len(candidates) + 1,
             "max_frontier_size": len(candidates),
             "remaining_frontier_size": 0,
             "deadline_reached": False,
@@ -5350,8 +5040,7 @@ class ScenicRoutePlanner:
             return True
         nodes: set[str] = set()
         previous_end: Optional[str] = None
-        for position, edge in enumerate(edges):
-            _check_active_deadline_at(position)
+        for edge in edges:
             start_id = str(edge.start_node_id)
             end_id = str(edge.end_node_id)
             if previous_end is not None and start_id != previous_end:
@@ -5360,7 +5049,6 @@ class ScenicRoutePlanner:
                 return False
             nodes.add(start_id)
             previous_end = end_id
-        _check_active_deadline()
         return previous_end not in nodes
 
     @staticmethod
