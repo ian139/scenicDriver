@@ -221,6 +221,20 @@ _FIXTURES = (
         2,
         topology="crossing",
     ),
+    FixtureSpec(
+        "canonical_beam_tie",
+        (),
+        1.5,
+        4,
+        topology="canonical_tie",
+    ),
+    FixtureSpec(
+        "rounded_aggregate_rank",
+        (),
+        4.0 / 3.0,
+        2,
+        topology="rounded_aggregate",
+    ),
 )
 
 
@@ -426,6 +440,116 @@ def _build_crossing_graph() -> RoadGraph:
     return graph
 
 
+def _build_canonical_tie_graph() -> RoadGraph:
+    graph = RoadGraph()
+    for index in range(9):
+        graph.add_node(Node(id=f"N{index}", lat=0.0, lon=index * 0.01))
+    for index in range(8):
+        graph.add_node(
+            Node(id=f"X{index}", lat=0.01, lon=index * 0.01 + 0.005)
+        )
+
+    for index in range(8):
+        main_prefix = "a" if index < 4 else "z"
+        _add_edge(
+            graph,
+            f"{main_prefix}-main-{index}",
+            f"N{index}",
+            f"N{index + 1}",
+            1.0,
+            0.0,
+            distance_km=1.0,
+        )
+        _add_edge(
+            graph,
+            f"detour-{index}-in",
+            f"N{index}",
+            f"X{index}",
+            1.0,
+            10.0,
+            distance_km=1.0,
+        )
+        _add_edge(
+            graph,
+            f"detour-{index}-out",
+            f"X{index}",
+            f"N{index + 1}",
+            1.0,
+            10.0,
+            distance_km=1.0,
+        )
+    return graph
+
+
+def _build_rounded_aggregate_graph() -> RoadGraph:
+    graph = RoadGraph()
+    for node_id, lat, lon in (
+        ("P0", 0.0, 0.0),
+        ("PD", 0.01, 0.005),
+        ("N0", 0.0, 0.01),
+        ("N1", 0.0, 0.02),
+        ("N2", 0.0, 0.03),
+    ):
+        graph.add_node(Node(id=node_id, lat=lat, lon=lon))
+
+    _add_edge(graph, "a-pre-main", "P0", "N0", 1.0, 0.0, distance_km=1.0)
+    _add_edge(
+        graph,
+        "detour-0-in",
+        "P0",
+        "PD",
+        0.5,
+        10.0,
+        distance_km=0.5,
+    )
+    _add_edge(
+        graph,
+        "detour-0-out",
+        "PD",
+        "N0",
+        0.5,
+        10.0,
+        distance_km=0.5,
+    )
+    _add_edge(
+        graph,
+        "a-huge-fast",
+        "N0",
+        "N1",
+        1.0,
+        0.0,
+        distance_km=1.0e16,
+    )
+    _add_edge(
+        graph,
+        "detour-1-in",
+        "N0",
+        "N1",
+        2.0,
+        6.0,
+        distance_km=1.0,
+    )
+    _add_edge(
+        graph,
+        "a-tail-fast",
+        "N1",
+        "N2",
+        1.0,
+        0.0,
+        distance_km=1.0,
+    )
+    _add_edge(
+        graph,
+        "detour-2-in",
+        "N1",
+        "N2",
+        2.0,
+        10.0,
+        distance_km=1.0,
+    )
+    return graph
+
+
 def _build_graph(fixture: FixtureSpec) -> RoadGraph:
     if fixture.topology == "staged":
         return _build_staged_graph(fixture)
@@ -433,6 +557,10 @@ def _build_graph(fixture: FixtureSpec) -> RoadGraph:
         return _build_distance_tie_graph()
     if fixture.topology == "crossing":
         return _build_crossing_graph()
+    if fixture.topology == "canonical_tie":
+        return _build_canonical_tie_graph()
+    if fixture.topology == "rounded_aggregate":
+        return _build_rounded_aggregate_graph()
     raise RuntimeError(f"{fixture.name}: unknown topology {fixture.topology!r}")
 
 
@@ -443,6 +571,10 @@ def _endpoint_node_ids(fixture: FixtureSpec) -> tuple[str, str]:
         return "A0", "B7"
     if fixture.topology == "crossing":
         return "P0", "G"
+    if fixture.topology == "canonical_tie":
+        return "N0", "N8"
+    if fixture.topology == "rounded_aggregate":
+        return "P0", "N2"
     raise RuntimeError(f"{fixture.name}: unknown topology {fixture.topology!r}")
 
 
@@ -700,7 +832,7 @@ def _fixture_digest() -> str:
 
 def main() -> None:
     total_started = perf_counter()
-    if len(_FIXTURES) != 16:
+    if len(_FIXTURES) != 18:
         raise RuntimeError("multi-detour fixture denominator changed")
 
     objective_regrets_pp: list[float] = []
@@ -807,7 +939,7 @@ def main() -> None:
     print(f"ASI fixture_digest={_fixture_digest()}")
     print(f"ASI denominator={denominator}")
     print("ASI policy_fixture_cases=2")
-    print("ASI review_fixture_cases=2")
+    print("ASI review_fixture_cases=4")
     print("ASI seed=none_no_rng")
     print("ASI workers=1")
     print(f"ASI compiled_repetitions={_COMPILED_REPETITIONS}")
