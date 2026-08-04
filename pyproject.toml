@@ -30,7 +30,6 @@ dependencies = [
 dev = [
   "pytest>=8.0",
   "ruff>=0.7",
-  "black>=24.0",
 ]
 
 [tool.pytest.ini_options]
