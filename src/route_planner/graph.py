@@ -1057,21 +1057,6 @@ class RoadGraph:
             check_cancelled()
         return graph
 
-    @classmethod
-    def from_osm(cls, osm_file: Path, scenic_scores: Optional[Dict[str, float]] = None) -> "RoadGraph":
-        try:
-            import osmnx as ox
-        except ImportError as exc:
-            raise ImportError("osmnx is required for OSM import. Run: uv run --with 'osmnx==2.1.0'") from exc
-
-        scenic_scores = scenic_scores or {}
-        osm_path = Path(osm_file)
-        if osm_path.suffix == ".graphml":
-            G = ox.load_graphml(osm_path)
-        else:
-            G = ox.graph_from_xml(osm_path)
-        return _graph_from_osmnx(G, scenic_scores)
-
 
 _T = TypeVar("_T")
 _TraversalRef = Tuple[str, bool]

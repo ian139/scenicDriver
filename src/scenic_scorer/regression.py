@@ -130,6 +130,21 @@ class ScenicScoreDataset(torch.utils.data.Dataset):
         )
 
 
+def resolve_device(device: str | None = None) -> str:
+    """Resolve compute device for scenic score regression model execution.
+
+    Selection priority when device is None or 'auto': CUDA -> MPS -> CPU.
+    Explicit device strings are passed through verbatim.
+    """
+    if device is None or device == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    return device
+
+
 def train_regression_model(
     data_path: Path,
     output_path: Path,
@@ -148,13 +163,7 @@ def train_regression_model(
     Returns:
         Final validation correlation coefficient
     """
-    if device is None:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+    device = resolve_device(device)
 
     torch.manual_seed(seed)
     np.random.seed(seed)

@@ -31,6 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.classifier.inference import get_inference_transform  # noqa: E402
 from src.classifier.model import LandscapeClassifier  # noqa: E402
 from src.terrain.features import compute_terrain_features  # noqa: E402
+from src.scenic_scorer.regression import resolve_device  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -165,14 +166,7 @@ def main() -> None:
     if not args.classifier_ckpt.exists():
         raise FileNotFoundError(f"classifier checkpoint not found: {args.classifier_ckpt}")
 
-    device = args.device
-    if device == "auto":
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+    device = resolve_device(args.device)
 
     df = pd.read_csv(args.labels_csv)
     required = {"image_path", "scenic_score"}

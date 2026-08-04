@@ -25,13 +25,15 @@ published image used by the lifecycle scripts is
 - AWS credentials supplied at runtime. The container accepts an env file such
   as `/root/.scenic/aws.env` containing `AWS_ACCESS_KEY_ID`,
   `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, and `SCENIC_S3_BUCKET`.
-  Follow [`aws-s3.md`](aws-s3.md) for bucket and credential setup. The
-  provisioning script uses the AWS CLI when available and falls back to the
-  repository's `boto3` S3 helper.
+  Follow [`aws-s3.md`](aws-s3.md) for bucket and credential setup. Container
+  provisioning checks identity and bucket access with `boto3`, then uses the
+  repository's `python -m src.data_pipeline.s3` helper for every S3 prefix
+  check and transfer.
 - `uv` and the checked-out repository for the state-backed wrapper path.
 
-The image does not need an extra AWS CLI layer when the `boto3` fallback is
-available. Never bake credentials into the image.
+The container does not need an AWS CLI layer: `boto3` and the repository S3
+helper are the only S3 interfaces used by its provisioning path. Never bake
+credentials into the image.
 
 ## Build, smoke-test, and publish the image
 
@@ -78,8 +80,16 @@ export SCENIC_S3_DATA_PREFIX=processed/regression/vast-smoke/$SCENIC_RUN_ID/
 export SCENIC_S3_MODELS_PREFIX=models/vast-smoke/$SCENIC_RUN_ID/
 export SCENIC_S3_OUTPUT_PREFIX=outputs/vast/$SCENIC_RUN_ID/
 
-aws s3 cp /path/to/tiny_features.npz "s3://$SCENIC_S3_BUCKET/$SCENIC_S3_DATA_PREFIX"
-aws s3 cp /path/to/tiny_regression.pt "s3://$SCENIC_S3_BUCKET/$SCENIC_S3_MODELS_PREFIX"
+uv run python -m src.data_pipeline.s3 upload-prefix \
+  --src /path/to/tiny_features.npz \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --prefix "$SCENIC_S3_DATA_PREFIX" \
+  --required
+uv run python -m src.data_pipeline.s3 upload-prefix \
+  --src /path/to/tiny_regression.pt \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --prefix "$SCENIC_S3_MODELS_PREFIX" \
+  --required
 ```
 
 Search for a suitable offer, start a temporary instance, and verify SSH and GPU
@@ -122,15 +132,38 @@ docker run --gpus all --name scenic-vast-validate \
 
 ### Provisioning gates
 
-`scripts/remote/provision_vast.sh` runs these checks in order. The commands
-below show the AWS CLI form; inside the container the script uses its `boto3`
-fallback when the AWS CLI is absent:
+`scripts/remote/provision_vast.sh` runs these checks in order. It performs
+identity and bucket authorization directly with `boto3`, then uses the
+repository S3 helper for every prefix check and transfer:
 
 ```bash
-aws sts get-caller-identity
-aws s3api head-bucket --bucket "$SCENIC_S3_BUCKET"
-aws s3 sync "s3://$SCENIC_S3_BUCKET/$SCENIC_S3_DATA_PREFIX" data/processed/regression
-aws s3 sync "s3://$SCENIC_S3_BUCKET/$SCENIC_S3_MODELS_PREFIX" models
+python - <<'PY'
+import boto3
+boto3.client("sts").get_caller_identity()
+PY
+python - <<'PY'
+import os
+import boto3
+boto3.client("s3").head_bucket(Bucket=os.environ["SCENIC_S3_BUCKET"])
+PY
+python -m src.data_pipeline.s3 check-prefix \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --prefix "$SCENIC_S3_DATA_PREFIX" \
+  --required
+python -m src.data_pipeline.s3 check-prefix \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --prefix "$SCENIC_S3_MODELS_PREFIX" \
+  --required
+python -m src.data_pipeline.s3 download-prefix \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --prefix "$SCENIC_S3_DATA_PREFIX" \
+  --dest data/processed/regression \
+  --required
+python -m src.data_pipeline.s3 download-prefix \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --prefix "$SCENIC_S3_MODELS_PREFIX" \
+  --dest models \
+  --required
 nvidia-smi
 python scripts/remote/container_smoke.py --device cuda --check-imports --json
 python scripts/remote/minimal_inference.py \
@@ -138,8 +171,11 @@ python scripts/remote/minimal_inference.py \
   --checkpoint models/<checkpoint>.pt \
   --dataset data/processed/regression/<features>.npz \
   --output scenic_artifacts/vast/<run-id>/inference_result.json
-aws s3 sync scenic_artifacts/vast/<run-id>/ \
-  "s3://$SCENIC_S3_BUCKET/$SCENIC_S3_OUTPUT_PREFIX"
+python -m src.data_pipeline.s3 upload-prefix \
+  --src scenic_artifacts/vast/<run-id>/ \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --prefix "$SCENIC_S3_OUTPUT_PREFIX" \
+  --required
 ```
 
 The script fails closed when required data/model prefixes or local inference
@@ -156,7 +192,8 @@ Validation checklist:
 - [ ] `nvidia-smi` succeeds on the host and through the container path.
 - [ ] `container_smoke.py --device cuda --check-imports` succeeds.
 - [ ] `minimal_inference.py` writes `inference_result.json` quickly.
-- [ ] `aws s3 sync` uploads the output directory to the output prefix.
+- [ ] `python -m src.data_pipeline.s3 upload-prefix` uploads the output
+      directory to the output prefix.
 - [ ] No long training command starts before every item above passes.
 
 ## Large CPU route and graph runs

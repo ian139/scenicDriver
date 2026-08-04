@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.scenic_scorer.regression import ScenicRegressionModel, ScenicScoreDataset  # noqa: E402
+from src.scenic_scorer.regression import ScenicRegressionModel, ScenicScoreDataset, resolve_device  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,16 +37,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     return parser.parse_args()
-
-
-def _resolve_device(device: str) -> str:
-    if device != "auto":
-        return device
-    if torch.cuda.is_available():
-        return "cuda"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
 
 
 def _safe_corr(preds: np.ndarray, targets: np.ndarray) -> float:
@@ -99,7 +89,7 @@ def _evaluate(model: ScenicRegressionModel, loader: torch.utils.data.DataLoader,
 
 def main() -> None:
     args = parse_args()
-    device = _resolve_device(args.device)
+    device = resolve_device(args.device)
 
     split_df = pd.read_csv(args.benchmark_split_csv)
     if "image_path" not in split_df.columns or "split" not in split_df.columns:

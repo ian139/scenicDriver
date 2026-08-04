@@ -76,20 +76,15 @@ run_with_timeout() {
     fi
 }
 
-have_aws_cli() {
-    command -v aws >/dev/null 2>&1
-}
-
-python_aws_identity() {
+verify_identity() {
     python - <<'PY'
-import json
 import boto3
 
-print(json.dumps(boto3.client("sts").get_caller_identity(), sort_keys=True))
+boto3.client("sts").get_caller_identity()
 PY
 }
 
-python_head_bucket() {
+verify_bucket() {
     python - <<'PY'
 import os
 import boto3
@@ -101,31 +96,22 @@ PY
 download_prefix() {
     local prefix="$1"
     local dest="$2"
-    if have_aws_cli; then
-        run_with_timeout aws s3 sync "s3://${SCENIC_S3_BUCKET}/${prefix}" "$dest" --only-show-errors
-    else
-        run_with_timeout python -m src.data_pipeline.s3 download-prefix \
-            --bucket "$SCENIC_S3_BUCKET" \
-            --prefix "$prefix" \
-            --dest "$dest" \
-            --required
-    fi
+    run_with_timeout python -m src.data_pipeline.s3 download-prefix \
+        --bucket "$SCENIC_S3_BUCKET" \
+        --prefix "$prefix" \
+        --dest "$dest" \
+        --required
 }
 
 upload_prefix() {
     local src="$1"
     local prefix="$2"
-    if have_aws_cli; then
-        run_with_timeout aws s3 sync "$src" "s3://${SCENIC_S3_BUCKET}/${prefix}" --only-show-errors
-    else
-        run_with_timeout python -m src.data_pipeline.s3 upload-prefix \
-            --src "$src" \
-            --bucket "$SCENIC_S3_BUCKET" \
-            --prefix "$prefix" \
-            --required
-    fi
+    run_with_timeout python -m src.data_pipeline.s3 upload-prefix \
+        --src "$src" \
+        --bucket "$SCENIC_S3_BUCKET" \
+        --prefix "$prefix" \
+        --required
 }
-
 
 require_s3_prefix() {
     local prefix="$1"
@@ -134,22 +120,12 @@ require_s3_prefix() {
         log "allow-missing: skipping required-prefix check for ${label}: s3://${SCENIC_S3_BUCKET}/${prefix}"
         return 0
     fi
-    if have_aws_cli; then
-        local count
-        count=$(aws s3api list-objects-v2 \
-            --bucket "$SCENIC_S3_BUCKET" \
-            --prefix "$prefix" \
-            --max-keys 1 \
-            --query 'length(Contents || `[]`)' \
-            --output text)
-        if [[ "$count" == "0" || "$count" == "None" ]]; then
-            die "Required ${label} prefix is empty or inaccessible: s3://${SCENIC_S3_BUCKET}/${prefix}"
-        fi
-    else
-        run_with_timeout python -m src.data_pipeline.s3 check-prefix \
-            --bucket "$SCENIC_S3_BUCKET" \
-            --prefix "$prefix" \
-            --required
+    if ! run_with_timeout python -m src.data_pipeline.s3 check-prefix \
+        --bucket "$SCENIC_S3_BUCKET" \
+        --prefix "$prefix" \
+        --required
+    then
+        die "Required ${label} prefix is empty or inaccessible: s3://${SCENIC_S3_BUCKET}/${prefix}"
     fi
     log "required ${label} prefix has objects: s3://${SCENIC_S3_BUCKET}/${prefix}"
 }
@@ -160,22 +136,19 @@ first_file() {
     find "$root" -type f -name "$pattern" -print -quit
 }
 
-# ── 1. AWS CLI / auth ─────────────────────────────────────────────────────
-log "=== STEP 1: AWS CLI and auth ==="
+# ── 1. S3 auth ────────────────────────────────────────────────────────────
+log "=== STEP 1: S3 auth ==="
 log "project root: $PROJECT_ROOT"
 timeout_check
 
 if [[ -z "${SCENIC_S3_BUCKET:-}" ]]; then
     die "SCENIC_S3_BUCKET is not set"
 fi
-if have_aws_cli; then
-    log "aws CLI: $(command -v aws)"
-    run_with_timeout aws sts get-caller-identity --output json >/tmp/scenic_aws_identity.json
-    run_with_timeout aws s3api head-bucket --bucket "$SCENIC_S3_BUCKET"
-else
-    log "aws CLI not found; using boto3 fallback for S3 operations"
-    run_with_timeout python_aws_identity >/tmp/scenic_aws_identity.json
-    run_with_timeout python_head_bucket
+if ! run_with_timeout verify_identity; then
+    die "AWS identity check failed; verify runtime credentials"
+fi
+if ! run_with_timeout verify_bucket; then
+    die "S3 bucket is not reachable or credentials lack access: s3://${SCENIC_S3_BUCKET}"
 fi
 log "AWS identity verified"
 log "S3 bucket reachable: s3://${SCENIC_S3_BUCKET}"

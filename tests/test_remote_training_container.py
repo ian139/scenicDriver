@@ -93,14 +93,13 @@ def test_vast_provision_script_is_fail_fast_and_syncs_s3() -> None:
         "set -euo pipefail",
         'PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"',
         'cd "$PROJECT_ROOT"',
-        "aws sts get-caller-identity",
-        "aws s3api head-bucket",
-        "aws CLI not found; using boto3 fallback for S3 operations",
+        "verify_identity()",
+        "verify_bucket()",
         "boto3.client(\"sts\").get_caller_identity()",
         "boto3.client(\"s3\").head_bucket",
         "require_s3_prefix \"$SCENIC_S3_DATA_PREFIX\" \"data\"",
         "require_s3_prefix \"$SCENIC_S3_MODELS_PREFIX\" \"models\"",
-        "aws s3 sync \"s3://${SCENIC_S3_BUCKET}/${prefix}\"",
+        "python -m src.data_pipeline.s3 check-prefix",
         "python -m src.data_pipeline.s3 download-prefix",
         "python scripts/remote/container_smoke.py --device cuda --check-imports --json",
         "python scripts/remote/minimal_inference.py",
@@ -109,6 +108,15 @@ def test_vast_provision_script_is_fail_fast_and_syncs_s3() -> None:
     ]
     for snippet in required_snippets:
         assert snippet in script, f"provision script missing: {snippet!r}"
+
+    forbidden_snippets = [
+        "aws ",
+        "have_aws_cli",
+        "command -v aws",
+        "boto3 fallback",
+    ]
+    for snippet in forbidden_snippets:
+        assert snippet not in script, f"stale AWS CLI path found: {snippet!r}"
 
     assert "--optional || log" not in script
 
