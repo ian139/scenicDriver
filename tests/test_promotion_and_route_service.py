@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
@@ -582,6 +583,40 @@ def _write_cache_graph(path: Path, scenic_score: float = 1.0) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+class _LargeNodeSet:
+    def __len__(self) -> int:
+        return route_service._ENDPOINT_NODE_DIAGNOSTIC_MAX_NODES + 1
+
+
+class _LargeEndpointGraph:
+    """Fake graph large enough to skip nearest-node diagnostic indexing.
+
+    Configurable: a finite ``projection_distance`` makes edge projections
+    succeed; ``float('inf')`` makes them fail while recording every
+    ``excluded_road_types`` query.
+    """
+
+    def __init__(self, *, projection_distance: float = 0.25) -> None:
+        self.projection_distance = projection_distance
+        self.edge_queries: list[frozenset[str]] = []
+        self.nodes = _LargeNodeSet()
+
+    def find_nearest_edge_positions_with_distance(
+        self, *args: object, **kwargs: object
+    ) -> tuple[list[object], float]:
+        self.edge_queries.append(kwargs["excluded_road_types"])
+        if math.isfinite(self.projection_distance):
+            return [object()], self.projection_distance
+        return [], self.projection_distance
+
+    def find_nearest_node_with_distance(
+        self, *args: object, **kwargs: object
+    ) -> None:
+        raise AssertionError(
+            "large endpoint graph must not build nearest-node index"
+        )
+
+
 def test_endpoint_snap_diagnostics_use_edge_projections(
     tmp_path: Path,
 ) -> None:
@@ -604,20 +639,7 @@ def test_endpoint_snap_diagnostics_use_edge_projections(
 
 
 def test_endpoint_snap_diagnostics_skip_large_nearest_node_index() -> None:
-    class _LargeNodes:
-        def __len__(self) -> int:
-            return route_service._ENDPOINT_NODE_DIAGNOSTIC_MAX_NODES + 1
-
-    class _LargeGraph:
-        nodes = _LargeNodes()
-
-        def find_nearest_edge_positions_with_distance(self, *args: object, **kwargs: object):
-            return [object()], 0.25
-
-        def find_nearest_node_with_distance(self, *args: object, **kwargs: object):
-            raise AssertionError("large diagnostic graph must not build node index")
-
-    graph = _LargeGraph()
+    graph = _LargeEndpointGraph()
     request = route_service.RouteRequest(
         graph_geojson="unused",
         start=(42.05, -72.001),
@@ -633,29 +655,7 @@ def test_endpoint_snap_diagnostics_skip_large_nearest_node_index() -> None:
 
 
 def test_endpoint_snap_diagnostics_bound_large_projection_failure() -> None:
-    class _LargeNodes:
-        def __len__(self) -> int:
-            return route_service._ENDPOINT_NODE_DIAGNOSTIC_MAX_NODES + 1
-
-    class _LargeGraph:
-        nodes = _LargeNodes()
-        edge_queries: list[frozenset[str]] = []
-
-        def find_nearest_edge_positions_with_distance(
-            self, *args: object, **kwargs: object
-        ):
-            del args
-            self.edge_queries.append(kwargs["excluded_road_types"])
-            return [], float("inf")
-
-        def find_nearest_node_with_distance(
-            self, *args: object, **kwargs: object
-        ):
-            raise AssertionError(
-                "large projection failure must not build node index"
-            )
-
-    graph = _LargeGraph()
+    graph = _LargeEndpointGraph(projection_distance=float("inf"))
     request = route_service.RouteRequest(
         graph_geojson="unused",
         start=(42.05, -72.001),

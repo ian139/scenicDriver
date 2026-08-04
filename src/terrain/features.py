@@ -77,7 +77,7 @@ def compute_terrain_features(
 
     vegetation_density = 0.5
     if satellite_img is not None and (
-        not isinstance(satellite_img, PathLike) or Path(satellite_img).exists()
+        not isinstance(satellite_img, (str, PathLike)) or Path(satellite_img).exists()
     ):
         sat_arr = _as_rgb_array(satellite_img)
         r = sat_arr[..., 0]
