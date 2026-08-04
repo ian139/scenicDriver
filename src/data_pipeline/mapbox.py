@@ -9,7 +9,6 @@ Production-ready implementation with caching, rate limiting, and error handling.
 import os
 import time
 import logging
-import hashlib
 from pathlib import Path
 from typing import Tuple, Optional, Iterator, List
 from dataclasses import dataclass
@@ -518,45 +517,7 @@ class MapboxTileSource:
         """Get download statistics for this session."""
         return self._stats
 
-    def reset_stats(self) -> None:
-        """Reset download statistics."""
-        self._stats = DownloadStats()
 
-    def clear_cache(self, older_than_days: Optional[int] = None) -> int:
-        """
-        Clear cached tiles.
-
-        Args:
-            older_than_days: Only clear tiles older than this (None = all)
-
-        Returns:
-            Number of tiles cleared
-        """
-        import shutil
-        from datetime import datetime, timedelta
-
-        cleared = 0
-
-        if older_than_days is None:
-            # Clear everything
-            if self.cache_dir.exists():
-                for item in self.cache_dir.iterdir():
-                    if item.is_dir():
-                        cleared += len(list(item.rglob("*.png")))
-                        shutil.rmtree(item)
-                    elif item.suffix == ".png":
-                        item.unlink()
-                        cleared += 1
-        else:
-            # Clear old files only
-            cutoff = datetime.now() - timedelta(days=older_than_days)
-            for png_file in self.cache_dir.rglob("*.png"):
-                if datetime.fromtimestamp(png_file.stat().st_mtime) < cutoff:
-                    png_file.unlink()
-                    cleared += 1
-
-        logger.info(f"Cleared {cleared} cached tiles")
-        return cleared
 
     def validate_token(self) -> bool:
         """

@@ -336,14 +336,6 @@ def _route_preload_mode() -> str:
     return _DEFAULT_ROUTE_PRELOAD_MODE
 
 
-def _route_preload_enabled() -> bool:
-    """Return whether startup route materialization is enabled.
-
-    Kept as a compatibility helper for callers that only need the old
-    boolean view; startup itself uses :func:`_route_preload_mode`.
-    """
-
-    return _route_preload_mode() != "off"
 
 
 def _preload_configured_route_assets(

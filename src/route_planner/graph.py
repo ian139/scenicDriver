@@ -1062,7 +1062,7 @@ class RoadGraph:
         try:
             import osmnx as ox
         except ImportError as exc:
-            raise ImportError("osmnx is required for OSM import. Run: uv sync --extra geo") from exc
+            raise ImportError("osmnx is required for OSM import. Run: uv run --with 'osmnx==2.1.0'") from exc
 
         scenic_scores = scenic_scores or {}
         osm_path = Path(osm_file)

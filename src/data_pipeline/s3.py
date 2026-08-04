@@ -14,15 +14,6 @@ class S3Uri:
     key: str
 
 
-def parse_s3_uri(uri: str) -> S3Uri:
-    if not uri.startswith("s3://"):
-        raise ValueError(f"expected s3:// URI: {uri}")
-    rest = uri[5:]
-    bucket, sep, key = rest.partition("/")
-    if not bucket:
-        raise ValueError(f"expected non-empty S3 bucket: {uri}")
-    return S3Uri(bucket=bucket, key=key if sep else "")
-
 
 def normalize_s3_only(value: str | bool | None, *, default: bool = True) -> bool:
     if value is None:
@@ -37,8 +28,6 @@ def normalize_s3_only(value: str | bool | None, *, default: bool = True) -> bool
     raise ValueError(f"invalid SCENIC_S3_ONLY value: {value!r}")
 
 
-def scenic_s3_env(bucket: str, s3_only: bool) -> dict[str, str]:
-    return {"SCENIC_S3_BUCKET": bucket, "SCENIC_S3_ONLY": "1" if s3_only else "0"}
 
 
 def _client(client: Any | None) -> Any:

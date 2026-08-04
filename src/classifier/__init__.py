@@ -29,8 +29,6 @@ from .inference import (
     batch_classify,
     classify_directory,
     preprocess_image,
-    compute_scenic_score,
-    get_class_distribution,
     get_inference_transform,
     get_training_transform,
     IMAGENET_MEAN,
@@ -51,8 +49,6 @@ __all__ = [
     "batch_classify",
     "classify_directory",
     "preprocess_image",
-    "compute_scenic_score",
-    "get_class_distribution",
     "get_inference_transform",
     "get_training_transform",
     # Constants

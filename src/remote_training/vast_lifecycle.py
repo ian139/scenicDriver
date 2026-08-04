@@ -44,8 +44,8 @@ class VastInitPlan:
     ssh_command: list[str]
     scp_command: list[str] | None
     bootstrap_script: str
-
-_PLAN_RETRY_OPTIONS: dict[int, tuple[int, int]] = {}
+    retries: int = 3
+    retry_delay_seconds: int = 5
 
 
 def validate_config(config: VastInitConfig) -> None:
@@ -215,13 +215,13 @@ def _bootstrap_script(config: VastInitConfig) -> str:
 
 def build_init_plan(config: VastInitConfig) -> VastInitPlan:
     validate_config(config)
-    plan = VastInitPlan(
+    return VastInitPlan(
         ssh_command=_ssh_command(config),
         scp_command=_scp_command(config),
         bootstrap_script=_bootstrap_script(config),
+        retries=config.retries,
+        retry_delay_seconds=config.retry_delay_seconds,
     )
-    _PLAN_RETRY_OPTIONS[id(plan)] = (config.retries, config.retry_delay_seconds)
-    return plan
 
 
 def _redacted_command(command: list[str]) -> str:
@@ -252,27 +252,26 @@ def _remote_env_parent_script(scp_command: list[str]) -> str:
 def run_init_plan(plan: VastInitPlan, *, dry_run: bool) -> int:
     if dry_run:
         return 0
-    retries, retry_delay_seconds = _PLAN_RETRY_OPTIONS.get(id(plan), (3, 5))
     if plan.scp_command is not None:
         mkdir_status = _run_with_retries(
             plan.ssh_command,
             stdin=_remote_env_parent_script(plan.scp_command),
-            retries=retries,
-            retry_delay_seconds=retry_delay_seconds,
+            retries=plan.retries,
+            retry_delay_seconds=plan.retry_delay_seconds,
         )
         if mkdir_status != 0:
             return mkdir_status
         scp_status = _run_with_retries(
             plan.scp_command,
             stdin=None,
-            retries=retries,
-            retry_delay_seconds=retry_delay_seconds,
+            retries=plan.retries,
+            retry_delay_seconds=plan.retry_delay_seconds,
         )
         if scp_status != 0:
             return scp_status
     return _run_with_retries(
         plan.ssh_command,
         stdin=plan.bootstrap_script,
-        retries=retries,
-        retry_delay_seconds=retry_delay_seconds,
+        retries=plan.retries,
+        retry_delay_seconds=plan.retry_delay_seconds,
     )

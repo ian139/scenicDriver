@@ -9,11 +9,10 @@ from .mapbox import (
     tile_to_lat_lon,
     tile_to_lat_lon_center,
 )
-from .tile_processor import ProcessedTile, Tile
+from .tile_processor import Tile
 
 __all__ = [
     "Tile",
-    "ProcessedTile",
     "MapboxTileSource",
     "MapboxTokenError",
     "MapboxDownloadError",

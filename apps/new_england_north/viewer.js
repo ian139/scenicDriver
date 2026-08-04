@@ -2,10 +2,7 @@ const DEFAULTS = Object.freeze({
   displayRange: "new_england_north",
   sourceRegion: "new_england_north",
   workingRun: "new_england_north_z14_v6_learned",
-  sourceModel: "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt",
-  activeRegistryModel: "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt",
   apiBase: `${window.location.origin}/api`,
-  center: [-70.15869140625, 44.99533046578542],
   zoom: 6.2,
   scenicWeight: 0.8,
 });
@@ -38,13 +35,8 @@ let CONFIG = {
   displayRange: params.get("source") || params.get("region") || params.get("display") || DEFAULTS.displayRange,
   sourceRegion: params.get("source") || params.get("region") || DEFAULTS.sourceRegion,
   workingRun: params.get("run") || DEFAULTS.workingRun,
-  sourceModel: DEFAULTS.sourceModel,
-  activeRegistryModel: DEFAULTS.activeRegistryModel,
 };
 
-// API base is a runtime variable (no longer bound to a DOM input). It can be
-// overridden via ?api=... and, if an `#apiBase` input is ever re-introduced, by
-// the user editing that field. Removed DOM must not break fetch paths.
 let apiBase =
   params.get("api") ||
   (["localhost", "127.0.0.1"].includes(window.location.hostname) &&
@@ -60,20 +52,11 @@ const ROUTE_SCENIC = "route-scenic";
 const ROUTE_ENDPOINT_SOURCE = "route-endpoint-source";
 const ROUTE_ENDPOINT_CONNECTORS = "route-endpoint-connectors";
 
-// Element lookups are null-safe: removed sections simply yield null and are
-// guarded by the helpers below (setText, etc.). Core route IDs must exist.
 const el = {
   apiStatus: document.getElementById("apiStatus"),
-  displayRange: document.getElementById("displayRange"),
-  sourceRegion: document.getElementById("sourceRegion"),
-  runName: document.getElementById("runName"),
-  modelNote: document.getElementById("modelNote"),
   regionSelect: document.getElementById("regionSelect"),
   runSelect: document.getElementById("runSelect"),
   regionStatus: document.getElementById("regionStatus"),
-  cellCount: document.getElementById("cellCount"),
-  avgScore: document.getElementById("avgScore"),
-  peakScore: document.getElementById("peakScore"),
   routeForm: document.getElementById("routeForm"),
   startInput: document.getElementById("startInput"),
   endInput: document.getElementById("endInput"),
@@ -89,7 +72,6 @@ const el = {
   clearRoute: document.getElementById("clearRoute"),
   clearStartBtn: document.getElementById("clearStartBtn"),
   clearEndBtn: document.getElementById("clearEndBtn"),
-  apiBase: document.getElementById("apiBase"),
   inspectorScore: document.getElementById("inspectorScore"),
   inspectorCoords: document.getElementById("inspectorCoords"),
   routeResultsDialog: document.getElementById("routeResultsDialog"),
@@ -1577,13 +1559,6 @@ function initBindings() {
   applyUrlParams();
   setRouteResultsVerbose(false);
   el.submitRoute.disabled = true;
-  setText(el.displayRange, CONFIG.displayRange);
-  setText(el.sourceRegion, CONFIG.sourceRegion);
-  setText(el.runName, CONFIG.workingRun);
-  if (el.apiBase) el.apiBase.value = apiBase;
-  if (el.modelNote) {
-    el.modelNote.textContent = `Scoring provenance: ${CONFIG.workingRun} at z14 using ${CONFIG.sourceModel}.`;
-  }
   const syncRangeOutputs = () => {
     setText(el.detourOut, `${Number(el.detourFactor.value).toFixed(2)}×`);
   };
@@ -1623,9 +1598,6 @@ async function main() {
   const artifactErrors = [];
   try {
     await loadSupportedRegions();
-    setText(el.displayRange, CONFIG.displayRange);
-    setText(el.sourceRegion, CONFIG.sourceRegion);
-    setText(el.runName, CONFIG.workingRun || "Unavailable");
   } catch (error) {
     const message = `Region metadata unavailable: ${error.message || error}`;
     artifactErrors.push(message);

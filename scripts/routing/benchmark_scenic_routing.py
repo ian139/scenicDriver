@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 import sys
-from typing import Any, Callable
+from typing import Any
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent

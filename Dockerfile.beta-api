@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
 
 # Use a pinned uv binary rather than an unpinned installer download.
-COPY --from=ghcr.io/astral-sh/uv:0.5.31 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.9.16 /uv /uvx /usr/local/bin/
 
 WORKDIR /app
 

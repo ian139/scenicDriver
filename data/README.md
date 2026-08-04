@@ -28,14 +28,28 @@ Report tooling defaults (unless overridden in env):
 - For S3 tile loading in annotator: `raw_dir = s3://<bucket>/raw`
 - Manual labels are appended/upserted to `data/raw/labels_human.csv`
 
-## Current Working Sets
+## Training and Validation Working Sets
 
-- `new_england_north` at `z14`: deployed regional imagery set
-  - bbox: `42.488301979602255, -73.5205078125` to `47.50235895196859, -66.796875`
-  - satellite tiles: `98,838`
-  - Terrain-RGB tiles: `98,838`
-- `masswhites` at `z14`: primary learned-model training set
-- `amherst_ma` at `z16`: secondary local validation set
+These datasets support model development and are not, by themselves, a list of
+deployed application regions:
+
+- `masswhites` at `z14`: primary learned-model training set.
+- `amherst_ma` at `z16`: secondary local validation set.
+
+## Configured and Deployed Regions
+
+The application region catalog is `config/app_regions.json`. It currently
+defines `new_england_north`, `masswhites`, `philadelphia`, and `pittsfield`;
+their graph paths and bounding boxes in that file are the source of truth for
+configured regions. Configuration alone does not mean that the corresponding
+artifacts are present or deployed.
+
+The hosted beta deployment is specifically the New England North release
+described in [`docs/setup/deployment.md`](../docs/setup/deployment.md). Its
+required graph, report, and model artifacts are listed in that runbook. The
+training/validation working sets above should not be interpreted as deployed
+regions; `amherst_ma`, in particular, is not an entry in the application
+region catalog.
 
 ## Regression Artifacts (Step 3)
 

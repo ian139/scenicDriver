@@ -279,27 +279,3 @@ def train_regression_model(
     return best_corr
 
 
-def evaluate_correlation(
-    model: ScenicRegressionModel,
-    dataset: ScenicScoreDataset
-) -> float:
-    """
-    Calculate Pearson correlation between predictions and targets.
-
-    Target: r >= 0.83
-    """
-    model.eval()
-    predictions = []
-    targets = []
-
-    with torch.no_grad():
-        for batch in torch.utils.data.DataLoader(dataset, batch_size=64):
-            vit_emb, terrain, logits, score, _ = batch
-            pred = model(vit_emb, terrain, logits)
-            predictions.extend(pred.squeeze().cpu().numpy())
-            targets.extend(score.squeeze().cpu().numpy())
-
-    correlation = np.corrcoef(predictions, targets)[0, 1]
-    if not np.isfinite(correlation):
-        return 0.0
-    return float(correlation)

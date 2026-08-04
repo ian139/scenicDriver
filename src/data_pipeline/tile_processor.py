@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
-
 import numpy as np
 from PIL import Image
 
@@ -27,10 +25,3 @@ class Tile:
         return Image.fromarray(self.image)
 
 
-@dataclass
-class ProcessedTile:
-    """Structured tile output for downstream scoring stages."""
-
-    tile: Tile
-    scenic_score: float
-    extras: Dict[str, float]

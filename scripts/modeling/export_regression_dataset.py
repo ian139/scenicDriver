@@ -28,9 +28,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.classifier.inference import get_inference_transform
-from src.classifier.model import LandscapeClassifier
-from src.terrain.features import TerrainFeatures, repair_terrain_zero_seam
+from src.classifier.inference import get_inference_transform  # noqa: E402
+from src.classifier.model import LandscapeClassifier  # noqa: E402
+from src.terrain.features import compute_terrain_features  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,41 +109,9 @@ def _open_image(path: str, raw_dir: str, s3_client: Any | None) -> Image.Image:
     return Image.open(BytesIO(obj["Body"].read())).convert("RGB")
 
 
-def _decode_terrain_rgb(terrain_img: Image.Image) -> np.ndarray:
-    arr = np.array(terrain_img).astype(np.float32)
-    r = arr[..., 0]
-    g = arr[..., 1]
-    b = arr[..., 2]
-    return -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1
-
-
 def _terrain_features_from_images(terrain_img: Image.Image, sat_img: Image.Image) -> np.ndarray:
-    elev = repair_terrain_zero_seam(_decode_terrain_rgb(terrain_img))
-    gy, gx = np.gradient(elev)
-    slope = np.sqrt(gx ** 2 + gy ** 2)
-
-    relief = float(elev.max() - elev.min())
-    slope_variation = float(min(slope.std() / 15.0, 1.0))
-    low_elev = elev < np.percentile(elev, 10)
-    flat = slope < np.percentile(slope, 10)
-    water_proximity = float((low_elev & flat).mean())
-
-    sat_arr = np.array(sat_img).astype(np.float32)
-    r = sat_arr[..., 0]
-    g = sat_arr[..., 1]
-    b = sat_arr[..., 2]
-    vegetation_density = float((g / np.maximum(r + g + b, 1e-6)).mean())
-
-    terrain = TerrainFeatures(
-        slope_variation=slope_variation,
-        elevation_change=relief,
-        water_proximity=water_proximity,
-        vegetation_density=vegetation_density,
-        coastal=False,
-        has_lake=False,
-        has_river=False,
-    )
-    return terrain.to_array().astype(np.float32)
+    """Return the canonical terrain vector for regression export."""
+    return compute_terrain_features(terrain_img, sat_img).features.to_array().astype(np.float32)
 
 
 def _terrain_path_from_sat(image_path: str) -> str:

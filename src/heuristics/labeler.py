@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-from src.terrain.features import TerrainFeatures, repair_terrain_zero_seam
+from src.terrain.features import compute_terrain_features
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -186,23 +186,19 @@ def run_heuristic_labeling(
         sat_img = _open_image(sat_path, s3_bucket, s3_client=s3_client).convert("RGB")
         terrain_img = _open_image(terrain_path, s3_bucket, s3_client=s3_client).convert("RGB")
 
-        elev = repair_terrain_zero_seam(_decode_terrain_rgb(terrain_img))
-        gy, gx = np.gradient(elev)
-        slope = np.sqrt(gx ** 2 + gy ** 2)
-
-        relief = float(elev.max() - elev.min())
-        roughness = float(elev.std())
-        slope_mean = float(slope.mean())
-
-        low_elev = elev < np.percentile(elev, 10)
-        flat = slope < np.percentile(slope, 10)
-        water_proxy = float((low_elev & flat).mean())
+        terrain_result = compute_terrain_features(terrain_img, sat_img)
+        terrain_features = terrain_result.features.to_array().astype(np.float32)
+        relief = terrain_result.relief
+        roughness = terrain_result.roughness
+        slope_mean = terrain_result.slope_mean
+        slope_variation = terrain_result.features.slope_variation
+        water_proxy = terrain_result.features.water_proximity
+        veg_proxy = terrain_result.features.vegetation_density
 
         sat_arr = np.array(sat_img).astype(np.float32)
         r = sat_arr[..., 0] / 255.0
         g = sat_arr[..., 1] / 255.0
         b = sat_arr[..., 2] / 255.0
-        veg_proxy = float(_safe_div(g, r + g + b).mean())
         brightness = (r + g + b) / 3.0
         maxc = np.maximum(r, np.maximum(g, b))
         minc = np.minimum(r, np.minimum(g, b))
@@ -218,14 +214,6 @@ def run_heuristic_labeling(
             & (texture < 0.12)
         )
         water_fraction = float(water_mask.mean())
-
-        terrain_features = _build_regression_terrain_features(
-            slope=slope,
-            relief=relief,
-            water_proxy=water_proxy,
-            veg_proxy=veg_proxy,
-        )
-        slope_variation = float(terrain_features[0])
 
         if learned_model is not None:
             class_id, class_name, class_score, class_logits, vit_embedding = _infer_classifier_outputs(
@@ -336,12 +324,6 @@ def _list_images(root: Path) -> list[Path]:
     return sorted([p for p in root.glob("**/*") if p.suffix.lower() in IMAGE_EXTENSIONS])
 
 
-def _decode_terrain_rgb(terrain_img: Image.Image) -> np.ndarray:
-    arr = np.array(terrain_img).astype(np.float32)
-    r = arr[..., 0]
-    g = arr[..., 1]
-    b = arr[..., 2]
-    return -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1
 
 
 def _safe_div(num: np.ndarray, den: np.ndarray) -> np.ndarray:
@@ -551,24 +533,6 @@ def _load_learned_regressor(
     return model
 
 
-def _build_regression_terrain_features(
-    *,
-    slope: np.ndarray,
-    relief: float,
-    water_proxy: float,
-    veg_proxy: float,
-) -> np.ndarray:
-    slope_variation = float(min(slope.std() / 15.0, 1.0))
-    terrain = TerrainFeatures(
-        slope_variation=slope_variation,
-        elevation_change=float(relief),
-        water_proximity=float(water_proxy),
-        vegetation_density=float(veg_proxy),
-        coastal=False,
-        has_lake=False,
-        has_river=False,
-    )
-    return terrain.to_array().astype(np.float32)
 
 
 def _infer_classifier_outputs(

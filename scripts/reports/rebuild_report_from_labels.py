@@ -22,9 +22,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.classifier.model import TERRAIN_CLASSES
-from src.heuristics.labeler import parse_tile_coords
-from src.heuristics.report import build_report
+from src.classifier.model import TERRAIN_CLASSES  # noqa: E402
+from src.heuristics.labeler import parse_tile_coords  # noqa: E402
+from src.heuristics.report import build_report  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
