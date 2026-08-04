@@ -127,13 +127,18 @@ def _default_s3_prefix(style: str) -> str:
 
 
 def _resolve_s3_prefix(*, prefix: str | None, style: str, output_dir: Path, zoom: int) -> str:
-    # Normalize common shorthand prefixes to canonical keys under raw/images.
-    raw_prefix = (prefix or _default_s3_prefix(style)).strip("/")
-    if raw_prefix in {"satellite", "terrain"}:
-        raw_prefix = f"raw/images/{raw_prefix}"
-    elif raw_prefix.startswith("images/"):
-        raw_prefix = f"raw/{raw_prefix}"
-
+    if prefix is None:
+        raw_prefix = _default_s3_prefix(style)
+    else:
+        raw_prefix = prefix.strip().strip("/")
+        if not (
+            raw_prefix in {"raw/images/satellite", "raw/images/terrain"}
+            or raw_prefix.startswith(("raw/images/satellite/", "raw/images/terrain/"))
+        ):
+            raise ValueError(
+                f"Invalid S3 prefix '{prefix}': must be canonical "
+                "'raw/images/{satellite,terrain}' form"
+            )
     base_prefix = raw_prefix
     region = None
     zoom_dir = f"z{zoom}"

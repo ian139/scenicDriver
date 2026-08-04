@@ -259,42 +259,19 @@ def _latest_run_for_region(region: str) -> str | None:
         return str(configured["run_name"])
 
     key = region.strip().lower()
-    aliases: dict[str, list[str]] = {
-        # Pittsfield runs were historically named with "masswhites".
-        "pittsfield": ["pittsfield", "masswhites"],
-    }
-    terms = aliases.get(key, [key])
-    # Common derived graph names (e.g., *_wide, *_core) should still resolve
-    # to the underlying run namespace.
-    if key.endswith("_wide"):
-        terms.append(key[: -len("_wide")])
-    if key.endswith("_core"):
-        terms.append(key[: -len("_core")])
-    parts = key.split("_")
-    if parts:
-        terms.append(parts[0])
-    # Deduplicate terms while preserving order.
-    dedup_terms: list[str] = []
-    seen_terms: set[str] = set()
-    for t in terms:
-        if not t:
-            continue
-        if t in seen_terms:
-            continue
-        seen_terms.add(t)
-        dedup_terms.append(t)
-    terms = dedup_terms
-    if not RUNS_DIR.exists():
+    if not key or not RUNS_DIR.exists():
         return None
     matches = [
         d
         for d in RUNS_DIR.iterdir()
-        if d.is_dir() and any(term in d.name.lower() for term in terms)
+        if d.is_dir()
+        and (d.name.lower() == key or d.name.lower().startswith(f"{key}_"))
     ]
     if not matches:
         return None
     matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return matches[0].name
+
 
 _ROUTE_PRELOAD_MODES = frozenset({"off", "best_effort", "required"})
 _DEFAULT_ROUTE_PRELOAD_MODE = "best_effort"

@@ -87,14 +87,16 @@ def test_graph_from_bbox_uses_west_south_east_north_order() -> None:
             calls.append((bbox, network_type))
             return "graph"
 
-    assert builder._graph_from_bbox_compat(
+    assert builder._load_overpass_graph(
         FakeOsmnx,
-        north=47.5,
-        south=42.4,
-        east=-66.7,
-        west=-73.5,
-        network_type="drive",
-    ) == "graph"
+        _args(
+            min_lat=42.4,
+            min_lon=-73.5,
+            max_lat=47.5,
+            max_lon=-66.7,
+            attempts=1,
+        ),
+    ) == ("graph", [])
     assert calls == [((-73.5, 42.4, -66.7, 47.5), "drive")]
 
 
@@ -223,14 +225,18 @@ def test_overpass_attempts_retry_whole_download(monkeypatch) -> None:
             raise RuntimeError(f"failure-{len(calls)}")
         return "graph"
 
-    monkeypatch.setattr(builder, "_graph_from_bbox_compat", fake_download)
+    fake_ox = SimpleNamespace(graph_from_bbox=fake_download)
     graph, errors = builder._load_overpass_graph(
-        object(),
+        fake_ox,
         _args(attempts=3),
     )
 
     assert graph == "graph"
     assert len(calls) == 3
+    assert all(
+        call == {"bbox": (-73.0, 42.0, -72.0, 43.0), "network_type": "drive"}
+        for call in calls
+    )
     assert [row["error_type"] for row in errors] == ["RuntimeError", "RuntimeError"]
 
 

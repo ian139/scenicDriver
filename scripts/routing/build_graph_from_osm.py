@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
-import inspect
 import json
 import math
 import os
@@ -138,34 +137,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _graph_from_bbox_compat(
-    ox,
-    north: float,
-    south: float,
-    east: float,
-    west: float,
-    network_type: str,
-):
-    fn = ox.graph_from_bbox
-    sig = inspect.signature(fn)
-    params = set(sig.parameters.keys())
-    # osmnx>=2 expects bbox in (left, bottom, right, top).
-    bbox = (west, south, east, north)
-
-    if "bbox" in params:
-        return fn(bbox=bbox, network_type=network_type)
-    if {"north", "south", "east", "west"}.issubset(params):
-        return fn(
-            north=north,
-            south=south,
-            east=east,
-            west=west,
-            network_type=network_type,
-        )
-    try:
-        return fn(bbox, network_type=network_type)
-    except TypeError:
-        return fn(north, south, east, west, network_type=network_type)
 
 
 def _slug_float(value: float) -> str:
@@ -677,12 +648,8 @@ def _load_overpass_graph(ox: Any, args: argparse.Namespace) -> tuple[Any, list[d
     for attempt in range(1, args.attempts + 1):
         try:
             return (
-                _graph_from_bbox_compat(
-                    ox=ox,
-                    north=args.max_lat,
-                    south=args.min_lat,
-                    east=args.max_lon,
-                    west=args.min_lon,
+                ox.graph_from_bbox(
+                    bbox=(args.min_lon, args.min_lat, args.max_lon, args.max_lat),
                     network_type=args.network,
                 ),
                 errors,

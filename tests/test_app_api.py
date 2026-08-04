@@ -166,6 +166,31 @@ def test_region_graph_fallback_and_discovery_support_sqlite(
         }
     ]
 
+
+def test_latest_run_for_region_uses_exact_key_without_legacy_aliases(
+    tmp_path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "MassWhites_z14_learned"
+    run_dir.mkdir()
+    (tmp_path / "masswhites-other").mkdir()
+    monkeypatch.setattr(app_api, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(app_api, "_app_region", lambda region: None)
+
+    assert app_api._latest_run_for_region("  MASSWHITES  ") == run_dir.name
+    assert app_api._latest_run_for_region("mass") is None
+    assert app_api._latest_run_for_region("masswhites_wide") is None
+    assert app_api._latest_run_for_region("pittsfield") is None
+
+
+def test_latest_run_for_region_preserves_configured_run_name(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api,
+        "_app_region",
+        lambda region: {"region": region, "run_name": "canonical-run"},
+    )
+
+    assert app_api._latest_run_for_region("pittsfield") == "canonical-run"
+
 def test_training_results_projects_active_record(tmp_path, monkeypatch) -> None:
     registry = tmp_path / "model_registry.json"
     registry.write_text(
