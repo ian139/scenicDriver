@@ -210,37 +210,14 @@ def test_handle_start_task_returns_after_new_bootstrap_none_host(monkeypatch: py
     assert "ssh -i /tmp/id_ed25519 -p 2222" in output
     assert "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@203.0.113.10" in output
 
-def test_legacy_state_is_read_and_normalized_to_cmux_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    cmux_state_dir = tmp_path / ".cmux-vast" / "state"
-    legacy_state_dir = tmp_path / ".orca-vast" / "state"
-    legacy_state_dir.mkdir(parents=True)
-    (legacy_state_dir / "legacy.json").write_text(
-        '{"task_name":"legacy","status":"worktree_running","orca_worktree_id":"w-1",'
-        '"orca_worktree_path":"/workspace/scenic-drive","orca_worktree_name":"legacy-task",'
-        '"orca_agent":"none"}\n',
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(cmux_vast_host, "STATE_DIR", cmux_state_dir)
-    monkeypatch.setattr(cmux_vast_host, "LEGACY_STATE_DIR", legacy_state_dir)
-
-    state = cmux_vast_host.load_state("legacy")
-
-    assert state["cmux_workspace_id"] is None
-    assert state["cmux_workspace_path"] is None
-    assert state["cmux_workspace_registered"] is False
-    assert state["remote_repo_dir"] == "/workspace/scenic-drive"
-    assert "orca_worktree_id" not in state
-    cmux_vast_host.write_state(state)
-    assert (cmux_state_dir / "legacy.json").exists()
-    assert not (cmux_state_dir / "legacy.json").read_text(encoding="utf-8").find('"orca_') >= 0
 
 
 def test_cmux_workspace_command_uses_documented_flags_without_running_cli() -> None:
-    assert cmux_vast_host.build_cmux_workspace_command("legacy-task", "/tmp/scenic-drive") == [
+    assert cmux_vast_host.build_cmux_workspace_command("cmux-task", "/tmp/scenic-drive") == [
         "cmux",
         "new-workspace",
         "--name",
-        "legacy-task",
+        "cmux-task",
         "--cwd",
         "/tmp/scenic-drive",
         "--focus",
@@ -361,39 +338,6 @@ def test_watch_missing_required_remote_path_does_not_destroy(
 
 
 
-def test_partial_migration_does_not_confirm_cmux_from_legacy_identity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = {
-        "task_name": "cmux-partial-migration",
-        "status": "workspace_pending",
-        "instance_id": 12345,
-        "remote_repo_dir": "/workspace/scenic-drive",
-        "cmux_workspace_id": None,
-        "cmux_workspace_path": None,
-        "orca_worktree_id": "legacy-worktree",
-        "orca_worktree_path": "/workspace/scenic-drive",
-    }
-    state = cmux_vast_host._normalize_state(state)
-    assert state["cmux_workspace_id"] is None
-    assert state["cmux_workspace_path"] is None
-    assert state["remote_repo_dir"] == "/workspace/scenic-drive"
-
-    destroy_calls: list[dict] = []
-    monkeypatch.setattr(
-        cmux_vast_host,
-        "run_command",
-        lambda command, **_: completed(
-            '[{"ref":"legacy-worktree","current_directory":"/workspace/scenic-drive"}]'
-        ),
-    )
-    monkeypatch.setattr(cmux_vast_host, "copy_artifacts", lambda current: pytest.fail("copy requires confirmed CMUX closure"))
-    monkeypatch.setattr(cmux_vast_host, "destroy_instance", lambda current: destroy_calls.append(current))
-
-    cmux_vast_host.process_watch_state(state, destroy=True, yes=True)
-
-    assert destroy_calls == []
-    assert state["status"] == "workspace_pending"
 
 def test_watch_destroys_after_observed_workspace_disappears(
     monkeypatch: pytest.MonkeyPatch,

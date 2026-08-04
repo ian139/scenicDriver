@@ -198,14 +198,6 @@ cmux sidebar open omp-worktrees
 
 The sidebar shows live CMUX workspaces. A git worktree appears there after it has been opened as a CMUX workspace.
 
-## Legacy persisted-state migration
-
-Older remote lifecycle runs may have state under `.orca-vast/state`. The active
-CMUX host implementation reads those files only when a matching CMUX state file
-does not exist, normalizes legacy workspace keys in memory, and writes the next
-state update under `.cmux-vast/state`. Active writes never contain legacy keys,
-and no legacy runtime setup, status, pairing, or worktree command is invoked.
-
 ## Opening an active workspace
 
 Normal `scripts/remote/vast-start-task.sh` (the `start-task` subcommand) allocates
@@ -223,14 +215,9 @@ Rerun the same command to retry registration safely.
 
 The explicit `--manual` exception prints a `cmux new-workspace` command and
 leaves the state `workspace_pending` and unregistered, with no identity recorded.
-Creating that workspace manually does not make it watchable until it is
-explicitly paired. Legacy migrated Orca state is likewise unregistered until an
-explicit pairing/registration action; migration only preserves descriptive
-metadata and never creates a CMUX workspace or infers CMUX identity from Orca
-fields.
+Creating that workspace manually does not make it watchable until it is explicitly
+paired.
 
-Do not create or open a workspace during bulk state migration, and do not start
-OMP automatically for imported state.
 ## Repository-wide group operations
 
 These group rules apply to every Scenic Drive task, branch, worktree, and
@@ -246,9 +233,8 @@ worker—not only UI or remote-training work.
 - Never promote an existing workspace to a newly created group anchor. CMUX always creates a fresh anchor by design.
 
 Per-group defaults and context-menu actions belong under `workspaceGroups` in
-`~/.config/cmux/cmux.json`, keyed by the anchor working directory. Repository
-guidance must use the documented `cmux workspace-group` CLI and must not depend
-on Orca runtime state.
+`~/.config/cmux/cmux.json`, keyed by the anchor working directory.
+Repository guidance must use the documented `cmux workspace-group` CLI.
 
 ## Verification gate
 

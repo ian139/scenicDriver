@@ -17,7 +17,6 @@ import time
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = PROJECT_ROOT / ".cmux-vast" / "state"
-LEGACY_STATE_DIR = PROJECT_ROOT / ".orca-vast" / "state"
 ARTIFACTS_DIR = PROJECT_ROOT / ".cmux-vast" / "artifacts"
 DEFAULT_OFFER_QUERY = "gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true"
 DEFAULT_IMAGE = "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04"
@@ -47,8 +46,6 @@ EXCLUDED_ROOTS = {
     ".venv",
     ".cmux-vast",
     ".worktrees",
-    # Keep legacy state out of remote overlays during migration.
-    ".orca-vast",
     ".secrets",
     "data/raw",
     "data/processed",
@@ -81,86 +78,28 @@ def state_path(task_name: str) -> Path:
     return STATE_DIR / f"{task_name}.json"
 
 
-def legacy_state_path(task_name: str) -> Path:
-    return LEGACY_STATE_DIR / f"{task_name}.json"
-
-
 def rel_state_path(task_name: str) -> Path:
     return state_path(task_name).relative_to(PROJECT_ROOT)
 
 
-def _normalize_state(state: dict) -> dict:
-    """Normalize legacy Orca state without treating it as CMUX identity."""
-    legacy_id = state.get("orca_worktree_id")
-    legacy_path = state.get("orca_worktree_path")
-    legacy_active = state.get("status") in {"orca_serving", "worktree_running"}
-    legacy_identity = legacy_id is not None or legacy_path is not None
-
-    # An Orca worktree path was a remote repository path in the old state
-    # format, but only retain it when it cannot be the local CMUX cwd.
-    if (
-        (
-            "remote_repo_dir" not in state
-            or state.get("remote_repo_dir") is None
-            or state.get("remote_repo_dir") == ""
-        )
-        and isinstance(legacy_path, str)
-    ):
-        candidate = legacy_path.strip()
-        workspace_cwd = str(state.get("workspace_cwd") or "").rstrip("/")
-        if candidate.startswith("/") and candidate.rstrip("/") != workspace_cwd:
-            state["remote_repo_dir"] = candidate
-
-    if legacy_identity or legacy_active:
-        # A name/agent are descriptive metadata and remain useful after
-        # migration.  Neither is used as a CMUX identity.
-        if "cmux_workspace_name" not in state and state.get("orca_worktree_name") is not None:
-            state["cmux_workspace_name"] = state["orca_worktree_name"]
-        if "cmux_agent" not in state and state.get("orca_agent") is not None:
-            state["cmux_agent"] = state["orca_agent"]
-        # Legacy identity is not evidence that a CMUX workspace was
-        # registered.  Keep explicit CMUX fields, but never fill them from
-        # Orca values.
-        state.setdefault("cmux_workspace_id", None)
-        state.setdefault("cmux_workspace_path", None)
-        state["cmux_workspace_registered"] = False
-        state["cmux_workspace_observed"] = False
-        state.pop("cmux_workspace_observed_ref", None)
-
-    if legacy_active:
-        state["status"] = "workspace_pending"
-    for key in tuple(state):
-        if key.startswith("orca_"):
-            state.pop(key, None)
-    return state
-
-
-def _state_source_path(task_name: str) -> Path | None:
-    current = state_path(task_name)
-    if current.exists():
-        return current
-    legacy = legacy_state_path(task_name)
-    return legacy if legacy.exists() else None
-
-
 def load_state(task_name: str) -> dict:
-    path = _state_source_path(task_name)
-    if path is None:
+    path = state_path(task_name)
+    if not path.exists():
         raise SystemExit(f"No state file for task: {task_name}")
     with path.open() as handle:
-        state = _normalize_state(json.load(handle))
+        state = json.load(handle)
     if state.get("status") not in VALID_STATUSES:
         raise SystemExit(f"Invalid state status in {path}: {state.get('status')}")
     return state
 
 
 def maybe_load_state(task_name: str) -> dict | None:
-    return load_state(task_name) if _state_source_path(task_name) is not None else None
+    path = state_path(task_name)
+    return load_state(task_name) if path.exists() else None
 
 
 def write_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    state = _normalize_state(state)
     state["updated_at"] = utc_now()
     path = state_path(state["task_name"])
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -1038,18 +977,13 @@ def states_to_watch(task_name: str | None) -> list[dict]:
         validate_task_name(task_name)
         return [load_state(task_name)]
     states: list[dict] = []
-    seen: set[str] = set()
-    for directory in (STATE_DIR, LEGACY_STATE_DIR):
-        if not directory.exists():
-            continue
-        for path in sorted(directory.glob("*.json")):
-            if path.name in seen:
-                continue
-            seen.add(path.name)
-            with path.open() as handle:
-                state = _normalize_state(json.load(handle))
-            if state.get("status") in VALID_STATUSES:
-                states.append(state)
+    if not STATE_DIR.exists():
+        return states
+    for path in sorted(STATE_DIR.glob("*.json")):
+        with path.open() as handle:
+            state = json.load(handle)
+        if state.get("status") in VALID_STATUSES:
+            states.append(state)
     return states
 
 

@@ -24,8 +24,6 @@ dist/
 
 # Local env / tooling
 .claude/
-# Legacy persisted state remains readable during CMUX migration.
-.orca-vast/
 # Active CMUX lifecycle state.
 .cmux-vast/
 
