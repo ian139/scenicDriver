@@ -120,8 +120,6 @@ def test_planner_cancellation_interrupts_endpoint_resolution_and_cleans_up(
 def test_native_search_boundary_propagates_cancellation_and_restores_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if planner_module._scipy_shortest_path is None:
-        pytest.skip("SciPy routing backend is unavailable")
     graph = _line_graph()
     planner = ScenicRoutePlanner(graph)
     cancelled = Event()

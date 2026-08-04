@@ -13,14 +13,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 
-try:
-    from scipy.sparse import csr_matrix as _scipy_csr_matrix
-    from scipy.sparse.csgraph import dijkstra as _scipy_dijkstra
-    from scipy.sparse.csgraph import shortest_path as _scipy_shortest_path
-except ImportError:  # pragma: no cover - exercised only without optional runtime
-    _scipy_csr_matrix = None
-    _scipy_dijkstra = None
-    _scipy_shortest_path = None
+from scipy.sparse import csr_matrix as _scipy_csr_matrix
+from scipy.sparse.csgraph import dijkstra as _scipy_dijkstra
+from scipy.sparse.csgraph import shortest_path as _scipy_shortest_path
 
 from .cancellation import RoutingDeadline, RoutingTimeout
 
@@ -134,6 +129,8 @@ class RouteSegment:
     traversal_id: str = ""
     # Exact per-edge travel duration retained for independent recomputation.
     duration_minutes: float = 0.0
+    source_edge_id: str | None = None
+    source_fraction: float | None = None
 
 
 @dataclass
@@ -498,12 +495,6 @@ class ScenicRoutePlanner:
         """
         if self.graph is None:
             raise RuntimeError("Road graph not loaded")
-        if _scipy_csr_matrix is None or _scipy_shortest_path is None:
-            return {
-                "available": False,
-                "topology_built": False,
-                "fastest_variants": 0,
-            }
         topology = self._csr_topology()
         if topology is None:
             return {
@@ -544,7 +535,7 @@ class ScenicRoutePlanner:
         """Build one all-traversal CSR topology for the current graph epoch."""
         del avoid_highways  # Highway filtering is a data mask, not topology.
         graph = owner if owner is not None else self.graph
-        if graph is None or _scipy_csr_matrix is None:
+        if graph is None:
             return None
         stamp = graph._heuristic_cache_stamp()
         try:
@@ -673,7 +664,7 @@ class ScenicRoutePlanner:
         scenic_cost: ScenicCostFunction,
     ) -> Optional[List[Edge]]:
         """Optimize scenic cost over the globally shortest-duration subgraph."""
-        if _scipy_shortest_path is None or start.id == goal.id:
+        if start.id == goal.id:
             return [] if start.id == goal.id else None
         fastest_cost = ScenicCostFunction(
             scenic_weight=0.0,
@@ -818,8 +809,6 @@ class ScenicRoutePlanner:
         weights: np.ndarray,
     ) -> Optional[Tuple[List[Edge], np.ndarray]]:
         """Return a deterministic CSR path and its traversal positions."""
-        if _scipy_shortest_path is None:
-            return None
         matrix = _scipy_csr_matrix(
             (
                 weights,
@@ -918,7 +907,7 @@ class ScenicRoutePlanner:
         edge weight nonnegative without changing the ranking because every
         feasible path has identical total duration.
         """
-        if _scipy_shortest_path is None or start.id == goal.id:
+        if start.id == goal.id:
             return [] if start.id == goal.id else None
         fastest_cost = ScenicCostFunction(
             scenic_weight=0.0,
@@ -1044,7 +1033,7 @@ class ScenicRoutePlanner:
                     graph = active_graph
             else:
                 graph = active_graph
-        if graph is None or _scipy_csr_matrix is None:
+        if graph is None:
             return None
         stamp = graph._heuristic_cache_stamp()
         cls = type(self)
@@ -1152,7 +1141,7 @@ class ScenicRoutePlanner:
         signature: Tuple[object, ...],
     ) -> Optional[_CSRData]:
         graph = self.graph
-        if graph is None or _scipy_csr_matrix is None:
+        if graph is None:
             return None
         topology = self._csr_topology(self._avoids_highways(cost_function))
         if topology is None:
@@ -1370,8 +1359,6 @@ class ScenicRoutePlanner:
         cost_function: ScenicCostFunction,
     ) -> Optional[List[Edge]]:
         """Return an exact built-in scalar shortest path via SciPy Dijkstra."""
-        if _scipy_shortest_path is None:
-            return None
         signature = self._built_in_cost_signature(cost_function)
         if signature is None:
             return None
@@ -3912,13 +3899,9 @@ class ScenicRoutePlanner:
         cost_limit: Optional[float] = None,
     ) -> Optional[Tuple[float, List[Edge], int, int, Tuple[object, ...]]]:
         """Solve ranked endpoint access through the immutable base CSR."""
-        if _scipy_shortest_path is None or _scipy_csr_matrix is None:
-            return None
         traversal = _scipy_shortest_path
         traversal_kwargs: Dict[str, object] = {"method": "D"}
         if cost_limit is not None:
-            if _scipy_dijkstra is None:
-                return None
             validated_limit = self._validated_nonnegative(
                 float(cost_limit), "compiled path cost limit"
             )
@@ -4090,7 +4073,6 @@ class ScenicRoutePlanner:
             use_min_only = (
                 node_count > self._COLLAPSED_ACCESS_NODE_THRESHOLD
                 and source_count > 1
-                and _scipy_shortest_path is not None
                 and target_node_count <= source_count
             )
             source_order = np.arange(source_count, dtype=np.int64)
@@ -6885,9 +6867,9 @@ class ScenicRoutePlanner:
                 direction=direction,
                 traversal_id=traversal_id,
                 duration_minutes=self._edge_duration_minutes(edge),
+                source_edge_id=getattr(edge, "canonical_edge_id", None),
+                source_fraction=getattr(edge, "source_fraction", None),
             )
-            segment.source_edge_id = getattr(edge, "canonical_edge_id", None)
-            segment.source_fraction = getattr(edge, "source_fraction", None)
             segments.append(segment)
             if not waypoints:
                 waypoints.append(

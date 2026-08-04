@@ -15,12 +15,13 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable
+
+import boto3
 
 DEFAULT_MANIFEST = Path(__file__).resolve().parents[2] / "deploy" / "beta_artifacts.json"
 
@@ -141,44 +142,13 @@ def _download_with_boto3(client: Any, bucket: str, key: str, destination: Path) 
         raise ArtifactBootstrapError(f"boto3 failed downloading s3://{bucket}/{key}: {exc}") from exc
 
 
-def _download_with_aws_cli(bucket: str, key: str, destination: Path) -> None:
-    try:
-        completed = subprocess.run(
-            ["aws", "s3", "cp", f"s3://{bucket}/{key}", str(destination)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise ArtifactBootstrapError("boto3 is unavailable and AWS CLI was not found; install boto3 or aws") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout or "").strip()
-        raise ArtifactBootstrapError(f"AWS CLI failed downloading s3://{bucket}/{key}: {detail}") from exc
-    if completed.returncode != 0:  # defensive for mocked subprocess implementations
-        raise ArtifactBootstrapError(f"AWS CLI failed downloading s3://{bucket}/{key}")
-
-
 def _download(bucket: str, key: str, destination: Path, client: Any | None) -> None:
-    if client is not None:
+    if client is None:
         try:
-            _download_with_boto3(client, bucket, key, destination)
-        except ArtifactBootstrapError:
-            raise
+            client = boto3.client("s3")
         except Exception as exc:
             raise ArtifactBootstrapError(f"boto3 failed downloading s3://{bucket}/{key}: {exc}") from exc
-        return
-    try:
-        import boto3  # type: ignore[import-not-found]
-    except ImportError:
-        _download_with_aws_cli(bucket, key, destination)
-    else:
-        try:
-            s3_client = boto3.client("s3")
-            _download_with_boto3(s3_client, bucket, key, destination)
-        except ArtifactBootstrapError:
-            raise
-        except Exception as exc:
-            raise ArtifactBootstrapError(f"boto3 failed downloading s3://{bucket}/{key}: {exc}") from exc
+    _download_with_boto3(client, bucket, key, destination)
 
 
 def bootstrap(

@@ -781,6 +781,8 @@ def test_frontier_time_limit_env_wires_plan_and_preload(
             del graph
             constructor_limits.append(frontier_time_limit_seconds)
 
+        def prewarm_routing_cache(self) -> dict[str, object]:
+            return {}
         def find_scenic_route(self, **kwargs: object) -> Route:
             del kwargs
             return _cache_test_route(1.0)

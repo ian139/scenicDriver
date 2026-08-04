@@ -775,11 +775,9 @@ def preload_route_assets(
             graph=graph,
             frontier_time_limit_seconds=frontier_time_limit_seconds,
         )
-    prewarm = getattr(planner, "prewarm_routing_cache", None)
-    if callable(prewarm):
-        prewarm_result = prewarm()
-        if isinstance(prewarm_result, Mapping):
-            planner_preload = dict(prewarm_result)
+    prewarm_result = planner.prewarm_routing_cache()
+    if isinstance(prewarm_result, Mapping):
+        planner_preload = dict(prewarm_result)
 
     return {
         "graph_path": str(graph_file),
@@ -912,8 +910,8 @@ def route_to_feature(
                 "normalized_scenic_score": _normalized_score(segment.scenic_score),
                 "road_name": segment.road_name,
                 "road_type": segment.road_type,
-                "source_edge_id": getattr(segment, "source_edge_id", None),
-                "source_fraction": getattr(segment, "source_fraction", None),
+                "source_edge_id": segment.source_edge_id,
+                "source_fraction": segment.source_fraction,
             }
         )
     objective_values = dict(objective or {})
