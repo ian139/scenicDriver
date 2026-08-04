@@ -38,15 +38,8 @@ Moved to `archive/scripts/`:
 - `archive/scripts/route_demo_geojson.py`
 - `archive/scripts/route_demo_graph_json.py`
 
-## Archived Notebooks
-Moved to `archive/notebooks/`:
-- `archive/notebooks/heuristic_ui.mo.py`
-
 ## Archived Notes
 Moved to `archive/notes/`:
-- `archive/notes/work-export-2026-04-20.md`
-- `archive/notes/coding-agent-session-mvp.md`
-- `archive/notes/archive-review-rebuild-guide.md`
 - `archive/notes/cmux-workflow-legacy.md` — historical non-active workflow; current replacement is `docs/internal/cmux-workflow.md`.
 
 ## Notes

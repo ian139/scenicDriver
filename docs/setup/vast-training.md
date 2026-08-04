@@ -6,8 +6,7 @@ model artifacts: the image contains the runtime and repository code, while S3
 holds input data, checkpoints, and outputs.
 
 The canonical GPU image definition is [`Dockerfile.remote-training`](../../Dockerfile.remote-training).
-Use `-f Dockerfile.remote-training` in scripted Docker/Vast commands. The root
-`Dockerfile` is kept as a convenience entry point to the same GPU image. The
+Use `-f Dockerfile.remote-training` in scripted Docker/Vast commands. The
 published image used by the lifecycle scripts is
 `ian139/scenicdriver-remote-training:latest`.
 
