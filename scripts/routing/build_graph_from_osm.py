@@ -1,8 +1,8 @@
 """
-Build a RoadGraph from an OSM bbox or local PBF extracts.
+Build a RoadGraph from local OSM PBF extracts.
 
-The local-PBF mode is the reproducible path for large regions. The legacy
-Overpass mode remains suitable for small builds.
+The repeatable local-PBF inputs are merged, filtered, and converted to XML
+before OSMnx loads the resulting graph.
 """
 
 from __future__ import annotations
@@ -34,9 +34,6 @@ from src.route_planner.graph import (  # noqa: E402
 )
 
 
-DEFAULT_MAX_QUERY_AREA = 50_000_000_000.0
-DEFAULT_TIMEOUT_SECONDS = 180
-DEFAULT_ATTEMPTS = 3
 PBF_HASH_CHUNK_SIZE = 8 * 1024 * 1024
 DRIVE_EXCLUDED_HIGHWAYS = frozenset(
     {
@@ -79,7 +76,7 @@ PBF_DERIVED_CACHE_VERSION = "complete-ways-highway-filter-v1"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build road graph from OSM bbox")
+    parser = argparse.ArgumentParser(description="Build road graph from local OSM PBF extracts")
     parser.add_argument("--min-lat", type=float, required=True)
     parser.add_argument("--min-lon", type=float, required=True)
     parser.add_argument("--max-lat", type=float, required=True)
@@ -103,14 +100,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional run folder name. If omitted, a deterministic name is generated.",
     )
     parser.add_argument("--network", type=str, default="drive")
-    parser.add_argument("--max-query-area", type=float, default=None)
-    parser.add_argument("--overpass-url", type=str, default=None)
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument(
         "--source-pbf",
         type=Path,
         action="append",
-        default=[],
+        required=True,
         help="Local PBF extract. Repeat for every source in the merged build.",
     )
     parser.add_argument("--require-source-checksums", action="store_true")
@@ -125,7 +119,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="OSMnx/cache folder. Local conversion intermediates are stored below it.",
     )
-    parser.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS)
     parser.add_argument(
         "--coverage-probe",
         nargs=3,
@@ -196,15 +189,11 @@ def _parse_probes(values: Iterable[Iterable[str]]) -> list[dict[str, float | str
     return probes
 
 
-def _settings_record(ox: Any, args: argparse.Namespace) -> dict[str, Any]:
+def _settings_record(ox: Any) -> dict[str, Any]:
     return {
         "version": getattr(ox, "__version__", "unknown"),
-        "requests_timeout": getattr(ox.settings, "requests_timeout", None),
         "cache_folder": getattr(ox.settings, "cache_folder", None),
         "use_cache": getattr(ox.settings, "use_cache", None),
-        "max_query_area_size": getattr(ox.settings, "max_query_area_size", None),
-        "overpass_url": getattr(ox.settings, "overpass_url", None),
-        "overpass_rate_limit": getattr(ox.settings, "overpass_rate_limit", None),
     }
 
 
@@ -213,13 +202,7 @@ def _configure_osmnx(ox: Any, args: argparse.Namespace) -> dict[str, Any]:
         args.cache_folder.mkdir(parents=True, exist_ok=True)
         ox.settings.cache_folder = str(args.cache_folder)
     ox.settings.use_cache = True
-    ox.settings.overpass_rate_limit = True
-    ox.settings.requests_timeout = int(args.timeout)
-    if args.max_query_area is not None:
-        ox.settings.max_query_area_size = float(args.max_query_area)
-    if args.overpass_url is not None:
-        ox.settings.overpass_url = args.overpass_url
-    return _settings_record(ox, args)
+    return _settings_record(ox)
 
 
 def _write_build_state(
@@ -643,40 +626,19 @@ def _publish_sqlite_graph(
         candidate_sidecar.unlink(missing_ok=True)
 
 
-def _load_overpass_graph(ox: Any, args: argparse.Namespace) -> tuple[Any, list[dict[str, Any]]]:
-    errors: list[dict[str, Any]] = []
-    for attempt in range(1, args.attempts + 1):
-        try:
-            return (
-                ox.graph_from_bbox(
-                    bbox=(args.min_lon, args.min_lat, args.max_lon, args.max_lat),
-                    network_type=args.network,
-                ),
-                errors,
-            )
-        except Exception as exc:
-            errors.append(
-                {
-                    "attempt": attempt,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                }
-            )
-    raise RuntimeError(f"OSMnx graph download failed after {args.attempts} attempts: {errors}")
 
 
 def _build(args: argparse.Namespace) -> dict[str, Any]:
+    source_values = getattr(args, "source_pbf", None) or []
+    if not source_values:
+        raise ValueError("At least one --source-pbf is required")
     bbox = _bbox(args)
-    if args.attempts < 1:
-        raise ValueError("--attempts must be positive")
     probes = _parse_probes(args.coverage_probe)
-    if args.require_source_checksums and not args.source_pbf:
-        raise ValueError("--require-source-checksums requires --source-pbf")
-    if args.source_pbf and args.network != "drive":
-        raise ValueError("Local PBF mode currently supports --network drive only")
-    if args.source_pbf and shutil.which("osmium") is None:
+    if args.network != "drive":
+        raise ValueError("PBF ingestion currently supports --network drive only")
+    if shutil.which("osmium") is None:
         raise FileNotFoundError(
-            "Local PBF mode requires the 'osmium' executable on PATH"
+            "PBF ingestion requires the 'osmium' executable on PATH"
         )
 
     output_path, run_dir, run_name = _resolve_output_paths(args)
@@ -684,14 +646,10 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
     build_state_path = run_dir / "build_state.json"
     cache_root = args.cache_folder or Path("cache/osmnx") / run_name
     cache_root.mkdir(parents=True, exist_ok=True)
-    source_names = [str(Path(path).expanduser()) for path in args.source_pbf]
+    source_names = [str(Path(path).expanduser()) for path in source_values]
     settings: dict[str, Any] = {
-        "timeout": args.timeout,
         "cache_folder": str(cache_root),
         "use_cache": True,
-        "max_query_area_size": args.max_query_area,
-        "overpass_url": args.overpass_url,
-        "overpass_rate_limit": True,
     }
     _write_build_state(
         build_state_path,
@@ -708,57 +666,53 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
 
     source_manifest: list[dict[str, Any]] = []
     replication_timestamps: dict[str, str] = {}
-    overpass_attempts: list[dict[str, Any]] = []
     try:
         import osmnx as ox
 
         osm_settings = _configure_osmnx(ox, args)
         settings.update(osm_settings)
-        if args.source_pbf:
-            source_paths = sorted(
-                (Path(path).expanduser().resolve() for path in args.source_pbf),
-                key=lambda path: str(path),
-            )
-            source_manifest = _source_manifest(
-                source_paths,
-                args.require_source_checksums,
-            )
-            xml_path, replication_timestamps = _merge_and_filter_pbf(
-                source_paths,
-                source_manifest,
-                bbox,
-                cache_root,
-            )
-            for row in source_manifest:
-                row["replication_timestamp"] = replication_timestamps[row["path"]]
-            _write_build_state(
-                build_state_path,
-                run_name=run_name,
-                bbox=bbox,
-                network=args.network,
-                graph_format=args.graph_format,
-                source_pbf=source_names,
-                settings=settings,
-                stage="acquisition",
-                status="running",
-                last_error=None,
-                extra={
-                    "source_manifest": source_manifest,
-                    "replication_timestamps": replication_timestamps,
-                },
-            )
-            G = _load_local_osm_graph(
-                ox,
-                xml_path,
-                (
-                    bbox["min_lon"],
-                    bbox["min_lat"],
-                    bbox["max_lon"],
-                    bbox["max_lat"],
-                ),
-            )
-        else:
-            G, overpass_attempts = _load_overpass_graph(ox, args)
+        source_paths = sorted(
+            (Path(path).expanduser().resolve() for path in source_values),
+            key=lambda path: str(path),
+        )
+        source_manifest = _source_manifest(
+            source_paths,
+            args.require_source_checksums,
+        )
+        xml_path, replication_timestamps = _merge_and_filter_pbf(
+            source_paths,
+            source_manifest,
+            bbox,
+            cache_root,
+        )
+        for row in source_manifest:
+            row["replication_timestamp"] = replication_timestamps[row["path"]]
+        _write_build_state(
+            build_state_path,
+            run_name=run_name,
+            bbox=bbox,
+            network=args.network,
+            graph_format=args.graph_format,
+            source_pbf=source_names,
+            settings=settings,
+            stage="acquisition",
+            status="running",
+            last_error=None,
+            extra={
+                "source_manifest": source_manifest,
+                "replication_timestamps": replication_timestamps,
+            },
+        )
+        G = _load_local_osm_graph(
+            ox,
+            xml_path,
+            (
+                bbox["min_lon"],
+                bbox["min_lat"],
+                bbox["max_lon"],
+                bbox["max_lat"],
+            ),
+        )
 
         _write_build_state(
             build_state_path,
@@ -774,7 +728,6 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
             extra={
                 "source_manifest": source_manifest,
                 "replication_timestamps": replication_timestamps,
-                "overpass_attempts": overpass_attempts,
             },
         )
         base_metadata: dict[str, Any] = {
@@ -842,7 +795,6 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
             "settings": settings,
             "source_manifest": source_manifest,
             "replication_timestamps": replication_timestamps,
-            "overpass_attempts": overpass_attempts,
             "coverage_probes": probe_metadata,
             "counts": {"nodes": node_count, "edges": edge_count},
             "graph_sha256": _digest_file(output_path, "sha256"),

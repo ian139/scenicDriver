@@ -23,14 +23,10 @@ def _args(**overrides):
         "output_root": Path("data/processed/road_graphs"),
         "run_name": "test-run",
         "network": "drive",
-        "max_query_area": None,
-        "overpass_url": None,
-        "timeout": 123,
         "source_pbf": [],
         "require_source_checksums": False,
         "graph_format": "json",
         "cache_folder": None,
-        "attempts": 3,
         "coverage_probe": [],
     }
     values.update(overrides)
@@ -60,8 +56,6 @@ def test_parser_preserves_repeatable_sources_and_probes(monkeypatch) -> None:
             "sqlite3",
             "--cache-folder",
             "cache/x",
-            "--attempts",
-            "5",
             "--coverage-probe",
             "start",
             "42.1",
@@ -74,59 +68,53 @@ def test_parser_preserves_repeatable_sources_and_probes(monkeypatch) -> None:
     assert [str(path) for path in args.source_pbf] == ["a.pbf", "b.pbf"]
     assert args.require_source_checksums is True
     assert args.graph_format == "sqlite3"
-    assert args.attempts == 5
     assert args.coverage_probe == [["start", "42.1", "-72.9"]]
 
-
-def test_graph_from_bbox_uses_west_south_east_north_order() -> None:
-    calls = []
-
-    class FakeOsmnx:
-        @staticmethod
-        def graph_from_bbox(*, bbox, network_type):
-            calls.append((bbox, network_type))
-            return "graph"
-
-    assert builder._load_overpass_graph(
-        FakeOsmnx,
-        _args(
-            min_lat=42.4,
-            min_lon=-73.5,
-            max_lat=47.5,
-            max_lon=-66.7,
-            attempts=1,
-        ),
-    ) == ("graph", [])
-    assert calls == [((-73.5, 42.4, -66.7, 47.5), "drive")]
-
-
-def test_osmnx_settings_use_requests_timeout_and_cache(tmp_path: Path) -> None:
-    settings = SimpleNamespace(
-        cache_folder=None,
-        use_cache=False,
-        requests_timeout=None,
-        max_query_area_size=1.0,
-        overpass_url="default",
-        overpass_rate_limit=False,
+def test_parser_requires_source_pbf(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "builder",
+            "--min-lat",
+            "42",
+            "--min-lon",
+            "-73",
+            "--max-lat",
+            "43",
+            "--max-lon",
+            "-72",
+        ],
     )
+
+    with pytest.raises(SystemExit) as exc_info:
+        builder.parse_args()
+
+    assert exc_info.value.code == 2
+    assert "--source-pbf" in capsys.readouterr().err
+
+
+def test_build_requires_source_pbf() -> None:
+    with pytest.raises(ValueError, match="At least one --source-pbf is required"):
+        builder._build(_args())
+
+
+
+
+def test_osmnx_settings_use_local_cache(tmp_path: Path) -> None:
+    settings = SimpleNamespace(cache_folder=None, use_cache=False)
     ox = SimpleNamespace(__version__="2.1.0", settings=settings)
-    args = _args(
-        cache_folder=tmp_path / "osmnx",
-        max_query_area=1234.0,
-        overpass_url="https://overpass.example/api",
-        timeout=77,
-    )
+    args = _args(cache_folder=tmp_path / "osmnx")
 
     record = builder._configure_osmnx(ox, args)
 
-    assert settings.requests_timeout == 77
     assert settings.use_cache is True
-    assert settings.overpass_rate_limit is True
     assert settings.cache_folder == str(tmp_path / "osmnx")
-    assert settings.max_query_area_size == 1234.0
-    assert settings.overpass_url == "https://overpass.example/api"
-    assert record["requests_timeout"] == 77
-    assert "timeout" not in record
+    assert record == {
+        "version": "2.1.0",
+        "cache_folder": str(tmp_path / "osmnx"),
+        "use_cache": True,
+    }
 
 
 def test_source_manifest_verifies_md5_and_records_sha256(tmp_path: Path) -> None:
@@ -215,29 +203,6 @@ def test_drive_filter_rejects_osmnx_compound_exclusions() -> None:
         assert not builder._drive_edge_allowed(data)
 
 
-
-def test_overpass_attempts_retry_whole_download(monkeypatch) -> None:
-    calls = []
-
-    def fake_download(**kwargs):
-        calls.append(kwargs)
-        if len(calls) < 3:
-            raise RuntimeError(f"failure-{len(calls)}")
-        return "graph"
-
-    fake_ox = SimpleNamespace(graph_from_bbox=fake_download)
-    graph, errors = builder._load_overpass_graph(
-        fake_ox,
-        _args(attempts=3),
-    )
-
-    assert graph == "graph"
-    assert len(calls) == 3
-    assert all(
-        call == {"bbox": (-73.0, 42.0, -72.0, 43.0), "network_type": "drive"}
-        for call in calls
-    )
-    assert [row["error_type"] for row in errors] == ["RuntimeError", "RuntimeError"]
 
 
 def test_local_pipeline_runs_buffer_component_simplify_exact_component(
