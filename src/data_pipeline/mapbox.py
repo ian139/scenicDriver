@@ -10,7 +10,7 @@ import os
 import time
 import logging
 from pathlib import Path
-from typing import Tuple, Optional, Iterator, List
+from typing import Tuple, Optional, Iterator
 from dataclasses import dataclass
 import math
 import numpy as np
@@ -118,20 +118,6 @@ def tile_to_lat_lon_center(x: int, y: int, zoom: int) -> Tuple[float, float]:
     return (nw_lat + se_lat) / 2, (nw_lon + se_lon) / 2
 
 
-def get_tile_bounds(x: int, y: int, zoom: int) -> Tuple[float, float, float, float]:
-    """
-    Get the geographic bounds of a tile.
-
-    Args:
-        x, y: Tile coordinates
-        zoom: Zoom level
-
-    Returns:
-        Tuple of (min_lat, min_lon, max_lat, max_lon)
-    """
-    nw_lat, nw_lon = tile_to_lat_lon(x, y, zoom)
-    se_lat, se_lon = tile_to_lat_lon(x + 1, y + 1, zoom)
-    return se_lat, nw_lon, nw_lat, se_lon
 
 
 class MapboxTileSource:
@@ -147,10 +133,6 @@ class MapboxTileSource:
     - Progress logging
     - Download statistics
 
-    Example:
-        source = MapboxTileSource(cache_dir=Path("./tiles"))
-        tile = source.get_tile_at_location(37.7749, -122.4194, zoom=15)
-        print(f"Downloaded: {tile.tile_id}")
     """
 
     BASE_URL = "https://api.mapbox.com/v4"
@@ -363,20 +345,6 @@ class MapboxTileSource:
             source="mapbox"
         )
 
-    def get_tile_at_location(self, lat: float, lon: float, zoom: int = 15) -> Tile:
-        """
-        Get the tile containing a specific location.
-
-        Args:
-            lat: Latitude
-            lon: Longitude
-            zoom: Zoom level (default 15, good balance of detail and coverage)
-
-        Returns:
-            Tile object
-        """
-        x, y = lat_lon_to_tile(lat, lon, zoom)
-        return self.get_tile(x, y, zoom)
 
     def get_tiles_for_bbox(
         self,
@@ -437,81 +405,6 @@ class MapboxTileSource:
                     logger.error(f"Failed to get tile {x},{y}: {e}")
                     continue
 
-    def download_training_sample(
-        self,
-        locations: List[Tuple[float, float, str]],
-        zoom: int = 15,
-        output_dir: Optional[Path] = None,
-        surrounding: int = 0
-    ) -> List[Path]:
-        """
-        Download tiles for a list of sample locations.
-
-        Args:
-            locations: List of (lat, lon, name) tuples
-            zoom: Tile zoom level
-            output_dir: Where to save tiles (default: cache_dir/training)
-            surrounding: Number of surrounding tiles to also download (0-2)
-
-        Returns:
-            List of paths to downloaded tiles
-        """
-        output_dir = Path(output_dir) if output_dir else self.cache_dir / "training"
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        paths = []
-        start_time = time.time()
-
-        max_index = (2 ** zoom) - 1
-
-        for lat, lon, name in locations:
-            try:
-                # Get main tile
-                x, y = lat_lon_to_tile(lat, lon, zoom)
-
-                # Calculate tiles to download (center + surrounding)
-                tiles_to_get = [(x, y)]
-                if surrounding > 0:
-                    for dx in range(-surrounding, surrounding + 1):
-                        for dy in range(-surrounding, surrounding + 1):
-                            if (dx, dy) != (0, 0):
-                                tiles_to_get.append((x + dx, y + dy))
-
-                for tx, ty in tiles_to_get:
-                    if tx < 0 or ty < 0 or tx > max_index or ty > max_index:
-                        logger.warning(
-                            f"Skipping out-of-range tile at z{zoom}: ({tx}, {ty})"
-                        )
-                        continue
-
-                    try:
-                        tile = self.get_tile(tx, ty, zoom)
-                    except (MapboxDownloadError, MapboxTokenError) as e:
-                        logger.error(f"Failed to download tile ({tx}, {ty}): {e}")
-                        continue
-
-                    # Create descriptive filename
-                    safe_name = name.lower().replace(" ", "_").replace(",", "")
-                    filename = f"{safe_name}_z{zoom}_{tx}_{ty}.png"
-                    path = output_dir / filename
-
-                    Image.fromarray(tile.image).save(path, optimize=True)
-                    paths.append(path)
-                    logger.info(f"Saved: {path}")
-
-            except (MapboxDownloadError, MapboxTokenError) as e:
-                logger.error(f"Failed to download tiles for {name}: {e}")
-                continue
-
-        self._stats.total_time_seconds = time.time() - start_time
-
-        logger.info(
-            f"Download complete: {len(paths)} tiles saved, "
-            f"{self._stats.tiles_cached} from cache, "
-            f"{self._stats.tiles_failed} failed"
-        )
-
-        return paths
 
     def get_stats(self) -> DownloadStats:
         """Get download statistics for this session."""
@@ -519,36 +412,6 @@ class MapboxTileSource:
 
 
 
-    def validate_token(self) -> bool:
-        """
-        Validate the Mapbox access token by making a test request.
-
-        Returns:
-            True if token is valid
-
-        Raises:
-            MapboxTokenError: If token is missing or invalid
-        """
-        self._ensure_token()
-
-        # Try to get a known tile (0,0 at zoom 0 always exists)
-        test_url = (
-            f"{self.BASE_URL}/{self.style_id}/0/0/0.png"
-            f"?access_token={self.access_token}"
-        )
-
-        try:
-            response = requests.head(test_url, timeout=10)
-            if response.status_code == 401:
-                raise MapboxTokenError("Invalid Mapbox access token")
-            elif response.status_code == 200:
-                logger.info("Mapbox token validated successfully")
-                return True
-            else:
-                logger.warning(f"Unexpected status code: {response.status_code}")
-                return False
-        except requests.exceptions.RequestException as e:
-            raise MapboxDownloadError(f"Failed to validate token: {e}")
 
     def __enter__(self):
         """Context manager entry."""

@@ -4,10 +4,8 @@ from .mapbox import (
     MapboxRateLimitError,
     MapboxTileSource,
     MapboxTokenError,
-    get_tile_bounds,
     lat_lon_to_tile,
     tile_to_lat_lon,
-    tile_to_lat_lon_center,
 )
 from .tile_processor import Tile
 
@@ -20,6 +18,4 @@ __all__ = [
     "DownloadStats",
     "lat_lon_to_tile",
     "tile_to_lat_lon",
-    "tile_to_lat_lon_center",
-    "get_tile_bounds",
 ]

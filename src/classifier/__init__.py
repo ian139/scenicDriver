@@ -5,16 +5,9 @@ Vision Transformer-based landscape classification for remote sensing imagery.
 
 This module provides:
 - LandscapeClassifier: ViT-B/16 model for 45-class terrain classification
-- Inference utilities for single image and batch classification
+- Image preprocessing and transform utilities
 - Training pipeline for RESISC45 dataset
 - Scenic weight mapping for terrain classes
-
-Example usage:
-    >>> from src.classifier import LandscapeClassifier, classify_image, load_model
-    >>> model = load_model("models/classifier/best_model.pt")
-    >>> result = classify_image("data/tiles/sample.png", model)
-    >>> print(f"Class: {result['class']} ({result['confidence']:.1%})")
-    >>> print(f"Scenic weight: {result['scenic_weight']:.0%}")
 """
 
 from .model import (
@@ -24,10 +17,6 @@ from .model import (
     get_scenic_weight,
 )
 from .inference import (
-    load_model,
-    classify_image,
-    batch_classify,
-    classify_directory,
     preprocess_image,
     get_inference_transform,
     get_training_transform,
@@ -44,10 +33,6 @@ __all__ = [
     "SCENIC_WEIGHTS",
     "get_scenic_weight",
     # Inference
-    "load_model",
-    "classify_image",
-    "batch_classify",
-    "classify_directory",
     "preprocess_image",
     "get_inference_transform",
     "get_training_transform",
