@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sqlite3
 
+import networkx as nx
 import pytest
 
 from src.route_planner.graph import (
@@ -15,36 +16,27 @@ from src.route_planner.graph import (
     _write_sqlite_graph,
 )
 
-
-class _FakeOsmGraph:
-    def nodes(self, data: bool = False):
-        rows = [
+def _fake_osm_graph() -> nx.MultiDiGraph:
+    graph = nx.MultiDiGraph()
+    graph.add_nodes_from(
+        [
             ("B", {"x": -72.0, "y": 42.1}),
             ("A", {"x": -72.0, "y": 42.0}),
         ]
-        return rows if data else [node_id for node_id, _ in rows]
-
-    def edges(self, keys: bool = False, data: bool = False):
-        assert keys and data
-        return [
-            (
-                "A",
-                "B",
-                0,
-                {
-                    "length": 12_000.0,
-                    "geometry": [(-72.0, 42.0), (-71.99, 42.05), (-72.0, 42.1)],
-                    "highway": "secondary",
-                    "maxspeed": "45 mph",
-                    "name": "Main Road",
-                    "oneway": False,
-                    "osmid": 123,
-                },
-            )
-        ]
-
-    def has_edge(self, start: str, end: str) -> bool:
-        return False
+    )
+    graph.add_edge(
+        "A",
+        "B",
+        key=0,
+        length=12_000.0,
+        geometry=[(-72.0, 42.0), (-71.99, 42.05), (-72.0, 42.1)],
+        highway="secondary",
+        maxspeed="45 mph",
+        name="Main Road",
+        oneway=False,
+        osmid=123,
+    )
+    return graph
 
 
 def _basic_graph() -> RoadGraph:
@@ -178,7 +170,7 @@ def test_failed_sqlite_write_leaves_existing_artifact_untouched(tmp_path: Path) 
 
 
 def test_streamed_osm_rows_match_roadgraph_conversion(tmp_path: Path) -> None:
-    osm_graph = _FakeOsmGraph()
+    osm_graph = _fake_osm_graph()
     expected = _graph_from_osmnx(osm_graph, {"123": 8.0})
     path = tmp_path / "streamed.sqlite3"
     _write_sqlite_graph(

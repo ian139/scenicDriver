@@ -1,5 +1,5 @@
 """
-Run a promotion-ready v4 regression pipeline by orchestrating existing scripts:
+Run a promotion-ready regression pipeline by orchestrating existing scripts:
 1) Build mixed labels (human-overlap aware aggregation).
 2) Export regression dataset features.
 3) Train candidate checkpoint.
@@ -16,7 +16,7 @@ import sys
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run end-to-end v4 regression pipeline")
+    parser = argparse.ArgumentParser(description="Run end-to-end regression pipeline")
     parser.add_argument(
         "--heuristic-labels",
         type=Path,

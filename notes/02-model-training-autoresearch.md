@@ -48,7 +48,7 @@ If the handoff is not ready, finish any reachable validation/reporting, write an
 - `scripts/modeling/evaluate_regression_baseline.py`
 - `scripts/modeling/compare_regression_on_benchmark.py`
 - `scripts/modeling/promote_regression_model.py`
-- `scripts/modeling/run_regression_v4_pipeline.py`
+- `scripts/modeling/run_regression_pipeline.py`
 - `src/scenic_scorer/regression.py`
 - `notebooks/learned_scoring.mo.py`
 - `data/processed/regression/model_registry.json`

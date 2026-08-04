@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-json",
         type=Path,
-        default=Path("data/processed/regression/benchmark_compare_v4_vs_v2.json"),
+        default=Path("data/processed/regression/benchmark_comparison.json"),
     )
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     return parser.parse_args()

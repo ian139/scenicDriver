@@ -1322,26 +1322,12 @@ def _stable_osm_sort_key(value: Any) -> tuple[int, object, str]:
 
 
 def _osmnx_node_data(G: Any) -> Mapping[Any, Any]:
-    nodes = getattr(G, "nodes")
-    if hasattr(nodes, "__getitem__"):
-        return nodes
-    return {node_id: data for node_id, data in nodes(data=True)}
+    return G.nodes
 
 
 def _iter_osmnx_base_nodes(G: Any) -> Iterator[Node]:
-    nodes = getattr(G, "nodes")
-    if callable(nodes) and not hasattr(nodes, "__getitem__"):
-        rows = sorted(nodes(data=True), key=lambda row: _stable_osm_sort_key(row[0]))
-        for node_id, data in rows:
-            yield Node(
-                id=str(node_id),
-                lat=float(data.get("y")),
-                lon=float(data.get("x")),
-            )
-        return
-
-    for node_id in sorted(nodes, key=_stable_osm_sort_key):
-        data = nodes[node_id]
+    rows = sorted(G.nodes(data=True), key=lambda row: _stable_osm_sort_key(row[0]))
+    for node_id, data in rows:
         yield Node(
             id=str(node_id),
             lat=float(data.get("y")),
@@ -1352,16 +1338,6 @@ def _iter_osmnx_base_nodes(G: Any) -> Iterator[Node]:
 def _iter_osmnx_edge_triples(
     G: Any,
 ) -> Iterator[tuple[Any, Any, Any, Mapping[str, Any]]]:
-    successors = getattr(G, "succ", None)
-    if successors is not None and hasattr(successors, "__getitem__"):
-        for start_id in sorted(successors, key=_stable_osm_sort_key):
-            neighbours = successors[start_id]
-            for end_id in sorted(neighbours, key=_stable_osm_sort_key):
-                keyed_edges = neighbours[end_id]
-                for key in sorted(keyed_edges, key=_stable_osm_sort_key):
-                    yield start_id, end_id, key, keyed_edges[key]
-        return
-
     rows = list(G.edges(keys=True, data=True))
     rows.sort(
         key=lambda row: (

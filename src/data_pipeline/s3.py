@@ -69,15 +69,9 @@ def download_file(
 
 
 def _iter_objects(s3: Any, bucket: str, prefix: str) -> Any:
-    paginator_factory = getattr(s3, "get_paginator", None)
-    if paginator_factory is not None:
-        paginator = paginator_factory("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            yield from page.get("Contents", [])
-        return
-    response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
-    yield from response.get("Contents", [])
-
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        yield from page.get("Contents", [])
 
 def download_prefix(
     bucket: str,

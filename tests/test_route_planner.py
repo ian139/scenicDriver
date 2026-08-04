@@ -5,6 +5,7 @@ import math
 import random
 from pathlib import Path
 
+import networkx as nx
 import pytest
 
 from src.route_planner.cost import CostWeights, ScenicCostFunction
@@ -615,22 +616,27 @@ def test_osm_linestring_intermediate_coordinates_survive_route_feature() -> None
     from src.route_planner.graph import _graph_from_osmnx
     from src.route_planner.service import route_to_feature
 
-    class _FakeGraph:
-        def nodes(self, data: bool = False):
-            assert data is True
-            return [("u", {"x": -72.0, "y": 42.0}), ("v", {"x": -71.98, "y": 42.01})]
-
-        def edges(self, keys: bool = False, data: bool = False):
-            assert keys and data
-            return [("u", "v", 0, {"length": 0.0, "highway": "secondary", "oneway": True, "geometry": _Geometry()})]
-
-        def has_edge(self, start: str, end: str) -> bool:
-            return False
-
     class _Geometry:
         coords = [(-72.0, 42.0), (-71.99, 42.005), (-71.98, 42.01)]
 
-    graph = _graph_from_osmnx(_FakeGraph(), {})
+    osm_graph = nx.MultiDiGraph()
+    osm_graph.add_nodes_from(
+        [
+            ("u", {"x": -72.0, "y": 42.0}),
+            ("v", {"x": -71.98, "y": 42.01}),
+        ]
+    )
+    osm_graph.add_edge(
+        "u",
+        "v",
+        key=0,
+        length=0.0,
+        highway="secondary",
+        oneway=True,
+        geometry=_Geometry(),
+    )
+
+    graph = _graph_from_osmnx(osm_graph, {})
     assert len(graph.nodes) == 3
     assert len(graph.edges) == 2
     planner = ScenicRoutePlanner(graph=graph)
@@ -691,42 +697,34 @@ def test_osm_length_is_authoritative_for_curves_and_geometryless_edges() -> None
             (-71.98, 42.0),
         ]
 
-    class _FakeGraph:
-        def nodes(self, data: bool = False):
-            assert data is True
-            return [
-                ("u", {"x": -72.0, "y": 42.0}),
-                ("v", {"x": -71.98, "y": 42.0}),
-                ("c", {"x": -71.0, "y": 41.0}),
-                ("d", {"x": -70.99, "y": 41.01}),
-            ]
+    osm_graph = nx.MultiDiGraph()
+    osm_graph.add_nodes_from(
+        [
+            ("u", {"x": -72.0, "y": 42.0}),
+            ("v", {"x": -71.98, "y": 42.0}),
+            ("c", {"x": -71.0, "y": 41.0}),
+            ("d", {"x": -70.99, "y": 41.01}),
+        ]
+    )
+    osm_graph.add_edge(
+        "u",
+        "v",
+        key=0,
+        length=2500.0,
+        highway="secondary",
+        oneway=True,
+        geometry=_Geometry(),
+    )
+    osm_graph.add_edge(
+        "c",
+        "d",
+        key=0,
+        length=1800.0,
+        highway="secondary",
+        oneway=True,
+    )
 
-        def edges(self, keys: bool = False, data: bool = False):
-            assert keys and data
-            return [
-                (
-                    "u",
-                    "v",
-                    0,
-                    {
-                        "length": 2500.0,
-                        "highway": "secondary",
-                        "oneway": True,
-                        "geometry": _Geometry(),
-                    },
-                ),
-                (
-                    "c",
-                    "d",
-                    0,
-                    {"length": 1800.0, "highway": "secondary", "oneway": True},
-                ),
-            ]
-
-        def has_edge(self, start: str, end: str) -> bool:
-            return False
-
-    graph = _graph_from_osmnx(_FakeGraph(), {})
+    graph = _graph_from_osmnx(osm_graph, {})
     curved = [
         edge for edge in graph.edges.values() if edge.id.startswith("u-v-0")
     ]
@@ -744,29 +742,22 @@ def test_osm_length_is_authoritative_for_curves_and_geometryless_edges() -> None
 def test_osm_invalid_length_falls_back_to_chord_total() -> None:
     from src.route_planner.graph import _graph_from_osmnx, _haversine_km
 
-    class _FakeGraph:
-        def nodes(self, data: bool = False):
-            assert data is True
-            return [
-                ("u", {"x": -72.0, "y": 42.0}),
-                ("v", {"x": -71.98, "y": 42.01}),
-            ]
+    osm_graph = nx.MultiDiGraph()
+    osm_graph.add_nodes_from(
+        [
+            ("u", {"x": -72.0, "y": 42.0}),
+            ("v", {"x": -71.98, "y": 42.01}),
+        ]
+    )
+    osm_graph.add_edge(
+        "u",
+        "v",
+        key=0,
+        length="not-a-length",
+        highway="secondary",
+    )
 
-        def edges(self, keys: bool = False, data: bool = False):
-            assert keys and data
-            return [
-                (
-                    "u",
-                    "v",
-                    0,
-                    {"length": "not-a-length", "highway": "secondary"},
-                )
-            ]
-
-        def has_edge(self, start: str, end: str) -> bool:
-            return False
-
-    graph = _graph_from_osmnx(_FakeGraph(), {})
+    graph = _graph_from_osmnx(osm_graph, {})
     edge = graph.edges["u-v-0-segment-0"]
     assert edge.distance_km == pytest.approx(
         _haversine_km(42.0, -72.0, 42.01, -71.98)

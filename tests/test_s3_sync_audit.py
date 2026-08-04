@@ -158,6 +158,34 @@ def test_s3_sync_requires_bucket(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "SCENIC_S3_BUCKET is required" in result.stdout
+def test_iter_objects_uses_canonical_paginator_across_pages() -> None:
+    from src.data_pipeline.s3 import _iter_objects
+
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    class FakePaginator:
+        def paginate(self, **kwargs: str) -> list[dict[str, list[dict[str, str]]]]:
+            calls.append(("paginate", kwargs))
+            return [
+                {"Contents": [{"Key": "prefix/first.bin"}]},
+                {"Contents": [{"Key": "prefix/second.bin"}]},
+            ]
+
+    class FakeS3Client:
+        def get_paginator(self, operation: str) -> FakePaginator:
+            calls.append(("get_paginator", {"operation": operation}))
+            return FakePaginator()
+
+    assert list(_iter_objects(FakeS3Client(), "bucket", "prefix/")) == [
+        {"Key": "prefix/first.bin"},
+        {"Key": "prefix/second.bin"},
+    ]
+    assert calls == [
+        ("get_paginator", {"operation": "list_objects_v2"}),
+        ("paginate", {"Bucket": "bucket", "Prefix": "prefix/"}),
+    ]
+
+
 
 
 def test_report_thumbnails_use_explicit_s3_raw_dir_bucket(
