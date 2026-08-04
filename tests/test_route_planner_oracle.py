@@ -1830,7 +1830,7 @@ def test_compiled_path_positions_preserve_reverse_traversal_identity() -> None:
         )
     )
     planner = ScenicRoutePlanner(graph)
-    topology = planner._csr_topology(False)
+    topology = planner._csr_topology()
     assert topology is not None
 
     result = planner._compiled_weighted_path_with_positions(

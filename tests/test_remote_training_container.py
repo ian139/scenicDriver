@@ -43,7 +43,7 @@ def test_remote_training_container_files_define_training_entrypoints() -> None:
 
     # --- .dockerignore entries ---
     dockerignore_text = dockerignore.read_text(encoding="utf-8")
-    # Keep the legacy state path ignored while CMUX migration reads old files.
+    # --- Active CMUX lifecycle state ---
     required_ignore_entries = [
         "data/raw/",
         "data/processed/",
@@ -53,7 +53,6 @@ def test_remote_training_container_files_define_training_entrypoints() -> None:
         ".venv/",
         ".git/",
         ".secrets/",
-        ".orca-vast/",
         ".cmux-vast/",
         "notebooks/__marimo__/",
     ]

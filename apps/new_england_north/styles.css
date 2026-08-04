@@ -445,11 +445,7 @@ h3 {
 }
 
 .address-suggestion,
-.suggestion-row,
-.address-suggestion-status,
-.address-suggestion-loading,
-.address-suggestion-empty,
-.address-suggestion-error {
+.address-suggestion-status {
   display: block;
   width: 100%;
   padding: 9px 11px;
