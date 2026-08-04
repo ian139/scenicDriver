@@ -1,5 +1,1 @@
-"""Learned scenic scoring."""
-
-from .regression import ScenicRegressionModel
-
-__all__ = ["ScenicRegressionModel"]
+"""Learned scenic scoring models and datasets."""
