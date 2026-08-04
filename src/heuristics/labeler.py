@@ -464,15 +464,11 @@ def _load_classifier(
         return None, None, device, None
 
     try:
-        from torchvision import transforms as tv
         from src.classifier.model import LandscapeClassifier, TERRAIN_CLASSES
-        from src.classifier.inference import RESISC45_MEAN, RESISC45_STD, IMAGENET_MEAN, IMAGENET_STD
+        from src.classifier.inference import get_inference_transform
     except ImportError as exc:
         warnings.append(f"Classifier dependencies missing: {exc}")
         return None, None, device, None
-
-    mean = RESISC45_MEAN if classifier_use_resisc45_stats else IMAGENET_MEAN
-    std = RESISC45_STD if classifier_use_resisc45_stats else IMAGENET_STD
 
     classifier = LandscapeClassifier(
         pretrained=False,
@@ -482,14 +478,7 @@ def _load_classifier(
     classifier.to(device)
     classifier.eval()
 
-    transform = tv.Compose(
-        [
-            tv.Resize((224, 224)),
-            tv.ToTensor(),
-            tv.Normalize(mean=mean, std=std),
-        ]
-    )
-
+    transform = get_inference_transform(use_resisc45_stats=classifier_use_resisc45_stats)
     class_names = list(TERRAIN_CLASSES)
     return classifier, transform, device, class_names
 

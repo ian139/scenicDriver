@@ -4,21 +4,12 @@ Owner: progno-ml-vision agent
 """
 
 
-from pathlib import Path
-from typing import Union, Optional
-
-from torch import Tensor
-from PIL import Image
-import numpy as np
-
 try:
     from torchvision import transforms
 except ImportError:
     raise ImportError(
         "torchvision required. Install with: uv sync"
     )
-
-
 
 
 # ImageNet normalization statistics
@@ -94,51 +85,6 @@ def get_training_transform(
 
 
 
-def preprocess_image(
-    image: Union[str, Path, Image.Image, np.ndarray],
-    transform: Optional[transforms.Compose] = None
-) -> Tensor:
-    """
-    Preprocess an image for classification.
-
-    Args:
-        image: Input image as:
-            - str/Path: path to image file
-            - PIL.Image: PIL image object
-            - np.ndarray: numpy array (H, W, C) in RGB format
-        transform: Optional custom transform. Uses default inference transform if None.
-
-    Returns:
-        Preprocessed tensor [1, 3, 224, 224] ready for model input
-    """
-    # Convert to PIL Image if necessary
-    if isinstance(image, (str, Path)):
-        image = Image.open(image).convert("RGB")
-    elif isinstance(image, np.ndarray):
-        # Assume numpy array is in RGB format (H, W, C)
-        if image.dtype != np.uint8:
-            # Scale float images to uint8
-            if image.max() <= 1.0:
-                image = (image * 255).astype(np.uint8)
-            else:
-                image = image.astype(np.uint8)
-        image = Image.fromarray(image).convert("RGB")
-    elif isinstance(image, Image.Image):
-        image = image.convert("RGB")
-    else:
-        raise TypeError(f"Unsupported image type: {type(image)}")
-
-    # Apply transform
-    if transform is None:
-        transform = get_inference_transform()
-
-    tensor = transform(image)
-
-    # Add batch dimension
-    if tensor.dim() == 3:
-        tensor = tensor.unsqueeze(0)
-
-    return tensor
 
 
 

@@ -9,7 +9,7 @@ Target: 94%+ classification accuracy
 
 import torch
 import torch.nn as nn
-from typing import Optional, List
+from typing import Optional
 from pathlib import Path
 
 try:
@@ -206,92 +206,6 @@ class LandscapeClassifier(nn.Module):
         with torch.no_grad():
             features = self.backbone(x)
         return features
-
-    def predict(self, x: torch.Tensor) -> dict:
-        """
-        Get prediction with confidence scores for a single image.
-
-        Args:
-            x: Single image tensor [1, 3, 224, 224]
-
-        Returns:
-            dict with keys:
-                - class: Predicted class name
-                - class_idx: Predicted class index
-                - confidence: Confidence score (0-1)
-                - scenic_weight: Scenic beauty weight for the class
-                - all_probs: Full probability distribution [45]
-                - top_5: List of (class_name, probability) for top 5 predictions
-        """
-        self.eval()
-        with torch.no_grad():
-            logits = self.forward(x)
-            probs = torch.softmax(logits, dim=-1)
-
-            # Handle batch dimension
-            if probs.dim() > 1:
-                probs = probs[0]
-
-            confidence, predicted = probs.max(dim=-1)
-
-            class_name = self.classes[predicted.item()]
-            scenic_weight = get_scenic_weight(class_name)
-
-            # Get top 5 predictions
-            top5_probs, top5_indices = probs.topk(5)
-            top_5 = [
-                (self.classes[idx.item()], prob.item())
-                for idx, prob in zip(top5_indices, top5_probs)
-            ]
-
-            return {
-                "class": class_name,
-                "class_idx": predicted.item(),
-                "confidence": confidence.item(),
-                "scenic_weight": scenic_weight,
-                "all_probs": probs.cpu().numpy(),
-                "top_5": top_5
-            }
-
-    def predict_batch(self, x: torch.Tensor) -> List[dict]:
-        """
-        Get predictions for a batch of images.
-
-        Args:
-            x: Batch of images [B, 3, 224, 224]
-
-        Returns:
-            List of prediction dicts, one per image
-        """
-        self.eval()
-        with torch.no_grad():
-            logits = self.forward(x)
-            probs = torch.softmax(logits, dim=-1)
-            confidences, predicted = probs.max(dim=-1)
-
-            results = []
-            for i in range(x.size(0)):
-                class_idx = predicted[i].item()
-                class_name = self.classes[class_idx]
-                conf = confidences[i].item()
-
-                # Top 5 for this sample
-                top5_probs, top5_indices = probs[i].topk(5)
-                top_5 = [
-                    (self.classes[idx.item()], prob.item())
-                    for idx, prob in zip(top5_indices, top5_probs)
-                ]
-
-                results.append({
-                    "class": class_name,
-                    "class_idx": class_idx,
-                    "confidence": conf,
-                    "scenic_weight": get_scenic_weight(class_name),
-                    "all_probs": probs[i].cpu().numpy(),
-                    "top_5": top_5
-                })
-
-            return results
 
     def load_weights(self, path: Path) -> None:
         """

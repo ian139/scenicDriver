@@ -186,11 +186,6 @@ class MapboxTileSource:
                 "Set MAPBOX_ACCESS_TOKEN environment variable to download tiles."
             )
 
-    @property
-    def has_token(self) -> bool:
-        """Check if access token is available."""
-        return self.access_token is not None
-
     def _ensure_token(self) -> None:
         """Raise error if token is not available."""
         if not self.access_token:

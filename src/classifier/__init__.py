@@ -17,7 +17,6 @@ from .model import (
     get_scenic_weight,
 )
 from .inference import (
-    preprocess_image,
     get_inference_transform,
     get_training_transform,
     IMAGENET_MEAN,
@@ -33,7 +32,6 @@ __all__ = [
     "SCENIC_WEIGHTS",
     "get_scenic_weight",
     # Inference
-    "preprocess_image",
     "get_inference_transform",
     "get_training_transform",
     # Constants
