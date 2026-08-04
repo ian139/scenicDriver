@@ -15,4 +15,6 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-uv run --offline --frozen python scripts/routing/autoresearch_multidetour.py
+uv run --offline --frozen pytest -q
+node --test tests/test_new_england_north_viewer.mjs
+uv run --offline --frozen python scripts/reports/autoresearch_cleanup_metric.py
