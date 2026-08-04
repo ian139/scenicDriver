@@ -143,8 +143,7 @@ class Route:
     average_scenic_score: float
     estimated_duration_minutes: float
     waypoints: List[Tuple[float, float]]
-    # Optimization diagnostics.  The first five fields above intentionally
-    # retain their historical order so direct callers remain source-compatible.
+    # Optimization diagnostics.
     edge_ids: Tuple[str, ...] = ()
     traversal_ids: Tuple[str, ...] = ()
     raw_scenic_score: float = 0.0
@@ -171,41 +170,6 @@ class Route:
         default_factory=_exact_search_diagnostics
     )
 
-    @property
-    def is_exact(self) -> bool:
-        return self.exact
-
-    @property
-    def status(self) -> str:
-        return self.exactness_status
-
-    @property
-    def objective(self) -> float:
-        return self.objective_value
-
-    @property
-    def raw_scenic(self) -> float:
-        return self.raw_scenic_score
-
-    @property
-    def normalized_scenic(self) -> float:
-        return self.normalized_scenic_score
-    @property
-    def scenic_score_normalized(self) -> float:
-        """Compatibility spelling used by service serializers."""
-        return self.normalized_scenic_score
-
-    @property
-    def requested_cap(self) -> float:
-        return self.requested_max_detour_factor
-
-    @property
-    def applied_cap(self) -> float:
-        return self.applied_max_detour_factor
-
-    @property
-    def actual_ratio(self) -> float:
-        return self.actual_duration_ratio
 
 @dataclass
 class _PathLabel:

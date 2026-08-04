@@ -889,9 +889,7 @@ def route_to_feature(
         _maybe_check_deadline(deadline, index, interval=1024)
         coords.append([float(lon), float(lat)])
     raw_score = float(route.average_scenic_score)
-    normalized_score = float(
-        getattr(route, "scenic_score_normalized", _normalized_score(raw_score))
-    )
+    normalized_score = float(route.normalized_scenic_score)
     route_edge_ids = getattr(route, "edge_ids", None)
     if route_edge_ids:
         identities = list(route_edge_ids)
@@ -999,10 +997,10 @@ def route_to_feature(
             "optimization_mode",
             getattr(route, "optimization_mode", "distance_weighted_scenic"),
         ),
-        "optimization_status": getattr(route, "status", "ok"),
-        "exactness_status": getattr(route, "exactness_status", "unknown"),
+        "optimization_status": route.exactness_status,
+        "exactness_status": route.exactness_status,
         "optimality_gap": getattr(route, "optimality_gap", None),
-        "status": getattr(route, "status", "ok"),
+        "status": route.exactness_status,
         "objective_value": objective_values.get(
             "objective_value", getattr(route, "objective_value", None)
         ),
@@ -1771,9 +1769,7 @@ def plan_routes(
             "highway_avoidance_cost": objective[
                 "highway_avoidance_cost"
             ],
-            "optimization_status": getattr(
-                scenic_route, "status", "ok" if baseline_route is not None else "uncertified"
-            ),
+            "optimization_status": scenic_route.exactness_status,
             "optimality_gap": getattr(scenic_route, "optimality_gap", None),
             "certified_upper_bound": getattr(
                 scenic_route, "certified_upper_bound", None

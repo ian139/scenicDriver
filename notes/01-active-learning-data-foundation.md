@@ -17,8 +17,8 @@ This is an implementation task, not a proposal. Inspect the repository before ch
 - OMP sessions may read and use `.env` values and credentials required for the requested work. Never print, persist, commit, or unnecessarily share secret values.
 - Large tiles, features, checkpoints, caches, reports, and generated datasets stay in ignored canonical paths. Never add them to Git or image layers.
 - Preserve `data/README.md` as the data-layout contract and `data/raw/labels_human.csv` as the backward-compatible absolute human-label source.
-- Default expansion budget: 1,000,000 combined zoom-14 rasters, interpreted as at most 500,000 satellite tiles plus the matching 500,000 Terrain-RGB tiles. Count unique `(z,x,y,style)` objects before acquisition and fail closed above budget.
-- Target geography: expand the current New England North footprint south and west, favoring contiguous US land and useful road corridors while avoiding ocean, Canada, and duplicate coverage. Prefer a land/state mask or deterministic tiled region manifest over a wasteful giant rectangle.
+- Hard expansion budget: at most 740,000 combined zoom-14 rasters—370,000 satellite tiles plus the matching 370,000 Terrain-RGB tiles. This total includes reusable tiles already downloaded or scanned in the current region. Inventory and validate existing tile/feature/label artifacts first, reuse every hash-valid compatible result, and acquire or process only the missing delta. Count unique `(z,x,y,style)` objects before acquisition and fail closed above 740,000.
+- Target geography: preserve the current New England North coverage and expand only west and south—never north or east. Favor contiguous US land and useful road corridors, generally avoiding ocean tiles and duplicate coverage. Prefer a deterministic land/state mask or collection of adjoining regions over a wasteful giant rectangle; record any unavoidable water coverage explicitly.
 - Do not train or promote the final candidate model in this prompt. Current-model inference, embedding extraction, weak labeling, batch selection, and small smoke training are allowed only to validate the data path.
 
 ## Current contracts to preserve
@@ -75,7 +75,7 @@ Create or extend canonical grouped CLIs so one command can:
 5. validate content type/decodability, dimensions, pair completeness, and hashes;
 6. emit a concise machine-readable report.
 
-Use bounded concurrency, retry only transient failures with backoff, and retain deterministic failure records. Never log access tokens. Do not begin the full acquisition until the dry run proves the budget and paths. Exercise at least a small representative acquisition or existing-cache validation; do not claim the million-tile corpus exists unless observed.
+Use bounded concurrency, retry only transient failures with backoff, and retain deterministic failure records. Never log access tokens. Do not begin acquisition until the dry run proves the 740,000-tile combined cap, reports how many existing satellite/Terrain-RGB tiles and derived artifacts can be reused, and identifies the exact missing delta. Reuse valid cached imagery, weak labels, predictions, and embeddings by content/model hash instead of redownloading or rescanning them. Exercise at least a small representative acquisition or existing-cache validation; do not claim the full 740,000-tile corpus exists unless observed.
 
 ### 3. Weak labels, current-model inference, and embeddings
 

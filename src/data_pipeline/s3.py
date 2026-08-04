@@ -15,17 +15,6 @@ class S3Uri:
 
 
 
-def normalize_s3_only(value: str | bool | None, *, default: bool = True) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "y", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "n", "off"}:
-        return False
-    raise ValueError(f"invalid SCENIC_S3_ONLY value: {value!r}")
 
 
 

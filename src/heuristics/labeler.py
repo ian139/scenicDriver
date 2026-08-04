@@ -465,7 +465,7 @@ def _load_classifier(
 
     try:
         from torchvision import transforms as tv
-        from src.classifier.model import LandscapeClassifier, TERRAIN_CLASSES, get_scenic_weight
+        from src.classifier.model import LandscapeClassifier, TERRAIN_CLASSES
         from src.classifier.inference import RESISC45_MEAN, RESISC45_STD, IMAGENET_MEAN, IMAGENET_STD
     except ImportError as exc:
         warnings.append(f"Classifier dependencies missing: {exc}")
@@ -491,7 +491,6 @@ def _load_classifier(
     )
 
     class_names = list(TERRAIN_CLASSES)
-    _ = get_scenic_weight  # keep for type reference
     return classifier, transform, device, class_names
 
 

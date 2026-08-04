@@ -298,24 +298,13 @@ def _latest_run_for_region(region: str) -> str | None:
 
 _ROUTE_PRELOAD_MODES = frozenset({"off", "best_effort", "required"})
 _DEFAULT_ROUTE_PRELOAD_MODE = "best_effort"
-_LEGACY_ROUTE_PRELOAD_MODES = {
-    "0": "off",
-    "false": "off",
-    "no": "off",
-    "off": "off",
-    "1": "required",
-    "true": "required",
-    "yes": "required",
-    "on": "required",
-}
 
 
 def _route_preload_mode() -> str:
     """Return the explicit startup route preload mode.
 
     A fresh checkout defaults to best effort so ignored graph/report assets are
-    not required just to start the API.  Legacy boolean values retain their
-    former strict-enabled/disabled behavior where possible.
+    not required just to start the API.
     """
 
     raw_value = os.getenv("SCENIC_ROUTE_PRELOAD")
@@ -325,8 +314,6 @@ def _route_preload_mode() -> str:
     value = raw_value.strip().lower().replace("-", "_")
     if value in _ROUTE_PRELOAD_MODES:
         return value
-    if value in _LEGACY_ROUTE_PRELOAD_MODES:
-        return _LEGACY_ROUTE_PRELOAD_MODES[value]
 
     _LOGGER.warning(
         "Unknown SCENIC_ROUTE_PRELOAD=%r; defaulting to %s",
