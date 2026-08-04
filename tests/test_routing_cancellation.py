@@ -1,5 +1,4 @@
 from threading import Event
-from typing import Any
 
 import pytest
 import src.route_planner.planner as planner_module

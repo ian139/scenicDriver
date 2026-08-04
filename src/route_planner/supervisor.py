@@ -41,7 +41,7 @@ import threading
 import traceback
 from typing import Any, Callable
 
-from .cancellation import CancelToken, RoutingCancelled, RoutingDeadline, RoutingTimeout
+from .cancellation import RoutingCancelled, RoutingDeadline, RoutingTimeout
 
 
 _PRELOAD_MARKER: Any = None

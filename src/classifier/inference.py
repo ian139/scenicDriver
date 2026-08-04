@@ -20,7 +20,7 @@ except ImportError:
         "torchvision required. Install with: uv sync"
     )
 
-from .model import LandscapeClassifier, TERRAIN_CLASSES, get_scenic_weight
+from .model import LandscapeClassifier
 
 
 # ImageNet normalization statistics
