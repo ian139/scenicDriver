@@ -8,8 +8,9 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
+import pandas as pd
 from PIL import Image
+import pytest
 
 
 def test_lifecycle_rule_targets_canonical_raw_images_prefix() -> None:
@@ -288,3 +289,56 @@ def test_heuristic_report_preview_preserves_256_cap(
     heuristic_report_region.main()
 
     assert captured["max_tiles"] == 256
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("human_override", 3.0),
+        ("heuristic", 1.5),
+        ("manual", 0.5),
+        ("weak", 0.5),
+        (None, 0.5),
+        (float("nan"), 0.5),
+    ],
+)
+def test_regression_dataset_sample_weight_uses_canonical_label_sources(
+    source: str | None, expected: float
+) -> None:
+    from scripts.modeling.export_regression_dataset import _sample_weight_for_row
+
+    assert _sample_weight_for_row(
+        pd.Series({"label_source": source}),
+        sample_weight_column=None,
+        label_source_column="label_source",
+        has_label_source=True,
+        has_scenic_human=False,
+        human_weight=3.0,
+        heuristic_weight=1.5,
+        default_weight=0.5,
+    ) == expected
+
+
+def test_regression_dataset_sample_weight_preserves_explicit_and_missing_behavior() -> None:
+    from scripts.modeling.export_regression_dataset import _sample_weight_for_row
+
+    kwargs = {
+        "sample_weight_column": "sample_weight",
+        "label_source_column": "label_source",
+        "has_label_source": True,
+        "has_scenic_human": False,
+        "human_weight": 3.0,
+        "heuristic_weight": 1.5,
+        "default_weight": 0.5,
+    }
+    assert _sample_weight_for_row(pd.Series({"sample_weight": 2.25}), **kwargs) == 2.25
+    with pytest.raises(ValueError, match="sample_weight"):
+        _sample_weight_for_row(pd.Series({"sample_weight": float("nan")}), **kwargs)
+
+
+def test_classifier_resume_requires_canonical_best_acc() -> None:
+    from src.classifier.train import _best_acc_from_checkpoint
+
+    assert _best_acc_from_checkpoint({"best_acc": 0.8, "val_acc": 0.1}) == 0.8
+    with pytest.raises(ValueError, match="required 'best_acc'"):
+        _best_acc_from_checkpoint({"val_acc": 0.8})

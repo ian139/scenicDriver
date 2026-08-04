@@ -290,7 +290,7 @@ workspace. The watch/down wrappers use the recorded workspace identity before
 collecting artifacts or destroying the host:
 
 ```bash
-scripts/remote/vast-start-task.sh scenic-vast-smoke 'Validate prebuilt image and S3-backed smoke run.' \
+scripts/remote/vast-start-task.sh scenic-vast-smoke \
   --agent none \
   --allocation-attempts 3 \
   --disk-gb 64 \

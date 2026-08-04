@@ -1411,6 +1411,7 @@ def test_direct_planner_response_forwards_one_deadline_identity(monkeypatch) -> 
     class FakeRoute:
         average_scenic_score = 5.0
         estimated_duration_minutes = 10.0
+        fastest_duration_minutes = 0.0
 
     class FakePlanner:
         graph = SimpleNamespace(nodes={}, edges={})

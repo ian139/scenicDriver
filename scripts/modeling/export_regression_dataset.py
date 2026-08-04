@@ -143,9 +143,9 @@ def _sample_weight_for_row(
     if has_label_source:
         source_raw = row.get(label_source_column)
         source = "" if pd.isna(source_raw) else str(source_raw).strip().lower()
-        if source in {"human", "manual", "human_override", "annotated"}:
+        if source == "human_override":
             return human_weight
-        if source in {"heuristic", "weak", "auto"}:
+        if source == "heuristic":
             return heuristic_weight
         return default_weight
 

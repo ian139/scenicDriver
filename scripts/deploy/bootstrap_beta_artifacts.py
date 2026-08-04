@@ -137,13 +137,8 @@ def _s3_key(prefix: str, source_key: str) -> str:
 def _download_with_boto3(client: Any, bucket: str, key: str, destination: Path) -> None:
     try:
         client.download_file(bucket, key, str(destination))
-        return
-    except AttributeError:
-        # A small compatibility path for test doubles and minimal S3 clients.
-        if not hasattr(client, "download_fileobj"):
-            raise ArtifactBootstrapError("boto3 S3 client does not provide download_file")
-        with destination.open("wb") as stream:
-            client.download_fileobj(bucket, key, stream)
+    except Exception as exc:
+        raise ArtifactBootstrapError(f"boto3 failed downloading s3://{bucket}/{key}: {exc}") from exc
 
 
 def _download_with_aws_cli(bucket: str, key: str, destination: Path) -> None:
@@ -265,8 +260,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--project-root", type=Path, default=None)
-    parser.add_argument("--s3-bucket", "--bucket", dest="bucket", default=None)
-    parser.add_argument("--s3-prefix", "--prefix", dest="prefix", default=None)
+    parser.add_argument("--s3-bucket", dest="bucket", default=None)
+    parser.add_argument("--s3-prefix", dest="prefix", default=None)
     parser.add_argument("--check-only", action="store_true", help="verify local artifacts without contacting S3")
     return parser
 
@@ -277,12 +272,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.prefix is not None:
         prefix = args.prefix
     else:
-        prefix = (
-            os.environ.get("SCENIC_S3_PREFIX")
-            or os.environ.get("SCENIC_S3_ARTIFACT_PREFIX")
-            or os.environ.get("SCENIC_BETA_S3_PREFIX")
-            or ""
-        )
+        prefix = os.environ.get("SCENIC_S3_PREFIX") or ""
     manifest = args.manifest
     if not manifest.is_absolute():
         root = (args.project_root or Path(__file__).resolve().parents[2]).resolve()

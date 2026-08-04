@@ -206,9 +206,7 @@ def derive_worker_count(
     return capacity
 
 
-# Friendly aliases used by operators and focused tests.
-derive_workers = derive_worker_count
-validate_workers = validate_worker_overrides
+ 
 
 
 def remote_paths(config: VastRouteConfig) -> dict[str, str]:

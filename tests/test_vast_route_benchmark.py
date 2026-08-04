@@ -25,7 +25,7 @@ def config(**overrides: object) -> benchmark.VastRouteConfig:
 
 def test_worker_derivation_is_cpu_and_memory_bounded() -> None:
     assert benchmark.derive_worker_count(65_536, 16) == 2
-    assert benchmark.derive_workers(32_768, 8) == 1
+    assert benchmark.derive_worker_count(32_768, 8) == 1
     with pytest.raises(ValueError, match="exceeds remote CPU"):
         benchmark.derive_worker_count(32_768, 2, explicit_workers=3)
     with pytest.raises(ValueError, match="insufficient"):

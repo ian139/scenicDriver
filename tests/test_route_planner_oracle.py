@@ -428,7 +428,6 @@ def _pairwise_large_fastest_oracle(
         else frozenset()
     )
     planner.cost_function.strict_highways = bool(avoid_highways)
-    planner.cost_function.avoid_highways = bool(avoid_highways)
     planner.cost_function.highway_preference = 0.0
     starts, _ = base.find_nearest_edge_positions_with_distance(
         *start, excluded_road_types=excluded
@@ -1720,7 +1719,7 @@ def test_compiled_unreachable_cache_short_circuits_python_fallback(
         )
     )
     planner = ScenicRoutePlanner(graph)
-    planner.cost_function.avoid_highways = True
+    planner.cost_function.strict_highways = True
     cost_function = planner._make_fastest_cost_function()
 
     assert planner._a_star(

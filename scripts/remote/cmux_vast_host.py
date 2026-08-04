@@ -595,7 +595,7 @@ def handle_up(args: argparse.Namespace) -> int:
     print(f"Vast CMUX host ready: {args.task_name}")
     print(f"State: {rel_state_path(args.task_name)}")
     print(f"Remote repo: {state['remote_repo_dir']}")
-    print(f"Next: scripts/remote/vast-start-task.sh {args.task_name} '<prompt>'")
+    print(f"Next: scripts/remote/vast-start-task.sh {args.task_name}")
     return 0
 
 
@@ -1034,12 +1034,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     start_task = subparsers.add_parser("start-task", help="Create and register a CMUX workspace for a Vast host")
     start_task.add_argument("task_name")
-    start_task.add_argument("prompt", help="Operator prompt retained for wrapper compatibility; not sent to CMUX.")
     start_task.add_argument("--agent", default="none")
     start_task.add_argument("--workspace-name")
     start_task.add_argument(
         "--manual",
-        "--manual-workspace",
         dest="manual",
         action="store_true",
         help="Print a manual CMUX command and leave the workspace explicitly unregistered.",

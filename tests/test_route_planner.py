@@ -2122,18 +2122,23 @@ def test_reverse_preprocessing_enumerates_traversals_once_per_request(
     )
     planner = ScenicRoutePlanner(graph=graph)
     original_get_edges = graph.get_edges
+    original_iter_edges = graph.iter_edges
     setup_complete = False
     setup_calls = 0
     forward_calls = 0
 
     def counted_get_edges(node_id: str) -> list[Edge]:
-        nonlocal setup_calls, forward_calls
+        nonlocal setup_calls
         edges = original_get_edges(node_id)
-        if setup_complete:
-            forward_calls += 1
-        else:
+        if not setup_complete:
             setup_calls += 1
         return edges
+
+    def counted_iter_edges(node_id: str):
+        nonlocal forward_calls
+        if setup_complete:
+            forward_calls += 1
+        return original_iter_edges(node_id)
 
     original_minimum = planner._minimum_cost_per_km
 
@@ -2144,6 +2149,7 @@ def test_reverse_preprocessing_enumerates_traversals_once_per_request(
         return result
 
     monkeypatch.setattr(graph, "get_edges", counted_get_edges)
+    monkeypatch.setattr(graph, "iter_edges", counted_iter_edges)
     monkeypatch.setattr(planner, "_minimum_cost_per_km", mark_setup_complete)
     path = planner._a_star(
         graph.get_node("S"),

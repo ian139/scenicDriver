@@ -802,11 +802,8 @@ def _normalized_score(raw_score: float) -> float:
 
 
 def _segment_identity(segment: Any, index: int) -> str:
-    edge_id = getattr(segment, "edge_id", None)
-    if edge_id is None:
-        edge_id = getattr(segment, "id", None)
-    if edge_id is None:
-        return f"segment:{index}"
+    del index
+    edge_id = segment.edge_id
     if str(edge_id) == "":
         raise ValueError("Route segment edge_id must not be empty")
     return str(edge_id)
@@ -822,26 +819,19 @@ def _route_comparison_identity(
     from being treated as one route merely because they share an edge.
     """
 
-    route_traversal_ids = getattr(route, "traversal_ids", None)
-    traversal_ids = (
-        tuple(route_traversal_ids)
-        if route_traversal_ids is not None
-        else ()
-    )
+    route_traversal_ids = tuple(route.traversal_ids)
     identities: list[tuple[str, str, str]] = []
     for index, segment in enumerate(route.segments):
         _maybe_check_deadline(deadline, index, interval=64)
         canonical_id = _segment_identity(segment, index)
         traversal_id = (
-            traversal_ids[index]
-            if index < len(traversal_ids)
-            else getattr(segment, "traversal_id", None)
+            route_traversal_ids[index]
+            if index < len(route_traversal_ids)
+            else segment.traversal_id
         )
         if traversal_id is None or str(traversal_id) == "":
             traversal_id = ""
-        direction = getattr(segment, "direction", None)
-        if direction is None:
-            direction = ""
+        direction = segment.direction
         identities.append(
             (canonical_id, str(traversal_id), str(direction))
         )
@@ -857,14 +847,14 @@ def _route_highway_count(
     if deadline is not None:
         deadline.check()
 
-    declared = getattr(route, "highway_count", None)
+    declared = route.highway_count
     if declared is not None:
         return int(declared)
     highway_names = HIGHWAY_ROAD_TYPES
     count = 0
     for index, segment in enumerate(route.segments):
         _maybe_check_deadline(deadline, index, interval=64)
-        if str(getattr(segment, "road_type", "")).lower() in highway_names:
+        if str(segment.road_type).lower() in highway_names:
             count += 1
     return count
 
@@ -890,7 +880,7 @@ def route_to_feature(
         coords.append([float(lon), float(lat)])
     raw_score = float(route.average_scenic_score)
     normalized_score = float(route.normalized_scenic_score)
-    route_edge_ids = getattr(route, "edge_ids", None)
+    route_edge_ids = tuple(route.edge_ids)
     if route_edge_ids:
         identities = list(route_edge_ids)
     else:
@@ -898,16 +888,14 @@ def route_to_feature(
         for index, segment in enumerate(route.segments):
             _maybe_check_deadline(deadline, index, interval=64)
             identities.append(_segment_identity(segment, index))
-    route_traversal_ids = getattr(route, "traversal_ids", None)
+    route_traversal_ids = tuple(route.traversal_ids)
     if route_traversal_ids:
         traversal_ids = list(route_traversal_ids)
     else:
         traversal_ids = []
         for index, segment in enumerate(route.segments):
             _maybe_check_deadline(deadline, index, interval=64)
-            traversal_ids.append(
-                str(getattr(segment, "traversal_id", identities[index]))
-            )
+            traversal_ids.append(str(segment.traversal_id))
     segment_rows = []
     for index, segment in enumerate(route.segments):
         _maybe_check_deadline(deadline, index, interval=64)
@@ -915,7 +903,7 @@ def route_to_feature(
             {
                 "edge_id": identities[index],
                 "traversal_id": traversal_ids[index],
-                "direction": getattr(segment, "direction", None),
+                "direction": segment.direction,
                 "start": [float(segment.start[0]), float(segment.start[1])],
                 "end": [float(segment.end[0]), float(segment.end[1])],
                 "distance_km": float(segment.distance_km),
@@ -950,8 +938,7 @@ def route_to_feature(
         "estimated_duration_minutes": float(route.estimated_duration_minutes),
         "highway_count": _route_highway_count(route, deadline=deadline),
         "requested_max_detour_factor": objective_values.get(
-            "requested_max_detour_factor",
-            getattr(route, "requested_max_detour_factor", None),
+            "requested_max_detour_factor", route.requested_max_detour_factor
         ),
         "requested_start": (
             None
@@ -975,37 +962,32 @@ def route_to_feature(
         ),
         "applied_max_detour_factor": objective_values.get(
             "applied_max_detour_factor",
-            getattr(route, "applied_max_detour_factor", None),
+            route.applied_max_detour_factor,
         ),
         "actual_duration_ratio": objective_values.get(
-            "actual_duration_ratio", getattr(route, "actual_duration_ratio", None)
+            "actual_duration_ratio", route.actual_duration_ratio
         ),
         "duration_utility": objective_values.get(
-            "duration_utility", getattr(route, "duration_utility", None)
+            "duration_utility", route.duration_utility
         ),
-        "score_coverage": getattr(route, "score_coverage", None),
-        "algorithm": getattr(route, "algorithm", None),
-        "fastest_duration_minutes": getattr(
-            route, "fastest_duration_minutes", None
-        ),
-        "duration_cap_minutes": getattr(route, "duration_cap_minutes", None),
-        "certified_upper_bound": getattr(route, "certified_upper_bound", None),
-        "normalization_version": getattr(
-            route, "normalization_version", _NORMALIZATION_VERSION
-        ),
+        "score_coverage": route.score_coverage,
+        "algorithm": route.algorithm,
+        "fastest_duration_minutes": route.fastest_duration_minutes,
+        "duration_cap_minutes": route.duration_cap_minutes,
+        "certified_upper_bound": route.certified_upper_bound,
+        "normalization_version": route.normalization_version,
         "optimization_mode": objective_values.get(
-            "optimization_mode",
-            getattr(route, "optimization_mode", "distance_weighted_scenic"),
+            "optimization_mode", "distance_weighted_scenic"
         ),
         "optimization_status": route.exactness_status,
         "exactness_status": route.exactness_status,
-        "optimality_gap": getattr(route, "optimality_gap", None),
+        "optimality_gap": route.optimality_gap,
         "status": route.exactness_status,
         "objective_value": objective_values.get(
-            "objective_value", getattr(route, "objective_value", None)
+            "objective_value", route.objective_value
         ),
         "objective": objective_values.get(
-            "objective_value", getattr(route, "objective_value", None)
+            "objective_value", route.objective_value
         ),
         "scenic_score_delta_absolute": objective_values.get(
             "scenic_score_delta_absolute"
@@ -1016,13 +998,13 @@ def route_to_feature(
         "same_route": objective_values.get("same_route"),
         "no_better_route_reason": objective_values.get(
             "no_better_route_reason",
-            getattr(route, "zero_improvement_reason", None),
+            route.zero_improvement_reason,
         ),
-        "zero_improvement_reason": getattr(route, "zero_improvement_reason", None),
-        "no_route_reason": getattr(route, "no_route_reason", None),
-        "score_run": getattr(route, "score_run", None),
+        "zero_improvement_reason": route.zero_improvement_reason,
+        "no_route_reason": route.no_route_reason,
+        "score_run": route.score_run,
         "search_diagnostics": _normalize_search_diagnostics(
-            getattr(route, "search_diagnostics", None)
+            route.search_diagnostics
         ),
     }
     if objective is not None:
@@ -1243,9 +1225,7 @@ def _detour_reference_duration(
     baseline_route: Route | None,
 ) -> float:
     scenic_duration = float(scenic_route.estimated_duration_minutes)
-    declared = float(
-        getattr(scenic_route, "fastest_duration_minutes", 0.0)
-    )
+    declared = float(scenic_route.fastest_duration_minutes)
     if math.isfinite(declared) and (
         declared > 0.0 or (declared == 0.0 and scenic_duration == 0.0)
     ):
@@ -1284,9 +1264,7 @@ def _objective_components(
     )
     normalized = _normalized_score(scenic_raw)
     if highway_avoidance_fallback:
-        objective = float(
-            getattr(scenic_route, "objective_value", normalized)
-        )
+        objective = float(scenic_route.objective_value)
         highway_cost = max(0.0, normalized - objective)
         optimization_mode = (
             "scenic_score_with_best_effort_highway_avoidance_under_duration_cap"
@@ -1318,9 +1296,7 @@ def _objective_components(
         baseline_identity is not None and scenic_identity == baseline_identity
     )
     no_better_reason = None
-    certified = bool(getattr(scenic_route, "exact", False)) or (
-        getattr(scenic_route, "optimality_gap", None) == 0.0
-    )
+    certified = bool(scenic_route.exact) or scenic_route.optimality_gap == 0.0
     if same_route:
         no_better_reason = (
             "same_route"
@@ -1736,9 +1712,7 @@ def plan_routes(
         else None
     )
     scenic_distance = float(scenic_route.total_distance_km)
-    duration_cap = float(
-        getattr(scenic_route, "duration_cap_minutes", 0.0) or 0.0
-    )
+    duration_cap = float(scenic_route.duration_cap_minutes or 0.0)
     if duration_cap <= 0.0:
         duration_cap = fastest_duration * request.max_detour_factor
     duration_cap_tolerance = 1e-12 * max(1.0, abs(duration_cap))
@@ -1762,31 +1736,26 @@ def plan_routes(
                 scenic_duration <= duration_cap + duration_cap_tolerance
             ),
             "optimization_mode": objective.get(
-                "optimization_mode",
-                getattr(scenic_route, "optimization_mode", "distance_weighted_scenic"),
+                "optimization_mode", "distance_weighted_scenic"
             ),
             "highway_preference": objective["highway_preference"],
             "highway_avoidance_cost": objective[
                 "highway_avoidance_cost"
             ],
             "optimization_status": scenic_route.exactness_status,
-            "optimality_gap": getattr(scenic_route, "optimality_gap", None),
-            "certified_upper_bound": getattr(
-                scenic_route, "certified_upper_bound", None
-            ),
+            "optimality_gap": scenic_route.optimality_gap,
+            "certified_upper_bound": scenic_route.certified_upper_bound,
             "normalized_scenic_score": objective["normalized_scenic_score"],
             "scenic_score_delta_absolute": objective["scenic_score_delta_absolute"],
             "scenic_score_delta_relative": objective["scenic_score_delta_relative"],
             "same_route": objective["same_route"],
             "no_better_route_reason": objective["no_better_route_reason"],
             "hard_highway_count": _route_highway_count(scenic_route, deadline=deadline),
-            "exactness_status": getattr(
-                scenic_route, "exactness_status", "unknown"
-            ),
+            "exactness_status": scenic_route.exactness_status,
         }
     )
     diagnostics["search_diagnostics"] = _normalize_search_diagnostics(
-        getattr(scenic_route, "search_diagnostics", None)
+        scenic_route.search_diagnostics
     )
     diagnostics["planning_elapsed_ms"] = (perf_counter() - started_at) * 1000.0
     if deadline is not None:

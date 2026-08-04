@@ -39,6 +39,16 @@ def seed_everything(seed: int = 42) -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
+def _best_acc_from_checkpoint(checkpoint: dict) -> float:
+    """Read the canonical best metric required by current checkpoints."""
+    if "best_acc" not in checkpoint:
+        raise ValueError(
+            "Checkpoint is missing required 'best_acc'; "
+            "resume checkpoints must be written by the current classifier trainer"
+        )
+    return float(checkpoint["best_acc"])
+
+
 
 def create_dataloaders(
     data_dir: Path,
@@ -408,7 +418,7 @@ def train(
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
-        best_acc = checkpoint.get("best_acc", checkpoint.get("val_acc", 0.0))
+        best_acc = _best_acc_from_checkpoint(checkpoint)
         print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2%}")
 
     output_dir = Path(output_dir)

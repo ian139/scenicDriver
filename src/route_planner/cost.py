@@ -50,10 +50,6 @@ class RoutingPolicy:
     highway_preference: float = 0.0
     scenic_priority: bool = False
 
-    @property
-    def avoid_highways(self) -> bool:
-        """Compatibility spelling for the strict highway filter."""
-        return self.strict_highways
 
 
 def resolve_routing_policy(
@@ -472,7 +468,6 @@ class ScenicCostFunction:
             if strict_highways is None
             else bool(strict_highways)
         )
-        self.avoid_highways = self.strict_highways
         self.highway_preference = _finite_nonnegative(highway_preference)
         self.weights = weights or CostWeights()
 
@@ -518,6 +513,6 @@ class ScenicCostFunction:
             return 0.0
         if self.highway_preference > 0.0:
             return self.highway_preference
-        if self.avoid_highways:
+        if self.strict_highways:
             return _finite_nonnegative(self.weights.highway_penalty)
         return 0.0

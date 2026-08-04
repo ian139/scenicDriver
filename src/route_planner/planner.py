@@ -463,17 +463,10 @@ class ScenicRoutePlanner:
             _EndpointAccessRequest
         ] = None
     def _make_cost_function(self, scenic_weight: float) -> ScenicCostFunction:
-        strict = bool(
-            getattr(
-                self.cost_function,
-                "avoid_highways",
-                getattr(self.cost_function, "strict_highways", False),
-            )
-        )
-        preference = float(getattr(self.cost_function, "highway_preference", 0.0))
+        strict = bool(self.cost_function.strict_highways)
+        preference = float(self.cost_function.highway_preference)
         return ScenicCostFunction(
             scenic_weight=scenic_weight,
-            avoid_highways=strict,
             strict_highways=strict,
             highway_preference=preference,
             weights=self.cost_function.weights,
@@ -483,16 +476,9 @@ class ScenicRoutePlanner:
         # Fastest routing is always the true travel-duration objective.  Do
         # not inherit user scenic/custom weights, which could otherwise alter
         # the detour baseline.
-        strict = bool(
-            getattr(
-                self.cost_function,
-                "avoid_highways",
-                getattr(self.cost_function, "strict_highways", False),
-            )
-        )
+        strict = bool(self.cost_function.strict_highways)
         return ScenicCostFunction(
             scenic_weight=0.0,
-            avoid_highways=strict,
             strict_highways=strict,
             highway_preference=0.0,
             weights=CostWeights(
@@ -526,10 +512,10 @@ class ScenicRoutePlanner:
                 "fastest_variants": 0,
             }
         variants = 0
-        for avoid_highways in (False, True):
+        for strict_highways in (False, True):
             cost = ScenicCostFunction(
                 scenic_weight=0.0,
-                avoid_highways=avoid_highways,
+                strict_highways=strict_highways,
                 weights=CostWeights(
                     travel_time=1.0,
                     scenic_reward=0.0,
@@ -691,7 +677,7 @@ class ScenicRoutePlanner:
             return [] if start.id == goal.id else None
         fastest_cost = ScenicCostFunction(
             scenic_weight=0.0,
-            avoid_highways=self._avoids_highways(scenic_cost),
+            strict_highways=self._avoids_highways(scenic_cost),
             weights=CostWeights(
                 travel_time=1.0,
                 scenic_reward=0.0,
@@ -936,7 +922,7 @@ class ScenicRoutePlanner:
             return [] if start.id == goal.id else None
         fastest_cost = ScenicCostFunction(
             scenic_weight=0.0,
-            avoid_highways=avoid_highways,
+            strict_highways=avoid_highways,
             weights=CostWeights(
                 travel_time=1.0,
                 scenic_reward=0.0,
@@ -1479,10 +1465,7 @@ class ScenicRoutePlanner:
         self, cost_function: Optional[ScenicCostFunction] = None
     ) -> bool:
         selected = cost_function if cost_function is not None else self.cost_function
-        value = getattr(selected, "avoid_highways", None)
-        if value is None:
-            value = getattr(selected, "strict_highways", False)
-        return bool(value)
+        return bool(getattr(selected, "strict_highways", False))
 
     def _edge_is_eligible(
         self, edge: Edge, cost_function: Optional[ScenicCostFunction] = None
@@ -1550,10 +1533,7 @@ class ScenicRoutePlanner:
         """Iterate outgoing traversals without requiring list materialization."""
         graph = self.graph
         assert graph is not None
-        iterator = getattr(graph, "iter_edges", None)
-        if callable(iterator):
-            return iterator(node_id)
-        return graph.get_edges(node_id)
+        return graph.iter_edges(node_id)
 
     def _cached_reverse_index(
         self, cost_function: ScenicCostFunction
@@ -1563,9 +1543,7 @@ class ScenicRoutePlanner:
         assert graph is not None
         stamp = graph._heuristic_cache_stamp()
         avoid_highways = self._avoids_highways(cost_function)
-        highway_preference = float(
-            getattr(cost_function, "highway_preference", 0.0)
-        )
+        highway_preference = float(cost_function.highway_preference)
         key = (id(graph), stamp, avoid_highways, highway_preference)
         cached = self._REVERSE_INDEX_CACHE.get(key)
         if cached is not None:
@@ -2182,7 +2160,7 @@ class ScenicRoutePlanner:
             return _ZeroBounds()
 
         fastest = ScenicRoutePlanner._make_fastest_cost_function(self)
-        fastest.avoid_highways = bool(avoid_highways)
+        fastest.strict_highways = bool(avoid_highways)
         signature = self._built_in_cost_signature(fastest)
         graph = self.graph
         if graph is None or signature is None or expired():
@@ -4809,7 +4787,6 @@ class ScenicRoutePlanner:
         base = request.overlay.base_graph
         scenic_cost = ScenicCostFunction(
             scenic_weight=search_scenic_weight,
-            avoid_highways=policy.strict_highways,
             strict_highways=policy.strict_highways,
             highway_preference=policy.highway_preference,
             weights=self.cost_function.weights,
@@ -4945,7 +4922,6 @@ class ScenicRoutePlanner:
                 avoid_highways=avoid_highways,
             )
             self.cost_function.strict_highways = policy.strict_highways
-            self.cost_function.avoid_highways = policy.strict_highways
             self.cost_function.highway_preference = 0.0
             middle = self._multi_access_builtin_path(
                 request.overlay,
@@ -5120,7 +5096,6 @@ class ScenicRoutePlanner:
             scenic_priority=scenic_priority,
         )
         self.cost_function.strict_highways = policy.strict_highways
-        self.cost_function.avoid_highways = policy.strict_highways
         self.cost_function.highway_preference = policy.highway_preference
         q_value = policy.scenic_weight
         kappa_value = policy.kappa
@@ -5440,7 +5415,6 @@ class ScenicRoutePlanner:
             avoid_highways=avoid_highways,
         )
         self.cost_function.strict_highways = policy.strict_highways
-        self.cost_function.avoid_highways = policy.strict_highways
         self.cost_function.highway_preference = 0.0
         start_node, end_node = self._routing_endpoint_nodes(start, end)
         bounded_graph = self._is_bounded_oracle_graph()
@@ -5599,12 +5573,7 @@ class ScenicRoutePlanner:
         came_from: Dict[str, Tuple[str, Edge]] = {}
         best_cost: Dict[str, float] = {start.id: 0.0}
         best_distance_km: Dict[str, float] = {start.id: 0.0}
-        if "get_edges" in getattr(self.graph, "__dict__", {}):
-            edge_iterator = self.graph.get_edges
-        else:
-            edge_iterator = getattr(self.graph, "iter_edges", None)
-            if not callable(edge_iterator):
-                edge_iterator = self.graph.get_edges
+        edge_iterator = self._iter_edges
 
         expanded = 0
         while frontier:
@@ -5707,8 +5676,8 @@ class ScenicRoutePlanner:
         weights = cost_function.weights
         return (
             float(cost_function.scenic_weight),
-            bool(getattr(cost_function, "strict_highways", False)),
-            float(getattr(cost_function, "highway_preference", 0.0)),
+            bool(cost_function.strict_highways),
+            float(cost_function.highway_preference),
             float(weights.travel_time),
             float(weights.scenic_reward),
             float(weights.highway_penalty),
@@ -6426,12 +6395,7 @@ class ScenicRoutePlanner:
         ]
         next_label_id = 1
         search_stamp = self.graph._heuristic_cache_stamp()
-        if "get_edges" in getattr(self.graph, "__dict__", {}):
-            edge_iterator = self.graph.get_edges
-        else:
-            edge_iterator = getattr(self.graph, "iter_edges", None)
-            if not callable(edge_iterator):
-                edge_iterator = self.graph.get_edges
+        edge_iterator = self._iter_edges
         builtin_cost = self._reverse_cost_eligible(cost_function)
         avoid_highways = self._avoids_highways(cost_function)
         validate_nonnegative = self._validated_nonnegative
