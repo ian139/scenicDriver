@@ -12,6 +12,7 @@ Use this workflow for every OMP coordinator, CMUX worker, and CMUX development s
 - Keep containers as the default runtime; host execution is developer convenience only.
 - Run final verification through the containerized path before marking work ready to push.
 - Never use model review as a substitute for tests, smoke checks, or container evidence.
+- Every OMP coordinator and worker has full authority to read and use `.env` values, API keys, access tokens, and other credentials when needed for the user's request, without additional confirmation. Limit use to that request and never reproduce secret values in prompts, reports, logs, Git, image layers, artifacts, or messages to sessions that do not need them.
 
 ## Initial one-time integration
 

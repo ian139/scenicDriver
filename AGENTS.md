@@ -34,10 +34,16 @@ Scenic Drive scores scenic beauty from satellite imagery and terrain data, then 
 - Preserve `archive/archive.md` as the archive manifest.
 - Beta deployment requires the canonical processed graph, learned run, registry, and active model checkpoint mounted from ignored `data/processed/` and `models/`; they remain outside Git and Docker image layers.
 
+## OMP Credential Authority
+- Every OMP session in this repository has full authority to read and use `.env` values, API keys, access tokens, and other credentials when needed to carry out the user's request. This authority applies to the main session and delegated workers without additional confirmation.
+- Limit credential access and use to the requested work. Never expose secret values in prompts, reports, logs, committed files, image layers, generated artifacts, or messages to agents that do not need them; keep existing runtime-only, ignored-file, and least-disclosure safeguards intact.
+
 ## Development Rules
 - Use `uv`, not `pip`, for Python dependency management.
 - Use marimo notebooks, not Jupyter, for training/research workflows.
-- Prefer one canonical workflow path; archive superseded alternatives instead of leaving duplicate active paths.
+- Forward-looking trajectory: Do NOT retain backward-compatibility layers, deprecation shims, legacy aliases, or unused code. Maintain zero dead code in active modules.
+- Clean cutover & pruning: Aggressively delete superseded implementations, orphaned scripts, and obsolete files instead of archiving or hoarding them. Backwards compatibility does not matter for this stage.
+- Keep repository layout clean, condensed, and organized. Every file must have a single, canonical purpose for upcoming development.
 - Run focused tests or smoke checks for changed API, script, notebook, or app paths before yielding.
 - OMP/CMUX workflow details live in `docs/internal/cmux-workflow.md`.
 - Use CMUX—not Orca—for repository workspaces, worker sessions, and worktree views.
@@ -48,7 +54,6 @@ Scenic Drive scores scenic beauty from satellite imagery and terrain data, then 
 - Use grouped `scripts/` subdirectories for workflow CLIs only.
 - Keep large datasets and model weights out of git.
 - Store run artifacts under `data/processed/` (ignored).
-
 ## Subagent Model Roles
 
 These roles resolve through the OMP `modelRoles` map. Each inherits the base provider config from that map; only the model and any role-specific flags are listed here.
@@ -56,3 +61,16 @@ These roles resolve through the OMP `modelRoles` map. Each inherits the base pro
 - `designer`: `openrouter/glm/5.2` — UI/UX design and visual refinement.
 - `commit`: `ollama-cloud/deepseek-v4-flash` — commit-message generation.
 - `task`: `ollama-cloud/deepseek-v4-pro --thinking high` — general subagent implementation work.
+
+
+## Parallel Subagent Execution
+
+- **Pre-work decomposition:** Before substantive work, the main model maps the critical path, independent ownership boundaries, real dependencies, and shared interfaces. It must not serially perform independent implementation or investigation that bounded workers can execute concurrently.
+- **Useful fan-out:** Dispatch the maximum useful set of genuinely independent slices in one `tasks[]` batch, up to the concurrency cap. Do not invent work to increase agent count. Serialize only when a real output, schema, API, or state dependency requires it.
+- **Agent allocation:** Use `task` for most bounded load-bearing implementation, including ordinary modules, tests, fixtures, migrations, reusable browser mechanics, and well-specified repairs. Use `task-high` substantially less often: normally at most one per wave, reserved for the hardest correctness-sensitive independent slice, such as lifecycle or concurrency invariants, security-sensitive persistence, ambiguous cross-module logic, or difficult root-cause repair. Use more than one only when multiple genuinely independent high-complexity invariants justify it. Never use `task-high` for routine edits, searches, formatting, mechanical changes, or straightforward tests. Use `scout` for read-only repository discovery and `reviewer` for independent post-integration review; neither substitutes for an implementation worker.
+- **Task contracts:** Every delegated task must specify exact files or subsystem ownership, required changes, non-goals, shared interfaces and invariants, observable acceptance criteria, and concrete evidence to return.
+- **Isolated worktrees:** Use isolated worktrees for independent code-editing agents when ownership boundaries permit. Subagents must not merge their own work, redefine shared contracts, or make cross-cutting product decisions independently. The main model owns review and integration.
+- **Concurrent validation:** Subagents must skip formatters, project-wide suites, and shared live-browser manipulation while parallel edits are in flight. They may run narrow checks scoped to their owned artifacts. After integration, the main model runs repository-level verification and the end-to-end smoke scenario once.
+- **Shared browser boundary:** Keep exactly one main-session owner for any visible CMUX browser and one-active-job workflow. Subagents may analyze sanitized observations, implement reusable mechanics, prepare schema-valid decisions, diagnose controls, or review evidence, but they must not concurrently manipulate the shared browser, claim another job, or receive unnecessary private values.
+- **Browser automation order:** Where applicable, OMP browser/CDP is primary; the repository-pinned Playwright CLI is the control-specific fallback; computer or coordinate interaction is last. Do not make ad hoc page scripts or coordinate automation the main implementation.
+- **Suggested default wave:** Several `task` workers, zero or one `task-high` worker, an optional `scout` during discovery, and an optional `reviewer` only after integration.
