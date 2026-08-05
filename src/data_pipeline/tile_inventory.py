@@ -53,6 +53,7 @@ def scan_tile_inventory(
         "satellite_valid": 0,
         "terrain_valid": 0,
         "complete_pairs": 0,
+        "reusable_pairs": 0,
         "incomplete_pairs": 0,
         "invalid_files": 0,
     }
@@ -82,6 +83,7 @@ def scan_tile_inventory(
         counts["satellite_valid"] += int(sat["valid"])
         counts["terrain_valid"] += int(ter["valid"])
         counts["complete_pairs"] += int(sat["valid"] and ter["valid"])
+        counts["reusable_pairs"] += int(sat["valid"] and ter["valid"])
         counts["incomplete_pairs"] += int(not (sat["valid"] and ter["valid"]))
         counts["invalid_files"] += int(sat["present"] and not sat["valid"]) + int(
             ter["present"] and not ter["valid"]
@@ -151,6 +153,16 @@ def scan_s3_inventory(
             bool(row.get("satellite_present")) and bool(row.get("terrain_present"))
             for row in output
         ),
+        "reusable_pairs": sum(
+            (
+                bool(row.get("satellite_present"))
+                or bool(row.get("satellite_s3_present"))
+            )
+            and (
+                bool(row.get("terrain_present")) or bool(row.get("terrain_s3_present"))
+            )
+            for row in output
+        ),
         "incomplete_pairs": sum(
             not (
                 bool(row.get("satellite_present")) and bool(row.get("terrain_present"))
@@ -182,8 +194,13 @@ def build_inventory_report(
         "counts": dict(counts),
         "reusable_pairs": sum(
             int(
-                (bool(r.get("satellite_present")) or bool(r.get("satellite_s3_present")))
-                and (bool(r.get("terrain_present")) or bool(r.get("terrain_s3_present")))
+                (
+                    bool(r.get("satellite_present"))
+                    or bool(r.get("satellite_s3_present"))
+                )
+                and (
+                    bool(r.get("terrain_present")) or bool(r.get("terrain_s3_present"))
+                )
             )
             for r in rows
         ),

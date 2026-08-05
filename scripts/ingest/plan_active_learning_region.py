@@ -35,6 +35,8 @@ from src.data_pipeline.tile_inventory import (  # noqa: E402
     scan_s3_inventory,
     scan_tile_inventory,
 )
+from src.active_learning.common import validate_run_name  # noqa: E402
+
 
 COLUMNS = [
     "region",
@@ -123,6 +125,8 @@ def _file_digest(path: Path) -> str | None:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
 def _identity_digest(value: Any) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -148,9 +152,7 @@ def _resume_identity(
             with path.open(encoding="utf-8") as stream:
                 existing.update(json.load(stream))
     spec_digest = (
-        _file_digest(Path(spec_path))
-        if spec_path
-        else _identity_digest(region_spec)
+        _file_digest(Path(spec_path)) if spec_path else _identity_digest(region_spec)
     )
     config_digest = _file_digest(Path(config_path))
     expected = {
@@ -343,6 +345,7 @@ def plan_run(
     s3_prefix_root: str = "raw/images",
     workers: int = 8,
 ) -> dict[str, Any]:
+    run_name = validate_run_name(run_name)
     if workers <= 0:
         raise ValueError("workers must be positive")
     if zoom != 14:
@@ -411,25 +414,31 @@ def plan_run(
     }
     _atomic_csv(run_dir / "tile_manifest.csv", rows)
     _atomic_json(run_dir / "acquisition_preflight.json", preflight)
-    if acquire and not os.environ.get("MAPBOX_ACCESS_TOKEN"):
-        raise RuntimeError(
-            "MAPBOX_ACCESS_TOKEN is required for acquisition; dry-run artifacts were written"
-        )
     failures: list[dict[str, Any]] = []
+    missing_any = any(
+        not row.get(f"{style}_present") and not row.get(f"{style}_s3_present")
+        for style in ("satellite", "terrain")
+        for row in rows
+    )
     if acquire:
-        acquire_missing(
-            rows,
-            image_root=Path(image_root),
-            zoom=zoom,
-            failures=failures,
-            max_workers=workers,
-        )
-        rows, counts = _inventory(
-            rows,
-            image_root=image_root,
-            s3_bucket=s3_bucket,
-            s3_prefix_root=s3_prefix_root,
-        )
+        if missing_any:
+            if not os.environ.get("MAPBOX_ACCESS_TOKEN"):
+                raise RuntimeError(
+                    "MAPBOX_ACCESS_TOKEN is required for acquisition; dry-run artifacts were written"
+                )
+            acquire_missing(
+                rows,
+                image_root=Path(image_root),
+                zoom=zoom,
+                failures=failures,
+                max_workers=workers,
+            )
+            rows, counts = _inventory(
+                rows,
+                image_root=image_root,
+                s3_bucket=s3_bucket,
+                s3_prefix_root=s3_prefix_root,
+            )
         preflight.update(
             {
                 "existing_satellite": counts["satellite_valid"],
@@ -441,8 +450,7 @@ def plan_run(
                     for row in rows
                 ),
                 "missing_terrain": sum(
-                    not row.get("terrain_present")
-                    and not row.get("terrain_s3_present")
+                    not row.get("terrain_present") and not row.get("terrain_s3_present")
                     for row in rows
                 ),
                 "estimated_missing_storage_bytes": (
@@ -484,10 +492,14 @@ def plan_run(
         "tile_budget_rasters": budget * 2,
         "geometry_digest": planned["geometry_digest"],
         "geography": {
-            "source": region_spec.get("geographic_source", "versioned region specification"),
+            "source": region_spec.get(
+                "geographic_source", "versioned region specification"
+            ),
             "included_jurisdictions": region_spec.get("included_jurisdictions", []),
             "excluded_jurisdictions": region_spec.get("excluded_jurisdictions", []),
-            "known_non_target_coverage": region_spec.get("known_non_target_coverage", []),
+            "known_non_target_coverage": region_spec.get(
+                "known_non_target_coverage", []
+            ),
             "limitations": region_spec.get("limitations", []),
         },
         "region_spec": region_spec,
@@ -528,7 +540,7 @@ def plan_run(
         },
         "stage_state": "acquired" if acquire else "planned",
         "ready_for_selection": not failures
-        and counts["complete_pairs"] == counts["coordinates"],
+        and counts["reusable_pairs"] == counts["coordinates"],
     }
     _atomic_json(run_dir / "region_manifest.json", manifest)
     _atomic_csv(run_dir / "tile_manifest.csv", rows)

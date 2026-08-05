@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
 import threading
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -40,7 +44,27 @@ def test_cli_defaults_loopback_and_remote_requires_opt_in() -> None:
     assert parse_args([]).host == "127.0.0.1"
     with pytest.raises(SystemExit):
         parse_args(["--host", "0.0.0.0"])
-    assert parse_args(["--host", "0.0.0.0", "--allow-remote"]).allow_remote is True
+    with pytest.raises(SystemExit):
+        parse_args(["--host", "0.0.0.0", "--allow-remote"])
+    with pytest.raises(SystemExit):
+        parse_args(
+            ["--host", "0.0.0.0", "--allow-remote", "--session-token", "secret123"]
+        )
+    parsed = parse_args(
+        [
+            "--host",
+            "0.0.0.0",
+            "--allow-remote",
+            "--session-token",
+            "secret123",
+            "--tls-cert",
+            "server.crt",
+            "--tls-key",
+            "server.key",
+        ]
+    )
+    assert parsed.allow_remote is True
+    assert parsed.session_token == "secret123"
 
 
 def test_paths_and_image_paths_fail_closed(tmp_path: Path) -> None:
@@ -155,7 +179,9 @@ def test_ui_contract_and_structured_error_surface() -> None:
     assert make_handler is not None
 
 
-def test_blind_qa_overlap_is_exposed_without_restoring_prior_answer(tmp_path: Path) -> None:
+def test_blind_qa_overlap_is_exposed_without_restoring_prior_answer(
+    tmp_path: Path,
+) -> None:
     state = fixture_state(tmp_path)
     state.load_batch({})
     state.save_annotation(
@@ -168,7 +194,9 @@ def test_blind_qa_overlap_is_exposed_without_restoring_prior_answer(tmp_path: Pa
         }
     )
     batch_csv = tmp_path / "qa_batch.csv"
-    batch_csv.write_text("image_path,is_qa_overlap,selection_reason\ntile.png,True,qa\n")
+    batch_csv.write_text(
+        "image_path,is_qa_overlap,selection_reason\ntile.png,True,qa\n"
+    )
 
     loaded = state.load_batch({"batch_csv": str(batch_csv)})
     assert loaded["batch"][0]["is_qa_overlap"] is True
@@ -176,3 +204,67 @@ def test_blind_qa_overlap_is_exposed_without_restoring_prior_answer(tmp_path: Pa
         "found": False,
         "image_path": "tile.png",
     }
+
+
+def test_remote_session_bootstrap_and_authenticated_access(tmp_path: Path) -> None:
+    state = fixture_state(tmp_path)
+    session_token = "secret_session_token_12345"
+    handler_class = make_handler(state, remote=True, session_token=session_token)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+    host, port = server.server_address
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.daemon = True
+    server_thread.start()
+    try:
+        url_base = f"http://{host}:{port}"
+
+        # 1. Access protected route without cookie -> 401 Unauthorized
+        req_unauth = urllib.request.Request(f"{url_base}/api/state")
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req_unauth)
+        assert exc_info.value.code == 401
+
+        # 2. Bootstrap session without proof -> 401 Unauthorized
+        req_no_proof = urllib.request.Request(f"{url_base}/api/session")
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req_no_proof)
+        assert exc_info.value.code == 401
+
+        # 3. Bootstrap session with wrong bearer proof -> 401 Unauthorized
+        req_wrong_proof = urllib.request.Request(
+            f"{url_base}/api/session",
+            headers={"Authorization": "Bearer wrong_token"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req_wrong_proof)
+        assert exc_info.value.code == 401
+
+        # 4. Bootstrap session with correct bearer proof -> 200 OK & Set-Cookie
+        req_bootstrap = urllib.request.Request(
+            f"{url_base}/api/session",
+            headers={"Authorization": f"Bearer {session_token}"},
+        )
+        with urllib.request.urlopen(req_bootstrap) as resp:
+            assert resp.status == 200
+            cookie_header = resp.headers.get("Set-Cookie")
+            assert cookie_header is not None
+            assert "scenic_session=secret_session_token_12345" in cookie_header
+            assert "HttpOnly" in cookie_header
+            assert "SameSite=Strict" in cookie_header
+            assert "Secure" in cookie_header
+            body = resp.read().decode("utf-8")
+            assert "secret_session_token_12345" not in body
+
+        # 5. Access protected route with cookie -> 200 OK
+        req_auth = urllib.request.Request(
+            f"{url_base}/api/state",
+            headers={"Cookie": f"scenic_session={session_token}"},
+        )
+        with urllib.request.urlopen(req_auth) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["schema_version"] == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()

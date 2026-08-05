@@ -35,26 +35,62 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_promote_regression_model_smoke(tmp_path: Path) -> None:
-    candidate_metrics = tmp_path / "candidate.json"
-    baseline_metrics = tmp_path / "baseline.json"
+    import torch
+    from src.active_learning.common import sha256_file
+    from src.scenic_scorer.regression import ScenicRegressionModel
+
+    decision_json = tmp_path / "decision.json"
     registry_json = tmp_path / "model_registry.json"
     candidate_ckpt = tmp_path / "candidate.pt"
-    candidate_ckpt.write_bytes(b"placeholder")
 
-    candidate_metrics.write_text(json.dumps({"corr": 0.95, "mae": 0.2, "rmse": 0.3, "samples": 100}), encoding="utf-8")
-    baseline_metrics.write_text(json.dumps({"corr": 0.9, "mae": 0.25, "rmse": 0.35, "samples": 100}), encoding="utf-8")
+    model = ScenicRegressionModel()
+    torch.save(
+        {
+            "checkpoint_schema_version": 1,
+            "checkpoint_state": "completed",
+            "model_state_dict": model.state_dict(),
+            "vit_dim": 768,
+            "terrain_dim": 6,
+            "num_classes": 45,
+            "hidden_dim": 256,
+            "val_loss": 0.1,
+        },
+        candidate_ckpt,
+    )
+    cand_sha = sha256_file(candidate_ckpt)
 
+    initial_registry = {
+        "schema_version": 1,
+        "active": {
+            "run_name": "baseline",
+            "checkpoint": str(candidate_ckpt),
+            "sha256": cand_sha,
+        },
+        "history": [],
+    }
+    registry_json.write_text(json.dumps(initial_registry), encoding="utf-8")
+    reg_sha = sha256_file(registry_json)
+    decision_payload = {
+        "all_gates_pass": True,
+        "reason": "Test promotion",
+        "baseline": {"sha256": cand_sha},
+        "candidate": {"sha256": cand_sha},
+        "expanded_human_benchmark": {
+            "candidate_metrics": {"corr": 0.95, "mae": 0.2, "rmse": 0.3, "samples": 100}
+        },
+    }
+    decision_json.write_text(json.dumps(decision_payload), encoding="utf-8")
     cmd = [
         sys.executable,
         str(REPO_ROOT / "scripts/modeling/promote_regression_model.py"),
-        "--candidate-metrics",
-        str(candidate_metrics),
-        "--baseline-metrics",
-        str(baseline_metrics),
+        "--decision",
+        str(decision_json),
         "--candidate-checkpoint",
         str(candidate_ckpt),
         "--registry-json",
         str(registry_json),
+        "--expected-registry-sha256",
+        reg_sha,
         "--run-name",
         "smoke_vx",
     ]
@@ -63,47 +99,7 @@ def test_promote_regression_model_smoke(tmp_path: Path) -> None:
     registry = json.loads(registry_json.read_text(encoding="utf-8"))
     assert registry["active"] is not None
     assert registry["active"]["run_name"] == "smoke_vx"
-    assert registry["active"]["checkpoint"] == str(candidate_ckpt)
-
-
-def test_promote_regression_model_from_benchmark_comparison(tmp_path: Path) -> None:
-    active_comparison = tmp_path / "active_compare.json"
-    control_comparison = tmp_path / "control_compare.json"
-    registry_json = tmp_path / "model_registry.json"
-    candidate_ckpt = tmp_path / "candidate.pt"
-    candidate_ckpt.write_bytes(b"placeholder")
-
-    comparison_payload = {
-        "baseline": {"corr": 0.9, "mae": 0.25, "rmse": 0.35, "samples": 20},
-        "candidate": {"corr": 0.95, "mae": 0.2, "rmse": 0.3, "samples": 20},
-        "deltas": {"corr": 0.05, "mae": -0.05, "rmse": -0.05},
-    }
-    active_comparison.write_text(json.dumps(comparison_payload), encoding="utf-8")
-    control_comparison.write_text(json.dumps(comparison_payload), encoding="utf-8")
-
-    cmd = [
-        sys.executable,
-        str(REPO_ROOT / "scripts/modeling/promote_regression_model.py"),
-        "--benchmark-comparison",
-        str(active_comparison),
-        "--required-control-comparison",
-        str(control_comparison),
-        "--candidate-checkpoint",
-        str(candidate_ckpt),
-        "--registry-json",
-        str(registry_json),
-        "--run-name",
-        "benchmark_vx",
-    ]
-    subprocess.run(cmd, check=True, cwd=REPO_ROOT)
-
-    registry = json.loads(registry_json.read_text(encoding="utf-8"))
-    assert registry["active"] is not None
-    assert registry["active"]["run_name"] == "benchmark_vx"
-    assert registry["active"]["metrics"] == {"corr": 0.95, "mae": 0.2, "rmse": 0.3, "samples": 20}
-    assert registry["active"]["source_metrics"] == str(active_comparison)
-
-
+    assert registry["active"]["sha256"] == cand_sha
 def test_route_compare_service_smoke(tmp_path: Path) -> None:
     graph = {
         "type": "FeatureCollection",

@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from PIL import Image
+from src.active_learning.common import sha256_file
 from src.active_learning.finalize import finalize_stage1
 from src.active_learning.scoring import (
     ScoringDependencies,
@@ -66,7 +67,9 @@ def _dependencies(counters: dict[str, int]) -> ScoringDependencies:
             np.arange(size * 4, dtype=np.float32).reshape(size, 4) + 1.0,
         )
 
-    def regression(embeddings: np.ndarray, terrain_features: np.ndarray, logits: np.ndarray) -> np.ndarray:
+    def regression(
+        embeddings: np.ndarray, terrain_features: np.ndarray, logits: np.ndarray
+    ) -> np.ndarray:
         counters["regression"] += 1
         assert embeddings.shape[0] == terrain_features.shape[0] == logits.shape[0]
         return np.linspace(2.0, 8.0, len(embeddings), dtype=np.float32)
@@ -87,7 +90,9 @@ def test_resume_skips_unchanged_rows_and_preserves_error_state(tmp_path: Path) -
     manifest = _manifest(tmp_path)
     counters = {"classifier": 0, "regression": 0}
     dependencies = _dependencies(counters)
-    first = score_tile_manifest(manifest, run_root=tmp_path / "run", dependencies=dependencies, batch_size=2)
+    first = score_tile_manifest(
+        manifest, run_root=tmp_path / "run", dependencies=dependencies, batch_size=2
+    )
     assert first["counts"] == {
         "manifest_rows": 3,
         "scored_rows": 2,
@@ -98,23 +103,37 @@ def test_resume_skips_unchanged_rows_and_preserves_error_state(tmp_path: Path) -
         "cache_misses": 3,
     }
     assert counters == {"classifier": 1, "regression": 1}
-    second = score_tile_manifest(manifest, run_root=tmp_path / "run", dependencies=dependencies, batch_size=2)
+    second = score_tile_manifest(
+        manifest, run_root=tmp_path / "run", dependencies=dependencies, batch_size=2
+    )
     assert second["counts"]["cache_hits"] == 2
     assert counters == {"classifier": 1, "regression": 1}
     candidates = pd.read_csv(tmp_path / "run" / "candidate_pool.csv")
     assert len(candidates) == 3
-    assert candidates.loc[candidates["score_status"] == "missing", "selector_eligible"].eq(False).all()
+    assert (
+        candidates.loc[candidates["score_status"] == "missing", "selector_eligible"]
+        .eq(False)
+        .all()
+    )
     assert candidates.loc[0, "image_path"] == "images/satellite/z14/fixture/100_200.png"
 
 
-def test_model_prediction_stays_separate_from_weak_and_human_names(tmp_path: Path) -> None:
+def test_model_prediction_stays_separate_from_weak_and_human_names(
+    tmp_path: Path,
+) -> None:
     manifest = _manifest(tmp_path).iloc[:1]
-    result = score_tile_manifest(manifest, run_root=tmp_path / "run", dependencies=_dependencies({"classifier": 0, "regression": 0}))
+    result = score_tile_manifest(
+        manifest,
+        run_root=tmp_path / "run",
+        dependencies=_dependencies({"classifier": 0, "regression": 0}),
+    )
     candidates = pd.read_csv(tmp_path / "run" / "candidate_pool.csv")
     row = candidates.iloc[0]
     assert "scenic_human" not in candidates.columns
     assert row["label_source"] == "active_regression_prediction"
-    assert row["scenic_score"] == row["scenic_score_heuristic"] == row["heuristic_score"]
+    assert (
+        row["scenic_score"] == row["scenic_score_heuristic"] == row["heuristic_score"]
+    )
     assert row["regression_prediction"] != row["scenic_score"]
     assert result["models"]["label_semantics"].startswith("regression_prediction")
 
@@ -128,8 +147,16 @@ def test_normalized_entropy_is_class_entropy_and_bounded() -> None:
 
 def test_embedding_npz_shape_and_stable_row_indices(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path).iloc[:2]
-    result = score_tile_manifest(manifest, run_root=tmp_path / "run", dependencies=_dependencies({"classifier": 0, "regression": 0}), lsh_seed=7, lsh_bits=8)
-    with np.load(tmp_path / "run" / "feature_embeddings.npz", allow_pickle=False) as arrays:
+    result = score_tile_manifest(
+        manifest,
+        run_root=tmp_path / "run",
+        dependencies=_dependencies({"classifier": 0, "regression": 0}),
+        lsh_seed=7,
+        lsh_bits=8,
+    )
+    with np.load(
+        tmp_path / "run" / "feature_embeddings.npz", allow_pickle=False
+    ) as arrays:
         assert arrays["embeddings"].shape == (2, 4)
         assert arrays["embeddings"].dtype == np.float32
         assert arrays["row_indices"].tolist() == [0, 1]
@@ -141,7 +168,9 @@ def test_embedding_npz_shape_and_stable_row_indices(tmp_path: Path) -> None:
 
 def test_malformed_registry_fails_closed(tmp_path: Path) -> None:
     registry = tmp_path / "registry.json"
-    registry.write_text(json.dumps({"active": {"checkpoint": "missing.pt"}}), encoding="utf-8")
+    registry.write_text(
+        json.dumps({"active": {"checkpoint": "missing.pt"}}), encoding="utf-8"
+    )
     with pytest.raises(FileNotFoundError):
         resolve_active_regression_checkpoint(registry)
     registry.write_text("[]", encoding="utf-8")
@@ -149,12 +178,13 @@ def test_malformed_registry_fails_closed(tmp_path: Path) -> None:
         resolve_active_regression_checkpoint(registry)
 
 
-
 def test_finalizer_requires_scoring_handoff_artifacts(tmp_path: Path) -> None:
     handoff = finalize_stage1(tmp_path, write=False)
     assert handoff["ready_for_stage2"] is False
     assert handoff["scoring_valid"] is False
     assert any("candidate_pool" in blocker for blocker in handoff["blockers"])
+
+
 def test_scorer_flushes_pending_images_at_batch_size(tmp_path: Path) -> None:
     rows = []
     for index in range(5):
@@ -202,7 +232,9 @@ def test_scorer_flushes_pending_images_at_batch_size(tmp_path: Path) -> None:
             np.arange(size * 4, dtype=np.float32).reshape(size, 4) + 1.0,
         )
 
-    def spy_regression(embeddings: np.ndarray, terrain_features: np.ndarray, logits: np.ndarray) -> np.ndarray:
+    def spy_regression(
+        embeddings: np.ndarray, terrain_features: np.ndarray, logits: np.ndarray
+    ) -> np.ndarray:
         return np.linspace(2.0, 8.0, len(embeddings), dtype=np.float32)
 
     deps = ScoringDependencies(
@@ -215,7 +247,118 @@ def test_scorer_flushes_pending_images_at_batch_size(tmp_path: Path) -> None:
         regression_hash="regression-fixture",
         device="cpu",
     )
-    result = score_tile_manifest(manifest_df, run_root=tmp_path / "run", dependencies=deps, batch_size=2)
+    result = score_tile_manifest(
+        manifest_df, run_root=tmp_path / "run", dependencies=deps, batch_size=2
+    )
     assert result["state"]["ready_for_selection"] is True
     assert recorded_batch_sizes == [2, 2, 1]
     assert all(size <= 2 for size in recorded_batch_sizes)
+
+
+def test_scoring_rejects_invalid_run_names(tmp_path: Path) -> None:
+    from src.active_learning.scoring import run_active_learning_scoring
+
+    manifest = tmp_path / "manifest.csv"
+    manifest.write_text("x,y\n1,1\n")
+    for bad_name in (
+        "",
+        "/abs/path",
+        "../traversal",
+        "dot/dot",
+        ".",
+        "..",
+        "invalid name",
+    ):
+        with pytest.raises(ValueError):
+            run_active_learning_scoring(
+                manifest,
+                output_dir=tmp_path / "runs",
+                run_name=bad_name,
+            )
+
+
+def test_validate_canonical_regression_checkpoint(tmp_path: Path) -> None:
+    import torch
+    from src.active_learning.scoring import _validate_regression_checkpoint
+    from src.scenic_scorer.regression import ScenicRegressionModel
+
+    # New canonical format: top-level dims + hidden_dim
+    model_new = ScenicRegressionModel(
+        vit_dim=4, terrain_dim=2, num_classes=3, hidden_dim=16
+    )
+    ckpt_new = tmp_path / "model_new.pt"
+    torch.save(
+        {
+            "model_state_dict": model_new.state_dict(),
+            "vit_dim": 4,
+            "terrain_dim": 2,
+            "num_classes": 3,
+            "hidden_dim": 16,
+        },
+        ckpt_new,
+    )
+    loaded_new, dims_new = _validate_regression_checkpoint(ckpt_new, device="cpu")
+    assert dims_new == {
+        "vit_dim": 4,
+        "terrain_dim": 2,
+        "num_classes": 3,
+        "hidden_dim": 16,
+    }
+    assert loaded_new is not None
+
+    # Preserved active v6 format: top-level dims without hidden_dim (defaults to 256)
+    model_v6 = ScenicRegressionModel(
+        vit_dim=4, terrain_dim=2, num_classes=3, hidden_dim=256
+    )
+    ckpt_v6 = tmp_path / "model_v6.pt"
+    torch.save(
+        {
+            "model_state_dict": model_v6.state_dict(),
+            "vit_dim": 4,
+            "terrain_dim": 2,
+            "num_classes": 3,
+        },
+        ckpt_v6,
+    )
+    loaded_v6, dims_v6 = _validate_regression_checkpoint(ckpt_v6, device="cpu")
+    assert dims_v6 == {
+        "vit_dim": 4,
+        "terrain_dim": 2,
+        "num_classes": 3,
+        "hidden_dim": 256,
+    }
+    assert loaded_v6 is not None
+
+
+def test_resolve_active_regression_checkpoint_sha256_read_only_validation(
+    tmp_path: Path,
+) -> None:
+    from src.active_learning.scoring import resolve_active_regression_checkpoint
+
+    ckpt = tmp_path / "model.pt"
+    ckpt.write_bytes(b"dummy_checkpoint_data")
+    actual_sha = sha256_file(ckpt)
+
+    # Legacy registry without sha256 -> accepts read-only without modifying registry
+    registry_file = tmp_path / "model_registry.json"
+    initial_content = json.dumps({"active": {"checkpoint": str(ckpt.name)}})
+    registry_file.write_text(initial_content, encoding="utf-8")
+    resolved = resolve_active_regression_checkpoint(registry_file)
+    assert resolved == ckpt
+    assert registry_file.read_text(encoding="utf-8") == initial_content
+
+    # Matching sha256 -> succeeds
+    registry_file.write_text(
+        json.dumps({"active": {"checkpoint": str(ckpt.name), "sha256": actual_sha}}),
+        encoding="utf-8",
+    )
+    resolved_matching = resolve_active_regression_checkpoint(registry_file)
+    assert resolved_matching == ckpt
+
+    # Mismatching sha256 -> fails closed
+    registry_file.write_text(
+        json.dumps({"active": {"checkpoint": str(ckpt.name), "sha256": "wrong_hash"}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="sha256 mismatch"):
+        resolve_active_regression_checkpoint(registry_file)

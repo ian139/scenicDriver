@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import hmac
 import ipaddress
 import json
 import mimetypes
 import os
 import re
+import ssl
 import tempfile
 import threading
 import time
@@ -17,6 +19,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from http import HTTPStatus
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -86,6 +89,45 @@ UNUSABLE_REASONS = {
     "other",
 }
 CONFIDENCE_VALUES = {"low", "medium", "high"}
+SESSION_COOKIE_NAME = "scenic_session"
+SESSION_COOKIE_ATTRS = "HttpOnly; SameSite=Strict; Path=/"
+
+
+def _session_cookie_value(token: str, *, secure: bool) -> str:
+    secure_attr = "; Secure" if secure else ""
+    return f"{SESSION_COOKIE_NAME}={token}; {SESSION_COOKIE_ATTRS}{secure_attr}"
+
+
+def _extract_session_token(headers: Any) -> str:
+    """Return the session token from a Cookie header, or an empty string."""
+    raw = headers.get("Cookie", "")
+    if not raw:
+        return ""
+    try:
+        cookie = SimpleCookie()
+        cookie.load(raw)
+    except CookieError:
+        return ""
+    morsel = cookie.get(SESSION_COOKIE_NAME)
+    if morsel is None:
+        return ""
+    return str(morsel.value)
+
+
+def _extract_bearer_token(headers: Any) -> str:
+    """Return the bearer token from an Authorization header, or an empty string."""
+    raw = headers.get("Authorization", "")
+    if not raw:
+        return ""
+    parts = raw.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1].strip()
+    return ""
+
+
+def _tokens_equal(left: str, right: str) -> bool:
+    """Constant-time comparison for bearer/session credentials."""
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
 
 
 class ApiError(Exception):
@@ -457,6 +499,15 @@ class AnnotatorState:
             raise ApiError(
                 400, "invalid_output_path", "annotations_csv must end in .csv"
             )
+        input_paths = {labels}
+        if batch:
+            input_paths.add(Path(batch))
+        if annotations in input_paths:
+            raise ApiError(
+                400,
+                "output_overwrites_input",
+                "annotations_csv must differ from labels_csv and batch_csv",
+            )
         raw_dir = self.path_policy.resolve_raw_root(config.raw_dir)
         return replace(
             config,
@@ -564,7 +615,9 @@ class AnnotatorState:
     ) -> dict[str, Any]:
         with self._lock:
             path = progress_path if progress_path is not None else self.progress_path
-            identity = annotator_id if annotator_id is not None else self.config.annotator_id
+            identity = (
+                annotator_id if annotator_id is not None else self.config.annotator_id
+            )
         with _locked_path(path, self._lock):
             store = _read_json(path)
             value = store["batches"].get(batch_id, {}).get(identity, {})
@@ -580,10 +633,14 @@ class AnnotatorState:
     ) -> dict[str, Any]:
         with self._lock:
             bid = batch_id if batch_id is not None else self.batch_id
-            identity = annotator_id if annotator_id is not None else self.config.annotator_id
+            identity = (
+                annotator_id if annotator_id is not None else self.config.annotator_id
+            )
             path = progress_path if progress_path is not None else self.progress_path
         if not bid:
-            raise ApiError(409, "batch_not_loaded", "Load a batch before updating progress")
+            raise ApiError(
+                409, "batch_not_loaded", "Load a batch before updating progress"
+            )
         with _locked_path(path, self._lock):
             store = _read_json(path)
             batch_state = store["batches"].setdefault(bid, {})
@@ -591,6 +648,34 @@ class AnnotatorState:
             state.update(changes)
             state["updated_at"] = datetime.now(timezone.utc).isoformat()
             _atomic_write(path, _json_bytes(store))
+            return dict(state)
+
+    def _update_unusable(
+        self,
+        image_path: str,
+        reason: str | None,
+        *,
+        batch_id: str,
+        progress_path: Path,
+        annotator_id: str,
+    ) -> dict[str, Any]:
+        with _locked_path(progress_path, self._lock):
+            store = _read_json(progress_path)
+            batch_state = store["batches"].setdefault(batch_id, {})
+            state = batch_state.setdefault(annotator_id, {})
+            unusable = dict(state.get("unusable", {}))
+            if reason:
+                unusable[image_path] = reason
+            else:
+                unusable.pop(image_path, None)
+            state.update(
+                {
+                    "unusable": unusable,
+                    "last_saved_image": image_path,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            _atomic_write(progress_path, _json_bytes(store))
             return dict(state)
 
     def load_batch(self, config_data: dict[str, Any]) -> dict[str, Any]:
@@ -618,6 +703,16 @@ class AnnotatorState:
                 raise ApiError(
                     400, "invalid_batch", "batch_csv must contain image_path"
                 )
+            if "target_annotator" in candidates:
+                targets = set(
+                    candidates["target_annotator"].dropna().astype(str).str.strip()
+                )
+                if targets != {config.annotator_id}:
+                    raise ApiError(
+                        403,
+                        "overlap_identity_mismatch",
+                        "This blind overlap batch targets a different annotator",
+                    )
             candidates = candidates.dropna(subset=["image_path"]).copy()
             candidates["image_path"] = candidates["image_path"].map(_safe_image_path)
             candidates = candidates.drop_duplicates(subset=["image_path"], keep="first")
@@ -628,11 +723,15 @@ class AnnotatorState:
             raise ApiError(404, "labels_not_found", "labels_csv was not found")
 
         batch_id = self._source_id(candidates, config, source)
-        with self._lock:
-            self.config = config
-            self.batch_id = batch_id
-            self.batch_source = source
-        saved_progress = self._read_batch_progress(batch_id)
+        annotations_path = Path(config.annotations_csv)
+        progress_path = annotations_path.with_name(
+            f"{annotations_path.stem}.annotation_progress.json"
+        )
+        saved_progress = self._read_batch_progress(
+            batch_id,
+            progress_path=progress_path,
+            annotator_id=config.annotator_id,
+        )
         saved_order = saved_progress.get("image_paths")
         if isinstance(saved_order, list):
             by_path = candidates.set_index("image_path", drop=False)
@@ -640,7 +739,9 @@ class AnnotatorState:
             if source == "batch_csv":
                 seen = set(ordered)
                 ordered.extend(
-                    str(path) for path in candidates["image_path"] if str(path) not in seen
+                    str(path)
+                    for path in candidates["image_path"]
+                    if str(path) not in seen
                 )
             batch_frame = (
                 by_path.loc[ordered].reset_index(drop=True)
@@ -659,16 +760,22 @@ class AnnotatorState:
             ).reset_index(drop=True)
 
         public_batch = self._public_batch(batch_frame)
-        with self._lock:
-            self.batch = public_batch
         if not saved_order:
             saved_progress = self._update_progress(
                 {
                     "cursor": 0,
                     "image_paths": [row["image_path"] for row in public_batch],
                     "started_at": datetime.now(timezone.utc).isoformat(),
-                }
+                },
+                batch_id=batch_id,
+                progress_path=progress_path,
+                annotator_id=config.annotator_id,
             )
+        with self._lock:
+            self.config = config
+            self.batch_id = batch_id
+            self.batch_source = source
+            self.batch = public_batch
         counts = self._annotation_counts()
         cursor = min(
             max(int(saved_progress.get("cursor", 0)), 0), max(0, len(public_batch) - 1)
@@ -701,6 +808,13 @@ class AnnotatorState:
         safe = self._assert_batch_image(image_path)
         with self._lock:
             config = self.config
+            blind_overlap = any(
+                str(row.get("image_path")) == safe
+                and _to_bool(row.get("is_qa_overlap"))
+                for row in self.batch
+            )
+        if blind_overlap:
+            return {"found": False, "image_path": safe}
         path = Path(config.annotations_csv)
         with _locked_path(path, self._lock):
             frame = _read_annotations(path)
@@ -727,37 +841,62 @@ class AnnotatorState:
             batch_paths = {str(row["image_path"]) for row in self.batch}
             progress_path = self.progress_path
         if not batch_id or not batch_paths:
-            raise ApiError(409, "batch_not_loaded", "Load a batch before updating progress")
+            raise ApiError(
+                409, "batch_not_loaded", "Load a batch before updating progress"
+            )
         claimed_identity = payload.get("annotator_id")
-        if claimed_identity is not None and str(claimed_identity) != config.annotator_id:
-            raise ApiError(403, "identity_mismatch", "annotator_id is fixed by the server")
+        if (
+            claimed_identity is not None
+            and str(claimed_identity) != config.annotator_id
+        ):
+            raise ApiError(
+                403, "identity_mismatch", "annotator_id is fixed by the server"
+            )
         image_path = _safe_image_path(str(payload.get("image_path", "")))
         if image_path not in batch_paths:
-            raise ApiError(403, "image_not_in_batch", "image_path is not in the active batch")
+            raise ApiError(
+                403, "image_not_in_batch", "image_path is not in the active batch"
+            )
         skip = _to_bool(payload.get("skip", False))
         score_value = payload.get("scenic_human")
         if score_value in (None, ""):
             if not skip:
-                raise ApiError(400, "score_required", "scenic_human is required unless the image is skipped")
+                raise ApiError(
+                    400,
+                    "score_required",
+                    "scenic_human is required unless the image is skipped",
+                )
             score: float | str = ""
         else:
             try:
                 score = float(score_value)
             except (TypeError, ValueError) as exc:
-                raise ApiError(400, "invalid_score", "scenic_human must be a number") from exc
+                raise ApiError(
+                    400, "invalid_score", "scenic_human must be a number"
+                ) from exc
             if not 0 <= score <= 10:
-                raise ApiError(400, "invalid_score", "scenic_human must be between 0 and 10")
+                raise ApiError(
+                    400, "invalid_score", "scenic_human must be between 0 and 10"
+                )
         confidence = str(payload.get("confidence", "medium")).lower()
         if confidence not in CONFIDENCE_VALUES:
-            raise ApiError(400, "invalid_confidence", "confidence must be low, medium, or high")
+            raise ApiError(
+                400, "invalid_confidence", "confidence must be low, medium, or high"
+            )
         notes = str(payload.get("notes", ""))
         if len(notes) > 4000:
-            raise ApiError(400, "notes_too_long", "notes must not exceed 4000 characters")
+            raise ApiError(
+                400, "notes_too_long", "notes must not exceed 4000 characters"
+            )
         reason = payload.get("unusable_reason")
         if reason not in (None, "") and str(reason) not in UNUSABLE_REASONS:
-            raise ApiError(400, "invalid_unusable_reason", "unusable_reason is unsupported")
+            raise ApiError(
+                400, "invalid_unusable_reason", "unusable_reason is unsupported"
+            )
         if reason and not skip:
-            raise ApiError(400, "invalid_unusable_reason", "unusable_reason requires skip=true")
+            raise ApiError(
+                400, "invalid_unusable_reason", "unusable_reason requires skip=true"
+            )
         record = {
             "image_path": image_path,
             "scenic_human": score,
@@ -775,24 +914,25 @@ class AnnotatorState:
                     frame["annotator_id"].astype(str) == config.annotator_id
                 )
                 frame = frame.loc[~matching].copy()
-            frame = pd.concat([frame, pd.DataFrame([record], columns=DEFAULT_COLUMNS)], ignore_index=True)
+            frame = pd.concat(
+                [frame, pd.DataFrame([record], columns=DEFAULT_COLUMNS)],
+                ignore_index=True,
+            )
             _atomic_write(annotations_path, _csv_bytes(frame))
             row_count = len(frame)
-        progress = self._read_batch_progress(
-            batch_id, progress_path=progress_path, annotator_id=config.annotator_id
-        )
-        unusable = dict(progress.get("unusable", {}))
-        if reason:
-            unusable[image_path] = str(reason)
-        else:
-            unusable.pop(image_path, None)
-        self._update_progress(
-            {"unusable": unusable, "last_saved_image": image_path},
+        self._update_unusable(
+            image_path,
+            str(reason) if reason else None,
             batch_id=batch_id,
             progress_path=progress_path,
             annotator_id=config.annotator_id,
         )
-        return {"saved": True, "row_count": row_count, "record": record, "progress": self._annotation_counts()}
+        return {
+            "saved": True,
+            "row_count": row_count,
+            "record": record,
+            "progress": self._annotation_counts(),
+        }
 
     def save_progress(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -821,9 +961,7 @@ class AnnotatorState:
                 frame["image_path"].astype(str).isin(paths)
                 & (frame["annotator_id"].astype(str) == config.annotator_id)
             ]
-        completed_paths = (
-            set(own["image_path"].astype(str)) if not own.empty else set()
-        )
+        completed_paths = set(own["image_path"].astype(str)) if not own.empty else set()
         completed = len(completed_paths)
         confidence = {name: 0 for name in sorted(CONFIDENCE_VALUES)}
         if not own.empty:
@@ -843,8 +981,7 @@ class AnnotatorState:
                 str(row.get("image_path", "")) in completed_paths
             )
         overlap = frame.loc[
-            frame["image_path"].astype(str).isin(paths)
-            & ~frame["skip"].map(_to_bool)
+            frame["image_path"].astype(str).isin(paths) & ~frame["skip"].map(_to_bool)
         ].copy()
         overlap["scenic_human"] = pd.to_numeric(
             overlap["scenic_human"], errors="coerce"
@@ -898,10 +1035,31 @@ class AnnotatorState:
 
 
 def make_handler(
-    state: AnnotatorState, s3_client: Any | None = None
+    state: AnnotatorState,
+    s3_client: Any | None = None,
+    *,
+    remote: bool = False,
+    session_token: str = "",
 ) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "ScenicAnnotator/1"
+
+        def _require_remote_auth(self) -> None:
+            """Reject unauthenticated requests when the server is reachable remotely."""
+            if not remote:
+                return
+            if not session_token:
+                raise ApiError(
+                    503,
+                    "auth_unavailable",
+                    "Remote access requires a session credential",
+                )
+            if not _tokens_equal(_extract_session_token(self.headers), session_token):
+                raise ApiError(
+                    401,
+                    "unauthorized",
+                    "A valid session credential is required",
+                )
 
         def _send_json(self, value: dict[str, Any], status: int = 200) -> None:
             data = json.dumps(
@@ -922,6 +1080,34 @@ def make_handler(
             if error.details:
                 payload["error"]["details"] = error.details
             self._send_json(payload, error.status)
+
+        def _validate_mutation_request(self) -> None:
+            content_type = self.headers.get("Content-Type", "")
+            if content_type.split(";", 1)[0].strip().lower() != "application/json":
+                raise ApiError(
+                    415,
+                    "unsupported_media_type",
+                    "State-changing requests require application/json",
+                )
+            origin = self.headers.get("Origin")
+            host = self.headers.get("Host", "")
+            if origin:
+                parsed_origin = urlparse(origin)
+                if (
+                    parsed_origin.scheme not in {"http", "https"}
+                    or parsed_origin.netloc != host
+                ):
+                    raise ApiError(
+                        403,
+                        "cross_origin_request",
+                        "State-changing requests must be same-origin",
+                    )
+            if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+                raise ApiError(
+                    403,
+                    "cross_origin_request",
+                    "Cross-site state changes are not allowed",
+                )
 
         def _read_json_body(self) -> dict[str, Any]:
             raw_length = self.headers.get("Content-Length")
@@ -951,6 +1137,31 @@ def make_handler(
 
         def _route(self, method: str) -> None:
             parsed = urlparse(self.path)
+            if method == "GET" and parsed.path == "/api/session":
+                if not remote or not session_token:
+                    raise ApiError(
+                        404, "not_found", "The requested endpoint does not exist"
+                    )
+                bearer_token = _extract_bearer_token(self.headers)
+                if not bearer_token or not _tokens_equal(bearer_token, session_token):
+                    raise ApiError(
+                        401,
+                        "unauthorized",
+                        "A valid session credential is required",
+                    )
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header(
+                    "Set-Cookie",
+                    _session_cookie_value(session_token, secure=remote),
+                )
+                self.send_header("Content-Length", str(len(b'{"session":"required"}')))
+                self.end_headers()
+                self.wfile.write(b'{"session":"required"}')
+                return
+            self._require_remote_auth()
             if method == "GET" and parsed.path == "/":
                 try:
                     html = TEMPLATE_PATH.read_bytes()
@@ -1000,6 +1211,7 @@ def make_handler(
                 self.wfile.write(body)
                 return
             if method == "POST":
+                self._validate_mutation_request()
                 payload = self._read_json_body()
                 if parsed.path == "/api/load-batch":
                     self._send_json(state.load_batch(payload.get("config", {})))
@@ -1077,14 +1289,39 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Explicitly allow binding to a non-loopback host",
     )
     parser.add_argument(
+        "--session-token",
+        type=str,
+        default="",
+        help=(
+            "Unguessable session credential required for remote access; "
+            "must be provided whenever remote access is enabled"
+        ),
+    )
+    parser.add_argument(
+        "--tls-cert",
+        type=Path,
+        help="TLS certificate PEM required for non-loopback remote access",
+    )
+    parser.add_argument(
+        "--tls-key",
+        type=Path,
+        help="TLS private-key PEM required for non-loopback remote access",
+    )
+    parser.add_argument(
         "--allowed-s3-root",
         action="append",
         default=[],
         help="Credential-free s3://bucket/prefix root approved for image reads (repeatable)",
     )
     args = parser.parse_args(argv)
-    if not _is_loopback_host(args.host) and not args.allow_remote:
-        parser.error("non-loopback --host requires explicit --allow-remote")
+    is_remote = args.allow_remote or not _is_loopback_host(args.host)
+    if is_remote:
+        if not _is_loopback_host(args.host) and not args.allow_remote:
+            parser.error("non-loopback --host requires explicit --allow-remote")
+        if not args.session_token:
+            parser.error("remote access requires explicit --session-token")
+        if args.tls_cert is None or args.tls_key is None:
+            parser.error("remote access requires --tls-cert and --tls-key")
     return args
 
 
@@ -1106,15 +1343,36 @@ def main() -> None:
     )
     state = AnnotatorState(config, path_policy=policy)
     s3_client = None
-    if state.config.raw_dir.startswith("s3://"):
+    if s3_roots:
         try:
             import boto3
         except ImportError as exc:
-            raise ImportError("boto3 is required when raw_dir uses s3://") from exc
+            raise ImportError("boto3 is required when S3 roots are approved") from exc
         s3_client = boto3.client("s3")
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(state, s3_client))
-    print(f"Scenic annotator running on http://{args.host}:{args.port}")
+    remote = args.allow_remote or not _is_loopback_host(args.host)
+    session_token = args.session_token
+    server = ThreadingHTTPServer(
+        (args.host, args.port),
+        make_handler(
+            state,
+            s3_client,
+            remote=remote,
+            session_token=session_token,
+        ),
+    )
+    if remote:
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        tls_context.load_cert_chain(args.tls_cert, args.tls_key)
+        server.socket = tls_context.wrap_socket(server.socket, server_side=True)
+    scheme = "https" if remote else "http"
+    print(f"Scenic annotator running on {scheme}://{args.host}:{args.port}")
     print(f"Annotator identity: {state.config.annotator_id}")
+    if remote:
+        print(
+            f"https://{args.host}:{args.port}/api/session "
+            "requires Authorization: Bearer <session_token> over TLS to set the browser cookie"
+        )
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()

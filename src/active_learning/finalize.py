@@ -10,8 +10,15 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from .common import atomic_write_json, jsonable, sha256_file
-from .scoring import CANDIDATE_POOL_COLUMNS, SCORING_SCHEMA_VERSION
+from .common import (
+    atomic_write_json,
+    atomic_write_text,
+    jsonable,
+    sha256_bytes,
+    sha256_file,
+)
+from .scoring import SCORING_SCHEMA_VERSION
+from .selection import audit_geographic_leakage
 
 SCHEMA_VERSION = 1
 ABSOLUTE_COLUMNS = (
@@ -48,6 +55,7 @@ RUN_ARTIFACTS = {
     "selection_diagnostics": "selection_diagnostics.json",
     "geographic_splits": "geographic_splits.csv",
     "leakage_audit": "leakage_audit.json",
+    "filtered_index": "filtered_index.csv",
 }
 
 
@@ -147,6 +155,8 @@ def _previous_hashes(path: Path) -> dict[str, str]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+    if not isinstance(value, dict) or value.get("ready_for_stage2") is not True:
+        return {}
     result: dict[str, str] = {}
     for entry in (
         value.get("artifacts", {}) if isinstance(value, dict) else {}
@@ -158,6 +168,48 @@ def _previous_hashes(path: Path) -> dict[str, str]:
         ):
             result[entry["path"]] = entry["sha256"]
     return result
+
+
+def _snapshot_annotations(
+    source_path: Path | None,
+    batch_path: Path | None,
+    destination: Path,
+    blockers: list[str],
+    *,
+    write: bool,
+) -> Path | None:
+    if source_path is None:
+        return None
+    if batch_path is None:
+        blockers.append("missing annotation batch for absolute annotation snapshot")
+        return None
+    source, source_error = _read_csv(source_path)
+    batch, batch_error = _read_csv(batch_path)
+    if source_error:
+        blockers.append(source_error)
+    if batch_error:
+        blockers.append(batch_error)
+    if source is None or batch is None:
+        return None
+    if "image_path" not in source.columns:
+        blockers.append("absolute annotation source missing image_path")
+        return None
+    if "image_path" not in batch.columns:
+        blockers.append("annotation batch missing image_path for snapshot")
+        return None
+    batch_images = set(batch["image_path"].astype(str).str.strip())
+    if not batch_images:
+        blockers.append("annotation batch has no image paths for snapshot")
+        return None
+    source_images = source["image_path"].astype(str).str.strip()
+    snapshot = source.loc[source_images.isin(batch_images)]
+    if write:
+        atomic_write_text(
+            destination,
+            snapshot.to_csv(index=False, lineterminator="\n"),
+        )
+        return destination
+    return source_path
 
 
 def _validate_tile(path: Path, root: Path, blockers: list[str]) -> tuple[bool, int]:
@@ -195,7 +247,7 @@ def _validate_tile(path: Path, root: Path, blockers: list[str]) -> tuple[bool, i
         for style in ("satellite", "terrain"):
             raw = str(row.get(f"{style}_path", "")).strip()
             local = Path(raw)
-            if not local.is_absolute() and not local.exists():
+            if not local.is_absolute():
                 local = root / local
             remote = _bool(row.get(f"{style}_s3_present")) and str(
                 row.get(f"{style}_s3_uri", "")
@@ -240,16 +292,20 @@ def _validate_annotations(path: Path | None, blockers: list[str]) -> tuple[bool,
     if (~confidence.isin(valid_confidence)).any():
         blockers.append("absolute annotations contain invalid confidence values")
     if image_paths.eq("").any() or annotators.eq("").any():
-        blockers.append("absolute annotations contain empty image or annotator identity")
-    if frame.assign(
-        _image_path=image_paths, _annotator_id=annotators
-    ).duplicated(["_image_path", "_annotator_id"]).any():
-        blockers.append("absolute annotations contain duplicate annotator/image records")
+        blockers.append(
+            "absolute annotations contain empty image or annotator identity"
+        )
+    if (
+        frame.assign(_image_path=image_paths, _annotator_id=annotators)
+        .duplicated(["_image_path", "_annotator_id"])
+        .any()
+    ):
+        blockers.append(
+            "absolute annotations contain duplicate annotator/image records"
+        )
     if not bool(completed.any()):
         blockers.append("absolute annotations contain no completed labels")
-    valid = not any(
-        blocker.startswith("absolute annotations") for blocker in blockers
-    )
+    valid = not any(blocker.startswith("absolute annotations") for blocker in blockers)
     return valid and bool(completed.any()), int(completed.sum())
 
 
@@ -278,7 +334,11 @@ def _validate_batch(path: Path, blockers: list[str]) -> tuple[bool, int]:
 
 
 def _validate_splits(
-    split_path: Path, audit_path: Path, blockers: list[str]
+    split_path: Path,
+    audit_path: Path,
+    blockers: list[str],
+    *,
+    manifest: Mapping[str, Any] | None = None,
 ) -> tuple[bool, int, dict[str, Any]]:
     frame, error = _read_csv(split_path)
     if error:
@@ -302,11 +362,46 @@ def _validate_splits(
             blockers.append(f"geographic split has no {expected} rows")
     if not isinstance(audit, dict) or audit.get("valid") is not True:
         blockers.append("geographic leakage audit is invalid")
+    outputs = manifest.get("outputs") if isinstance(manifest, Mapping) else None
+    split_record = (
+        outputs.get("geographic_splits_csv") if isinstance(outputs, Mapping) else None
+    )
+    audit_record = (
+        outputs.get("leakage_audit_json") if isinstance(outputs, Mapping) else None
+    )
+    expected_split_hash = (
+        split_record.get("sha256") if isinstance(split_record, Mapping) else None
+    )
+    expected_audit_hash = (
+        audit_record.get("sha256") if isinstance(audit_record, Mapping) else None
+    )
+    if not isinstance(expected_split_hash, str):
+        blockers.append("batch manifest lacks geographic splits output hash")
+    elif sha256_file(split_path).lower() != expected_split_hash.lower():
+        blockers.append("geographic splits hash mismatch against batch manifest")
+    if not isinstance(expected_audit_hash, str):
+        blockers.append("batch manifest lacks leakage audit output hash")
+    elif sha256_file(audit_path).lower() != expected_audit_hash.lower():
+        blockers.append("leakage audit hash mismatch against batch manifest")
+    if isinstance(audit, dict) and audit.get("valid") is True:
+        try:
+            radius = int(
+                manifest.get("selection_config", {}).get("adjacency_radius", 1)
+            )
+        except (AttributeError, TypeError, ValueError):
+            radius = 1
+        recomputed = audit_geographic_leakage(frame, adjacency_radius=radius)
+        if recomputed.get("valid") is not True:
+            blockers.append(
+                "geographic leakage audit does not match admitted split rows"
+            )
     return (
         not missing
         and not frame.empty
         and isinstance(audit, dict)
-        and audit.get("valid") is True,
+        and audit.get("valid") is True
+        and isinstance(expected_split_hash, str)
+        and isinstance(expected_audit_hash, str),
         len(frame),
         audit if isinstance(audit, dict) else {},
     )
@@ -348,10 +443,155 @@ def _validate_human_table(
             blockers.append("benchmark contains weak labels only")
             valid = False
         return bool(valid), len(frame)
-    valid = {"image_path", "scenic_score"}.issubset(frame.columns) and not frame.empty
+    valid = {"image_path", "scenic_score", "label_source"}.issubset(
+        frame.columns
+    ) and not frame.empty
     if not valid:
-        blockers.append("mixed-label CSV lacks image_path/scenic_score rows")
+        blockers.append(
+            "mixed-label CSV lacks image_path/scenic_score/label_source rows"
+        )
+        return False, len(frame)
+    sources = frame["label_source"].astype(str).str.strip().str.lower()
+    if not sources.eq("human_override").any():
+        blockers.append("mixed-label CSV contains no human_override provenance")
+        valid = False
     return bool(valid), len(frame)
+
+
+def _validate_benchmark_splits(
+    benchmark_path: Path | None,
+    split_path: Path,
+    blockers: list[str],
+) -> bool:
+    if benchmark_path is None:
+        return False
+    benchmark, benchmark_error = _read_csv(benchmark_path)
+    splits, split_error = _read_csv(split_path)
+    if benchmark_error:
+        blockers.append(benchmark_error)
+    if split_error:
+        blockers.append(split_error)
+    if benchmark is None or splits is None:
+        return False
+    required = {"image_path", "split"}
+    if not required.issubset(benchmark.columns):
+        blockers.append("benchmark lacks fixed geographic split assignments")
+        return False
+    if not required.issubset(splits.columns):
+        blockers.append("geographic splits lack image_path/split assignments")
+        return False
+    expected = splits[list(required)].copy()
+    observed = benchmark[list(required)].copy()
+    for frame in (expected, observed):
+        frame["image_path"] = frame["image_path"].astype(str).str.strip()
+        frame["split"] = (
+            frame["split"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .replace("validation", "val")
+        )
+    if (
+        expected.groupby("image_path")["split"].nunique().gt(1).any()
+        or observed.groupby("image_path")["split"].nunique().gt(1).any()
+    ):
+        blockers.append(
+            "benchmark or geographic splits contain conflicting assignments"
+        )
+        return False
+    expected_by_path = expected.drop_duplicates("image_path").set_index("image_path")[
+        "split"
+    ]
+    observed_by_path = observed.drop_duplicates("image_path").set_index("image_path")[
+        "split"
+    ]
+    missing = observed_by_path.index.difference(expected_by_path.index)
+    if len(missing):
+        blockers.append("benchmark contains images absent from geographic splits")
+        return False
+    if not observed_by_path.equals(expected_by_path.loc[observed_by_path.index]):
+        blockers.append("benchmark split assignments do not match geographic splits")
+        return False
+    return True
+
+
+def _validate_benchmark_lineage(
+    benchmark_path: Path | None,
+    annotations_path: Path | None,
+    split_path: Path,
+    blockers: list[str],
+) -> bool:
+    blocker_start = len(blockers)
+    if benchmark_path is None or annotations_path is None:
+        blockers.append("benchmark lineage inputs are missing")
+        return False
+    summary_path = benchmark_path.parent / "summary.json"
+    summary, summary_error = _read_json(summary_path)
+    if summary_error:
+        blockers.append(summary_error)
+        return False
+    assert summary is not None
+    hashes = summary.get("source_hashes")
+    if not isinstance(hashes, Mapping):
+        blockers.append("benchmark summary lacks source hashes")
+        return False
+    expected = {
+        "annotations_csv": annotations_path,
+        "geographic_splits_csv": split_path,
+        "benchmark_split_csv": benchmark_path,
+    }
+    for key, path in expected.items():
+        digest = hashes.get(key)
+        if (
+            not isinstance(digest, str)
+            or not path.is_file()
+            or sha256_file(path).lower() != digest.lower()
+        ):
+            blockers.append(f"benchmark {key} hash mismatch")
+
+    annotations, annotation_error = _read_csv(annotations_path)
+    benchmark, benchmark_error = _read_csv(benchmark_path)
+    if annotation_error:
+        blockers.append(annotation_error)
+    if benchmark_error:
+        blockers.append(benchmark_error)
+    if annotations is None or benchmark is None:
+        return False
+    required_annotations = {"image_path", "scenic_human", "skip"}
+    if not required_annotations.issubset(annotations.columns):
+        blockers.append("benchmark source annotations lack absolute-label columns")
+        return False
+    target_column = (
+        "scenic_human_mean"
+        if "scenic_human_mean" in benchmark.columns
+        else "scenic_human"
+        if "scenic_human" in benchmark.columns
+        else None
+    )
+    if target_column is None or "image_path" not in benchmark.columns:
+        blockers.append("benchmark lacks image_path or human target")
+        return False
+    scores = pd.to_numeric(annotations["scenic_human"], errors="coerce")
+    usable = annotations.loc[scores.notna() & ~annotations["skip"].map(_bool)].copy()
+    usable["scenic_human"] = scores.loc[usable.index].astype(float)
+    means = usable.groupby(usable["image_path"].astype(str).str.strip(), sort=True)[
+        "scenic_human"
+    ].mean()
+    benchmark_paths = benchmark["image_path"].astype(str).str.strip()
+    observed = pd.to_numeric(benchmark[target_column], errors="coerce")
+    if benchmark_paths.duplicated().any():
+        blockers.append("benchmark contains duplicate image paths")
+    elif not benchmark_paths.isin(means.index).all():
+        blockers.append("benchmark contains targets absent from source annotations")
+    else:
+        canonical = means.loc[benchmark_paths].to_numpy(dtype=float)
+        if observed.isna().any() or not np.allclose(
+            observed.to_numpy(dtype=float), canonical, rtol=0.0, atol=1e-9
+        ):
+            blockers.append(
+                "benchmark human targets do not match source annotation aggregates"
+            )
+    return not blockers[blocker_start:]
 
 
 def _validate_registry(
@@ -370,12 +610,27 @@ def _validate_registry(
     if checkpoint is None or not checkpoint.exists():
         blockers.append(f"baseline checkpoint missing: {active.get('checkpoint')}")
         return False, {"active": active}
-    return True, {
+    checkpoint_sha256 = sha256_file(checkpoint)
+    declared_sha256 = active.get("sha256")
+    if declared_sha256 is not None:
+        if not isinstance(declared_sha256, str) or not declared_sha256.strip():
+            blockers.append("baseline registry active.sha256 is not a valid string")
+        elif sha256_file(checkpoint).lower() != declared_sha256.strip().lower():
+            blockers.append("baseline registry active.sha256 does not match checkpoint")
+    registry_valid = not (
+        declared_sha256 is not None
+        and (
+            not isinstance(declared_sha256, str)
+            or not declared_sha256.strip()
+            or checkpoint_sha256.lower() != declared_sha256.strip().lower()
+        )
+    )
+    return registry_valid, {
         "registry_path": str(path),
         "registry_sha256": sha256_file(path),
         "active": active,
         "checkpoint_path": str(checkpoint),
-        "checkpoint_sha256": sha256_file(checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
     }
 
 
@@ -391,9 +646,7 @@ def _validate_acquisition_preflight(path: Path, blockers: list[str]) -> bool:
     return True
 
 
-def _scoring_artifact_hash(
-    manifest: Mapping[str, Any], name: str
-) -> str | None:
+def _scoring_artifact_hash(manifest: Mapping[str, Any], name: str) -> str | None:
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, Mapping):
         return None
@@ -466,14 +719,22 @@ def _validate_scoring_artifacts(
     try:
         with np.load(embedding_path, allow_pickle=False) as arrays:
             if "embeddings" not in arrays or "row_indices" not in arrays:
-                blockers.append("feature embeddings NPZ lacks embeddings/row_indices arrays")
+                blockers.append(
+                    "feature embeddings NPZ lacks embeddings/row_indices arrays"
+                )
                 embedding_rows = 0
             else:
                 embeddings = np.asarray(arrays["embeddings"])
                 row_indices = np.asarray(arrays["row_indices"])
                 embedding_rows = int(len(embeddings))
-                if embeddings.ndim != 2 or embedding_rows <= 0 or embeddings.shape[1] <= 0:
-                    blockers.append("feature embeddings NPZ embeddings array is empty or not 2-D")
+                if (
+                    embeddings.ndim != 2
+                    or embedding_rows <= 0
+                    or embeddings.shape[1] <= 0
+                ):
+                    blockers.append(
+                        "feature embeddings NPZ embeddings array is empty or not 2-D"
+                    )
                 if (
                     row_indices.ndim != 1
                     or len(row_indices) != embedding_rows
@@ -485,7 +746,9 @@ def _validate_scoring_artifacts(
                     not np.issubdtype(embeddings.dtype, np.number)
                     or not np.isfinite(embeddings).all()
                 ):
-                    blockers.append("feature embeddings NPZ embeddings are not finite numeric values")
+                    blockers.append(
+                        "feature embeddings NPZ embeddings are not finite numeric values"
+                    )
     except (OSError, ValueError, TypeError) as exc:
         blockers.append(f"invalid feature embeddings NPZ: {exc}")
         embedding_rows = 0
@@ -551,6 +814,8 @@ def _validate_scoring_artifacts(
         int(len(candidate)),
         embedding_rows,
     )
+
+
 def _validate_lineage(
     paths: Mapping[str, Path | None],
     baseline: Mapping[str, Any],
@@ -585,6 +850,7 @@ def _validate_lineage(
     )
     if (
         tile_path is None
+        or not tile_path.is_file()
         or not isinstance(expected_tile_hash, str)
         or sha256_file(tile_path).lower() != expected_tile_hash.lower()
     ):
@@ -614,6 +880,7 @@ def _validate_lineage(
         )
         if (
             candidate_path is None
+            or not candidate_path.is_file()
             or not isinstance(expected, str)
             or sha256_file(candidate_path).lower() != expected.lower()
         ):
@@ -632,6 +899,22 @@ def _validate_lineage(
     if batch is None or annotations is None:
         return False
     batch_manifest = payloads.get("batch_manifest", {})
+    outputs = batch_manifest.get("outputs")
+    outputs_batch_record = (
+        outputs.get("annotation_batch_csv") if isinstance(outputs, Mapping) else None
+    )
+    expected_batch_hash = (
+        outputs_batch_record.get("sha256")
+        if isinstance(outputs_batch_record, Mapping)
+        else None
+    )
+    if (
+        batch_path is None
+        or not batch_path.is_file()
+        or not isinstance(expected_batch_hash, str)
+        or sha256_file(batch_path).lower() != expected_batch_hash.lower()
+    ):
+        blockers.append("batch_manifest annotation batch output hash mismatch")
     try:
         declared_rows = int(batch_manifest["row_count"])
     except (KeyError, TypeError, ValueError, OverflowError):
@@ -646,6 +929,29 @@ def _validate_lineage(
         or not batch["batch_id"].astype(str).eq(declared_batch_id).all()
     ):
         blockers.append("annotation batch identity does not match batch manifest")
+    selection_contract = batch_manifest.get("selection_contract")
+    selection_digest = batch_manifest.get("selection_contract_sha256")
+    if isinstance(selection_contract, Mapping):
+        actual_digest = sha256_bytes(
+            json.dumps(
+                jsonable(dict(selection_contract)),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        ordered_images = (
+            batch["image_path"].astype(str).tolist() if "image_path" in batch else []
+        )
+        if (
+            selection_digest != actual_digest
+            or declared_batch_id != f"batch-{actual_digest[:16]}"
+            or selection_contract.get("selected_identities") != ordered_images
+        ):
+            blockers.append(
+                "annotation batch does not match immutable selection contract"
+            )
+    else:
+        blockers.append("batch manifest lacks immutable selection contract")
 
     if "image_path" in batch and set(ABSOLUTE_COLUMNS).issubset(annotations.columns):
         completed = annotations[
@@ -654,15 +960,41 @@ def _validate_lineage(
         ]
         required_images = set(batch["image_path"].astype(str).str.strip())
         completed_images = set(completed["image_path"].astype(str).str.strip())
-        missing_images = sorted(required_images - completed_images)
+        skipped_images = set(
+            annotations.loc[annotations["skip"].map(_bool), "image_path"]
+            .astype(str)
+            .str.strip()
+        )
+        handled_images = completed_images | skipped_images
+        missing_images = sorted(required_images - handled_images)
         if missing_images:
             blockers.append(
                 "annotation batch has "
-                f"{len(missing_images)} images without completed human labels"
+                f"{len(missing_images)} images without completed review decisions"
             )
+        if "is_qa_overlap" in batch:
+            qa_images = set(
+                batch.loc[batch["is_qa_overlap"].map(_bool), "image_path"]
+                .astype(str)
+                .str.strip()
+            )
+            annotator_counts = (
+                completed.assign(
+                    _image_path=completed["image_path"].astype(str).str.strip(),
+                    _annotator_id=completed["annotator_id"].astype(str).str.strip(),
+                )
+                .groupby("_image_path")["_annotator_id"]
+                .nunique()
+            )
+            incomplete_qa = sorted(
+                image for image in qa_images if int(annotator_counts.get(image, 0)) < 2
+            )
+            if incomplete_qa:
+                blockers.append(
+                    "annotation batch has "
+                    f"{len(incomplete_qa)} blind QA images without two annotators"
+                )
     return not blockers[blocker_start:]
-
-
 
 
 def finalize_stage1(
@@ -696,6 +1028,7 @@ def finalize_stage1(
         and Path("data/raw/labels_human.csv").exists()
     ):
         paths["absolute_annotations"] = Path("data/raw/labels_human.csv")
+    paths["annotation_snapshot"] = root / "absolute_annotations.csv"
     paths["mixed_labels"] = (
         Path(mixed_labels_csv)
         if mixed_labels_csv
@@ -714,6 +1047,181 @@ def finalize_stage1(
         else Path("data/processed/regression/model_registry.json")
     )
     paths["baseline_checkpoint"] = Path(checkpoint_path) if checkpoint_path else None
+    if handoff_path.is_file():
+        try:
+            prior_handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            prior_handoff = None
+        if (
+            isinstance(prior_handoff, dict)
+            and prior_handoff.get("ready_for_stage2") is True
+        ):
+            immutable_blockers: list[str] = []
+            prior_artifacts = prior_handoff.get("artifacts", {})
+            if not isinstance(prior_artifacts, dict):
+                immutable_blockers.append(
+                    "previous ready handoff artifacts are malformed"
+                )
+                prior_artifacts = {}
+            for key, entry in prior_artifacts.items():
+                if not isinstance(entry, dict):
+                    continue
+                prior_path = _resolve(entry.get("path"), root)
+                prior_digest = entry.get("sha256")
+                if (
+                    prior_path is None
+                    or not prior_path.is_file()
+                    or not isinstance(prior_digest, str)
+                    or sha256_file(prior_path) != prior_digest
+                ):
+                    immutable_blockers.append(
+                        f"hash mismatch against previous handoff: {entry.get('path')}"
+                    )
+                    lineage_messages = {
+                        "tile_manifest": "scoring manifest tile source hash mismatch",
+                        "candidate_pool": "batch_manifest candidate source hash mismatch",
+                        "baseline_checkpoint": (
+                            "scoring regression checkpoint does not match baseline"
+                        ),
+                    }
+                    if key in lineage_messages:
+                        immutable_blockers.append(lineage_messages[key])
+            requested_run_name = run_name or root.name
+            if prior_handoff.get("run_name") != requested_run_name:
+                immutable_blockers.append(
+                    "run_name differs from previous ready handoff"
+                )
+            if prior_handoff.get("seeds", {}) != jsonable(dict(seeds or {})):
+                immutable_blockers.append("seeds differ from previous ready handoff")
+            if prior_handoff.get("material_config", {}) != jsonable(
+                dict(material_config or {})
+            ):
+                immutable_blockers.append(
+                    "material_config differs from previous ready handoff"
+                )
+            direct_inputs = {
+                "mixed_labels": paths["mixed_labels"],
+                "benchmark": paths["benchmark"],
+                "baseline_registry": paths["baseline_registry"],
+                "baseline_checkpoint": paths["baseline_checkpoint"],
+            }
+            for key, requested_path in direct_inputs.items():
+                prior_entry = prior_artifacts.get(key)
+                if requested_path is None or not isinstance(prior_entry, dict):
+                    continue
+                expected = prior_entry.get("sha256")
+                if (
+                    not requested_path.is_file()
+                    or not isinstance(expected, str)
+                    or sha256_file(requested_path) != expected
+                ):
+                    immutable_blockers.append(
+                        f"{key} differs from previous ready handoff"
+                    )
+            annotation_source = paths["absolute_annotations"]
+            annotation_batch = paths["annotation_batch"]
+            prior_annotation = prior_artifacts.get("absolute_annotations")
+            if (
+                annotation_source is not None
+                and annotation_batch is not None
+                and isinstance(prior_annotation, dict)
+            ):
+                source_frame, source_error = _read_csv(annotation_source)
+                batch_frame, batch_error = _read_csv(annotation_batch)
+                if source_error or batch_error:
+                    immutable_blockers.append(
+                        "annotation inputs differ from previous ready handoff"
+                    )
+                elif (
+                    source_frame is not None
+                    and batch_frame is not None
+                    and "image_path" in source_frame
+                    and "image_path" in batch_frame
+                ):
+                    batch_images = set(
+                        batch_frame["image_path"].astype(str).str.strip()
+                    )
+                    source_images = source_frame["image_path"].astype(str).str.strip()
+                    snapshot = source_frame.loc[source_images.isin(batch_images)]
+                    snapshot_digest = sha256_bytes(
+                        snapshot.to_csv(index=False, lineterminator="\n").encode(
+                            "utf-8"
+                        )
+                    )
+                    if snapshot_digest != prior_annotation.get("sha256"):
+                        immutable_blockers.append(
+                            "absolute_annotations differs from previous ready handoff"
+                        )
+                        immutable_blockers.append(
+                            "annotation batch has images without completed review decisions"
+                        )
+                else:
+                    immutable_blockers.append(
+                        "annotation inputs differ from previous ready handoff"
+                    )
+            if not immutable_blockers:
+                return jsonable(prior_handoff)
+            refused = dict(prior_handoff)
+            refused["ready_for_stage2"] = False
+            refused["blockers"] = list(prior_handoff.get("blockers", [])) + list(
+                dict.fromkeys(immutable_blockers)
+            )
+            refused["incomplete_work"] = refused["blockers"]
+            return jsonable(refused)
+    annotation_source_path = paths["absolute_annotations"]
+    paths["absolute_annotations"] = _snapshot_annotations(
+        paths["absolute_annotations"],
+        paths["annotation_batch"],
+        paths["annotation_snapshot"],
+        blockers,
+        write=write,
+    )
+    filtered_path = paths["filtered_index"]
+    candidate_path = paths["candidate_pool"]
+    annotation_path = paths["absolute_annotations"]
+    if (
+        filtered_path is not None
+        and candidate_path is not None
+        and annotation_path is not None
+        and candidate_path.is_file()
+        and annotation_path.is_file()
+    ):
+        candidate_frame, candidate_error = _read_csv(candidate_path)
+        annotation_frame, annotation_error = _read_csv(annotation_path)
+        if candidate_error:
+            blockers.append(candidate_error)
+        if annotation_error:
+            blockers.append(annotation_error)
+        if (
+            candidate_frame is not None
+            and annotation_frame is not None
+            and "image_path" in candidate_frame
+            and set(ABSOLUTE_COLUMNS).issubset(annotation_frame.columns)
+        ):
+            annotation_scores = pd.to_numeric(
+                annotation_frame["scenic_human"], errors="coerce"
+            )
+            annotation_paths = annotation_frame["image_path"].astype(str).str.strip()
+            completed_paths = set(
+                annotation_paths[
+                    annotation_scores.notna() & ~annotation_frame["skip"].map(_bool)
+                ]
+            )
+            skipped_paths = (
+                set(annotation_paths[annotation_frame["skip"].map(_bool)])
+                - completed_paths
+            )
+            filtered = candidate_frame.reset_index(names="candidate_row_index").loc[
+                ~candidate_frame["image_path"].astype(str).isin(skipped_paths),
+                ["candidate_row_index", "image_path"],
+            ]
+            if filtered.empty:
+                blockers.append("filtered training index contains no usable rows")
+            elif write:
+                atomic_write_text(
+                    filtered_path,
+                    filtered.to_csv(index=False, lineterminator="\n"),
+                )
     required = set(RUN_ARTIFACTS) | {
         "absolute_annotations",
         "mixed_labels",
@@ -772,13 +1280,30 @@ def finalize_stage1(
     annotation_ok, annotation_rows = _validate_annotations(
         paths["absolute_annotations"], blockers
     )
+    batch_manifest, batch_manifest_error = _read_json(
+        paths["batch_manifest"] or root / RUN_ARTIFACTS["batch_manifest"]
+    )
+    if batch_manifest_error:
+        blockers.append(batch_manifest_error)
     split_ok, split_rows, audit = _validate_splits(
         paths["geographic_splits"] or root / RUN_ARTIFACTS["geographic_splits"],
         paths["leakage_audit"] or root / RUN_ARTIFACTS["leakage_audit"],
         blockers,
+        manifest=batch_manifest,
     )
     benchmark_ok, benchmark_rows = _validate_human_table(
         paths["benchmark"], blockers, benchmark=True
+    )
+    benchmark_lineage_ok = _validate_benchmark_splits(
+        paths["benchmark"],
+        paths["geographic_splits"] or root / RUN_ARTIFACTS["geographic_splits"],
+        blockers,
+    )
+    benchmark_provenance_ok = _validate_benchmark_lineage(
+        paths["benchmark"],
+        annotation_source_path,
+        paths["geographic_splits"] or root / RUN_ARTIFACTS["geographic_splits"],
+        blockers,
     )
     mixed_ok, mixed_rows = _validate_human_table(paths["mixed_labels"], blockers)
     registry_ok, baseline = _validate_registry(
@@ -812,11 +1337,12 @@ def finalize_stage1(
         "scoring_valid": bool(scoring_ok),
         "annotations_valid": bool(batch_ok and annotation_ok),
         "splits_valid": bool(split_ok),
-        "benchmark_valid": bool(benchmark_ok),
+        "benchmark_valid": bool(
+            benchmark_ok and benchmark_lineage_ok and benchmark_provenance_ok
+        ),
         "baseline_valid": bool(registry_ok),
         "hashes_valid": bool(
-            lineage_ok
-            and not any("hash mismatch" in blocker for blocker in blockers)
+            lineage_ok and not any("hash mismatch" in blocker for blocker in blockers)
         ),
     }
     handoff = {

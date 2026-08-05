@@ -71,7 +71,6 @@ def test_budget_rejected_before_output(tmp_path: Path):
     assert not (tmp_path / "runs").exists()
 
 
-
 def test_existing_run_rejects_identity_drift_before_rewrite(tmp_path: Path) -> None:
     spec = {"version": 1, "regions": [get_builtin_region_spec()["regions"][0]]}
     first = plan_run(
@@ -92,6 +91,7 @@ def test_existing_run_rejects_identity_drift_before_rewrite(tmp_path: Path) -> N
             budget=100_001,
         )
     assert manifest_path.read_bytes() == before
+
 
 def test_inventory_reuses_valid_pair_and_manifest_contract(tmp_path: Path):
     image_root = tmp_path / "images"
@@ -151,6 +151,7 @@ def test_inventory_reuses_valid_pair_and_manifest_contract(tmp_path: Path):
             "terrain_s3_uri",
         ]
 
+
 def test_s3_inventory_reuses_nonempty_canonical_pair() -> None:
     class Paginator:
         def paginate(self, *, Bucket: str, Prefix: str):
@@ -159,7 +160,10 @@ def test_s3_inventory_reuses_nonempty_canonical_pair() -> None:
             yield {
                 "Contents": [
                     {"Key": f"raw/images/{style}/z14/west/10_20.png", "Size": 123},
-                    {"Key": f"raw/images/{style}/z14/west/nested/10_20.png", "Size": 999},
+                    {
+                        "Key": f"raw/images/{style}/z14/west/nested/10_20.png",
+                        "Size": 999,
+                    },
                 ]
             }
 
@@ -243,3 +247,95 @@ def test_acquisition_uses_bounded_workers_and_writes_pairs(
     assert all(row["satellite_present"] and row["terrain_present"] for row in rows)
     assert all(Path(row["satellite_path"]).is_file() for row in rows)
     assert all(Path(row["terrain_path"]).is_file() for row in rows)
+
+
+def test_plan_run_rejects_invalid_run_names(tmp_path: Path) -> None:
+    spec = get_builtin_region_spec()
+    for bad_name in (
+        "",
+        "/abs/path",
+        "../traversal",
+        "dot/dot",
+        ".",
+        "..",
+        "invalid name",
+    ):
+        with pytest.raises(ValueError):
+            plan_run(
+                run_name=bad_name,
+                spec=spec,
+                output_root=tmp_path / "runs",
+                image_root=tmp_path / "images",
+            )
+
+
+def test_plan_run_fully_cached_requires_no_mapbox_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MAPBOX_ACCESS_TOKEN", raising=False)
+    image_root = tmp_path / "images"
+    spec = {"version": 1, "regions": [get_builtin_region_spec()["regions"][0]]}
+    planned = parse_and_validate_region_spec(spec)
+    for x, y in planned["ordered_coords"]:
+        region = planned["coord_to_region"][(x, y)]
+        sat = image_root / "satellite" / "z14" / region / f"{x}_{y}.png"
+        ter = image_root / "terrain" / "z14" / region / f"{x}_{y}.png"
+        sat.parent.mkdir(parents=True, exist_ok=True)
+        ter.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (4, 4), color="blue").save(sat, format="PNG")
+        Image.new("RGB", (4, 4), color="green").save(ter, format="PNG")
+
+    res = plan_run(
+        run_name="cached_run",
+        spec=spec,
+        output_root=tmp_path / "runs",
+        image_root=image_root,
+        acquire=True,
+    )
+    assert res["region_manifest"]["stage_state"] == "acquired"
+    assert res["region_manifest"]["ready_for_selection"] is True
+
+
+def test_s3_only_readiness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyPaginator:
+        def __init__(self, key: str):
+            self.key = key
+
+        def paginate(self, Bucket: str, Prefix: str):
+            filename = "100_100.png"
+            return [
+                {
+                    "Contents": [
+                        {
+                            "Key": f"{Prefix}{filename}",
+                            "Size": 1024,
+                        }
+                    ]
+                }
+            ]
+
+    class DummyS3Client:
+        def get_paginator(self, name: str):
+            return DummyPaginator(name)
+
+    monkeypatch.setattr("boto3.client", lambda name: DummyS3Client())
+    inv_rows, counts = scan_s3_inventory(
+        [
+            {
+                "region": "west",
+                "z": 14,
+                "x": 100,
+                "y": 100,
+                "satellite_present": False,
+                "terrain_present": False,
+            }
+        ],
+        bucket="test-bucket",
+        s3_client=DummyS3Client(),
+    )
+    assert counts["satellite_valid"] == 0
+    assert counts["terrain_valid"] == 0
+    assert counts["complete_pairs"] == 0
+    assert counts["reusable_pairs"] == 1
+    assert counts["satellite_s3_objects"] == 1
+    assert counts["terrain_s3_objects"] == 1

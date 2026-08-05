@@ -27,35 +27,93 @@ from urllib.parse import urlparse
 import numpy as np
 import pandas as pd
 from PIL import Image
+from .common import validate_run_name
 
-from .common import atomic_write_json, atomic_write_text, jsonable, sha256_bytes, sha256_file
+
+from .common import (
+    atomic_write_json,
+    atomic_write_text,
+    jsonable,
+    sha256_bytes,
+    sha256_file,
+)
 from src.terrain.features import compute_terrain_features
 
 SCORING_SCHEMA_VERSION = 1
 SCHEMA_VERSION = SCORING_SCHEMA_VERSION
 CANONICAL_TILE_COLUMNS = (
-    "region", "z", "x", "y", "lat", "lon", "satellite_path", "terrain_path",
-    "satellite_present", "terrain_present",
+    "region",
+    "z",
+    "x",
+    "y",
+    "lat",
+    "lon",
+    "satellite_path",
+    "terrain_path",
+    "satellite_present",
+    "terrain_present",
 )
 OPTIONAL_TILE_COLUMNS = ("satellite_s3_uri", "terrain_s3_uri")
 
 # Scalar-only columns.  Vectors are never expanded into CSV or JSON.
 CANDIDATE_POOL_COLUMNS = (
-    "image_path", "tile_identity", "source_identity", "region", "z", "x", "y", "lat", "lon",
-    "satellite_path", "terrain_path", "satellite_s3_uri", "terrain_s3_uri",
-    "manifest_satellite_present", "manifest_terrain_present", "satellite_present", "terrain_present",
-    "availability_state", "score_status", "selector_eligible", "error",
-    "satellite_content_sha256", "terrain_content_sha256",
-    "heuristic_score", "scenic_score", "scenic_score_heuristic",
-    "heuristic_class_component", "heuristic_relief_component", "heuristic_roughness_component",
-    "heuristic_slope_component", "heuristic_water_component", "heuristic_vegetation_component",
-    "heuristic_water_fraction_penalty", "relief", "roughness", "slope_mean", "slope_variation",
-    "water_proximity", "vegetation_density", "water_fraction",
-    "regression_prediction", "model_prediction", "label_source",
-    "classifier_checkpoint_sha256", "regression_checkpoint_sha256",
-    "class_id", "class_name", "class_probability", "class_count",
-    "normalized_class_entropy", "class_uncertainty", "uncertainty",
-    "embedding_identity", "embedding_dimension", "embedding_row_index", "embedding_cluster_id", "cluster_id",
+    "image_path",
+    "tile_identity",
+    "source_identity",
+    "region",
+    "z",
+    "x",
+    "y",
+    "lat",
+    "lon",
+    "satellite_path",
+    "terrain_path",
+    "satellite_s3_uri",
+    "terrain_s3_uri",
+    "manifest_satellite_present",
+    "manifest_terrain_present",
+    "satellite_present",
+    "terrain_present",
+    "availability_state",
+    "score_status",
+    "selector_eligible",
+    "error",
+    "satellite_content_sha256",
+    "terrain_content_sha256",
+    "heuristic_score",
+    "scenic_score",
+    "scenic_score_heuristic",
+    "heuristic_class_component",
+    "heuristic_relief_component",
+    "heuristic_roughness_component",
+    "heuristic_slope_component",
+    "heuristic_water_component",
+    "heuristic_vegetation_component",
+    "heuristic_water_fraction_penalty",
+    "relief",
+    "roughness",
+    "slope_mean",
+    "slope_variation",
+    "water_proximity",
+    "vegetation_density",
+    "water_fraction",
+    "regression_prediction",
+    "model_prediction",
+    "label_source",
+    "classifier_checkpoint_sha256",
+    "regression_checkpoint_sha256",
+    "class_id",
+    "class_name",
+    "class_probability",
+    "class_count",
+    "normalized_class_entropy",
+    "class_uncertainty",
+    "uncertainty",
+    "embedding_identity",
+    "embedding_dimension",
+    "embedding_row_index",
+    "embedding_cluster_id",
+    "cluster_id",
     "cache_hit",
 )
 
@@ -156,7 +214,15 @@ def _bool(value: Any) -> bool:
     if isinstance(value, (int, float, np.integer, np.floating)):
         return bool(value)
     return _clean_text(value).lower() in {
-        "1", "true", "yes", "y", "t", "on", "available", "complete", "completed"
+        "1",
+        "true",
+        "yes",
+        "y",
+        "t",
+        "on",
+        "available",
+        "complete",
+        "completed",
     }
 
 
@@ -201,7 +267,9 @@ def _source_identity(row: Mapping[str, Any]) -> str:
     )
 
 
-def _resolve_local_path(value: str, *, manifest_dir: Path, run_root: Path) -> Path | None:
+def _resolve_local_path(
+    value: str, *, manifest_dir: Path, run_root: Path
+) -> Path | None:
     if not value:
         return None
     raw = Path(value).expanduser()
@@ -242,8 +310,13 @@ def _default_s3_client() -> Any:
 
 
 def _read_source(
-    *, value: str, uri: str, manifest_dir: Path, run_root: Path,
-    s3_client: Any | None, style: str,
+    *,
+    value: str,
+    uri: str,
+    manifest_dir: Path,
+    run_root: Path,
+    s3_client: Any | None,
+    style: str,
 ) -> _SourceData:
     source = _SourceData(value=value, uri=uri)
     resolved = _resolve_local_path(value, manifest_dir=manifest_dir, run_root=run_root)
@@ -254,7 +327,9 @@ def _read_source(
         s3_ref = _s3_parts(uri) if uri else None
         if s3_ref:
             if s3_client is None:
-                raise ValueError(f"{style} source requires an injected or configured S3 client")
+                raise ValueError(
+                    f"{style} source requires an injected or configured S3 client"
+                )
             bucket, key = s3_ref
             response = s3_client.get_object(Bucket=bucket, Key=key)
             content_type = _clean_text(response.get("ContentType")).lower()
@@ -272,7 +347,9 @@ def _read_source(
                 raise ValueError(f"{style} S3 object did not return bytes")
             source.payload = bytes(payload)
         else:
-            raise FileNotFoundError(f"{style} image not found: {value or uri or '<empty>'}")
+            raise FileNotFoundError(
+                f"{style} image not found: {value or uri or '<empty>'}"
+            )
     source.content_hash = hashlib.sha256(source.payload).hexdigest()
     return source
 
@@ -289,7 +366,9 @@ def _open_rgb(
         except TypeError:
             image = image_loader(source.value or source.uri)
         if not isinstance(image, Image.Image):
-            raise TypeError(f"injected {style} image loader must return PIL.Image.Image")
+            raise TypeError(
+                f"injected {style} image loader must return PIL.Image.Image"
+            )
         return image.convert("RGB")
     if source.payload is None:
         raise ValueError("image source has no bytes")
@@ -301,7 +380,9 @@ def _torch_module(value: Any) -> bool:
     if value is None:
         return False
     module = type(value).__module__
-    return module.startswith("torch") or (hasattr(value, "state_dict") and hasattr(value, "parameters"))
+    return module.startswith("torch") or (
+        hasattr(value, "state_dict") and hasattr(value, "parameters")
+    )
 
 
 def _to_numpy(value: Any, *, dtype: np.dtype = np.dtype(np.float32)) -> np.ndarray:
@@ -319,7 +400,13 @@ def _stack_transforms(values: list[Any], *, use_torch: bool) -> Any:
         raise ValueError("cannot stack an empty transformed batch")
     if use_torch:
         import torch
-        tensors = [value if isinstance(value, torch.Tensor) else torch.as_tensor(np.asarray(value), dtype=torch.float32) for value in values]
+
+        tensors = [
+            value
+            if isinstance(value, torch.Tensor)
+            else torch.as_tensor(np.asarray(value), dtype=torch.float32)
+            for value in values
+        ]
         return torch.stack(tensors, dim=0)
     return np.stack([_to_numpy(value) for value in values], axis=0).astype(np.float32)
 
@@ -329,7 +416,12 @@ def _softmax(logits: np.ndarray) -> np.ndarray:
     values -= np.max(values, axis=1, keepdims=True)
     exponent = np.exp(np.clip(values, -745.0, 80.0))
     denominator = exponent.sum(axis=1, keepdims=True)
-    probabilities = np.divide(exponent, denominator, out=np.full_like(exponent, 1.0 / max(1, exponent.shape[1])), where=denominator > 0)
+    probabilities = np.divide(
+        exponent,
+        denominator,
+        out=np.full_like(exponent, 1.0 / max(1, exponent.shape[1])),
+        where=denominator > 0,
+    )
     return probabilities.astype(np.float32)
 
 
@@ -350,21 +442,36 @@ def normalized_class_entropy(probabilities: Sequence[float] | np.ndarray) -> flo
 
 
 def _terrain_values(result: Any) -> tuple[np.ndarray, dict[str, float]]:
-    features_obj = result.get("features") if isinstance(result, Mapping) else getattr(result, "features", None)
+    features_obj = (
+        result.get("features")
+        if isinstance(result, Mapping)
+        else getattr(result, "features", None)
+    )
     if features_obj is None:
         raise ValueError("terrain feature result has no features")
-    terrain_array = np.asarray(features_obj.to_array() if hasattr(features_obj, "to_array") else features_obj, dtype=np.float32).reshape(-1)
+    terrain_array = np.asarray(
+        features_obj.to_array() if hasattr(features_obj, "to_array") else features_obj,
+        dtype=np.float32,
+    ).reshape(-1)
     if terrain_array.size == 0 or not np.isfinite(terrain_array).all():
         raise ValueError("terrain feature result contains no finite features")
 
     def metric(name: str) -> float:
-        raw = result.get(name, 0.0) if isinstance(result, Mapping) else getattr(result, name, 0.0)
+        raw = (
+            result.get(name, 0.0)
+            if isinstance(result, Mapping)
+            else getattr(result, name, 0.0)
+        )
         number = _finite(raw)
         return float(number if number is not None else 0.0)
 
     metrics = {name: metric(name) for name in ("relief", "roughness", "slope_mean")}
     for name in ("slope_variation", "water_proximity", "vegetation_density"):
-        raw = features_obj.get(name, 0.0) if isinstance(features_obj, Mapping) else getattr(features_obj, name, 0.0)
+        raw = (
+            features_obj.get(name, 0.0)
+            if isinstance(features_obj, Mapping)
+            else getattr(features_obj, name, 0.0)
+        )
         number = _finite(raw)
         metrics[name] = float(number if number is not None else 0.0)
     return terrain_array, metrics
@@ -379,18 +486,29 @@ def _satellite_metrics(image: Image.Image) -> dict[str, float]:
     saturation = (maxc - minc) / np.maximum(maxc + 1e-6, 1e-6)
     gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
     texture = float(gray.std())
-    water_mask = ((b > r * 1.2) & (b > g * 1.15) & (brightness < 0.65) & (saturation > 0.18) & (texture < 0.12))
+    water_mask = (
+        (b > r * 1.2)
+        & (b > g * 1.15)
+        & (brightness < 0.65)
+        & (saturation > 0.18)
+        & (texture < 0.12)
+    )
     return {"water_fraction": float(water_mask.mean())}
 
 
-def _heuristic_components(class_score: float, terrain: Mapping[str, float], sat: Mapping[str, float]) -> dict[str, float]:
+def _heuristic_components(
+    class_score: float, terrain: Mapping[str, float], sat: Mapping[str, float]
+) -> dict[str, float]:
     water_fraction = float(sat.get("water_fraction", 0.0))
     class_weight = 2.5 * max(0.3, 1.0 - 0.9 * water_fraction)
     components = {
         "heuristic_class_component": class_weight * float(class_score),
-        "heuristic_relief_component": 2.0 * math.tanh(float(terrain.get("relief", 0.0)) / 500.0),
-        "heuristic_roughness_component": 1.5 * math.tanh(float(terrain.get("roughness", 0.0)) / 200.0),
-        "heuristic_slope_component": 1.5 * math.tanh(float(terrain.get("slope_mean", 0.0)) / 15.0),
+        "heuristic_relief_component": 2.0
+        * math.tanh(float(terrain.get("relief", 0.0)) / 500.0),
+        "heuristic_roughness_component": 1.5
+        * math.tanh(float(terrain.get("roughness", 0.0)) / 200.0),
+        "heuristic_slope_component": 1.5
+        * math.tanh(float(terrain.get("slope_mean", 0.0)) / 15.0),
         "heuristic_water_component": 1.5 * float(terrain.get("water_proximity", 0.0)),
         "heuristic_vegetation_component": float(terrain.get("vegetation_density", 0.0)),
         "heuristic_water_fraction_penalty": -1.2 * water_fraction,
@@ -426,71 +544,134 @@ def _device_name(device: str) -> str:
         return "cpu"
     if requested == "cuda" and not torch.cuda.is_available():
         return "cpu"
-    if requested == "mps" and (not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available()):
+    if requested == "mps" and (
+        not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available()
+    ):
         return "cpu"
     return requested
 
 
 def _torch_load(path: Path, *, map_location: str) -> Any:
     import torch
+
     try:
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=map_location)
 
 
-def resolve_active_regression_checkpoint(registry_path: str | Path = "data/processed/regression/model_registry.json") -> Path:
+def resolve_active_regression_checkpoint(
+    registry_path: str | Path = "data/processed/regression/model_registry.json",
+) -> Path:
     """Resolve active registry checkpoint and fail closed on malformed data."""
     registry_file = Path(registry_path)
     try:
         payload = json.loads(registry_file.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise FileNotFoundError(f"active regression registry not found: {registry_file}") from exc
+        raise FileNotFoundError(
+            f"active regression registry not found: {registry_file}"
+        ) from exc
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"malformed active regression registry: {registry_file}") from exc
-    if not isinstance(payload, Mapping) or not isinstance(payload.get("active"), Mapping):
-        raise ValueError("malformed active regression registry: active record is missing")
+        raise ValueError(
+            f"malformed active regression registry: {registry_file}"
+        ) from exc
+    if not isinstance(payload, Mapping) or not isinstance(
+        payload.get("active"), Mapping
+    ):
+        raise ValueError(
+            "malformed active regression registry: active record is missing"
+        )
     raw_checkpoint = payload["active"].get("checkpoint")
     if not isinstance(raw_checkpoint, str) or not raw_checkpoint.strip():
-        raise ValueError("malformed active regression registry: active checkpoint is missing")
+        raise ValueError(
+            "malformed active regression registry: active checkpoint is missing"
+        )
     checkpoint_value = Path(raw_checkpoint).expanduser()
     candidates = [checkpoint_value]
     if not checkpoint_value.is_absolute():
-        candidates += [registry_file.parent / checkpoint_value, Path.cwd() / checkpoint_value]
+        candidates += [
+            registry_file.parent / checkpoint_value,
+            Path.cwd() / checkpoint_value,
+        ]
+    found_candidate: Path | None = None
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
-            return candidate
-    raise FileNotFoundError(f"active regression checkpoint not found: {raw_checkpoint}")
+            found_candidate = candidate
+            break
+    if found_candidate is None:
+        raise FileNotFoundError(
+            f"active regression checkpoint not found: {raw_checkpoint}"
+        )
+
+    actual_sha256 = sha256_file(found_candidate)
+    active_record = payload["active"]
+    expected_sha256 = active_record.get("sha256")
+    if expected_sha256 is not None:
+        expected_str = str(expected_sha256).strip()
+        if expected_str != actual_sha256:
+            raise ValueError(
+                f"active regression checkpoint sha256 mismatch for {found_candidate}: expected {expected_str}, got {actual_sha256}"
+            )
+
+    return found_candidate
 
 
-def _validate_regression_checkpoint(path: Path, *, device: str) -> tuple[Any, dict[str, int]]:
+def _validate_regression_checkpoint(
+    path: Path, *, device: str
+) -> tuple[Any, dict[str, int]]:
     payload = _torch_load(path, map_location=device)
     if not isinstance(payload, Mapping):
         raise ValueError(f"malformed regression checkpoint: {path}")
-    required = {"model_state_dict", "vit_dim", "terrain_dim", "num_classes"}
-    missing = sorted(required - set(payload))
+    if "model_state_dict" not in payload or not isinstance(
+        payload["model_state_dict"], Mapping
+    ):
+        raise ValueError(
+            f"malformed regression checkpoint {path}: missing model_state_dict"
+        )
+
+    source = payload
+    required = ("vit_dim", "terrain_dim", "num_classes")
+    missing = sorted(set(required) - set(source.keys()))
     if missing:
         raise ValueError(f"malformed regression checkpoint {path}: missing {missing}")
-    try:
-        dims = {name: int(payload[name]) for name in ("vit_dim", "terrain_dim", "num_classes")}
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"malformed regression checkpoint {path}: invalid dimensions") from exc
-    if any(value <= 0 for value in dims.values()) or not isinstance(payload["model_state_dict"], Mapping):
-        raise ValueError(f"malformed regression checkpoint {path}: invalid state/dimensions")
+
+    dims: dict[str, int] = {}
+    for key in required:
+        val = source.get(key)
+        if isinstance(val, bool) or not isinstance(val, (int, np.integer)):
+            raise ValueError(f"malformed regression checkpoint {path}: invalid {key}")
+        parsed = int(val)
+        if parsed <= 0:
+            raise ValueError(f"malformed regression checkpoint {path}: invalid {key}")
+        dims[key] = parsed
+
+    hidden_val = source.get("hidden_dim", payload.get("hidden_dim", 256))
+    if isinstance(hidden_val, bool) or not isinstance(hidden_val, (int, np.integer)):
+        raise ValueError(f"malformed regression checkpoint {path}: invalid hidden_dim")
+    hidden_dim = int(hidden_val)
+    if hidden_dim <= 0:
+        raise ValueError(f"malformed regression checkpoint {path}: invalid hidden_dim")
+    dims["hidden_dim"] = hidden_dim
+
     from src.scenic_scorer.regression import ScenicRegressionModel
-    model = ScenicRegressionModel(**dims).to(device)
+
     try:
+        model = ScenicRegressionModel(**dims).to(device)
         model.load_state_dict(payload["model_state_dict"], strict=True)
-    except (RuntimeError, TypeError, ValueError) as exc:
-        raise ValueError(f"malformed regression checkpoint {path}: state dict mismatch") from exc
+    except (RuntimeError, TypeError, ValueError, KeyError) as exc:
+        raise ValueError(
+            f"malformed regression checkpoint {path}: state dict mismatch"
+        ) from exc
     model.eval()
     return model, dims
 
 
 def load_scoring_models(
-    *, registry_path: str | Path = "data/processed/regression/model_registry.json",
+    *,
+    registry_path: str | Path = "data/processed/regression/model_registry.json",
     classifier_checkpoint: str | Path = "models/classifier/best_model.pt",
-    device: str = "auto", classifier_use_resisc45_stats: bool = True,
+    device: str = "auto",
+    classifier_use_resisc45_stats: bool = True,
 ) -> LoadedScoringModels:
     """Load classifier and active regression exactly once, read-only."""
     resolved_device = _device_name(device)
@@ -513,34 +694,107 @@ def load_scoring_models(
     try:
         from src.classifier.inference import get_inference_transform
         from src.classifier.model import LandscapeClassifier, TERRAIN_CLASSES
-        classifier = LandscapeClassifier(pretrained=False, pretrained_path=classifier_path, device=resolved_device)
+
+        classifier = LandscapeClassifier(
+            pretrained=False, pretrained_path=classifier_path, device=resolved_device
+        )
         classifier.to(resolved_device)
         classifier.eval()
     except ImportError as exc:
-        raise ImportError("classifier dependencies are required for active-learning scoring") from exc
+        raise ImportError(
+            "classifier dependencies are required for active-learning scoring"
+        ) from exc
     except Exception as exc:
         raise ValueError(f"malformed classifier checkpoint: {classifier_path}") from exc
-    regression, _dims = _validate_regression_checkpoint(regression_path, device=resolved_device)
+    regression, _dims = _validate_regression_checkpoint(
+        regression_path, device=resolved_device
+    )
     return LoadedScoringModels(
-        classifier=classifier, classifier_transform=get_inference_transform(use_resisc45_stats=classifier_use_resisc45_stats),
-        regression_model=regression, class_names=tuple(TERRAIN_CLASSES), device=resolved_device,
-        classifier_checkpoint=classifier_path, regression_checkpoint=regression_path,
-        classifier_hash=sha256_file(classifier_path), regression_hash=sha256_file(regression_path),
+        classifier=classifier,
+        classifier_transform=get_inference_transform(
+            use_resisc45_stats=classifier_use_resisc45_stats
+        ),
+        regression_model=regression,
+        class_names=tuple(TERRAIN_CLASSES),
+        device=resolved_device,
+        classifier_checkpoint=classifier_path,
+        regression_checkpoint=regression_path,
+        classifier_hash=sha256_file(classifier_path),
+        regression_hash=sha256_file(regression_path),
     )
 
 
 def _dependencies_from_loaded(models: LoadedScoringModels) -> ScoringDependencies:
     return ScoringDependencies(
-        classifier=models.classifier, classifier_transform=models.classifier_transform,
-        regression_model=models.regression_model, class_names=models.class_names, device=models.device,
-        classifier_hash=models.classifier_hash, regression_hash=models.regression_hash,
-        classifier_checkpoint=models.classifier_checkpoint, regression_checkpoint=models.regression_checkpoint,
+        classifier=models.classifier,
+        classifier_transform=models.classifier_transform,
+        regression_model=models.regression_model,
+        class_names=models.class_names,
+        device=models.device,
+        classifier_hash=models.classifier_hash,
+        regression_hash=models.regression_hash,
+        classifier_checkpoint=models.classifier_checkpoint,
+        regression_checkpoint=models.regression_checkpoint,
     )
 
 
-def _read_cache(run_root: Path) -> _CacheData | None:
-    candidate_path, embedding_path = run_root / "candidate_pool.csv", run_root / "feature_embeddings.npz"
-    if not candidate_path.exists() or not embedding_path.exists():
+def _preprocessing_contract(
+    dependencies: ScoringDependencies, classifier_use_resisc45_stats: bool
+) -> dict[str, str]:
+    contract = {
+        "classifier_transform": dependencies.classifier_preprocess_identity
+        or (
+            f"{type(dependencies.classifier_transform).__module__}."
+            f"{type(dependencies.classifier_transform).__qualname__}"
+            if dependencies.classifier_transform
+            else "injected_or_identity"
+        ),
+        "classifier_normalization": (
+            "RESISC45" if classifier_use_resisc45_stats else "ImageNet"
+        ),
+        "classifier_input": "RGB; project inference transform targets 224x224",
+        "terrain_features": "src.terrain.features.compute_terrain_features",
+        "device": dependencies.device,
+    }
+    contract["pipeline_sha256"] = sha256_bytes(
+        json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
+    )
+    return contract
+
+
+def _read_cache(run_root: Path, *, pipeline_identity: str) -> _CacheData | None:
+    candidate_path = run_root / "candidate_pool.csv"
+    embedding_path = run_root / "feature_embeddings.npz"
+    scoring_path = run_root / "scoring_manifest.json"
+    if (
+        not candidate_path.exists()
+        or not embedding_path.exists()
+        or not scoring_path.exists()
+    ):
+        return None
+    try:
+        manifest = json.loads(scoring_path.read_text(encoding="utf-8"))
+        preprocessing = manifest.get("preprocessing", {})
+        if (
+            not isinstance(preprocessing, Mapping)
+            or preprocessing.get("pipeline_sha256") != pipeline_identity
+        ):
+            return None
+        artifacts = manifest.get("artifacts", {})
+        if not isinstance(artifacts, Mapping):
+            return None
+        for name, path in (
+            ("candidate_pool.csv", candidate_path),
+            ("feature_embeddings.npz", embedding_path),
+        ):
+            entry = artifacts.get(name)
+            expected = entry.get("sha256") if isinstance(entry, Mapping) else None
+            if (
+                not isinstance(expected, str)
+                or sha256_file(path).lower() != expected.lower()
+            ):
+                return None
+    except (OSError, json.JSONDecodeError, TypeError):
         return None
     try:
         frame = pd.read_csv(candidate_path, low_memory=False)
@@ -560,12 +814,26 @@ def _read_cache(run_root: Path) -> _CacheData | None:
         return None
 
 
-def _cache_match(row: Mapping[str, Any], cached: Mapping[str, Any], *, classifier_hash: str, regression_hash: str, arrays: Mapping[str, np.ndarray]) -> int | None:
+def _cache_match(
+    row: Mapping[str, Any],
+    cached: Mapping[str, Any],
+    *,
+    classifier_hash: str,
+    regression_hash: str,
+    arrays: Mapping[str, np.ndarray],
+) -> int | None:
     if _clean_text(cached.get("score_status")) != "scored":
         return None
-    if _clean_text(cached.get("satellite_content_sha256")) != _clean_text(row.get("satellite_content_sha256")) or _clean_text(cached.get("terrain_content_sha256")) != _clean_text(row.get("terrain_content_sha256")):
+    if _clean_text(cached.get("satellite_content_sha256")) != _clean_text(
+        row.get("satellite_content_sha256")
+    ) or _clean_text(cached.get("terrain_content_sha256")) != _clean_text(
+        row.get("terrain_content_sha256")
+    ):
         return None
-    if _clean_text(cached.get("classifier_checkpoint_sha256")) != classifier_hash or _clean_text(cached.get("regression_checkpoint_sha256")) != regression_hash:
+    if (
+        _clean_text(cached.get("classifier_checkpoint_sha256")) != classifier_hash
+        or _clean_text(cached.get("regression_checkpoint_sha256")) != regression_hash
+    ):
         return None
     raw_index = _finite(cached.get("embedding_row_index"))
     if raw_index is None or int(raw_index) < 0:
@@ -589,17 +857,48 @@ def _cache_match(row: Mapping[str, Any], cached: Mapping[str, Any], *, classifie
 
 
 def _copy_cached_fields(result: dict[str, Any], cached: Mapping[str, Any]) -> None:
-    identity_fields = {"image_path", "tile_identity", "source_identity", "region", "z", "x", "y", "lat", "lon", "satellite_path", "terrain_path", "satellite_s3_uri", "terrain_s3_uri", "manifest_satellite_present", "manifest_terrain_present", "satellite_content_sha256", "terrain_content_sha256", "cache_hit", "embedding_row_index", "embedding_cluster_id", "cluster_id"}
+    identity_fields = {
+        "image_path",
+        "tile_identity",
+        "source_identity",
+        "region",
+        "z",
+        "x",
+        "y",
+        "lat",
+        "lon",
+        "satellite_path",
+        "terrain_path",
+        "satellite_s3_uri",
+        "terrain_s3_uri",
+        "manifest_satellite_present",
+        "manifest_terrain_present",
+        "satellite_content_sha256",
+        "terrain_content_sha256",
+        "cache_hit",
+        "embedding_row_index",
+        "embedding_cluster_id",
+        "cluster_id",
+    }
     for key in CANDIDATE_POOL_COLUMNS:
         if key not in identity_fields and key in cached:
             result[key] = _json_scalar(cached[key])
 
 
-def _call_classifier(dependencies: ScoringDependencies, images: list[Image.Image]) -> tuple[np.ndarray, np.ndarray]:
-    transformed = [dependencies.classifier_transform(image) if dependencies.classifier_transform else np.asarray(image, dtype=np.float32) for image in images]
+def _call_classifier(
+    dependencies: ScoringDependencies, images: list[Image.Image]
+) -> tuple[np.ndarray, np.ndarray]:
+    transformed = [
+        dependencies.classifier_transform(image)
+        if dependencies.classifier_transform
+        else np.asarray(image, dtype=np.float32)
+        for image in images
+    ]
     if dependencies.classifier_predictor is not None:
         try:
-            output = dependencies.classifier_predictor(_stack_transforms(transformed, use_torch=False))
+            output = dependencies.classifier_predictor(
+                _stack_transforms(transformed, use_torch=False)
+            )
         except (TypeError, AttributeError):
             output = dependencies.classifier_predictor(images)
     else:
@@ -610,6 +909,7 @@ def _call_classifier(dependencies: ScoringDependencies, images: list[Image.Image
         if use_torch:
             batch = batch.to(dependencies.device)
             import torch
+
             with torch.no_grad():
                 logits_value = dependencies.classifier(batch)
                 features_value = dependencies.classifier.get_features(batch)
@@ -621,7 +921,9 @@ def _call_classifier(dependencies: ScoringDependencies, images: list[Image.Image
         output = {"logits": logits_value, "embeddings": features_value}
     if isinstance(output, Mapping):
         logits_value = output.get("logits", output.get("class_logits"))
-        features_value = output.get("embeddings", output.get("features", output.get("vit_embeddings")))
+        features_value = output.get(
+            "embeddings", output.get("features", output.get("vit_embeddings"))
+        )
     elif isinstance(output, (tuple, list)) and len(output) >= 2:
         logits_value, features_value = output[0], output[1]
     else:
@@ -633,12 +935,24 @@ def _call_classifier(dependencies: ScoringDependencies, images: list[Image.Image
         logits = logits.reshape(1, -1)
     if embeddings.ndim == 1:
         embeddings = embeddings.reshape(1, -1)
-    if logits.ndim != 2 or embeddings.ndim != 2 or len(logits) != len(images) or len(embeddings) != len(images) or logits.shape[1] <= 0 or embeddings.shape[1] <= 0:
+    if (
+        logits.ndim != 2
+        or embeddings.ndim != 2
+        or len(logits) != len(images)
+        or len(embeddings) != len(images)
+        or logits.shape[1] <= 0
+        or embeddings.shape[1] <= 0
+    ):
         raise ValueError("classifier outputs do not match batch shape")
     return logits.astype(np.float32), embeddings.astype(np.float32)
 
 
-def _call_regression(dependencies: ScoringDependencies, embeddings: np.ndarray, terrain_features: np.ndarray, logits: np.ndarray) -> np.ndarray:
+def _call_regression(
+    dependencies: ScoringDependencies,
+    embeddings: np.ndarray,
+    terrain_features: np.ndarray,
+    logits: np.ndarray,
+) -> np.ndarray:
     if dependencies.regression_predictor is not None:
         output = dependencies.regression_predictor(embeddings, terrain_features, logits)
     else:
@@ -646,13 +960,20 @@ def _call_regression(dependencies: ScoringDependencies, embeddings: np.ndarray, 
             raise ValueError("active regression model is required for scoring")
         if _torch_module(dependencies.regression_model):
             import torch
+
             with torch.no_grad():
-                output = dependencies.regression_model(torch.from_numpy(embeddings).float().to(dependencies.device), torch.from_numpy(terrain_features).float().to(dependencies.device), torch.from_numpy(logits).float().to(dependencies.device))
+                output = dependencies.regression_model(
+                    torch.from_numpy(embeddings).float().to(dependencies.device),
+                    torch.from_numpy(terrain_features).float().to(dependencies.device),
+                    torch.from_numpy(logits).float().to(dependencies.device),
+                )
         else:
             output = dependencies.regression_model(embeddings, terrain_features, logits)
     values = _to_numpy(output).reshape(-1)
     if len(values) != len(embeddings) or not np.isfinite(values).all():
-        raise ValueError("regression predictions do not match batch or contain non-finite values")
+        raise ValueError(
+            "regression predictions do not match batch or contain non-finite values"
+        )
     return np.clip(values.astype(np.float32), 0.0, 10.0)
 
 
@@ -662,7 +983,9 @@ def _lsh_clusters(embeddings: np.ndarray, *, seed: int, bits: int) -> list[str]:
     if bits <= 0 or bits > 63:
         raise ValueError("LSH bits must be between 1 and 63")
     rng = np.random.default_rng(int(seed))
-    hyperplanes = rng.standard_normal((embeddings.shape[1], int(bits))).astype(np.float32)
+    hyperplanes = rng.standard_normal((embeddings.shape[1], int(bits))).astype(
+        np.float32
+    )
     signs = (embeddings @ hyperplanes) >= 0.0
     values = np.zeros(len(embeddings), dtype=np.uint64)
     for bit in range(int(bits)):
@@ -673,7 +996,9 @@ def _lsh_clusters(embeddings: np.ndarray, *, seed: int, bits: int) -> list[str]:
 
 def _atomic_write_npz(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".npz", dir=path.parent)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".npz", dir=path.parent
+    )
     os.close(descriptor)
     try:
         np.savez_compressed(temporary, **arrays)
@@ -694,35 +1019,56 @@ def _base_result(row: Mapping[str, Any]) -> dict[str, Any]:
         result[name] = _json_scalar(row.get(name))
     satellite_path = _clean_text(row.get("satellite_path"))
     image_path = _clean_text(row.get("image_path")) or satellite_path
-    result.update({
-        "image_path": image_path or _clean_text(row.get("satellite_s3_uri")),
-        "tile_identity": _tile_identity(row),
-        "source_identity": _source_identity(row),
-        "region": _clean_text(row.get("region")) or "unknown",
-        "manifest_satellite_present": _bool(row.get("satellite_present"))
-        or _bool(row.get("satellite_s3_present")),
-        "manifest_terrain_present": _bool(row.get("terrain_present"))
-        or _bool(row.get("terrain_s3_present")),
-        "satellite_present": False, "terrain_present": False,
-        "availability_state": "missing", "score_status": "missing", "selector_eligible": False,
-        "error": None, "embedding_row_index": -1, "cache_hit": False,
-    })
+    result.update(
+        {
+            "image_path": image_path or _clean_text(row.get("satellite_s3_uri")),
+            "tile_identity": _tile_identity(row),
+            "source_identity": _source_identity(row),
+            "region": _clean_text(row.get("region")) or "unknown",
+            "manifest_satellite_present": _bool(row.get("satellite_present"))
+            or _bool(row.get("satellite_s3_present")),
+            "manifest_terrain_present": _bool(row.get("terrain_present"))
+            or _bool(row.get("terrain_s3_present")),
+            "satellite_present": False,
+            "terrain_present": False,
+            "availability_state": "missing",
+            "score_status": "missing",
+            "selector_eligible": False,
+            "error": None,
+            "embedding_row_index": -1,
+            "cache_hit": False,
+        }
+    )
     return result
 
 
 def _mark_error(result: dict[str, Any], message: str, *, missing: bool = False) -> None:
-    result.update({"availability_state": "missing" if missing else "error", "score_status": "missing" if missing else "error", "selector_eligible": False, "satellite_present": False, "terrain_present": False, "error": str(message)})
+    result.update(
+        {
+            "availability_state": "missing" if missing else "error",
+            "score_status": "missing" if missing else "error",
+            "selector_eligible": False,
+            "satellite_present": False,
+            "terrain_present": False,
+            "error": str(message),
+        }
+    )
 
 
 def score_tile_manifest(
     manifest: str | Path | pd.DataFrame,
-    *, run_root: str | Path,
+    *,
+    run_root: str | Path,
     dependencies: ScoringDependencies | None = None,
     registry_path: str | Path = "data/processed/regression/model_registry.json",
     classifier_checkpoint: str | Path = "models/classifier/best_model.pt",
-    device: str = "auto", classifier_use_resisc45_stats: bool = True,
-    batch_size: int = 32, lsh_seed: int = 0, lsh_bits: int = 16,
-    max_rows: int | None = None, write: bool = True,
+    device: str = "auto",
+    classifier_use_resisc45_stats: bool = True,
+    batch_size: int = 32,
+    lsh_seed: int = 0,
+    lsh_bits: int = 16,
+    max_rows: int | None = None,
+    write: bool = True,
 ) -> dict[str, Any]:
     """Score manifest rows and atomically publish candidate, NPZ, and manifest.
 
@@ -744,7 +1090,11 @@ def score_tile_manifest(
             frame = pd.read_csv(manifest_path, low_memory=False)
         except (OSError, ValueError) as exc:
             raise ValueError(f"invalid tile manifest: {manifest_path}") from exc
-        source_hash, manifest_label, manifest_dir = sha256_file(manifest_path), str(manifest_path), manifest_path.parent
+        source_hash, manifest_label, manifest_dir = (
+            sha256_file(manifest_path),
+            str(manifest_path),
+            manifest_path.parent,
+        )
     missing_columns = sorted(set(CANONICAL_TILE_COLUMNS) - set(frame.columns))
     if missing_columns:
         raise ValueError(f"tile manifest missing columns: {missing_columns}")
@@ -759,13 +1109,28 @@ def score_tile_manifest(
         raise ValueError("batch_size must be positive")
 
     if dependencies is None:
-        dependencies = _dependencies_from_loaded(load_scoring_models(registry_path=registry_path, classifier_checkpoint=classifier_checkpoint, device=device, classifier_use_resisc45_stats=classifier_use_resisc45_stats))
+        dependencies = _dependencies_from_loaded(
+            load_scoring_models(
+                registry_path=registry_path,
+                classifier_checkpoint=classifier_checkpoint,
+                device=device,
+                classifier_use_resisc45_stats=classifier_use_resisc45_stats,
+            )
+        )
     else:
         dependencies = ScoringDependencies(**dependencies.__dict__)
-        dependencies.device = _device_name(device if device != "auto" else dependencies.device)
-    if dependencies.classifier_predictor is not None and not dependencies.classifier_hash:
+        dependencies.device = _device_name(
+            device if device != "auto" else dependencies.device
+        )
+    if (
+        dependencies.classifier_predictor is not None
+        and not dependencies.classifier_hash
+    ):
         raise ValueError("injected classifier_predictor requires classifier_hash")
-    if dependencies.regression_predictor is not None and not dependencies.regression_hash:
+    if (
+        dependencies.regression_predictor is not None
+        and not dependencies.regression_hash
+    ):
         raise ValueError("injected regression_predictor requires regression_hash")
     if dependencies.s3_client is None and any(
         _s3_parts(_clean_text(value))
@@ -774,13 +1139,19 @@ def score_tile_manifest(
         for value in frame[name].tolist()
     ):
         dependencies.s3_client = _default_s3_client()
-    classifier_hash = _model_identity("classifier", dependencies.classifier, dependencies.classifier_hash)
-    regression_hash = _model_identity("regression", dependencies.regression_model, dependencies.regression_hash)
-    cache = _read_cache(root)
+    classifier_hash = _model_identity(
+        "classifier", dependencies.classifier, dependencies.classifier_hash
+    )
+    regression_hash = _model_identity(
+        "regression", dependencies.regression_model, dependencies.regression_hash
+    )
+    preprocessing = _preprocessing_contract(dependencies, classifier_use_resisc45_stats)
+    cache = _read_cache(root, pipeline_identity=preprocessing["pipeline_sha256"])
     results = [_base_result(row) for _, row in frame.iterrows()]
     cache_hits, pending = 0, []
     vector_by_index, logits_by_index, probs_by_index, terrain_by_index = {}, {}, {}, {}
     errors: list[dict[str, Any]] = []
+
     def score_chunk(chunk: list[_PendingRow]) -> None:
         try:
             logits, embeddings = _call_classifier(
@@ -849,9 +1220,7 @@ def score_tile_manifest(
                 logits_by_index[item.index] = logits[offset].astype(
                     np.float32, copy=True
                 )
-                probs_by_index[item.index] = row_probs.astype(
-                    np.float32, copy=True
-                )
+                probs_by_index[item.index] = row_probs.astype(np.float32, copy=True)
                 terrain_by_index[item.index] = item.terrain_features.astype(
                     np.float32, copy=True
                 )
@@ -867,27 +1236,78 @@ def score_tile_manifest(
                     }
                 )
 
-
     for index, (_, source_row) in enumerate(frame.iterrows()):
         row, result = source_row.to_dict(), results[index]
-        if not result["manifest_satellite_present"] or not result["manifest_terrain_present"]:
-            missing_style = "satellite" if not result["manifest_satellite_present"] else "terrain"
-            _mark_error(result, f"manifest marks {missing_style} imagery unavailable", missing=True)
-            errors.append({"source_identity": result["source_identity"], "error": result["error"], "status": "missing"})
+        if (
+            not result["manifest_satellite_present"]
+            or not result["manifest_terrain_present"]
+        ):
+            missing_style = (
+                "satellite" if not result["manifest_satellite_present"] else "terrain"
+            )
+            _mark_error(
+                result,
+                f"manifest marks {missing_style} imagery unavailable",
+                missing=True,
+            )
+            errors.append(
+                {
+                    "source_identity": result["source_identity"],
+                    "error": result["error"],
+                    "status": "missing",
+                }
+            )
             continue
         try:
-            satellite = _read_source(value=_clean_text(row.get("satellite_path")), uri=_clean_text(row.get("satellite_s3_uri")), manifest_dir=manifest_dir, run_root=root, s3_client=dependencies.s3_client, style="satellite")
-            terrain = _read_source(value=_clean_text(row.get("terrain_path")), uri=_clean_text(row.get("terrain_s3_uri")), manifest_dir=manifest_dir, run_root=root, s3_client=dependencies.s3_client, style="terrain")
-            assert satellite.content_hash is not None and terrain.content_hash is not None
+            satellite = _read_source(
+                value=_clean_text(row.get("satellite_path")),
+                uri=_clean_text(row.get("satellite_s3_uri")),
+                manifest_dir=manifest_dir,
+                run_root=root,
+                s3_client=dependencies.s3_client,
+                style="satellite",
+            )
+            terrain = _read_source(
+                value=_clean_text(row.get("terrain_path")),
+                uri=_clean_text(row.get("terrain_s3_uri")),
+                manifest_dir=manifest_dir,
+                run_root=root,
+                s3_client=dependencies.s3_client,
+                style="terrain",
+            )
+            assert (
+                satellite.content_hash is not None and terrain.content_hash is not None
+            )
             result["satellite_content_sha256"] = satellite.content_hash
             result["terrain_content_sha256"] = terrain.content_hash
             cached_row = cache.rows.get(result["source_identity"]) if cache else None
-            cached_index = _cache_match(result, cached_row, classifier_hash=classifier_hash, regression_hash=regression_hash, arrays=cache.arrays) if cache and cached_row else None
+            cached_index = (
+                _cache_match(
+                    result,
+                    cached_row,
+                    classifier_hash=classifier_hash,
+                    regression_hash=regression_hash,
+                    arrays=cache.arrays,
+                )
+                if cache and cached_row
+                else None
+            )
             if cached_index is not None:
                 _copy_cached_fields(result, cached_row)
-                result.update({"satellite_present": True, "terrain_present": True, "availability_state": "available", "score_status": "scored", "selector_eligible": True, "cache_hit": True})
+                result.update(
+                    {
+                        "satellite_present": True,
+                        "terrain_present": True,
+                        "availability_state": "available",
+                        "score_status": "scored",
+                        "selector_eligible": True,
+                        "cache_hit": True,
+                    }
+                )
                 cache_hits += 1
-                vector_by_index[index] = np.asarray(cache.arrays["embeddings"][cached_index], dtype=np.float32).copy()
+                vector_by_index[index] = np.asarray(
+                    cache.arrays["embeddings"][cached_index], dtype=np.float32
+                ).copy()
                 for name, target in (
                     ("class_logits", logits_by_index),
                     ("class_probs", probs_by_index),
@@ -913,20 +1333,39 @@ def score_tile_manifest(
                 )
             terrain_result = dependencies.terrain_feature_fn(terrain_img, sat_img)
             terrain_features, terrain_metrics = _terrain_values(terrain_result)
-            pending.append(_PendingRow(index=index, satellite=sat_img, terrain_features=terrain_features, terrain_metrics=terrain_metrics, satellite_hash=satellite.content_hash, terrain_hash=terrain.content_hash))
+            pending.append(
+                _PendingRow(
+                    index=index,
+                    satellite=sat_img,
+                    terrain_features=terrain_features,
+                    terrain_metrics=terrain_metrics,
+                    satellite_hash=satellite.content_hash,
+                    terrain_hash=terrain.content_hash,
+                )
+            )
             if len(pending) >= batch_size:
                 score_chunk(pending)
                 pending.clear()
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             _mark_error(result, message, missing=isinstance(exc, FileNotFoundError))
-            errors.append({"source_identity": result["source_identity"], "error": message, "status": result["score_status"]})
+            errors.append(
+                {
+                    "source_identity": result["source_identity"],
+                    "error": message,
+                    "status": result["score_status"],
+                }
+            )
 
     if pending:
         score_chunk(pending)
         pending.clear()
 
-    scored_indices = [i for i, result in enumerate(results) if result.get("score_status") == "scored" and i in vector_by_index]
+    scored_indices = [
+        i
+        for i, result in enumerate(results)
+        if result.get("score_status") == "scored" and i in vector_by_index
+    ]
     embedding_dimension = 0
     if scored_indices:
         dimensions = {int(vector_by_index[i].shape[-1]) for i in scored_indices}
@@ -934,65 +1373,207 @@ def score_tile_manifest(
             message = "embedding dimensions differ across scored rows"
             for i in scored_indices:
                 _mark_error(results[i], message)
-                errors.append({"source_identity": results[i]["source_identity"], "error": message, "status": "error"})
+                errors.append(
+                    {
+                        "source_identity": results[i]["source_identity"],
+                        "error": message,
+                        "status": "error",
+                    }
+                )
             scored_indices = []
         else:
             embedding_dimension = next(iter(dimensions))
-    embedding_matrix = np.stack([vector_by_index[i] for i in scored_indices], axis=0).astype(np.float32) if scored_indices else np.empty((0, 0), dtype=np.float32)
-    clusters = _lsh_clusters(embedding_matrix, seed=lsh_seed, bits=lsh_bits) if scored_indices else []
-    embedding_identity = f"classifier-vit:{classifier_hash}:float32:{embedding_dimension}" if embedding_dimension else None
+    embedding_matrix = (
+        np.stack([vector_by_index[i] for i in scored_indices], axis=0).astype(
+            np.float32
+        )
+        if scored_indices
+        else np.empty((0, 0), dtype=np.float32)
+    )
+    clusters = (
+        _lsh_clusters(embedding_matrix, seed=lsh_seed, bits=lsh_bits)
+        if scored_indices
+        else []
+    )
+    embedding_identity = (
+        f"classifier-vit:{classifier_hash}:float32:{embedding_dimension}"
+        if embedding_dimension
+        else None
+    )
     row_to_embedding = {i: offset for offset, i in enumerate(scored_indices)}
     for i, result in enumerate(results):
         if i in row_to_embedding:
             row_index = row_to_embedding[i]
-            result.update({"embedding_row_index": row_index, "embedding_dimension": embedding_dimension, "embedding_identity": embedding_identity, "embedding_cluster_id": clusters[row_index], "cluster_id": clusters[row_index]})
+            result.update(
+                {
+                    "embedding_row_index": row_index,
+                    "embedding_dimension": embedding_dimension,
+                    "embedding_identity": embedding_identity,
+                    "embedding_cluster_id": clusters[row_index],
+                    "cluster_id": clusters[row_index],
+                }
+            )
         elif result.get("score_status") != "scored":
-            result.update({"embedding_row_index": -1, "embedding_dimension": None, "embedding_identity": None, "embedding_cluster_id": None, "cluster_id": None})
+            result.update(
+                {
+                    "embedding_row_index": -1,
+                    "embedding_dimension": None,
+                    "embedding_identity": None,
+                    "embedding_cluster_id": None,
+                    "cluster_id": None,
+                }
+            )
 
     candidate_frame = pd.DataFrame(results).reindex(columns=CANDIDATE_POOL_COLUMNS)
     for column in CANDIDATE_POOL_COLUMNS:
         candidate_frame[column] = candidate_frame[column].map(_json_scalar)
-    for column in ("selector_eligible", "satellite_present", "terrain_present", "cache_hit"):
+    for column in (
+        "selector_eligible",
+        "satellite_present",
+        "terrain_present",
+        "cache_hit",
+    ):
         candidate_frame[column] = candidate_frame[column].map(_bool)
     arrays = {
         "embeddings": embedding_matrix,
-        "class_logits": np.stack([logits_by_index[i] for i in scored_indices], axis=0).astype(np.float32) if scored_indices else np.empty((0, 0), dtype=np.float32),
-        "class_probs": np.stack([probs_by_index[i] for i in scored_indices], axis=0).astype(np.float32) if scored_indices else np.empty((0, 0), dtype=np.float32),
-        "terrain_features": np.stack([terrain_by_index[i] for i in scored_indices], axis=0).astype(np.float32) if scored_indices else np.empty((0, 0), dtype=np.float32),
+        "class_logits": np.stack(
+            [logits_by_index[i] for i in scored_indices], axis=0
+        ).astype(np.float32)
+        if scored_indices
+        else np.empty((0, 0), dtype=np.float32),
+        "class_probs": np.stack(
+            [probs_by_index[i] for i in scored_indices], axis=0
+        ).astype(np.float32)
+        if scored_indices
+        else np.empty((0, 0), dtype=np.float32),
+        "terrain_features": np.stack(
+            [terrain_by_index[i] for i in scored_indices], axis=0
+        ).astype(np.float32)
+        if scored_indices
+        else np.empty((0, 0), dtype=np.float32),
         "row_indices": np.asarray(scored_indices, dtype=np.int64),
     }
-    candidate_path, embeddings_path, scoring_path = root / "candidate_pool.csv", root / "feature_embeddings.npz", root / "scoring_manifest.json"
+    candidate_path, embeddings_path, scoring_path = (
+        root / "candidate_pool.csv",
+        root / "feature_embeddings.npz",
+        root / "scoring_manifest.json",
+    )
     artifact_hashes = {}
     if write:
-        atomic_write_text(candidate_path, candidate_frame.to_csv(index=False, lineterminator="\n"))
+        atomic_write_text(
+            candidate_path, candidate_frame.to_csv(index=False, lineterminator="\n")
+        )
         _atomic_write_npz(embeddings_path, arrays)
-        artifact_hashes = {"candidate_pool.csv": sha256_file(candidate_path), "feature_embeddings.npz": sha256_file(embeddings_path)}
+        artifact_hashes = {
+            "candidate_pool.csv": sha256_file(candidate_path),
+            "feature_embeddings.npz": sha256_file(embeddings_path),
+        }
     scored_count = len(scored_indices)
     missing_count = sum(result.get("score_status") == "missing" for result in results)
     error_count = sum(result.get("score_status") == "error" for result in results)
     payload: dict[str, Any] = {
         "schema_version": SCORING_SCHEMA_VERSION,
-        "source": {"tile_manifest": {"path": manifest_label, "sha256": source_hash, "rows": source_rows, "selected_rows": int(len(frame))}, "identity_definition": "region/z/x/y plus satellite_path, terrain_path, and optional S3 URIs", "source_content_definition": "SHA-256 of exact source bytes before PIL conversion"},
-        "models": {"classifier_checkpoint": str(dependencies.classifier_checkpoint) if dependencies.classifier_checkpoint else None, "classifier_checkpoint_sha256": classifier_hash, "regression_checkpoint": str(dependencies.regression_checkpoint) if dependencies.regression_checkpoint else None, "regression_checkpoint_sha256": regression_hash, "label_semantics": "regression_prediction/model_prediction are active-model outputs; no human label is inferred"},
-        "preprocessing": {"classifier_transform": dependencies.classifier_preprocess_identity or (f"{type(dependencies.classifier_transform).__module__}.{type(dependencies.classifier_transform).__qualname__}" if dependencies.classifier_transform else "injected_or_identity"), "classifier_normalization": "RESISC45" if classifier_use_resisc45_stats else "ImageNet", "classifier_input": "RGB; project inference transform targets 224x224", "terrain_features": "src.terrain.features.compute_terrain_features", "device": dependencies.device, "batch_size": int(batch_size)},
-        "uncertainty": {"name": UNCERTAINTY_NAME, "definition": UNCERTAINTY_DEFINITION, "range": [0.0, 1.0], "class_count": 45, "selector_column": "uncertainty"},
-        "embedding": {"identity": embedding_identity, "array_key": "embeddings", "dtype": "float32", "dimension": int(embedding_dimension), "row_index_column": "embedding_row_index", "row_indices_array_key": "row_indices", "cluster_column": "embedding_cluster_id", "lsh": {"method": "sign random-hyperplane locality-sensitive hash", "seed": int(lsh_seed), "bits": int(lsh_bits), "definition": "hex bit signature of embedding dot products against standard-normal fixed-seed hyperplanes"}},
-        "counts": {"manifest_rows": int(len(frame)), "scored_rows": int(scored_count), "selector_eligible_rows": int(candidate_frame["selector_eligible"].sum()), "missing_rows": int(missing_count), "error_rows": int(error_count), "cache_hits": int(cache_hits), "cache_misses": int(max(0, len(frame) - cache_hits))},
+        "source": {
+            "tile_manifest": {
+                "path": manifest_label,
+                "sha256": source_hash,
+                "rows": source_rows,
+                "selected_rows": int(len(frame)),
+            },
+            "identity_definition": "region/z/x/y plus satellite_path, terrain_path, and optional S3 URIs",
+            "source_content_definition": "SHA-256 of exact source bytes before PIL conversion",
+        },
+        "models": {
+            "classifier_checkpoint": str(dependencies.classifier_checkpoint)
+            if dependencies.classifier_checkpoint
+            else None,
+            "classifier_checkpoint_sha256": classifier_hash,
+            "regression_checkpoint": str(dependencies.regression_checkpoint)
+            if dependencies.regression_checkpoint
+            else None,
+            "regression_checkpoint_sha256": regression_hash,
+            "label_semantics": "regression_prediction/model_prediction are active-model outputs; no human label is inferred",
+        },
+        "preprocessing": {**preprocessing, "batch_size": int(batch_size)},
+        "uncertainty": {
+            "name": UNCERTAINTY_NAME,
+            "definition": UNCERTAINTY_DEFINITION,
+            "range": [0.0, 1.0],
+            "class_count": 45,
+            "selector_column": "uncertainty",
+        },
+        "embedding": {
+            "identity": embedding_identity,
+            "array_key": "embeddings",
+            "dtype": "float32",
+            "dimension": int(embedding_dimension),
+            "row_index_column": "embedding_row_index",
+            "row_indices_array_key": "row_indices",
+            "cluster_column": "embedding_cluster_id",
+            "lsh": {
+                "method": "sign random-hyperplane locality-sensitive hash",
+                "seed": int(lsh_seed),
+                "bits": int(lsh_bits),
+                "definition": "hex bit signature of embedding dot products against standard-normal fixed-seed hyperplanes",
+            },
+        },
+        "counts": {
+            "manifest_rows": int(len(frame)),
+            "scored_rows": int(scored_count),
+            "selector_eligible_rows": int(candidate_frame["selector_eligible"].sum()),
+            "missing_rows": int(missing_count),
+            "error_rows": int(error_count),
+            "cache_hits": int(cache_hits),
+            "cache_misses": int(max(0, len(frame) - cache_hits)),
+        },
         "errors": errors,
-        "artifacts": {"candidate_pool.csv": {"path": "candidate_pool.csv", "sha256": artifact_hashes.get("candidate_pool.csv"), "rows": int(len(candidate_frame)), "columns": list(CANDIDATE_POOL_COLUMNS)}, "feature_embeddings.npz": {"path": "feature_embeddings.npz", "sha256": artifact_hashes.get("feature_embeddings.npz"), "arrays": {key: list(value.shape) for key, value in arrays.items()}}},
-        "state": {"complete": bool(scored_count + missing_count + error_count == len(frame)), "ready_for_selection": bool(scored_count > 0), "readiness": "ready_for_selection" if scored_count > 0 else "blocked_no_successful_scored_rows"},
+        "artifacts": {
+            "candidate_pool.csv": {
+                "path": "candidate_pool.csv",
+                "sha256": artifact_hashes.get("candidate_pool.csv"),
+                "rows": int(len(candidate_frame)),
+                "columns": list(CANDIDATE_POOL_COLUMNS),
+            },
+            "feature_embeddings.npz": {
+                "path": "feature_embeddings.npz",
+                "sha256": artifact_hashes.get("feature_embeddings.npz"),
+                "arrays": {key: list(value.shape) for key, value in arrays.items()},
+            },
+        },
+        "state": {
+            "complete": bool(scored_count + missing_count + error_count == len(frame)),
+            "ready_for_selection": bool(scored_count > 0),
+            "readiness": "ready_for_selection"
+            if scored_count > 0
+            else "blocked_no_successful_scored_rows",
+        },
     }
     if write:
         atomic_write_json(scoring_path, jsonable(payload))
-        payload["artifacts"]["scoring_manifest.json"] = {"path": "scoring_manifest.json", "sha256": sha256_file(scoring_path)}
+        payload["artifacts"]["scoring_manifest.json"] = {
+            "path": "scoring_manifest.json",
+            "sha256": sha256_file(scoring_path),
+        }
     else:
-        payload["artifacts"]["scoring_manifest.json"] = {"path": "scoring_manifest.json", "sha256": None}
+        payload["artifacts"]["scoring_manifest.json"] = {
+            "path": "scoring_manifest.json",
+            "sha256": None,
+        }
     return jsonable(payload)
 
 
-def run_active_learning_scoring(manifest_path: str | Path, *, output_dir: str | Path = "data/processed/active_learning", run_name: str = "active_learning", **kwargs: Any) -> dict[str, Any]:
+def run_active_learning_scoring(
+    manifest_path: str | Path,
+    *,
+    output_dir: str | Path = "data/processed/active_learning",
+    run_name: str = "active_learning",
+    **kwargs: Any,
+) -> dict[str, Any]:
     """Convenience wrapper using the canonical ignored active-learning root."""
-    return score_tile_manifest(manifest_path, run_root=Path(output_dir) / run_name, **kwargs)
+    run_name = validate_run_name(run_name)
+    return score_tile_manifest(
+        manifest_path, run_root=Path(output_dir) / run_name, **kwargs
+    )
 
 
 score_manifest = score_tile_manifest
@@ -1000,12 +1581,24 @@ score_active_learning_pool = run_active_learning_scoring
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Score a canonical active-learning tile pool")
+    parser = argparse.ArgumentParser(
+        description="Score a canonical active-learning tile pool"
+    )
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("data/processed/active_learning"))
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("data/processed/active_learning")
+    )
     parser.add_argument("--run-name", default="active_learning")
-    parser.add_argument("--registry", type=Path, default=Path("data/processed/regression/model_registry.json"))
-    parser.add_argument("--classifier-checkpoint", type=Path, default=Path("models/classifier/best_model.pt"))
+    parser.add_argument(
+        "--registry",
+        type=Path,
+        default=Path("data/processed/regression/model_registry.json"),
+    )
+    parser.add_argument(
+        "--classifier-checkpoint",
+        type=Path,
+        default=Path("models/classifier/best_model.pt"),
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lsh-seed", type=int, default=0)
@@ -1017,8 +1610,34 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
-    result = run_active_learning_scoring(args.manifest, output_dir=args.output_dir, run_name=args.run_name, registry_path=args.registry, classifier_checkpoint=args.classifier_checkpoint, device=args.device, classifier_use_resisc45_stats=not args.imagenet_stats, batch_size=args.batch_size, lsh_seed=args.lsh_seed, lsh_bits=args.lsh_bits, max_rows=args.max_rows)
-    print(json.dumps({"run_root": str(Path(args.output_dir) / args.run_name), "candidate_pool": "candidate_pool.csv", "feature_embeddings": "feature_embeddings.npz", "scoring_manifest": "scoring_manifest.json", "counts": result["counts"], "state": result["state"]}, sort_keys=True))
+    result = run_active_learning_scoring(
+        args.manifest,
+        output_dir=args.output_dir,
+        run_name=args.run_name,
+        registry_path=args.registry,
+        classifier_checkpoint=args.classifier_checkpoint,
+        device=args.device,
+        classifier_use_resisc45_stats=not args.imagenet_stats,
+        batch_size=args.batch_size,
+        lsh_seed=args.lsh_seed,
+        lsh_bits=args.lsh_bits,
+        max_rows=args.max_rows,
+    )
+    print(
+        json.dumps(
+            {
+                "run_root": str(
+                    Path(args.output_dir) / validate_run_name(args.run_name)
+                ),
+                "candidate_pool": "candidate_pool.csv",
+                "feature_embeddings": "feature_embeddings.npz",
+                "scoring_manifest": "scoring_manifest.json",
+                "counts": result["counts"],
+                "state": result["state"],
+            },
+            sort_keys=True,
+        )
+    )
     if not result["state"]["ready_for_selection"]:
         raise SystemExit(2)
 

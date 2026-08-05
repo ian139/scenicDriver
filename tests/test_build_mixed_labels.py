@@ -10,7 +10,9 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_build_mixed_labels_writes_audit_columns_and_retains_heuristics(tmp_path: Path) -> None:
+def test_build_mixed_labels_writes_audit_columns_and_retains_heuristics(
+    tmp_path: Path,
+) -> None:
     heuristic = tmp_path / "heuristic.csv"
     annotations = tmp_path / "annotations.csv"
     output = tmp_path / "mixed.csv"

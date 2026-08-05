@@ -28,6 +28,36 @@ Report tooling defaults (unless overridden in env):
 - For S3 tile loading in annotator: `raw_dir = s3://<bucket>/raw`
 - Manual labels are appended/upserted to `data/raw/labels_human.csv`
 
+## Active-Learning Run Artifacts
+
+Every Stage-One run owns one ignored directory:
+`data/processed/active_learning/<run_name>/`. Its canonical artifacts are:
+
+- `region_manifest.json`, `tile_manifest.csv`, `inventory_report.json`, and
+  `acquisition_preflight.json` for bounded acquisition;
+- `candidate_pool.csv`, `feature_embeddings.npz`, and
+  `scoring_manifest.json` for resumable weak-label/model inference;
+- `annotation_batch.csv`, `batch_manifest.json`, `selection_diagnostics.json`,
+  `geographic_splits.csv`, and `leakage_audit.json` for deterministic
+  selection and fixed train/validation/test membership;
+- `mixed_labels.csv` for per-run mixed supervision (aggregated human overrides overlaying weak heuristic labels);
+- `benchmark_split.csv`, `benchmark_tiles.csv`, `agreement_by_annotator.csv`,
+  `agreement_by_pair.csv`, and `summary.json` for per-run fixed-geographic benchmark splits and agreement reports;
+- `stage1_handoff.json` for fail-closed Stage-Two admission.
+
+### Cumulative vs. Per-Run Snapshot Semantics
+
+- `data/raw/labels_human.csv` is cumulative across runs and retains all historical manual annotations across runs.
+- Per-run builders (`build_mixed_labels.py` and `build_human_benchmark.py`) take cumulative annotations as input and filter them to the tile identities present in the run's fixed `geographic_splits.csv`.
+- The generated per-run artifacts (`mixed_labels.csv`, `benchmark_split.csv`, `benchmark_tiles.csv`, etc.) are per-run snapshots strictly aligned with that run's fixed geographic assignments.
+
+`candidate_pool.csv` contains scalar scores and identities only. Dense
+embeddings, class outputs, and terrain vectors stay in
+`feature_embeddings.npz` with explicit row indices. Missing imagery remains a
+status row and is never selector-eligible. Do not overwrite a prior run name
+or move generated artifacts into Git.
+
+
 ## Training and Validation Working Sets
 
 These datasets support model development and are not, by themselves, a list of
@@ -61,17 +91,16 @@ region catalog.
 
 ## Human Benchmark Artifacts
 
-- Build benchmark split + agreement stats:
-  - `uv run python scripts/annotation/build_human_benchmark.py --annotations-csv data/raw/labels_human.csv --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --output-dir data/processed/regression --run-name masswhites_human_benchmark_v1 --val-frac 0.2 --test-frac 0.2 --seed 42`
+- Build per-run benchmark split + agreement stats:
+  - `uv run python scripts/annotation/build_human_benchmark.py --annotations-csv data/raw/labels_human.csv --geographic-splits-csv data/processed/active_learning/<run_name>/geographic_splits.csv --output-dir data/processed/active_learning --run-name <run_name>`
 - Build overlap batch for cross-annotator agreement collection:
   - `uv run python scripts/annotation/build_overlap_batch.py --annotations-csv data/raw/labels_human.csv --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv --source-annotator ian --target-annotator paperspace --sample-size 200 --seed 42 --output-csv data/processed/regression/overlap_batch_ian_to_paperspace_200.csv`
-- Output folder layout:
-  - `data/processed/regression/<run_name>/benchmark_tiles.csv`
-  - `data/processed/regression/<run_name>/benchmark_split.csv`
-  - `data/processed/regression/<run_name>/agreement_by_annotator.csv`
-  - `data/processed/regression/<run_name>/agreement_by_pair.csv`
-  - `data/processed/regression/<run_name>/summary.json`
-
+- Output folder layout (`data/processed/active_learning/<run_name>/` or `data/processed/regression/<run_name>/`):
+  - `benchmark_tiles.csv`
+  - `benchmark_split.csv`
+  - `agreement_by_annotator.csv`
+  - `agreement_by_pair.csv`
+  - `summary.json`
 ## Report Overlay Artifacts
 
 Report viewer route overlay supports either layout in `data/processed/heuristic_runs/<run_name>/report/`:

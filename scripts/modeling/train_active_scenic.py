@@ -20,20 +20,49 @@ from src.scenic_scorer.active_training import (  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Prepare and train the active scenic regression candidate")
-    parser.add_argument("--handoff", type=Path, required=True, help="Validated stage-one stage1_handoff.json")
-    parser.add_argument("--dataset", type=Path, default=None, help="Prepared dataset NPZ (defaults under output-dir)")
-    parser.add_argument("--split-csv", type=Path, default=None, help="Fixed geographic split CSV (defaults to handoff artifact)")
-    parser.add_argument("--output-dir", type=Path, default=Path("data/processed/active_training"))
+    parser = argparse.ArgumentParser(
+        description="Prepare and train the active scenic regression candidate"
+    )
+    parser.add_argument(
+        "--handoff",
+        type=Path,
+        required=True,
+        help="Validated stage-one stage1_handoff.json",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=None,
+        help="Prepared dataset NPZ (defaults under output-dir)",
+    )
+    parser.add_argument(
+        "--split-csv",
+        type=Path,
+        default=None,
+        help="Fixed geographic split CSV (defaults to handoff artifact)",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("data/processed/active_training")
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--learning-rate", "--lr", dest="learning_rate", type=float, default=1e-3)
+    parser.add_argument(
+        "--learning-rate", "--lr", dest="learning_rate", type=float, default=1e-3
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
+    parser.add_argument(
+        "--device", choices=["auto", "cpu", "cuda", "mps"], default="auto"
+    )
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--max-seconds", type=float, default=None)
+    parser.add_argument(
+        "--sample-weight-scheme",
+        choices=["standard", "region_balanced"],
+        default="standard",
+    )
+    parser.add_argument("--loss-function", choices=["mse", "huber"], default="mse")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--no-sample-weights", action="store_true")
     return parser.parse_args()
@@ -65,9 +94,17 @@ def main() -> None:
         max_steps=args.max_steps,
         max_seconds=args.max_seconds,
         use_sample_weights=not args.no_sample_weights,
+        sample_weight_scheme=args.sample_weight_scheme,
+        loss_function=args.loss_function,
     )
-    result = train_active_model(dataset_path, split_csv, args.output_dir, config, resume=args.resume)
-    print(json.dumps({"prepared": prepared, "training": result}, sort_keys=True, allow_nan=False))
+    result = train_active_model(
+        dataset_path, split_csv, args.output_dir, config, resume=args.resume
+    )
+    print(
+        json.dumps(
+            {"prepared": prepared, "training": result}, sort_keys=True, allow_nan=False
+        )
+    )
     _print_metrics(result)
 
 

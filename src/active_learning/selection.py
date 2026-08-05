@@ -28,6 +28,7 @@ from .common import (
     jsonable,
     sha256_bytes,
     sha256_file,
+    validate_run_name,
 )
 
 SCHEMA_VERSION = 1
@@ -485,6 +486,14 @@ def _prepare_for_selection(
         out = out.loc[available].reset_index(drop=True)
         if out.empty:
             raise ValueError("candidate input contains no available paired imagery")
+    if "selector_eligible" in out.columns:
+        out = out.loc[out["selector_eligible"].map(_to_bool)].reset_index(drop=True)
+    if "score_status" in out.columns:
+        out = out.loc[out["score_status"].map(_clean_text) == "scored"].reset_index(
+            drop=True
+        )
+    if out.empty:
+        raise ValueError("candidate input contains no eligible scored candidates")
     model = _column_numeric(out, MODEL_COLUMNS)
     heuristic = _column_numeric(out, HEURISTIC_COLUMNS)
     uncertainty = _column_numeric(out, UNCERTAINTY_COLUMNS)
@@ -760,6 +769,9 @@ class SelectionConfig:
     random_control_fraction: float = 0.0
     weights: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "run_name", validate_run_name(self.run_name))
+
 
 @dataclass
 class SelectionArtifacts:
@@ -790,6 +802,17 @@ def select_batch(
     prepared = _prepare_for_selection(
         candidates, seed=int(config.seed), prior_annotations=prior_annotations
     )
+    split_source = prepared.drop(
+        columns=[column for column in prepared.columns if column.startswith("_")],
+        errors="ignore",
+    )
+    splits = build_geographic_splits(
+        split_source,
+        seed=int(config.seed),
+        adjacency_radius=int(config.adjacency_radius),
+    )
+    split_paths = set(splits["image_path"].astype(str))
+    prepared = prepared.loc[prepared["image_path"].astype(str).isin(split_paths)].copy()
     eligible = prepared.loc[~prepared["_prior_annotated"]].copy()
     overlap_pool = prepared.loc[prepared["_prior_annotated"]].copy()
     scored_count = int(prepared["model_score_available"].sum())
@@ -1029,8 +1052,27 @@ def select_batch(
     ):
         if column in output.columns:
             output = output.drop(columns=[column])
-    batch_id_seed = "|".join(str(value) for value in prepared["_tile_key"].tolist())
-    batch_id = f"batch-{sha256_bytes(f'{config.run_name}|{config.seed}|{batch_id_seed}'.encode('utf-8'))[:16]}"
+    batch_contract = {
+        "run_name": str(config.run_name),
+        "seed": int(config.seed),
+        "batch_size": int(config.batch_size),
+        "adjacency_radius": int(config.adjacency_radius),
+        "minimum_separation_km": float(config.min_separation_km),
+        "qa_overlap_count": int(config.qa_overlap_count),
+        "qa_overlap_fraction": float(config.qa_overlap_fraction),
+        "random_control_count": int(config.random_control_count),
+        "random_control_fraction": float(config.random_control_fraction),
+        "weights": {key: float(value) for key, value in weights.items()},
+        "selected_identities": [
+            str(prepared.loc[index, "image_path"]) for index in selected_indices
+        ],
+    }
+    contract_digest = sha256_bytes(
+        json.dumps(batch_contract, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+    batch_id = "batch-" + contract_digest[:16]
     output["selection_reason"] = [
         records[index]["selection_reason"] for index in selected_indices
     ]
@@ -1116,15 +1158,6 @@ def select_batch(
     output.attrs["batch_id"] = batch_id
     output.attrs["run_id"] = str(config.run_name)
 
-    split_source = prepared.drop(
-        columns=[column for column in prepared.columns if column.startswith("_")],
-        errors="ignore",
-    )
-    splits = build_geographic_splits(
-        split_source,
-        seed=int(config.seed),
-        adjacency_radius=int(config.adjacency_radius),
-    )
     audit = audit_geographic_leakage(
         splits, adjacency_radius=int(config.adjacency_radius)
     )
@@ -1263,6 +1296,8 @@ def select_batch(
             "random_control_fraction": float(config.random_control_fraction),
             "weights": {key: float(value) for key, value in weights.items()},
         },
+        "selection_contract": batch_contract,
+        "selection_contract_sha256": contract_digest,
         "uncertainty_definition": "normalized provided uncertainty column only; absent values remain unavailable",
     }
     return SelectionArtifacts(
@@ -1278,7 +1313,7 @@ def select_batch(
 def select_candidates(
     candidates: pd.DataFrame,
     *,
-    batch_size: int,
+    batch_size: int = 100,
     seed: int = 0,
     run_name: str = "active_learning",
     prior_annotations: Any = None,
@@ -1289,6 +1324,7 @@ def select_candidates(
     Diagnostics and the manifest are available through ``DataFrame.attrs`` and
     through :func:`select_batch` when callers need the complete artifact set.
     """
+    run_name = validate_run_name(run_name)
 
     config = SelectionConfig(
         batch_size=batch_size, seed=seed, run_name=run_name, **kwargs
@@ -1616,11 +1652,12 @@ def run_selection(
     prior_annotations: Any = None,
 ) -> SelectionArtifacts:
     """Run selection and persist the contracted batch artifacts."""
-
+    run_name = validate_run_name(run_name)
     source = Path(candidate_input)
     candidates = load_candidate_table(source)
-    config = config or SelectionConfig(run_name=run_name)
-    if config.run_name != run_name:
+    if config is None:
+        config = SelectionConfig(run_name=run_name)
+    elif config.run_name != run_name:
         config = SelectionConfig(
             batch_size=config.batch_size,
             seed=config.seed,
@@ -1649,18 +1686,37 @@ def run_selection(
     atomic_write_text(
         split_path, artifacts.geographic_splits.to_csv(index=False, lineterminator="\n")
     )
+    atomic_write_json(leakage_path, artifacts.leakage_audit)
     input_digest = sha256_file(source)
+    batch_digest = sha256_file(batch_path)
+    split_digest = sha256_file(split_path)
+    leakage_digest = sha256_file(leakage_path)
+    batch_bytes = int(batch_path.stat().st_size)
+    split_bytes = int(split_path.stat().st_size)
+    leakage_bytes = int(leakage_path.stat().st_size)
     artifacts.batch_manifest["candidate_input"] = {
         "path": str(source),
         "sha256": input_digest,
         "rows": int(len(candidates)),
     }
     artifacts.batch_manifest["outputs"] = {
-        "annotation_batch_csv": str(batch_path),
+        "annotation_batch_csv": {
+            "path": str(batch_path),
+            "sha256": batch_digest,
+            "bytes": batch_bytes,
+        },
         "batch_manifest_json": str(manifest_path),
         "selection_diagnostics_json": str(diagnostics_path),
-        "geographic_splits_csv": str(split_path),
-        "leakage_audit_json": str(leakage_path),
+        "geographic_splits_csv": {
+            "path": str(split_path),
+            "sha256": split_digest,
+            "bytes": split_bytes,
+        },
+        "leakage_audit_json": {
+            "path": str(leakage_path),
+            "sha256": leakage_digest,
+            "bytes": leakage_bytes,
+        },
     }
     artifacts.diagnostics["candidate_input"] = {
         "path": str(source),
@@ -1669,5 +1725,4 @@ def run_selection(
     artifacts.diagnostics["outputs"] = artifacts.batch_manifest["outputs"]
     atomic_write_json(manifest_path, artifacts.batch_manifest)
     atomic_write_json(diagnostics_path, artifacts.diagnostics)
-    atomic_write_json(leakage_path, artifacts.leakage_audit)
     return artifacts

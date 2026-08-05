@@ -9,12 +9,13 @@ and optional model registry promotion from a validated Stage-One handoff.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
+import signal
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,17 +23,61 @@ from typing import Any, Dict, List, Optional, Tuple
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+try:
+    from src.active_learning.common import validate_run_name  # noqa: E402
+except (ImportError, SyntaxError):
+    import importlib.util
 
-from src.scenic_scorer.active_training import (
+    _common_path = PROJECT_ROOT / "src" / "active_learning" / "common.py"
+    _spec = importlib.util.spec_from_file_location(
+        "src_active_learning_common", _common_path
+    )
+    if _spec and _spec.loader:
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        validate_run_name = _mod.validate_run_name
+    else:
+        raise
+from src.scenic_scorer.active_training import (  # noqa: E402
     ActiveTrainingConfig,
     prepare_active_dataset,
     train_active_model,
 )
-from src.scenic_scorer.active_evaluation import (
+from src.scenic_scorer.active_evaluation import (  # noqa: E402
     evaluate_stage_two,
     promote_from_decision,
-    rollback_registry,
 )
+
+
+class DeadlineExceededError(TimeoutError):
+    """Raised when a POSIX real-time deadline guard times out."""
+
+    pass
+
+
+@contextlib.contextmanager
+def deadline_guard(max_seconds: Optional[float]):
+    """
+    Enforces a POSIX real-time deadline guard using signal.setitimer.
+    Raises DeadlineExceededError if the wall-clock deadline expires during execution.
+    """
+    if max_seconds is None:
+        yield
+        return
+
+    if max_seconds <= 0:
+        raise DeadlineExceededError("Global deadline already exceeded.")
+
+    def _alarm_handler(signum: int, frame: Any) -> None:
+        raise DeadlineExceededError("Global deadline exceeded during execution phase.")
+
+    old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.setitimer(signal.ITIMER_REAL, max_seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def compute_sha256(path: str | Path) -> str:
@@ -47,6 +92,38 @@ def compute_sha256(path: str | Path) -> str:
     return hasher.hexdigest()
 
 
+def compute_experiment_digest(
+    exp_id: str,
+    config: Any,
+    handoff_sha256: str,
+    dataset_sha256: str,
+    expanded_benchmark_sha256: str,
+    control_benchmark_sha256: str,
+    route_qa_sha256: str,
+    baseline_checkpoint_sha256: str,
+    thresholds_sha256: Optional[str] = None,
+) -> str:
+    """Compute a deterministic SHA-256 digest binding experiment config and input artifact hashes."""
+    cfg_dict = (
+        dataclasses.asdict(config)
+        if dataclasses.is_dataclass(config)
+        else (config if isinstance(config, dict) else str(config))
+    )
+    payload = {
+        "exp_id": exp_id,
+        "config": cfg_dict,
+        "handoff_sha256": handoff_sha256,
+        "dataset_sha256": dataset_sha256,
+        "expanded_benchmark_sha256": expanded_benchmark_sha256,
+        "control_benchmark_sha256": control_benchmark_sha256,
+        "route_qa_sha256": route_qa_sha256,
+        "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
+        "thresholds_sha256": thresholds_sha256,
+    }
+    canonical = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def sanitize_command(cmd: str | List[str]) -> str:
     """Sanitize command strings before persisting them in run artifacts."""
     cmd_str = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
@@ -58,7 +135,7 @@ def sanitize_command(cmd: str | List[str]) -> str:
 
 
 def resolve_stage_one_handoff(
-    handoff_arg: Optional[str] = None
+    handoff_arg: Optional[str] = None,
 ) -> Tuple[Path, Dict[str, Any]]:
     """
     Resolve and validate stage-one handoff path.
@@ -119,9 +196,7 @@ def validate_handoff_content(handoff_path: Path, handoff_data: Dict[str, Any]) -
 
     blockers = handoff_data.get("blockers", [])
     if len(blockers) > 0:
-        raise ValueError(
-            f"Handoff {handoff_path} has active blockers: {blockers}"
-        )
+        raise ValueError(f"Handoff {handoff_path} has active blockers: {blockers}")
 
     artifacts = handoff_data.get("artifacts", {})
     root_dir = handoff_path.parent
@@ -131,7 +206,11 @@ def validate_handoff_content(handoff_path: Path, handoff_data: Dict[str, Any]) -
             required = record.get("required", True)
             expected_hash = record.get("sha256")
             if rel_path:
-                art_p = root_dir / rel_path if not Path(rel_path).is_absolute() else Path(rel_path)
+                art_p = (
+                    root_dir / rel_path
+                    if not Path(rel_path).is_absolute()
+                    else Path(rel_path)
+                )
                 if required and not art_p.exists():
                     raise FileNotFoundError(
                         f"Required artifact '{name}' missing at {art_p} in handoff {handoff_path}"
@@ -151,52 +230,313 @@ def build_candidate_ladder(
     ladder = []
     # Candidate 1: Baseline configuration
     c1 = dataclasses.replace(base_config)
-    ladder.append({
-        "exp_id": "exp_01_baseline_control",
-        "hypothesis": "Baseline training configuration with standard weights.",
-        "config": c1,
-    })
+    ladder.append(
+        {
+            "exp_id": "exp_01_baseline_control",
+            "hypothesis": "Baseline training configuration with standard weights.",
+            "config": c1,
+        }
+    )
 
     # Candidate 2: Region-balanced sample weighting
     if max_experiments >= 2:
         c2 = dataclasses.replace(base_config, sample_weight_scheme="region_balanced")
-        ladder.append({
-            "exp_id": "exp_02_region_balanced",
-            "hypothesis": "Region-balanced sample weighting improves low-support regional slices.",
-            "config": c2,
-        })
+        ladder.append(
+            {
+                "exp_id": "exp_02_region_balanced",
+                "hypothesis": "Region-balanced sample weighting improves low-support regional slices.",
+                "config": c2,
+            }
+        )
 
     # Candidate 3: Robust Huber loss
     if max_experiments >= 3:
         c3 = dataclasses.replace(base_config, loss_function="huber")
-        ladder.append({
-            "exp_id": "exp_03_robust_huber_loss",
-            "hypothesis": "Huber loss reduces sensitivity to noisy human annotations.",
-            "config": c3,
-        })
+        ladder.append(
+            {
+                "exp_id": "exp_03_robust_huber_loss",
+                "hypothesis": "Huber loss reduces sensitivity to noisy human annotations.",
+                "config": c3,
+            }
+        )
 
     # Candidate 4: Lower learning rate with weight decay
     if max_experiments >= 4:
         c4 = dataclasses.replace(base_config, learning_rate=5e-5, weight_decay=1e-3)
-        ladder.append({
-            "exp_id": "exp_04_fine_learning_rate",
-            "hypothesis": "Lower learning rate prevents overfitting on small active sets.",
-            "config": c4,
-        })
+        ladder.append(
+            {
+                "exp_id": "exp_04_fine_learning_rate",
+                "hypothesis": "Lower learning rate prevents overfitting on small active sets.",
+                "config": c4,
+            }
+        )
 
     # Candidate 5: Higher capacity / extra steps
     if max_experiments >= 5:
         c5 = dataclasses.replace(base_config, epochs=15)
-        ladder.append({
-            "exp_id": "exp_05_extended_epochs",
-            "hypothesis": "Extended training epochs improves continuous scenic score ranking.",
-            "config": c5,
-        })
+        ladder.append(
+            {
+                "exp_id": "exp_05_extended_epochs",
+                "hypothesis": "Extended training epochs improves continuous scenic score ranking.",
+                "config": c5,
+            }
+        )
 
     return ladder[:max_experiments]
 
 
-def load_existing_experiments(experiments_jsonl: Path) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+def validate_experiment_record(
+    rec: Dict[str, Any],
+    expected_baseline_sha256: Optional[str] = None,
+    expected_input_digest: Optional[str] = None,
+) -> bool:
+    """
+    Validate a reused completed or retained experiment record.
+    Returns True if candidate checkpoint and eval decision exist,
+    hashes, gates, identities, and input digest align.
+    """
+    if not isinstance(rec, dict):
+        return False
+
+    status = rec.get("status")
+    if status not in ("completed", "retained"):
+        return False
+
+    if expected_input_digest:
+        rec_digest = rec.get("input_digest")
+        if not rec_digest or rec_digest != expected_input_digest:
+            return False
+
+    ckpt_str = rec.get("candidate_checkpoint")
+    eval_dec_str = rec.get("eval_decision_path")
+    if not ckpt_str or not eval_dec_str:
+        return False
+
+    ckpt_path = Path(ckpt_str)
+    eval_dec_path = Path(eval_dec_str)
+
+    if not ckpt_path.is_file() or not eval_dec_path.is_file():
+        return False
+
+    try:
+        cand_sha256 = compute_sha256(ckpt_path)
+    except Exception:
+        return False
+
+    try:
+        eval_data = json.loads(eval_dec_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    if not isinstance(eval_data, dict):
+        return False
+
+    eval_cand = eval_data.get("candidate", {})
+    if not isinstance(eval_cand, dict):
+        return False
+
+    eval_cand_sha256 = eval_cand.get("sha256")
+    if not eval_cand_sha256 or eval_cand_sha256 != cand_sha256:
+        return False
+
+    eval_cand_ckpt = eval_cand.get("checkpoint")
+    if eval_cand_ckpt:
+        try:
+            if Path(eval_cand_ckpt).resolve() != ckpt_path.resolve():
+                return False
+        except Exception:
+            return False
+
+    rec_gate = rec.get("all_gates_pass")
+    eval_gate = eval_data.get("all_gates_pass")
+    if not isinstance(rec_gate, bool) or not isinstance(eval_gate, bool):
+        return False
+    if rec_gate != eval_gate:
+        return False
+
+    if expected_baseline_sha256:
+        eval_base = eval_data.get("baseline")
+        if not isinstance(eval_base, dict):
+            return False
+        base_sha = eval_base.get("sha256")
+        if (
+            not isinstance(base_sha, str)
+            or not base_sha
+            or base_sha != expected_baseline_sha256
+        ):
+            return False
+    return True
+
+
+def select_best_candidate(records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Select best passing candidate based on highest correlation then lowest MAE.
+    Tie-breaking: correlation descending, MAE ascending.
+    """
+    passing_candidates = [r for r in records if r.get("all_gates_pass") is True]
+    if not passing_candidates:
+        return None
+
+    def candidate_sort_key(r: Dict[str, Any]) -> Tuple[float, float]:
+        metrics = r.get("metrics", {})
+        corr = metrics.get("pearson_corr")
+        if corr is None:
+            corr = metrics.get("corr", 0.0)
+        mae = metrics.get("mae", float("inf"))
+        return (float(corr), -float(mae))
+
+    passing_candidates.sort(key=candidate_sort_key, reverse=True)
+    return passing_candidates[0]
+
+
+def determine_aggregate_run_state(
+    evaluated_records: List[Dict[str, Any]],
+    intended_count: int,
+    timed_out: bool = False,
+) -> str:
+    """
+    Determine aggregate run_state for final summary and metrics.
+    Returns one of: 'timed_out', 'paused', 'failed', 'completed'.
+    Only returns 'completed' when intended ladder count is reached and all records succeeded.
+    """
+    if timed_out:
+        return "timed_out"
+
+    for r in evaluated_records:
+        status = r.get("status")
+        if status == "stopped":
+            return "timed_out"
+
+    for r in evaluated_records:
+        status = r.get("status")
+        if status == "failed":
+            return "failed"
+
+    for r in evaluated_records:
+        status = r.get("status")
+        if status == "paused":
+            return "paused"
+
+    if len(evaluated_records) < intended_count:
+        return "timed_out"
+
+    for r in evaluated_records:
+        status = r.get("status")
+        if status not in ("completed", "retained"):
+            return "failed"
+
+    return "completed"
+
+
+def is_valid_resumable_experiment(exp_dir: Path) -> bool:
+    """Check if experiment directory contains a valid paused continuation or completed summary state for resume."""
+    summary_path = exp_dir / "training_summary.json"
+    if not summary_path.is_file():
+        return False
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return False
+        state = data.get("state")
+        if state == "paused":
+            return (exp_dir / "resume.pt").is_file()
+        if state == "completed":
+            return (exp_dir / "candidate.pt").is_file()
+        return False
+    except Exception:
+        return False
+
+
+is_valid_paused_experiment = is_valid_resumable_experiment
+
+
+def validate_run_manifest(
+    existing_manifest: Dict[str, Any],
+    run_name: str,
+    handoff_sha256: str,
+    baseline_registry_sha256: str,
+    baseline_checkpoint_sha256: str,
+    expanded_benchmark_sha256: str,
+    control_benchmark_sha256: str,
+    route_qa_sha256: str,
+    thresholds_sha256: Optional[str],
+    args: argparse.Namespace,
+) -> None:
+    """Validate that existing run_manifest matches current invocation material config and input/baseline hashes."""
+    mismatches = []
+
+    if "run_name" not in existing_manifest or existing_manifest["run_name"] != run_name:
+        mismatches.append(
+            f"run_name mismatch: manifest={existing_manifest.get('run_name')}, current={run_name}"
+        )
+    # Material execution mode flags
+    mode_checks = [
+        ("dry_run", args.dry_run),
+        ("promote_requested", args.promote),
+    ]
+    for key, current_val in mode_checks:
+        if key not in existing_manifest:
+            mismatches.append(f"missing key in manifest: {key}")
+        elif existing_manifest[key] != current_val:
+            mismatches.append(
+                f"{key} mismatch: manifest={existing_manifest[key]}, current={current_val}"
+            )
+
+    hash_checks = [
+        ("stage1_handoff_sha256", handoff_sha256),
+        ("baseline_registry_sha256", baseline_registry_sha256),
+        ("baseline_checkpoint_sha256", baseline_checkpoint_sha256),
+        ("expanded_benchmark_sha256", expanded_benchmark_sha256),
+        ("control_benchmark_sha256", control_benchmark_sha256),
+        ("route_qa_sha256", route_qa_sha256),
+        ("thresholds_sha256", thresholds_sha256),
+    ]
+    for key, current_val in hash_checks:
+        if key not in existing_manifest:
+            mismatches.append(f"missing key in manifest: {key}")
+        elif existing_manifest[key] != current_val:
+            mismatches.append(
+                f"{key} mismatch: manifest={existing_manifest[key]}, current={current_val}"
+            )
+
+    if "config" not in existing_manifest or not isinstance(
+        existing_manifest["config"], dict
+    ):
+        mismatches.append("manifest config field is missing or not a dictionary")
+    else:
+        cfg = existing_manifest["config"]
+        config_checks = [
+            ("seed", args.seed),
+            ("max_experiments", args.max_experiments),
+            ("device", args.device),
+            ("max_steps", args.max_steps),
+            ("expanded_benchmark_csv", str(args.expanded_benchmark_csv)),
+            ("control_benchmark_csv", str(args.control_benchmark_csv)),
+            ("route_qa_json", str(args.route_qa_json)),
+            (
+                "thresholds_json",
+                str(args.thresholds_json) if args.thresholds_json else None,
+            ),
+        ]
+        for key, current_val in config_checks:
+            if key not in cfg:
+                mismatches.append(f"missing config key in manifest: {key}")
+            elif cfg[key] != current_val:
+                mismatches.append(
+                    f"config.{key} mismatch: manifest={cfg[key]}, current={current_val}"
+                )
+
+    if mismatches:
+        raise ValueError(
+            "Run manifest validation failed on resume:\n" + "\n".join(mismatches)
+        )
+
+
+def load_existing_experiments(
+    experiments_jsonl: Path,
+    expected_baseline_sha256: Optional[str] = None,
+    expected_input_digests: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     """Load existing completed experiment records for truthful resume handling."""
     completed_map: Dict[str, Dict[str, Any]] = {}
     all_records: List[Dict[str, Any]] = []
@@ -212,9 +552,22 @@ def load_existing_experiments(experiments_jsonl: Path) -> Tuple[Dict[str, Dict[s
             rec = json.loads(line)
             all_records.append(rec)
             exp_id = rec.get("exp_id")
-            status = rec.get("status")
-            if exp_id and status in ("completed", "retained"):
+            exp_digest = (
+                expected_input_digests.get(exp_id)
+                if expected_input_digests and exp_id
+                else None
+            )
+            if exp_id and validate_experiment_record(
+                rec,
+                expected_baseline_sha256=expected_baseline_sha256,
+                expected_input_digest=exp_digest,
+            ):
                 completed_map[exp_id] = rec
+            elif exp_id and rec.get("status") in ("completed", "retained"):
+                print(
+                    f"WARNING: Stale or invalid experiment record {exp_id} in {experiments_jsonl}. Will rerun.",
+                    file=sys.stderr,
+                )
         except Exception:
             continue
 
@@ -267,7 +620,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-seconds",
         type=float,
-        default=None,
+        default=1800.0,
         help="Maximum runtime in seconds before stopping autoresearch loop.",
     )
     parser.add_argument(
@@ -284,21 +637,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--expanded-benchmark-csv",
-        type=str,
-        default=None,
-        help="Path to expanded human benchmark CSV.",
+        type=Path,
+        required=True,
+        help="Expanded human benchmark CSV",
     )
     parser.add_argument(
         "--control-benchmark-csv",
-        type=str,
-        default=None,
-        help="Path to New England control benchmark CSV.",
+        type=Path,
+        required=True,
+        help="New England control benchmark CSV",
     )
     parser.add_argument(
         "--route-qa-json",
-        type=str,
-        default=None,
-        help="Path to route QA JSON specifications.",
+        type=Path,
+        required=True,
+        help="Route QA evidence JSON",
     )
     parser.add_argument(
         "--thresholds-json",
@@ -311,11 +664,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Attempt registry promotion if candidate passes all evaluation gates.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.run_name = validate_run_name(args.run_name)
+    if args.max_seconds is not None and args.max_seconds <= 0:
+        raise ValueError("--max-seconds must be positive")
+    if not (1 <= args.max_experiments <= 5):
+        raise ValueError("--max-experiments must be between 1 and 5")
+    return args
 
 
 def main() -> None:
+    start_time = time.time()
     args = parse_args()
+    global_deadline = start_time + args.max_seconds
+    timed_out_flag = False
 
     # 1. Handoff Resolution and Fast Failure before training
     print("METRIC handoff_validating=1")
@@ -328,8 +690,37 @@ def main() -> None:
         print("METRIC handoff_ready=0")
         sys.exit(1)
 
+    required_inputs = {
+        "expanded benchmark": args.expanded_benchmark_csv,
+        "control benchmark": args.control_benchmark_csv,
+        "route QA evidence": args.route_qa_json,
+    }
+    if args.thresholds_json:
+        required_inputs["thresholds"] = Path(args.thresholds_json)
+    for label, path in required_inputs.items():
+        if not Path(path).is_file():
+            raise FileNotFoundError(f"Missing {label}: {path}")
+
     # 2. Setup Run Directory
     run_dir = Path("data/processed/modeling_autoresearch") / args.run_name
+    artifacts_exist = False
+    if run_dir.exists():
+        artifact_files = [
+            "run_manifest.json",
+            "experiments.jsonl",
+            "promotion_decision.json",
+            "final_summary.json",
+            "prepared_dataset.npz",
+        ]
+        if any((run_dir / f).exists() for f in artifact_files):
+            artifacts_exist = True
+
+    if artifacts_exist and not args.resume and not args.status:
+        raise FileExistsError(
+            f"Run directory '{run_dir}' already exists with run artifacts. "
+            "Pass --resume to resume or use a new --run-name."
+        )
+
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "run_manifest.json"
     experiments_jsonl = run_dir / "experiments.jsonl"
@@ -339,7 +730,9 @@ def main() -> None:
     # 3. Capture Immutable Baseline Identity
     registry_path = Path("data/processed/regression/model_registry.json")
     if not registry_path.exists():
-        print(f"ERROR: Active model registry missing at {registry_path}", file=sys.stderr)
+        print(
+            f"ERROR: Active model registry missing at {registry_path}", file=sys.stderr
+        )
         print("METRIC baseline_sha256=missing")
         sys.exit(1)
 
@@ -347,41 +740,126 @@ def main() -> None:
     print(f"METRIC baseline_sha256={baseline_registry_sha256}")
 
     registry_content = json.loads(registry_path.read_text(encoding="utf-8"))
-    active_model = registry_content.get("active_model", {})
-    baseline_checkpoint_path = active_model.get("checkpoint_path", "data/processed/regression/model.pt")
+    active_model = registry_content.get("active")
+    if not isinstance(active_model, dict) or not active_model.get("checkpoint"):
+        raise ValueError("active model registry lacks active.checkpoint")
+    baseline_checkpoint_path = Path(active_model["checkpoint"])
+    if not baseline_checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Active baseline checkpoint missing: {baseline_checkpoint_path}"
+        )
+    baseline_checkpoint_sha256 = compute_sha256(baseline_checkpoint_path)
 
     # Handle --status mode
     if args.status:
-        completed_map, all_records = load_existing_experiments(experiments_jsonl)
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Run status requested but manifest missing at {manifest_path}"
+            )
+        try:
+            status_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as err:
+            raise ValueError(f"Run manifest at {manifest_path} is invalid JSON: {err}")
+        if not isinstance(status_manifest, dict) or not status_manifest.get(
+            "baseline_checkpoint_sha256"
+        ):
+            raise ValueError(
+                f"Run manifest at {manifest_path} is malformed or lacks baseline_checkpoint_sha256"
+            )
+        manifest_baseline_checkpoint_sha256 = status_manifest[
+            "baseline_checkpoint_sha256"
+        ]
+
+        completed_map, all_records = load_existing_experiments(
+            experiments_jsonl,
+            expected_baseline_sha256=manifest_baseline_checkpoint_sha256,
+        )
         print(f"Run status for '{args.run_name}':")
         print(f"  Directory: {run_dir}")
-        print(f"  Baseline Registry SHA256: {baseline_registry_sha256}")
+        print(
+            f"  Recorded Run Baseline Checkpoint SHA256: {manifest_baseline_checkpoint_sha256}"
+        )
+        print(
+            f"  Current Registry Active Checkpoint SHA256: {baseline_checkpoint_sha256}"
+        )
+        print(f"  Current Registry SHA256: {baseline_registry_sha256}")
         print(f"  Completed Experiments: {len(completed_map)}")
         for exp_id, rec in completed_map.items():
             metrics = rec.get("metrics", {})
-            print(f"    - {exp_id}: MAE={metrics.get('mae')} RMSE={metrics.get('rmse')} Corr={metrics.get('corr')}")
+            print(
+                f"    - {exp_id}: MAE={metrics.get('mae')} RMSE={metrics.get('rmse')} Corr={metrics.get('pearson_corr', metrics.get('corr'))}"
+            )
         sys.exit(0)
 
-    # Initialize Manifest
-    manifest = {
-        "run_name": args.run_name,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "stage1_handoff_path": str(handoff_path),
-        "stage1_handoff_sha256": compute_sha256(handoff_path),
-        "baseline_registry_path": str(registry_path),
-        "baseline_registry_sha256": baseline_registry_sha256,
-        "baseline_checkpoint_path": baseline_checkpoint_path,
-        "dry_run": args.dry_run,
-        "promote_requested": args.promote,
-        "config": {
-            "seed": args.seed,
-            "device": args.device,
-            "max_experiments": args.max_experiments,
-            "max_steps": args.max_steps,
-            "max_seconds": args.max_seconds,
-        },
-    }
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    # Compute Input Hashes
+    expanded_benchmark_sha256 = compute_sha256(args.expanded_benchmark_csv)
+    control_benchmark_sha256 = compute_sha256(args.control_benchmark_csv)
+    route_qa_sha256 = compute_sha256(args.route_qa_json)
+    thresholds_sha256 = (
+        compute_sha256(args.thresholds_json)
+        if args.thresholds_json and Path(args.thresholds_json).is_file()
+        else None
+    )
+    handoff_sha256 = compute_sha256(handoff_path)
+
+    manifest_baseline_checkpoint_sha256 = baseline_checkpoint_sha256
+    # Handle Manifest (Immutable run identity/config/input hashes)
+    if args.resume:
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Resume requested but run manifest missing at {manifest_path}"
+            )
+        try:
+            existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as err:
+            raise ValueError(f"Run manifest at {manifest_path} is invalid JSON: {err}")
+        validate_run_manifest(
+            existing_manifest=existing_manifest,
+            run_name=args.run_name,
+            handoff_sha256=handoff_sha256,
+            baseline_registry_sha256=baseline_registry_sha256,
+            baseline_checkpoint_sha256=baseline_checkpoint_sha256,
+            expanded_benchmark_sha256=expanded_benchmark_sha256,
+            control_benchmark_sha256=control_benchmark_sha256,
+            route_qa_sha256=route_qa_sha256,
+            thresholds_sha256=thresholds_sha256,
+            args=args,
+        )
+        if "baseline_checkpoint_sha256" in existing_manifest:
+            manifest_baseline_checkpoint_sha256 = existing_manifest[
+                "baseline_checkpoint_sha256"
+            ]
+    else:
+        manifest = {
+            "run_name": args.run_name,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "stage1_handoff_path": str(handoff_path),
+            "stage1_handoff_sha256": handoff_sha256,
+            "baseline_registry_path": str(registry_path),
+            "baseline_registry_sha256": baseline_registry_sha256,
+            "baseline_checkpoint_path": str(baseline_checkpoint_path),
+            "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
+            "expanded_benchmark_sha256": expanded_benchmark_sha256,
+            "control_benchmark_sha256": control_benchmark_sha256,
+            "route_qa_sha256": route_qa_sha256,
+            "thresholds_sha256": thresholds_sha256,
+            "dry_run": args.dry_run,
+            "promote_requested": args.promote,
+            "config": {
+                "seed": args.seed,
+                "device": args.device,
+                "max_experiments": args.max_experiments,
+                "max_steps": args.max_steps,
+                "max_seconds": args.max_seconds,
+                "expanded_benchmark_csv": str(args.expanded_benchmark_csv),
+                "control_benchmark_csv": str(args.control_benchmark_csv),
+                "route_qa_json": str(args.route_qa_json),
+                "thresholds_json": (
+                    str(args.thresholds_json) if args.thresholds_json else None
+                ),
+            },
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     # 4. Build Experiment Ladder
     base_config = ActiveTrainingConfig(
@@ -390,18 +868,59 @@ def main() -> None:
     )
     ladder = build_candidate_ladder(base_config, args.max_experiments)
 
+    if time.time() >= global_deadline:
+        print(f"Time budget of {args.max_seconds}s reached before dataset preparation.")
+        sys.exit(0)
+
+    prepared_dataset_path = run_dir / "prepared_dataset.npz"
+    dataset_sha256_dry = (
+        compute_sha256(prepared_dataset_path)
+        if prepared_dataset_path.is_file()
+        else "pending_preparation"
+    )
+
+    expected_digests: Dict[str, str] = {}
+    for exp in ladder:
+        exp_id = exp["exp_id"]
+        expected_digests[exp_id] = compute_experiment_digest(
+            exp_id=exp_id,
+            config=exp["config"],
+            handoff_sha256=handoff_sha256,
+            dataset_sha256=dataset_sha256_dry,
+            expanded_benchmark_sha256=expanded_benchmark_sha256,
+            control_benchmark_sha256=control_benchmark_sha256,
+            route_qa_sha256=route_qa_sha256,
+            baseline_checkpoint_sha256=baseline_checkpoint_sha256,
+            thresholds_sha256=thresholds_sha256,
+        )
+
     # Handle --dry-run mode
     if args.dry_run:
+        completed_map = {}
+        if args.resume and experiments_jsonl.exists():
+            completed_map, _ = load_existing_experiments(
+                experiments_jsonl,
+                expected_baseline_sha256=manifest_baseline_checkpoint_sha256,
+                expected_input_digests=expected_digests,
+            )
+
         planned_records = []
         for exp in ladder:
-            exp_rec = {
-                "exp_id": exp["exp_id"],
-                "hypothesis": exp["hypothesis"],
-                "status": "planned",
-                "command": sanitize_command(f"train_active_model --exp {exp['exp_id']}"),
-                "config": dataclasses.asdict(exp["config"]) if dataclasses.is_dataclass(exp["config"]) else str(exp["config"]),
-            }
-            planned_records.append(exp_rec)
+            exp_id = exp["exp_id"]
+            if args.resume and exp_id in completed_map:
+                planned_records.append(completed_map[exp_id])
+            else:
+                exp_rec = {
+                    "exp_id": exp_id,
+                    "hypothesis": exp["hypothesis"],
+                    "status": "planned",
+                    "command": sanitize_command(f"train_active_model --exp {exp_id}"),
+                    "config": dataclasses.asdict(exp["config"])
+                    if dataclasses.is_dataclass(exp["config"])
+                    else str(exp["config"]),
+                    "input_digest": expected_digests[exp_id],
+                }
+                planned_records.append(exp_rec)
 
         with experiments_jsonl.open("w", encoding="utf-8") as f:
             for rec in planned_records:
@@ -411,28 +930,62 @@ def main() -> None:
         print("Dry run plan written successfully. No mutations performed.")
         sys.exit(0)
 
+    # Dataset Preparation with deadline guard (executed only in non-dry-run mode)
+    remaining_prep = global_deadline - time.time()
+    try:
+        with deadline_guard(remaining_prep):
+            dataset_info = prepare_active_dataset(handoff_path, prepared_dataset_path)
+    except DeadlineExceededError:
+        print(
+            f"Time budget of {args.max_seconds}s reached during dataset preparation.",
+            file=sys.stderr,
+        )
+        sys.exit(0)
+
+    dataset_path = dataset_info["dataset_path"]
+    split_csv_path = dataset_info["split_path"]
+    dataset_sha256 = compute_sha256(dataset_path)
+
+    # Recompute expected digests with actual dataset sha256
+    expected_digests = {}
+    for exp in ladder:
+        exp_id = exp["exp_id"]
+        expected_digests[exp_id] = compute_experiment_digest(
+            exp_id=exp_id,
+            config=exp["config"],
+            handoff_sha256=handoff_sha256,
+            dataset_sha256=dataset_sha256,
+            expanded_benchmark_sha256=expanded_benchmark_sha256,
+            control_benchmark_sha256=control_benchmark_sha256,
+            route_qa_sha256=route_qa_sha256,
+            baseline_checkpoint_sha256=baseline_checkpoint_sha256,
+            thresholds_sha256=thresholds_sha256,
+        )
+
     # 5. Load truthful resume state
-    completed_map, _ = load_existing_experiments(experiments_jsonl) if args.resume else ({}, [])
-
+    completed_map, _ = (
+        load_existing_experiments(
+            experiments_jsonl,
+            expected_baseline_sha256=manifest_baseline_checkpoint_sha256,
+            expected_input_digests=expected_digests,
+        )
+        if args.resume
+        else ({}, [])
+    )
     # 6. Autoresearch Loop
-    start_time = time.time()
     evaluated_records: List[Dict[str, Any]] = []
-
-    prepared_dataset_path = run_dir / "prepared_dataset.npz"
-    split_csv_path = handoff_path.parent / "splits.csv"
-    if not split_csv_path.exists():
-        split_csv_path = handoff_path.parent / "benchmark_split.csv"
-
-    # Dataset Preparation
-    dataset_info = prepare_active_dataset(handoff_path, prepared_dataset_path)
-    dataset_path = dataset_info.get("dataset_path", str(prepared_dataset_path))
 
     for exp in ladder:
         exp_id = exp["exp_id"]
+        exp_digest = expected_digests[exp_id]
 
-        # Check time budget
-        if args.max_seconds and (time.time() - start_time) > args.max_seconds:
-            print(f"Time budget of {args.max_seconds}s reached. Stopping autoresearch loop.")
+        now = time.time()
+        remaining_seconds = global_deadline - now
+        if remaining_seconds <= 0:
+            print(
+                f"Time budget of {args.max_seconds}s reached. "
+                "Stopping autoresearch loop."
+            )
             break
 
         # Reuse completed experiment if resuming
@@ -446,43 +999,124 @@ def main() -> None:
         exp_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            train_result = train_active_model(
-                dataset_path=dataset_path,
-                split_csv=split_csv_path if split_csv_path.exists() else handoff_path,
-                output_dir=exp_dir,
-                config=exp["config"],
-                resume=args.resume,
+            experiment_config = dataclasses.replace(
+                exp["config"], max_seconds=remaining_seconds
             )
-            candidate_ckpt = train_result.get("checkpoint_path", str(exp_dir / "candidate.pt"))
+            try:
+                with deadline_guard(remaining_seconds):
+                    train_result = train_active_model(
+                        dataset_path=dataset_path,
+                        split_csv=split_csv_path,
+                        output_dir=exp_dir,
+                        config=experiment_config,
+                        resume=args.resume and is_valid_resumable_experiment(exp_dir),
+                    )
+            except DeadlineExceededError:
+                print(
+                    f"Time budget of {args.max_seconds}s reached during training of {exp_id}. "
+                    "Stopping autoresearch loop.",
+                    file=sys.stderr,
+                )
+                exp_record = {
+                    "exp_id": exp_id,
+                    "hypothesis": exp["hypothesis"],
+                    "status": "stopped",
+                    "reason": "deadline_exceeded_during_training",
+                    "input_digest": exp_digest,
+                }
+                evaluated_records.append(exp_record)
+                with experiments_jsonl.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(exp_record) + "\n")
+                break
+
+            if train_result.get("state") != "completed":
+                exp_record = {
+                    "exp_id": exp_id,
+                    "hypothesis": exp["hypothesis"],
+                    "status": train_result.get("state", "paused"),
+                    "training": train_result,
+                    "input_digest": exp_digest,
+                }
+                evaluated_records.append(exp_record)
+                with experiments_jsonl.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(exp_record) + "\n")
+                print(f"METRIC exp_id={exp_id} status={exp_record['status']}")
+                continue
+            candidate_ckpt = train_result["candidate_checkpoint"]
+
+            # Check global deadline before in-process non-preemptible evaluation
+            remaining_eval = global_deadline - time.time()
+            if remaining_eval <= 0:
+                print(
+                    f"Time budget of {args.max_seconds}s reached before evaluation of {exp_id}. "
+                    "Stopping autoresearch loop."
+                )
+                exp_record = {
+                    "exp_id": exp_id,
+                    "hypothesis": exp["hypothesis"],
+                    "status": "stopped",
+                    "reason": "deadline_exceeded_before_eval",
+                    "candidate_checkpoint": candidate_ckpt,
+                    "input_digest": exp_digest,
+                }
+                evaluated_records.append(exp_record)
+                with experiments_jsonl.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(exp_record) + "\n")
+                break
 
             thresholds = None
             if args.thresholds_json and Path(args.thresholds_json).exists():
-                thresholds = json.loads(Path(args.thresholds_json).read_text(encoding="utf-8"))
+                thresholds = json.loads(
+                    Path(args.thresholds_json).read_text(encoding="utf-8")
+                )
 
-            eval_result = evaluate_stage_two(
-                dataset_path=dataset_path,
-                candidate_checkpoint=candidate_ckpt,
-                baseline_checkpoint=baseline_checkpoint_path,
-                expanded_benchmark_csv=args.expanded_benchmark_csv,
-                control_benchmark_csv=args.control_benchmark_csv,
-                route_qa_json=args.route_qa_json,
-                thresholds=thresholds,
-                output_path=exp_dir / "eval_decision.json",
-            )
+            eval_decision_path = exp_dir / "eval_decision.json"
+            try:
+                with deadline_guard(remaining_eval):
+                    eval_result = evaluate_stage_two(
+                        dataset_path=dataset_path,
+                        candidate_checkpoint=candidate_ckpt,
+                        baseline_checkpoint=baseline_checkpoint_path,
+                        expanded_benchmark_csv=args.expanded_benchmark_csv,
+                        control_benchmark_csv=args.control_benchmark_csv,
+                        route_qa_json=args.route_qa_json,
+                        thresholds=thresholds,
+                        output_path=eval_decision_path,
+                    )
+            except DeadlineExceededError:
+                print(
+                    f"Time budget of {args.max_seconds}s reached during evaluation of {exp_id}. "
+                    "Stopping autoresearch loop.",
+                    file=sys.stderr,
+                )
+                exp_record = {
+                    "exp_id": exp_id,
+                    "hypothesis": exp["hypothesis"],
+                    "status": "stopped",
+                    "reason": "deadline_exceeded_during_eval",
+                    "candidate_checkpoint": candidate_ckpt,
+                    "input_digest": exp_digest,
+                }
+                evaluated_records.append(exp_record)
+                with experiments_jsonl.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(exp_record) + "\n")
+                break
 
             all_pass = eval_result.get("all_gates_pass", False)
-            metrics = eval_result.get("metrics", {})
-            mae = metrics.get("mae", 0.0)
-            rmse = metrics.get("rmse", 0.0)
-            corr = metrics.get("corr", 0.0)
+            metrics = eval_result["expanded_human_benchmark"]["candidate_metrics"]
+            mae = metrics["mae"]
+            rmse = metrics["rmse"]
+            corr = metrics["pearson_corr"]
 
             exp_record = {
                 "exp_id": exp_id,
                 "hypothesis": exp["hypothesis"],
                 "status": "completed",
                 "candidate_checkpoint": candidate_ckpt,
+                "eval_decision_path": str(eval_decision_path),
                 "metrics": metrics,
                 "all_gates_pass": all_pass,
+                "input_digest": exp_digest,
                 "evaluated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
             evaluated_records.append(exp_record)
@@ -503,23 +1137,14 @@ def main() -> None:
                 "hypothesis": exp["hypothesis"],
                 "status": "failed",
                 "error": str(e),
+                "input_digest": exp_digest,
             }
             evaluated_records.append(exp_record)
             with experiments_jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(exp_record) + "\n")
             print(f"METRIC exp_id={exp_id} status=failed")
-
     # 7. Select Best Passing Candidate
-    passing_candidates = [r for r in evaluated_records if r.get("all_gates_pass")]
-    best_candidate = None
-    if passing_candidates:
-        # Sort by highest correlation or lowest MAE
-        passing_candidates.sort(
-            key=lambda r: (r.get("metrics", {}).get("corr", 0.0), -r.get("metrics", {}).get("mae", 10.0)),
-            reverse=True,
-        )
-        best_candidate = passing_candidates[0]
-
+    best_candidate = select_best_candidate(evaluated_records)
     all_gates_pass = best_candidate is not None
     print(f"METRIC all_gates_pass={1 if all_gates_pass else 0}")
 
@@ -529,35 +1154,52 @@ def main() -> None:
         "retained_candidate": best_candidate,
         "evaluated_experiments": len(evaluated_records),
         "baseline_registry_sha256": baseline_registry_sha256,
+        "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
         "decision_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     decision_path.write_text(json.dumps(decision_summary, indent=2), encoding="utf-8")
 
     # 8. Registry Promotion Safety
     promoted = False
+    PROMOTION_RESERVE_SECONDS = 5.0
     if args.promote:
-        if all_gates_pass and best_candidate:
+        remaining_promo = global_deadline - time.time()
+        if remaining_promo < PROMOTION_RESERVE_SECONDS:
+            print(
+                f"Time budget of {args.max_seconds}s reached (less than {PROMOTION_RESERVE_SECONDS}s reserve remaining for promotion). Promotion skipped.",
+                file=sys.stderr,
+            )
+            timed_out_flag = True
+            print("METRIC promoted=0 promotion_blocked=1 promotion_timed_out=1")
+        elif all_gates_pass and best_candidate:
             cand_ckpt = best_candidate["candidate_checkpoint"]
             print(f"Promoting candidate {best_candidate['exp_id']} to registry...")
             promo_res = promote_from_decision(
-                decision_path=decision_path,
+                decision_path=best_candidate["eval_decision_path"],
                 candidate_checkpoint=cand_ckpt,
                 registry_path=registry_path,
                 expected_registry_sha256=baseline_registry_sha256,
                 run_name=args.run_name,
             )
             promoted = True
-            print(f"METRIC promoted=1 new_version={promo_res.get('promoted_version')}")
+            print(
+                f"METRIC promoted=1 registry_sha256={promo_res['new_registry_sha256']}"
+            )
         else:
-            print("Promotion requested but compound decision gates failed or no passing candidate found. Registry unchanged.")
+            print(
+                "Promotion requested but compound decision gates failed or no passing candidate found. Registry unchanged."
+            )
             print("METRIC promoted=0 promotion_blocked=1")
     else:
         print("METRIC promoted=0 promote_flag_absent=1")
 
     # 9. Final Summary
+    run_state = determine_aggregate_run_state(
+        evaluated_records, len(ladder), timed_out=timed_out_flag
+    )
     final_summary = {
         "run_name": args.run_name,
-        "run_state": "completed",
+        "run_state": run_state,
         "total_experiments": len(evaluated_records),
         "all_gates_pass": all_gates_pass,
         "retained_exp_id": best_candidate["exp_id"] if best_candidate else None,
@@ -565,7 +1207,9 @@ def main() -> None:
         "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     summary_path.write_text(json.dumps(final_summary, indent=2), encoding="utf-8")
-    print(f"METRIC run_state=completed retained_exp={final_summary['retained_exp_id']} promoted={1 if promoted else 0}")
+    print(
+        f"METRIC run_state={run_state} retained_exp={final_summary['retained_exp_id']} promoted={1 if promoted else 0}"
+    )
 
 
 if __name__ == "__main__":

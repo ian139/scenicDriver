@@ -8,6 +8,32 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
+import re
+
+
+def validate_run_name(name: Any) -> str:
+    """Validate that *name* is a valid safe single-path-component run slug."""
+    if not isinstance(name, str):
+        raise ValueError("run_name must be a string")
+    name = name.strip()
+    if not name:
+        raise ValueError("run_name cannot be empty")
+    if os.path.isabs(name) or name.startswith("/") or name.startswith("\\"):
+        raise ValueError(f"run_name cannot be an absolute path: {name!r}")
+    if (
+        "/" in name
+        or "\\" in name
+        or os.sep in name
+        or (os.altsep and os.altsep in name)
+    ):
+        raise ValueError(f"run_name cannot contain path separators: {name!r}")
+    if name in (".", "..") or ".." in name:
+        raise ValueError(
+            f"run_name cannot be '.' or '..' or contain traversal: {name!r}"
+        )
+    if not re.match(r"^[a-zA-Z0-9._-]+$", name):
+        raise ValueError(f"run_name must be a valid slug: {name!r}")
+    return name
 
 
 def sha256_file(path: str | Path) -> str:

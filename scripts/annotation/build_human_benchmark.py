@@ -17,40 +17,45 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.active_learning.common import sha256_file, validate_run_name  # noqa: E402
+
 
 BOOL_TRUE = {"1", "true", "yes", "y", "t", "on"}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build human benchmark split and agreement stats")
-    parser.add_argument("--annotations-csv", type=Path, default=Path("data/raw/labels_human.csv"))
+    parser = argparse.ArgumentParser(
+        description="Build human benchmark split and agreement stats"
+    )
+    parser.add_argument(
+        "--annotations-csv", type=Path, default=Path("data/raw/labels_human.csv")
+    )
     parser.add_argument(
         "--labels-csv",
         type=Path,
         default=Path("data/processed/regression/labels_masswhites_z14_mixed5000.csv"),
         help="Optional labels file for class_id/heuristic joins",
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("data/processed/regression"))
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("data/processed/regression")
+    )
     parser.add_argument("--run-name", type=str, default="human_benchmark_v1")
-    parser.add_argument("--val-frac", type=float, default=0.2)
-    parser.add_argument("--test-frac", type=float, default=0.2)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--geographic-splits-csv",
         type=Path,
-        help="Fixed leakage-resistant image_path/split assignments; disables random splitting",
-    )
-    parser.add_argument(
-        "--stratify-by-class",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Stratify split by class_id when available",
+        required=True,
+        help="Fixed leakage-resistant image_path/split assignments",
     )
     return parser.parse_args()
 
@@ -63,59 +68,6 @@ def _to_bool(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return str(value).strip().lower() in BOOL_TRUE
-
-
-def _split_counts(n: int, val_frac: float, test_frac: float) -> tuple[int, int]:
-    n_test = int(round(n * test_frac))
-    n_val = int(round(n * val_frac))
-
-    if n >= 3 and test_frac > 0 and n_test == 0:
-        n_test = 1
-    if n - n_test >= 2 and val_frac > 0 and n_val == 0:
-        n_val = 1
-
-    max_eval = max(0, n - 1)
-    while n_test + n_val > max_eval:
-        if n_val >= n_test and n_val > 0:
-            n_val -= 1
-        elif n_test > 0:
-            n_test -= 1
-        else:
-            break
-
-    return n_val, n_test
-
-
-def _assign_split(
-    frame: pd.DataFrame,
-    *,
-    seed: int,
-    val_frac: float,
-    test_frac: float,
-    stratify_by_class: bool,
-) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    out = frame.copy()
-    out["split"] = "train"
-
-    use_strat = stratify_by_class and "class_id" in out.columns and out["class_id"].notna().any()
-    if use_strat:
-        groups = out.groupby("class_id", dropna=False)
-    else:
-        groups = [(None, out)]
-
-    for _, group in groups:
-        idx = group.index.to_numpy()
-        if len(idx) == 0:
-            continue
-        rng.shuffle(idx)
-        n_val, n_test = _split_counts(len(idx), val_frac, test_frac)
-        if n_val > 0:
-            out.loc[idx[:n_val], "split"] = "val"
-        if n_test > 0:
-            out.loc[idx[n_val : n_val + n_test], "split"] = "test"
-
-    return out
 
 
 def _corr(a: pd.Series, b: pd.Series) -> float | None:
@@ -140,7 +92,7 @@ def _prepare_annotations(path: Path) -> tuple[pd.DataFrame, int]:
         raise ValueError(f"Missing required annotation columns: {sorted(missing)}")
 
     ann["image_path"] = ann["image_path"].astype(str).str.strip()
-    ann["annotator_id"] = ann["annotator_id"].astype(str).str.strip().replace("", "unknown")
+    ann["annotator_id"] = ann["annotator_id"].fillna("").astype(str).str.strip()
     ann["scenic_human"] = pd.to_numeric(ann["scenic_human"], errors="coerce")
 
     if "skip" in ann.columns:
@@ -154,11 +106,33 @@ def _prepare_annotations(path: Path) -> tuple[pd.DataFrame, int]:
         ann["_timestamp"] = pd.NaT
     ann["_row_id"] = np.arange(len(ann))
 
-    ann = ann.loc[~ann["skip"] & ann["scenic_human"].notna() & ann["image_path"].ne("")].copy()
+    ann = ann.loc[
+        ~ann["skip"]
+        & ann["scenic_human"].notna()
+        & ann["image_path"].ne("")
+        & ann["annotator_id"].ne("")
+        & ann["annotator_id"].str.lower().ne("nan")
+    ].copy()
     ann = ann.sort_values(["_timestamp", "_row_id"])
     ann = ann.drop_duplicates(subset=["image_path", "annotator_id"], keep="last")
     ann = ann.drop(columns=["_row_id"])
     return ann, total_rows
+
+
+def _filter_annotations_by_splits(
+    ann: pd.DataFrame, splits_path: Path
+) -> tuple[pd.DataFrame, int]:
+    if not splits_path.is_file():
+        raise FileNotFoundError(f"Missing geographic splits CSV: {splits_path}")
+    assignments = pd.read_csv(splits_path)
+    required = {"image_path", "split"}
+    missing = required - set(assignments.columns)
+    if missing:
+        raise ValueError(f"Geographic splits CSV missing columns: {sorted(missing)}")
+    valid_paths = set(assignments["image_path"].astype(str).str.strip())
+    retained = ann.loc[ann["image_path"].isin(valid_paths)].copy()
+    dropped_count = len(ann) - len(retained)
+    return retained, dropped_count
 
 
 def _build_tile_table(ann: pd.DataFrame, labels_path: Path | None) -> pd.DataFrame:
@@ -181,10 +155,21 @@ def _build_tile_table(ann: pd.DataFrame, labels_path: Path | None) -> pd.DataFra
 
     if labels_path is not None and labels_path.exists():
         labels = pd.read_csv(labels_path)
-        keep_cols = [c for c in ["image_path", "class_id", "scenic_score_heuristic", "label_source"] if c in labels.columns]
+        keep_cols = [
+            c
+            for c in [
+                "image_path",
+                "class_id",
+                "scenic_score_heuristic",
+                "label_source",
+            ]
+            if c in labels.columns
+        ]
         if keep_cols:
             labels_small = labels[keep_cols].copy()
-            labels_small = labels_small.drop_duplicates(subset=["image_path"], keep="first")
+            labels_small = labels_small.drop_duplicates(
+                subset=["image_path"], keep="first"
+            )
             tile = tile.merge(labels_small, on="image_path", how="left")
     return tile
 
@@ -200,7 +185,11 @@ def _apply_geographic_splits(tile: pd.DataFrame, path: Path) -> pd.DataFrame:
     assignments = assignments.copy()
     assignments["image_path"] = assignments["image_path"].astype(str).str.strip()
     assignments["split"] = (
-        assignments["split"].astype(str).str.strip().str.lower().replace("validation", "val")
+        assignments["split"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .replace("validation", "val")
     )
     invalid = sorted(set(assignments["split"]) - {"train", "val", "test"})
     if invalid:
@@ -253,12 +242,12 @@ def _agreement_tables(ann: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     pairs: list[dict[str, Any]] = []
     annotators = sorted(ann["annotator_id"].dropna().unique().tolist())
     for a_id, b_id in itertools.combinations(annotators, 2):
-        a_df = ann.loc[ann["annotator_id"] == a_id, ["image_path", "scenic_human"]].rename(
-            columns={"scenic_human": "score_a"}
-        )
-        b_df = ann.loc[ann["annotator_id"] == b_id, ["image_path", "scenic_human"]].rename(
-            columns={"scenic_human": "score_b"}
-        )
+        a_df = ann.loc[
+            ann["annotator_id"] == a_id, ["image_path", "scenic_human"]
+        ].rename(columns={"scenic_human": "score_a"})
+        b_df = ann.loc[
+            ann["annotator_id"] == b_id, ["image_path", "scenic_human"]
+        ].rename(columns={"scenic_human": "score_b"})
         overlap = a_df.merge(b_df, on="image_path", how="inner")
         if overlap.empty:
             continue
@@ -277,35 +266,35 @@ def _agreement_tables(ann: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     pairwise = pd.DataFrame(
         pairs,
-        columns=["annotator_a", "annotator_b", "overlap_tiles", "mean_diff", "mae", "rmse", "corr"],
+        columns=[
+            "annotator_a",
+            "annotator_b",
+            "overlap_tiles",
+            "mean_diff",
+            "mae",
+            "rmse",
+            "corr",
+        ],
     )
     if not pairwise.empty:
-        pairwise = pairwise.sort_values(["overlap_tiles", "mae"], ascending=[False, True])
+        pairwise = pairwise.sort_values(
+            ["overlap_tiles", "mae"], ascending=[False, True]
+        )
     return by_annotator, pairwise
 
 
 def main() -> None:
     args = parse_args()
-    if args.val_frac < 0 or args.test_frac < 0:
-        raise ValueError("val_frac and test_frac must be >= 0")
-    if args.val_frac + args.test_frac >= 1.0:
-        raise ValueError("val_frac + test_frac must be < 1.0")
-
+    run_name = validate_run_name(args.run_name)
     ann, total_rows_before_filter = _prepare_annotations(args.annotations_csv)
+    ann, non_run_rows_dropped = _filter_annotations_by_splits(
+        ann, args.geographic_splits_csv
+    )
     tile = _build_tile_table(ann, args.labels_csv if args.labels_csv else None)
-    if args.geographic_splits_csv:
-        split = _apply_geographic_splits(tile, args.geographic_splits_csv)
-    else:
-        split = _assign_split(
-            tile,
-            seed=args.seed,
-            val_frac=args.val_frac,
-            test_frac=args.test_frac,
-            stratify_by_class=args.stratify_by_class,
-        )
+    split = _apply_geographic_splits(tile, args.geographic_splits_csv)
     by_annotator, pairwise = _agreement_tables(ann)
 
-    base = args.output_dir / args.run_name
+    base = args.output_dir / run_name
     base.mkdir(parents=True, exist_ok=True)
 
     tile_path = base / "benchmark_tiles.csv"
@@ -323,37 +312,51 @@ def main() -> None:
     split_counts = split["split"].value_counts().to_dict()
 
     benchmark_vs_heuristic = None
-    if "scenic_score_heuristic" in split.columns and split["scenic_score_heuristic"].notna().any():
-        valid = split.loc[split["scenic_score_heuristic"].notna(), ["scenic_human_mean", "scenic_score_heuristic"]]
+    if (
+        "scenic_score_heuristic" in split.columns
+        and split["scenic_score_heuristic"].notna().any()
+    ):
+        valid = split.loc[
+            split["scenic_score_heuristic"].notna(),
+            ["scenic_human_mean", "scenic_score_heuristic"],
+        ]
         if not valid.empty:
             diff = valid["scenic_human_mean"] - valid["scenic_score_heuristic"]
             benchmark_vs_heuristic = {
                 "tiles": int(len(valid)),
                 "mae": float(diff.abs().mean()),
                 "rmse": float(np.sqrt((diff**2).mean())),
-                "corr": _corr(valid["scenic_human_mean"], valid["scenic_score_heuristic"]),
+                "corr": _corr(
+                    valid["scenic_human_mean"], valid["scenic_score_heuristic"]
+                ),
             }
 
     summary = {
-        "run_name": args.run_name,
+        "run_name": run_name,
         "source_annotations_csv": str(args.annotations_csv),
         "source_labels_csv": str(args.labels_csv) if args.labels_csv else None,
-        "source_geographic_splits_csv": (
-            str(args.geographic_splits_csv) if args.geographic_splits_csv else None
-        ),
-        "split_strategy": (
-            "fixed_geographic" if args.geographic_splits_csv else "seeded_random_legacy"
-        ),
+        "source_geographic_splits_csv": str(args.geographic_splits_csv),
+        "split_strategy": "fixed_geographic",
         "total_rows_before_filter": int(total_rows_before_filter),
+        "non_run_rows_dropped": int(non_run_rows_dropped),
         "rows_after_filter_and_dedupe": int(len(ann)),
         "unique_tiles": int(tile["image_path"].nunique()),
         "annotators": int(ann["annotator_id"].nunique()),
         "tiles_with_overlap_ge_2": overlap_tiles,
-        "mean_annotator_std": float(tile["scenic_human_std"].mean()) if len(tile) else 0.0,
-        "median_annotator_std": float(tile["scenic_human_std"].median()) if len(tile) else 0.0,
+        "mean_annotator_std": float(tile["scenic_human_std"].mean())
+        if len(tile)
+        else 0.0,
+        "median_annotator_std": float(tile["scenic_human_std"].median())
+        if len(tile)
+        else 0.0,
         "split_counts": {k: int(v) for k, v in split_counts.items()},
         "pairwise_overlap_rows": int(len(pairwise)),
         "benchmark_vs_heuristic": benchmark_vs_heuristic,
+        "source_hashes": {
+            "annotations_csv": sha256_file(args.annotations_csv),
+            "geographic_splits_csv": sha256_file(args.geographic_splits_csv),
+            "benchmark_split_csv": sha256_file(split_path),
+        },
         "outputs": {
             "benchmark_tiles_csv": str(tile_path),
             "benchmark_split_csv": str(split_path),
@@ -371,6 +374,7 @@ def main() -> None:
     print(f"Wrote {summary_path}")
     print(
         f"Rows(after dedupe): {summary['rows_after_filter_and_dedupe']} | "
+        f"Non-run rows dropped: {summary['non_run_rows_dropped']} | "
         f"Unique tiles: {summary['unique_tiles']} | "
         f"Annotators: {summary['annotators']}"
     )

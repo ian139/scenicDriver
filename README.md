@@ -96,6 +96,7 @@ archive/                 Curated historical material
 |---|---|
 | Download regional tiles | `scripts/ingest/download_bbox_tiles.py` |
 | Annotate scenic labels | `notebooks/annotate_scenic.mo.py` or `scripts/annotation/annotate_scenic_web.py` |
+| Plan, score, select, and annotate an active-learning batch | `scripts/ingest/plan_active_learning_region.py`, `scripts/modeling/score_active_learning_pool.py`, and `scripts/annotation/select_active_learning.py` |
 | Train and evaluate scoring | `notebooks/regression.mo.py` and `scripts/modeling/` |
 | Generate regional reports | `scripts/reports/heuristic_report.py` |
 | Build an OSM road graph | `scripts/routing/build_graph_from_osm.py` |
@@ -107,6 +108,52 @@ Run a marimo workflow with, for example:
 ```bash
 uv run marimo edit notebooks/regression.mo.py
 ```
+
+Stage-One active-learning runs are isolated under
+`data/processed/active_learning/<run_name>/`. Plan before acquisition, then
+score, select, annotate, and finalize the same run:
+```bash
+
+uv run python scripts/ingest/plan_active_learning_region.py --run-name <run_name>
+uv run python scripts/ingest/plan_active_learning_region.py --run-name <run_name> --acquire --workers 8
+uv run python scripts/modeling/score_active_learning_pool.py --manifest data/processed/active_learning/<run_name>/tile_manifest.csv --run-name <run_name>
+uv run python scripts/annotation/select_active_learning.py --candidate-input data/processed/active_learning/<run_name>/candidate_pool.csv --prior-annotations data/raw/labels_human.csv --run-name <run_name>
+uv run python scripts/annotation/annotate_scenic_web.py --batch-csv data/processed/active_learning/<run_name>/annotation_batch.csv --annotations-csv data/raw/labels_human.csv
+uv run python scripts/modeling/build_mixed_labels.py --heuristic-labels data/processed/active_learning/<run_name>/candidate_pool.csv --annotations-csv data/raw/labels_human.csv --output data/processed/active_learning/<run_name>/mixed_labels.csv
+uv run python scripts/annotation/build_human_benchmark.py --annotations-csv data/raw/labels_human.csv --geographic-splits-csv data/processed/active_learning/<run_name>/geographic_splits.csv --output-dir data/processed/active_learning --run-name <run_name>
+uv run python scripts/annotation/finalize_stage1.py --run-root data/processed/active_learning/<run_name> --run-name <run_name>
+```
+
+Train one bounded deterministic Stage-Two candidate from an admitted handoff:
+
+```bash
+uv run python scripts/modeling/train_active_scenic.py \
+  --handoff data/processed/active_learning/<run_name>/stage1_handoff.json \
+  --output-dir data/processed/active_learning/<run_name>/training \
+  --epochs 20 --batch-size 64 --max-steps 200 --max-seconds 1800 --device auto
+```
+
+The guarded autoresearch launcher is opt-in. It validates the Stage-One handoff,
+active baseline, human benchmarks, route QA, and bounded experiment ladder
+before starting work:
+
+```bash
+OMP_RUN_AUTORESEARCH=1 bash autoresearch.sh \
+  --handoff data/processed/active_learning/<run_name>/stage1_handoff.json \
+  --run-name <run_name> \
+  --expanded-benchmark-csv data/processed/active_learning/<run_name>/expanded_human_benchmark.csv \
+  --control-benchmark-csv data/processed/active_learning/<run_name>/control_benchmark.csv \
+  --route-qa-json data/processed/active_learning/<run_name>/route_qa.json \
+  --max-experiments 3 --max-steps 200 --max-seconds 1800 --device auto
+```
+
+Omit `OMP_RUN_AUTORESEARCH=1` to keep the launcher inert. Use `--dry-run` to
+validate inputs and persist only the planned experiment ladder.
+
+
+The finalizer fails closed unless acquisition, scoring, human annotation,
+fixed geographic splits, human benchmark, mixed labels, artifact hashes, and
+the active baseline identity all validate.
 
 ## Documentation
 
