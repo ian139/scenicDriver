@@ -15,6 +15,10 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
+if [[ "${OMP_RUN_AUTORESEARCH:-0}" == "1" ]]; then
+  exec uv run --offline --frozen python scripts/modeling/run_active_scenic_autoresearch.py "$@"
+fi
+
 uv run --offline --frozen pytest -q
 node --test tests/test_new_england_north_viewer.mjs
 uv run --offline --frozen python scripts/reports/autoresearch_cleanup_metric.py
