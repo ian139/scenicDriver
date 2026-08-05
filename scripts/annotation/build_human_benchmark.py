@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-frac", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--geographic-splits-csv",
+        type=Path,
+        help="Fixed leakage-resistant image_path/split assignments; disables random splitting",
+    )
+    parser.add_argument(
         "--stratify-by-class",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -184,6 +189,42 @@ def _build_tile_table(ann: pd.DataFrame, labels_path: Path | None) -> pd.DataFra
     return tile
 
 
+def _apply_geographic_splits(tile: pd.DataFrame, path: Path) -> pd.DataFrame:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing geographic splits CSV: {path}")
+    assignments = pd.read_csv(path)
+    required = {"image_path", "split"}
+    missing = required - set(assignments.columns)
+    if missing:
+        raise ValueError(f"Geographic splits CSV missing columns: {sorted(missing)}")
+    assignments = assignments.copy()
+    assignments["image_path"] = assignments["image_path"].astype(str).str.strip()
+    assignments["split"] = (
+        assignments["split"].astype(str).str.strip().str.lower().replace("validation", "val")
+    )
+    invalid = sorted(set(assignments["split"]) - {"train", "val", "test"})
+    if invalid:
+        raise ValueError(f"Geographic splits CSV has invalid split values: {invalid}")
+    conflicts = assignments.groupby("image_path")["split"].nunique()
+    if (conflicts > 1).any():
+        raise ValueError("Geographic splits CSV assigns one image to multiple splits")
+    keep = [
+        column
+        for column in ("image_path", "split", "geographic_block", "split_seed")
+        if column in assignments
+    ]
+    assignments = assignments[keep].drop_duplicates("image_path", keep="first")
+    output = tile.merge(assignments, on="image_path", how="left", validate="one_to_one")
+    missing_assignments = output["split"].isna()
+    if missing_assignments.any():
+        examples = output.loc[missing_assignments, "image_path"].head(3).tolist()
+        raise ValueError(
+            f"Geographic splits CSV has no assignment for {int(missing_assignments.sum())} "
+            f"benchmark tiles; examples: {examples}"
+        )
+    return output
+
+
 def _agreement_tables(ann: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     by_annotator = (
         ann.groupby("annotator_id", as_index=False)
@@ -242,13 +283,16 @@ def main() -> None:
 
     ann, total_rows_before_filter = _prepare_annotations(args.annotations_csv)
     tile = _build_tile_table(ann, args.labels_csv if args.labels_csv else None)
-    split = _assign_split(
-        tile,
-        seed=args.seed,
-        val_frac=args.val_frac,
-        test_frac=args.test_frac,
-        stratify_by_class=args.stratify_by_class,
-    )
+    if args.geographic_splits_csv:
+        split = _apply_geographic_splits(tile, args.geographic_splits_csv)
+    else:
+        split = _assign_split(
+            tile,
+            seed=args.seed,
+            val_frac=args.val_frac,
+            test_frac=args.test_frac,
+            stratify_by_class=args.stratify_by_class,
+        )
     by_annotator, pairwise = _agreement_tables(ann)
 
     base = args.output_dir / args.run_name
@@ -284,6 +328,12 @@ def main() -> None:
         "run_name": args.run_name,
         "source_annotations_csv": str(args.annotations_csv),
         "source_labels_csv": str(args.labels_csv) if args.labels_csv else None,
+        "source_geographic_splits_csv": (
+            str(args.geographic_splits_csv) if args.geographic_splits_csv else None
+        ),
+        "split_strategy": (
+            "fixed_geographic" if args.geographic_splits_csv else "seeded_random_legacy"
+        ),
         "total_rows_before_filter": int(total_rows_before_filter),
         "rows_after_filter_and_dedupe": int(len(ann)),
         "unique_tiles": int(tile["image_path"].nunique()),

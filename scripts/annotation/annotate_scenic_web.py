@@ -90,7 +90,14 @@ CONFIDENCE_VALUES = {"low", "medium", "high"}
 class ApiError(Exception):
     """Expected request failure safe to return to a browser."""
 
-    def __init__(self, status: int, code: str, message: str, *, details: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.code = code
@@ -121,16 +128,32 @@ class PathPolicy:
         s3_roots: Sequence[str] = (),
     ) -> None:
         self.project_root = project_root.resolve()
-        roots = local_roots or (self.project_root / "data" / "raw", self.project_root / "data" / "processed")
+        roots = local_roots or (
+            self.project_root / "data" / "raw",
+            self.project_root / "data" / "processed",
+        )
         self.local_roots = tuple(Path(root).resolve() for root in roots)
-        self.s3_roots = tuple(self._normalize_s3_root(root) for root in s3_roots if root)
+        self.s3_roots = tuple(
+            self._normalize_s3_root(root) for root in s3_roots if root
+        )
 
     @staticmethod
     def _normalize_s3_root(value: str) -> str:
         parsed = urlparse(value)
-        if parsed.scheme != "s3" or not parsed.netloc or parsed.username or parsed.password:
-            raise ValueError("approved S3 roots must be credential-free s3://bucket/prefix URIs")
-        if parsed.query or parsed.fragment or any(part == ".." for part in parsed.path.split("/")):
+        if (
+            parsed.scheme != "s3"
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+        ):
+            raise ValueError(
+                "approved S3 roots must be credential-free s3://bucket/prefix URIs"
+            )
+        if (
+            parsed.query
+            or parsed.fragment
+            or any(part == ".." for part in parsed.path.split("/"))
+        ):
             raise ValueError("approved S3 root is invalid")
         return f"s3://{parsed.netloc}/{parsed.path.strip('/')}".rstrip("/")
 
@@ -144,8 +167,14 @@ class PathPolicy:
         if not candidate.is_absolute():
             candidate = self.project_root / candidate
         resolved = candidate.resolve(strict=False)
-        if not any(resolved == root or root in resolved.parents for root in self.local_roots):
-            raise ApiError(403, "path_not_approved", f"{kind} must stay under an approved data root")
+        if not any(
+            resolved == root or root in resolved.parents for root in self.local_roots
+        ):
+            raise ApiError(
+                403,
+                "path_not_approved",
+                f"{kind} must stay under an approved data root",
+            )
         if must_exist and not resolved.exists():
             raise ApiError(404, "path_not_found", f"{kind} was not found")
         return resolved
@@ -154,8 +183,15 @@ class PathPolicy:
         raw = os.path.expandvars(str(value).strip())
         if raw.startswith("s3://"):
             normalized = self._normalize_s3_root(raw)
-            if not any(normalized == root or normalized.startswith(f"{root}/") for root in self.s3_roots):
-                raise ApiError(403, "s3_root_not_approved", "raw_dir is outside the approved S3 roots")
+            if not any(
+                normalized == root or normalized.startswith(f"{root}/")
+                for root in self.s3_roots
+            ):
+                raise ApiError(
+                    403,
+                    "s3_root_not_approved",
+                    "raw_dir is outside the approved S3 roots",
+                )
             return normalized
         return str(self.resolve_local(raw, kind="raw_dir", must_exist=True))
 
@@ -189,7 +225,9 @@ def _locked_path(path: Path, process_lock: threading.RLock) -> Iterator[None]:
 
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
     try:
         with os.fdopen(fd, "wb") as output:
             output.write(data)
@@ -221,10 +259,17 @@ def _read_annotations(path: Path) -> pd.DataFrame:
 
 def _csv_bytes(frame: pd.DataFrame) -> bytes:
     rows = frame.where(pd.notna(frame), "").to_dict(orient="records")
-    with tempfile.SpooledTemporaryFile(mode="w+", newline="", encoding="utf-8") as stream:
+    with tempfile.SpooledTemporaryFile(
+        mode="w+", newline="", encoding="utf-8"
+    ) as stream:
         writer = csv.DictWriter(stream, fieldnames=DEFAULT_COLUMNS, lineterminator="\n")
         writer.writeheader()
-        writer.writerows(({column: row.get(column, "") for column in DEFAULT_COLUMNS} for row in rows))
+        writer.writerows(
+            (
+                {column: row.get(column, "") for column in DEFAULT_COLUMNS}
+                for row in rows
+            )
+        )
         stream.seek(0)
         return stream.read().encode("utf-8")
 
@@ -235,15 +280,21 @@ def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ApiError(500, "progress_store_invalid", "The progress store is unreadable") from exc
+        raise ApiError(
+            500, "progress_store_invalid", "The progress store is unreadable"
+        ) from exc
     if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
-        raise ApiError(500, "progress_store_invalid", "The progress store schema is unsupported")
+        raise ApiError(
+            500, "progress_store_invalid", "The progress store schema is unsupported"
+        )
     value.setdefault("batches", {})
     return value
 
 
 def _json_bytes(value: dict[str, Any]) -> bytes:
-    return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    return (
+        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
 
 
 def _json_ready(value: Any) -> Any:
@@ -275,7 +326,9 @@ def _sample_stratified(frame: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     if n <= 0 or frame.empty:
         return frame.iloc[0:0].copy()
     if "class_id" not in frame.columns or frame["class_id"].isna().all():
-        return frame.sample(n=min(n, len(frame)), random_state=seed).reset_index(drop=True)
+        return frame.sample(n=min(n, len(frame)), random_state=seed).reset_index(
+            drop=True
+        )
     groups = sorted(frame["class_id"].dropna().unique().tolist(), key=str)
     chunks: list[pd.DataFrame] = []
     remaining = min(n, len(frame))
@@ -289,7 +342,10 @@ def _sample_stratified(frame: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     if needed > 0:
         remainder = frame.loc[~frame["image_path"].isin(sampled["image_path"])]
         sampled = pd.concat(
-            [sampled, remainder.sample(n=min(needed, len(remainder)), random_state=seed)],
+            [
+                sampled,
+                remainder.sample(n=min(needed, len(remainder)), random_state=seed),
+            ],
             ignore_index=True,
         )
     return sampled.drop_duplicates(subset=["image_path"]).reset_index(drop=True)
@@ -299,8 +355,15 @@ def _safe_image_path(image_path: str) -> str:
     value = str(image_path).strip().replace("\\", "/")
     parsed = urlparse(value)
     parts = value.split("/")
-    if not value or parsed.scheme or value.startswith("/") or any(part in {"", ".", ".."} for part in parts):
-        raise ApiError(400, "invalid_image_path", "image_path must be a relative canonical path")
+    if (
+        not value
+        or parsed.scheme
+        or value.startswith("/")
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise ApiError(
+            400, "invalid_image_path", "image_path must be a relative canonical path"
+        )
     return value
 
 
@@ -311,7 +374,9 @@ def _parse_s3(raw_dir: str) -> tuple[str, str] | None:
     return parsed.netloc, parsed.path.strip("/")
 
 
-def _serve_image_bytes(raw_dir: str, image_path: str, *, s3_client: Any | None) -> tuple[bytes, str]:
+def _serve_image_bytes(
+    raw_dir: str, image_path: str, *, s3_client: Any | None
+) -> tuple[bytes, str]:
     safe_path = _safe_image_path(image_path)
     s3_info = _parse_s3(raw_dir)
     if s3_info is not None:
@@ -323,8 +388,14 @@ def _serve_image_bytes(raw_dir: str, image_path: str, *, s3_client: Any | None) 
             obj = s3_client.get_object(Bucket=bucket, Key=key)
             body = obj["Body"].read()
         except Exception as exc:
-            raise ApiError(404, "image_not_found", "The requested image could not be loaded") from exc
-        content_type = obj.get("ContentType") or mimetypes.guess_type(safe_path)[0] or "application/octet-stream"
+            raise ApiError(
+                404, "image_not_found", "The requested image could not be loaded"
+            ) from exc
+        content_type = (
+            obj.get("ContentType")
+            or mimetypes.guess_type(safe_path)[0]
+            or "application/octet-stream"
+        )
         return body, content_type
 
     root = Path(raw_dir).resolve()
@@ -334,12 +405,16 @@ def _serve_image_bytes(raw_dir: str, image_path: str, *, s3_client: Any | None) 
     try:
         body = path.read_bytes()
     except FileNotFoundError as exc:
-        raise ApiError(404, "image_not_found", "The requested image was not found") from exc
+        raise ApiError(
+            404, "image_not_found", "The requested image was not found"
+        ) from exc
     return body, mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
 
 class AnnotatorState:
-    def __init__(self, config: AnnotatorConfig, *, path_policy: PathPolicy | None = None):
+    def __init__(
+        self, config: AnnotatorConfig, *, path_policy: PathPolicy | None = None
+    ):
         self._lock = threading.RLock()
         self.path_policy = path_policy or PathPolicy()
         self.config = self._validated_config(config, browser_update=False)
@@ -353,18 +428,34 @@ class AnnotatorState:
         annotations = Path(self.config.annotations_csv)
         return annotations.with_name(f"{annotations.stem}.annotation_progress.json")
 
-    def _validated_config(self, config: AnnotatorConfig, *, browser_update: bool) -> AnnotatorConfig:
+    def _validated_config(
+        self, config: AnnotatorConfig, *, browser_update: bool
+    ) -> AnnotatorConfig:
         if browser_update and config.annotator_id != self.config.annotator_id:
-            raise ApiError(403, "identity_locked", "Annotator identity is fixed by the server")
+            raise ApiError(
+                403, "identity_locked", "Annotator identity is fixed by the server"
+            )
         if config.sample_size < 1 or config.sample_size > 100_000:
-            raise ApiError(400, "invalid_sample_size", "sample_size must be between 1 and 100000")
-        labels = self.path_policy.resolve_local(config.labels_csv, kind="labels_csv", must_exist=False)
+            raise ApiError(
+                400, "invalid_sample_size", "sample_size must be between 1 and 100000"
+            )
+        labels = self.path_policy.resolve_local(
+            config.labels_csv, kind="labels_csv", must_exist=False
+        )
         batch = ""
         if config.batch_csv.strip():
-            batch = str(self.path_policy.resolve_local(config.batch_csv, kind="batch_csv", must_exist=True))
-        annotations = self.path_policy.resolve_local(config.annotations_csv, kind="annotations_csv", must_exist=False)
+            batch = str(
+                self.path_policy.resolve_local(
+                    config.batch_csv, kind="batch_csv", must_exist=True
+                )
+            )
+        annotations = self.path_policy.resolve_local(
+            config.annotations_csv, kind="annotations_csv", must_exist=False
+        )
         if annotations.suffix.lower() != ".csv":
-            raise ApiError(400, "invalid_output_path", "annotations_csv must end in .csv")
+            raise ApiError(
+                400, "invalid_output_path", "annotations_csv must end in .csv"
+            )
         raw_dir = self.path_policy.resolve_raw_root(config.raw_dir)
         return replace(
             config,
@@ -380,7 +471,9 @@ class AnnotatorState:
             config = self.config
         return {
             "labels_csv": self.path_policy.display(config.labels_csv),
-            "batch_csv": self.path_policy.display(config.batch_csv) if config.batch_csv else "",
+            "batch_csv": self.path_policy.display(config.batch_csv)
+            if config.batch_csv
+            else "",
             "raw_dir": self.path_policy.display(config.raw_dir),
             "annotations_csv": self.path_policy.display(config.annotations_csv),
             "sample_size": config.sample_size,
@@ -413,21 +506,33 @@ class AnnotatorState:
                 labels_csv=str(values.get("labels_csv", current.labels_csv)),
                 batch_csv=str(values.get("batch_csv", current.batch_csv)),
                 raw_dir=str(values.get("raw_dir", current.raw_dir)),
-                annotations_csv=str(values.get("annotations_csv", current.annotations_csv)),
+                annotations_csv=str(
+                    values.get("annotations_csv", current.annotations_csv)
+                ),
                 sample_size=int(values.get("sample_size", current.sample_size)),
                 seed=int(values.get("seed", current.seed)),
-                stratify_by_class=_to_bool(values.get("stratify_by_class", current.stratify_by_class)),
+                stratify_by_class=_to_bool(
+                    values.get("stratify_by_class", current.stratify_by_class)
+                ),
                 annotator_id=str(values.get("annotator_id", current.annotator_id)),
             )
         except (TypeError, ValueError) as exc:
-            raise ApiError(400, "invalid_config", "sample_size and seed must be integers") from exc
+            raise ApiError(
+                400, "invalid_config", "sample_size and seed must be integers"
+            ) from exc
         return self._validated_config(updated, browser_update=True)
 
     @staticmethod
     def _reject_secret_columns(frame: pd.DataFrame) -> None:
-        blocked = sorted(column for column in frame.columns if SECRET_COLUMN.search(str(column)))
+        blocked = sorted(
+            column for column in frame.columns if SECRET_COLUMN.search(str(column))
+        )
         if blocked:
-            raise ApiError(400, "sensitive_metadata", "The batch contains secret-like metadata columns")
+            raise ApiError(
+                400,
+                "sensitive_metadata",
+                "The batch contains secret-like metadata columns",
+            )
 
     @staticmethod
     def _public_batch(frame: pd.DataFrame) -> list[dict[str, Any]]:
@@ -444,7 +549,9 @@ class AnnotatorState:
             "seed": config.seed,
             "stratify_by_class": config.stratify_by_class,
         }
-        digest = hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        digest = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         return f"batch-{digest[:16]}"
 
     def _read_batch_progress(self, batch_id: str) -> dict[str, Any]:
@@ -460,7 +567,9 @@ class AnnotatorState:
             annotator_id = self.config.annotator_id
             path = self.progress_path
         if not batch_id:
-            raise ApiError(409, "batch_not_loaded", "Load a batch before updating progress")
+            raise ApiError(
+                409, "batch_not_loaded", "Load a batch before updating progress"
+            )
         with _locked_path(path, self._lock):
             store = _read_json(path)
             batch_state = store["batches"].setdefault(batch_id, {})
@@ -478,7 +587,9 @@ class AnnotatorState:
             labels = pd.read_csv(labels_path)
             self._reject_secret_columns(labels)
             if "image_path" not in labels.columns:
-                raise ApiError(400, "invalid_labels", "labels_csv must contain image_path")
+                raise ApiError(
+                    400, "invalid_labels", "labels_csv must contain image_path"
+                )
             labels = labels.dropna(subset=["image_path"]).copy()
             labels["image_path"] = labels["image_path"].map(_safe_image_path)
 
@@ -490,7 +601,9 @@ class AnnotatorState:
             if candidates.empty:
                 raise ApiError(400, "empty_batch", "batch_csv is empty")
             if "image_path" not in candidates.columns:
-                raise ApiError(400, "invalid_batch", "batch_csv must contain image_path")
+                raise ApiError(
+                    400, "invalid_batch", "batch_csv must contain image_path"
+                )
             candidates = candidates.dropna(subset=["image_path"]).copy()
             candidates["image_path"] = candidates["image_path"].map(_safe_image_path)
             candidates = candidates.drop_duplicates(subset=["image_path"], keep="first")
@@ -510,11 +623,17 @@ class AnnotatorState:
         if isinstance(saved_order, list):
             by_path = candidates.set_index("image_path", drop=False)
             ordered = [str(path) for path in saved_order if str(path) in by_path.index]
-            batch_frame = by_path.loc[ordered].reset_index(drop=True) if ordered else candidates.iloc[0:0].copy()
+            batch_frame = (
+                by_path.loc[ordered].reset_index(drop=True)
+                if ordered
+                else candidates.iloc[0:0].copy()
+            )
         elif source == "batch_csv":
             batch_frame = candidates.head(config.sample_size).reset_index(drop=True)
         elif config.stratify_by_class:
-            batch_frame = _sample_stratified(candidates, config.sample_size, config.seed)
+            batch_frame = _sample_stratified(
+                candidates, config.sample_size, config.seed
+            )
         else:
             batch_frame = candidates.sample(
                 n=min(config.sample_size, len(candidates)), random_state=config.seed
@@ -525,10 +644,16 @@ class AnnotatorState:
             self.batch = public_batch
         if not saved_order:
             saved_progress = self._update_progress(
-                {"cursor": 0, "image_paths": [row["image_path"] for row in public_batch], "started_at": datetime.now(timezone.utc).isoformat()}
+                {
+                    "cursor": 0,
+                    "image_paths": [row["image_path"] for row in public_batch],
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                }
             )
         counts = self._annotation_counts()
-        cursor = min(max(int(saved_progress.get("cursor", 0)), 0), max(0, len(public_batch) - 1))
+        cursor = min(
+            max(int(saved_progress.get("cursor", 0)), 0), max(0, len(public_batch) - 1)
+        )
         return {
             "schema_version": SCHEMA_VERSION,
             "config": self.public_config(),
@@ -548,7 +673,9 @@ class AnnotatorState:
     def _assert_batch_image(self, image_path: Any) -> str:
         safe = _safe_image_path(str(image_path))
         if safe not in self._current_paths():
-            raise ApiError(403, "image_not_in_batch", "image_path is not in the active batch")
+            raise ApiError(
+                403, "image_not_in_batch", "image_path is not in the active batch"
+            )
         return safe
 
     def get_annotation(self, image_path: Any) -> dict[str, Any]:
@@ -567,7 +694,9 @@ class AnnotatorState:
         if matches.empty:
             return {"found": False, "image_path": safe}
         record = _json_ready(matches.iloc[-1][DEFAULT_COLUMNS].to_dict())
-        auxiliary = self._read_batch_progress(self.batch_id).get("unusable", {}).get(safe)
+        auxiliary = (
+            self._read_batch_progress(self.batch_id).get("unusable", {}).get(safe)
+        )
         return {"found": True, "record": record, "unusable_reason": auxiliary}
 
     def save_annotation(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -577,33 +706,54 @@ class AnnotatorState:
             config = self.config
             annotations_path = Path(config.annotations_csv)
         claimed_identity = payload.get("annotator_id")
-        if claimed_identity is not None and str(claimed_identity) != config.annotator_id:
-            raise ApiError(403, "identity_mismatch", "annotator_id is fixed by the server")
+        if (
+            claimed_identity is not None
+            and str(claimed_identity) != config.annotator_id
+        ):
+            raise ApiError(
+                403, "identity_mismatch", "annotator_id is fixed by the server"
+            )
         image_path = self._assert_batch_image(payload.get("image_path", ""))
         skip = _to_bool(payload.get("skip", False))
         score_value = payload.get("scenic_human")
         if score_value in (None, ""):
             if not skip:
-                raise ApiError(400, "score_required", "scenic_human is required unless the image is skipped")
+                raise ApiError(
+                    400,
+                    "score_required",
+                    "scenic_human is required unless the image is skipped",
+                )
             score: float | str = ""
         else:
             try:
                 score = float(score_value)
             except (TypeError, ValueError) as exc:
-                raise ApiError(400, "invalid_score", "scenic_human must be a number") from exc
+                raise ApiError(
+                    400, "invalid_score", "scenic_human must be a number"
+                ) from exc
             if not 0 <= score <= 10:
-                raise ApiError(400, "invalid_score", "scenic_human must be between 0 and 10")
+                raise ApiError(
+                    400, "invalid_score", "scenic_human must be between 0 and 10"
+                )
         confidence = str(payload.get("confidence", "medium")).lower()
         if confidence not in CONFIDENCE_VALUES:
-            raise ApiError(400, "invalid_confidence", "confidence must be low, medium, or high")
+            raise ApiError(
+                400, "invalid_confidence", "confidence must be low, medium, or high"
+            )
         notes = str(payload.get("notes", ""))
         if len(notes) > 4000:
-            raise ApiError(400, "notes_too_long", "notes must not exceed 4000 characters")
+            raise ApiError(
+                400, "notes_too_long", "notes must not exceed 4000 characters"
+            )
         reason = payload.get("unusable_reason")
         if reason not in (None, "") and str(reason) not in UNUSABLE_REASONS:
-            raise ApiError(400, "invalid_unusable_reason", "unusable_reason is unsupported")
+            raise ApiError(
+                400, "invalid_unusable_reason", "unusable_reason is unsupported"
+            )
         if reason and not skip:
-            raise ApiError(400, "invalid_unusable_reason", "unusable_reason requires skip=true")
+            raise ApiError(
+                400, "invalid_unusable_reason", "unusable_reason requires skip=true"
+            )
 
         record = {
             "image_path": image_path,
@@ -621,7 +771,10 @@ class AnnotatorState:
                     frame["annotator_id"].astype(str) == config.annotator_id
                 )
                 frame = frame.loc[~matching].copy()
-            frame = pd.concat([frame, pd.DataFrame([record], columns=DEFAULT_COLUMNS)], ignore_index=True)
+            frame = pd.concat(
+                [frame, pd.DataFrame([record], columns=DEFAULT_COLUMNS)],
+                ignore_index=True,
+            )
             _atomic_write(annotations_path, _csv_bytes(frame))
             row_count = len(frame)
 
@@ -654,7 +807,8 @@ class AnnotatorState:
     def _annotation_counts(self) -> dict[str, Any]:
         with self._lock:
             config = self.config
-            paths = self._current_paths()
+            batch = [dict(row) for row in self.batch]
+            paths = [str(row.get("image_path", "")) for row in batch]
         annotations_path = Path(config.annotations_csv)
         with _locked_path(annotations_path, self._lock):
             frame = _read_annotations(annotations_path)
@@ -665,16 +819,57 @@ class AnnotatorState:
                 frame["image_path"].astype(str).isin(paths)
                 & (frame["annotator_id"].astype(str) == config.annotator_id)
             ]
-        completed = int(own["image_path"].astype(str).nunique()) if not own.empty else 0
+        completed_paths = (
+            set(own["image_path"].astype(str)) if not own.empty else set()
+        )
+        completed = len(completed_paths)
         confidence = {name: 0 for name in sorted(CONFIDENCE_VALUES)}
         if not own.empty:
-            confidence.update({str(key): int(value) for key, value in own["confidence"].value_counts().items()})
+            confidence.update(
+                {
+                    str(key): int(value)
+                    for key, value in own["confidence"].value_counts().items()
+                }
+            )
         skipped = int(own["skip"].map(_to_bool).sum()) if not own.empty else 0
+        coverage: dict[str, dict[str, int]] = {}
+        for row in batch:
+            region = str(row.get("region") or "unknown")
+            region_counts = coverage.setdefault(region, {"completed": 0, "total": 0})
+            region_counts["total"] += 1
+            region_counts["completed"] += int(
+                str(row.get("image_path", "")) in completed_paths
+            )
+        overlap = frame.loc[
+            frame["image_path"].astype(str).isin(paths)
+            & ~frame["skip"].map(_to_bool)
+        ].copy()
+        overlap["scenic_human"] = pd.to_numeric(
+            overlap["scenic_human"], errors="coerce"
+        )
+        overlap = overlap.dropna(subset=["scenic_human"])
+        ranges = (
+            overlap.groupby("image_path")["scenic_human"].agg(["count", "min", "max"])
+            if not overlap.empty
+            else pd.DataFrame()
+        )
+        ranges = ranges.loc[ranges["count"] >= 2] if not ranges.empty else ranges
+        consistency = (
+            float(((ranges["max"] - ranges["min"]) <= 1.0).mean())
+            if not ranges.empty
+            else None
+        )
         return {
             "completed": completed,
             "remaining": max(0, len(paths) - completed),
             "skipped": skipped,
             "confidence": confidence,
+            "coverage": coverage,
+            "overlap_consistency": {
+                "tiles_with_overlap": int(len(ranges)),
+                "within_one_point_fraction": consistency,
+                "definition": "fraction of multi-annotator tiles with score range <= 1",
+            },
         }
 
     def summary(self) -> dict[str, Any]:
@@ -691,19 +886,25 @@ class AnnotatorState:
             },
         }
 
-    def image_bytes(self, image_path: Any, *, s3_client: Any | None) -> tuple[bytes, str]:
+    def image_bytes(
+        self, image_path: Any, *, s3_client: Any | None
+    ) -> tuple[bytes, str]:
         safe = self._assert_batch_image(image_path)
         with self._lock:
             raw_dir = self.config.raw_dir
         return _serve_image_bytes(raw_dir, safe, s3_client=s3_client)
 
 
-def make_handler(state: AnnotatorState, s3_client: Any | None = None) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    state: AnnotatorState, s3_client: Any | None = None
+) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "ScenicAnnotator/1"
 
         def _send_json(self, value: dict[str, Any], status: int = 200) -> None:
-            data = json.dumps(_json_ready(value), allow_nan=False, separators=(",", ":")).encode("utf-8")
+            data = json.dumps(
+                _json_ready(value), allow_nan=False, separators=(",", ":")
+            ).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -713,7 +914,9 @@ def make_handler(state: AnnotatorState, s3_client: Any | None = None) -> type[Ba
             self.wfile.write(data)
 
         def _send_error(self, error: ApiError) -> None:
-            payload: dict[str, Any] = {"error": {"code": error.code, "message": error.message}}
+            payload: dict[str, Any] = {
+                "error": {"code": error.code, "message": error.message}
+            }
             if error.details:
                 payload["error"]["details"] = error.details
             self._send_json(payload, error.status)
@@ -723,15 +926,25 @@ def make_handler(state: AnnotatorState, s3_client: Any | None = None) -> type[Ba
             try:
                 length = int(raw_length or "0")
             except ValueError as exc:
-                raise ApiError(400, "invalid_content_length", "Content-Length must be an integer") from exc
+                raise ApiError(
+                    400, "invalid_content_length", "Content-Length must be an integer"
+                ) from exc
             if length <= 0 or length > MAX_JSON_BYTES:
-                raise ApiError(413 if length > MAX_JSON_BYTES else 400, "invalid_body", "A bounded JSON body is required")
+                raise ApiError(
+                    413 if length > MAX_JSON_BYTES else 400,
+                    "invalid_body",
+                    "A bounded JSON body is required",
+                )
             try:
                 value = json.loads(self.rfile.read(length).decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ApiError(400, "invalid_json", "Request body must be valid UTF-8 JSON") from exc
+                raise ApiError(
+                    400, "invalid_json", "Request body must be valid UTF-8 JSON"
+                ) from exc
             if not isinstance(value, dict):
-                raise ApiError(400, "invalid_json", "Request body must be a JSON object")
+                raise ApiError(
+                    400, "invalid_json", "Request body must be a JSON object"
+                )
             return value
 
         def _route(self, method: str) -> None:
@@ -740,18 +953,31 @@ def make_handler(state: AnnotatorState, s3_client: Any | None = None) -> type[Ba
                 try:
                     html = TEMPLATE_PATH.read_bytes()
                 except OSError as exc:
-                    raise ApiError(500, "template_unavailable", "The annotation interface is unavailable") from exc
+                    raise ApiError(
+                        500,
+                        "template_unavailable",
+                        "The annotation interface is unavailable",
+                    ) from exc
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'")
+                self.send_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'; img-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'",
+                )
                 self.send_header("Content-Length", str(len(html)))
                 self.end_headers()
                 self.wfile.write(html)
                 return
             if method == "GET" and parsed.path in {"/api/default-config", "/api/state"}:
-                self._send_json({"schema_version": SCHEMA_VERSION, "config": state.public_config(), "summary": state.summary()})
+                self._send_json(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "config": state.public_config(),
+                        "summary": state.summary(),
+                    }
+                )
                 return
             if method == "GET" and parsed.path == "/api/summary":
                 self._send_json(state.summary())
@@ -790,7 +1016,11 @@ def make_handler(state: AnnotatorState, s3_client: Any | None = None) -> type[Ba
             except ApiError as error:
                 self._send_error(error)
             except Exception:
-                self._send_error(ApiError(500, "internal_error", "The request could not be completed"))
+                self._send_error(
+                    ApiError(
+                        500, "internal_error", "The request could not be completed"
+                    )
+                )
 
         def do_POST(self) -> None:  # noqa: N802
             try:
@@ -798,7 +1028,11 @@ def make_handler(state: AnnotatorState, s3_client: Any | None = None) -> type[Ba
             except ApiError as error:
                 self._send_error(error)
             except Exception:
-                self._send_error(ApiError(500, "internal_error", "The request could not be completed"))
+                self._send_error(
+                    ApiError(
+                        500, "internal_error", "The request could not be completed"
+                    )
+                )
 
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
             return
@@ -816,18 +1050,30 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run local web annotator for scenic tiles")
+    parser = argparse.ArgumentParser(
+        description="Run local web annotator for scenic tiles"
+    )
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--labels-csv", type=str, default="data/raw/labels.csv")
     parser.add_argument("--batch-csv", type=str, default="")
     parser.add_argument("--raw-dir", type=str, default="data/raw")
-    parser.add_argument("--annotations-csv", type=str, default="data/raw/labels_human.csv")
+    parser.add_argument(
+        "--annotations-csv", type=str, default="data/raw/labels_human.csv"
+    )
     parser.add_argument("--sample-size", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--stratify-by-class", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--annotator-id", type=str, default=os.getenv("USER", "annotator"))
-    parser.add_argument("--allow-remote", action="store_true", help="Explicitly allow binding to a non-loopback host")
+    parser.add_argument(
+        "--stratify-by-class", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--annotator-id", type=str, default=os.getenv("USER", "annotator")
+    )
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Explicitly allow binding to a non-loopback host",
+    )
     parser.add_argument(
         "--allowed-s3-root",
         action="append",

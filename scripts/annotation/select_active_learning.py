@@ -5,14 +5,31 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
-from src.active_learning.selection import SelectionConfig, run_selection
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+from src.active_learning.selection import SelectionConfig, run_selection  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Select a deterministic active-learning annotation batch")
-    parser.add_argument("--candidate-input", "--candidates", "--input", dest="candidate_input", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("data/processed/active_learning"))
+    parser = argparse.ArgumentParser(
+        description="Select a deterministic active-learning annotation batch"
+    )
+    parser.add_argument(
+        "--candidate-input",
+        "--candidates",
+        "--input",
+        dest="candidate_input",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("data/processed/active_learning")
+    )
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
@@ -47,9 +64,26 @@ def main() -> None:
         random_control_fraction=args.random_control_fraction,
         weights=weights or SelectionConfig().weights,
     )
-    artifacts = run_selection(args.candidate_input, output_dir=args.output_dir, run_name=args.run_name, config=config, prior_annotations=args.prior_annotations)
+    artifacts = run_selection(
+        args.candidate_input,
+        output_dir=args.output_dir,
+        run_name=args.run_name,
+        config=config,
+        prior_annotations=args.prior_annotations,
+    )
     root = args.output_dir / args.run_name
-    print(json.dumps({"run_root": str(root), "batch": str(root / "annotation_batch.csv"), "rows": len(artifacts.selected), "batch_id": artifacts.selected.attrs.get("batch_id"), "leakage_audit_valid": artifacts.leakage_audit.get("valid", False)}, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "run_root": str(root),
+                "batch": str(root / "annotation_batch.csv"),
+                "rows": len(artifacts.selected),
+                "batch_id": artifacts.selected.attrs.get("batch_id"),
+                "leakage_audit_valid": artifacts.leakage_audit.get("valid", False),
+            },
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":

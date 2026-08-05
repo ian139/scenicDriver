@@ -14,7 +14,7 @@ import hashlib
 import json
 import math
 import re
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -22,11 +22,23 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from .common import atomic_write_json, jsonable, sha256_bytes, sha256_file
+from .common import (
+    atomic_write_json,
+    atomic_write_text,
+    jsonable,
+    sha256_bytes,
+    sha256_file,
+)
 
 SCHEMA_VERSION = 1
 
-IMAGE_COLUMNS = ("image_path", "satellite_path", "image_id", "tile_id", "image_identity")
+IMAGE_COLUMNS = (
+    "image_path",
+    "satellite_path",
+    "image_id",
+    "tile_id",
+    "image_identity",
+)
 MODEL_COLUMNS = (
     "model_score",
     "model_prediction",
@@ -102,7 +114,15 @@ def _to_bool(value: Any) -> bool:
         pass
     if isinstance(value, (int, float, np.integer, np.floating)):
         return bool(value)
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "t", "on", "completed"}
+    return str(value).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "t",
+        "on",
+        "completed",
+    }
 
 
 def _first_column(frame: pd.DataFrame, names: Sequence[str]) -> pd.Series:
@@ -179,7 +199,9 @@ def _tile_parts(row: pd.Series) -> tuple[int | None, int | None, int | None]:
     values: list[int | None] = []
     for name in ("z", "zoom"):
         if name in row.index:
-            values.append(int(float(row[name])) if _finite_number(row[name]) is not None else None)
+            values.append(
+                int(float(row[name])) if _finite_number(row[name]) is not None else None
+            )
             break
     else:
         values.append(None)
@@ -192,7 +214,13 @@ def _tile_parts(row: pd.Series) -> tuple[int | None, int | None, int | None]:
             values.append(None)
     if all(value is not None for value in values):
         return values[0], values[1], values[2]  # type: ignore[return-value]
-    for name in ("tile_id", "image_id", "image_identity", "image_path", "satellite_path"):
+    for name in (
+        "tile_id",
+        "image_id",
+        "image_identity",
+        "image_path",
+        "satellite_path",
+    ):
         if name in row.index:
             parsed = _parse_triplet(row[name])
             if all(value is not None for value in parsed):
@@ -252,7 +280,12 @@ def _haversine_km(lat_a: float, lon_a: float, lat_b: float, lon_b: float) -> flo
     radians = math.pi / 180.0
     d_lat = (lat_b - lat_a) * radians
     d_lon = (lon_b - lon_a) * radians
-    a = math.sin(d_lat / 2) ** 2 + math.cos(lat_a * radians) * math.cos(lat_b * radians) * math.sin(d_lon / 2) ** 2
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(lat_a * radians)
+        * math.cos(lat_b * radians)
+        * math.sin(d_lon / 2) ** 2
+    )
     return 6371.0088 * 2 * math.asin(min(1.0, math.sqrt(max(0.0, a))))
 
 
@@ -268,66 +301,134 @@ def _tile_key(z: int | None, x: int | None, y: int | None, identity: str) -> str
     return f"image:{identity}"
 
 
-def _canonicalise(frame: pd.DataFrame, *, seed: int = 0, deduplicate: bool = True) -> pd.DataFrame:
+def _canonicalise(
+    frame: pd.DataFrame, *, seed: int = 0, deduplicate: bool = True
+) -> pd.DataFrame:
     if not isinstance(frame, pd.DataFrame):
         raise TypeError("candidate input must be a pandas DataFrame")
     if frame.empty:
         raise ValueError("candidate input has no rows")
     out = frame.copy()
-    identity_values: list[str] = []
-    image_values: list[str] = []
-    satellite_values: list[str] = []
-    terrain_values: list[str] = []
-    regions: list[str] = []
-    classes: list[str] = []
-    zs: list[int | None] = []
-    xs: list[int | None] = []
-    ys: list[int | None] = []
-    tile_keys: list[str] = []
-    vectors: list[list[float] | None] = []
-    for _, row in out.iterrows():
-        identity = ""
-        for name in ("image_identity", "image_id", "tile_id", "image_path", "satellite_path"):
-            if name in row.index:
-                identity = _clean_text(row[name])
-                if identity:
-                    break
-        if not identity:
-            raise ValueError("candidate rows require image_path, satellite_path, image_id, or tile_id")
-        image = _clean_text(row.get("image_path")) or _clean_text(row.get("satellite_path")) or identity
-        satellite = _clean_text(row.get("satellite_path")) or image
-        terrain = _clean_text(row.get("terrain_path"))
-        region = _clean_text(row.get("region")) or "unknown"
-        class_id = _clean_text(row.get("class_id")) or "unknown"
-        z, x, y = _tile_parts(row)
-        identity_values.append(identity)
-        image_values.append(image)
-        satellite_values.append(satellite)
-        terrain_values.append(terrain)
-        regions.append(region)
-        classes.append(class_id)
-        zs.append(z)
-        xs.append(x)
-        ys.append(y)
-        tile_keys.append(_tile_key(z, x, y, identity))
-        vectors.append(_feature_vector(row))
-    out["image_path"] = image_values
-    out["satellite_path"] = satellite_values
-    out["terrain_path"] = terrain_values
-    out["region"] = regions
-    out["class_id"] = classes
-    out["z"] = pd.array(zs, dtype="Int64")
-    out["x"] = pd.array(xs, dtype="Int64")
-    out["y"] = pd.array(ys, dtype="Int64")
-    out["_image_identity"] = identity_values
+
+    identity_columns = [
+        name
+        for name in (
+            "image_identity",
+            "image_id",
+            "tile_id",
+            "image_path",
+            "satellite_path",
+        )
+        if name in out.columns
+    ]
+    if not identity_columns:
+        raise ValueError(
+            "candidate rows require image_path, satellite_path, image_id, or tile_id"
+        )
+    identities = (
+        pd.concat([out[name].map(_clean_text) for name in identity_columns], axis=1)
+        .replace("", np.nan)
+        .bfill(axis=1)
+        .iloc[:, 0]
+        .fillna("")
+    )
+    if identities.eq("").any():
+        raise ValueError(
+            "candidate rows require image_path, satellite_path, image_id, or tile_id"
+        )
+
+    image = (
+        out["image_path"].map(_clean_text)
+        if "image_path" in out
+        else pd.Series("", index=out.index)
+    )
+    satellite = (
+        out["satellite_path"].map(_clean_text)
+        if "satellite_path" in out
+        else pd.Series("", index=out.index)
+    )
+    terrain = (
+        out["terrain_path"].map(_clean_text)
+        if "terrain_path" in out
+        else pd.Series("", index=out.index)
+    )
+    image = image.mask(image.eq(""), satellite).mask(
+        lambda value: value.eq(""), identities
+    )
+    satellite = satellite.mask(satellite.eq(""), image)
+    out["image_path"] = image
+    out["satellite_path"] = satellite
+    out["terrain_path"] = terrain
+    out["region"] = (
+        out["region"].map(_clean_text).replace("", "unknown")
+        if "region" in out
+        else "unknown"
+    )
+    out["class_id"] = (
+        out["class_id"].map(_clean_text).replace("", "unknown")
+        if "class_id" in out
+        else "unknown"
+    )
+
+    coordinate_values: dict[str, pd.Series] = {}
+    for name in ("z", "x", "y"):
+        coordinate_values[name] = (
+            pd.to_numeric(out[name], errors="coerce")
+            if name in out
+            else pd.Series(np.nan, index=out.index)
+        )
+    missing_coordinates = (
+        coordinate_values["z"].isna()
+        | coordinate_values["x"].isna()
+        | coordinate_values["y"].isna()
+    )
+    if missing_coordinates.any():
+        for index in out.index[missing_coordinates]:
+            z, x, y = _tile_parts(out.loc[index])
+            coordinate_values["z"].loc[index] = z
+            coordinate_values["x"].loc[index] = x
+            coordinate_values["y"].loc[index] = y
+    for name in ("z", "x", "y"):
+        out[name] = pd.array(coordinate_values[name], dtype="Int64")
+
+    tile_keys = [
+        _tile_key(
+            None if pd.isna(z) else int(z),
+            None if pd.isna(x) else int(x),
+            None if pd.isna(y) else int(y),
+            str(identity),
+        )
+        for z, x, y, identity in zip(
+            out["z"], out["x"], out["y"], identities, strict=True
+        )
+    ]
+    vector_columns = {
+        "embedding",
+        "embedding_vector",
+        "features",
+        "feature_vector",
+    }.intersection(out.columns)
+    vector_columns.update(
+        column
+        for column in out.columns
+        if str(column).startswith(("embedding_", "feature_"))
+    )
+    vectors = (
+        [_feature_vector(row) for _, row in out.iterrows()]
+        if vector_columns
+        else [None] * len(out)
+    )
+    out["_image_identity"] = identities.astype(str)
     out["_tile_key"] = tile_keys
     out["_feature_vector"] = vectors
     out["_stable_key"] = [_stable_key(value, seed) for value in tile_keys]
-    out = out.sort_values(["_stable_key", "image_path"], kind="mergesort").reset_index(drop=True)
-    # A tile is an identity even if two candidate rows point at different style
-    # files.  Keeping one row prevents style duplicates from dominating a batch.
+    out = out.sort_values(["_stable_key", "image_path"], kind="mergesort").reset_index(
+        drop=True
+    )
     if deduplicate:
-        out = out.drop_duplicates(subset=["_tile_key"], keep="first").reset_index(drop=True)
+        out = out.drop_duplicates(subset=["_tile_key"], keep="first").reset_index(
+            drop=True
+        )
     return out
 
 
@@ -351,7 +452,13 @@ def _prior_identity_set(prior_annotations: Any) -> set[str]:
         prior = prior.loc[pd.to_numeric(prior["scenic_human"], errors="coerce").notna()]
     result: set[str] = set()
     for _, row in prior.iterrows():
-        for name in ("image_path", "satellite_path", "image_identity", "image_id", "tile_id"):
+        for name in (
+            "image_path",
+            "satellite_path",
+            "image_identity",
+            "image_id",
+            "tile_id",
+        ):
             if name in row.index:
                 value = _clean_text(row[name])
                 if value:
@@ -371,6 +478,13 @@ def _prepare_for_selection(
     prior_annotations: Any = None,
 ) -> pd.DataFrame:
     out = _canonicalise(candidates, seed=seed)
+    if "satellite_present" in out.columns:
+        available = out["satellite_present"].map(_to_bool)
+        if "terrain_present" in out.columns:
+            available &= out["terrain_present"].map(_to_bool)
+        out = out.loc[available].reset_index(drop=True)
+        if out.empty:
+            raise ValueError("candidate input contains no available paired imagery")
     model = _column_numeric(out, MODEL_COLUMNS)
     heuristic = _column_numeric(out, HEURISTIC_COLUMNS)
     uncertainty = _column_numeric(out, UNCERTAINTY_COLUMNS)
@@ -379,8 +493,14 @@ def _prepare_for_selection(
     out["_uncertainty_raw"] = uncertainty
     model_norm = _normalise(model)
     heuristic_norm = _normalise(heuristic)
-    out["score_disagreement"] = (model_norm - heuristic_norm).abs().where(model.notna() & heuristic.notna(), 0.0)
-    out["score_uncertainty"] = _normalise_nonnegative(uncertainty).where(uncertainty.notna(), 0.0)
+    out["score_disagreement"] = (
+        (model_norm - heuristic_norm)
+        .abs()
+        .where(model.notna() & heuristic.notna(), 0.0)
+    )
+    out["score_uncertainty"] = _normalise_nonnegative(uncertainty).where(
+        uncertainty.notna(), 0.0
+    )
     out["uncertainty_available"] = bool(uncertainty.notna().any())
     out["model_score_available"] = model.notna()
     out["heuristic_score_available"] = heuristic.notna()
@@ -395,28 +515,50 @@ def _prepare_for_selection(
         out.loc[model.isna(), "score_band"] = "unknown"
     else:
         out["score_band"] = "unknown"
-    band_counts = out.loc[out["score_band"].ne("unknown"), "score_band"].value_counts().to_dict()
+    band_counts = (
+        out.loc[out["score_band"].ne("unknown"), "score_band"].value_counts().to_dict()
+    )
     n_scored = sum(int(value) for value in band_counts.values())
     band_targets = {
         band: max(1.0, n_scored * fraction)
         for band, fraction in (("low", 0.25), ("middle", 0.50), ("high", 0.25))
     }
-    out["score_band_score"] = out["score_band"].map(
-        lambda value: max(0.0, (band_targets.get(str(value), 0.0) - band_counts.get(str(value), 0)) / max(1.0, band_targets.get(str(value), 1.0)))
-    ).astype(float)
+    out["score_band_score"] = (
+        out["score_band"]
+        .map(
+            lambda value: max(
+                0.0,
+                (band_targets.get(str(value), 0.0) - band_counts.get(str(value), 0))
+                / max(1.0, band_targets.get(str(value), 1.0)),
+            )
+        )
+        .astype(float)
+    )
     cluster = _first_column(out, CLUSTER_COLUMNS).map(_clean_text)
     out["_cluster"] = cluster
     cluster_counts = cluster.where(cluster.ne(""), "unknown").value_counts().to_dict()
     max_cluster = max(cluster_counts.values(), default=1)
-    out["score_diversity"] = cluster.where(cluster.ne(""), "unknown").map(
-        lambda value: 1.0 - (cluster_counts.get(value or "unknown", 1) - 1) / max(1, max_cluster)
-    ).clip(0.0, 1.0).astype(float)
+    out["score_diversity"] = (
+        cluster.where(cluster.ne(""), "unknown")
+        .map(
+            lambda value: (
+                1.0
+                - (cluster_counts.get(value or "unknown", 1) - 1) / max(1, max_cluster)
+            )
+        )
+        .clip(0.0, 1.0)
+        .astype(float)
+    )
     strata = out["region"].astype(str) + "\0" + out["class_id"].astype(str)
     strata_counts = strata.value_counts().to_dict()
     max_stratum = max(strata_counts.values(), default=1)
-    out["score_underrepresented"] = strata.map(
-        lambda value: 1.0 - (strata_counts.get(value, 1) - 1) / max(1, max_stratum)
-    ).clip(0.0, 1.0).astype(float)
+    out["score_underrepresented"] = (
+        strata.map(
+            lambda value: 1.0 - (strata_counts.get(value, 1) - 1) / max(1, max_stratum)
+        )
+        .clip(0.0, 1.0)
+        .astype(float)
+    )
     out["_stratum"] = strata
     out["_random_key"] = [
         _stable_int(seed, f"random-control\0{tile_key}") / float(2**64 - 1)
@@ -431,17 +573,29 @@ def _prepare_for_selection(
     annotated_markers |= out["image_path"].isin(prior_ids)
     annotated_markers |= out["_tile_key"].isin(prior_ids)
     out["_prior_annotated"] = annotated_markers
-    out["_prior_identity"] = out["_image_identity"].isin(prior_ids) | out["image_path"].isin(prior_ids) | out["_tile_key"].isin(prior_ids)
+    out["_prior_identity"] = (
+        out["_image_identity"].isin(prior_ids)
+        | out["image_path"].isin(prior_ids)
+        | out["_tile_key"].isin(prior_ids)
+    )
     return out
 
 
-def _vector_distance(a: Sequence[float] | None, b: Sequence[float] | None) -> float | None:
+def _vector_distance(
+    a: Sequence[float] | None, b: Sequence[float] | None
+) -> float | None:
     if a is None or b is None or len(a) != len(b) or not a:
         return None
     return float(math.sqrt(sum((left - right) ** 2 for left, right in zip(a, b))))
 
 
-def _blocked(row: pd.Series, selected: Iterable[pd.Series], *, adjacency_radius: int, min_separation_km: float) -> bool:
+def _blocked(
+    row: pd.Series,
+    selected: Iterable[pd.Series],
+    *,
+    adjacency_radius: int,
+    min_separation_km: float,
+) -> bool:
     z, x, y = row.get("z"), row.get("x"), row.get("y")
     z = int(z) if _finite_number(z) is not None else None
     x = int(x) if _finite_number(x) is not None else None
@@ -454,17 +608,35 @@ def _blocked(row: pd.Series, selected: Iterable[pd.Series], *, adjacency_radius:
         pz = int(pz) if _finite_number(pz) is not None else None
         px = int(px) if _finite_number(px) is not None else None
         py = int(py) if _finite_number(py) is not None else None
-        if None not in (z, x, y, pz, px, py) and z == pz:
+        if (
+            z is not None
+            and x is not None
+            and y is not None
+            and pz is not None
+            and px is not None
+            and py is not None
+            and z == pz
+        ):
             if max(abs(x - px), abs(y - py)) <= max(0, int(adjacency_radius)):
                 return True
         if min_separation_km > 0.0 and lat is not None and lon is not None:
             p_lat, p_lon = _row_lat_lon(previous)
-            if p_lat is not None and p_lon is not None and _haversine_km(lat, lon, p_lat, p_lon) < min_separation_km:
+            if (
+                p_lat is not None
+                and p_lon is not None
+                and _haversine_km(lat, lon, p_lat, p_lon) < min_separation_km
+            ):
                 return True
     return False
 
 
-def _dynamic_components(row: pd.Series, selected: list[pd.Series], selected_regions: set[str], selected_clusters: set[str], target_bands: Mapping[str, float]) -> dict[str, float]:
+def _dynamic_components(
+    row: pd.Series,
+    selected: list[pd.Series],
+    selected_regions: set[str],
+    selected_clusters: set[str],
+    target_bands: Mapping[str, float],
+) -> dict[str, float]:
     components = {
         "disagreement": float(row.get("score_disagreement", 0.0) or 0.0),
         "uncertainty": float(row.get("score_uncertainty", 0.0) or 0.0),
@@ -481,12 +653,17 @@ def _dynamic_components(row: pd.Series, selected: list[pd.Series], selected_regi
         components["diversity"] = min(components["diversity"], 0.25)
     vector = row.get("_feature_vector")
     if selected and vector is not None:
-        distances = [_vector_distance(vector, previous.get("_feature_vector")) for previous in selected]
-        distances = [distance for distance in distances if distance is not None]
+        raw_distances = [
+            _vector_distance(vector, previous.get("_feature_vector"))
+            for previous in selected
+        ]
+        distances = [distance for distance in raw_distances if distance is not None]
         if distances:
             # A scale of one is intentionally conservative: feature vectors are
             # often already normalized, while raw distances remain auditable.
-            components["diversity"] = max(components["diversity"], min(1.0, min(distances)))
+            components["diversity"] = max(
+                components["diversity"], min(1.0, min(distances))
+            )
     region = _clean_text(row.get("region")) or "unknown"
     geographic = 1.0 if region not in selected_regions else 0.0
     lat, lon = _row_lat_lon(row)
@@ -503,32 +680,67 @@ def _dynamic_components(row: pd.Series, selected: list[pd.Series], selected_regi
     if band in target_bands:
         components["score_band"] = max(
             components["score_band"],
-            max(0.0, target_bands[band] - sum(1 for item in selected if _clean_text(item.get("score_band")) == band)) / max(1.0, target_bands[band]),
+            max(
+                0.0,
+                target_bands[band]
+                - sum(
+                    1
+                    for item in selected
+                    if _clean_text(item.get("score_band")) == band
+                ),
+            )
+            / max(1.0, target_bands[band]),
         )
-    return {name: float(max(0.0, min(1.0, value))) for name, value in components.items()}
+    return {
+        name: float(max(0.0, min(1.0, value))) for name, value in components.items()
+    }
 
 
-def _weighted_score(components: Mapping[str, float], weights: Mapping[str, float]) -> float:
-    return float(sum(float(weights.get(name, 0.0)) * float(value) for name, value in components.items()))
+def _weighted_score(
+    components: Mapping[str, float], weights: Mapping[str, float]
+) -> float:
+    return float(
+        sum(
+            float(weights.get(name, 0.0)) * float(value)
+            for name, value in components.items()
+        )
+    )
 
 
 def _reason(components: Mapping[str, float]) -> str:
-    order = ("disagreement", "uncertainty", "diversity", "geographic", "underrepresented", "score_band", "random_control")
-    best = max(order, key=lambda name: (float(components.get(name, 0.0)), -order.index(name)))
+    order = (
+        "disagreement",
+        "uncertainty",
+        "diversity",
+        "geographic",
+        "underrepresented",
+        "score_band",
+        "random_control",
+    )
+    best = max(
+        order, key=lambda name: (float(components.get(name, 0.0)), -order.index(name))
+    )
     return REASON_NAMES[best]
 
 
 def _normalise_weights(weights: Mapping[str, float] | None) -> dict[str, float]:
     result = dict(DEFAULT_WEIGHTS)
     if weights:
-        aliases = {"geographic_coverage": "geographic", "underrepresented_strata": "underrepresented", "band": "score_band", "random": "random_control"}
+        aliases = {
+            "geographic_coverage": "geographic",
+            "underrepresented_strata": "underrepresented",
+            "band": "score_band",
+            "random": "random_control",
+        }
         for key, value in weights.items():
             canonical = aliases.get(str(key), str(key))
             if canonical not in result:
                 raise ValueError(f"unknown selection weight: {key}")
             number = _finite_number(value)
             if number is None or number < 0:
-                raise ValueError(f"selection weight must be finite and non-negative: {key}")
+                raise ValueError(
+                    f"selection weight must be finite and non-negative: {key}"
+                )
             result[canonical] = float(number)
     if sum(result.values()) <= 0:
         raise ValueError("at least one selection weight must be positive")
@@ -575,7 +787,9 @@ def select_batch(
     if float(config.min_separation_km) < 0:
         raise ValueError("min_separation_km must be non-negative")
     weights = _normalise_weights(config.weights)
-    prepared = _prepare_for_selection(candidates, seed=int(config.seed), prior_annotations=prior_annotations)
+    prepared = _prepare_for_selection(
+        candidates, seed=int(config.seed), prior_annotations=prior_annotations
+    )
     eligible = prepared.loc[~prepared["_prior_annotated"]].copy()
     overlap_pool = prepared.loc[prepared["_prior_annotated"]].copy()
     scored_count = int(prepared["model_score_available"].sum())
@@ -587,24 +801,78 @@ def select_batch(
     requested_overlap = max(0, min(batch_size, requested_overlap))
     requested_controls = int(config.random_control_count)
     if requested_controls <= 0 and float(config.random_control_fraction) > 0:
-        requested_controls = int(round(batch_size * float(config.random_control_fraction)))
+        requested_controls = int(
+            round(batch_size * float(config.random_control_fraction))
+        )
     requested_controls = max(0, min(batch_size - requested_overlap, requested_controls))
     regular_capacity = max(0, batch_size - requested_overlap)
+    eligible_pool_count = len(eligible)
+    shortlist_limit = max(5_000, regular_capacity * 50)
+    if len(eligible) > shortlist_limit:
+        eligible = eligible.copy()
+        eligible["_static_selection_score"] = (
+            eligible["score_disagreement"] * weights["disagreement"]
+            + eligible["score_uncertainty"] * weights["uncertainty"]
+            + eligible["score_diversity"] * weights["diversity"]
+            + eligible["score_underrepresented"] * weights["underrepresented"]
+            + eligible["score_band_score"] * weights["score_band"]
+        )
+        representative_indices = (
+            eligible.sort_values(
+                ["_static_selection_score", "_stable_key"],
+                ascending=[False, True],
+                kind="mergesort",
+            )
+            .groupby(["region", "class_id"], sort=True)
+            .head(1)
+            .index.tolist()
+        )
+        ranked_indices = (
+            eligible.sort_values(
+                ["_static_selection_score", "_stable_key"],
+                ascending=[False, True],
+                kind="mergesort",
+            )
+            .head(max(1, shortlist_limit * 3 // 4))
+            .index.tolist()
+        )
+        exploratory_indices = (
+            eligible.sort_values(["_random_key", "_stable_key"], kind="mergesort")
+            .head(shortlist_limit - len(ranked_indices))
+            .index.tolist()
+        )
+        shortlist = list(
+            dict.fromkeys(representative_indices + ranked_indices + exploratory_indices)
+        )
+        eligible = eligible.loc[shortlist[:shortlist_limit]].copy()
     selected_indices: list[int] = []
     records: dict[int, dict[str, Any]] = {}
     selected_rows: list[pd.Series] = []
     selected_regions: set[str] = set()
     selected_clusters: set[str] = set()
-    band_targets = {"low": max(1.0, regular_capacity * 0.25), "middle": max(1.0, regular_capacity * 0.50), "high": max(1.0, regular_capacity * 0.25)}
+    band_targets = {
+        "low": max(1.0, regular_capacity * 0.25),
+        "middle": max(1.0, regular_capacity * 0.50),
+        "high": max(1.0, regular_capacity * 0.25),
+    }
 
-    def add(index: int, components: Mapping[str, float], *, reason: str, control: bool = False, overlap: bool = False) -> None:
+    def add(
+        index: int,
+        components: Mapping[str, float],
+        *,
+        reason: str,
+        control: bool = False,
+        overlap: bool = False,
+    ) -> None:
         row = prepared.loc[index]
         selected_indices.append(index)
         selected_rows.append(row)
         selected_regions.add(_clean_text(row.get("region")) or "unknown")
         selected_clusters.add(_clean_text(row.get("_cluster")) or "unknown")
         payload = dict(components)
-        payload["random_control"] = float(row.get("_random_key", 0.0)) if control else 0.0
+        payload["random_control"] = (
+            float(row.get("_random_key", 0.0)) if control else 0.0
+        )
         records[index] = {
             "components": payload,
             "selection_score": _weighted_score(payload, weights),
@@ -616,25 +884,61 @@ def select_batch(
     # Controls are deterministic random draws, but remain subject to spatial
     # exclusion so the control cannot itself create a duplicate-heavy batch.
     if requested_controls:
-        control_order = sorted(eligible.index.tolist(), key=lambda index: (float(prepared.loc[index, "_random_key"]), prepared.loc[index, "_stable_key"]))
+        control_order = sorted(
+            eligible.index.tolist(),
+            key=lambda index: (
+                float(prepared.loc[index, "_random_key"]),
+                prepared.loc[index, "_stable_key"],
+            ),
+        )
         for index in control_order:
-            if len([item for item in selected_indices if not records[item]["is_qa_overlap"]]) >= min(regular_capacity, requested_controls):
+            if len(
+                [
+                    item
+                    for item in selected_indices
+                    if not records[item]["is_qa_overlap"]
+                ]
+            ) >= min(regular_capacity, requested_controls):
                 break
             row = prepared.loc[index]
-            if _blocked(row, selected_rows, adjacency_radius=int(config.adjacency_radius), min_separation_km=float(config.min_separation_km)):
+            if _blocked(
+                row,
+                selected_rows,
+                adjacency_radius=int(config.adjacency_radius),
+                min_separation_km=float(config.min_separation_km),
+            ):
                 continue
-            components = _dynamic_components(row, selected_rows, selected_regions, selected_clusters, band_targets)
+            components = _dynamic_components(
+                row, selected_rows, selected_regions, selected_clusters, band_targets
+            )
             add(index, components, reason="random_control", control=True)
 
-    while len([item for item in selected_indices if not records[item]["is_qa_overlap"]]) < regular_capacity:
+    while (
+        len([item for item in selected_indices if not records[item]["is_qa_overlap"]])
+        < regular_capacity
+    ):
         available = [index for index in eligible.index.tolist() if index not in records]
         ranked: list[tuple[float, str, int, dict[str, float]]] = []
         for index in available:
             row = prepared.loc[index]
-            if _blocked(row, selected_rows, adjacency_radius=int(config.adjacency_radius), min_separation_km=float(config.min_separation_km)):
+            if _blocked(
+                row,
+                selected_rows,
+                adjacency_radius=int(config.adjacency_radius),
+                min_separation_km=float(config.min_separation_km),
+            ):
                 continue
-            components = _dynamic_components(row, selected_rows, selected_regions, selected_clusters, band_targets)
-            ranked.append((_weighted_score(components, weights), str(row["_stable_key"]), index, components))
+            components = _dynamic_components(
+                row, selected_rows, selected_regions, selected_clusters, band_targets
+            )
+            ranked.append(
+                (
+                    _weighted_score(components, weights),
+                    str(row["_stable_key"]),
+                    index,
+                    components,
+                )
+            )
         if not ranked:
             break
         ranked.sort(key=lambda item: (-item[0], item[1]))
@@ -645,48 +949,112 @@ def select_batch(
     # filter, but are still kept spatially separate from one another and from
     # newly selected rows.
     if requested_overlap:
-        overlap_order = sorted(overlap_pool.index.tolist(), key=lambda index: (prepared.loc[index, "_stable_key"], prepared.loc[index, "_image_identity"]))
+        overlap_order = sorted(
+            overlap_pool.index.tolist(),
+            key=lambda index: (
+                prepared.loc[index, "_stable_key"],
+                prepared.loc[index, "_image_identity"],
+            ),
+        )
         for index in overlap_order:
             if len(selected_indices) >= batch_size:
                 break
             row = prepared.loc[index]
-            if _blocked(row, selected_rows, adjacency_radius=int(config.adjacency_radius), min_separation_km=float(config.min_separation_km)):
+            if _blocked(
+                row,
+                selected_rows,
+                adjacency_radius=int(config.adjacency_radius),
+                min_separation_km=float(config.min_separation_km),
+            ):
                 continue
-            components = _dynamic_components(row, selected_rows, selected_regions, selected_clusters, band_targets)
+            components = _dynamic_components(
+                row, selected_rows, selected_regions, selected_clusters, band_targets
+            )
             add(index, components, reason="qa_overlap", overlap=True)
 
     # If no explicit prior file was supplied, a candidate may carry a prior
     # marker.  It is useful as an overlap source only when requested.
     if requested_overlap and len(selected_indices) < batch_size:
-        remaining = [index for index in prepared.index.tolist() if index not in records and bool(prepared.loc[index, "_prior_annotated"])]
-        for index in sorted(remaining, key=lambda item: str(prepared.loc[item, "_stable_key"])):
+        remaining = [
+            index
+            for index in prepared.index.tolist()
+            if index not in records and bool(prepared.loc[index, "_prior_annotated"])
+        ]
+        for index in sorted(
+            remaining, key=lambda item: str(prepared.loc[item, "_stable_key"])
+        ):
             if len(selected_indices) >= batch_size:
                 break
             row = prepared.loc[index]
-            if _blocked(row, selected_rows, adjacency_radius=int(config.adjacency_radius), min_separation_km=float(config.min_separation_km)):
+            if _blocked(
+                row,
+                selected_rows,
+                adjacency_radius=int(config.adjacency_radius),
+                min_separation_km=float(config.min_separation_km),
+            ):
                 continue
-            components = _dynamic_components(row, selected_rows, selected_regions, selected_clusters, band_targets)
+            components = _dynamic_components(
+                row, selected_rows, selected_regions, selected_clusters, band_targets
+            )
             add(index, components, reason="qa_overlap", overlap=True)
 
-    output = prepared.loc[selected_indices].copy() if selected_indices else prepared.iloc[0:0].copy()
+    output = (
+        prepared.loc[selected_indices].copy()
+        if selected_indices
+        else prepared.iloc[0:0].copy()
+    )
     output = output.reset_index(drop=True)
-    output_columns_to_drop = [column for column in output.columns if column.startswith("_")]
+    output_columns_to_drop = [
+        column for column in output.columns if column.startswith("_")
+    ]
     if output_columns_to_drop:
         output = output.drop(columns=output_columns_to_drop)
-    for column in ("selection_reason", "selection_score", "selection_rank", "rank", "batch_id", "run_id", "is_random_control", "is_qa_overlap", "uncertainty_observed", "disagreement_score", "uncertainty_score", "diversity_score", "geographic_score", "underrepresented_score", "score_band_component", "random_control_score"):
+    for column in (
+        "selection_reason",
+        "selection_score",
+        "selection_rank",
+        "rank",
+        "batch_id",
+        "run_id",
+        "is_random_control",
+        "is_qa_overlap",
+        "uncertainty_observed",
+        "disagreement_score",
+        "uncertainty_score",
+        "diversity_score",
+        "geographic_score",
+        "underrepresented_score",
+        "score_band_component",
+        "random_control_score",
+    ):
         if column in output.columns:
             output = output.drop(columns=[column])
     batch_id_seed = "|".join(str(value) for value in prepared["_tile_key"].tolist())
     batch_id = f"batch-{sha256_bytes(f'{config.run_name}|{config.seed}|{batch_id_seed}'.encode('utf-8'))[:16]}"
-    output["selection_reason"] = [records[index]["selection_reason"] for index in selected_indices]
-    output["selection_score"] = [round(float(records[index]["selection_score"]), 12) for index in selected_indices]
+    output["selection_reason"] = [
+        records[index]["selection_reason"] for index in selected_indices
+    ]
+    output["selection_score"] = [
+        round(float(records[index]["selection_score"]), 12)
+        for index in selected_indices
+    ]
     output["selection_rank"] = list(range(1, len(output) + 1))
     output["rank"] = output["selection_rank"]
     output["batch_id"] = batch_id
     output["run_id"] = str(config.run_name)
-    output["is_random_control"] = [records[index]["is_random_control"] for index in selected_indices]
-    output["is_qa_overlap"] = [records[index]["is_qa_overlap"] for index in selected_indices]
-    output["uncertainty_observed"] = [bool(prepared.loc[index, "_uncertainty_raw"] == prepared.loc[index, "_uncertainty_raw"]) for index in selected_indices]
+    output["is_random_control"] = [
+        records[index]["is_random_control"] for index in selected_indices
+    ]
+    output["is_qa_overlap"] = [
+        records[index]["is_qa_overlap"] for index in selected_indices
+    ]
+    output["uncertainty_observed"] = [
+        bool(
+            prepared.loc[index, "_uncertainty_raw"]
+            == prepared.loc[index, "_uncertainty_raw"]
+        )
+        for index in selected_indices
+    ]
     component_columns = {
         "disagreement": "disagreement_score",
         "uncertainty": "uncertainty_score",
@@ -697,19 +1065,50 @@ def select_batch(
         "random_control": "random_control_score",
     }
     for component, column in component_columns.items():
-        output[column] = [round(float(records[index]["components"].get(component, 0.0)), 12) for index in selected_indices]
+        output[column] = [
+            round(float(records[index]["components"].get(component, 0.0)), 12)
+            for index in selected_indices
+        ]
         output[f"component_{component}"] = output[column]
     # Keep the output easy for the web annotator to consume while retaining the
     # original candidate columns as auxiliary metadata.
     preferred = [
-        "image_path", "satellite_path", "terrain_path", "image_id", "tile_id",
-        "region", "class_id", "z", "x", "y", "lat", "lon", "score_band",
-        "selection_reason", "selection_score", "selection_rank", "rank", "batch_id", "run_id",
-        "disagreement_score", "uncertainty_score", "diversity_score", "geographic_score",
-        "underrepresented_score", "score_band_component", "random_control_score",
-        "component_disagreement", "component_uncertainty", "component_diversity",
-        "component_geographic", "component_underrepresented", "component_score_band",
-        "component_random_control", "uncertainty_observed", "is_random_control", "is_qa_overlap",
+        "image_path",
+        "satellite_path",
+        "terrain_path",
+        "image_id",
+        "tile_id",
+        "region",
+        "class_id",
+        "z",
+        "x",
+        "y",
+        "lat",
+        "lon",
+        "score_band",
+        "selection_reason",
+        "selection_score",
+        "selection_rank",
+        "rank",
+        "batch_id",
+        "run_id",
+        "disagreement_score",
+        "uncertainty_score",
+        "diversity_score",
+        "geographic_score",
+        "underrepresented_score",
+        "score_band_component",
+        "random_control_score",
+        "component_disagreement",
+        "component_uncertainty",
+        "component_diversity",
+        "component_geographic",
+        "component_underrepresented",
+        "component_score_band",
+        "component_random_control",
+        "uncertainty_observed",
+        "is_random_control",
+        "is_qa_overlap",
     ]
     ordered = [column for column in preferred if column in output.columns]
     ordered.extend(column for column in output.columns if column not in ordered)
@@ -717,49 +1116,130 @@ def select_batch(
     output.attrs["batch_id"] = batch_id
     output.attrs["run_id"] = str(config.run_name)
 
-    split_source = prepared.drop(columns=[column for column in prepared.columns if column.startswith("_")], errors="ignore")
-    splits = build_geographic_splits(split_source, seed=int(config.seed), adjacency_radius=int(config.adjacency_radius))
-    audit = audit_geographic_leakage(splits, adjacency_radius=int(config.adjacency_radius))
-    reason_counts = output["selection_reason"].value_counts().sort_index().to_dict() if not output.empty else {}
+    split_source = prepared.drop(
+        columns=[column for column in prepared.columns if column.startswith("_")],
+        errors="ignore",
+    )
+    splits = build_geographic_splits(
+        split_source,
+        seed=int(config.seed),
+        adjacency_radius=int(config.adjacency_radius),
+    )
+    audit = audit_geographic_leakage(
+        splits, adjacency_radius=int(config.adjacency_radius)
+    )
+    reason_counts = (
+        output["selection_reason"].value_counts().sort_index().to_dict()
+        if not output.empty
+        else {}
+    )
     diagnostics: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "run_name": str(config.run_name),
         "batch_id": batch_id,
         "seed": int(config.seed),
         "candidate_rows": int(len(prepared)),
-        "eligible_rows": int(len(eligible)),
+        "eligible_rows": int(eligible_pool_count),
+        "shortlist_rows": int(len(eligible)),
         "selected_rows": int(len(output)),
         "scored_model_rows": scored_count,
         "uncertainty_rows_observed": uncertainty_count,
         "uncertainty_available": bool(uncertainty_count > 0),
         "prior_annotated_rows": int(prepared["_prior_annotated"].sum()),
         "requested_overlap_rows": requested_overlap,
-        "selected_overlap_rows": int(output["is_qa_overlap"].sum()) if not output.empty else 0,
+        "selected_overlap_rows": int(output["is_qa_overlap"].sum())
+        if not output.empty
+        else 0,
         "requested_random_controls": requested_controls,
-        "selected_random_controls": int(output["is_random_control"].sum()) if not output.empty else 0,
+        "selected_random_controls": int(output["is_random_control"].sum())
+        if not output.empty
+        else 0,
         "adjacency_radius": int(config.adjacency_radius),
         "minimum_separation_km": float(config.min_separation_km),
         "weights": {key: float(value) for key, value in weights.items()},
         "stable_ordering": "selection_rank ascending; score ties use deterministic SHA-256 identity key",
         "component_availability": {
-            "disagreement": bool(prepared["model_score_available"].any() and prepared["heuristic_score_available"].any()),
+            "disagreement": bool(
+                prepared["model_score_available"].any()
+                and prepared["heuristic_score_available"].any()
+            ),
             "uncertainty": bool(uncertainty_count > 0),
             "embedding_features": bool(prepared["_feature_vector"].notna().any()),
             "embedding_clusters": bool(prepared["_cluster"].ne("").any()),
-            "geography": bool(prepared["region"].ne("unknown").any() or prepared[["lat", "lon"]].notna().all(axis=1).any()),
+            "geography": bool(
+                prepared["region"].ne("unknown").any()
+                or prepared[["lat", "lon"]].notna().all(axis=1).any()
+            ),
         },
-        "reason_distribution": {str(key): int(value) for key, value in reason_counts.items()},
-        "score_band_distribution": {str(key): int(value) for key, value in (output["score_band"].value_counts().sort_index().to_dict().items() if not output.empty and "score_band" in output.columns else [])},
-        "region_distribution": {str(key): int(value) for key, value in (output["region"].value_counts().sort_index().to_dict().items() if not output.empty else [])},
-        "cluster_distribution": {str(key): int(value) for key, value in (output.get("embedding_cluster", output.get("cluster_id", pd.Series(dtype=object))).value_counts().sort_index().to_dict().items() if not output.empty else [])},
+        "reason_distribution": {
+            str(key): int(value) for key, value in reason_counts.items()
+        },
+        "score_band_distribution": {
+            str(key): int(value)
+            for key, value in (
+                output["score_band"].value_counts().sort_index().to_dict().items()
+                if not output.empty and "score_band" in output.columns
+                else []
+            )
+        },
+        "region_distribution": {
+            str(key): int(value)
+            for key, value in (
+                output["region"].value_counts().sort_index().to_dict().items()
+                if not output.empty
+                else []
+            )
+        },
+        "cluster_distribution": {
+            str(key): int(value)
+            for key, value in (
+                output.get(
+                    "embedding_cluster",
+                    output.get("cluster_id", pd.Series(dtype=object)),
+                )
+                .value_counts()
+                .sort_index()
+                .to_dict()
+                .items()
+                if not output.empty
+                else []
+            )
+        },
         "geographic_coverage": {
-            "unique_regions": sorted(str(value) for value in output["region"].dropna().unique()) if not output.empty and "region" in output.columns else [],
-            "lat_min": _finite_number(output["lat"].min()) if not output.empty and "lat" in output.columns and output["lat"].notna().any() else None,
-            "lat_max": _finite_number(output["lat"].max()) if not output.empty and "lat" in output.columns and output["lat"].notna().any() else None,
-            "lon_min": _finite_number(output["lon"].min()) if not output.empty and "lon" in output.columns and output["lon"].notna().any() else None,
-            "lon_max": _finite_number(output["lon"].max()) if not output.empty and "lon" in output.columns and output["lon"].notna().any() else None,
+            "unique_regions": sorted(
+                str(value) for value in output["region"].dropna().unique()
+            )
+            if not output.empty and "region" in output.columns
+            else [],
+            "lat_min": _finite_number(output["lat"].min())
+            if not output.empty
+            and "lat" in output.columns
+            and output["lat"].notna().any()
+            else None,
+            "lat_max": _finite_number(output["lat"].max())
+            if not output.empty
+            and "lat" in output.columns
+            and output["lat"].notna().any()
+            else None,
+            "lon_min": _finite_number(output["lon"].min())
+            if not output.empty
+            and "lon" in output.columns
+            and output["lon"].notna().any()
+            else None,
+            "lon_max": _finite_number(output["lon"].max())
+            if not output.empty
+            and "lon" in output.columns
+            and output["lon"].notna().any()
+            else None,
         },
-        "geographic_split_counts": {str(key): int(value) for key, value in splits["split"].value_counts().sort_index().to_dict().items()},
+        "geographic_split_counts": {
+            str(key): int(value)
+            for key, value in splits["split"]
+            .value_counts()
+            .sort_index()
+            .to_dict()
+            .items()
+        },
         "leakage_audit_valid": bool(audit["valid"]),
     }
     manifest = {
@@ -810,8 +1290,12 @@ def select_candidates(
     through :func:`select_batch` when callers need the complete artifact set.
     """
 
-    config = SelectionConfig(batch_size=batch_size, seed=seed, run_name=run_name, **kwargs)
-    artifacts = select_batch(candidates, config=config, prior_annotations=prior_annotations)
+    config = SelectionConfig(
+        batch_size=batch_size, seed=seed, run_name=run_name, **kwargs
+    )
+    artifacts = select_batch(
+        candidates, config=config, prior_annotations=prior_annotations
+    )
     artifacts.selected.attrs["diagnostics"] = artifacts.diagnostics
     artifacts.selected.attrs["batch_manifest"] = artifacts.batch_manifest
     artifacts.selected.attrs["geographic_splits"] = artifacts.geographic_splits
@@ -835,155 +1319,132 @@ def _tile_block(row: pd.Series, block_size: int, block_degrees: float) -> str:
     return f"{region}|identity|{_clean_text(row.get('_tile_key')) or _clean_text(row.get('image_path'))}"
 
 
-def _union_find(size: int) -> tuple[list[int], Any, Any]:
-    parent = list(range(size))
-    rank = [0] * size
-
-    def find(value: int) -> int:
-        while parent[value] != value:
-            parent[value] = parent[parent[value]]
-            value = parent[value]
-        return value
-
-    def union(left: int, right: int) -> None:
-        root_left, root_right = find(left), find(right)
-        if root_left == root_right:
-            return
-        if rank[root_left] < rank[root_right]:
-            root_left, root_right = root_right, root_left
-        parent[root_right] = root_left
-        if rank[root_left] == rank[root_right]:
-            rank[root_left] += 1
-
-    return parent, find, union
-
-
-def _adjacency_groups(frame: pd.DataFrame, *, adjacency_radius: int, distance_km: float = 0.0) -> dict[int, list[int]]:
-    parent, find, union = _union_find(len(frame))
-    tile_lookup: dict[tuple[int, int, int], int] = {}
-    identity_lookup: dict[str, int] = {}
-    for index, row in frame.reset_index(drop=True).iterrows():
-        key = _clean_text(row.get("_tile_key")) or _clean_text(row.get("image_path"))
-        if key and key in identity_lookup:
-            union(index, identity_lookup[key])
-        elif key:
-            identity_lookup[key] = index
-        z, x, y = row.get("z"), row.get("x"), row.get("y")
-        if None not in (z, x, y) and all(_finite_number(value) is not None for value in (z, x, y)):
-            zxy = (int(z), int(x), int(y))
-            tile_lookup[zxy] = index
-            radius = max(0, int(adjacency_radius))
-            for dx in range(-radius, radius + 1):
-                for dy in range(-radius, radius + 1):
-                    other = tile_lookup.get((zxy[0], zxy[1] + dx, zxy[2] + dy))
-                    if other is not None:
-                        union(index, other)
-    if distance_km > 0.0:
-        geo_buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
-        # A coarse bucket keeps the fallback quadratic check bounded while
-        # still checking every point in neighboring buckets.
-        degrees = max(0.01, distance_km / 111.0)
-        reset = frame.reset_index(drop=True)
-        for index, row in reset.iterrows():
-            lat, lon = _row_lat_lon(row)
-            if lat is None or lon is None:
-                continue
-            bucket = (int(math.floor(lat / degrees)), int(math.floor(lon / degrees)))
-            for bx in range(bucket[0] - 1, bucket[0] + 2):
-                for by in range(bucket[1] - 1, bucket[1] + 2):
-                    for other in geo_buckets.get((bx, by), []):
-                        p_lat, p_lon = _row_lat_lon(reset.loc[other])
-                        if p_lat is not None and p_lon is not None and _haversine_km(lat, lon, p_lat, p_lon) < distance_km:
-                            union(index, other)
-            geo_buckets[bucket].append(index)
-    groups: dict[int, list[int]] = defaultdict(list)
-    for index in range(len(frame)):
-        groups[find(index)].append(index)
-    return dict(groups)
-
-
 def build_geographic_splits(
     frame: pd.DataFrame,
     *,
     seed: int = 0,
     val_fraction: float = 0.15,
     test_fraction: float = 0.15,
-    block_size: int = 8,
+    block_size: int = 32,
     block_degrees: float = 0.25,
     adjacency_radius: int = 1,
     adjacency_distance_km: float = 0.0,
 ) -> pd.DataFrame:
-    """Assign deterministic geographic components to train/val/test.
-
-    Duplicate or adjacent tile components are indivisible units.  This makes
-    the generated assignment safe by construction; :func:`audit_geographic_leakage`
-    remains an independent check for externally supplied split files.
-    """
-
-    if not 0 <= val_fraction < 1 or not 0 <= test_fraction < 1 or val_fraction + test_fraction >= 1:
-        raise ValueError("val_fraction and test_fraction must be non-negative and sum to less than one")
+    """Assign deterministic geographic blocks and remove cross-split boundaries."""
+    if (
+        not 0 <= val_fraction < 1
+        or not 0 <= test_fraction < 1
+        or val_fraction + test_fraction >= 1
+    ):
+        raise ValueError(
+            "val_fraction and test_fraction must be non-negative and sum to less than one"
+        )
     if block_size <= 0 or block_degrees <= 0:
         raise ValueError("block_size and block_degrees must be positive")
-    prepared = _canonicalise(frame, seed=seed) if not {"_tile_key", "_stable_key"}.issubset(frame.columns) else frame.copy()
-    prepared = prepared.reset_index(drop=True)
+    prepared = (
+        _canonicalise(frame, seed=seed)
+        if not {"_tile_key", "_stable_key"}.issubset(frame.columns)
+        else frame.copy()
+    ).reset_index(drop=True)
     if prepared.empty:
         output = prepared.copy()
         output["geographic_block"] = pd.Series(dtype="object")
         output["split"] = pd.Series(dtype="object")
         return output
-    prepared["geographic_block"] = [
-        _tile_block(row, block_size=block_size, block_degrees=block_degrees) for _, row in prepared.iterrows()
-    ]
-    groups = _adjacency_groups(prepared, adjacency_radius=adjacency_radius, distance_km=adjacency_distance_km)
-    component_records: list[dict[str, Any]] = []
-    for root, indices in groups.items():
-        block = min(str(prepared.loc[index, "geographic_block"]) for index in indices)
-        stable = min(str(prepared.loc[index, "_stable_key"]) for index in indices) if "_stable_key" in prepared.columns else min(str(prepared.loc[index, "image_path"]) for index in indices)
-        component_records.append({"root": root, "indices": indices, "block": block, "stable": stable, "size": len(indices)})
-    component_records.sort(key=lambda item: (item["block"], item["stable"]))
-    n_rows = len(prepared)
-    targets = {
-        "train": max(1, int(round(n_rows * (1.0 - val_fraction - test_fraction)))) if n_rows else 0,
-        "val": int(round(n_rows * val_fraction)),
-        "test": int(round(n_rows * test_fraction)),
+
+    if prepared[["z", "x", "y"]].notna().all(axis=None):
+        prepared["geographic_block"] = (
+            prepared["region"].astype(str)
+            + "|z"
+            + prepared["z"].astype("Int64").astype(str)
+            + "|b"
+            + (prepared["x"].astype("Int64") // block_size).astype(str)
+            + "|"
+            + (prepared["y"].astype("Int64") // block_size).astype(str)
+        )
+    else:
+        prepared["geographic_block"] = [
+            _tile_block(row, block_size=block_size, block_degrees=block_degrees)
+            for _, row in prepared.iterrows()
+        ]
+    block_rows = {
+        str(block): list(indices)
+        for block, indices in prepared.groupby(
+            "geographic_block", sort=True
+        ).groups.items()
     }
-    if len(component_records) >= 2 and val_fraction > 0:
-        targets["val"] = max(1, targets["val"])
-    if len(component_records) >= 3 and test_fraction > 0:
-        targets["test"] = max(1, targets["test"])
-    split_order = ("train", "val", "test")
-    assigned = {name: 0 for name in split_order}
-    component_split: dict[int, str] = {}
-    for component in component_records:
+    blocks = sorted(
+        block_rows,
+        key=lambda block: (_stable_int(seed, f"split-block\0{block}"), block),
+    )
+    fractions = {
+        "train": 1.0 - val_fraction - test_fraction,
+        "val": val_fraction,
+        "test": test_fraction,
+    }
+    targets = {
+        name: max(1, int(round(len(prepared) * fraction)))
+        for name, fraction in fractions.items()
+    }
+    assigned = {name: 0 for name in fractions}
+    block_split: dict[str, str] = {}
+    for block in blocks:
         choices = sorted(
-            split_order,
+            fractions,
             key=lambda name: (
-                assigned[name] / max(1, targets[name]),
+                assigned[name] / targets[name],
                 assigned[name],
-                _stable_int(seed, f"split\0{name}\0{component['block']}"),
-                split_order.index(name),
+                _stable_int(seed, f"{name}\0{block}"),
             ),
         )
         chosen = choices[0]
-        component_split[int(component["root"])] = chosen
-        assigned[chosen] += int(component["size"])
-    prepared["split"] = [component_split[next(root for root, indices in groups.items() if index in indices)] for index in range(len(prepared))]
+        block_split[block] = chosen
+        assigned[chosen] += len(block_rows[block])
+    prepared["split"] = prepared["geographic_block"].map(block_split)
     prepared["split_seed"] = int(seed)
-    prepared = prepared.sort_values(["split", "geographic_block", "_stable_key"], kind="mergesort").reset_index(drop=True)
+
+    initial_audit = audit_geographic_leakage(
+        prepared,
+        adjacency_radius=adjacency_radius,
+        adjacency_distance_km=adjacency_distance_km,
+    )
+    boundary_rows = {
+        int(index)
+        for violation in initial_audit["violations"]
+        if str(violation.get("kind", "")).startswith("adjacent")
+        for index in violation.get("rows", [])
+    }
+    if boundary_rows:
+        prepared = prepared.drop(index=sorted(boundary_rows)).reset_index(drop=True)
+
+    prepared = prepared.sort_values(
+        ["split", "geographic_block", "_stable_key"], kind="mergesort"
+    ).reset_index(drop=True)
     drop_private = [column for column in prepared.columns if column.startswith("_")]
     if drop_private:
         prepared = prepared.drop(columns=drop_private)
-    preferred = ["image_path", "satellite_path", "terrain_path", "image_id", "tile_id", "region", "class_id", "z", "x", "y", "lat", "lon", "geographic_block", "split", "split_seed"]
+    preferred = [
+        "image_path",
+        "satellite_path",
+        "terrain_path",
+        "image_id",
+        "tile_id",
+        "region",
+        "class_id",
+        "z",
+        "x",
+        "y",
+        "lat",
+        "lon",
+        "geographic_block",
+        "split",
+        "split_seed",
+    ]
     ordered = [column for column in preferred if column in prepared.columns]
     ordered.extend(column for column in prepared.columns if column not in ordered)
-    return prepared[ordered]
-
-
-def _split_values(value: Any) -> set[str]:
-    if value is None:
-        return set()
-    text = _clean_text(value)
-    return {text} if text else set()
+    output = prepared[ordered]
+    output.attrs["excluded_boundary_rows"] = len(boundary_rows)
+    return output
 
 
 def audit_geographic_leakage(
@@ -1004,7 +1465,11 @@ def audit_geographic_leakage(
             "violations": [{"kind": "schema", "message": "split column is required"}],
             "split_counts": {},
         }
-    prepared = _canonicalise(frame, seed=0, deduplicate=False) if not {"_tile_key"}.issubset(frame.columns) else frame.reset_index(drop=True).copy()
+    prepared = (
+        _canonicalise(frame, seed=0, deduplicate=False)
+        if not {"_tile_key"}.issubset(frame.columns)
+        else frame.reset_index(drop=True).copy()
+    )
     # Canonicalisation may discard split if it was not carried as an original
     # column; restore it from the source frame by positional order.
     if "split" not in prepared.columns:
@@ -1024,12 +1489,21 @@ def audit_geographic_leakage(
         splits = sorted(value for value in identity_splits[key] if value)
         if len(splits) > 1:
             duplicate_cross = True
-            violations.append({"kind": "duplicate", "tile_key": key, "splits": splits, "rows": identity_rows[key]})
+            violations.append(
+                {
+                    "kind": "duplicate",
+                    "tile_key": key,
+                    "splits": splits,
+                    "rows": identity_rows[key],
+                }
+            )
 
     tile_lookup: dict[tuple[int, int, int], int] = {}
     for index, row in prepared.iterrows():
         z, x, y = row.get("z"), row.get("x"), row.get("y")
-        if None in (z, x, y) or not all(_finite_number(value) is not None for value in (z, x, y)):
+        if None in (z, x, y) or not all(
+            _finite_number(value) is not None for value in (z, x, y)
+        ):
             continue
         tile_lookup[(int(z), int(x), int(y))] = int(index)
     seen_pairs: set[tuple[int, int]] = set()
@@ -1040,28 +1514,63 @@ def audit_geographic_leakage(
                 other = tile_lookup.get((z, x + dx, y + dy))
                 if other is None or other == index:
                     continue
-                pair = tuple(sorted((index, other)))
+                pair = (min(index, other), max(index, other))
                 if pair in seen_pairs:
                     continue
                 seen_pairs.add(pair)
-                split_a, split_b = _clean_text(prepared.loc[index, "split"]), _clean_text(prepared.loc[other, "split"])
+                split_a, split_b = (
+                    _clean_text(prepared.loc[index, "split"]),
+                    _clean_text(prepared.loc[other, "split"]),
+                )
                 if split_a and split_b and split_a != split_b:
                     adjacent_cross = True
-                    violations.append({"kind": "adjacent", "tile_keys": [f"z{z}/{x}/{y}", f"z{z}/{int(prepared.loc[other, 'x'])}/{int(prepared.loc[other, 'y'])}"], "splits": sorted((split_a, split_b)), "rows": [index, other]})
+                    violations.append(
+                        {
+                            "kind": "adjacent",
+                            "tile_keys": [
+                                f"z{z}/{x}/{y}",
+                                f"z{z}/{int(prepared.loc[other, 'x'])}/{int(prepared.loc[other, 'y'])}",
+                            ],
+                            "splits": sorted((split_a, split_b)),
+                            "rows": [index, other],
+                        }
+                    )
     if adjacency_distance_km > 0.0:
-        geo_rows = [(int(index), *_row_lat_lon(row), _clean_text(row.get("split"))) for index, row in prepared.iterrows()]
+        geo_rows = [
+            (int(index), *_row_lat_lon(row), _clean_text(row.get("split")))
+            for index, row in prepared.iterrows()
+        ]
         for left_position, left in enumerate(geo_rows):
             left_index, left_lat, left_lon, left_split = left
             if left_lat is None or left_lon is None or not left_split:
                 continue
             for right in geo_rows[left_position + 1 :]:
                 right_index, right_lat, right_lon, right_split = right
-                if right_lat is None or right_lon is None or not right_split or left_split == right_split:
+                if (
+                    right_lat is None
+                    or right_lon is None
+                    or not right_split
+                    or left_split == right_split
+                ):
                     continue
-                if _haversine_km(left_lat, left_lon, right_lat, right_lon) < adjacency_distance_km:
+                if (
+                    _haversine_km(left_lat, left_lon, right_lat, right_lon)
+                    < adjacency_distance_km
+                ):
                     adjacent_cross = True
-                    violations.append({"kind": "adjacent_geographic", "distance_km": _haversine_km(left_lat, left_lon, right_lat, right_lon), "splits": sorted((left_split, right_split)), "rows": [left_index, right_index]})
-    violations.sort(key=lambda item: (str(item.get("kind")), json.dumps(item, sort_keys=True)))
+                    violations.append(
+                        {
+                            "kind": "adjacent_geographic",
+                            "distance_km": _haversine_km(
+                                left_lat, left_lon, right_lat, right_lon
+                            ),
+                            "splits": sorted((left_split, right_split)),
+                            "rows": [left_index, right_index],
+                        }
+                    )
+    violations.sort(
+        key=lambda item: (str(item.get("kind")), json.dumps(item, sort_keys=True))
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "valid": not violations,
@@ -1070,7 +1579,15 @@ def audit_geographic_leakage(
         "adjacent_cross_split": adjacent_cross,
         "violation_count": int(len(violations)),
         "violations": violations,
-        "split_counts": {str(key): int(value) for key, value in frame["split"].astype(str).value_counts().sort_index().to_dict().items()},
+        "split_counts": {
+            str(key): int(value)
+            for key, value in frame["split"]
+            .astype(str)
+            .value_counts()
+            .sort_index()
+            .to_dict()
+            .items()
+        },
     }
 
 
@@ -1084,7 +1601,9 @@ def load_candidate_table(path: str | Path) -> pd.DataFrame:
     if suffix in {".parquet", ".pq"}:
         return pd.read_parquet(source)
     if suffix in {".csv", ".tsv", ".txt"}:
-        return pd.read_csv(source, sep="\t" if suffix == ".tsv" else ",")
+        return pd.read_csv(
+            source, sep="\t" if suffix == ".tsv" else ",", low_memory=False
+        )
     raise ValueError(f"candidate input must be CSV or Parquet: {source}")
 
 
@@ -1114,7 +1633,9 @@ def run_selection(
             random_control_fraction=config.random_control_fraction,
             weights=config.weights,
         )
-    artifacts = select_batch(candidates, config=config, prior_annotations=prior_annotations)
+    artifacts = select_batch(
+        candidates, config=config, prior_annotations=prior_annotations
+    )
     base = Path(output_dir) / run_name
     base.mkdir(parents=True, exist_ok=True)
     batch_path = base / "annotation_batch.csv"
@@ -1122,10 +1643,18 @@ def run_selection(
     diagnostics_path = base / "selection_diagnostics.json"
     manifest_path = base / "batch_manifest.json"
     leakage_path = base / "leakage_audit.json"
-    artifacts.selected.to_csv(batch_path, index=False, lineterminator="\n")
-    artifacts.geographic_splits.to_csv(split_path, index=False, lineterminator="\n")
+    atomic_write_text(
+        batch_path, artifacts.selected.to_csv(index=False, lineterminator="\n")
+    )
+    atomic_write_text(
+        split_path, artifacts.geographic_splits.to_csv(index=False, lineterminator="\n")
+    )
     input_digest = sha256_file(source)
-    artifacts.batch_manifest["candidate_input"] = {"path": str(source), "sha256": input_digest, "rows": int(len(candidates))}
+    artifacts.batch_manifest["candidate_input"] = {
+        "path": str(source),
+        "sha256": input_digest,
+        "rows": int(len(candidates)),
+    }
     artifacts.batch_manifest["outputs"] = {
         "annotation_batch_csv": str(batch_path),
         "batch_manifest_json": str(manifest_path),
@@ -1133,7 +1662,10 @@ def run_selection(
         "geographic_splits_csv": str(split_path),
         "leakage_audit_json": str(leakage_path),
     }
-    artifacts.diagnostics["candidate_input"] = {"path": str(source), "sha256": input_digest}
+    artifacts.diagnostics["candidate_input"] = {
+        "path": str(source),
+        "sha256": input_digest,
+    }
     artifacts.diagnostics["outputs"] = artifacts.batch_manifest["outputs"]
     atomic_write_json(manifest_path, artifacts.batch_manifest)
     atomic_write_json(diagnostics_path, artifacts.diagnostics)

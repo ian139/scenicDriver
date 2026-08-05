@@ -15,7 +15,9 @@ from typing import Any, Sequence
 from src.data_pipeline.mapbox import lat_lon_to_tile, tile_to_lat_lon_center
 
 
-def load_app_region_bounds(config_path: Path | str = "config/app_regions.json") -> dict[str, Any]:
+def load_app_region_bounds(
+    config_path: Path | str = "config/app_regions.json",
+) -> dict[str, Any]:
     """Load region configurations from app_regions.json."""
     path = Path(config_path)
     if not path.is_file():
@@ -35,18 +37,26 @@ def enumerate_bbox_tiles(
     min_lat: float, min_lon: float, max_lat: float, max_lon: float, zoom: int = 14
 ) -> list[tuple[int, int]]:
     """Enumerate all (x, y) tile coordinates covering the given bounding box at specified zoom."""
-    nw_x, nw_y = lat_lon_to_tile(max_lat, min_lon, zoom)
-    se_x, se_y = lat_lon_to_tile(min_lat, max_lon, zoom)
-
-    min_x, max_x = min(nw_x, se_x), max(nw_x, se_x)
     if zoom < 0 or zoom > 22:
         raise ValueError(f"Unsupported zoom: {zoom}; expected 0..22.")
     if not all(math.isfinite(float(v)) for v in (min_lat, min_lon, max_lat, max_lon)):
         raise ValueError("Bounding box coordinates must be finite numbers.")
     if min_lat >= max_lat or min_lon >= max_lon:
         raise ValueError("Bounding box must have min values strictly below max values.")
-    if not (-90 <= min_lat <= 90 and -90 <= max_lat <= 90 and -180 <= min_lon <= 180 and -180 <= max_lon <= 180):
-        raise ValueError("Bounding box coordinates are outside valid latitude/longitude ranges.")
+    if not (
+        -90 <= min_lat <= 90
+        and -90 <= max_lat <= 90
+        and -180 <= min_lon <= 180
+        and -180 <= max_lon <= 180
+    ):
+        raise ValueError(
+            "Bounding box coordinates are outside valid latitude/longitude ranges."
+        )
+
+    nw_x, nw_y = lat_lon_to_tile(max_lat, min_lon, zoom)
+    se_x, se_y = lat_lon_to_tile(min_lat, max_lon, zoom)
+    min_x, max_x = min(nw_x, se_x), max(nw_x, se_x)
+    min_y, max_y = min(nw_y, se_y), max(nw_y, se_y)
 
     tiles = []
     for x in range(min_x, max_x + 1):
@@ -55,7 +65,9 @@ def enumerate_bbox_tiles(
     return tiles
 
 
-def point_in_polygon(lon: float, lat: float, polygon: Sequence[Sequence[float]]) -> bool:
+def point_in_polygon(
+    lon: float, lat: float, polygon: Sequence[Sequence[float]]
+) -> bool:
     """Ray-casting point-in-polygon test. Polygon points expected as [lon, lat]."""
     n = len(polygon)
     inside = False
@@ -72,22 +84,33 @@ def point_in_polygon(lon: float, lat: float, polygon: Sequence[Sequence[float]])
         p1x, p1y = p2x, p2y
     return inside
 
+
 def enumerate_polygon_tiles(
     polygon: Sequence[Sequence[float]], zoom: int = 14
 ) -> list[tuple[int, int]]:
     """Enumerate tile coordinates whose centers fall within the given polygon [[lon, lat], ...]."""
     if len(polygon) < 3:
         raise ValueError("Polygon must contain at least three points.")
-    if any(len(point) != 2 or not all(math.isfinite(float(value)) for value in point) for point in polygon):
+    if any(
+        len(point) != 2 or not all(math.isfinite(float(value)) for value in point)
+        for point in polygon
+    ):
         raise ValueError("Polygon points must be finite [longitude, latitude] pairs.")
-    if any(not (-180 <= float(point[0]) <= 180 and -90 <= float(point[1]) <= 90) for point in polygon):
-        raise ValueError("Polygon coordinates are outside valid latitude/longitude ranges.")
+    if any(
+        not (-180 <= float(point[0]) <= 180 and -90 <= float(point[1]) <= 90)
+        for point in polygon
+    ):
+        raise ValueError(
+            "Polygon coordinates are outside valid latitude/longitude ranges."
+        )
     lons = [pt[0] for pt in polygon]
     lats = [pt[1] for pt in polygon]
     min_lon, max_lon = min(lons), max(lons)
     min_lat, max_lat = min(lats), max(lats)
 
-    candidate_tiles = enumerate_bbox_tiles(min_lat, min_lon, max_lat, max_lon, zoom=zoom)
+    candidate_tiles = enumerate_bbox_tiles(
+        min_lat, min_lon, max_lat, max_lon, zoom=zoom
+    )
     valid_tiles = []
     for x, y in candidate_tiles:
         clat, clon = tile_to_lat_lon_center(x, y, zoom)
@@ -97,10 +120,46 @@ def enumerate_polygon_tiles(
 
 
 def get_builtin_region_spec() -> dict[str, Any]:
-    """Return canonical Stage-One versioned region specification."""
+    """Return the canonical near-cap west/south inland expansion."""
     return {
         "version": 1,
-        "description": "Stage-One Active Learning Inland Expansion Spec",
+        "description": (
+            "Preserve New England North and add one contiguous inland band "
+            "south to 38N and west to 83.55W while avoiding Atlantic expansion"
+        ),
+        "geographic_source": "deterministic collection of two adjoining zoom-14 bounding boxes",
+        "included_jurisdictions": [
+            "Connecticut",
+            "Delaware",
+            "District of Columbia",
+            "Maine",
+            "Maryland",
+            "Massachusetts",
+            "Michigan",
+            "New Hampshire",
+            "New Jersey",
+            "New York",
+            "Ohio",
+            "Pennsylvania",
+            "Rhode Island",
+            "Vermont",
+            "Virginia",
+            "West Virginia",
+        ],
+        "excluded_jurisdictions": [
+            "US states wholly south of 38N",
+            "US areas wholly west of 83.55W",
+        ],
+        "known_non_target_coverage": [
+            "southern Ontario and Quebec",
+            "Great Lakes water",
+            "water already inside the preserved New England North bbox",
+        ],
+        "limitations": [
+            "No compatible land/state polygon dataset is available in the repository; "
+            "tile centers are filtered by adjoining bounding boxes, so non-US land and "
+            "inland water remain and must be measured downstream."
+        ],
         "regions": [
             {
                 "name": "new_england_north",
@@ -113,33 +172,13 @@ def get_builtin_region_spec() -> dict[str, Any]:
                 },
             },
             {
-                "name": "ny_upstate_west",
+                "name": "west_south_inland",
                 "type": "bbox",
                 "bbox": {
-                    "min_lat": 42.488301979602255,
-                    "min_lon": -79.75,
+                    "min_lat": 38.0,
+                    "min_lon": -83.55,
                     "max_lat": 47.50235895196859,
                     "max_lon": -73.5205078125,
-                },
-            },
-            {
-                "name": "pa_midatlantic_south",
-                "type": "bbox",
-                "bbox": {
-                    "min_lat": 39.75,
-                    "min_lon": -79.75,
-                    "max_lat": 42.488301979602255,
-                    "max_lon": -73.5205078125,
-                },
-            },
-            {
-                "name": "southern_new_england_inland",
-                "type": "bbox",
-                "bbox": {
-                    "min_lat": 41.1,
-                    "min_lon": -73.5205078125,
-                    "max_lat": 42.488301979602255,
-                    "max_lon": -71.2,
                 },
             },
         ],
@@ -172,23 +211,29 @@ def parse_and_validate_region_spec(
 
     regions_list = spec_data.get("regions")
     if not isinstance(regions_list, list) or not regions_list:
-        raise ValueError("Region specification must contain a non-empty 'regions' list.")
+        raise ValueError(
+            "Region specification must contain a non-empty 'regions' list."
+        )
 
     # Load baseline New England North bounds
     app_bounds = load_app_region_bounds(app_regions_path)
     if "new_england_north" not in app_bounds:
-        raise ValueError(f"Baseline region 'new_england_north' not found in {app_regions_path}.")
+        raise ValueError(
+            f"Baseline region 'new_england_north' not found in {app_regions_path}."
+        )
 
     nen_bbox = app_bounds["new_england_north"]
     nen_tiles_list = enumerate_bbox_tiles(
-        nen_bbox["min_lat"], nen_bbox["min_lon"], nen_bbox["max_lat"], nen_bbox["max_lon"], zoom=zoom
+        nen_bbox["min_lat"],
+        nen_bbox["min_lon"],
+        nen_bbox["max_lat"],
+        nen_bbox["max_lon"],
+        zoom=zoom,
     )
     nen_tiles_set = set(nen_tiles_list)
 
-    nen_min_x = min(x for x, y in nen_tiles_set)
-    nen_max_x = max(x for x, y in nen_tiles_set)
-    nen_min_y = min(y for x, y in nen_tiles_set)
-    nen_max_y = max(y for x, y in nen_tiles_set)
+    nen_max_x = max(x for x, _ in nen_tiles_set)
+    nen_min_y = min(y for _, y in nen_tiles_set)
 
     # Process regions in order
     coord_to_region: dict[tuple[int, int], str] = {}
@@ -204,11 +249,19 @@ def parse_and_validate_region_spec(
 
         if r_type == "bbox":
             bbox = r_entry.get("bbox")
-            if not isinstance(bbox, dict) or not all(key in bbox for key in ("min_lat", "min_lon", "max_lat", "max_lon")):
-                raise ValueError(f"Bbox region '{r_name}' requires min_lat, min_lon, max_lat, and max_lon.")
+            if not isinstance(bbox, dict) or not all(
+                key in bbox for key in ("min_lat", "min_lon", "max_lat", "max_lon")
+            ):
+                raise ValueError(
+                    f"Bbox region '{r_name}' requires min_lat, min_lon, max_lat, and max_lon."
+                )
             try:
                 r_tiles = enumerate_bbox_tiles(
-                    bbox["min_lat"], bbox["min_lon"], bbox["max_lat"], bbox["max_lon"], zoom=zoom
+                    bbox["min_lat"],
+                    bbox["min_lon"],
+                    bbox["max_lat"],
+                    bbox["max_lon"],
+                    zoom=zoom,
                 )
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"Invalid bbox for region '{r_name}': {exc}") from exc

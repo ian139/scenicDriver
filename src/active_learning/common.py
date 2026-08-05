@@ -56,6 +56,27 @@ def atomic_write_json(path: str | Path, value: Mapping[str, Any]) -> None:
         raise
 
 
+def atomic_write_text(path: str | Path, payload: str) -> None:
+    """Atomically replace a UTF-8 text file in the destination directory."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def jsonable(value: Any) -> Any:
     """Convert common NumPy/Pandas scalar values into JSON-safe values."""
 
