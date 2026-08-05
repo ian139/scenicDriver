@@ -123,6 +123,61 @@ def _file_digest(path: Path) -> str | None:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+def _identity_digest(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _resume_identity(
+    run_dir: Path,
+    *,
+    planned: dict[str, Any],
+    region_spec: dict[str, Any],
+    spec_path: str | None,
+    config_path: Path | str,
+    zoom: int,
+    budget: int,
+) -> tuple[str, str | None]:
+    manifest_path = run_dir / "region_manifest.json"
+    preflight_path = run_dir / "acquisition_preflight.json"
+    if not manifest_path.exists() and not preflight_path.exists():
+        return _identity_digest(region_spec), None
+    existing: dict[str, Any] = {}
+    for path in (manifest_path, preflight_path):
+        if path.exists():
+            with path.open(encoding="utf-8") as stream:
+                existing.update(json.load(stream))
+    spec_digest = (
+        _file_digest(Path(spec_path))
+        if spec_path
+        else _identity_digest(region_spec)
+    )
+    config_digest = _file_digest(Path(config_path))
+    expected = {
+        "geometry_digest": planned["geometry_digest"],
+        "zoom": zoom,
+        "tile_budget_coordinates": budget,
+        "region_spec_sha256": spec_digest,
+        "app_regions_sha256": config_digest,
+    }
+    old_spec = existing.get("region_spec")
+    old_inputs = existing.get("inputs", {})
+    old_spec_digest = old_inputs.get("region_spec_sha256")
+    if old_spec_digest is None and old_spec is not None:
+        old_spec_digest = _identity_digest(old_spec)
+    old_config_digest = old_inputs.get("app_regions_sha256")
+    checks = {
+        "geometry_digest": existing.get("geometry_digest"),
+        "zoom": existing.get("zoom"),
+        "tile_budget_coordinates": existing.get("tile_budget_coordinates"),
+        "region_spec_sha256": old_spec_digest,
+        "app_regions_sha256": old_config_digest,
+    }
+    for key, old in checks.items():
+        if old is not None and old != expected[key]:
+            raise ValueError(f"existing run identity drift: {key}")
+    created = existing.get("created_at_utc")
+    return expected["region_spec_sha256"], created
 
 
 def _repository_revision() -> str | None:
@@ -182,7 +237,6 @@ def acquire_missing(
     *,
     image_root: Path,
     zoom: int,
-    failures: list[dict[str, Any]],
     max_workers: int = 8,
 ) -> None:
     """Acquire missing pair members with bounded concurrency and source-level retries."""
@@ -192,11 +246,14 @@ def acquire_missing(
         ("satellite", "mapbox.satellite", "satellite_path"),
         ("terrain", "mapbox.terrain-rgb", "terrain_path"),
     ):
-        pending_rows = [row for row in rows if not row[f"{style}_present"]]
+        pending_rows = [
+            row
+            for row in rows
+            if not row[f"{style}_present"] and not row.get(f"{style}_s3_present")
+        ]
         worker_state = threading.local()
 
         def fetch(row: dict[str, Any]) -> None:
-            source = getattr(worker_state, "source", None)
             if source is None:
                 with _quiet_mapbox_logging():
                     source = MapboxTileSource(
@@ -294,6 +351,16 @@ def plan_run(
         zoom=zoom,
     )
     run_dir = Path(output_root) / run_name
+    spec_digest, created_at = _resume_identity(
+        run_dir,
+        planned=planned,
+        region_spec=region_spec,
+        spec_path=spec_path,
+        config_path=config_path,
+        zoom=zoom,
+        budget=budget,
+    )
+    config_digest = _file_digest(Path(config_path))
     rows = _manifest_rows(planned, zoom, Path(image_root))
     rows, counts = _inventory(
         rows,
@@ -309,17 +376,31 @@ def plan_run(
         "unique_coordinates": planned["unique_coordinates_count"],
         "total_rasters": planned["total_rasters_count"],
         "tile_budget_coordinates": budget,
-        "tile_budget_rasters": budget * 2,
         "existing_satellite": counts["satellite_valid"],
         "existing_terrain": counts["terrain_valid"],
         "existing_complete_pairs": counts["complete_pairs"],
-        "missing_satellite": counts["coordinates"] - counts["satellite_valid"],
-        "missing_terrain": counts["coordinates"] - counts["terrain_valid"],
+        "missing_satellite": sum(
+            not row.get("satellite_present") and not row.get("satellite_s3_present")
+            for row in rows
+        ),
+        "missing_terrain": sum(
+            not row.get("terrain_present") and not row.get("terrain_s3_present")
+            for row in rows
+        ),
         "estimated_missing_storage_bytes": (
-            (counts["coordinates"] - counts["satellite_valid"])
-            + (counts["coordinates"] - counts["terrain_valid"])
+            sum(
+                not row.get("satellite_present") and not row.get("satellite_s3_present")
+                for row in rows
+            )
+            + sum(
+                not row.get("terrain_present") and not row.get("terrain_s3_present")
+                for row in rows
+            )
         )
         * 262_144,
+        "region_spec_sha256": spec_digest,
+        "app_regions_sha256": config_digest,
+        "state": "planned",
         "storage_estimate_assumption": "256 KiB average compressed PNG per raster",
     }
     _atomic_csv(run_dir / "tile_manifest.csv", rows)
@@ -343,6 +424,38 @@ def plan_run(
             s3_bucket=s3_bucket,
             s3_prefix_root=s3_prefix_root,
         )
+        preflight.update(
+            {
+                "existing_satellite": counts["satellite_valid"],
+                "existing_terrain": counts["terrain_valid"],
+                "existing_complete_pairs": counts["complete_pairs"],
+                "missing_satellite": sum(
+                    not row.get("satellite_present")
+                    and not row.get("satellite_s3_present")
+                    for row in rows
+                ),
+                "missing_terrain": sum(
+                    not row.get("terrain_present")
+                    and not row.get("terrain_s3_present")
+                    for row in rows
+                ),
+                "estimated_missing_storage_bytes": (
+                    sum(
+                        not row.get("satellite_present")
+                        and not row.get("satellite_s3_present")
+                        for row in rows
+                    )
+                    + sum(
+                        not row.get("terrain_present")
+                        and not row.get("terrain_s3_present")
+                        for row in rows
+                    )
+                )
+                * 262_144,
+                "state": "acquired",
+            }
+        )
+        _atomic_json(run_dir / "acquisition_preflight.json", preflight)
     failures.sort(
         key=lambda item: (
             item.get("region", ""),
@@ -356,7 +469,7 @@ def plan_run(
     manifest = {
         "schema_version": 1,
         "run_name": run_name,
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "created_at_utc": created_at or datetime.now(timezone.utc).isoformat(),
         "repository_revision": _repository_revision(),
         "seeds": {},
         "zoom": zoom,
@@ -379,10 +492,9 @@ def plan_run(
         "acquisition_requested": acquire,
         "failures": failures,
         "inputs": {
-            "region_spec_path": spec_path,
-            "region_spec_sha256": _file_digest(Path(spec_path)) if spec_path else None,
+            "region_spec_sha256": spec_digest,
             "app_regions_path": str(config_path),
-            "app_regions_sha256": _file_digest(Path(config_path)),
+            "app_regions_sha256": config_digest,
             "acquisition_preflight_path": str(run_dir / "acquisition_preflight.json"),
             "acquisition_preflight_sha256": _file_digest(
                 run_dir / "acquisition_preflight.json"
@@ -402,7 +514,7 @@ def plan_run(
                 "terrain": "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}@2x.png",
             },
         },
-        "reuse_validation": "local PNG decode or canonical non-empty S3 object listing",
+        "reuse_validation": "local PNG decode/hash validation; canonical S3 listing is reusable for acquisition only",
         "acquisition": {
             "workers": workers,
             "transient_retry_policy": "MapboxTileSource: 3 retries, exponential backoff for 429/5xx",

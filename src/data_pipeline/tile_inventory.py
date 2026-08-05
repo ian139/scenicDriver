@@ -125,8 +125,10 @@ def scan_s3_inventory(
                 for item in page.get("Contents", []):
                     key = str(item.get("Key", ""))
                     size = int(item.get("Size", 0))
-                    if size > 0 and key.endswith(".png"):
-                        found[Path(key).name] = size
+                    if size > 0 and key.startswith(prefix):
+                        rel = key[len(prefix) :]
+                        if rel and "/" not in rel and rel.endswith(".png"):
+                            found[rel] = size
             objects[(style, region)] = found
 
     for row in output:
@@ -141,8 +143,6 @@ def scan_s3_inventory(
                 if s3_present
                 else ""
             )
-            row[f"{style}_present"] = bool(row.get(f"{style}_present")) or s3_present
-
     counts = {
         "coordinates": len(output),
         "satellite_valid": sum(bool(row.get("satellite_present")) for row in output),
@@ -181,7 +181,11 @@ def build_inventory_report(
         "schema_version": 1,
         "counts": dict(counts),
         "reusable_pairs": sum(
-            int(r["satellite_present"] and r["terrain_present"]) for r in rows
+            int(
+                (bool(r.get("satellite_present")) or bool(r.get("satellite_s3_present")))
+                and (bool(r.get("terrain_present")) or bool(r.get("terrain_s3_present")))
+            )
+            for r in rows
         ),
         "failures": sorted(
             failures or [],
