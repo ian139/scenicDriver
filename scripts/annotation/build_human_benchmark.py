@@ -208,6 +208,16 @@ def _apply_geographic_splits(tile: pd.DataFrame, path: Path) -> pd.DataFrame:
     conflicts = assignments.groupby("image_path")["split"].nunique()
     if (conflicts > 1).any():
         raise ValueError("Geographic splits CSV assigns one image to multiple splits")
+    if "geographic_block" in assignments.columns:
+        blocks = assignments.loc[
+            assignments["geographic_block"].notna()
+            & assignments["geographic_block"].astype(str).str.strip().ne("")
+        ]
+        block_conflicts = blocks.groupby("geographic_block")["split"].nunique()
+        if (block_conflicts > 1).any():
+            raise ValueError(
+                "Geographic splits CSV assigns one geographic_block to multiple splits"
+            )
     keep = [
         column
         for column in ("image_path", "split", "geographic_block", "split_seed")

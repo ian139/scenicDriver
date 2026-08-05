@@ -121,15 +121,34 @@ def _sample_stratified(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
 
 
 def _pick_source_annotator(ann: pd.DataFrame, target_annotator: str) -> str:
+    eligible = ann.loc[ann["annotator_id"] != target_annotator, ["annotator_id"]]
     counts = (
-        ann.loc[ann["annotator_id"] != target_annotator]
-        .groupby("annotator_id", dropna=False)
+        eligible.groupby("annotator_id", sort=False)
         .size()
-        .sort_values(ascending=False)
+        .rename("count")
+        .reset_index()
     )
     if counts.empty:
         raise ValueError("No source annotator candidates found (only target annotator present).")
-    return str(counts.index[0])
+    return str(
+        counts.sort_values(
+            ["count", "annotator_id"],
+            ascending=[False, True],
+        ).iloc[0]["annotator_id"]
+    )
+
+
+def _handled_paths(path: Path, target_annotator: str) -> set[str]:
+    raw = pd.read_csv(path, usecols=["image_path", "annotator_id"])
+    return set(
+        raw.loc[
+            raw["annotator_id"].astype(str).str.strip().eq(target_annotator),
+            "image_path",
+        ]
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
 
 
 def main() -> None:
@@ -148,7 +167,7 @@ def main() -> None:
 
     source_df = ann.loc[ann["annotator_id"] == source, ["image_path", "scenic_human"]].copy()
     source_df = source_df.rename(columns={"scenic_human": "source_scenic_human"})
-    target_done = set(ann.loc[ann["annotator_id"] == target, "image_path"].astype(str))
+    target_done = _handled_paths(args.annotations_csv, target)
     source_df = source_df.loc[~source_df["image_path"].isin(target_done)].copy()
     source_df = source_df.drop_duplicates(subset=["image_path"], keep="first")
 
