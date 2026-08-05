@@ -23,6 +23,10 @@ MAINTENANCE_ROOTS = (
 )
 ROOT_FILES = (
     "README.md",
+    "compose.beta.yml",
+    "compose.remote-training.yml",
+    "Dockerfile",
+    "Dockerfile.beta-api",
     "pyproject.toml",
     "Dockerfile.remote-training",
     ".dockerignore",
