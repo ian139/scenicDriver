@@ -158,6 +158,7 @@ export SCENIC_LIFECYCLE_DIR={_quote(remote_lifecycle_dir)}
 export SCENIC_TRAIN_DATASET_KEY={_quote(config.train_dataset_key)}
 export SCENIC_TRAIN_DATASET={_quote(DEFAULT_TRAIN_DATASET)}
 export SCENIC_DATASET_PATH={_quote(validation_dataset)}
+export SCENIC_VALIDATION_CHECKPOINT_KEY={_quote(config.validation_checkpoint_key)}
 export SCENIC_CHECKPOINT_PATH={_quote(validation_checkpoint)}
 export SCENIC_TRAIN_OUTPUT={_quote(train_output)}
 export SCENIC_TRAIN_EPOCHS={_quote(config.epochs)}
@@ -165,7 +166,7 @@ export SCENIC_TRAIN_BATCH_SIZE={_quote(config.batch_size)}
 export SCENIC_TRAIN_LR={_quote(config.lr)}
 export SCENIC_TRAIN_VAL_SPLIT={_quote(config.val_split)}
 export SCENIC_TRAIN_SEED={_quote(config.seed)}
-mkdir -p "$SCENIC_OUTPUT_ROOT" "$SCENIC_LIFECYCLE_DIR" "$(dirname "$SCENIC_TRAIN_DATASET")" "$(dirname "$SCENIC_TRAIN_OUTPUT")"
+mkdir -p "$SCENIC_OUTPUT_ROOT" "$SCENIC_LIFECYCLE_DIR" "$(dirname "$SCENIC_TRAIN_DATASET")" "$(dirname "$SCENIC_DATASET_PATH")" "$(dirname "$SCENIC_CHECKPOINT_PATH")" "$(dirname "$SCENIC_TRAIN_OUTPUT")"
 ensure_torch_supports_gpu() {{
   set +e
   python - <<'PY'
@@ -236,6 +237,16 @@ set +e
 (
   set -euo pipefail
   ensure_torch_supports_gpu
+  python -m src.data_pipeline.s3 download-file \
+    --bucket "$SCENIC_S3_BUCKET" \
+    --key "$SCENIC_TRAIN_DATASET_KEY" \
+    --dest "$SCENIC_DATASET_PATH" \
+    --required
+  python -m src.data_pipeline.s3 download-file \
+    --bucket "$SCENIC_S3_BUCKET" \
+    --key "$SCENIC_VALIDATION_CHECKPOINT_KEY" \
+    --dest "$SCENIC_CHECKPOINT_PATH" \
+    --required
   python -m src.data_pipeline.s3 download-file \
     --bucket "$SCENIC_S3_BUCKET" \
     --key "$SCENIC_TRAIN_DATASET_KEY" \
@@ -622,32 +633,118 @@ def handle_cleanup(args: argparse.Namespace) -> int:
         return 0
     previous_status = str(state.get("status", ""))
     update_status(state, "destroying")
-    if destroy_recorded_instance(state):
-        final_status = "failed_destroyed" if previous_status.startswith("failed") else "destroyed"
-        update_status(state, final_status)
-        print(f"Vast training instance destroyed: {args.task_name}")
-        return 0
-    print(f"Destroy failed for Vast training task: {args.task_name}", file=sys.stderr)
-    return 1
+    try:
+        destroyed = destroy_recorded_instance(state)
+    except Exception as exc:  # noqa: BLE001 - persist a retryable terminal state.
+        error = f"destroy failed during cleanup: {exc}"
+    else:
+        error = "destroy failed during cleanup" if not destroyed else ""
+    if error:
+        update_status(state, "failed_kept", error=error)
+        print(f"Destroy failed for Vast training task: {args.task_name}", file=sys.stderr)
+        return 1
+    final_status = "failed_destroyed" if previous_status.startswith("failed") else "destroyed"
+    update_status(state, final_status)
+    print(f"Vast training instance destroyed: {args.task_name}")
+    return 0
 
 
 def handle_validate(args: argparse.Namespace) -> int:
+    import numpy as np
     import torch
 
+    from src.scenic_scorer.regression import ScenicRegressionModel, ScenicScoreDataset
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA validation requested but CUDA is unavailable")
     checkpoint = Path(args.checkpoint)
-    dataset = Path(args.dataset)
+    dataset_path = Path(args.dataset)
     if not checkpoint.is_file():
         raise FileNotFoundError(f"checkpoint not found: {checkpoint}")
-    if not dataset.is_file():
-        raise FileNotFoundError(f"dataset not found: {dataset}")
+    if not dataset_path.is_file():
+        raise FileNotFoundError(f"dataset not found: {dataset_path}")
+
+    try:
+        checkpoint_payload = torch.load(
+            checkpoint,
+            map_location=args.device,
+            weights_only=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - normalize corrupt artifact failures.
+        raise ValueError(f"corrupt or unreadable checkpoint: {checkpoint}") from exc
+    if not isinstance(checkpoint_payload, dict):
+        raise ValueError(f"checkpoint must contain a mapping: {checkpoint}")
+    required_checkpoint_keys = {"model_state_dict", "vit_dim", "terrain_dim", "num_classes"}
+    missing_keys = sorted(required_checkpoint_keys - set(checkpoint_payload))
+    if missing_keys:
+        raise ValueError(f"checkpoint missing required keys: {missing_keys}")
+
+    dimensions: dict[str, int] = {}
+    for name in ("vit_dim", "terrain_dim", "num_classes"):
+        value = checkpoint_payload[name]
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
+            raise ValueError(f"checkpoint {name} must be a positive integer")
+        dimensions[name] = int(value)
+    hidden_value = checkpoint_payload.get("hidden_dim", 256)
+    if isinstance(hidden_value, bool) or not isinstance(hidden_value, (int, np.integer)) or hidden_value < 2:
+        raise ValueError("checkpoint hidden_dim must be an integer >= 2")
+    dimensions["hidden_dim"] = int(hidden_value)
+
+    try:
+        model = ScenicRegressionModel(**dimensions).to(args.device)
+        model.load_state_dict(checkpoint_payload["model_state_dict"], strict=True)
+    except (RuntimeError, TypeError, ValueError, KeyError) as exc:
+        raise ValueError("checkpoint model state is incompatible with ScenicRegressionModel") from exc
+    model.eval()
+
+    try:
+        feature_dataset = ScenicScoreDataset(dataset_path)
+    except Exception as exc:  # noqa: BLE001 - normalize corrupt artifact failures.
+        raise ValueError(f"corrupt or incompatible dataset: {dataset_path}") from exc
+    if len(feature_dataset) < 1:
+        raise ValueError(f"dataset is empty: {dataset_path}")
+    for values in (
+        feature_dataset.vit_embeddings,
+        feature_dataset.terrain_features,
+        feature_dataset.class_logits,
+        feature_dataset.scenic_scores,
+    ):
+        if not torch.isfinite(values).all().item():
+            raise ValueError(f"dataset contains non-finite values: {dataset_path}")
+    vit_embedding, terrain_features, class_logits, _, _ = feature_dataset[0]
+    if any(
+        values.ndim != 1
+        for values in (vit_embedding, terrain_features, class_logits)
+    ):
+        raise ValueError(f"dataset feature arrays must be rank-2: {dataset_path}")
+    actual_dimensions = {
+        "vit_dim": int(vit_embedding.shape[0]),
+        "terrain_dim": int(terrain_features.shape[0]),
+        "num_classes": int(class_logits.shape[0]),
+    }
+    if any(actual_dimensions[name] != dimensions[name] for name in actual_dimensions):
+        raise ValueError(
+            "dataset dimensions are incompatible with checkpoint: "
+            f"dataset={actual_dimensions}, checkpoint={dimensions}"
+        )
+
+    inputs = (
+        vit_embedding.unsqueeze(0).to(args.device),
+        terrain_features.unsqueeze(0).to(args.device),
+        class_logits.unsqueeze(0).to(args.device),
+    )
+    with torch.inference_mode():
+        prediction = model(*inputs)
+    if prediction.numel() != 1 or not torch.isfinite(prediction).all().item():
+        raise ValueError("model forward pass produced a non-finite result")
+
     payload = {
         "ok": True,
         "device": args.device,
         "checkpoint": str(checkpoint),
-        "dataset": str(dataset),
+        "dataset": str(dataset_path),
         "torch_version": torch.__version__,
+        "dimensions": actual_dimensions,
+        "prediction": float(prediction.reshape(-1)[0].item()),
     }
     if args.output:
         output = Path(args.output)

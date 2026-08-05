@@ -27,7 +27,8 @@ def parse_args() -> argparse.Namespace:
         help="Where to save best baseline checkpoint",
     )
     parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val-split", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
@@ -52,6 +53,7 @@ def main() -> None:
         output_path=args.output,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         learning_rate=args.lr,
         val_split=args.val_split,
         seed=args.seed,

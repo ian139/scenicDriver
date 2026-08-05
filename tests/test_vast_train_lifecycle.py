@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
+import torch
 
 from scripts.remote import cmux_vast_host, vast_train
+from src.scenic_scorer.regression import ScenicRegressionModel
 
 
 def make_config(**overrides: object) -> vast_train.VastTrainConfig:
@@ -305,3 +309,136 @@ def test_train_cleanup_uses_recorded_instance_id(tmp_path: Path, monkeypatch: py
 
     assert ["copy-artifacts"] in commands
     assert ["vastai", "destroy", "instance", "12345", "--yes"] in commands
+
+
+
+def test_remote_training_script_downloads_validation_inputs_before_validate() -> None:
+    script = vast_train.build_remote_training_script(make_config())
+
+    dataset_index = script.index('--dest "$SCENIC_DATASET_PATH"')
+    checkpoint_index = script.index('--dest "$SCENIC_CHECKPOINT_PATH"')
+    validation_index = script.index("python scripts/remote/vast_train.py validate")
+
+    assert dataset_index < validation_index
+    assert checkpoint_index < validation_index
+
+
+def _write_validation_fixture(tmp_path: Path, *, compatible: bool = True) -> tuple[Path, Path]:
+    vit_dim, terrain_dim, num_classes = (3, 2, 4)
+    model = ScenicRegressionModel(
+        vit_dim=vit_dim,
+        terrain_dim=terrain_dim,
+        num_classes=num_classes,
+    )
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "vit_dim": vit_dim,
+            "terrain_dim": terrain_dim,
+            "num_classes": num_classes,
+        },
+        checkpoint,
+    )
+    dataset = tmp_path / "features.npz"
+    dataset_vit_dim = vit_dim if compatible else vit_dim + 1
+    np.savez(
+        dataset,
+        vit_embeddings=np.ones((1, dataset_vit_dim), dtype=np.float32),
+        terrain_features=np.ones((1, terrain_dim), dtype=np.float32),
+        class_logits=np.ones((1, num_classes), dtype=np.float32),
+        scenic_scores=np.ones((1,), dtype=np.float32),
+    )
+    return checkpoint, dataset
+
+
+def test_validate_runs_finite_forward_pass_for_compatible_cpu_fixture(
+    tmp_path: Path,
+) -> None:
+    checkpoint, dataset = _write_validation_fixture(tmp_path)
+    output = tmp_path / "validation.json"
+    args = vast_train.build_parser().parse_args(
+        [
+            "validate",
+            "--device",
+            "cpu",
+            "--checkpoint",
+            str(checkpoint),
+            "--dataset",
+            str(dataset),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert vast_train.handle_validate(args) == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["ok"] is True
+    assert payload["device"] == "cpu"
+
+
+def test_validate_rejects_incompatible_fixture(tmp_path: Path) -> None:
+    checkpoint, dataset = _write_validation_fixture(tmp_path, compatible=False)
+    args = vast_train.build_parser().parse_args(
+        [
+            "validate",
+            "--device",
+            "cpu",
+            "--checkpoint",
+            str(checkpoint),
+            "--dataset",
+            str(dataset),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="dimensions"):
+        vast_train.handle_validate(args)
+
+
+def test_train_cleanup_persists_failed_kept_when_destroy_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {
+        "task_name": "scenic-train-smoke",
+        "instance_id": 12345,
+        "status": "completed_kept",
+    }
+    writes: list[dict] = []
+    args = vast_train.build_parser().parse_args(
+        ["cleanup", "scenic-train-smoke", "--destroy", "--yes"]
+    )
+
+    def update_status(current: dict, status: str, **updates: object) -> None:
+        current.update(updates, status=status)
+        writes.append(dict(current))
+
+    monkeypatch.setattr(vast_train, "load_state", lambda task_name: state)
+    monkeypatch.setattr(vast_train, "update_status", update_status)
+    monkeypatch.setattr(vast_train, "destroy_recorded_instance", lambda current: False)
+
+    assert vast_train.handle_cleanup(args) == 1
+    assert state["status"] == "failed_kept"
+    assert state["error"] == "destroy failed during cleanup"
+    assert writes[-1]["status"] == "failed_kept"
+    assert writes[-1]["error"] == "destroy failed during cleanup"
+
+
+def test_validate_rejects_corrupt_checkpoint(tmp_path: Path) -> None:
+    _, dataset = _write_validation_fixture(tmp_path)
+    checkpoint = tmp_path / "corrupt.pt"
+    checkpoint.write_bytes(b"not a torch checkpoint")
+    args = vast_train.build_parser().parse_args(
+        [
+            "validate",
+            "--device",
+            "cpu",
+            "--checkpoint",
+            str(checkpoint),
+            "--dataset",
+            str(dataset),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="corrupt or unreadable checkpoint"):
+        vast_train.handle_validate(args)

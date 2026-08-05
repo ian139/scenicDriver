@@ -346,6 +346,66 @@ def test_scorer_flushes_pending_images_at_batch_size(tmp_path: Path) -> None:
     assert all(size <= 2 for size in recorded_batch_sizes)
 
 
+def test_uncached_pending_payload_high_water_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.active_learning.scoring as scoring_module
+
+    total_rows = 9
+    batch_size = 2
+    rows = []
+    row_payload_bytes: list[int] = []
+    for index in range(total_rows):
+        satellite = tmp_path / f"bounded_sat_{index}.png"
+        terrain = tmp_path / f"bounded_ter_{index}.png"
+        _png(satellite, (50 + index, 100, 150))
+        _png(terrain, (120, 120, 120))
+        row_payload_bytes.append(satellite.stat().st_size + terrain.stat().st_size)
+        rows.append(
+            {
+                "image_path": f"images/satellite/z14/bounded/{index}.png",
+                "region": "fixture",
+                "z": 14,
+                "x": index,
+                "y": 200,
+                "lat": 40.0 + index,
+                "lon": -70.0,
+                "satellite_path": satellite.name,
+                "terrain_path": terrain.name,
+                "satellite_present": True,
+                "terrain_present": True,
+            }
+        )
+
+    observed_payload_bytes: list[int] = []
+    original_dataset = scoring_module._ScoringDataset
+
+    class ObservedDataset(original_dataset):
+        def __init__(self, inputs: list[object], **kwargs: object) -> None:
+            observed_payload_bytes.append(
+                sum(
+                    len(source.payload or b"")
+                    for item in inputs
+                    for source in (item.satellite, item.terrain)
+                )
+            )
+            super().__init__(inputs, **kwargs)
+
+    monkeypatch.setattr(scoring_module, "_ScoringDataset", ObservedDataset)
+    result = score_tile_manifest(
+        pd.DataFrame(rows),
+        run_root=tmp_path / "bounded-run",
+        dependencies=_dependencies({"classifier": 0, "regression": 0}),
+        batch_size=batch_size,
+    )
+
+    assert result["counts"]["scored_rows"] == total_rows, result["errors"]
+    assert len(observed_payload_bytes) == (total_rows + batch_size - 1) // batch_size
+    largest_row_payload = max(observed_payload_bytes)
+    assert largest_row_payload < sum(row_payload_bytes)
+    assert largest_row_payload <= max(row_payload_bytes) * batch_size
+
+
 def test_scoring_rejects_invalid_run_names(tmp_path: Path) -> None:
     from src.active_learning.scoring import run_active_learning_scoring
 

@@ -1,10 +1,4 @@
-"""
-Scenic Score Regression Model
-Owner: progno-ml-vision agent
-
-Learns to predict scenic scores from image features + terrain data.
-Trained on dataset generated from formula-based scoring with human validation.
-"""
+"""Scenic-score regression from classifier and terrain features."""
 
 from pathlib import Path
 from typing import Optional, Tuple
@@ -15,18 +9,7 @@ import torch.nn as nn
 
 
 class ScenicRegressionModel(nn.Module):
-    """
-    Neural network to predict scenic scores directly from features.
-
-    Input features:
-        - ViT embedding (768-dim from classifier backbone)
-        - Terrain features (slope, elevation, water, vegetation)
-        - Classification logits (45-dim)
-
-    Output: Scenic score (0-10)
-
-    Target correlation with human ratings: r >= 0.83
-    """
+    """Predict a scenic score from ViT, terrain, and class features."""
 
     def __init__(
         self,
@@ -149,20 +132,16 @@ def train_regression_model(
     data_path: Path,
     output_path: Path,
     epochs: int = 100,
-    batch_size: int = 64,
+    batch_size: int = 256,
     learning_rate: float = 1e-3,
     val_split: float = 0.15,
     seed: int = 42,
     device: Optional[str] = None,
     weight_decay: float = 1e-4,
     use_sample_weights: bool = True,
+    num_workers: int = 4,
 ) -> float:
-    """
-    Train the scenic score regression model.
-
-    Returns:
-        Final validation correlation coefficient
-    """
+    """Train the scenic-score regression model and return validation correlation."""
     device = resolve_device(device)
 
     torch.manual_seed(seed)
@@ -185,11 +164,17 @@ def train_regression_model(
     train_ds = torch.utils.data.Subset(dataset, train_idx)
     val_ds = torch.utils.data.Subset(dataset, val_idx)
 
+    cuda = str(device).startswith("cuda")
+    loader_options = dict(
+        batch_size=batch_size, num_workers=num_workers, pin_memory=cuda
+    )
+    if num_workers:
+        loader_options.update(prefetch_factor=2, persistent_workers=True)
     train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=0
+        train_ds, shuffle=True, **loader_options
     )
     val_loader = torch.utils.data.DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=0
+        val_ds, shuffle=False, **loader_options
     )
 
     sample_v, sample_t, sample_c, _, _ = dataset[0]
@@ -201,6 +186,7 @@ def train_regression_model(
 
     criterion = nn.MSELoss(reduction="none")
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scaler = torch.amp.GradScaler("cuda", enabled=cuda)
 
     best_val = float("inf")
     best_corr = -1.0
@@ -216,36 +202,33 @@ def train_regression_model(
     for _ in range(epochs):
         model.train()
         train_losses = []
-        for vit_emb, terrain, logits, score, sample_weight in train_loader:
-            vit_emb = vit_emb.to(device)
-            terrain = terrain.to(device)
-            logits = logits.to(device)
-            score = score.to(device)
-            sample_weight = sample_weight.to(device)
-
+        for batch in train_loader:
+            vit_emb, terrain, logits, score, sample_weight = (
+                value.to(device, non_blocking=cuda) for value in batch
+            )
             optimizer.zero_grad()
-            pred = model(vit_emb, terrain, logits)
-            per_sample_loss = criterion(pred, score)
-            if use_sample_weights:
-                denom = torch.clamp(sample_weight.sum(), min=1e-8)
-                loss = (per_sample_loss * sample_weight).sum() / denom
-            else:
-                loss = per_sample_loss.mean()
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast("cuda", enabled=cuda):
+                pred = model(vit_emb, terrain, logits)
+                per_sample_loss = criterion(pred, score)
+                if use_sample_weights:
+                    denom = torch.clamp(sample_weight.sum(), min=1e-8)
+                    loss = (per_sample_loss * sample_weight).sum() / denom
+                else:
+                    loss = per_sample_loss.mean()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             train_losses.append(loss.item())
 
         model.eval()
         val_losses = []
         preds = []
         targets = []
-        with torch.no_grad():
-            for vit_emb, terrain, logits, score, sample_weight in val_loader:
-                vit_emb = vit_emb.to(device)
-                terrain = terrain.to(device)
-                logits = logits.to(device)
-                score = score.to(device)
-                sample_weight = sample_weight.to(device)
+        with torch.inference_mode(), torch.amp.autocast("cuda", enabled=cuda):
+            for batch in val_loader:
+                vit_emb, terrain, logits, score, sample_weight = (
+                    value.to(device, non_blocking=cuda) for value in batch
+                )
                 pred = model(vit_emb, terrain, logits)
                 per_sample_loss = criterion(pred, score)
                 if use_sample_weights:
@@ -254,8 +237,8 @@ def train_regression_model(
                 else:
                     loss = per_sample_loss.mean()
                 val_losses.append(loss.item())
-                preds.append(pred.detach().cpu().numpy().reshape(-1))
-                targets.append(score.detach().cpu().numpy().reshape(-1))
+                preds.append(pred.float().cpu().numpy().reshape(-1))
+                targets.append(score.float().cpu().numpy().reshape(-1))
 
         val_loss = float(np.mean(val_losses)) if val_losses else 0.0
         all_preds = np.concatenate(preds) if preds else np.array([0.0], dtype=np.float32)

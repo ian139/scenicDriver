@@ -23,6 +23,14 @@ DEFAULT_IMAGE = "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04"
 DEFAULT_BRANCH = "Ian139/RemoteTraining"
 DEFAULT_REMOTE_REPO_DIR = "/workspace/scenic-drive"
 DEFAULT_REMOTE_ENV_FILE = "/root/.scenic/aws.env"
+DEFAULT_S3_DATA_PREFIX = "processed/regression/"
+DEFAULT_S3_MODELS_PREFIX = "models/"
+DEFAULT_VALIDATION_DATASET_KEY = (
+    "processed/regression/features_masswhites_z14_mixed5000_v4_h4.npz"
+)
+DEFAULT_VALIDATION_CHECKPOINT_KEY = (
+    "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt"
+)
 DEFAULT_CMUX_WORKSPACE_CWD = str(PROJECT_ROOT)
 VALID_STATUSES = {
     "creating",
@@ -424,6 +432,14 @@ def upload_repo(target: SshTarget, remote_repo_dir: str, branch: str) -> None:
 
 
 def bootstrap_remote(target: SshTarget, remote_repo_dir: str, remote_env_file: str) -> None:
+    dataset_path = (
+        f"{remote_repo_dir.rstrip('/')}/data/processed/regression/"
+        f"{Path(DEFAULT_VALIDATION_DATASET_KEY).name}"
+    )
+    checkpoint_path = (
+        f"{remote_repo_dir.rstrip('/')}/models/"
+        f"{Path(DEFAULT_VALIDATION_CHECKPOINT_KEY).name}"
+    )
     script = f"""
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -432,20 +448,50 @@ apt-get install -y git curl ca-certificates python3 python3-venv python3-pip bui
 if ! command -v uv >/dev/null 2>&1; then curl -LsSf https://astral.sh/uv/install.sh | sh; fi
 export PATH="$HOME/.local/bin:$PATH"
 cd {remote_quote(remote_repo_dir)}
-set -a; . {remote_quote(remote_env_file)}; set +a
+set -a
+. {remote_quote(remote_env_file)}
+set +a
+: "${{SCENIC_S3_BUCKET:?SCENIC_S3_BUCKET is required in the remote env file}}"
+export SCENIC_VALIDATION_DATASET_KEY={remote_quote(DEFAULT_VALIDATION_DATASET_KEY)}
+export SCENIC_VALIDATION_CHECKPOINT_KEY={remote_quote(DEFAULT_VALIDATION_CHECKPOINT_KEY)}
+export SCENIC_DATASET_PATH={remote_quote(dataset_path)}
+export SCENIC_CHECKPOINT_PATH={remote_quote(checkpoint_path)}
+mkdir -p "$(dirname "$SCENIC_DATASET_PATH")" "$(dirname "$SCENIC_CHECKPOINT_PATH")"
 uv sync --python 3.11
+uv run python -m src.data_pipeline.s3 download-file \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --key "$SCENIC_VALIDATION_DATASET_KEY" \
+  --dest "$SCENIC_DATASET_PATH" \
+  --required
+uv run python -m src.data_pipeline.s3 download-file \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --key "$SCENIC_VALIDATION_CHECKPOINT_KEY" \
+  --dest "$SCENIC_CHECKPOINT_PATH" \
+  --required
 uv run python scripts/modeling/train_regression_baseline.py --help >/tmp/scenic_train_help.txt
 """.strip()
     ssh(target, "bash -lc " + shlex.quote(script))
 
 
 def run_remote_container_validation(target: SshTarget, remote_repo_dir: str, remote_env_file: str) -> None:
+    dataset_path = (
+        f"{remote_repo_dir.rstrip('/')}/data/processed/regression/"
+        f"{Path(DEFAULT_VALIDATION_DATASET_KEY).name}"
+    )
+    checkpoint_path = (
+        f"{remote_repo_dir.rstrip('/')}/models/"
+        f"{Path(DEFAULT_VALIDATION_CHECKPOINT_KEY).name}"
+    )
     script = f"""
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 cd {remote_quote(remote_repo_dir)}
-set -a; . {remote_quote(remote_env_file)}; set +a
-python scripts/remote/vast_train.py validate --device cuda \
+set -a
+. {remote_quote(remote_env_file)}
+set +a
+export SCENIC_DATASET_PATH={remote_quote(dataset_path)}
+export SCENIC_CHECKPOINT_PATH={remote_quote(checkpoint_path)}
+uv run python scripts/remote/vast_train.py validate --device cuda \
   --checkpoint "$SCENIC_CHECKPOINT_PATH" \
   --dataset "$SCENIC_DATASET_PATH" \
   --output /tmp/scenic_container_validation.json
@@ -500,9 +546,9 @@ def check_up_preconditions(args: argparse.Namespace) -> None:
     existing = maybe_load_state(args.task_name)
     if existing is not None and existing.get("status") != "destroyed":
         raise SystemExit(f"State exists: {rel_state_path(args.task_name)}; run `python scripts/remote/cmux_vast_host.py down` or choose a new task name")
-    require_commands(["vastai", "ssh", "scp", "tar", "git", "uv"])
     identity_file = str(Path(args.identity_file).expanduser())
     public_key = str(Path(args.ssh_public_key).expanduser())
+    require_commands(["vastai", "ssh", "scp", "tar", "git"])
     if not Path(identity_file).exists():
         raise SystemExit(f"identity file not found: {identity_file}")
     if not Path(public_key).exists():
@@ -936,17 +982,26 @@ def workspace_closed(state: dict) -> bool:
             state["cmux_workspace_observed"] = False
             return False
         return False
-
     return (
         state.get("cmux_workspace_observed") is True
-        and _cmux_scalar_identity(state.get("cmux_workspace_observed_ref")) in recorded_values
+        and _cmux_scalar_identity(state.get("cmux_workspace_observed_ref"))
+        in recorded_values
     )
-
 
 def destroy_instance(state: dict) -> None:
     require_commands(["vastai"])
-    run_command(["vastai", "destroy", "instance", str(state["instance_id"]), "--yes"])
+    try:
+        result = run_command(["vastai", "destroy", "instance", str(state["instance_id"]), "--yes"])
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "command returned non-zero"
+            raise RuntimeError(detail)
+    except Exception as exc:  # noqa: BLE001 - preserve a terminal cleanup state.
+        error = f"destroy failed: {exc}"
+        update_status(state, "failed_kept", error=error)
+        raise RuntimeError(error) from exc
     update_status(state, "destroyed")
+
+
 
 
 def process_watch_state(state: dict, *, destroy: bool, yes: bool) -> None:
@@ -1022,7 +1077,11 @@ def handle_down(args: argparse.Namespace) -> int:
     if not artifacts_ok:
         print(f"Required artifact copy incomplete; refusing to destroy {args.task_name}", file=sys.stderr)
         return 1
-    destroy_instance(state)
+    try:
+        destroy_instance(state)
+    except Exception as exc:  # noqa: BLE001 - destroy_instance persists failed_kept.
+        print(f"Destroy failed for Vast task {args.task_name}: {exc}", file=sys.stderr)
+        return 1
     print(f"Vast task destroyed: {args.task_name}")
     return 0
 

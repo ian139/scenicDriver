@@ -512,3 +512,59 @@ def test_handle_start_task_skips_workspace_create_when_already_registered(
     assert commands == []
     assert state["cmux_workspace_ref"] == "cmux-ref-existing"
     assert state["cmux_workspace_id"] == "8b7b6d3e-cf9d-41e2-8c33-6b68f0a3b0e1"
+
+
+
+def test_full_bootstrap_provisions_explicit_validation_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = cmux_vast_host.SshTarget(
+        host="ssh5.vast.ai",
+        port=2222,
+        user="root",
+        identity_file="/tmp/id_ed25519",
+    )
+    commands: list[str] = []
+    monkeypatch.setattr(
+        cmux_vast_host,
+        "ssh",
+        lambda current, command: commands.append(command),
+    )
+
+    cmux_vast_host.bootstrap_remote(target, "/workspace/scenic-drive", "/root/.scenic/aws.env")
+
+    assert len(commands) == 1
+    script = commands[0]
+    dataset_assignment = script.index("export SCENIC_DATASET_PATH=")
+    checkpoint_assignment = script.index("export SCENIC_CHECKPOINT_PATH=")
+    dataset_download = script.index('--dest "$SCENIC_DATASET_PATH"')
+    checkpoint_download = script.index('--dest "$SCENIC_CHECKPOINT_PATH"')
+    assert dataset_assignment < dataset_download
+    assert checkpoint_assignment < checkpoint_download
+    assert "--required" in script
+    assert "SCENIC_CHECKPOINT_PATH" not in script[:checkpoint_assignment]
+    assert "SCENIC_DATASET_PATH" not in script[:dataset_assignment]
+
+
+def test_destroy_failure_persists_terminal_failed_kept_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {
+        "task_name": "destroy-failure",
+        "instance_id": 12345,
+        "status": "done",
+    }
+    writes: list[dict] = []
+    monkeypatch.setattr(cmux_vast_host, "write_state", lambda current: writes.append(dict(current)))
+    monkeypatch.setattr(
+        cmux_vast_host,
+        "run_command",
+        lambda command, **kwargs: completed(returncode=1),
+    )
+
+    with pytest.raises(RuntimeError, match="destroy"):
+        cmux_vast_host.destroy_instance(state)
+
+    assert state["status"] == "failed_kept"
+    assert "error" in state
+    assert writes[-1]["status"] == "failed_kept"

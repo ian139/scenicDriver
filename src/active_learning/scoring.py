@@ -1431,7 +1431,8 @@ def score_tile_manifest(
         dependencies=dependencies,
     )
     loader_options["batch_size"] = batch_size
-    cache_hits, pending_inputs = 0, []
+    cache_hits = 0
+    pending_inputs: list[_ScoringInput] = []
     vector_by_index, logits_by_index, probs_by_index, terrain_by_index = {}, {}, {}, {}
     errors: list[dict[str, Any]] = []
 
@@ -1529,6 +1530,48 @@ def score_tile_manifest(
             for item in chunk:
                 record_error(item.index, message)
 
+    def score_pending(inputs: list[_ScoringInput]) -> None:
+        if not inputs:
+            return
+        import torch
+
+        loader = torch.utils.data.DataLoader(
+            _ScoringDataset(
+                inputs,
+                classifier_transform=dependencies.classifier_transform,
+                terrain_feature_fn=dependencies.terrain_feature_fn,
+                image_loader=dependencies.image_loader,
+            ),
+            **loader_options,
+        )
+        try:
+            for batch in loader:
+                chunk: list[_PendingRow] = []
+                for item in batch:
+                    if isinstance(item, _ScoringError):
+                        record_error(item.index, item.message, missing=item.missing)
+                    else:
+                        chunk.append(item)
+                if chunk:
+                    score_chunk(chunk)
+        finally:
+            # Drop the loader and its worker dataset before the next source chunk
+            # is read.  This keeps source payload residency proportional to the
+            # configured batch/prefetch window, not the manifest size.
+            del loader
+
+    def flush_pending() -> None:
+        nonlocal pending_inputs
+        if not pending_inputs:
+            return
+        inputs = pending_inputs
+        pending_inputs = []
+        try:
+            score_pending(inputs)
+        finally:
+            inputs.clear()
+
+
     for index, (_, source_row) in enumerate(frame.iterrows()):
         row, result = source_row.to_dict(), results[index]
         if (
@@ -1612,28 +1655,9 @@ def score_tile_manifest(
                 f"{type(exc).__name__}: {exc}",
                 missing=isinstance(exc, FileNotFoundError),
             )
-
-    if pending_inputs:
-        import torch
-
-        loader = torch.utils.data.DataLoader(
-            _ScoringDataset(
-                pending_inputs,
-                classifier_transform=dependencies.classifier_transform,
-                terrain_feature_fn=dependencies.terrain_feature_fn,
-                image_loader=dependencies.image_loader,
-            ),
-            **loader_options,
-        )
-        for batch in loader:
-            chunk = []
-            for item in batch:
-                if isinstance(item, _ScoringError):
-                    record_error(item.index, item.message, missing=item.missing)
-                else:
-                    chunk.append(item)
-            if chunk:
-                score_chunk(chunk)
+        if len(pending_inputs) >= batch_size:
+            flush_pending()
+    flush_pending()
 
     scored_indices = [
         i
