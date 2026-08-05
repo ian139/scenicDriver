@@ -1,0 +1,1050 @@
+"""Stage-two active scenic dataset preparation and resumable training.
+
+This module is strict at the stage-one boundary. It consumes the scorer's
+ordered candidate pool and feature cache, overlays absolute human labels, and
+trains the existing :class:`ScenicRegressionModel` on fixed geographic
+assignments supplied by stage one. No random split or implicit row filter is
+performed here.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import random
+import tempfile
+import time
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+import pandas as pd
+import torch
+
+from .regression import ScenicRegressionModel, resolve_device
+
+
+HANDOFF_SCHEMA_VERSION = 1
+DATASET_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 1
+_ALLOWED_SPLITS = {"train", "val", "validation", "test"}
+_REQUIRED_READINESS = ("data_complete", "annotations_valid", "splits_valid", "benchmark_valid")
+_REQUIRED_FEATURE_ARRAYS = ("embeddings", "terrain_features", "class_logits", "class_probs", "row_indices")
+_FILTERED_INDEX_NAMES = ("filtered_index", "filtered_indices", "filtered_index_artifact", "filtered_index_csv")
+
+
+@dataclass(frozen=True)
+class ActiveTrainingConfig:
+    """Material and bounded controls for active stage-two training.
+
+    ``max_steps`` and ``max_seconds`` are per-invocation continuation budgets;
+    the checkpoint's global step remains cumulative. They are excluded from
+    ``config_hash`` so a paused run can continue with a larger budget.
+    """
+
+    epochs: int = 20
+    batch_size: int = 64
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    seed: int = 42
+    device: str = "auto"
+    hidden_dim: int = 256
+    use_sample_weights: bool = True
+    max_steps: int | None = None
+    max_seconds: float | None = None
+
+    def validate(self) -> None:
+        if isinstance(self.epochs, bool) or int(self.epochs) < 1:
+            raise ValueError("epochs must be a positive integer")
+        if isinstance(self.batch_size, bool) or int(self.batch_size) < 1:
+            raise ValueError("batch_size must be a positive integer")
+        learning_rate = float(self.learning_rate)
+        weight_decay = float(self.weight_decay)
+        if not math.isfinite(learning_rate) or learning_rate <= 0:
+            raise ValueError("learning_rate must be finite and positive")
+        if not math.isfinite(weight_decay) or weight_decay < 0:
+            raise ValueError("weight_decay must be finite and non-negative")
+        if isinstance(self.seed, bool) or not isinstance(self.seed, (int, np.integer)):
+            raise ValueError("seed must be an integer")
+        if isinstance(self.hidden_dim, bool) or int(self.hidden_dim) < 1:
+            raise ValueError("hidden_dim must be a positive integer")
+        if self.max_steps is not None and (isinstance(self.max_steps, bool) or int(self.max_steps) < 0):
+            raise ValueError("max_steps must be a non-negative integer or null")
+        if self.max_seconds is not None:
+            seconds = float(self.max_seconds)
+            if not math.isfinite(seconds) or seconds < 0:
+                raise ValueError("max_seconds must be finite and non-negative or null")
+        if not isinstance(self.use_sample_weights, bool):
+            raise ValueError("use_sample_weights must be boolean")
+
+    def as_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        for name in ("epochs", "batch_size", "seed", "hidden_dim"):
+            value[name] = int(value[name])
+        for name in ("learning_rate", "weight_decay"):
+            value[name] = float(value[name])
+        if value["max_steps"] is not None:
+            value["max_steps"] = int(value["max_steps"])
+        if value["max_seconds"] is not None:
+            value["max_seconds"] = float(value["max_seconds"])
+        return value
+
+
+class ActiveTrainingError(ValueError):
+    """Raised when an immutable stage-one or training artifact is unsafe."""
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _atomic_npz(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".npz", dir=path.parent)
+    os.close(fd)
+    try:
+        np.savez_compressed(temporary, **arrays)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _atomic_torch(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    try:
+        torch.save(dict(value), temporary)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, (np.integer, np.floating, np.bool_)):
+        return _jsonable(value.item())
+    if isinstance(value, np.ndarray):
+        return [_jsonable(item) for item in value.tolist()]
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if bool(pd.isna(value)):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "none", "nat"} else text
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if value is None:
+        return False
+    try:
+        if bool(pd.isna(value)):
+            return False
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return bool(value)
+    return _clean_text(value).lower() in {"1", "true", "yes", "y", "t", "on", "completed", "skipped"}
+
+
+def _finite_float(value: Any, field: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ActiveTrainingError(f"{field} must be numeric") from exc
+    if not math.isfinite(parsed):
+        raise ActiveTrainingError(f"{field} must be finite")
+    return parsed
+
+
+def _load_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ActiveTrainingError(f"invalid {label} JSON: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ActiveTrainingError(f"{label} must be a JSON object: {path}")
+    return value
+
+
+def _load_csv(path: Path, label: str) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, low_memory=False)
+    except (OSError, ValueError) as exc:
+        raise ActiveTrainingError(f"invalid {label} CSV: {path}: {exc}") from exc
+
+
+def _handoff_root(handoff: Mapping[str, Any], handoff_path: Path) -> Path:
+    raw = handoff.get("run_root")
+    if raw is None:
+        return handoff_path.parent
+    candidate = Path(str(raw)).expanduser()
+    return candidate if candidate.is_absolute() else (handoff_path.parent / candidate).resolve()
+
+
+def _artifact_entry(handoff: Mapping[str, Any], names: Sequence[str]) -> tuple[str, Any] | None:
+    artifacts = handoff.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        return None
+    for name in names:
+        if name in artifacts:
+            return name, artifacts[name]
+    return None
+
+
+def _artifact_path_value(entry: Any) -> str | None:
+    raw = entry.get("path") if isinstance(entry, Mapping) else entry
+    text = _clean_text(raw)
+    return text or None
+
+
+def _artifact_expected_hash(handoff: Mapping[str, Any], key: str, entry: Any) -> str | None:
+    if isinstance(entry, Mapping):
+        raw = entry.get("sha256")
+        if isinstance(raw, str) and raw:
+            return raw.lower()
+    hashes = handoff.get("artifact_hashes")
+    if isinstance(hashes, Mapping):
+        for candidate in (key, key.removesuffix(".csv"), key.removesuffix(".npz")):
+            raw = hashes.get(candidate)
+            if isinstance(raw, str) and raw:
+                return raw.lower()
+    return None
+
+
+def _resolve_artifact(
+    handoff: Mapping[str, Any], handoff_path: Path, names: Sequence[str], *, required: bool = True
+) -> tuple[Path | None, str | None]:
+    found = _artifact_entry(handoff, names)
+    if found is None:
+        if required:
+            raise ActiveTrainingError(f"handoff is missing required artifact reference: {names[0]}")
+        return None, None
+    key, entry = found
+    raw_path = _artifact_path_value(entry)
+    if raw_path is None:
+        if required or (isinstance(entry, Mapping) and entry.get("required") is True):
+            raise ActiveTrainingError(f"handoff artifact has no path: {key}")
+        return None, None
+    path_value = Path(raw_path).expanduser()
+    candidates = [path_value] if path_value.is_absolute() else [root / path_value, handoff_path.parent / path_value, Path.cwd() / path_value]
+    path = next((item for item in candidates if item.exists() and item.is_file()), None)
+    if path is None:
+        raise ActiveTrainingError(f"handoff artifact is missing: {key}: {raw_path}")
+    expected = _artifact_expected_hash(handoff, key, entry)
+    if expected is None or len(expected) != 64:
+        raise ActiveTrainingError(f"handoff artifact lacks a valid SHA-256: {key}")
+    actual = _sha256_file(path)
+    if actual.lower() != expected.lower():
+        raise ActiveTrainingError(f"handoff artifact hash mismatch: {key}")
+    return path.resolve(), actual
+
+
+def _resolve_baseline_checkpoint(handoff: Mapping[str, Any], handoff_path: Path) -> tuple[Path, str]:
+    baseline = handoff.get("baseline")
+    if not isinstance(baseline, Mapping):
+        raise ActiveTrainingError("stage-one handoff lacks baseline identity")
+    required = ("checkpoint_path", "checkpoint_sha256", "registry_sha256", "active")
+    missing = [key for key in required if key not in baseline]
+    if missing:
+        raise ActiveTrainingError(f"baseline identity is incomplete: {missing}")
+    checkpoint_raw = _clean_text(baseline.get("checkpoint_path"))
+    expected = _clean_text(baseline.get("checkpoint_sha256")).lower()
+    registry_expected = _clean_text(baseline.get("registry_sha256")).lower()
+    if not checkpoint_raw or len(expected) != 64 or len(registry_expected) != 64 or not isinstance(baseline.get("active"), Mapping):
+        raise ActiveTrainingError("baseline identity has invalid path, hashes, or active record")
+    root = _handoff_root(handoff, handoff_path)
+    raw_path = Path(checkpoint_raw).expanduser()
+    candidates = [raw_path] if raw_path.is_absolute() else [root / raw_path, handoff_path.parent / raw_path, Path.cwd() / raw_path]
+    checkpoint = next((item for item in candidates if item.exists() and item.is_file()), None)
+    if checkpoint is None:
+        raise ActiveTrainingError(f"baseline checkpoint is missing: {checkpoint_raw}")
+    actual = _sha256_file(checkpoint)
+    if actual.lower() != expected:
+        raise ActiveTrainingError("baseline checkpoint hash mismatch")
+    return checkpoint.resolve(), actual
+
+
+def _validate_handoff(handoff_path: str | Path) -> tuple[dict[str, Any], Path, dict[str, tuple[Path, str]]]:
+    source = Path(handoff_path).expanduser().resolve()
+    if not source.exists() or not source.is_file():
+        raise ActiveTrainingError(f"stage-one handoff not found: {source}")
+    handoff = _load_json(source, "stage-one handoff")
+    if handoff.get("schema_version") != HANDOFF_SCHEMA_VERSION:
+        raise ActiveTrainingError("stage-one handoff schema version mismatch")
+    if handoff.get("ready_for_stage2") is not True:
+        raise ActiveTrainingError("stage-one handoff is not ready_for_stage2")
+    readiness = handoff.get("readiness")
+    for key in _REQUIRED_READINESS:
+        value = handoff.get(key)
+        if value is not True and (not isinstance(readiness, Mapping) or readiness.get(key) is not True):
+            raise ActiveTrainingError(f"stage-one handoff readiness is false or missing: {key}")
+    artifacts = handoff.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise ActiveTrainingError("stage-one handoff lacks artifacts object")
+
+    # Validate every required artifact explicitly declared by stage one.
+    for key, entry in artifacts.items():
+        if not isinstance(entry, Mapping) or entry.get("required") is not True:
+            continue
+        _resolve_artifact(handoff, source, (str(key),), required=True)
+
+    resolved: dict[str, tuple[Path, str]] = {}
+    for canonical, aliases in {
+        "candidate_pool": ("candidate_pool", "candidate_pool.csv"),
+        "feature_embeddings": ("feature_embeddings", "feature_embeddings.npz"),
+        "annotations": ("absolute_annotations", "annotations", "human_annotations", "absolute_annotations.csv"),
+        "splits": ("geographic_splits", "splits", "geographic_splits.csv"),
+        "baseline_registry": ("baseline_registry", "model_registry", "registry"),
+    }.items():
+        path, digest = _resolve_artifact(handoff, source, aliases, required=True)
+        assert path is not None and digest is not None
+        resolved[canonical] = (path, digest)
+
+    baseline_checkpoint, checkpoint_hash = _resolve_baseline_checkpoint(handoff, source)
+    baseline = handoff["baseline"]
+    assert isinstance(baseline, Mapping)
+    registry_path, registry_hash = resolved["baseline_registry"]
+    expected_registry_hash = _clean_text(baseline.get("registry_sha256")).lower()
+    if registry_hash.lower() != expected_registry_hash:
+        raise ActiveTrainingError("baseline registry hash mismatch")
+    registry = _load_json(registry_path, "baseline registry")
+    active = registry.get("active")
+    if not isinstance(active, Mapping) or dict(active) != dict(baseline["active"]):
+        raise ActiveTrainingError("baseline active record does not match registry")
+    resolved["baseline_checkpoint"] = (baseline_checkpoint, checkpoint_hash)
+
+    leakage = _artifact_entry(handoff, ("leakage_audit", "leakage_audit.json"))
+    if leakage is not None:
+        path, _ = _resolve_artifact(handoff, source, (leakage[0],), required=True)
+        assert path is not None
+        audit = _load_json(path, "leakage audit")
+        if audit.get("valid") is not True:
+            raise ActiveTrainingError("stage-one leakage audit is not valid")
+    return handoff, source, resolved
+
+
+def _read_feature_arrays(path: Path) -> dict[str, np.ndarray]:
+    try:
+        with np.load(path, allow_pickle=False) as loaded:
+            missing = [key for key in _REQUIRED_FEATURE_ARRAYS if key not in loaded]
+            if missing:
+                raise ActiveTrainingError(f"feature NPZ is missing required arrays: {missing}")
+            arrays = {key: np.asarray(loaded[key]).copy() for key in loaded.files}
+    except ActiveTrainingError:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise ActiveTrainingError(f"invalid feature NPZ: {path}: {exc}") from exc
+    n = len(arrays["embeddings"])
+    for key in ("embeddings", "terrain_features", "class_logits", "class_probs"):
+        array = arrays[key]
+        if array.ndim != 2 or len(array) != n or array.shape[1] <= 0:
+            raise ActiveTrainingError(f"feature NPZ array has invalid shape: {key}")
+        if not np.issubdtype(array.dtype, np.number) or not np.isfinite(array).all():
+            raise ActiveTrainingError(f"feature NPZ array is non-finite or non-numeric: {key}")
+    row_indices = arrays["row_indices"]
+    if row_indices.ndim != 1 or len(row_indices) != n:
+        raise ActiveTrainingError("feature NPZ row_indices shape mismatch")
+    if not np.issubdtype(row_indices.dtype, np.integer):
+        converted = row_indices.astype(np.int64)
+        if not np.array_equal(converted, row_indices):
+            raise ActiveTrainingError("feature NPZ row_indices must contain integers")
+        arrays["row_indices"] = converted
+    if len(np.unique(arrays["row_indices"])) != n:
+        raise ActiveTrainingError("feature NPZ row_indices contain duplicates")
+    return arrays
+
+
+def _candidate_identity(frame: pd.DataFrame) -> list[str]:
+    if "image_path" not in frame.columns:
+        raise ActiveTrainingError("candidate pool lacks image_path")
+    values = [_clean_text(value) for value in frame["image_path"].tolist()]
+    if any(not value for value in values):
+        raise ActiveTrainingError("candidate pool contains empty image_path")
+    if len(set(values)) != len(values):
+        raise ActiveTrainingError("candidate pool contains duplicate image IDs")
+    for column in ("source_identity", "tile_identity"):
+        if column in frame.columns:
+            values_for_column = [_clean_text(value) for value in frame[column].tolist()]
+            nonempty = [value for value in values_for_column if value]
+            if len(set(nonempty)) != len(nonempty):
+                raise ActiveTrainingError(f"candidate pool contains duplicate {column} IDs")
+    return values
+
+
+def _read_filtered_indices(path: Path, candidate: pd.DataFrame) -> list[int]:
+    suffix = path.suffix.lower()
+    values: Any = None
+    if suffix == ".json":
+        payload = _load_json(path, "filtered-index")
+        for key in ("candidate_row_indices", "row_indices", "indices"):
+            if key in payload:
+                values = payload[key]
+                break
+        if values is None and "image_paths" in payload:
+            values = {"image_paths": payload["image_paths"]}
+    elif suffix == ".npz":
+        try:
+            with np.load(path, allow_pickle=False) as arrays:
+                for key in ("candidate_row_indices", "row_indices", "indices"):
+                    if key in arrays:
+                        values = np.asarray(arrays[key]).tolist()
+                        break
+                if values is None and "image_paths" in arrays:
+                    values = {"image_paths": np.asarray(arrays["image_paths"]).tolist()}
+        except (OSError, ValueError, TypeError) as exc:
+            raise ActiveTrainingError(f"invalid filtered-index NPZ: {path}") from exc
+    else:
+        frame = _load_csv(path, "filtered-index")
+        for key in ("candidate_row_index", "row_index", "index"):
+            if key in frame.columns:
+                values = frame[key].tolist()
+                break
+        if values is None and "image_path" in frame.columns:
+            values = {"image_paths": frame["image_path"].tolist()}
+    if isinstance(values, Mapping):
+        raw_paths = values.get("image_paths")
+        if not isinstance(raw_paths, Sequence) or isinstance(raw_paths, (str, bytes)):
+            raise ActiveTrainingError("filtered-index image_paths must be an ordered list")
+        positions = {value: index for index, value in enumerate(_candidate_identity(candidate))}
+        try:
+            indices = [positions[_clean_text(value)] for value in raw_paths]
+        except KeyError as exc:
+            raise ActiveTrainingError("filtered-index references unknown image_path") from exc
+    else:
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            raise ActiveTrainingError("filtered-index must contain ordered row indices")
+        indices = []
+        for value in values:
+            try:
+                number = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ActiveTrainingError("filtered-index row index is not an integer") from exc
+            if number != value:
+                raise ActiveTrainingError("filtered-index row index is not an integer")
+            indices.append(number)
+    if not indices or len(set(indices)) != len(indices):
+        raise ActiveTrainingError("filtered-index must contain unique non-empty rows")
+    if min(indices) < 0 or max(indices) >= len(candidate):
+        raise ActiveTrainingError("filtered-index row is outside candidate pool")
+    return indices
+
+
+def _split_values(frame: pd.DataFrame) -> dict[str, str]:
+    if "image_path" not in frame.columns or "split" not in frame.columns:
+        raise ActiveTrainingError("geographic splits require image_path and split columns")
+    paths = [_clean_text(value) for value in frame["image_path"].tolist()]
+    if any(not path for path in paths):
+        raise ActiveTrainingError("geographic splits contain empty image_path")
+    if len(set(paths)) != len(paths):
+        raise ActiveTrainingError("geographic splits contain duplicate image IDs")
+    result: dict[str, str] = {}
+    for image_path, raw_split in zip(paths, frame["split"].tolist(), strict=True):
+        split = _clean_text(raw_split).lower()
+        if split not in _ALLOWED_SPLITS:
+            raise ActiveTrainingError(f"invalid geographic split: {raw_split}")
+        result[image_path] = "val" if split == "validation" else split
+    return result
+
+
+def _geo_key(row: Mapping[str, Any]) -> str | None:
+    tile = _clean_text(row.get("tile_identity"))
+    if tile:
+        return f"tile:{tile}"
+    parts = [_clean_text(row.get(name)) for name in ("region", "z", "x", "y")]
+    if all(parts):
+        try:
+            parts[1:] = [str(int(float(value))) for value in parts[1:]]
+        except (TypeError, ValueError):
+            pass
+        return "tile:" + "/".join(parts)
+    return None
+
+
+def _validate_geographic_leakage(candidate: pd.DataFrame, selected: Sequence[int], splits: Mapping[str, str]) -> None:
+    rows = candidate.iloc[list(selected)]
+    by_key: dict[str, str] = {}
+    for _, row in rows.iterrows():
+        image_path = _clean_text(row.get("image_path"))
+        split = splits[image_path]
+        key = _geo_key(row)
+        if key is not None:
+            prior = by_key.get(key)
+            if prior is not None and prior != split:
+                raise ActiveTrainingError(f"geographic leakage across splits for {key}")
+            by_key[key] = split
+    for column in ("geographic_group", "geo_group", "block", "group"):
+        if column not in rows.columns:
+            continue
+        groups: dict[str, str] = {}
+        for _, row in rows.iterrows():
+            group = _clean_text(row.get(column))
+            if not group:
+                continue
+            image_path = _clean_text(row.get("image_path"))
+            split = splits[image_path]
+            prior = groups.get(group)
+            if prior is not None and prior != split:
+                raise ActiveTrainingError(f"geographic leakage across splits for {column}={group}")
+            groups[group] = split
+    if not {"region", "z", "x", "y"}.issubset(rows.columns):
+        return
+    coords: list[tuple[str, int, int, int, str]] = []
+    for _, row in rows.iterrows():
+        try:
+            region = _clean_text(row["region"])
+            z = int(float(row["z"]))
+            x = int(float(row["x"]))
+            y = int(float(row["y"]))
+        except (TypeError, ValueError):
+            continue
+        image_path = _clean_text(row["image_path"])
+        coords.append((region, z, x, y, splits[image_path]))
+    for index, left in enumerate(coords):
+        for right in coords[index + 1 :]:
+            if left[:2] != right[:2] or left[4] == right[4]:
+                continue
+            if max(abs(left[2] - right[2]), abs(left[3] - right[3])) <= 1:
+                raise ActiveTrainingError("adjacent geographic tiles leak across splits")
+
+
+def _validate_splits_for_selected(split_frame: pd.DataFrame, candidate: pd.DataFrame, selected: Sequence[int]) -> dict[str, str]:
+    values = _split_values(split_frame)
+    selected_paths = [_clean_text(candidate.iloc[index]["image_path"]) for index in selected]
+    if set(values) != set(selected_paths):
+        missing = sorted(set(selected_paths) - set(values))
+        extra = sorted(set(values) - set(selected_paths))
+        raise ActiveTrainingError(f"geographic splits do not exactly match prepared identities; missing={missing}, extra={extra}")
+    counts = {split: sum(value == split for value in values.values()) for split in ("train", "val", "test")}
+    if any(counts[split] == 0 for split in counts):
+        raise ActiveTrainingError("geographic splits must contain train, val, and test rows")
+    _validate_geographic_leakage(candidate, selected, values)
+    return values
+
+
+def _annotation_labels(annotation: pd.DataFrame, candidate_paths: Sequence[str]) -> dict[str, float | None]:
+    if "image_path" not in annotation.columns or "scenic_human" not in annotation.columns:
+        raise ActiveTrainingError("human annotations require image_path and scenic_human")
+    paths = [_clean_text(value) for value in annotation["image_path"].tolist()]
+    if any(not path for path in paths):
+        raise ActiveTrainingError("human annotations contain empty image_path")
+    if len(set(paths)) != len(paths):
+        raise ActiveTrainingError("human annotations contain duplicate image IDs")
+    unknown = sorted(set(paths) - set(candidate_paths))
+    if unknown:
+        raise ActiveTrainingError(f"human annotations reference unknown image IDs: {unknown}")
+    labels: dict[str, float | None] = {}
+    for _, row in annotation.iterrows():
+        image_path = _clean_text(row["image_path"])
+        skipped = _as_bool(row.get("skip", False)) if "skip" in annotation.columns else False
+        value = row.get("scenic_human")
+        if skipped or value is None or (isinstance(value, float) and math.isnan(value)):
+            labels[image_path] = None
+            continue
+        score = _finite_float(value, "scenic_human")
+        if not 0 <= score <= 10:
+            raise ActiveTrainingError("scenic_human must be in [0, 10]")
+        labels[image_path] = score
+    return labels
+
+
+def _candidate_embedding_rows(
+    handoff: Mapping[str, Any], handoff_path: Path, candidate: pd.DataFrame, arrays: Mapping[str, np.ndarray]
+) -> tuple[list[int], list[int]]:
+    n_features = len(arrays["embeddings"])
+    row_indices = np.asarray(arrays["row_indices"], dtype=np.int64)
+    if np.any(row_indices < 0) or np.any(row_indices >= len(candidate)):
+        raise ActiveTrainingError("feature NPZ row_indices reference outside candidate pool")
+    candidate_values = candidate.get("embedding_row_index")
+    if candidate_values is None:
+        raise ActiveTrainingError("candidate pool lacks embedding_row_index")
+    mapped: dict[int, int] = {}
+    for candidate_row, raw in enumerate(candidate_values.tolist()):
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ActiveTrainingError("candidate embedding_row_index must be integer") from exc
+        if value != raw or value < 0 or value >= n_features:
+            continue
+        if value in mapped.values() or int(row_indices[value]) != candidate_row:
+            continue
+        mapped[candidate_row] = value
+    selected = list(range(len(candidate)))
+    if len(mapped) == len(candidate) and set(mapped) == set(row_indices.tolist()):
+        return selected, [mapped[index] for index in selected]
+
+    found = _artifact_entry(handoff, _FILTERED_INDEX_NAMES)
+    if found is None:
+        raise ActiveTrainingError("candidate pool and feature NPZ are filtered without a declared filtered-index artifact")
+    filtered_path, _ = _resolve_artifact(handoff, handoff_path, (found[0],), required=True)
+    assert filtered_path is not None
+    selected = _read_filtered_indices(filtered_path, candidate)
+    if set(selected) != set(int(value) for value in row_indices.tolist()) or len(selected) != n_features:
+        raise ActiveTrainingError("filtered-index does not exactly describe feature NPZ rows")
+    feature_rows: list[int] = []
+    for candidate_row in selected:
+        raw = candidate.iloc[candidate_row].get("embedding_row_index")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ActiveTrainingError("filtered candidate embedding_row_index must be integer") from exc
+        if value != raw or value < 0 or value >= n_features or int(row_indices[value]) != candidate_row:
+            raise ActiveTrainingError("filtered candidate identity does not match feature NPZ")
+        feature_rows.append(value)
+    return selected, feature_rows
+
+
+def prepare_active_dataset(handoff_path: str | Path, output_path: str | Path) -> dict[str, Any]:
+    """Validate a stage-one handoff and materialize its ordered training NPZ."""
+
+    handoff, source, resolved = _validate_handoff(handoff_path)
+    candidate_path, candidate_hash = resolved["candidate_pool"]
+    feature_path, feature_hash = resolved["feature_embeddings"]
+    annotation_path, annotation_hash = resolved["annotations"]
+    split_path, split_hash = resolved["splits"]
+    candidate = _load_csv(candidate_path, "candidate pool")
+    all_candidate_paths = _candidate_identity(candidate)
+    arrays = _read_feature_arrays(feature_path)
+    selected, feature_rows = _candidate_embedding_rows(handoff, source, candidate, arrays)
+    candidate_paths = [all_candidate_paths[index] for index in selected]
+    split_frame = _load_csv(split_path, "geographic splits")
+    split_values = _validate_splits_for_selected(split_frame, candidate, selected)
+    annotation = _load_csv(annotation_path, "human annotations")
+    human_labels = _annotation_labels(annotation, candidate_paths)
+
+    targets: list[float] = []
+    weights: list[float] = []
+    labels: list[str] = []
+    for selected_position, image_path in enumerate(candidate_paths):
+        candidate_row = candidate.iloc[selected[selected_position]]
+        weak = _finite_float(candidate_row.get("scenic_score"), "candidate scenic_score")
+        if not 0 <= weak <= 10:
+            raise ActiveTrainingError("candidate scenic_score must be in [0, 10]")
+        human = human_labels.get(image_path)
+        if human is None:
+            targets.append(weak)
+            weights.append(1.0)
+            labels.append("weak")
+        else:
+            targets.append(float(human))
+            weights.append(4.0)
+            labels.append("human")
+
+    selected_feature_rows = np.asarray(feature_rows, dtype=np.int64)
+    output = Path(output_path).expanduser().resolve()
+    output_arrays = {
+        "vit_embeddings": np.asarray(arrays["embeddings"])[selected_feature_rows].astype(np.float32, copy=False),
+        "terrain_features": np.asarray(arrays["terrain_features"])[selected_feature_rows].astype(np.float32, copy=False),
+        "class_logits": np.asarray(arrays["class_logits"])[selected_feature_rows].astype(np.float32, copy=False),
+        "scenic_scores": np.asarray(targets, dtype=np.float32),
+        "sample_weights": np.asarray(weights, dtype=np.float32),
+        "image_paths": np.asarray(candidate_paths, dtype=str),
+        "label_sources": np.asarray(labels, dtype=str),
+    }
+    _atomic_npz(output, output_arrays)
+    dataset_hash = _sha256_file(output)
+    counts = {
+        "rows": len(candidate_paths),
+        "train": sum(split_values[path] == "train" for path in candidate_paths),
+        "val": sum(split_values[path] == "val" for path in candidate_paths),
+        "test": sum(split_values[path] == "test" for path in candidate_paths),
+        "human": labels.count("human"),
+        "weak": labels.count("weak"),
+    }
+    return _jsonable({
+        "schema_version": DATASET_SCHEMA_VERSION,
+        "state": "prepared",
+        "dataset_path": str(output),
+        "dataset_sha256": dataset_hash,
+        "split_path": str(split_path),
+        "split_sha256": split_hash,
+        "handoff_path": str(Path(handoff_path).expanduser().resolve()),
+        "handoff_sha256": _sha256_file(source),
+        "counts": counts,
+        "sample_count": counts["rows"],
+        "hashes": {"candidate_pool": candidate_hash, "feature_embeddings": feature_hash, "annotations": annotation_hash, "splits": split_hash, "dataset": dataset_hash},
+        "ordered_image_paths_sha256": _sha256_bytes("\n".join(candidate_paths).encode("utf-8")),
+        "label_sources": {"human": counts["human"], "weak": counts["weak"]},
+        "deterministic_limitations": [
+            "Training order is deterministic and explicit; accelerator kernels may remain nondeterministic.",
+            "The compressed NPZ container is content-addressed after materialization.",
+        ],
+    })
+
+
+def _load_prepared_dataset(path: Path) -> dict[str, np.ndarray]:
+    try:
+        with np.load(path, allow_pickle=False) as loaded:
+            required = ("vit_embeddings", "terrain_features", "class_logits", "scenic_scores", "sample_weights", "image_paths", "label_sources")
+            missing = [key for key in required if key not in loaded]
+            if missing:
+                raise ActiveTrainingError(f"prepared dataset is missing arrays: {missing}")
+            arrays = {key: np.asarray(loaded[key]).copy() for key in required}
+    except ActiveTrainingError:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise ActiveTrainingError(f"invalid prepared dataset: {path}: {exc}") from exc
+    n = len(arrays["scenic_scores"])
+    for key in ("vit_embeddings", "terrain_features", "class_logits"):
+        if arrays[key].ndim != 2 or len(arrays[key]) != n or arrays[key].shape[1] <= 0:
+            raise ActiveTrainingError(f"prepared dataset array shape mismatch: {key}")
+        if not np.issubdtype(arrays[key].dtype, np.number) or not np.isfinite(arrays[key]).all():
+            raise ActiveTrainingError(f"prepared dataset has non-finite features: {key}")
+    scores = np.asarray(arrays["scenic_scores"], dtype=np.float32).reshape(-1)
+    weights = np.asarray(arrays["sample_weights"], dtype=np.float32).reshape(-1)
+    if len(scores) != n or len(weights) != n or not np.isfinite(scores).all():
+        raise ActiveTrainingError("prepared dataset scenic_scores/sample_weights length or finiteness mismatch")
+    if np.any(scores < 0) or np.any(scores > 10):
+        raise ActiveTrainingError("prepared dataset scenic_scores must be in [0, 10]")
+    if not np.isfinite(weights).all() or np.any(weights <= 0):
+        raise ActiveTrainingError("prepared dataset sample_weights must be finite and strictly positive")
+    paths = [_clean_text(value) for value in arrays["image_paths"].reshape(-1).tolist()]
+    if len(paths) != n or any(not value for value in paths) or len(set(paths)) != n:
+        raise ActiveTrainingError("prepared dataset image_paths must be unique and aligned")
+    sources = [_clean_text(value) for value in arrays["label_sources"].reshape(-1).tolist()]
+    if len(sources) != n or any(value not in {"human", "weak"} for value in sources):
+        raise ActiveTrainingError("prepared dataset label_sources are invalid")
+    arrays["scenic_scores"] = scores
+    arrays["sample_weights"] = weights
+    arrays["image_paths"] = np.asarray(paths, dtype=str)
+    arrays["label_sources"] = np.asarray(sources, dtype=str)
+    return arrays
+
+
+def _load_training_splits(path: Path, image_paths: Sequence[str]) -> dict[str, np.ndarray]:
+    frame = _load_csv(path, "training split")
+    values = _split_values(frame)
+    expected = set(image_paths)
+    if set(values) != expected:
+        raise ActiveTrainingError("training split identities do not exactly match prepared dataset")
+    if len(values) != len(frame):
+        raise ActiveTrainingError("training split contains duplicate image IDs")
+    positions = {path: index for index, path in enumerate(image_paths)}
+    result = {split: np.asarray([positions[path] for path in image_paths if values[path] == split], dtype=np.int64) for split in ("train", "val", "test")}
+    if any(len(result[split]) == 0 for split in result):
+        raise ActiveTrainingError("training split must contain train, val, and test rows")
+    return result
+
+
+def _material_config(config: ActiveTrainingConfig, resolved_device: str) -> dict[str, Any]:
+    value = config.as_dict()
+    value.pop("max_steps", None)
+    value.pop("max_seconds", None)
+    value["device"] = resolved_device
+    return value
+
+
+def _config_hash(config: ActiveTrainingConfig, resolved_device: str) -> str:
+    payload = json.dumps(_material_config(config, resolved_device), sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return _sha256_bytes(payload)
+
+
+def _rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: Mapping[str, Any]) -> None:
+    if not {"python", "numpy", "torch"}.issubset(state):
+        raise ActiveTrainingError("checkpoint RNG state is incomplete")
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _torch_load(path: Path, device: str) -> Mapping[str, Any]:
+    try:
+        value = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        value = torch.load(path, map_location=device)
+    if not isinstance(value, Mapping):
+        raise ActiveTrainingError(f"checkpoint is not a mapping: {path}")
+    return value
+
+
+def _checkpoint_payload(model: ScenicRegressionModel, optimizer: torch.optim.Optimizer, *, state: str, next_epoch: int, next_batch: int, global_step: int, dataset_hash: str, split_hash: str, config_hash: str, architecture: Mapping[str, int], counts: Mapping[str, int], history: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    return {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_state": state,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "next_epoch": int(next_epoch),
+        "next_batch": int(next_batch),
+        "epoch": int(next_epoch),
+        "global_step": int(global_step),
+        "dataset_sha256": dataset_hash,
+        "split_sha256": split_hash,
+        "config_hash": config_hash,
+        "architecture": dict(architecture),
+        "counts": dict(counts),
+        "history": list(history),
+        "rng_state": _rng_state(),
+    }
+
+
+def _metrics(model: ScenicRegressionModel, arrays: Mapping[str, np.ndarray], indices: np.ndarray, device: str, use_sample_weights: bool) -> dict[str, float]:
+    model.eval()
+    with torch.no_grad():
+        vit = torch.from_numpy(np.asarray(arrays["vit_embeddings"])[indices]).float().to(device)
+        terrain = torch.from_numpy(np.asarray(arrays["terrain_features"])[indices]).float().to(device)
+        logits = torch.from_numpy(np.asarray(arrays["class_logits"])[indices]).float().to(device)
+        target = np.asarray(arrays["scenic_scores"])[indices].astype(np.float32, copy=False)
+        weight = np.asarray(arrays["sample_weights"])[indices].astype(np.float32, copy=False)
+        prediction = model(vit, terrain, logits).detach().cpu().numpy().reshape(-1)
+    error = prediction - target
+    metric_weight = weight if use_sample_weights else np.ones_like(weight)
+    denominator = float(metric_weight.sum())
+    if denominator <= 0:
+        raise ActiveTrainingError("metric denominator is not positive")
+    mse = float(np.sum(metric_weight * error * error) / denominator)
+    mae = float(np.sum(metric_weight * np.abs(error)) / denominator)
+    pearson = float(np.corrcoef(prediction, target)[0, 1]) if len(prediction) > 1 and np.std(prediction) > 0 and np.std(target) > 0 else 0.0
+    if not math.isfinite(pearson):
+        pearson = 0.0
+    return {"mse": mse, "rmse": float(math.sqrt(max(mse, 0.0))), "mae": mae, "pearson": pearson, "count": int(len(indices))}
+
+
+def _load_completed_summary(summary_path: Path, candidate_path: Path, dataset_hash: str, split_hash: str, config_hash: str) -> dict[str, Any]:
+    summary = _load_json(summary_path, "training summary")
+    if summary.get("state") != "completed":
+        raise ActiveTrainingError("training summary is not completed")
+    if summary.get("dataset_sha256") != dataset_hash or summary.get("split_sha256") != split_hash or summary.get("config_hash") != config_hash:
+        raise ActiveTrainingError("completed summary hashes do not match requested inputs")
+    if not candidate_path.exists():
+        raise ActiveTrainingError("completed summary has no candidate checkpoint")
+    actual = _sha256_file(candidate_path)
+    expected = summary.get("candidate_checkpoint_sha256")
+    if not isinstance(expected, str) or actual.lower() != expected.lower():
+        raise ActiveTrainingError("completed candidate checkpoint hash mismatch")
+    checkpoint = _torch_load(candidate_path, "cpu")
+    if checkpoint.get("checkpoint_state") != "completed" or checkpoint.get("dataset_sha256") != dataset_hash or checkpoint.get("split_sha256") != split_hash or checkpoint.get("config_hash") != config_hash:
+        raise ActiveTrainingError("completed candidate checkpoint metadata is invalid")
+    result = dict(summary)
+    result["reused"] = True
+    return _jsonable(result)
+
+
+def train_active_model(dataset_path: str | Path, split_csv: str | Path, output_dir: str | Path, config: ActiveTrainingConfig, resume: bool = False) -> dict[str, Any]:
+    """Train weighted MSE on fixed splits with truthful continuation state."""
+
+    if not isinstance(config, ActiveTrainingConfig):
+        raise TypeError("config must be an ActiveTrainingConfig")
+    config.validate()
+    dataset = Path(dataset_path).expanduser().resolve()
+    split_path = Path(split_csv).expanduser().resolve()
+    if not dataset.exists() or not dataset.is_file():
+        raise ActiveTrainingError(f"prepared dataset not found: {dataset}")
+    if not split_path.exists() or not split_path.is_file():
+        raise ActiveTrainingError(f"split CSV not found: {split_path}")
+    arrays = _load_prepared_dataset(dataset)
+    splits = _load_training_splits(split_path, arrays["image_paths"].tolist())
+    dataset_hash = _sha256_file(dataset)
+    split_hash = _sha256_file(split_path)
+    device = resolve_device(config.device)
+    config_hash = _config_hash(config, device)
+    root = Path(output_dir).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    candidate_path, resume_path, summary_path = root / "candidate.pt", root / "resume.pt", root / "training_summary.json"
+
+    if resume and summary_path.exists() and candidate_path.exists() and _load_json(summary_path, "training summary").get("state") == "completed":
+        return _load_completed_summary(summary_path, candidate_path, dataset_hash, split_hash, config_hash)
+    if resume and summary_path.exists() and _load_json(summary_path, "training summary").get("state") == "failed":
+        raise ActiveTrainingError("failed training run is not resumable")
+    if resume and not resume_path.exists():
+        raise ActiveTrainingError("resume requested but no continuation checkpoint exists")
+
+    splits_counts = {key: int(len(value)) for key, value in splits.items()}
+    architecture = {"vit_dim": int(arrays["vit_embeddings"].shape[1]), "terrain_dim": int(arrays["terrain_features"].shape[1]), "num_classes": int(arrays["class_logits"].shape[1]), "hidden_dim": int(config.hidden_dim)}
+    torch.manual_seed(int(config.seed))
+    np.random.seed(int(config.seed))
+    random.seed(int(config.seed))
+    model = ScenicRegressionModel(**architecture).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(config.learning_rate), weight_decay=float(config.weight_decay))
+    history: list[dict[str, Any]] = []
+    next_epoch = next_batch = global_step = 0
+
+    if resume:
+        checkpoint = _torch_load(resume_path, device)
+        required = {"checkpoint_schema_version", "checkpoint_state", "model_state_dict", "optimizer_state_dict", "next_epoch", "next_batch", "global_step", "dataset_sha256", "split_sha256", "config_hash", "architecture", "rng_state"}
+        if not required.issubset(checkpoint) or checkpoint.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION:
+            raise ActiveTrainingError("resume checkpoint is incomplete and cannot be resumed")
+        if checkpoint.get("checkpoint_state") != "paused":
+            raise ActiveTrainingError("resume checkpoint is not a paused continuation")
+        if checkpoint.get("dataset_sha256") != dataset_hash or checkpoint.get("split_sha256") != split_hash or checkpoint.get("config_hash") != config_hash:
+            raise ActiveTrainingError("resume checkpoint hash mismatch")
+        if dict(checkpoint.get("architecture", {})) != architecture:
+            raise ActiveTrainingError("resume checkpoint architecture mismatch")
+        try:
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        except (RuntimeError, ValueError, KeyError) as exc:
+            raise ActiveTrainingError("resume checkpoint model or optimizer state is invalid") from exc
+        next_epoch, next_batch, global_step = int(checkpoint["next_epoch"]), int(checkpoint["next_batch"]), int(checkpoint["global_step"])
+        history = [dict(item) for item in checkpoint.get("history", [])]
+        _restore_rng_state(checkpoint["rng_state"])
+
+    started = time.monotonic()
+    steps_this_invocation = 0
+    state, stop_reason = "completed", None
+    try:
+        while next_epoch < int(config.epochs):
+            train_indices = splits["train"]
+            batch_start = next_batch * int(config.batch_size)
+            if batch_start >= len(train_indices):
+                next_epoch, next_batch = next_epoch + 1, 0
+                continue
+            while batch_start < len(train_indices):
+                if config.max_steps is not None and steps_this_invocation >= int(config.max_steps):
+                    state, stop_reason = "paused", "max_steps"
+                    break
+                if config.max_seconds is not None and (time.monotonic() - started) >= float(config.max_seconds):
+                    state, stop_reason = "paused", "max_seconds"
+                    break
+                batch_indices = train_indices[batch_start : batch_start + int(config.batch_size)]
+                vit = torch.from_numpy(np.asarray(arrays["vit_embeddings"])[batch_indices]).float().to(device)
+                terrain = torch.from_numpy(np.asarray(arrays["terrain_features"])[batch_indices]).float().to(device)
+                logits = torch.from_numpy(np.asarray(arrays["class_logits"])[batch_indices]).float().to(device)
+                target = torch.from_numpy(np.asarray(arrays["scenic_scores"])[batch_indices]).float().to(device).reshape(-1, 1)
+                weights = torch.from_numpy(np.asarray(arrays["sample_weights"])[batch_indices]).float().to(device).reshape(-1, 1)
+                optimizer.zero_grad(set_to_none=True)
+                prediction = model(vit, terrain, logits)
+                per_sample = (prediction - target) ** 2
+                loss = (per_sample * weights).sum() / torch.clamp(weights.sum(), min=1e-8) if config.use_sample_weights else per_sample.mean()
+                loss.backward()
+                optimizer.step()
+                global_step, steps_this_invocation, next_batch = global_step + 1, steps_this_invocation + 1, next_batch + 1
+                batch_start += len(batch_indices)
+                _atomic_torch(resume_path, _checkpoint_payload(model, optimizer, state="paused", next_epoch=next_epoch, next_batch=next_batch, global_step=global_step, dataset_hash=dataset_hash, split_hash=split_hash, config_hash=config_hash, architecture=architecture, counts=splits_counts, history=history))
+                if next_batch * int(config.batch_size) >= len(train_indices):
+                    next_epoch, next_batch = next_epoch + 1, 0
+                    break
+                if config.max_steps is not None and steps_this_invocation >= int(config.max_steps):
+                    state, stop_reason = "paused", "max_steps"
+                    break
+                if config.max_seconds is not None and (time.monotonic() - started) >= float(config.max_seconds):
+                    state, stop_reason = "paused", "max_seconds"
+                    break
+            if state == "paused":
+                break
+            history.append({"epoch": int(next_epoch), "metrics": {split: _metrics(model, arrays, splits[split], device, config.use_sample_weights) for split in ("train", "val", "test")}})
+        if next_epoch < int(config.epochs):
+            state = "paused"
+            stop_reason = stop_reason or "budget"
+    except BaseException as exc:
+        state, stop_reason = "failed", f"{type(exc).__name__}: {exc}"
+        _atomic_json(summary_path, _jsonable({"schema_version": DATASET_SCHEMA_VERSION, "state": state, "failure_reason": stop_reason, "dataset_sha256": dataset_hash, "split_sha256": split_hash, "config_hash": config_hash, "counts": splits_counts, "global_step": global_step, "hashes": {"dataset": dataset_hash, "split": split_hash}}))
+        raise
+
+    metrics = {split: _metrics(model, arrays, splits[split], device, config.use_sample_weights) for split in ("train", "val", "test")}
+    summary: dict[str, Any] = {"schema_version": DATASET_SCHEMA_VERSION, "state": state, "stop_reason": stop_reason, "dataset_path": str(dataset), "split_path": str(split_path), "output_dir": str(root), "dataset_sha256": dataset_hash, "split_sha256": split_hash, "config_hash": config_hash, "config": config.as_dict(), "resolved_device": device, "architecture": architecture, "counts": splits_counts, "global_step": int(global_step), "epochs_completed": int(next_epoch), "steps_this_invocation": int(steps_this_invocation), "metrics": metrics, "history": history, "candidate_checkpoint": str(candidate_path), "resume_checkpoint": str(resume_path), "deterministic_limitations": ["CPU execution uses fixed row and batch order with restored Python/NumPy/Torch RNG state.", "GPU/MPS kernels may be nondeterministic; no bitwise accelerator claim is made.", "Bound limits are per invocation; global_step is cumulative across resumes."]}
+    if state == "completed":
+        payload = _checkpoint_payload(model, optimizer, state="completed", next_epoch=next_epoch, next_batch=next_batch, global_step=global_step, dataset_hash=dataset_hash, split_hash=split_hash, config_hash=config_hash, architecture=architecture, counts=splits_counts, history=history)
+        _atomic_torch(candidate_path, payload)
+        _atomic_torch(resume_path, payload)
+        summary["candidate_checkpoint_sha256"], summary["resume_checkpoint_sha256"] = _sha256_file(candidate_path), _sha256_file(resume_path)
+        summary["hashes"] = {"dataset": dataset_hash, "split": split_hash, "candidate_checkpoint": summary["candidate_checkpoint_sha256"], "resume_checkpoint": summary["resume_checkpoint_sha256"]}
+    else:
+        _atomic_torch(resume_path, _checkpoint_payload(model, optimizer, state="paused", next_epoch=next_epoch, next_batch=next_batch, global_step=global_step, dataset_hash=dataset_hash, split_hash=split_hash, config_hash=config_hash, architecture=architecture, counts=splits_counts, history=history))
+        summary["candidate_checkpoint_sha256"] = None
+        summary["resume_checkpoint_sha256"] = _sha256_file(resume_path)
+        summary["hashes"] = {"dataset": dataset_hash, "split": split_hash, "resume_checkpoint": summary["resume_checkpoint_sha256"]}
+    _atomic_json(summary_path, _jsonable(summary))
+    return _jsonable(summary)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Prepare and train active scenic regression data")
+    parser.add_argument("--handoff", type=Path, required=True)
+    parser.add_argument("--dataset", type=Path, default=None)
+    parser.add_argument("--split-csv", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=Path("data/processed/active_training"))
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--learning-rate", "--lr", dest="learning_rate", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--max-seconds", type=float, default=None)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--no-sample-weights", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    dataset_path = args.dataset or (args.output_dir / "active_dataset.npz")
+    prepared = prepare_active_dataset(args.handoff, dataset_path)
+    split_csv = args.split_csv or Path(prepared["split_path"])
+    config = ActiveTrainingConfig(epochs=args.epochs, batch_size=args.batch_size, learning_rate=args.learning_rate, weight_decay=args.weight_decay, hidden_dim=args.hidden_dim, seed=args.seed, device=args.device, max_steps=args.max_steps, max_seconds=args.max_seconds, use_sample_weights=not args.no_sample_weights)
+    result = train_active_model(dataset_path, split_csv, args.output_dir, config, resume=args.resume)
+    print(json.dumps(_jsonable({"prepared": prepared, "training": result}), sort_keys=True, allow_nan=False))
+    print(f"METRIC state={result.get('state')}")
+    print(f"METRIC global_step={result.get('global_step', 0)}")
+    metrics = result.get("metrics", {})
+    if isinstance(metrics, Mapping) and isinstance(metrics.get("val"), Mapping):
+        print(f"METRIC val_rmse={metrics['val'].get('rmse', 0.0)}")
+        print(f"METRIC val_mae={metrics['val'].get('mae', 0.0)}")
+
+
+if __name__ == "__main__":
+    main()
