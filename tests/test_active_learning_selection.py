@@ -187,7 +187,13 @@ def test_finalizer_accepts_complete_validated_fixture(tmp_path: Path) -> None:
     )
     scoring_manifest = {
         "schema_version": 1,
-        "state": {"ready_for_selection": True},
+        "state": {"complete": True, "ready_for_selection": True},
+        "counts": {
+            "manifest_rows": len(paths),
+            "scored_rows": len(paths),
+            "missing_rows": 0,
+            "error_rows": 0,
+        },
         "artifacts": {
             "candidate_pool.csv": {
                 "path": "candidate_pool.csv",

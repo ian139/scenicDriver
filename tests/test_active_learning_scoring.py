@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 from PIL import Image
 from src.active_learning.finalize import finalize_stage1
 from src.active_learning.scoring import (
@@ -28,6 +29,7 @@ def _manifest(root: Path) -> pd.DataFrame:
         _png(terrain, (120, 120, 120))
         rows.append(
             {
+                "image_path": f"images/satellite/z14/fixture/{100 + index}_200.png",
                 "region": "fixture",
                 "z": 14,
                 "x": 100 + index,
@@ -102,6 +104,7 @@ def test_resume_skips_unchanged_rows_and_preserves_error_state(tmp_path: Path) -
     candidates = pd.read_csv(tmp_path / "run" / "candidate_pool.csv")
     assert len(candidates) == 3
     assert candidates.loc[candidates["score_status"] == "missing", "selector_eligible"].eq(False).all()
+    assert candidates.loc[0, "image_path"] == "images/satellite/z14/fixture/100_200.png"
 
 
 def test_model_prediction_stays_separate_from_weak_and_human_names(tmp_path: Path) -> None:
