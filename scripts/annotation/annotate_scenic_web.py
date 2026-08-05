@@ -554,26 +554,39 @@ class AnnotatorState:
         ).hexdigest()
         return f"batch-{digest[:16]}"
 
-    def _read_batch_progress(self, batch_id: str) -> dict[str, Any]:
-        path = self.progress_path
+    def _read_batch_progress(
+        self,
+        batch_id: str,
+        *,
+        progress_path: Path | None = None,
+        annotator_id: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            path = progress_path if progress_path is not None else self.progress_path
+            identity = annotator_id if annotator_id is not None else self.config.annotator_id
         with _locked_path(path, self._lock):
             store = _read_json(path)
-            value = store["batches"].get(batch_id, {}).get(self.config.annotator_id, {})
+            value = store["batches"].get(batch_id, {}).get(identity, {})
             return dict(value) if isinstance(value, dict) else {}
 
-    def _update_progress(self, changes: dict[str, Any]) -> dict[str, Any]:
+    def _update_progress(
+        self,
+        changes: dict[str, Any],
+        *,
+        batch_id: str | None = None,
+        progress_path: Path | None = None,
+        annotator_id: str | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
-            batch_id = self.batch_id
-            annotator_id = self.config.annotator_id
-            path = self.progress_path
-        if not batch_id:
-            raise ApiError(
-                409, "batch_not_loaded", "Load a batch before updating progress"
-            )
+            bid = batch_id if batch_id is not None else self.batch_id
+            identity = annotator_id if annotator_id is not None else self.config.annotator_id
+            path = progress_path if progress_path is not None else self.progress_path
+        if not bid:
+            raise ApiError(409, "batch_not_loaded", "Load a batch before updating progress")
         with _locked_path(path, self._lock):
             store = _read_json(path)
-            batch_state = store["batches"].setdefault(batch_id, {})
-            state = batch_state.setdefault(annotator_id, {})
+            batch_state = store["batches"].setdefault(bid, {})
+            state = batch_state.setdefault(identity, {})
             state.update(changes)
             state["updated_at"] = datetime.now(timezone.utc).isoformat()
             _atomic_write(path, _json_bytes(store))
@@ -623,13 +636,18 @@ class AnnotatorState:
         if isinstance(saved_order, list):
             by_path = candidates.set_index("image_path", drop=False)
             ordered = [str(path) for path in saved_order if str(path) in by_path.index]
+            if source == "batch_csv":
+                seen = set(ordered)
+                ordered.extend(
+                    str(path) for path in candidates["image_path"] if str(path) not in seen
+                )
             batch_frame = (
                 by_path.loc[ordered].reset_index(drop=True)
                 if ordered
                 else candidates.iloc[0:0].copy()
             )
         elif source == "batch_csv":
-            batch_frame = candidates.head(config.sample_size).reset_index(drop=True)
+            batch_frame = candidates.copy().reset_index(drop=True)
         elif config.stratify_by_class:
             batch_frame = _sample_stratified(
                 candidates, config.sample_size, config.seed
@@ -704,57 +722,41 @@ class AnnotatorState:
             raise ApiError(400, "invalid_payload", "Request body must be an object")
         with self._lock:
             config = self.config
-            annotations_path = Path(config.annotations_csv)
+            batch_id = self.batch_id
+            batch_paths = {str(row["image_path"]) for row in self.batch}
+            progress_path = self.progress_path
+        if not batch_id or not batch_paths:
+            raise ApiError(409, "batch_not_loaded", "Load a batch before updating progress")
         claimed_identity = payload.get("annotator_id")
-        if (
-            claimed_identity is not None
-            and str(claimed_identity) != config.annotator_id
-        ):
-            raise ApiError(
-                403, "identity_mismatch", "annotator_id is fixed by the server"
-            )
-        image_path = self._assert_batch_image(payload.get("image_path", ""))
+        if claimed_identity is not None and str(claimed_identity) != config.annotator_id:
+            raise ApiError(403, "identity_mismatch", "annotator_id is fixed by the server")
+        image_path = _safe_image_path(str(payload.get("image_path", "")))
+        if image_path not in batch_paths:
+            raise ApiError(403, "image_not_in_batch", "image_path is not in the active batch")
         skip = _to_bool(payload.get("skip", False))
         score_value = payload.get("scenic_human")
         if score_value in (None, ""):
             if not skip:
-                raise ApiError(
-                    400,
-                    "score_required",
-                    "scenic_human is required unless the image is skipped",
-                )
+                raise ApiError(400, "score_required", "scenic_human is required unless the image is skipped")
             score: float | str = ""
         else:
             try:
                 score = float(score_value)
             except (TypeError, ValueError) as exc:
-                raise ApiError(
-                    400, "invalid_score", "scenic_human must be a number"
-                ) from exc
+                raise ApiError(400, "invalid_score", "scenic_human must be a number") from exc
             if not 0 <= score <= 10:
-                raise ApiError(
-                    400, "invalid_score", "scenic_human must be between 0 and 10"
-                )
+                raise ApiError(400, "invalid_score", "scenic_human must be between 0 and 10")
         confidence = str(payload.get("confidence", "medium")).lower()
         if confidence not in CONFIDENCE_VALUES:
-            raise ApiError(
-                400, "invalid_confidence", "confidence must be low, medium, or high"
-            )
+            raise ApiError(400, "invalid_confidence", "confidence must be low, medium, or high")
         notes = str(payload.get("notes", ""))
         if len(notes) > 4000:
-            raise ApiError(
-                400, "notes_too_long", "notes must not exceed 4000 characters"
-            )
+            raise ApiError(400, "notes_too_long", "notes must not exceed 4000 characters")
         reason = payload.get("unusable_reason")
         if reason not in (None, "") and str(reason) not in UNUSABLE_REASONS:
-            raise ApiError(
-                400, "invalid_unusable_reason", "unusable_reason is unsupported"
-            )
+            raise ApiError(400, "invalid_unusable_reason", "unusable_reason is unsupported")
         if reason and not skip:
-            raise ApiError(
-                400, "invalid_unusable_reason", "unusable_reason requires skip=true"
-            )
-
+            raise ApiError(400, "invalid_unusable_reason", "unusable_reason requires skip=true")
         record = {
             "image_path": image_path,
             "scenic_human": score,
@@ -764,6 +766,7 @@ class AnnotatorState:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "notes": notes,
         }
+        annotations_path = Path(config.annotations_csv)
         with _locked_path(annotations_path, self._lock):
             frame = _read_annotations(annotations_path)
             if not frame.empty:
@@ -771,26 +774,24 @@ class AnnotatorState:
                     frame["annotator_id"].astype(str) == config.annotator_id
                 )
                 frame = frame.loc[~matching].copy()
-            frame = pd.concat(
-                [frame, pd.DataFrame([record], columns=DEFAULT_COLUMNS)],
-                ignore_index=True,
-            )
+            frame = pd.concat([frame, pd.DataFrame([record], columns=DEFAULT_COLUMNS)], ignore_index=True)
             _atomic_write(annotations_path, _csv_bytes(frame))
             row_count = len(frame)
-
-        progress = self._read_batch_progress(self.batch_id)
+        progress = self._read_batch_progress(
+            batch_id, progress_path=progress_path, annotator_id=config.annotator_id
+        )
         unusable = dict(progress.get("unusable", {}))
         if reason:
             unusable[image_path] = str(reason)
         else:
             unusable.pop(image_path, None)
-        self._update_progress({"unusable": unusable, "last_saved_image": image_path})
-        return {
-            "saved": True,
-            "row_count": row_count,
-            "record": record,
-            "progress": self._annotation_counts(),
-        }
+        self._update_progress(
+            {"unusable": unusable, "last_saved_image": image_path},
+            batch_id=batch_id,
+            progress_path=progress_path,
+            annotator_id=config.annotator_id,
+        )
+        return {"saved": True, "row_count": row_count, "record": record, "progress": self._annotation_counts()}
 
     def save_progress(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
