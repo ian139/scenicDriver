@@ -153,3 +153,26 @@ def test_ui_contract_and_structured_error_surface() -> None:
     ):
         assert marker in html
     assert make_handler is not None
+
+
+def test_blind_qa_overlap_is_exposed_without_restoring_prior_answer(tmp_path: Path) -> None:
+    state = fixture_state(tmp_path)
+    state.load_batch({})
+    state.save_annotation(
+        {
+            "image_path": "tile.png",
+            "scenic_human": 5,
+            "confidence": "high",
+            "skip": False,
+            "notes": "earlier answer",
+        }
+    )
+    batch_csv = tmp_path / "qa_batch.csv"
+    batch_csv.write_text("image_path,is_qa_overlap,selection_reason\ntile.png,True,qa\n")
+
+    loaded = state.load_batch({"batch_csv": str(batch_csv)})
+    assert loaded["batch"][0]["is_qa_overlap"] is True
+    assert state.get_annotation("tile.png") == {
+        "found": False,
+        "image_path": "tile.png",
+    }

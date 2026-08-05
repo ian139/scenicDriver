@@ -242,6 +242,63 @@ def test_finalizer_accepts_complete_validated_fixture(tmp_path: Path) -> None:
     registry.write_text(json.dumps({"active": {"checkpoint": str(checkpoint)}}))
     registry_before = registry.read_bytes()
 
+    (tmp_path / "batch_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "row_count": len(paths),
+                "batch_id": "batch",
+                "candidate_input": {
+                    "path": "candidate_pool.csv",
+                    "sha256": sha256_file(tmp_path / "candidate_pool.csv"),
+                },
+            }
+        )
+    )
+    (tmp_path / "selection_diagnostics.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "candidate_input": {
+                    "path": "candidate_pool.csv",
+                    "sha256": sha256_file(tmp_path / "candidate_pool.csv"),
+                },
+            }
+        )
+    )
+    (tmp_path / "scoring_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "state": {"complete": True, "ready_for_selection": True},
+                "counts": {
+                    "manifest_rows": len(paths),
+                    "scored_rows": len(paths),
+                    "missing_rows": 0,
+                    "error_rows": 0,
+                },
+                "source": {
+                    "tile_manifest": {
+                        "path": "tile_manifest.csv",
+                        "sha256": sha256_file(tmp_path / "tile_manifest.csv"),
+                    }
+                },
+                "models": {
+                    "regression_checkpoint_sha256": sha256_file(checkpoint),
+                },
+                "artifacts": {
+                    "candidate_pool.csv": {
+                        "path": "candidate_pool.csv",
+                        "sha256": sha256_file(tmp_path / "candidate_pool.csv"),
+                    },
+                    "feature_embeddings.npz": {
+                        "path": "feature_embeddings.npz",
+                        "sha256": sha256_file(tmp_path / "feature_embeddings.npz"),
+                    },
+                },
+            }
+        )
+    )
     handoff = finalize_stage1(
         tmp_path,
         run_name="fixture",
@@ -251,6 +308,64 @@ def test_finalizer_accepts_complete_validated_fixture(tmp_path: Path) -> None:
         registry_path=registry,
         checkpoint_path=checkpoint,
     )
+    tile_manifest = tmp_path / "tile_manifest.csv"
+    tile_bytes = tile_manifest.read_bytes()
+    tile_manifest.write_bytes(tile_bytes + b"\n")
+    stale_tile = finalize_stage1(
+        tmp_path,
+        run_name="fixture",
+        annotations_csv=tmp_path / "annotations.csv",
+        mixed_labels_csv=tmp_path / "mixed_labels.csv",
+        benchmark_csv=tmp_path / "benchmark.csv",
+        registry_path=registry,
+        checkpoint_path=checkpoint,
+    )
+    assert "scoring manifest tile source hash mismatch" in stale_tile["blockers"]
+    tile_manifest.write_bytes(tile_bytes)
+
+    candidate_path = tmp_path / "candidate_pool.csv"
+    candidate_bytes = candidate_path.read_bytes()
+    candidate_path.write_bytes(candidate_bytes + b"\n")
+    stale_candidate = finalize_stage1(
+        tmp_path,
+        run_name="fixture",
+        annotations_csv=tmp_path / "annotations.csv",
+        mixed_labels_csv=tmp_path / "mixed_labels.csv",
+        benchmark_csv=tmp_path / "benchmark.csv",
+        registry_path=registry,
+        checkpoint_path=checkpoint,
+    )
+    assert "batch_manifest candidate source hash mismatch" in stale_candidate["blockers"]
+    candidate_path.write_bytes(candidate_bytes)
+
+    checkpoint_bytes = checkpoint.read_bytes()
+    checkpoint.write_bytes(checkpoint_bytes + b"stale")
+    stale_checkpoint = finalize_stage1(
+        tmp_path,
+        run_name="fixture",
+        annotations_csv=tmp_path / "annotations.csv",
+        mixed_labels_csv=tmp_path / "mixed_labels.csv",
+        benchmark_csv=tmp_path / "benchmark.csv",
+        registry_path=registry,
+        checkpoint_path=checkpoint,
+    )
+    assert "scoring regression checkpoint does not match baseline" in stale_checkpoint["blockers"]
+    checkpoint.write_bytes(checkpoint_bytes)
+
+    annotations_path = tmp_path / "annotations.csv"
+    annotations_bytes = annotations_path.read_bytes()
+    pd.read_csv(annotations_path).iloc[:2].to_csv(annotations_path, index=False)
+    incomplete_batch = finalize_stage1(
+        tmp_path,
+        run_name="fixture",
+        annotations_csv=annotations_path,
+        mixed_labels_csv=tmp_path / "mixed_labels.csv",
+        benchmark_csv=tmp_path / "benchmark.csv",
+        registry_path=registry,
+        checkpoint_path=checkpoint,
+    )
+    assert any("without completed human labels" in blocker for blocker in incomplete_batch["blockers"])
+    annotations_path.write_bytes(annotations_bytes)
 
     assert handoff["ready_for_stage2"] is True
     assert not handoff["blockers"]

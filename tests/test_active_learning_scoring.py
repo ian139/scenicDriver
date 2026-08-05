@@ -155,3 +155,67 @@ def test_finalizer_requires_scoring_handoff_artifacts(tmp_path: Path) -> None:
     assert handoff["ready_for_stage2"] is False
     assert handoff["scoring_valid"] is False
     assert any("candidate_pool" in blocker for blocker in handoff["blockers"])
+def test_scorer_flushes_pending_images_at_batch_size(tmp_path: Path) -> None:
+    rows = []
+    for index in range(5):
+        sat = tmp_path / f"batch_sat_{index}.png"
+        ter = tmp_path / f"batch_ter_{index}.png"
+        _png(sat, (50 + index * 10, 100, 150))
+        _png(ter, (120, 120, 120))
+        rows.append(
+            {
+                "image_path": f"images/satellite/z14/batch/{index}.png",
+                "region": "fixture",
+                "z": 14,
+                "x": index,
+                "y": 200,
+                "lat": 40.0 + index,
+                "lon": -70.0,
+                "satellite_path": sat.name,
+                "terrain_path": ter.name,
+                "satellite_present": True,
+                "terrain_present": True,
+            }
+        )
+    manifest_df = pd.DataFrame(rows)
+    manifest_path = tmp_path / "tile_manifest.csv"
+    manifest_df.to_csv(manifest_path, index=False)
+
+    recorded_batch_sizes: list[int] = []
+
+    def transform(image: Image.Image) -> np.ndarray:
+        return np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
+
+    def terrain(_terrain: Image.Image, _satellite: Image.Image) -> dict[str, object]:
+        return {
+            "features": np.asarray([0.2, 0.3, 0.4, 0.5, 0.0, 0.0], dtype=np.float32),
+            "relief": 100.0,
+            "roughness": 20.0,
+            "slope_mean": 4.0,
+        }
+
+    def spy_classifier(batch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        size = len(batch)
+        recorded_batch_sizes.append(size)
+        return (
+            np.tile(np.asarray([[2.0, 0.0, -1.0]], dtype=np.float32), (size, 1)),
+            np.arange(size * 4, dtype=np.float32).reshape(size, 4) + 1.0,
+        )
+
+    def spy_regression(embeddings: np.ndarray, terrain_features: np.ndarray, logits: np.ndarray) -> np.ndarray:
+        return np.linspace(2.0, 8.0, len(embeddings), dtype=np.float32)
+
+    deps = ScoringDependencies(
+        classifier_transform=transform,
+        classifier_predictor=spy_classifier,
+        regression_predictor=spy_regression,
+        terrain_feature_fn=terrain,
+        class_names=("forest", "mountain", "lake"),
+        classifier_hash="classifier-fixture",
+        regression_hash="regression-fixture",
+        device="cpu",
+    )
+    result = score_tile_manifest(manifest_df, run_root=tmp_path / "run", dependencies=deps, batch_size=2)
+    assert result["state"]["ready_for_selection"] is True
+    assert recorded_batch_sizes == [2, 2, 1]
+    assert all(size <= 2 for size in recorded_batch_sizes)
