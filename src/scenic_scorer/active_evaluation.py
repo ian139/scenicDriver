@@ -2,9 +2,8 @@
 Active model evaluation, atomic promotion, and rollback module for Stage-Two scenic regression models.
 """
 
-from __future__ import annotations
-
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -182,10 +181,9 @@ def evaluate_stage_two(
     min_route_qa_score = float(thresh_dict.get("min_route_qa_score", 0.80))
     min_route_stability_score = float(thresh_dict.get("min_route_stability_score", 0.80))
     min_complexity_score = float(thresh_dict.get("min_complexity_score", 0.0))
-
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset NPZ not found: {dataset_path}")
-    data_npz = np.load(dataset_path, allow_pickle=True)
+    data_npz = np.load(dataset_path, allow_pickle=False)
     required_npz_keys = {
         "vit_embeddings", "terrain_features", "class_logits", "scenic_scores",
         "sample_weights", "image_paths", "label_sources",
@@ -200,15 +198,27 @@ def evaluate_stage_two(
     terr = data_npz["terrain_features"]
     cls_logits = data_npz["class_logits"]
     npz_scores = data_npz["scenic_scores"]
+    sample_weights = data_npz["sample_weights"]
     image_paths_raw = data_npz["image_paths"]
     
-    image_paths = [str(p) for p in image_paths_raw]
+    n_samples = len(vit)
+    if not (len(terr) == n_samples and len(cls_logits) == n_samples and len(npz_scores) == n_samples and len(sample_weights) == n_samples and len(image_paths_raw) == n_samples):
+        raise ValueError("NPZ arrays length mismatch across required fields")
+    
+    if not (np.isfinite(vit).all() and np.isfinite(terr).all() and np.isfinite(cls_logits).all() and np.isfinite(npz_scores).all() and np.isfinite(sample_weights).all()):
+        raise ValueError("NPZ contains non-finite values (NaN or Inf)")
+    
+    if np.any(sample_weights <= 0):
+        raise ValueError("NPZ sample_weights must be strictly positive (> 0)")
+    
+    image_paths = [str(p.decode("utf-8") if isinstance(p, bytes) else p) for p in image_paths_raw]
     
     # Check for duplicate image_paths in NPZ
     if len(image_paths) != len(set(image_paths)):
         raise ValueError("Duplicate image_paths found in NPZ dataset")
     
     npz_path_map = {p: i for i, p in enumerate(image_paths)}
+    min_supported_slice_samples = int(thresh_dict.get("min_supported_slice_samples", 5))
     
     # 2. Load models
     candidate_model = _load_model_checkpoint(candidate_checkpoint)
@@ -231,14 +241,22 @@ def evaluate_stage_two(
         missing_paths = []
         
         for r in records:
+            if "split" not in r or str(r["split"]).strip().lower() != "test":
+                raise ValueError(f"Benchmark {name} requires exact split=test")
+            if "scenic_score" in r:
+                raise ValueError(f"Benchmark {name} target must be scenic_human_mean or scenic_human, never weak/mixed scenic_score")
+
+
+            score_val = r.get("scenic_human_mean")
+            if score_val is None or score_val == "":
+                score_val = r.get("scenic_human")
+            if score_val is None or score_val == "":
+                raise ValueError(f"Benchmark {name} record target must be scenic_human_mean or scenic_human, never weak/mixed scenic_score: {r}")
+
             img_p = r.get("image_path") or r.get("image_paths") or r.get("path") or r.get("image")
             if not img_p:
                 raise ValueError(f"Benchmark {name} record missing image path column: {r}")
             img_p_str = str(img_p)
-            
-            score_val = r.get("scenic_score") or r.get("human_score") or r.get("score") or r.get("human_label") or r.get("label")
-            if score_val is None:
-                raise ValueError(f"Benchmark {name} record missing score column: {r}")
             
             if img_p_str not in npz_path_map:
                 missing_paths.append(img_p_str)
@@ -261,23 +279,23 @@ def evaluate_stage_two(
         csv_paths = [mr["image_path"] for mr in matched_records]
         if len(csv_paths) != len(set(csv_paths)):
             raise ValueError(f"Benchmark {name} CSV contains duplicate image paths")
+
+        if len(matched_records) != len(npz_path_map):
+            raise ValueError(f"Benchmark {name} denominator mismatch: expected {len(npz_path_map)} records, got {len(matched_records)}")
             
         y_true = np.array([mr["target"] for mr in matched_records], dtype=np.float32)
         y_cand = np.array([mr["cand_pred"] for mr in matched_records], dtype=np.float32)
         y_base = np.array([mr["base_pred"] for mr in matched_records], dtype=np.float32)
+        if not np.isfinite(y_true).all():
+            raise ValueError(f"Benchmark {name} targets must be finite")
         
         cand_metrics = _compute_metrics(y_true, y_cand)
         base_metrics = _compute_metrics(y_true, y_base)
         
-        # Sliced metrics
-        slice_map: dict[str, list[dict]] = {}
-        for mr in matched_records:
-            s_name = mr["slice"]
-            slice_map.setdefault(s_name, []).append(mr)
-            
         sliced_results = {}
         region_results = {}
         worst_slice_mse = 0.0
+        has_supported_slice = False
         for group_name, group_key in (("slice", "slice"), ("region", "region")):
             groups: dict[str, list[dict]] = {}
             for rec in matched_records:
@@ -291,8 +309,20 @@ def evaluate_stage_two(
                 s_yb = np.array([r["base_pred"] for r in s_recs], dtype=np.float32)
                 s_cand_m = _compute_metrics(s_yt, s_yc)
                 s_base_m = _compute_metrics(s_yt, s_yb)
-                target_results[s_name] = {"candidate": s_cand_m, "baseline": s_base_m, "samples": len(s_recs)}
-                worst_slice_mse = max(worst_slice_mse, s_cand_m["mse"])
+                is_supported = (len(s_recs) >= min_supported_slice_samples)
+                target_results[s_name] = {
+                    "candidate": s_cand_m,
+                    "baseline": s_base_m,
+                    "samples": len(s_recs),
+                    "supported": is_supported,
+                }
+                if is_supported:
+                    worst_slice_mse = max(worst_slice_mse, s_cand_m["mse"])
+                    has_supported_slice = True
+
+        if not has_supported_slice:
+            worst_slice_mse = cand_metrics["mse"]
+
         return {
             "records": matched_records, "candidate_metrics": cand_metrics,
             "baseline_metrics": base_metrics, "sliced_metrics": sliced_results,
@@ -317,13 +347,38 @@ def evaluate_stage_two(
             bin_mae = float(np.mean(np.abs(exp_yc[mask] - exp_yt[mask])))
             bin_errors.append(bin_mae)
     calibration_error = float(np.mean(bin_errors)) if bin_errors else 0.0
+
+    cand_min = float(np.min(exp_yc))
+    cand_max = float(np.max(exp_yc))
+    cand_range = cand_max - cand_min
+    cand_std = float(np.std(exp_yc))
+    target_std = float(np.std(exp_yt))
+    spread_ratio = cand_std / target_std if target_std > 1e-8 else 0.0
+    mean_drift = float(abs(np.mean(exp_yc) - np.mean(exp_yt)))
     
+    sat_count = int(np.sum((exp_yc <= 0.0) | (exp_yc >= 10.0)))
+    sat_ratio = float(sat_count / len(exp_yc))
+    unique_vals = len(np.unique(np.round(exp_yc, 4)))
+    unique_ratio = float(unique_vals / len(exp_yc))
+
+    min_spread_ratio = float(thresh_dict.get("min_spread_ratio", 0.15))
+    max_mean_drift = float(thresh_dict.get("max_mean_drift", 2.0))
+    max_saturation_ratio = float(thresh_dict.get("max_saturation_ratio", 0.20))
+    min_unique_ratio = float(thresh_dict.get("min_unique_ratio", 0.05))
+
+    pred_range_pass = bool(np.isfinite(exp_yc).all() and cand_min >= 0.0 and cand_max <= 10.0 and cand_range > 1e-4)
+    spread_ratio_pass = bool(spread_ratio >= min_spread_ratio and cand_std > 1e-4)
+    mean_drift_pass = bool(mean_drift <= max_mean_drift)
+    saturation_pass = bool(sat_ratio <= max_saturation_ratio)
+    tie_pass = bool(unique_ratio >= min_unique_ratio)
+    distribution_pass = bool(pred_range_pass and spread_ratio_pass and mean_drift_pass and saturation_pass and tie_pass)
+
     distribution_qa = {
         "candidate": {
             "mean": float(np.mean(exp_yc)),
-            "std": float(np.std(exp_yc)),
-            "min": float(np.min(exp_yc)),
-            "max": float(np.max(exp_yc)),
+            "std": cand_std,
+            "min": cand_min,
+            "max": cand_max,
         },
         "baseline": {
             "mean": float(np.mean(exp_yb)),
@@ -333,11 +388,15 @@ def evaluate_stage_two(
         },
         "target": {
             "mean": float(np.mean(exp_yt)),
-            "std": float(np.std(exp_yt)),
+            "std": target_std,
             "min": float(np.min(exp_yt)),
             "max": float(np.max(exp_yt)),
         },
         "prediction_drift_vs_baseline_mean": float(np.abs(np.mean(exp_yc) - np.mean(exp_yb))),
+        "prediction_drift_vs_target_mean": mean_drift,
+        "spread_ratio": spread_ratio,
+        "saturation_ratio": sat_ratio,
+        "unique_ratio": unique_ratio,
         "calibration_error": calibration_error,
     }
 
@@ -353,18 +412,21 @@ def evaluate_stage_two(
     if not isinstance(route_qa_data, dict):
         raise ValueError(f"Route QA JSON {rq_path} must be a dictionary")
     
-    required_rq_fields = {"route_qa_score", "stability_score", "complexity_score"}
-    missing_rq = sorted(required_rq_fields - set(route_qa_data.keys()))
-    if missing_rq:
-        raise ValueError(f"Route QA JSON {rq_path} missing required fields: {missing_rq}")
-    try:
-        route_qa_score = float(route_qa_data["route_qa_score"])
-        stability_score = float(route_qa_data["stability_score"])
-        complexity_score = float(route_qa_data["complexity_score"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Route QA evidence scores must be numeric") from exc
-    if not np.isfinite([route_qa_score, stability_score, complexity_score]).all():
-        raise ValueError("Route QA evidence scores must be finite")
+    routes = route_qa_data.get("routes")
+    has_nonempty_routes = isinstance(routes, (list, dict)) and len(routes) > 0
+    all_invariants_pass = route_qa_data.get("all_invariants_pass") is True
+
+    stability_confirmed = (
+        route_qa_data.get("stability_confirmed") is True
+        or (isinstance(route_qa_data.get("stability"), dict) and route_qa_data["stability"].get("confirmed") is True)
+    )
+
+    complexity_accepted = (
+        route_qa_data.get("complexity_accepted") is True
+        or (isinstance(route_qa_data.get("complexity"), dict) and route_qa_data["complexity"].get("accepted") is True)
+    )
+
+    route_evidence_pass = bool(has_nonempty_routes and all_invariants_pass and stability_confirmed and complexity_accepted)
 
     # 7. Compound Decision Gates Evaluation
     exp_cand_mse = exp_res["candidate_metrics"]["mse"]
@@ -386,9 +448,8 @@ def evaluate_stage_two(
         "control_benchmark_corr_pass": bool(ctrl_cand_corr >= min_control_corr),
         "worst_slice_mse_pass": bool(worst_slice_mse <= max_worst_slice_mse),
         "calibration_pass": bool(calibration_error <= max_calibration_error),
-        "route_qa_score_pass": bool(route_qa_score >= min_route_qa_score),
-        "stability_pass": bool(stability_score >= min_route_stability_score),
-        "complexity_pass": bool(complexity_score >= min_complexity_score),
+        "distribution_pass": distribution_pass,
+        "route_evidence_pass": route_evidence_pass,
     }
 
     all_gates_pass = all(gates.values())
@@ -421,9 +482,10 @@ def evaluate_stage_two(
         },
         "calibration_and_distribution": distribution_qa,
         "route_qa_evidence": {
-            "route_qa_score": route_qa_score,
-            "stability_score": stability_score,
-            "complexity_score": complexity_score,
+            "routes": routes,
+            "all_invariants_pass": all_invariants_pass,
+            "stability_confirmed": stability_confirmed,
+            "complexity_accepted": complexity_accepted,
             "details": route_qa_data,
         },
         "thresholds_evaluated": thresh_dict,
@@ -435,6 +497,44 @@ def evaluate_stage_two(
     return decision_dict
 
 
+def _locked_registry(reg_path: Path):
+    """Hold an advisory lock for the complete registry transaction."""
+    lock_path = reg_path.with_name(reg_path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "a+b")
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    return lock_file
+
+
+def _write_registry_locked(reg_path: Path, registry_data: dict[str, Any]) -> str:
+    """Durably replace and reread a registry while caller holds its lock."""
+    temp_name: str | None = None
+    try:
+        reg_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=reg_path.parent, delete=False, encoding="utf-8") as tf:
+            temp_name = tf.name
+            json.dump(registry_data, tf, indent=2)
+            tf.flush()
+            os.fsync(tf.fileno())
+        os.replace(temp_name, reg_path)
+        temp_name = None
+        dir_fd = os.open(reg_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        reread = json.loads(reg_path.read_text(encoding="utf-8"))
+        if reread != registry_data:
+            raise ValueError("Registry reread verification failed")
+        return file_sha256(reg_path)
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+
+
 def promote_from_decision(
     decision_path: str | Path,
     candidate_checkpoint: str | Path,
@@ -442,87 +542,51 @@ def promote_from_decision(
     expected_registry_sha256: str,
     run_name: str,
 ) -> dict[str, Any]:
-    """
-    Atomically promote candidate model into model_registry.json if decision passes.
-    Rejection or hash mismatch leaves registry bytes 100% untouched.
-    """
-    dec_path = Path(decision_path)
-    cand_path = Path(candidate_checkpoint)
-    reg_path = Path(registry_path)
-
+    """Promote only a passing, hash-matched candidate in one locked transaction."""
+    dec_path, cand_path, reg_path = Path(decision_path), Path(candidate_checkpoint), Path(registry_path)
     if not dec_path.exists():
         raise FileNotFoundError(f"Decision file not found: {dec_path}")
     if not cand_path.exists():
         raise FileNotFoundError(f"Candidate checkpoint not found: {cand_path}")
     if not reg_path.exists():
         raise FileNotFoundError(f"Registry file not found: {reg_path}")
-
-    # Read and validate decision
     decision_data = json.loads(dec_path.read_text(encoding="utf-8"))
     if not decision_data.get("all_gates_pass", False):
         raise ValueError(f"Promotion rejected: decision at {dec_path} has all_gates_pass == False")
-
-    # Check candidate SHA256 integrity
-    dec_cand_sha256 = decision_data.get("candidate", {}).get("sha256")
-    if not isinstance(dec_cand_sha256, str) or not dec_cand_sha256:
-        raise ValueError("Promotion rejected: decision is missing candidate SHA256 evidence")
-    cand_sha256 = file_sha256(cand_path)
-    if dec_cand_sha256 != cand_sha256:
-        raise ValueError(f"Candidate SHA256 mismatch: decision expected {dec_cand_sha256}, got {cand_sha256}")
-
-    # Hash check on current registry
-    actual_reg_sha256 = file_sha256(reg_path)
-    if actual_reg_sha256 != expected_registry_sha256:
-        raise ValueError(f"Registry SHA256 mismatch: expected {expected_registry_sha256}, got {actual_reg_sha256}")
-
-    # Read registry
-    registry_data = json.loads(reg_path.read_text(encoding="utf-8"))
-    if "active" not in registry_data or not isinstance(registry_data["active"], dict):
-        raise ValueError(f"Malformed registry at {reg_path}: missing active entry")
-
-    history = registry_data.get("history", [])
-    if not isinstance(history, list):
-        history = []
-
-    # Preserve current active in history
-    prior_active = dict(registry_data["active"])
-    history.append(prior_active)
-
-    # Form new active entry
-    exp_cand_m = decision_data.get("expanded_human_benchmark", {}).get("candidate_metrics", {})
-    new_active = {
-        "checkpoint": str(cand_path.resolve()),
-        "promoted_at": datetime.now(timezone.utc).isoformat(),
-        "run_name": run_name,
-        "sha256": cand_sha256,
-        "metrics": exp_cand_m,
-        "decision_path": str(dec_path.resolve()),
-    }
-
-    registry_data["active"] = new_active
-    registry_data["history"] = history
-
-    # Atomic write to registry
-    reg_dir = reg_path.parent
-    reg_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", dir=reg_dir, delete=False, encoding="utf-8") as tf:
-        json.dump(registry_data, tf, indent=2)
-        temp_name = tf.name
-
-    os.replace(temp_name, reg_path)
-
-    # Post-write verification
-    new_reg_sha256 = file_sha256(reg_path)
-    reread = json.loads(reg_path.read_text(encoding="utf-8"))
-    if reread.get("active", {}).get("sha256") != cand_sha256:
-        raise ValueError("Promotion verification failed: active checkpoint hash mismatch")
+    dec_sha = decision_data.get("candidate", {}).get("sha256")
+    cand_sha = file_sha256(cand_path)
+    if not isinstance(dec_sha, str) or dec_sha != cand_sha:
+        raise ValueError("Candidate SHA256 mismatch or missing decision evidence")
     _load_model_checkpoint(cand_path)
-    return {
-        "status": "promoted",
-        "run_name": run_name,
-        "new_registry_sha256": new_reg_sha256,
-        "active": new_active,
-    }
+    lock = _locked_registry(reg_path)
+    try:
+        actual = file_sha256(reg_path)
+        if actual != expected_registry_sha256:
+            raise ValueError(f"Registry SHA256 mismatch: expected {expected_registry_sha256}, got {actual}")
+        registry_data = json.loads(reg_path.read_text(encoding="utf-8"))
+        if not isinstance(registry_data.get("active"), dict):
+            raise ValueError(f"Malformed registry at {reg_path}: missing active entry")
+        history = registry_data.get("history", [])
+        if not isinstance(history, list):
+            raise ValueError("Malformed registry history")
+        prior_active = dict(registry_data["active"])
+        exp_metrics = decision_data.get("expanded_human_benchmark", {}).get("candidate_metrics", {})
+        new_active = {
+            "checkpoint": str(cand_path.resolve()), "promoted_at": datetime.now(timezone.utc).isoformat(),
+            "run_name": run_name, "sha256": cand_sha, "metrics": exp_metrics,
+            "decision_path": str(dec_path.resolve()),
+        }
+        history.append(prior_active)
+        registry_data["active"], registry_data["history"] = new_active, history
+        events = registry_data.setdefault("events", [])
+        if not isinstance(events, list):
+            raise ValueError("Malformed registry events")
+        events.append({"event": "promotion", "prior": prior_active, "new": new_active, "decision": decision_data})
+        new_hash = _write_registry_locked(reg_path, registry_data)
+        return {"status": "promoted", "run_name": run_name, "new_registry_sha256": new_hash, "active": new_active}
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
 
 
 def rollback_registry(
@@ -530,52 +594,45 @@ def rollback_registry(
     target_history_index: int,
     expected_registry_sha256: str,
 ) -> dict[str, Any]:
-    """
-    Atomically rollback model registry active model to a historical entry.
-    """
+    """Restore a validated historical raw record and append a rollback event."""
     reg_path = Path(registry_path)
     if not reg_path.exists():
         raise FileNotFoundError(f"Registry file not found: {reg_path}")
-
-    actual_reg_sha256 = file_sha256(reg_path)
-    if actual_reg_sha256 != expected_registry_sha256:
-        raise ValueError(f"Registry SHA256 mismatch: expected {expected_registry_sha256}, got {actual_reg_sha256}")
-
-    registry_data = json.loads(reg_path.read_text(encoding="utf-8"))
-    if "active" not in registry_data or not isinstance(registry_data["active"], dict):
-        raise ValueError(f"Malformed registry at {reg_path}: missing active entry")
-
-    history = registry_data.get("history", [])
-    if not isinstance(history, list) or not history:
-        raise ValueError(f"Cannot rollback registry {reg_path}: history is empty")
-
+    lock = _locked_registry(reg_path)
     try:
-        target_entry = history[target_history_index]
-    except IndexError as exc:
-        raise ValueError(f"Invalid target history index {target_history_index} for history length {len(history)}") from exc
+        actual = file_sha256(reg_path)
+        if actual != expected_registry_sha256:
+            raise ValueError(f"Registry SHA256 mismatch: expected {expected_registry_sha256}, got {actual}")
+        data = json.loads(reg_path.read_text(encoding="utf-8"))
+        if not isinstance(data.get("active"), dict):
+            raise ValueError(f"Malformed registry at {reg_path}: missing active entry")
+        history = data.get("history", [])
+        if not isinstance(history, list) or not history:
+            raise ValueError(f"Cannot rollback registry {reg_path}: history is empty")
+        try:
+            target = history[target_history_index]
+        except IndexError as exc:
+            raise ValueError("Invalid target history index") from exc
+        if not isinstance(target, dict):
+            raise ValueError("Historical registry record is invalid")
+        checkpoint = Path(str(target.get("checkpoint", "")))
+        target_sha = target.get("sha256")
+        if not checkpoint.is_file() or not isinstance(target_sha, str) or file_sha256(checkpoint) != target_sha:
+            raise ValueError("Historical checkpoint identity validation failed")
+        _load_model_checkpoint(checkpoint)
+        prior = dict(data["active"])
+        real_idx = target_history_index if target_history_index >= 0 else len(history) + target_history_index
+        new_active = dict(history.pop(real_idx))
+        history.append(prior)
+        data["active"], data["history"] = new_active, history
+        events = data.setdefault("events", [])
+        if not isinstance(events, list):
+            raise ValueError("Malformed registry events")
+        events.append({"event": "rollback", "prior": prior, "new": new_active, "target_history_index": target_history_index})
+        new_hash = _write_registry_locked(reg_path, data)
+        return {"status": "rolled_back", "target_history_index": target_history_index, "new_registry_sha256": new_hash, "active": new_active}
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
 
-    # Perform swap: current active moved to history, target historical entry becomes active
-    prior_active = dict(registry_data["active"])
-    # If target_history_index was negative (e.g. -1), convert to positive index for pop
-    real_idx = target_history_index if target_history_index >= 0 else len(history) + target_history_index
-    new_active = history.pop(real_idx)
-    history.append(prior_active)
 
-    registry_data["active"] = new_active
-    registry_data["history"] = history
-
-    # Atomic write to registry
-    reg_dir = reg_path.parent
-    with tempfile.NamedTemporaryFile("w", dir=reg_dir, delete=False, encoding="utf-8") as tf:
-        json.dump(registry_data, tf, indent=2)
-        temp_name = tf.name
-
-    os.replace(temp_name, reg_path)
-
-    new_reg_sha256 = file_sha256(reg_path)
-    return {
-        "status": "rolled_back",
-        "target_history_index": target_history_index,
-        "new_registry_sha256": new_reg_sha256,
-        "active": new_active,
-    }
