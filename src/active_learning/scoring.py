@@ -205,9 +205,15 @@ def _resolve_local_path(value: str, *, manifest_dir: Path, run_root: Path) -> Pa
     if not value:
         return None
     raw = Path(value).expanduser()
-    candidates = [raw]
-    if not raw.is_absolute():
-        candidates += [manifest_dir / raw, run_root / raw, Path.cwd() / raw]
+    if raw.is_absolute():
+        candidates = [raw]
+    else:
+        candidates = [
+            manifest_dir / raw,
+            run_root / raw,
+            run_root.parent / raw,
+            Path.cwd() / raw,
+        ]
     for candidate in candidates:
         try:
             if candidate.exists() and candidate.is_file():
@@ -251,6 +257,15 @@ def _read_source(
                 raise ValueError(f"{style} source requires an injected or configured S3 client")
             bucket, key = s3_ref
             response = s3_client.get_object(Bucket=bucket, Key=key)
+            content_type = _clean_text(response.get("ContentType")).lower()
+            if content_type and content_type not in {
+                "image/png",
+                "image/x-png",
+                "application/octet-stream",
+            }:
+                raise ValueError(
+                    f"{style} S3 object has unexpected content type: {content_type}"
+                )
             body = response.get("Body")
             payload = body.read() if hasattr(body, "read") else body
             if not isinstance(payload, (bytes, bytearray)):
@@ -328,7 +343,8 @@ def normalized_class_entropy(probabilities: Sequence[float] | np.ndarray) -> flo
     if total <= 0.0:
         return 0.0
     values /= total
-    entropy = -float(np.sum(np.where(values > 0.0, values * np.log(values), 0.0)))
+    positive = values[values > 0.0]
+    entropy = -float(np.sum(positive * np.log(positive)))
     normalizer = math.log(float(values.size))
     return float(np.clip(entropy / normalizer if normalizer > 0 else 0.0, 0.0, 1.0))
 
@@ -558,6 +574,17 @@ def _cache_match(row: Mapping[str, Any], cached: Mapping[str, Any], *, classifie
     embeddings = arrays.get("embeddings")
     if embeddings is None or embeddings.ndim != 2 or index >= len(embeddings):
         return None
+    for name in ("embeddings", "class_logits", "class_probs", "terrain_features"):
+        array = arrays.get(name)
+        if (
+            array is None
+            or array.ndim != 2
+            or len(array) != len(embeddings)
+            or index >= len(array)
+            or not np.issubdtype(array.dtype, np.number)
+            or not np.isfinite(array[index]).all()
+        ):
+            return None
     return index
 
 
@@ -666,13 +693,16 @@ def _base_result(row: Mapping[str, Any]) -> dict[str, Any]:
     for name in CANONICAL_TILE_COLUMNS + OPTIONAL_TILE_COLUMNS:
         result[name] = _json_scalar(row.get(name))
     satellite_path = _clean_text(row.get("satellite_path"))
+    image_path = _clean_text(row.get("image_path")) or satellite_path
     result.update({
-        "image_path": satellite_path or _clean_text(row.get("satellite_s3_uri")),
+        "image_path": image_path or _clean_text(row.get("satellite_s3_uri")),
         "tile_identity": _tile_identity(row),
         "source_identity": _source_identity(row),
         "region": _clean_text(row.get("region")) or "unknown",
-        "manifest_satellite_present": _bool(row.get("satellite_present")),
-        "manifest_terrain_present": _bool(row.get("terrain_present")),
+        "manifest_satellite_present": _bool(row.get("satellite_present"))
+        or _bool(row.get("satellite_s3_present")),
+        "manifest_terrain_present": _bool(row.get("terrain_present"))
+        or _bool(row.get("terrain_s3_present")),
         "satellite_present": False, "terrain_present": False,
         "availability_state": "missing", "score_status": "missing", "selector_eligible": False,
         "error": None, "embedding_row_index": -1, "cache_hit": False,
@@ -733,6 +763,10 @@ def score_tile_manifest(
     else:
         dependencies = ScoringDependencies(**dependencies.__dict__)
         dependencies.device = _device_name(device if device != "auto" else dependencies.device)
+    if dependencies.classifier_predictor is not None and not dependencies.classifier_hash:
+        raise ValueError("injected classifier_predictor requires classifier_hash")
+    if dependencies.regression_predictor is not None and not dependencies.regression_hash:
+        raise ValueError("injected regression_predictor requires regression_hash")
     if dependencies.s3_client is None and any(
         _s3_parts(_clean_text(value))
         for name in OPTIONAL_TILE_COLUMNS
@@ -747,6 +781,92 @@ def score_tile_manifest(
     cache_hits, pending = 0, []
     vector_by_index, logits_by_index, probs_by_index, terrain_by_index = {}, {}, {}, {}
     errors: list[dict[str, Any]] = []
+    def score_chunk(chunk: list[_PendingRow]) -> None:
+        try:
+            logits, embeddings = _call_classifier(
+                dependencies, [item.satellite for item in chunk]
+            )
+            terrain_features = np.stack(
+                [item.terrain_features for item in chunk], axis=0
+            ).astype(np.float32)
+            predictions = _call_regression(
+                dependencies, embeddings, terrain_features, logits
+            )
+            probabilities = _softmax(logits)
+            class_names = tuple(dependencies.class_names or ())
+            if class_names and len(class_names) != logits.shape[1]:
+                class_names = tuple(class_names[: logits.shape[1]])
+            for offset, item in enumerate(chunk):
+                result = results[item.index]
+                row_probs = probabilities[offset]
+                class_id = int(np.argmax(row_probs))
+                class_name = (
+                    class_names[class_id]
+                    if class_id < len(class_names)
+                    else f"class_{class_id}"
+                )
+                try:
+                    from src.classifier.model import get_scenic_weight
+
+                    class_score = float(get_scenic_weight(class_name))
+                except Exception:
+                    class_score = 0.3
+                sat_metrics = _satellite_metrics(item.satellite)
+                components, entropy = (
+                    _heuristic_components(
+                        class_score, item.terrain_metrics, sat_metrics
+                    ),
+                    normalized_class_entropy(row_probs),
+                )
+                result.update(
+                    {
+                        **components,
+                        **item.terrain_metrics,
+                        "water_fraction": sat_metrics["water_fraction"],
+                        "regression_prediction": float(predictions[offset]),
+                        "model_prediction": float(predictions[offset]),
+                        "label_source": "active_regression_prediction",
+                        "classifier_checkpoint_sha256": classifier_hash,
+                        "regression_checkpoint_sha256": regression_hash,
+                        "class_id": class_id,
+                        "class_name": class_name,
+                        "class_probability": float(row_probs[class_id]),
+                        "class_count": int(len(row_probs)),
+                        "normalized_class_entropy": entropy,
+                        "class_uncertainty": entropy,
+                        "uncertainty": entropy,
+                        "satellite_present": True,
+                        "terrain_present": True,
+                        "availability_state": "available",
+                        "score_status": "scored",
+                        "selector_eligible": True,
+                        "error": None,
+                    }
+                )
+                vector_by_index[item.index] = embeddings[offset].astype(
+                    np.float32, copy=True
+                )
+                logits_by_index[item.index] = logits[offset].astype(
+                    np.float32, copy=True
+                )
+                probs_by_index[item.index] = row_probs.astype(
+                    np.float32, copy=True
+                )
+                terrain_by_index[item.index] = item.terrain_features.astype(
+                    np.float32, copy=True
+                )
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            for item in chunk:
+                _mark_error(results[item.index], message)
+                errors.append(
+                    {
+                        "source_identity": results[item.index]["source_identity"],
+                        "error": message,
+                        "status": "error",
+                    }
+                )
+
 
     for index, (_, source_row) in enumerate(frame.iterrows()):
         row, result = source_row.to_dict(), results[index]
@@ -759,6 +879,8 @@ def score_tile_manifest(
             satellite = _read_source(value=_clean_text(row.get("satellite_path")), uri=_clean_text(row.get("satellite_s3_uri")), manifest_dir=manifest_dir, run_root=root, s3_client=dependencies.s3_client, style="satellite")
             terrain = _read_source(value=_clean_text(row.get("terrain_path")), uri=_clean_text(row.get("terrain_s3_uri")), manifest_dir=manifest_dir, run_root=root, s3_client=dependencies.s3_client, style="terrain")
             assert satellite.content_hash is not None and terrain.content_hash is not None
+            result["satellite_content_sha256"] = satellite.content_hash
+            result["terrain_content_sha256"] = terrain.content_hash
             cached_row = cache.rows.get(result["source_identity"]) if cache else None
             cached_index = _cache_match(result, cached_row, classifier_hash=classifier_hash, regression_hash=regression_hash, arrays=cache.arrays) if cache and cached_row else None
             if cached_index is not None:
@@ -766,51 +888,43 @@ def score_tile_manifest(
                 result.update({"satellite_present": True, "terrain_present": True, "availability_state": "available", "score_status": "scored", "selector_eligible": True, "cache_hit": True})
                 cache_hits += 1
                 vector_by_index[index] = np.asarray(cache.arrays["embeddings"][cached_index], dtype=np.float32).copy()
-                for name, target in (("class_logits", logits_by_index), ("class_probs", probs_by_index), ("terrain_features", terrain_by_index)):
-                    array = cache.arrays.get(name)
-                    if array is None or array.ndim < 2 or cached_index >= len(array):
-                        raise ValueError(f"cache NPZ is missing valid {name} array")
-                    target[index] = np.asarray(array[cached_index], dtype=np.float32).copy()
+                for name, target in (
+                    ("class_logits", logits_by_index),
+                    ("class_probs", probs_by_index),
+                    ("terrain_features", terrain_by_index),
+                ):
+                    target[index] = np.asarray(
+                        cache.arrays[name][cached_index], dtype=np.float32
+                    ).copy()
                 continue
-            sat_img, terrain_img = _open_rgb(satellite, image_loader=dependencies.image_loader, style="satellite"), _open_rgb(terrain, image_loader=dependencies.image_loader, style="terrain")
+            sat_img = _open_rgb(
+                satellite,
+                image_loader=dependencies.image_loader,
+                style="satellite",
+            )
+            terrain_img = _open_rgb(
+                terrain,
+                image_loader=dependencies.image_loader,
+                style="terrain",
+            )
+            if sat_img.size != terrain_img.size or min(*sat_img.size) <= 0:
+                raise ValueError(
+                    "satellite and terrain imagery must have matching positive dimensions"
+                )
             terrain_result = dependencies.terrain_feature_fn(terrain_img, sat_img)
             terrain_features, terrain_metrics = _terrain_values(terrain_result)
             pending.append(_PendingRow(index=index, satellite=sat_img, terrain_features=terrain_features, terrain_metrics=terrain_metrics, satellite_hash=satellite.content_hash, terrain_hash=terrain.content_hash))
-        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            if len(pending) >= batch_size:
+                score_chunk(pending)
+                pending.clear()
+        except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             _mark_error(result, message, missing=isinstance(exc, FileNotFoundError))
             errors.append({"source_identity": result["source_identity"], "error": message, "status": result["score_status"]})
 
-    for start in range(0, len(pending), batch_size):
-        chunk = pending[start : start + batch_size]
-        try:
-            logits, embeddings = _call_classifier(dependencies, [item.satellite for item in chunk])
-            terrain_features = np.stack([item.terrain_features for item in chunk], axis=0).astype(np.float32)
-            predictions, probabilities = _call_regression(dependencies, embeddings, terrain_features, logits), _softmax(logits)
-            class_names = tuple(dependencies.class_names or ())
-            if class_names and len(class_names) != logits.shape[1]:
-                class_names = tuple(class_names[: logits.shape[1]])
-            for offset, item in enumerate(chunk):
-                result = results[item.index]
-                row_probs, class_id = probabilities[offset], int(np.argmax(probabilities[offset]))
-                class_name = class_names[class_id] if class_id < len(class_names) else f"class_{class_id}"
-                try:
-                    from src.classifier.model import get_scenic_weight
-                    class_score = float(get_scenic_weight(class_name))
-                except Exception:
-                    class_score = 0.3
-                sat_metrics = _satellite_metrics(item.satellite)
-                components, entropy = _heuristic_components(class_score, item.terrain_metrics, sat_metrics), normalized_class_entropy(row_probs)
-                result.update({**components, "relief": item.terrain_metrics["relief"], "roughness": item.terrain_metrics["roughness"], "slope_mean": item.terrain_metrics["slope_mean"], "slope_variation": item.terrain_metrics["slope_variation"], "water_proximity": item.terrain_metrics["water_proximity"], "vegetation_density": item.terrain_metrics["vegetation_density"], "water_fraction": sat_metrics["water_fraction"], "regression_prediction": float(predictions[offset]), "model_prediction": float(predictions[offset]), "label_source": "active_regression_prediction", "classifier_checkpoint_sha256": classifier_hash, "regression_checkpoint_sha256": regression_hash, "class_id": class_id, "class_name": class_name, "class_probability": float(row_probs[class_id]), "class_count": int(len(row_probs)), "normalized_class_entropy": entropy, "class_uncertainty": entropy, "uncertainty": entropy, "satellite_present": True, "terrain_present": True, "availability_state": "available", "score_status": "scored", "selector_eligible": True, "error": None})
-                vector_by_index[item.index] = embeddings[offset].astype(np.float32, copy=True)
-                logits_by_index[item.index] = logits[offset].astype(np.float32, copy=True)
-                probs_by_index[item.index] = row_probs.astype(np.float32, copy=True)
-                terrain_by_index[item.index] = item.terrain_features.astype(np.float32, copy=True)
-        except (OSError, ValueError, TypeError, RuntimeError) as exc:
-            message = f"{type(exc).__name__}: {exc}"
-            for item in chunk:
-                _mark_error(results[item.index], message)
-                errors.append({"source_identity": results[item.index]["source_identity"], "error": message, "status": "error"})
+    if pending:
+        score_chunk(pending)
+        pending.clear()
 
     scored_indices = [i for i, result in enumerate(results) if result.get("score_status") == "scored" and i in vector_by_index]
     embedding_dimension = 0

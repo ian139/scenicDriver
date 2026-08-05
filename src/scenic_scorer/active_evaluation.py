@@ -178,9 +178,7 @@ def evaluate_stage_two(
     min_control_corr = float(thresh_dict.get("min_control_corr", 0.75))
     max_worst_slice_mse = float(thresh_dict.get("max_worst_slice_mse", 2.5))
     max_calibration_error = float(thresh_dict.get("max_calibration_error", 1.5))
-    min_route_qa_score = float(thresh_dict.get("min_route_qa_score", 0.80))
-    min_route_stability_score = float(thresh_dict.get("min_route_stability_score", 0.80))
-    min_complexity_score = float(thresh_dict.get("min_complexity_score", 0.0))
+    # Route, stability, and complexity gates consume structured boolean evidence.
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset NPZ not found: {dataset_path}")
     data_npz = np.load(dataset_path, allow_pickle=False)
@@ -235,54 +233,63 @@ def evaluate_stage_two(
     base_pred_map = {p: float(pred) for p, pred in zip(image_paths, base_npz_preds)}
 
     # Helper function to process benchmark CSV against NPZ predictions
-    def process_benchmark(csv_path: str | Path, name: str):
+    def process_benchmark(csv_path: str | Path, name: str) -> dict[str, Any]:
         records = _read_benchmark_csv(csv_path)
+        if any("split" not in record for record in records):
+            raise ValueError(f"Benchmark {name} requires an explicit split column")
+        test_records = [
+            record
+            for record in records
+            if str(record["split"]).strip().lower() == "test"
+        ]
+        if not test_records:
+            raise ValueError(f"Benchmark {name} contains no split=test rows")
         matched_records = []
         missing_paths = []
-        
-        for r in records:
-            if "split" not in r or str(r["split"]).strip().lower() != "test":
-                raise ValueError(f"Benchmark {name} requires exact split=test")
-            if "scenic_score" in r:
-                raise ValueError(f"Benchmark {name} target must be scenic_human_mean or scenic_human, never weak/mixed scenic_score")
-
-
-            score_val = r.get("scenic_human_mean")
+        for record in test_records:
+            score_val = record.get("scenic_human_mean")
             if score_val is None or score_val == "":
-                score_val = r.get("scenic_human")
+                score_val = record.get("scenic_human")
             if score_val is None or score_val == "":
-                raise ValueError(f"Benchmark {name} record target must be scenic_human_mean or scenic_human, never weak/mixed scenic_score: {r}")
-
-            img_p = r.get("image_path") or r.get("image_paths") or r.get("path") or r.get("image")
-            if not img_p:
-                raise ValueError(f"Benchmark {name} record missing image path column: {r}")
-            img_p_str = str(img_p)
-            
-            if img_p_str not in npz_path_map:
-                missing_paths.append(img_p_str)
-            else:
-                matched_records.append({
-                    "image_path": img_p_str,
+                raise ValueError(
+                    f"Benchmark {name} test target must be scenic_human_mean "
+                    "or scenic_human, never weak/mixed scenic_score"
+                )
+            image_path = (
+                record.get("image_path")
+                or record.get("image_paths")
+                or record.get("path")
+                or record.get("image")
+            )
+            if not image_path:
+                raise ValueError(f"Benchmark {name} record lacks image_path")
+            image_path = str(image_path)
+            if image_path not in npz_path_map:
+                missing_paths.append(image_path)
+                continue
+            matched_records.append(
+                {
+                    "image_path": image_path,
                     "target": float(score_val),
-                    "region": r.get("region", "default"),
-                    "slice": r.get("slice", r.get("terrain_type", r.get("region", "default"))),
-                    "cand_pred": cand_pred_map[img_p_str],
-                    "base_pred": base_pred_map[img_p_str],
-                })
-                
+                    "region": record.get("region", "default"),
+                    "slice": record.get(
+                        "slice",
+                        record.get("terrain_type", record.get("region", "default")),
+                    ),
+                    "cand_pred": cand_pred_map[image_path],
+                    "base_pred": base_pred_map[image_path],
+                }
+            )
         if missing_paths:
-            raise ValueError(f"Benchmark {name} contains {len(missing_paths)} paths not present in NPZ dataset")
-        if not matched_records:
-            raise ValueError(f"Benchmark {name} has zero matched records with NPZ dataset")
-        
-        # Check duplicate paths within CSV
-        csv_paths = [mr["image_path"] for mr in matched_records]
-        if len(csv_paths) != len(set(csv_paths)):
-            raise ValueError(f"Benchmark {name} CSV contains duplicate image paths")
-
-        if len(matched_records) != len(npz_path_map):
-            raise ValueError(f"Benchmark {name} denominator mismatch: expected {len(npz_path_map)} records, got {len(matched_records)}")
-            
+            raise ValueError(
+                f"Benchmark {name} has {len(missing_paths)} test paths absent "
+                "from the prepared dataset"
+            )
+        benchmark_paths = [record["image_path"] for record in matched_records]
+        if len(benchmark_paths) != len(set(benchmark_paths)):
+            raise ValueError(f"Benchmark {name} contains duplicate test image paths")
+        if len(matched_records) != len(test_records):
+            raise ValueError(f"Benchmark {name} test denominator mismatch")
         y_true = np.array([mr["target"] for mr in matched_records], dtype=np.float32)
         y_cand = np.array([mr["cand_pred"] for mr in matched_records], dtype=np.float32)
         y_base = np.array([mr["base_pred"] for mr in matched_records], dtype=np.float32)
@@ -576,14 +583,22 @@ def promote_from_decision(
             "run_name": run_name, "sha256": cand_sha, "metrics": exp_metrics,
             "decision_path": str(dec_path.resolve()),
         }
-        history.append(prior_active)
+        history.append(
+            {
+                "event": "promote",
+                "record": new_active,
+                "prior_active": prior_active,
+                "decision": decision_data,
+            }
+        )
         registry_data["active"], registry_data["history"] = new_active, history
-        events = registry_data.setdefault("events", [])
-        if not isinstance(events, list):
-            raise ValueError("Malformed registry events")
-        events.append({"event": "promotion", "prior": prior_active, "new": new_active, "decision": decision_data})
         new_hash = _write_registry_locked(reg_path, registry_data)
-        return {"status": "promoted", "run_name": run_name, "new_registry_sha256": new_hash, "active": new_active}
+        return {
+            "status": "promoted",
+            "run_name": run_name,
+            "new_registry_sha256": new_hash,
+            "active": new_active,
+        }
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
@@ -610,25 +625,34 @@ def rollback_registry(
         if not isinstance(history, list) or not history:
             raise ValueError(f"Cannot rollback registry {reg_path}: history is empty")
         try:
-            target = history[target_history_index]
+            target_event = history[target_history_index]
         except IndexError as exc:
             raise ValueError("Invalid target history index") from exc
-        if not isinstance(target, dict):
-            raise ValueError("Historical registry record is invalid")
-        checkpoint = Path(str(target.get("checkpoint", "")))
-        target_sha = target.get("sha256")
-        if not checkpoint.is_file() or not isinstance(target_sha, str) or file_sha256(checkpoint) != target_sha:
+        if (
+            not isinstance(target_event, dict)
+            or not isinstance(target_event.get("record"), dict)
+        ):
+            raise ValueError("Historical registry event has no model record")
+        new_active = dict(target_event["record"])
+        checkpoint = Path(str(new_active.get("checkpoint", "")))
+        target_sha = new_active.get("sha256")
+        if (
+            not checkpoint.is_file()
+            or not isinstance(target_sha, str)
+            or file_sha256(checkpoint) != target_sha
+        ):
             raise ValueError("Historical checkpoint identity validation failed")
         _load_model_checkpoint(checkpoint)
         prior = dict(data["active"])
-        real_idx = target_history_index if target_history_index >= 0 else len(history) + target_history_index
-        new_active = dict(history.pop(real_idx))
-        history.append(prior)
+        history.append(
+            {
+                "event": "rollback",
+                "record": new_active,
+                "prior_active": prior,
+                "target_history_index": target_history_index,
+            }
+        )
         data["active"], data["history"] = new_active, history
-        events = data.setdefault("events", [])
-        if not isinstance(events, list):
-            raise ValueError("Malformed registry events")
-        events.append({"event": "rollback", "prior": prior, "new": new_active, "target_history_index": target_history_index})
         new_hash = _write_registry_locked(reg_path, data)
         return {"status": "rolled_back", "target_history_index": target_history_index, "new_registry_sha256": new_hash, "active": new_active}
     finally:

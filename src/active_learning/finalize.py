@@ -173,10 +173,22 @@ def _validate_tile(path: Path, root: Path, blockers: list[str]) -> tuple[bool, i
         if frame.empty:
             blockers.append("tile manifest is empty")
         return False, len(frame)
+    zooms = pd.to_numeric(frame["z"], errors="coerce")
+    if zooms.isna().any() or not zooms.eq(14).all():
+        blockers.append("tile manifest must contain only zoom-14 rows")
+    if len(frame) > 370_000:
+        blockers.append("tile manifest exceeds 370000-coordinate hard cap")
+    if frame.duplicated(["region", "z", "x", "y"]).any():
+        blockers.append("tile manifest contains duplicate tile identities")
 
-    present = frame["satellite_present"].map(_bool) & frame["terrain_present"].map(
-        _bool
-    )
+    present = pd.Series(True, index=frame.index)
+    for style in ("satellite", "terrain"):
+        available = frame[f"{style}_present"].map(_bool)
+        if f"{style}_s3_present" in frame and f"{style}_s3_uri" in frame:
+            available |= frame[f"{style}_s3_present"].map(_bool) & frame[
+                f"{style}_s3_uri"
+            ].astype(str).str.startswith("s3://")
+        present &= available
     if not bool(present.all()):
         blockers.append("tile manifest contains incomplete image pairs")
     for _, row in frame.iterrows():
@@ -214,12 +226,31 @@ def _validate_annotations(path: Path | None, blockers: list[str]) -> tuple[bool,
     if frame.empty:
         blockers.append("absolute annotations are empty")
         return False, 0
-    completed = pd.to_numeric(frame["scenic_human"], errors="coerce").notna()
-    completed &= frame["image_path"].astype(str).str.strip().ne("")
-    completed &= ~frame["skip"].map(_bool)
+    if missing or extra:
+        return False, 0
+    scores = pd.to_numeric(frame["scenic_human"], errors="coerce")
+    image_paths = frame["image_path"].astype(str).str.strip()
+    annotators = frame["annotator_id"].astype(str).str.strip()
+    skipped = frame["skip"].map(_bool)
+    completed = scores.notna() & image_paths.ne("") & ~skipped
+    if (scores.notna() & ~scores.between(0.0, 10.0)).any():
+        blockers.append("absolute annotations contain scores outside [0, 10]")
+    valid_confidence = {"low", "medium", "high"}
+    confidence = frame["confidence"].astype(str).str.strip().str.lower()
+    if (~confidence.isin(valid_confidence)).any():
+        blockers.append("absolute annotations contain invalid confidence values")
+    if image_paths.eq("").any() or annotators.eq("").any():
+        blockers.append("absolute annotations contain empty image or annotator identity")
+    if frame.assign(
+        _image_path=image_paths, _annotator_id=annotators
+    ).duplicated(["_image_path", "_annotator_id"]).any():
+        blockers.append("absolute annotations contain duplicate annotator/image records")
     if not bool(completed.any()):
         blockers.append("absolute annotations contain no completed labels")
-    return not missing and not extra and bool(completed.any()), int(completed.sum())
+    valid = not any(
+        blocker.startswith("absolute annotations") for blocker in blockers
+    )
+    return valid and bool(completed.any()), int(completed.sum())
 
 
 def _validate_batch(path: Path, blockers: list[str]) -> tuple[bool, int]:
@@ -382,7 +413,7 @@ def _validate_scoring_artifacts(
     scoring_path: Path,
     root: Path,
     blockers: list[str],
-)-> tuple[bool, int, int]:
+) -> tuple[bool, int, int]:
     """Validate the selector handoff table, dense arrays, and their hashes."""
     blocker_start = len(blockers)
 
@@ -423,12 +454,15 @@ def _validate_scoring_artifacts(
     )
     if not bool(scored.any()):
         blockers.append("candidate pool contains no successfully scored rows")
+    if bool(scored.any()) and not bool(scored.all()):
+        blockers.append("candidate pool contains unscored or failed rows")
     if "regression_prediction" in candidate and not bool(
         pd.to_numeric(candidate.loc[scored, "regression_prediction"], errors="coerce")
         .notna()
         .any()
     ):
         blockers.append("candidate pool contains no active regression predictions")
+    row_indices: np.ndarray | None = None
     try:
         with np.load(embedding_path, allow_pickle=False) as arrays:
             if "embeddings" not in arrays or "row_indices" not in arrays:
@@ -440,17 +474,40 @@ def _validate_scoring_artifacts(
                 embedding_rows = int(len(embeddings))
                 if embeddings.ndim != 2 or embedding_rows <= 0 or embeddings.shape[1] <= 0:
                     blockers.append("feature embeddings NPZ embeddings array is empty or not 2-D")
-                if row_indices.ndim != 1 or len(row_indices) != embedding_rows:
-                    blockers.append("feature embeddings NPZ row_indices shape mismatch")
-                if not np.issubdtype(embeddings.dtype, np.number):
-                    blockers.append("feature embeddings NPZ embeddings array is not numeric")
+                if (
+                    row_indices.ndim != 1
+                    or len(row_indices) != embedding_rows
+                    or not np.issubdtype(row_indices.dtype, np.integer)
+                    or len(np.unique(row_indices)) != len(row_indices)
+                ):
+                    blockers.append("feature embeddings NPZ row_indices are invalid")
+                if (
+                    not np.issubdtype(embeddings.dtype, np.number)
+                    or not np.isfinite(embeddings).all()
+                ):
+                    blockers.append("feature embeddings NPZ embeddings are not finite numeric values")
     except (OSError, ValueError, TypeError) as exc:
         blockers.append(f"invalid feature embeddings NPZ: {exc}")
         embedding_rows = 0
     if "embedding_row_index" in candidate:
-        indices = pd.to_numeric(candidate.loc[scored, "embedding_row_index"], errors="coerce")
-        if indices.isna().any() or (indices < 0).any() or (indices >= max(embedding_rows, 1)).any():
+        indices = pd.to_numeric(
+            candidate.loc[scored, "embedding_row_index"], errors="coerce"
+        )
+        invalid_indices = (
+            indices.isna()
+            | (indices < 0)
+            | (indices >= max(embedding_rows, 1))
+            | (indices % 1 != 0)
+        )
+        if invalid_indices.any():
             blockers.append("candidate pool embedding row indices are invalid")
+        elif row_indices is not None and len(row_indices) == embedding_rows:
+            compact = indices.astype(int).to_numpy()
+            expected_source_rows = np.flatnonzero(scored.to_numpy())
+            if not np.array_equal(row_indices[compact], expected_source_rows):
+                blockers.append(
+                    "candidate pool embedding indices do not match NPZ source rows"
+                )
     for name, path in (
         ("candidate_pool.csv", candidate_path),
         ("feature_embeddings.npz", embedding_path),
@@ -461,8 +518,29 @@ def _validate_scoring_artifacts(
         elif sha256_file(path).lower() != expected.lower():
             blockers.append(f"scoring artifact hash mismatch: {name}")
     state = scoring.get("state")
+    if not isinstance(state, Mapping) or state.get("complete") is not True:
+        blockers.append("scoring manifest is not complete")
     if not isinstance(state, Mapping) or state.get("ready_for_selection") is not True:
         blockers.append("scoring manifest is not ready for selection")
+    counts = scoring.get("counts")
+    if not isinstance(counts, Mapping):
+        blockers.append("scoring manifest lacks counts")
+    else:
+        try:
+            manifest_rows = int(counts["manifest_rows"])
+            scored_rows = int(counts["scored_rows"])
+            missing_rows = int(counts["missing_rows"])
+            error_rows = int(counts["error_rows"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            blockers.append("scoring manifest contains invalid counts")
+        else:
+            if (
+                manifest_rows != len(candidate)
+                or scored_rows != int(scored.sum())
+                or missing_rows != 0
+                or error_rows != 0
+            ):
+                blockers.append("scoring manifest reports inconsistent or failed rows")
     return (
         not blockers[blocker_start:]
         and not candidate.empty
@@ -473,6 +551,118 @@ def _validate_scoring_artifacts(
         int(len(candidate)),
         embedding_rows,
     )
+def _validate_lineage(
+    paths: Mapping[str, Path | None],
+    baseline: Mapping[str, Any],
+    blockers: list[str],
+) -> bool:
+    """Reject stale or cross-run artifacts even when their row counts agree."""
+    blocker_start = len(blockers)
+    required_json = ("scoring_manifest", "batch_manifest", "selection_diagnostics")
+    payloads: dict[str, dict[str, Any]] = {}
+    for name in required_json:
+        path = paths.get(name)
+        if path is None:
+            blockers.append(f"missing lineage artifact: {name}")
+            continue
+        payload, error = _read_json(path)
+        if error:
+            blockers.append(error)
+        elif payload is not None:
+            payloads[name] = payload
+
+    tile_path = paths.get("tile_manifest")
+    candidate_path = paths.get("candidate_pool")
+    scoring = payloads.get("scoring_manifest", {})
+    scoring_source = scoring.get("source", {})
+    tile_source = (
+        scoring_source.get("tile_manifest", {})
+        if isinstance(scoring_source, Mapping)
+        else {}
+    )
+    expected_tile_hash = (
+        tile_source.get("sha256") if isinstance(tile_source, Mapping) else None
+    )
+    if (
+        tile_path is None
+        or not isinstance(expected_tile_hash, str)
+        or sha256_file(tile_path).lower() != expected_tile_hash.lower()
+    ):
+        blockers.append("scoring manifest tile source hash mismatch")
+
+    scoring_models = scoring.get("models", {})
+    scoring_regression_hash = (
+        scoring_models.get("regression_checkpoint_sha256")
+        if isinstance(scoring_models, Mapping)
+        else None
+    )
+    baseline_hash = baseline.get("checkpoint_sha256")
+    if (
+        not isinstance(scoring_regression_hash, str)
+        or not isinstance(baseline_hash, str)
+        or scoring_regression_hash.lower() != baseline_hash.lower()
+    ):
+        blockers.append("scoring regression checkpoint does not match baseline")
+
+    for name in ("batch_manifest", "selection_diagnostics"):
+        payload = payloads.get(name, {})
+        candidate_input = payload.get("candidate_input", {})
+        expected = (
+            candidate_input.get("sha256")
+            if isinstance(candidate_input, Mapping)
+            else None
+        )
+        if (
+            candidate_path is None
+            or not isinstance(expected, str)
+            or sha256_file(candidate_path).lower() != expected.lower()
+        ):
+            blockers.append(f"{name} candidate source hash mismatch")
+
+    batch_path = paths.get("annotation_batch")
+    annotations_path = paths.get("absolute_annotations")
+    if batch_path is None or annotations_path is None:
+        return False
+    batch, batch_error = _read_csv(batch_path)
+    annotations, annotations_error = _read_csv(annotations_path)
+    if batch_error:
+        blockers.append(batch_error)
+    if annotations_error:
+        blockers.append(annotations_error)
+    if batch is None or annotations is None:
+        return False
+    batch_manifest = payloads.get("batch_manifest", {})
+    try:
+        declared_rows = int(batch_manifest["row_count"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        blockers.append("batch manifest contains invalid row_count")
+    else:
+        if declared_rows != len(batch):
+            blockers.append("batch manifest row count does not match annotation batch")
+    declared_batch_id = str(batch_manifest.get("batch_id", "")).strip()
+    if (
+        not declared_batch_id
+        or "batch_id" not in batch
+        or not batch["batch_id"].astype(str).eq(declared_batch_id).all()
+    ):
+        blockers.append("annotation batch identity does not match batch manifest")
+
+    if "image_path" in batch and set(ABSOLUTE_COLUMNS).issubset(annotations.columns):
+        completed = annotations[
+            pd.to_numeric(annotations["scenic_human"], errors="coerce").notna()
+            & ~annotations["skip"].map(_bool)
+        ]
+        required_images = set(batch["image_path"].astype(str).str.strip())
+        completed_images = set(completed["image_path"].astype(str).str.strip())
+        missing_images = sorted(required_images - completed_images)
+        if missing_images:
+            blockers.append(
+                "annotation batch has "
+                f"{len(missing_images)} images without completed human labels"
+            )
+    return not blockers[blocker_start:]
+
+
 
 
 def finalize_stage1(
@@ -604,6 +794,12 @@ def finalize_stage1(
         root,
         blockers,
     )
+    lineage_ok = _validate_lineage(paths, baseline, blockers)
+    if scoring_rows != tile_rows:
+        blockers.append(
+            f"candidate pool row count {scoring_rows} does not match tile manifest {tile_rows}"
+        )
+        scoring_ok = False
     records = {
         key: _artifact(path, root, entry["required"])
         for key, (path, entry) in (
@@ -618,7 +814,10 @@ def finalize_stage1(
         "splits_valid": bool(split_ok),
         "benchmark_valid": bool(benchmark_ok),
         "baseline_valid": bool(registry_ok),
-        "hashes_valid": not any("hash mismatch" in blocker for blocker in blockers),
+        "hashes_valid": bool(
+            lineage_ok
+            and not any("hash mismatch" in blocker for blocker in blockers)
+        ),
     }
     handoff = {
         "schema_version": SCHEMA_VERSION,

@@ -75,6 +75,7 @@ PUBLIC_BATCH_COLUMNS = {
     "score_bin",
     "is_repeat",
     "qa_repeat",
+    "is_qa_overlap",
 }
 UNUSABLE_REASONS = {
     "missing_imagery",

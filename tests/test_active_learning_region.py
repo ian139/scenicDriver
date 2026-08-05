@@ -89,8 +89,7 @@ def test_existing_run_rejects_identity_drift_before_rewrite(tmp_path: Path) -> N
             spec=spec,
             output_root=tmp_path / "runs",
             image_root=tmp_path / "images",
-            zoom=15,
-            budget=100_000,
+            budget=100_001,
         )
     assert manifest_path.read_bytes() == before
 

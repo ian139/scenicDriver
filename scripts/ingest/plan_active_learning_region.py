@@ -237,6 +237,7 @@ def acquire_missing(
     *,
     image_root: Path,
     zoom: int,
+    failures: list[dict[str, Any]],
     max_workers: int = 8,
 ) -> None:
     """Acquire missing pair members with bounded concurrency and source-level retries."""
@@ -254,6 +255,7 @@ def acquire_missing(
         worker_state = threading.local()
 
         def fetch(row: dict[str, Any]) -> None:
+            source = getattr(worker_state, "source", None)
             if source is None:
                 with _quiet_mapbox_logging():
                     source = MapboxTileSource(
@@ -343,6 +345,10 @@ def plan_run(
 ) -> dict[str, Any]:
     if workers <= 0:
         raise ValueError("workers must be positive")
+    if zoom != 14:
+        raise ValueError("active-learning acquisition requires zoom 14")
+    if budget < 1 or budget > 370_000:
+        raise ValueError("budget must be between 1 and 370000 tile coordinates")
     region_spec = spec if spec is not None else _load_spec(spec_path)
     planned = parse_and_validate_region_spec(
         region_spec,
