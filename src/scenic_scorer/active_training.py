@@ -65,7 +65,7 @@ class ActiveTrainingConfig:
     """
 
     epochs: int = 20
-    batch_size: int = 64
+    batch_size: int = 256
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     seed: int = 42
@@ -1190,6 +1190,7 @@ def _checkpoint_payload(
     model: ScenicRegressionModel,
     optimizer: torch.optim.Optimizer,
     *,
+    scaler: torch.amp.GradScaler | None = None,
     state: str,
     next_epoch: int,
     next_batch: int,
@@ -1206,6 +1207,7 @@ def _checkpoint_payload(
         "checkpoint_state": state,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
         "next_epoch": int(next_epoch),
         "next_batch": int(next_batch),
         "epoch": int(next_epoch),
@@ -1228,29 +1230,27 @@ def _metrics(
     use_sample_weights: bool,
 ) -> dict[str, float]:
     model.eval()
-    with torch.no_grad():
-        vit = (
-            torch.from_numpy(np.asarray(arrays["vit_embeddings"])[indices])
-            .float()
-            .to(device)
-        )
-        terrain = (
-            torch.from_numpy(np.asarray(arrays["terrain_features"])[indices])
-            .float()
-            .to(device)
-        )
-        logits = (
-            torch.from_numpy(np.asarray(arrays["class_logits"])[indices])
-            .float()
-            .to(device)
-        )
+    use_cuda = str(device).startswith("cuda")
+
+    def move(values: np.ndarray) -> torch.Tensor:
+        tensor = torch.from_numpy(values).float()
+        if use_cuda:
+            tensor = tensor.pin_memory()
+        return tensor.to(device, non_blocking=use_cuda)
+
+    with torch.inference_mode(), torch.autocast(
+        device_type="cuda", enabled=use_cuda
+    ):
+        vit = move(np.asarray(arrays["vit_embeddings"])[indices])
+        terrain = move(np.asarray(arrays["terrain_features"])[indices])
+        logits = move(np.asarray(arrays["class_logits"])[indices])
         target = np.asarray(arrays["scenic_scores"])[indices].astype(
             np.float32, copy=False
         )
         weight = np.asarray(arrays["sample_weights"])[indices].astype(
             np.float32, copy=False
         )
-        prediction = model(vit, terrain, logits).detach().cpu().numpy().reshape(-1)
+        prediction = model(vit, terrain, logits).float().cpu().numpy().reshape(-1)
     error = prediction - target
     metric_weight = weight if use_sample_weights else np.ones_like(weight)
     denominator = float(metric_weight.sum())
@@ -1522,6 +1522,8 @@ def train_active_model(
         lr=float(config.learning_rate),
         weight_decay=float(config.weight_decay),
     )
+    use_cuda = str(device).startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
     history: list[dict[str, Any]] = []
     next_epoch = next_batch = global_step = 0
 
@@ -1561,6 +1563,9 @@ def train_active_model(
             raise ActiveTrainingError("resume checkpoint architecture mismatch")
         try:
             model.load_state_dict(checkpoint["model_state_dict"])
+            scaler_state = checkpoint.get("scaler_state_dict")
+            if isinstance(scaler_state, Mapping):
+                scaler.load_state_dict(scaler_state)
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         except (RuntimeError, ValueError, KeyError) as exc:
             raise ActiveTrainingError(
@@ -1586,6 +1591,7 @@ def train_active_model(
             _checkpoint_payload(
                 model,
                 optimizer,
+                scaler=scaler,
                 state="paused",
                 next_epoch=next_epoch,
                 next_batch=next_batch,
@@ -1623,52 +1629,38 @@ def train_active_model(
                 batch_indices = train_indices[
                     batch_start : batch_start + int(config.batch_size)
                 ]
-                vit = (
-                    torch.from_numpy(
-                        np.asarray(arrays["vit_embeddings"])[batch_indices]
-                    )
-                    .float()
-                    .to(device)
+
+                def move(values: np.ndarray) -> torch.Tensor:
+                    tensor = torch.from_numpy(values).float()
+                    if use_cuda:
+                        tensor = tensor.pin_memory()
+                    return tensor.to(device, non_blocking=use_cuda)
+
+                vit = move(np.asarray(arrays["vit_embeddings"])[batch_indices])
+                terrain = move(np.asarray(arrays["terrain_features"])[batch_indices])
+                logits = move(np.asarray(arrays["class_logits"])[batch_indices])
+                target = move(np.asarray(arrays["scenic_scores"])[batch_indices]).reshape(
+                    -1, 1
                 )
-                terrain = (
-                    torch.from_numpy(
-                        np.asarray(arrays["terrain_features"])[batch_indices]
-                    )
-                    .float()
-                    .to(device)
-                )
-                logits = (
-                    torch.from_numpy(np.asarray(arrays["class_logits"])[batch_indices])
-                    .float()
-                    .to(device)
-                )
-                target = (
-                    torch.from_numpy(np.asarray(arrays["scenic_scores"])[batch_indices])
-                    .float()
-                    .to(device)
-                    .reshape(-1, 1)
-                )
-                weights = (
-                    torch.from_numpy(training_weights[batch_indices])
-                    .float()
-                    .to(device)
-                    .reshape(-1, 1)
-                )
+                weights = move(training_weights[batch_indices]).reshape(-1, 1)
                 optimizer.zero_grad(set_to_none=True)
-                prediction = model(vit, terrain, logits)
-                if config.loss_function == "huber":
-                    per_sample = torch.nn.functional.smooth_l1_loss(
-                        prediction, target, reduction="none"
+                with torch.autocast(device_type="cuda", enabled=use_cuda):
+                    prediction = model(vit, terrain, logits)
+                    if config.loss_function == "huber":
+                        per_sample = torch.nn.functional.smooth_l1_loss(
+                            prediction, target, reduction="none"
+                        )
+                    else:
+                        per_sample = (prediction - target) ** 2
+                    loss = (
+                        (per_sample * weights).sum()
+                        / torch.clamp(weights.sum(), min=1e-8)
+                        if config.use_sample_weights
+                        else per_sample.mean()
                     )
-                else:
-                    per_sample = (prediction - target) ** 2
-                loss = (
-                    (per_sample * weights).sum() / torch.clamp(weights.sum(), min=1e-8)
-                    if config.use_sample_weights
-                    else per_sample.mean()
-                )
-                loss.backward()
-                optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 global_step, steps_this_invocation, next_batch = (
                     global_step + 1,
                     steps_this_invocation + 1,
@@ -1680,6 +1672,7 @@ def train_active_model(
                     _checkpoint_payload(
                         model,
                         optimizer,
+                        scaler=scaler,
                         state="paused",
                         next_epoch=next_epoch,
                         next_batch=next_batch,
@@ -1740,6 +1733,9 @@ def train_active_model(
             global_step = int(committed["global_step"])
             history = [dict(item) for item in committed.get("history", [])]
             _restore_rng_state(committed["rng_state"])
+            committed_scaler = committed.get("scaler_state_dict")
+            if isinstance(committed_scaler, Mapping):
+                scaler.load_state_dict(committed_scaler)
         except (KeyError, TypeError, ValueError, RuntimeError) as restore_exc:
             raise ActiveTrainingError(
                 "last committed resume checkpoint cannot be restored after interruption"
@@ -1807,6 +1803,7 @@ def train_active_model(
         payload = _checkpoint_payload(
             model,
             optimizer,
+            scaler=scaler,
             state="completed",
             next_epoch=next_epoch,
             next_batch=next_batch,
@@ -1836,6 +1833,7 @@ def train_active_model(
             _checkpoint_payload(
                 model,
                 optimizer,
+                scaler=scaler,
                 state="paused",
                 next_epoch=next_epoch,
                 next_batch=next_batch,
@@ -1870,7 +1868,7 @@ def _parse_args() -> argparse.Namespace:
         "--output-dir", type=Path, default=Path("data/processed/active_training")
     )
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument(
         "--learning-rate", "--lr", dest="learning_rate", type=float, default=1e-3
     )

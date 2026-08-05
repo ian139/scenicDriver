@@ -59,7 +59,7 @@ At beta startup, required-preload mode validates and opens the configured graph,
 | `src/route_planner/` | Graph representation, endpoint projection, route objectives, execution safety |
 | `config/app_regions.json` | Region bounds and active artifact paths |
 | `deploy/beta_artifacts.json` | Versioned release artifact identity, sizes, and digests |
-| `compose.beta.yml` | Nginx/API topology and read-only runtime mounts |
+| `Dockerfile.remote-training` | Canonical CUDA training image |
 
 ## Artifact contract
 
@@ -75,10 +75,8 @@ The JSON deployment manifest is authoritative. `scripts/deploy/bootstrap_beta_ar
 
 ## Deployment topology
 
-`compose.beta.yml` runs two services:
-
-- **web** — Nginx serves the static app and proxies `/api`;
-- **api** — FastAPI reads processed data and models from read-only mounts.
+The canonical runtime image is built from `Dockerfile.remote-training`; local
+development keeps direct uvicorn and static-server workflows.
 
 Credentials are runtime-only. Image builds contain source and dependencies, never datasets, model weights, generated reports, graphs, or tokens.
 

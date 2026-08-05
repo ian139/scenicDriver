@@ -1,7 +1,0 @@
-FROM nginx:alpine
-
-COPY apps/new_england_north/index.html \
-     apps/new_england_north/styles.css \
-     apps/new_england_north/viewer.js \
-     /usr/share/nginx/html/
-COPY apps/new_england_north/nginx.beta.conf /etc/nginx/conf.d/default.conf

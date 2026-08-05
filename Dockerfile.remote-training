@@ -1,45 +1,35 @@
-# pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
-
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PATH="/opt/conda/bin:/root/.local/bin:${PATH}"
-ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=Etc/UTC
-
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Pinned uv binary image; avoids the curl installer path.
-COPY --from=ghcr.io/astral-sh/uv:0.9.16 /uv /uvx /usr/local/bin/
-
-WORKDIR /workspace
-
-# Install the locked runtime dependencies into the CUDA-enabled base environment.
-# Torch and torchvision are supplied by that image, so prune them (and only
-# dependencies no longer needed after pruning) before installing the export.
+# Stage 1: Dependency exporter
+FROM ghcr.io/astral-sh/uv:0.9.16 AS builder
+WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv export --locked --no-dev --no-emit-project \
       --prune torch --prune torchvision \
-      --output-file /tmp/remote-training-requirements.txt \
- && uv pip install --system --no-cache-dir --no-deps \
+      --output-file /tmp/remote-training-requirements.txt
+
+# Stage 2: CUDA runtime
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime AS runtime
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/opt/conda/bin:/root/.local/bin:${PATH}" \
+    DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:0.9.16 /uv /uvx /usr/local/bin/
+WORKDIR /workspace
+COPY --from=builder /tmp/remote-training-requirements.txt /tmp/remote-training-requirements.txt
+RUN uv pip install --system --no-cache-dir --no-deps \
       --requirement /tmp/remote-training-requirements.txt \
  && rm /tmp/remote-training-requirements.txt
-
-# Copy application source (training-only; no apps/)
+COPY pyproject.toml uv.lock ./
 COPY src/ src/
 COPY scripts/ scripts/
 COPY notebooks/ notebooks/
 COPY config/ config/
 COPY data/README.md data/README.md
 COPY README.md AGENTS.md ./
-
-# Install the local package metadata without re-resolving torch/torchvision.
 RUN uv pip install --system --no-cache-dir --no-deps -e .
-
-# Create runtime directories
 RUN mkdir -p data/raw data/processed models cache scenic_artifacts
-
-CMD ["python", "scripts/remote/container_smoke.py"]
+# The image intentionally has no runtime command; callers select a canonical
+# lifecycle or benchmark entrypoint explicitly.

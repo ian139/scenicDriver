@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir", type=Path, default=Path("data/processed/active_training")
     )
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument(
         "--learning-rate", "--lr", dest="learning_rate", type=float, default=1e-3
     )

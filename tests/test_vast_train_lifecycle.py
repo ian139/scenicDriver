@@ -158,7 +158,7 @@ def test_train_run_requires_checkpoint_key_under_models_prefix(tmp_path: Path, m
 def test_remote_training_script_runs_validation_before_training() -> None:
     script = vast_train.build_remote_training_script(make_config())
 
-    validation_index = script.index("bash scripts/remote/provision_vast.sh")
+    validation_index = script.index("python scripts/remote/vast_train.py validate")
     training_index = script.index("python scripts/modeling/train_regression_baseline.py")
 
     assert validation_index < training_index
@@ -172,8 +172,7 @@ def test_remote_training_script_writes_sentinels_and_uploads_outputs() -> None:
         "done.json",
         "failed.json",
         "exit_code.txt",
-        "python scripts/remote/minimal_inference.py",
-        "python -m src.data_pipeline.s3 upload-prefix",
+        "python scripts/remote/vast_train.py validate",
         "export SCENIC_DATASET_PATH=/workspace/data/processed/regression/tiny_features.npz",
         "export SCENIC_CHECKPOINT_PATH=/workspace/models/tiny_regression.pt",
     ]

@@ -200,15 +200,11 @@ The sidebar shows live CMUX workspaces. A git worktree appears there after it ha
 
 ## Opening an active workspace
 
-Normal `scripts/remote/vast-start-task.sh` (the `start-task` subcommand) allocates
-and bootstrap-checks the Vast host, then creates and registers its CMUX workspace
-through the v2 JSON-RPC call `cmux rpc workspace.create`. The wrapper persists the
-returned workspace reference and UUID separately in
-`.cmux-vast/state/<task-name>.json` as `cmux_workspace_ref` and
-`cmux_workspace_id`. `scripts/remote/vast-watch.sh` uses that recorded identity
-when it observes `cmux workspace list --json`; it does not infer a workspace from
-the name or current directory.
-
+`python scripts/remote/cmux_vast_host.py start-task` allocates and
+bootstrap-checks the Vast host, then creates and registers its CMUX workspace.
+The command persists the returned workspace reference and UUID separately in
+`.cmux-vast/state/<task-name>.json` and the same canonical script watches that
+recorded identity.
 If workspace creation or registration fails, `start-task` clears the identity,
 leaves the state `workspace_pending`, records the error, and returns failure.
 Rerun the same command to retry registration safely.

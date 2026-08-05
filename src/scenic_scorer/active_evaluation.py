@@ -15,7 +15,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from src.scenic_scorer.regression import ScenicRegressionModel
+from src.scenic_scorer.regression import ScenicRegressionModel, resolve_device
 
 
 def file_sha256(path: str | Path) -> str:
@@ -137,22 +137,33 @@ def _predict_dataset(
     vit_embeddings: np.ndarray,
     terrain_features: np.ndarray,
     class_logits: np.ndarray,
-    batch_size: int = 128,
+    batch_size: int = 256,
+    device: str | None = None,
 ) -> np.ndarray:
     """Run model inference over dataset arrays in batches."""
+    resolved_device = resolve_device(device)
+    model = model.to(resolved_device)
     n_samples = len(vit_embeddings)
     preds = []
+    use_cuda = resolved_device.startswith("cuda")
 
-    with torch.no_grad():
+    def move(values: np.ndarray) -> torch.Tensor:
+        tensor = torch.from_numpy(values).float()
+        if use_cuda:
+            tensor = tensor.pin_memory()
+        return tensor.to(resolved_device, non_blocking=use_cuda)
+
+    with torch.inference_mode(), torch.autocast(
+        device_type="cuda", enabled=use_cuda
+    ):
         for start_idx in range(0, n_samples, batch_size):
             end_idx = min(start_idx + batch_size, n_samples)
-            vit_b = torch.from_numpy(vit_embeddings[start_idx:end_idx]).float()
-            terr_b = torch.from_numpy(terrain_features[start_idx:end_idx]).float()
-            cls_b = torch.from_numpy(class_logits[start_idx:end_idx]).float()
-
-            out = model(vit_b, terr_b, cls_b)
-            scores = out.squeeze(-1).cpu().numpy()
-            preds.append(scores)
+            out = model(
+                move(vit_embeddings[start_idx:end_idx]),
+                move(terrain_features[start_idx:end_idx]),
+                move(class_logits[start_idx:end_idx]),
+            )
+            preds.append(out.float().squeeze(-1).cpu().numpy())
 
     if not preds:
         return np.array([], dtype=np.float32)
@@ -200,17 +211,15 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]
     else:
         pearson_corr = 0.0
         spearman_corr = 0.0
-
     return {
+        "samples": int(len(y_true)),
         "mse": mse,
         "mae": mae,
         "rmse": rmse,
         "r2": r2,
         "pearson_corr": pearson_corr,
         "spearman_corr": spearman_corr,
-        "samples": len(y_true),
     }
-
 
 def evaluate_stage_two(
     dataset_path: str | Path,
@@ -221,6 +230,7 @@ def evaluate_stage_two(
     route_qa_json: str | Path,
     thresholds: dict[str, Any] | str | Path | None,
     output_path: str | Path,
+    device: str | None = None,
 ) -> dict[str, Any]:
     """
     Perform strict same-denominator Stage-Two evaluation of candidate vs baseline models.
@@ -321,17 +331,26 @@ def evaluate_stage_two(
     npz_path_map = {p: i for i, p in enumerate(image_paths)}
     npz_split_map = dict(zip(image_paths, prepared_splits, strict=True))
     min_supported_slice_samples = int(thresh_dict.get("min_supported_slice_samples", 5))
+    resolved_device = resolve_device(device)
 
     # 2. Load models
-    candidate_model = _load_model_checkpoint(candidate_checkpoint, is_candidate=True)
-    baseline_model = _load_model_checkpoint(baseline_checkpoint, is_candidate=False)
+    candidate_model = _load_model_checkpoint(
+        candidate_checkpoint, device=resolved_device, is_candidate=True
+    )
+    baseline_model = _load_model_checkpoint(
+        baseline_checkpoint, device=resolved_device, is_candidate=False
+    )
 
     candidate_sha256 = file_sha256(candidate_checkpoint)
     baseline_sha256 = file_sha256(baseline_checkpoint)
 
     # 3. Model inference on entire NPZ
-    cand_npz_preds = _predict_dataset(candidate_model, vit, terr, cls_logits)
-    base_npz_preds = _predict_dataset(baseline_model, vit, terr, cls_logits)
+    cand_npz_preds = _predict_dataset(
+        candidate_model, vit, terr, cls_logits, device=resolved_device
+    )
+    base_npz_preds = _predict_dataset(
+        baseline_model, vit, terr, cls_logits, device=resolved_device
+    )
 
     cand_pred_map = {p: float(pred) for p, pred in zip(image_paths, cand_npz_preds)}
     base_pred_map = {p: float(pred) for p, pred in zip(image_paths, base_npz_preds)}

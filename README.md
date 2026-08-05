@@ -58,18 +58,6 @@ Open <http://localhost:3000>. Useful API endpoints:
 
 A clean checkout can run the API and app shell. Heatmaps and route comparison require the ignored graph, report, registry, and model artifacts described in the [deployment guide](docs/setup/deployment.md).
 
-## Hosted beta
-
-The beta uses Nginx for the static app and reverse proxy, plus FastAPI for the API. Runtime artifacts and credentials are mounted or supplied externally; they are never copied into image layers.
-
-```bash
-cp .env.beta.example .env.beta
-# Set MAPBOX_ACCESS_TOKEN in .env.beta
-
-docker compose --env-file .env.beta -f compose.beta.yml up --build
-```
-
-Open `http://localhost:${SCENIC_WEB_PORT:-80}`. Before deployment, bootstrap and validate the canonical artifacts using the [deployment runbook](docs/setup/deployment.md).
 
 ## Repository layout
 

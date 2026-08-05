@@ -181,14 +181,15 @@ class LandscapeClassifier(nn.Module):
         Returns:
             Class logits [B, num_classes]
         """
-        # Extract features from ViT backbone
-        # backbone returns [B, feature_dim] when num_classes=0
+        return self.forward_with_features(x)[0]
+
+    def forward_with_features(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the ViT backbone once and return classifier logits and features."""
         features = self.backbone(x)
+        return self.classifier(features), features
 
-        # Pass through classifier head
-        logits = self.classifier(features)
-
-        return logits
 
     def get_features(self, x: torch.Tensor) -> torch.Tensor:
         """

@@ -236,12 +236,16 @@ set +e
 (
   set -euo pipefail
   ensure_torch_supports_gpu
-  bash scripts/remote/provision_vast.sh
   python -m src.data_pipeline.s3 download-file \
     --bucket "$SCENIC_S3_BUCKET" \
     --key "$SCENIC_TRAIN_DATASET_KEY" \
     --dest "$SCENIC_TRAIN_DATASET" \
     --required
+  python scripts/remote/vast_train.py validate \
+    --device cuda \
+    --checkpoint "$SCENIC_CHECKPOINT_PATH" \
+    --dataset "$SCENIC_DATASET_PATH" \
+    --output "$SCENIC_OUTPUT_ROOT/validation_result.json"
   python scripts/modeling/train_regression_baseline.py \
     --dataset "$SCENIC_TRAIN_DATASET" \
     --output "$SCENIC_TRAIN_OUTPUT" \
@@ -251,7 +255,7 @@ set +e
     --val-split "$SCENIC_TRAIN_VAL_SPLIT" \
     --seed "$SCENIC_TRAIN_SEED" \
     --device cuda
-  python scripts/remote/minimal_inference.py \
+  python scripts/remote/vast_train.py validate \
     --device cuda \
     --checkpoint "$SCENIC_TRAIN_OUTPUT" \
     --dataset "$SCENIC_TRAIN_DATASET" \
@@ -467,7 +471,7 @@ def _handle_training_result(config: VastTrainConfig, state: dict, remote_status:
         if not config.destroy:
             update_status(state, "completed_kept")
             print(f"Training completed; instance kept for {config.task_name}")
-            print(f"Cleanup: scripts/remote/vast-train.sh cleanup {config.task_name} --copy-artifacts --destroy --yes")
+            print(f"Cleanup: python scripts/remote/vast_train.py cleanup {config.task_name} --copy-artifacts --destroy --yes")
             return 0
         update_status(state, "destroying")
         if destroy_recorded_instance(state):
@@ -486,7 +490,7 @@ def _handle_training_result(config: VastTrainConfig, state: dict, remote_status:
             return 1
     update_status(state, "failed_kept")
     print(f"Training failed; instance kept for {config.task_name}", file=sys.stderr)
-    print(f"Cleanup: scripts/remote/vast-train.sh cleanup {config.task_name} --copy-artifacts --destroy --yes", file=sys.stderr)
+    print(f"Cleanup: python scripts/remote/vast_train.py cleanup {config.task_name} --copy-artifacts --destroy --yes", file=sys.stderr)
     return 1
 
 
@@ -623,9 +627,34 @@ def handle_cleanup(args: argparse.Namespace) -> int:
         update_status(state, final_status)
         print(f"Vast training instance destroyed: {args.task_name}")
         return 0
-    update_status(state, "failed_kept", error="destroy failed during cleanup")
     print(f"Destroy failed for Vast training task: {args.task_name}", file=sys.stderr)
     return 1
+
+
+def handle_validate(args: argparse.Namespace) -> int:
+    import torch
+
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA validation requested but CUDA is unavailable")
+    checkpoint = Path(args.checkpoint)
+    dataset = Path(args.dataset)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"checkpoint not found: {checkpoint}")
+    if not dataset.is_file():
+        raise FileNotFoundError(f"dataset not found: {dataset}")
+    payload = {
+        "ok": True,
+        "device": args.device,
+        "checkpoint": str(checkpoint),
+        "dataset": str(dataset),
+        "torch_version": torch.__version__,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps(payload, sort_keys=True))
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -668,10 +697,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     cleanup = subparsers.add_parser("cleanup", help="Recover artifacts and optionally destroy a recorded Vast training instance")
     cleanup.add_argument("task_name")
+
     cleanup.add_argument("--copy-artifacts", action="store_true")
     cleanup.add_argument("--destroy", action="store_true")
     cleanup.add_argument("--yes", action="store_true")
     cleanup.set_defaults(func=handle_cleanup)
+    validate = subparsers.add_parser("validate", help="Validate a CUDA runtime and checkpoint/dataset pair")
+    validate.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    validate.add_argument("--checkpoint", required=True)
+    validate.add_argument("--dataset", required=True)
+    validate.add_argument("--output")
+    validate.set_defaults(func=handle_validate)
 
     return parser
 

@@ -16,7 +16,7 @@ Target: 94%+ accuracy on RESISC45 test set
 
 import argparse
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 import random
 
 import torch
@@ -52,11 +52,12 @@ def _best_acc_from_checkpoint(checkpoint: dict) -> float:
 
 def create_dataloaders(
     data_dir: Path,
-    batch_size: int = 32,
+    batch_size: int = 256,
     num_workers: int = 4,
     val_split: float = 0.2,
     seed: int = 42,
-    use_resisc45_stats: bool = False
+    use_resisc45_stats: bool = False,
+    pin_memory: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Create train and validation dataloaders for RESISC45.
@@ -77,8 +78,9 @@ def create_dataloaders(
 
     Args:
         data_dir: Path to RESISC45 dataset root directory
-        batch_size: Batch size for training (default: 32)
+        batch_size: Batch size for training (default: 256)
         num_workers: Number of dataloader workers (default: 4)
+        pin_memory: Enable page-locked host buffers for CUDA transfers
         val_split: Fraction of data for validation (default: 0.2)
         seed: Random seed for reproducible splits
         use_resisc45_stats: Use RESISC45 specific normalization stats
@@ -148,23 +150,28 @@ def create_dataloaders(
     val_dataset = TransformSubset(full_dataset, val_indices, val_transform)
 
     # Create dataloaders
+    effective_pin = pin_memory
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": effective_pin,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+        loader_kwargs["persistent_workers"] = True
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
         drop_last=True,  # Drop incomplete batches for stable batch norm
+        **loader_kwargs,
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
-
     return train_loader, val_loader
 
 
@@ -208,8 +215,9 @@ def train_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
-    device: str,
-    gradient_clip: float = 1.0
+    device: Union[str, torch.device],
+    gradient_clip: float = 1.0,
+    scaler: Optional[torch.amp.GradScaler] = None,
 ) -> float:
     """
     Train for one epoch.
@@ -229,20 +237,34 @@ def train_epoch(
     total_loss = 0.0
     num_batches = 0
 
+    device_obj = torch.device(device) if isinstance(device, str) else device
+    is_cuda = (device_obj.type == "cuda")
+
+    active_scaler: torch.amp.GradScaler = (
+        scaler
+        if scaler is not None
+        else torch.amp.GradScaler("cuda", enabled=is_cuda)
+    )
+
     for batch in tqdm(dataloader, desc="Training", leave=False):
         images, labels = batch
-        images, labels = images.to(device), labels.to(device)
+        images = images.to(device, non_blocking=is_cuda)
+        labels = labels.to(device, non_blocking=is_cuda)
 
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
+        with torch.amp.autocast("cuda", enabled=is_cuda):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+        active_scaler.scale(loss).backward()
 
         # Gradient clipping for training stability
         if gradient_clip > 0:
+            active_scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
 
-        optimizer.step()
+        active_scaler.step(optimizer)
+        active_scaler.update()
 
         total_loss += loss.item()
         num_batches += 1
@@ -254,7 +276,7 @@ def validate(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
-    device: str
+    device: Union[str, torch.device]
 ) -> Tuple[float, float]:
     """
     Validate model on the validation set.
@@ -274,20 +296,24 @@ def validate(
     total = 0
     num_batches = 0
 
+    device_obj = torch.device(device) if isinstance(device, str) else device
+    is_cuda = (device_obj.type == "cuda")
+
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validating", leave=False):
             images, labels = batch
-            images, labels = images.to(device), labels.to(device)
+            images = images.to(device, non_blocking=is_cuda)
+            labels = labels.to(device, non_blocking=is_cuda)
 
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            with torch.amp.autocast("cuda", enabled=is_cuda):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
 
             total_loss += loss.item()
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
             num_batches += 1
-
     accuracy = correct / max(total, 1)
     avg_loss = total_loss / max(num_batches, 1)
     return avg_loss, accuracy
@@ -297,7 +323,7 @@ def train(
     data_dir: Path,
     output_dir: Path,
     epochs: int = 50,
-    batch_size: int = 32,
+    batch_size: int = 256,
     learning_rate: float = 1e-4,
     weight_decay: float = 0.01,
     warmup_epochs: int = 5,
@@ -309,6 +335,7 @@ def train(
     use_resisc45_stats: bool = False,
     label_smoothing: float = 0.1,
     gradient_clip: float = 1.0,
+    pin_memory: Optional[bool] = None,
 ) -> None:
     """
     Train the landscape classifier on RESISC45 dataset.
@@ -326,15 +353,15 @@ def train(
         data_dir: Path to RESISC45 dataset
         output_dir: Directory to save checkpoints and best model
         epochs: Total training epochs (default: 50)
-        batch_size: Training batch size (default: 32)
+        batch_size: Training batch size (default: 256)
         learning_rate: Peak learning rate (default: 1e-4)
         weight_decay: AdamW weight decay (default: 0.01)
         warmup_epochs: Number of warmup epochs (default: 5)
         device: Training device (auto-detect if None)
         resume: Path to checkpoint to resume from
         seed: Random seed for reproducibility
-        freeze_backbone_epochs: Epochs to freeze backbone (default: 0)
         num_workers: DataLoader workers (default: 4)
+        pin_memory: Enable pinned host buffers for CUDA transfers
         use_resisc45_stats: Use RESISC45 normalization stats
         label_smoothing: Label smoothing factor (default: 0.1)
         gradient_clip: Max gradient norm (default: 1.0)
@@ -379,15 +406,23 @@ def train(
 
     # Create dataloaders
     print(f"\nLoading dataset from {data_dir}...")
+    device_obj = torch.device(device)
+    is_cuda = (device_obj.type == "cuda")
+    if pin_memory is None:
+        pin_memory = is_cuda
+    pin_memory = bool(pin_memory)
+
     train_loader, val_loader = create_dataloaders(
         data_dir,
         batch_size=batch_size,
         num_workers=num_workers,
-        use_resisc45_stats=use_resisc45_stats
+        use_resisc45_stats=use_resisc45_stats,
+        pin_memory=pin_memory,
     )
 
     # Training setup
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    scaler = torch.amp.GradScaler("cuda", enabled=is_cuda)
 
     # Use different learning rates for backbone vs classifier
     backbone_params = list(model.backbone.parameters())
@@ -417,6 +452,7 @@ def train(
         checkpoint = torch.load(resume, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
         best_acc = _best_acc_from_checkpoint(checkpoint)
         print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2%}")
@@ -454,7 +490,7 @@ def train(
         # Train
         train_loss = train_epoch(
             model, train_loader, optimizer, criterion, device,
-            gradient_clip=gradient_clip
+            gradient_clip=gradient_clip, scaler=scaler
         )
 
         # Validate
@@ -484,6 +520,7 @@ def train(
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
             "val_acc": val_acc,
             "best_acc": best_acc,
             "history": history,
@@ -528,7 +565,7 @@ if __name__ == "__main__":
         help="Total training epochs"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=32,
+        "--batch_size", type=int, default=256,
         help="Training batch size"
     )
     parser.add_argument(

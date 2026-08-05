@@ -12,22 +12,42 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.active_learning.scoring import run_active_learning_scoring
+from src.active_learning.scoring import (  # noqa: E402
+    DEFAULT_SCORING_BATCH_SIZE,
+    DEFAULT_SCORING_NUM_WORKERS,
+    run_active_learning_scoring,
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Score a canonical tile manifest for active learning")
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("data/processed/active_learning"))
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("data/processed/active_learning")
+    )
     parser.add_argument("--run-name", default="active_learning")
-    parser.add_argument("--registry", type=Path, default=Path("data/processed/regression/model_registry.json"))
-    parser.add_argument("--classifier-checkpoint", type=Path, default=Path("models/classifier/best_model.pt"))
-    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"))
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--registry",
+        type=Path,
+        default=Path("data/processed/regression/model_registry.json"),
+    )
+    parser.add_argument(
+        "--classifier-checkpoint",
+        type=Path,
+        default=Path("models/classifier/best_model.pt"),
+    )
+    parser.add_argument(
+        "--device", default="auto", choices=("auto", "cpu", "cuda", "mps")
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=DEFAULT_SCORING_BATCH_SIZE
+    )
+    parser.add_argument("--num-workers", type=int, default=DEFAULT_SCORING_NUM_WORKERS)
     parser.add_argument("--max-rows", type=int)
     parser.add_argument("--lsh-seed", type=int, default=0)
     parser.add_argument("--lsh-bits", type=int, default=16)
     parser.add_argument("--imagenet-stats", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -37,23 +57,33 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.manifest,
         output_dir=args.output_dir,
         run_name=args.run_name,
+        dry_run=args.dry_run,
         registry_path=args.registry,
         classifier_checkpoint=args.classifier_checkpoint,
         device=args.device,
         classifier_use_resisc45_stats=not args.imagenet_stats,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         max_rows=args.max_rows,
         lsh_seed=args.lsh_seed,
         lsh_bits=args.lsh_bits,
     )
-    print(json.dumps({
-        "run_root": str(args.output_dir / args.run_name),
-        "candidate_pool": "candidate_pool.csv",
-        "feature_embeddings": "feature_embeddings.npz",
-        "scoring_manifest": "scoring_manifest.json",
-        "counts": result["counts"],
-        "state": result["state"],
-    }, sort_keys=True))
+    if args.dry_run:
+        print(json.dumps(result, sort_keys=True))
+        return
+    print(
+        json.dumps(
+            {
+                "run_root": str(args.output_dir / args.run_name),
+                "candidate_pool": "candidate_pool.csv",
+                "feature_embeddings": "feature_embeddings.npz",
+                "scoring_manifest": "scoring_manifest.json",
+                "counts": result["counts"],
+                "state": result["state"],
+            },
+            sort_keys=True,
+        )
+    )
     if not result["state"]["ready_for_selection"]:
         raise SystemExit(2)
 

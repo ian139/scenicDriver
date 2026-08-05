@@ -439,22 +439,27 @@ uv run python scripts/modeling/train_regression_baseline.py --help >/tmp/scenic_
     ssh(target, "bash -lc " + shlex.quote(script))
 
 
-def run_remote_container_smoke(target: SshTarget, remote_repo_dir: str, remote_env_file: str) -> None:
+def run_remote_container_validation(target: SshTarget, remote_repo_dir: str, remote_env_file: str) -> None:
     script = f"""
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 cd {remote_quote(remote_repo_dir)}
 set -a; . {remote_quote(remote_env_file)}; set +a
-uv run python scripts/remote/container_smoke.py --device cuda --json >/tmp/scenic_container_smoke.json
+python scripts/remote/vast_train.py validate --device cuda \
+  --checkpoint "$SCENIC_CHECKPOINT_PATH" \
+  --dataset "$SCENIC_DATASET_PATH" \
+  --output /tmp/scenic_container_validation.json
 """.strip()
     ssh(target, "bash -lc " + shlex.quote(script))
 
 
-def verify_remote_smoke(target: SshTarget) -> None:
-    result = ssh(target, "cat /tmp/scenic_container_smoke.json")
+def verify_remote_validation(target: SshTarget) -> None:
+    result = ssh(target, "cat /tmp/scenic_container_validation.json")
     payload = json.loads(result.stdout)
     if not isinstance(payload, dict) or payload.get("ok") is not True or payload.get("device") != "cuda":
-        raise RuntimeError("Remote CUDA smoke failed: " + result.stdout.strip())
+        raise RuntimeError("Remote CUDA validation failed: " + result.stdout.strip())
+
+
 
 
 
@@ -494,7 +499,7 @@ def check_up_preconditions(args: argparse.Namespace) -> None:
     validate_task_name(args.task_name)
     existing = maybe_load_state(args.task_name)
     if existing is not None and existing.get("status") != "destroyed":
-        raise SystemExit(f"State exists: {rel_state_path(args.task_name)}; run vast-down or choose a new task name")
+        raise SystemExit(f"State exists: {rel_state_path(args.task_name)}; run `python scripts/remote/cmux_vast_host.py down` or choose a new task name")
     require_commands(["vastai", "ssh", "scp", "tar", "git", "uv"])
     identity_file = str(Path(args.identity_file).expanduser())
     public_key = str(Path(args.ssh_public_key).expanduser())
@@ -574,10 +579,10 @@ def do_up(args: argparse.Namespace) -> dict:
 
         phase_started = time.monotonic()
         try:
-            run_remote_container_smoke(target, args.remote_repo_dir, DEFAULT_REMOTE_ENV_FILE)
-            verify_remote_smoke(target)
+            run_remote_container_validation(target, args.remote_repo_dir, DEFAULT_REMOTE_ENV_FILE)
+            verify_remote_validation(target)
         finally:
-            record_startup_timing(state, "container_smoke", phase_started)
+            record_startup_timing(state, "container_validation", phase_started)
 
         update_status(state, "ready", ssh_host=target.host, ssh_port=target.port)
         return state
@@ -595,7 +600,6 @@ def handle_up(args: argparse.Namespace) -> int:
     print(f"Vast CMUX host ready: {args.task_name}")
     print(f"State: {rel_state_path(args.task_name)}")
     print(f"Remote repo: {state['remote_repo_dir']}")
-    print(f"Next: scripts/remote/vast-start-task.sh {args.task_name}")
     return 0
 
 
@@ -740,7 +744,7 @@ def handle_start_task(args: argparse.Namespace) -> int:
             "CMUX workspace already registered: "
             f"ref={state.get('cmux_workspace_ref')} id={state.get('cmux_workspace_id')}"
         )
-        print("Watch: scripts/remote/vast-watch.sh --once")
+        print("Watch state with: python scripts/remote/cmux_vast_host.py watch --once")
         return 0
 
     if getattr(args, "manual", False):
@@ -756,7 +760,7 @@ def handle_start_task(args: argparse.Namespace) -> int:
         command = build_cmux_workspace_command(name, cwd)
         print(f"CMUX workspace command (manual, unregistered): {shlex.join(command)}")
         print("CMUX workspace creation was left to the operator; no identity was recorded.")
-        print("Watch: scripts/remote/vast-watch.sh --once")
+        print("Watch state with: python scripts/remote/cmux_vast_host.py watch --once")
         return 0
 
     try:
@@ -785,7 +789,7 @@ def handle_start_task(args: argparse.Namespace) -> int:
     )
     state.pop("cmux_workspace_observed_ref", None)
     print(f"CMUX workspace registered: ref={workspace_ref} id={workspace_id}")
-    print("Watch: scripts/remote/vast-watch.sh --once")
+    print("Watch state with: python scripts/remote/cmux_vast_host.py watch --once")
     return 0
 
 
@@ -839,7 +843,7 @@ def copy_artifacts(state: dict) -> bool:
         (f"{remote_root}/data/processed/regression/", artifact_dir / "data" / "processed" / "regression", True),
         (f"{remote_root}/models/", artifact_dir / "models", False),
         (f"{remote_root}/scenic_artifacts/", artifact_dir / "scenic_artifacts", True),
-        ("/tmp/scenic_container_smoke.json", artifact_dir / "scenic_container_smoke.json", False),
+        ("/tmp/scenic_container_validation.json", artifact_dir / "scenic_container_validation.json", False),
     )
     for remote_path, local_path, required in copy_requests:
         try:
@@ -969,7 +973,7 @@ def process_watch_state(state: dict, *, destroy: bool, yes: bool) -> None:
         print(f"Vast task destroyed: {task_name}")
     else:
         update_status(state, "done")
-        print(f"Task is closed; destroy with scripts/remote/vast-down.sh {task_name} --destroy --yes")
+        print(f"Task is closed; destroy with python scripts/remote/cmux_vast_host.py down {task_name} --destroy --yes")
 
 
 def states_to_watch(task_name: str | None) -> list[dict]:

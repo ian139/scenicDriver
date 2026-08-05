@@ -45,16 +45,17 @@ docker build --platform linux/amd64 \
   -t scenicdriver/remote-training:vast-smoke .
 ```
 
-Run the import/device smoke locally. Use the CPU check on a non-CUDA host and
-the CUDA check on a host exposing an NVIDIA GPU:
+Run canonical validation locally. Use CPU on a non-CUDA host and CUDA on a host
+exposing an NVIDIA GPU:
 
 ```bash
 docker run --rm --platform linux/amd64 scenicdriver/remote-training:vast-smoke \
-  python scripts/remote/container_smoke.py --check-imports --device cpu
+  python scripts/remote/vast_train.py validate --device cpu \
+  --checkpoint models/<checkpoint>.pt --dataset data/processed/regression/<features>.npz
 
-# On a CUDA host:
 docker run --rm --gpus all scenicdriver/remote-training:vast-smoke \
-  python scripts/remote/container_smoke.py --check-imports --device cuda
+  python scripts/remote/vast_train.py validate --device cuda \
+  --checkpoint models/<checkpoint>.pt --dataset data/processed/regression/<features>.npz
 ```
 
 Publishing is separate from GPU rental. Tag, push, and prove that the registry
@@ -127,14 +128,13 @@ docker run --gpus all --name scenic-vast-validate \
   -v /workspace/scenic-models:/workspace/models \
   -v /workspace/scenic-artifacts:/workspace/scenic_artifacts \
   ian139/scenicdriver-remote-training:latest \
-  bash scripts/remote/provision_vast.sh
+  python scripts/remote/vast_train.py validate --device cuda \
 ```
 
 ### Provisioning gates
 
-`scripts/remote/provision_vast.sh` runs these checks in order. It performs
-identity and bucket authorization directly with `boto3`, then uses the
-repository S3 helper for every prefix check and transfer:
+The canonical `vast_train.py validate` command performs CUDA and input checks;
+S3 transfers use the repository helper for every prefix check and transfer.
 
 ```bash
 python - <<'PY'
@@ -165,9 +165,7 @@ python -m src.data_pipeline.s3 download-prefix \
   --dest models \
   --required
 nvidia-smi
-python scripts/remote/container_smoke.py --device cuda --check-imports --json
-python scripts/remote/minimal_inference.py \
-  --device cuda \
+python scripts/remote/vast_train.py validate --device cuda \
   --checkpoint models/<checkpoint>.pt \
   --dataset data/processed/regression/<features>.npz \
   --output scenic_artifacts/vast/<run-id>/inference_result.json
@@ -187,11 +185,7 @@ Validation checklist:
 
 - [ ] The image builds with `Dockerfile.remote-training`.
 - [ ] The image pulls from Docker Hub on the Vast host.
-- [ ] `scripts/remote/provision_vast.sh` pulls required data and model prefixes
-      from S3; missing prefixes fail unless `SCENIC_ALLOW_MISSING_ARTIFACTS=1`.
-- [ ] `nvidia-smi` succeeds on the host and through the container path.
-- [ ] `container_smoke.py --device cuda --check-imports` succeeds.
-- [ ] `minimal_inference.py` writes `inference_result.json` quickly.
+- [ ] `vast_train.py validate --device cuda` succeeds.
 - [ ] `python -m src.data_pipeline.s3 upload-prefix` uploads the output
       directory to the output prefix.
 - [ ] No long training command starts before every item above passes.
@@ -280,14 +274,14 @@ for the training dataset.
 ```bash
 export SCENIC_S3_BUCKET=scenicdriver-data
 
-scripts/remote/vast-train.sh run <task-name> \
+python scripts/remote/vast_train.py run <task-name> \
   --train-dataset-key <key> \
   --epochs 1 \
   --batch-size 64
 
-scripts/remote/vast-train.sh status <task-name>
+python scripts/remote/vast_train.py status <task-name>
 
-scripts/remote/vast-train.sh cleanup <task-name> --copy-artifacts --destroy --yes
+python scripts/remote/vast_train.py cleanup <task-name> --copy-artifacts --destroy --yes
 ```
 
 `--epochs 1 --batch-size 64` is a cost-controlled smoke train. Omit those
@@ -327,15 +321,15 @@ workspace. The watch/down wrappers use the recorded workspace identity before
 collecting artifacts or destroying the host:
 
 ```bash
-scripts/remote/vast-start-task.sh scenic-vast-smoke \
+python scripts/remote/cmux_vast_host.py start-task scenic-vast-smoke \
   --agent none \
   --allocation-attempts 3 \
   --disk-gb 64 \
   --image ian139/scenicdriver-remote-training:latest \
   --timeout-seconds 1800
 
-scripts/remote/vast-watch.sh --interval-seconds 60 --destroy --yes
-scripts/remote/vast-down.sh scenic-vast-smoke --copy-artifacts --destroy --yes
+python scripts/remote/cmux_vast_host.py watch --interval-seconds 60 --destroy --yes
+python scripts/remote/cmux_vast_host.py down scenic-vast-smoke --copy-artifacts --destroy --yes
 ```
 
 The CMUX state file keeps the workspace reference and id tied to the unique
@@ -351,7 +345,5 @@ For repository workspace and orchestration conventions, see [`../internal/cmux-w
 ## Related documentation
 
 - [`aws-s3.md`](aws-s3.md) — S3 bucket, credentials, and local synchronization
-- [`../../compose.remote-training.yml`](../../compose.remote-training.yml) — local GPU/container smoke service
-- [`../../scripts/remote/provision_vast.sh`](../../scripts/remote/provision_vast.sh) — fail-fast validation script
 - [`../../scripts/remote/vast_train.py`](../../scripts/remote/vast_train.py) — state-backed lifecycle implementation
 - [`../../scripts/remote/vast_route_benchmark.py`](../../scripts/remote/vast_route_benchmark.py) — resumable full-bbox CPU benchmark lifecycle

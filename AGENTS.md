@@ -22,10 +22,6 @@ Scenic Drive scores scenic beauty from satellite imagery and terrain data, then 
 - `uv run python scripts/ingest/download_bbox_tiles.py ...`
 - `uv run python scripts/reports/heuristic_report.py ...`
 - `uv run python scripts/routing/route_compare_service.py ...`
-- `cp .env.beta.example .env.beta` and populate `MAPBOX_ACCESS_TOKEN`
-- `docker compose --env-file .env.beta -f compose.beta.yml up --build`
-- Open `http://localhost:${SCENIC_WEB_PORT:-80}`
-- `docker compose --env-file .env.beta -f compose.beta.yml down`
 
 ## Data And Artifact Policy
 - Keep large data, generated reports, caches, and model weights out of git.

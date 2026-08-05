@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 import hashlib
 import io
@@ -122,6 +123,18 @@ UNCERTAINTY_DEFINITION = (
     "class uncertainty = -sum(p_i * ln(p_i)) / ln(K), where p is the softmax "
     "distribution over K RESISC45 classes; zero terms are zero and K <= 1 is zero"
 )
+DEFAULT_SCORING_BATCH_SIZE = 256
+DEFAULT_SCORING_NUM_WORKERS = 4
+SCORING_PREFETCH_FACTOR = 2
+_TERRAIN_METRIC_NAMES = (
+    "relief",
+    "roughness",
+    "slope_mean",
+    "slope_variation",
+    "water_proximity",
+    "vegetation_density",
+)
+
 
 
 @dataclass
@@ -174,14 +187,29 @@ class _SourceData:
 
 
 @dataclass
+class _ScoringInput:
+    index: int
+    satellite: _SourceData
+    terrain: _SourceData
+
+
+@dataclass
+class _ScoringError:
+    index: int
+    message: str
+    missing: bool = False
+
+
+@dataclass
 class _PendingRow:
     index: int
     satellite: Image.Image
+    transformed: Any
     terrain_features: np.ndarray
     terrain_metrics: dict[str, float]
+    satellite_metrics: dict[str, float]
     satellite_hash: str
     terrain_hash: str
-
 
 @dataclass
 class _CacheData:
@@ -384,6 +412,31 @@ def _torch_module(value: Any) -> bool:
         hasattr(value, "state_dict") and hasattr(value, "parameters")
     )
 
+def _cuda_device(device: str) -> bool:
+    return str(device).lower().startswith("cuda")
+
+
+def _autocast_context(device: str) -> Any:
+    if not _cuda_device(device):
+        return nullcontext()
+    import torch
+
+    return torch.autocast(device_type="cuda", dtype=torch.float16)
+
+
+def _pin_tensor(value: Any, *, device: str) -> Any:
+    if not _cuda_device(device):
+        return value
+    import torch
+
+    if not isinstance(value, torch.Tensor):
+        return value
+    if value.is_cuda or value.is_pinned():
+        return value
+    if not torch.cuda.is_available():
+        return value
+    return value.pin_memory()
+
 
 def _to_numpy(value: Any, *, dtype: np.dtype = np.dtype(np.float32)) -> np.ndarray:
     if hasattr(value, "detach"):
@@ -494,6 +547,111 @@ def _satellite_metrics(image: Image.Image) -> dict[str, float]:
         & (texture < 0.12)
     )
     return {"water_fraction": float(water_mask.mean())}
+
+
+class _ScoringDataset:
+    """Decode, transform, and derive terrain features in DataLoader workers."""
+
+    def __init__(
+        self,
+        inputs: Sequence[_ScoringInput],
+        *,
+        classifier_transform: Callable[[Image.Image], Any] | None,
+        terrain_feature_fn: Callable[..., Any],
+        image_loader: Callable[..., Image.Image] | None,
+    ) -> None:
+        self._inputs = tuple(inputs)
+        self._classifier_transform = classifier_transform
+        self._terrain_feature_fn = terrain_feature_fn
+        self._image_loader = image_loader
+
+    def __len__(self) -> int:
+        return len(self._inputs)
+
+    def __getitem__(self, position: int) -> _PendingRow | _ScoringError:
+        item = self._inputs[position]
+        try:
+            satellite = _open_rgb(
+                item.satellite,
+                image_loader=self._image_loader,
+                style="satellite",
+            )
+            terrain = _open_rgb(
+                item.terrain,
+                image_loader=self._image_loader,
+                style="terrain",
+            )
+            if satellite.size != terrain.size or min(*satellite.size) <= 0:
+                raise ValueError(
+                    "satellite and terrain imagery must have matching positive dimensions"
+                )
+            terrain_result = self._terrain_feature_fn(terrain, satellite)
+            terrain_features, terrain_metrics = _terrain_values(terrain_result)
+            transformed = (
+                self._classifier_transform(satellite)
+                if self._classifier_transform is not None
+                else np.asarray(satellite, dtype=np.float32)
+            )
+            return _PendingRow(
+                index=item.index,
+                satellite=satellite,
+                transformed=transformed,
+                terrain_features=terrain_features,
+                terrain_metrics=terrain_metrics,
+                satellite_metrics=_satellite_metrics(satellite),
+                satellite_hash=str(item.satellite.content_hash),
+                terrain_hash=str(item.terrain.content_hash),
+            )
+        except Exception as exc:
+            return _ScoringError(
+                index=item.index,
+                message=f"{type(exc).__name__}: {exc}",
+                missing=isinstance(exc, FileNotFoundError),
+            )
+
+
+def _collate_scoring_items(
+    items: list[_PendingRow | _ScoringError],
+) -> list[_PendingRow | _ScoringError]:
+    """Keep worker results ordered while allowing per-row failures."""
+    return items
+
+
+def _loader_options(
+    *,
+    device: str,
+    num_workers: int,
+    dependencies: ScoringDependencies,
+) -> tuple[dict[str, Any], int]:
+    requested = int(num_workers)
+    if requested < 0:
+        raise ValueError("num_workers must be non-negative")
+    cuda = _cuda_device(device)
+    if cuda and requested <= 0:
+        raise ValueError("CUDA scoring requires num_workers > 0")
+    injected = bool(
+        dependencies.classifier_predictor is not None
+        or dependencies.regression_predictor is not None
+        or dependencies.image_loader is not None
+        or dependencies.classifier_checkpoint is None
+        or dependencies.regression_checkpoint is None
+    )
+    effective = requested if cuda or not injected else 0
+    options: dict[str, Any] = {
+        "batch_size": None,
+        "shuffle": False,
+        "num_workers": effective,
+        "pin_memory": cuda,
+        "collate_fn": _collate_scoring_items,
+    }
+    if effective > 0:
+        options.update(
+            {
+                "prefetch_factor": SCORING_PREFETCH_FACTOR,
+                "persistent_workers": True,
+            }
+        )
+    return options, effective
 
 
 def _heuristic_components(
@@ -886,39 +1044,67 @@ def _copy_cached_fields(result: dict[str, Any], cached: Mapping[str, Any]) -> No
 
 
 def _call_classifier(
-    dependencies: ScoringDependencies, images: list[Image.Image]
+    dependencies: ScoringDependencies,
+    images: list[Image.Image],
+    *,
+    transformed_batch: Any | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    transformed = [
-        dependencies.classifier_transform(image)
-        if dependencies.classifier_transform
-        else np.asarray(image, dtype=np.float32)
-        for image in images
-    ]
+    transformed: Any
+    if transformed_batch is None:
+        transformed = [
+            dependencies.classifier_transform(image)
+            if dependencies.classifier_transform
+            else np.asarray(image, dtype=np.float32)
+            for image in images
+        ]
+    else:
+        transformed = transformed_batch
     if dependencies.classifier_predictor is not None:
+        if isinstance(transformed, list):
+            transformed = _stack_transforms(transformed, use_torch=False)
         try:
-            output = dependencies.classifier_predictor(
-                _stack_transforms(transformed, use_torch=False)
-            )
+            output = dependencies.classifier_predictor(transformed)
         except (TypeError, AttributeError):
             output = dependencies.classifier_predictor(images)
     else:
         if dependencies.classifier is None:
             raise ValueError("classifier is required for active-model scoring")
         use_torch = _torch_module(dependencies.classifier)
-        batch = _stack_transforms(transformed, use_torch=use_torch)
+        batch = (
+            _stack_transforms(transformed, use_torch=use_torch)
+            if isinstance(transformed, list)
+            else transformed
+        )
         if use_torch:
-            batch = batch.to(dependencies.device)
             import torch
 
-            with torch.no_grad():
-                logits_value = dependencies.classifier(batch)
-                features_value = dependencies.classifier.get_features(batch)
+            if not isinstance(batch, torch.Tensor):
+                batch = torch.as_tensor(batch, dtype=torch.float32)
+            batch = _pin_tensor(batch, device=dependencies.device)
+            batch = batch.to(
+                dependencies.device,
+                non_blocking=_cuda_device(dependencies.device),
+            )
+            with torch.no_grad(), _autocast_context(dependencies.device):
+                combined = getattr(
+                    dependencies.classifier, "forward_with_features", None
+                )
+                if combined is not None:
+                    output = combined(batch)
+                else:
+                    logits_value = dependencies.classifier(batch)
+                    if not hasattr(dependencies.classifier, "get_features"):
+                        raise ValueError(
+                            "classifier must expose get_features for embeddings"
+                        )
+                    features_value = dependencies.classifier.get_features(batch)
+                    output = {"logits": logits_value, "embeddings": features_value}
         else:
             logits_value = dependencies.classifier(batch)
             if not hasattr(dependencies.classifier, "get_features"):
                 raise ValueError("classifier must expose get_features for embeddings")
             features_value = dependencies.classifier.get_features(batch)
-        output = {"logits": logits_value, "embeddings": features_value}
+            output = {"logits": logits_value, "embeddings": features_value}
     if isinstance(output, Mapping):
         logits_value = output.get("logits", output.get("class_logits"))
         features_value = output.get(
@@ -961,11 +1147,19 @@ def _call_regression(
         if _torch_module(dependencies.regression_model):
             import torch
 
-            with torch.no_grad():
+            def on_device(value: np.ndarray) -> torch.Tensor:
+                tensor = torch.as_tensor(value, dtype=torch.float32).contiguous()
+                tensor = _pin_tensor(tensor, device=dependencies.device)
+                return tensor.to(
+                    dependencies.device,
+                    non_blocking=_cuda_device(dependencies.device),
+                )
+
+            with torch.no_grad(), _autocast_context(dependencies.device):
                 output = dependencies.regression_model(
-                    torch.from_numpy(embeddings).float().to(dependencies.device),
-                    torch.from_numpy(terrain_features).float().to(dependencies.device),
-                    torch.from_numpy(logits).float().to(dependencies.device),
+                    on_device(embeddings),
+                    on_device(terrain_features),
+                    on_device(logits),
                 )
         else:
             output = dependencies.regression_model(embeddings, terrain_features, logits)
@@ -1055,6 +1249,86 @@ def _mark_error(result: dict[str, Any], message: str, *, missing: bool = False) 
     )
 
 
+def _validate_device_request(device: str) -> str:
+    requested = str(device or "auto").lower()
+    if requested not in {"auto", "cpu", "cuda", "mps"}:
+        raise ValueError(f"unsupported device: {device}")
+    return requested
+
+
+def _manifest_frame(
+    manifest: str | Path | pd.DataFrame,
+) -> tuple[pd.DataFrame, str, Path, str]:
+    if isinstance(manifest, pd.DataFrame):
+        frame = manifest.copy()
+        return frame, "<dataframe>", Path.cwd(), sha256_bytes(_stable_row_text(frame))
+    manifest_path = Path(manifest)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"tile manifest not found: {manifest_path}")
+    try:
+        frame = pd.read_csv(manifest_path, low_memory=False)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"invalid tile manifest: {manifest_path}") from exc
+    return frame, str(manifest_path), manifest_path.parent, sha256_file(manifest_path)
+
+
+def validate_scoring_inputs(
+    manifest: str | Path | pd.DataFrame,
+    *,
+    run_name: str = "active_learning",
+    batch_size: int = DEFAULT_SCORING_BATCH_SIZE,
+    num_workers: int = DEFAULT_SCORING_NUM_WORKERS,
+    device: str = "auto",
+    max_rows: int | None = None,
+    lsh_bits: int = 16,
+) -> dict[str, Any]:
+    """Validate dry-run inputs without loading models or touching output paths."""
+    validated_name = validate_run_name(run_name)
+    requested_device = _validate_device_request(device)
+    if isinstance(batch_size, bool) or int(batch_size) <= 0:
+        raise ValueError("batch_size must be positive")
+    if isinstance(num_workers, bool) or int(num_workers) < 0:
+        raise ValueError("num_workers must be non-negative")
+    if isinstance(lsh_bits, bool) or not 1 <= int(lsh_bits) <= 63:
+        raise ValueError("LSH bits must be between 1 and 63")
+    if requested_device == "cuda" and int(num_workers) <= 0:
+        raise ValueError("CUDA scoring requires num_workers > 0")
+    frame, manifest_label, _manifest_dir, source_hash = _manifest_frame(manifest)
+    missing_columns = sorted(set(CANONICAL_TILE_COLUMNS) - set(frame.columns))
+    if missing_columns:
+        raise ValueError(f"tile manifest missing columns: {missing_columns}")
+    if frame.empty:
+        raise ValueError("tile manifest is empty")
+    source_rows = int(len(frame))
+    if max_rows is not None:
+        frame = frame.iloc[: max(0, int(max_rows))].copy()
+        if frame.empty:
+            raise ValueError("tile manifest has no rows after max_rows")
+    return {
+        "dry_run": True,
+        "valid": True,
+        "run_name": validated_name,
+        "manifest": {
+            "path": manifest_label,
+            "sha256": source_hash,
+            "rows": source_rows,
+            "selected_rows": int(len(frame)),
+        },
+        "configuration": {
+            "device": requested_device,
+            "batch_size": int(batch_size),
+            "num_workers": int(num_workers),
+            "pin_memory": requested_device == "cuda",
+            "prefetch_factor": SCORING_PREFETCH_FACTOR
+            if int(num_workers) > 0
+            else None,
+            "persistent_workers": int(num_workers) > 0,
+            "max_rows": int(max_rows) if max_rows is not None else None,
+        },
+        "artifacts": {},
+    }
+
+
 def score_tile_manifest(
     manifest: str | Path | pd.DataFrame,
     *,
@@ -1064,7 +1338,8 @@ def score_tile_manifest(
     classifier_checkpoint: str | Path = "models/classifier/best_model.pt",
     device: str = "auto",
     classifier_use_resisc45_stats: bool = True,
-    batch_size: int = 32,
+    batch_size: int = DEFAULT_SCORING_BATCH_SIZE,
+    num_workers: int = DEFAULT_SCORING_NUM_WORKERS,
     lsh_seed: int = 0,
     lsh_bits: int = 16,
     max_rows: int | None = None,
@@ -1107,6 +1382,8 @@ def score_tile_manifest(
             raise ValueError("tile manifest has no rows after max_rows")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if isinstance(num_workers, bool) or int(num_workers) < 0:
+        raise ValueError("num_workers must be non-negative")
 
     if dependencies is None:
         dependencies = _dependencies_from_loaded(
@@ -1148,14 +1425,38 @@ def score_tile_manifest(
     preprocessing = _preprocessing_contract(dependencies, classifier_use_resisc45_stats)
     cache = _read_cache(root, pipeline_identity=preprocessing["pipeline_sha256"])
     results = [_base_result(row) for _, row in frame.iterrows()]
-    cache_hits, pending = 0, []
+    loader_options, effective_num_workers = _loader_options(
+        device=dependencies.device,
+        num_workers=num_workers,
+        dependencies=dependencies,
+    )
+    loader_options["batch_size"] = batch_size
+    cache_hits, pending_inputs = 0, []
     vector_by_index, logits_by_index, probs_by_index, terrain_by_index = {}, {}, {}, {}
     errors: list[dict[str, Any]] = []
 
+    def record_error(index: int, message: str, *, missing: bool = False) -> None:
+        result = results[index]
+        _mark_error(result, message, missing=missing)
+        errors.append(
+            {
+                "source_identity": result["source_identity"],
+                "error": message,
+                "status": result["score_status"],
+            }
+        )
+
     def score_chunk(chunk: list[_PendingRow]) -> None:
         try:
+            use_torch = _torch_module(dependencies.classifier)
+            transformed = _stack_transforms(
+                [item.transformed for item in chunk], use_torch=use_torch
+            )
+            transformed = _pin_tensor(transformed, device=dependencies.device)
             logits, embeddings = _call_classifier(
-                dependencies, [item.satellite for item in chunk]
+                dependencies,
+                [item.satellite for item in chunk],
+                transformed_batch=transformed,
             )
             terrain_features = np.stack(
                 [item.terrain_features for item in chunk], axis=0
@@ -1182,10 +1483,9 @@ def score_tile_manifest(
                     class_score = float(get_scenic_weight(class_name))
                 except Exception:
                     class_score = 0.3
-                sat_metrics = _satellite_metrics(item.satellite)
                 components, entropy = (
                     _heuristic_components(
-                        class_score, item.terrain_metrics, sat_metrics
+                        class_score, item.terrain_metrics, item.satellite_metrics
                     ),
                     normalized_class_entropy(row_probs),
                 )
@@ -1193,7 +1493,7 @@ def score_tile_manifest(
                     {
                         **components,
                         **item.terrain_metrics,
-                        "water_fraction": sat_metrics["water_fraction"],
+                        "water_fraction": item.satellite_metrics["water_fraction"],
                         "regression_prediction": float(predictions[offset]),
                         "model_prediction": float(predictions[offset]),
                         "label_source": "active_regression_prediction",
@@ -1227,14 +1527,7 @@ def score_tile_manifest(
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             for item in chunk:
-                _mark_error(results[item.index], message)
-                errors.append(
-                    {
-                        "source_identity": results[item.index]["source_identity"],
-                        "error": message,
-                        "status": "error",
-                    }
-                )
+                record_error(item.index, message)
 
     for index, (_, source_row) in enumerate(frame.iterrows()):
         row, result = source_row.to_dict(), results[index]
@@ -1245,17 +1538,10 @@ def score_tile_manifest(
             missing_style = (
                 "satellite" if not result["manifest_satellite_present"] else "terrain"
             )
-            _mark_error(
-                result,
+            record_error(
+                index,
                 f"manifest marks {missing_style} imagery unavailable",
                 missing=True,
-            )
-            errors.append(
-                {
-                    "source_identity": result["source_identity"],
-                    "error": result["error"],
-                    "status": "missing",
-                }
             )
             continue
         try:
@@ -1317,49 +1603,37 @@ def score_tile_manifest(
                         cache.arrays[name][cached_index], dtype=np.float32
                     ).copy()
                 continue
-            sat_img = _open_rgb(
-                satellite,
-                image_loader=dependencies.image_loader,
-                style="satellite",
+            pending_inputs.append(
+                _ScoringInput(index=index, satellite=satellite, terrain=terrain)
             )
-            terrain_img = _open_rgb(
-                terrain,
-                image_loader=dependencies.image_loader,
-                style="terrain",
-            )
-            if sat_img.size != terrain_img.size or min(*sat_img.size) <= 0:
-                raise ValueError(
-                    "satellite and terrain imagery must have matching positive dimensions"
-                )
-            terrain_result = dependencies.terrain_feature_fn(terrain_img, sat_img)
-            terrain_features, terrain_metrics = _terrain_values(terrain_result)
-            pending.append(
-                _PendingRow(
-                    index=index,
-                    satellite=sat_img,
-                    terrain_features=terrain_features,
-                    terrain_metrics=terrain_metrics,
-                    satellite_hash=satellite.content_hash,
-                    terrain_hash=terrain.content_hash,
-                )
-            )
-            if len(pending) >= batch_size:
-                score_chunk(pending)
-                pending.clear()
         except Exception as exc:
-            message = f"{type(exc).__name__}: {exc}"
-            _mark_error(result, message, missing=isinstance(exc, FileNotFoundError))
-            errors.append(
-                {
-                    "source_identity": result["source_identity"],
-                    "error": message,
-                    "status": result["score_status"],
-                }
+            record_error(
+                index,
+                f"{type(exc).__name__}: {exc}",
+                missing=isinstance(exc, FileNotFoundError),
             )
 
-    if pending:
-        score_chunk(pending)
-        pending.clear()
+    if pending_inputs:
+        import torch
+
+        loader = torch.utils.data.DataLoader(
+            _ScoringDataset(
+                pending_inputs,
+                classifier_transform=dependencies.classifier_transform,
+                terrain_feature_fn=dependencies.terrain_feature_fn,
+                image_loader=dependencies.image_loader,
+            ),
+            **loader_options,
+        )
+        for batch in loader:
+            chunk = []
+            for item in batch:
+                if isinstance(item, _ScoringError):
+                    record_error(item.index, item.message, missing=item.missing)
+                else:
+                    chunk.append(item)
+            if chunk:
+                score_chunk(chunk)
 
     scored_indices = [
         i
@@ -1494,7 +1768,21 @@ def score_tile_manifest(
             "regression_checkpoint_sha256": regression_hash,
             "label_semantics": "regression_prediction/model_prediction are active-model outputs; no human label is inferred",
         },
-        "preprocessing": {**preprocessing, "batch_size": int(batch_size)},
+        "preprocessing": {
+            **preprocessing,
+            "batch_size": int(batch_size),
+            "num_workers": int(effective_num_workers),
+            "requested_num_workers": int(num_workers),
+            "pin_memory": bool(loader_options["pin_memory"]),
+            "prefetch_factor": (
+                int(loader_options["prefetch_factor"])
+                if "prefetch_factor" in loader_options
+                else None
+            ),
+            "persistent_workers": bool(
+                loader_options.get("persistent_workers", False)
+            ),
+        },
         "uncertainty": {
             "name": UNCERTAINTY_NAME,
             "definition": UNCERTAINTY_DEFINITION,
@@ -1567,17 +1855,24 @@ def run_active_learning_scoring(
     *,
     output_dir: str | Path = "data/processed/active_learning",
     run_name: str = "active_learning",
+    dry_run: bool = False,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Convenience wrapper using the canonical ignored active-learning root."""
-    run_name = validate_run_name(run_name)
+    """Run scoring or validate its inputs without creating a run."""
+    validated_name = validate_run_name(run_name)
+    if dry_run:
+        return validate_scoring_inputs(
+            manifest_path,
+            run_name=validated_name,
+            batch_size=kwargs.get("batch_size", DEFAULT_SCORING_BATCH_SIZE),
+            num_workers=kwargs.get("num_workers", DEFAULT_SCORING_NUM_WORKERS),
+            device=kwargs.get("device", "auto"),
+            max_rows=kwargs.get("max_rows"),
+            lsh_bits=kwargs.get("lsh_bits", 16),
+        )
     return score_tile_manifest(
-        manifest_path, run_root=Path(output_dir) / run_name, **kwargs
+        manifest_path, run_root=Path(output_dir) / validated_name, **kwargs
     )
-
-
-score_manifest = score_tile_manifest
-score_active_learning_pool = run_active_learning_scoring
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1599,12 +1894,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("models/classifier/best_model.pt"),
     )
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--device", default="auto", choices=("auto", "cpu", "cuda", "mps")
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=DEFAULT_SCORING_BATCH_SIZE
+    )
+    parser.add_argument("--num-workers", type=int, default=DEFAULT_SCORING_NUM_WORKERS)
     parser.add_argument("--lsh-seed", type=int, default=0)
     parser.add_argument("--lsh-bits", type=int, default=16)
     parser.add_argument("--max-rows", type=int)
     parser.add_argument("--imagenet-stats", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1614,15 +1915,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.manifest,
         output_dir=args.output_dir,
         run_name=args.run_name,
+        dry_run=args.dry_run,
         registry_path=args.registry,
         classifier_checkpoint=args.classifier_checkpoint,
         device=args.device,
         classifier_use_resisc45_stats=not args.imagenet_stats,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         lsh_seed=args.lsh_seed,
         lsh_bits=args.lsh_bits,
         max_rows=args.max_rows,
     )
+    if args.dry_run:
+        print(json.dumps(result, sort_keys=True))
+        return
     print(
         json.dumps(
             {

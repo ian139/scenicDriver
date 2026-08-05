@@ -33,29 +33,6 @@ uv run python scripts/routing/check_beta_artifacts.py --project-root .
 
 The bootstrap downloads only manifest destinations, decompresses packaged objects when required, and verifies their uncompressed sizes and SHA-256 digests. The routing checker validates the graph schema, configured bounding box, coverage probes, and report/model linkage.
 
-## Start the beta
-
-```bash
-cp .env.beta.example .env.beta
-# Set MAPBOX_ACCESS_TOKEN in the untracked .env.beta file.
-
-docker compose --env-file .env.beta -f compose.beta.yml up --build
-```
-
-Open `http://localhost:${SCENIC_WEB_PORT:-80}`. The beta sets `SCENIC_ROUTE_PRELOAD=required`, so missing or invalid route assets fail startup instead of serving an incomplete deployment.
-
-Verify:
-
-1. `/api/v1/healthz` reports a healthy required preload.
-2. The New England North heatmap loads.
-3. A route comparison returns fastest and scenic routes.
-4. Address search works with the supplied Mapbox token.
-
-Stop the deployment with:
-
-```bash
-docker compose --env-file .env.beta -f compose.beta.yml down
-```
 
 ## Build the regional graph
 

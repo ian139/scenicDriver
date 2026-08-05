@@ -10,12 +10,16 @@ from PIL import Image
 from src.active_learning.common import sha256_file
 from src.active_learning.finalize import finalize_stage1
 from src.active_learning.scoring import (
+    DEFAULT_SCORING_BATCH_SIZE,
+    DEFAULT_SCORING_NUM_WORKERS,
     ScoringDependencies,
+    _call_classifier,
+    _loader_options,
     normalized_class_entropy,
     resolve_active_regression_checkpoint,
+    run_active_learning_scoring,
     score_tile_manifest,
 )
-
 
 def _png(path: Path, color: tuple[int, int, int]) -> None:
     Image.new("RGB", (4, 4), color=color).save(path, format="PNG")
@@ -84,6 +88,93 @@ def _dependencies(counters: dict[str, int]) -> ScoringDependencies:
         regression_hash="regression-fixture",
         device="cpu",
     )
+
+
+def test_scoring_defaults_and_dry_run_create_no_artifacts(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    output = tmp_path / "runs"
+    result = run_active_learning_scoring(
+        manifest,
+        output_dir=output,
+        run_name="fixture",
+        dry_run=True,
+    )
+    assert result["configuration"]["batch_size"] == DEFAULT_SCORING_BATCH_SIZE == 256
+    assert result["configuration"]["num_workers"] == DEFAULT_SCORING_NUM_WORKERS
+    assert result["configuration"]["pin_memory"] is False
+    assert result["artifacts"] == {}
+    assert not output.exists()
+
+
+def test_cuda_loader_options_enable_pinned_prefetch_workers() -> None:
+    dependencies = ScoringDependencies(
+        classifier_checkpoint=Path("classifier.pt"),
+        regression_checkpoint=Path("regression.pt"),
+    )
+    options, effective = _loader_options(
+        device="cuda",
+        num_workers=3,
+        dependencies=dependencies,
+    )
+    assert effective == 3
+    assert options["num_workers"] == 3
+    assert options["pin_memory"] is True
+    assert options["prefetch_factor"] == 2
+    assert options["persistent_workers"] is True
+
+
+def test_classifier_combined_forward_uses_one_backbone() -> None:
+    torch = pytest.importorskip("torch")
+
+    class FixtureClassifier(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, _batch):
+            raise AssertionError("scoring should use the combined forward")
+
+        def forward_with_features(self, batch):
+            self.calls += 1
+            features = batch.mean(dim=(2, 3))
+            return features[:, :2], features
+
+    classifier = FixtureClassifier()
+    dependencies = ScoringDependencies(
+        classifier=classifier,
+        classifier_transform=lambda _image: torch.ones(3, 4, 4),
+        device="cpu",
+    )
+    logits, embeddings = _call_classifier(
+        dependencies,
+        [Image.new("RGB", (4, 4), color=(1, 2, 3))],
+    )
+    assert classifier.calls == 1
+    assert logits.shape == (1, 2)
+    assert embeddings.shape == (1, 3)
+
+
+def test_scoring_cli_dry_run_has_no_run_artifacts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from scripts.modeling.score_active_learning_pool import main
+
+    manifest_path = tmp_path / "manifest.csv"
+    _manifest(tmp_path).to_csv(manifest_path, index=False)
+    output = tmp_path / "cli-runs"
+    main(
+        [
+            "--manifest",
+            str(manifest_path),
+            "--output-dir",
+            str(output),
+            "--run-name",
+            "fixture",
+            "--dry-run",
+        ]
+    )
+    assert not output.exists()
+    assert '"dry_run": true' in capsys.readouterr().out
 
 
 def test_resume_skips_unchanged_rows_and_preserves_error_state(tmp_path: Path) -> None:
