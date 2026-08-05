@@ -7,9 +7,11 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
 import pandas as pd
 
 from .common import atomic_write_json, jsonable, sha256_file
+from .scoring import CANDIDATE_POOL_COLUMNS, SCORING_SCHEMA_VERSION
 
 SCHEMA_VERSION = 1
 ABSOLUTE_COLUMNS = (
@@ -37,8 +39,12 @@ RUN_ARTIFACTS = {
     "region_manifest": "region_manifest.json",
     "tile_manifest": "tile_manifest.csv",
     "inventory_report": "inventory_report.json",
+    "acquisition_preflight": "acquisition_preflight.json",
     "annotation_batch": "annotation_batch.csv",
     "batch_manifest": "batch_manifest.json",
+    "candidate_pool": "candidate_pool.csv",
+    "feature_embeddings": "feature_embeddings.npz",
+    "scoring_manifest": "scoring_manifest.json",
     "selection_diagnostics": "selection_diagnostics.json",
     "geographic_splits": "geographic_splits.csv",
     "leakage_audit": "leakage_audit.json",
@@ -342,6 +348,133 @@ def _validate_registry(
     }
 
 
+def _validate_acquisition_preflight(path: Path, blockers: list[str]) -> bool:
+    payload, error = _read_json(path)
+    if error:
+        blockers.append(error)
+        return False
+    assert payload is not None
+    if payload.get("budget_valid") is not True:
+        blockers.append("acquisition preflight budget_valid is not true")
+        return False
+    return True
+
+
+def _scoring_artifact_hash(
+    manifest: Mapping[str, Any], name: str
+) -> str | None:
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        return None
+    candidates = (name, name.removesuffix(".csv"), name.removesuffix(".npz"))
+    for key in candidates:
+        entry = artifacts.get(key)
+        if isinstance(entry, Mapping) and isinstance(entry.get("sha256"), str):
+            return str(entry["sha256"])
+        if isinstance(entry, str):
+            return entry
+    return None
+
+
+def _validate_scoring_artifacts(
+    candidate_path: Path,
+    embedding_path: Path,
+    scoring_path: Path,
+    root: Path,
+    blockers: list[str],
+)-> tuple[bool, int, int]:
+    """Validate the selector handoff table, dense arrays, and their hashes."""
+    blocker_start = len(blockers)
+
+    candidate, error = _read_csv(candidate_path)
+    if error:
+        blockers.append(error)
+        return False, 0, 0
+    scoring, scoring_error = _read_json(scoring_path)
+    if scoring_error:
+        blockers.append(scoring_error)
+        return False, 0, 0
+    assert candidate is not None and scoring is not None
+    if scoring.get("schema_version") != SCORING_SCHEMA_VERSION:
+        blockers.append("scoring manifest schema version mismatch")
+    required_columns = {
+        "image_path",
+        "source_identity",
+        "satellite_path",
+        "terrain_path",
+        "score_status",
+        "selector_eligible",
+        "heuristic_score",
+        "scenic_score",
+        "scenic_score_heuristic",
+        "regression_prediction",
+        "normalized_class_entropy",
+        "embedding_row_index",
+    }
+    missing = sorted(required_columns - set(candidate.columns))
+    if missing:
+        blockers.append(f"candidate pool missing columns: {missing}")
+    if candidate.empty:
+        blockers.append("candidate pool is empty")
+    scored = (
+        candidate["score_status"].astype(str).str.lower().eq("scored")
+        if "score_status" in candidate
+        else pd.Series(False, index=candidate.index)
+    )
+    if not bool(scored.any()):
+        blockers.append("candidate pool contains no successfully scored rows")
+    if "regression_prediction" in candidate and not bool(
+        pd.to_numeric(candidate.loc[scored, "regression_prediction"], errors="coerce")
+        .notna()
+        .any()
+    ):
+        blockers.append("candidate pool contains no active regression predictions")
+    try:
+        with np.load(embedding_path, allow_pickle=False) as arrays:
+            if "embeddings" not in arrays or "row_indices" not in arrays:
+                blockers.append("feature embeddings NPZ lacks embeddings/row_indices arrays")
+                embedding_rows = 0
+            else:
+                embeddings = np.asarray(arrays["embeddings"])
+                row_indices = np.asarray(arrays["row_indices"])
+                embedding_rows = int(len(embeddings))
+                if embeddings.ndim != 2 or embedding_rows <= 0 or embeddings.shape[1] <= 0:
+                    blockers.append("feature embeddings NPZ embeddings array is empty or not 2-D")
+                if row_indices.ndim != 1 or len(row_indices) != embedding_rows:
+                    blockers.append("feature embeddings NPZ row_indices shape mismatch")
+                if not np.issubdtype(embeddings.dtype, np.number):
+                    blockers.append("feature embeddings NPZ embeddings array is not numeric")
+    except (OSError, ValueError, TypeError) as exc:
+        blockers.append(f"invalid feature embeddings NPZ: {exc}")
+        embedding_rows = 0
+    if "embedding_row_index" in candidate:
+        indices = pd.to_numeric(candidate.loc[scored, "embedding_row_index"], errors="coerce")
+        if indices.isna().any() or (indices < 0).any() or (indices >= max(embedding_rows, 1)).any():
+            blockers.append("candidate pool embedding row indices are invalid")
+    for name, path in (
+        ("candidate_pool.csv", candidate_path),
+        ("feature_embeddings.npz", embedding_path),
+    ):
+        expected = _scoring_artifact_hash(scoring, name)
+        if expected is None:
+            blockers.append(f"scoring manifest lacks hash for {name}")
+        elif sha256_file(path).lower() != expected.lower():
+            blockers.append(f"scoring artifact hash mismatch: {name}")
+    state = scoring.get("state")
+    if not isinstance(state, Mapping) or state.get("ready_for_selection") is not True:
+        blockers.append("scoring manifest is not ready for selection")
+    return (
+        not blockers[blocker_start:]
+        and not candidate.empty
+        and bool(scored.any())
+        and embedding_rows > 0
+        and isinstance(state, Mapping)
+        and state.get("ready_for_selection") is True,
+        int(len(candidate)),
+        embedding_rows,
+    )
+
+
 def finalize_stage1(
     run_root: str | Path,
     *,
@@ -436,6 +569,10 @@ def finalize_stage1(
     )
     if error:
         blockers.append(error)
+    acquisition_budget_ok = _validate_acquisition_preflight(
+        paths["acquisition_preflight"] or root / RUN_ARTIFACTS["acquisition_preflight"],
+        blockers,
+    )
     tile_ok, tile_rows = _validate_tile(
         paths["tile_manifest"] or root / RUN_ARTIFACTS["tile_manifest"], root, blockers
     )
@@ -460,6 +597,13 @@ def finalize_stage1(
         paths["baseline_checkpoint"],
         blockers,
     )
+    scoring_ok, scoring_rows, embedding_rows = _validate_scoring_artifacts(
+        paths["candidate_pool"] or root / RUN_ARTIFACTS["candidate_pool"],
+        paths["feature_embeddings"] or root / RUN_ARTIFACTS["feature_embeddings"],
+        paths["scoring_manifest"] or root / RUN_ARTIFACTS["scoring_manifest"],
+        root,
+        blockers,
+    )
     records = {
         key: _artifact(path, root, entry["required"])
         for key, (path, entry) in (
@@ -468,6 +612,8 @@ def finalize_stage1(
     }
     readiness = {
         "data_complete": bool(region is not None and inventory is not None and tile_ok),
+        "acquisition_budget_valid": bool(acquisition_budget_ok),
+        "scoring_valid": bool(scoring_ok),
         "annotations_valid": bool(batch_ok and annotation_ok),
         "splits_valid": bool(split_ok),
         "benchmark_valid": bool(benchmark_ok),
@@ -487,6 +633,8 @@ def finalize_stage1(
             "split_rows": split_rows,
             "benchmark_rows": benchmark_rows,
             "mixed_label_rows": mixed_rows,
+            "candidate_pool_rows": scoring_rows,
+            "embedding_rows": embedding_rows,
         },
         "baseline": baseline,
         "seeds": jsonable(dict(seeds or {})),

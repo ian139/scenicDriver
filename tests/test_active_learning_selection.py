@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import numpy as np
 import pandas as pd
 
+from src.active_learning.common import sha256_file
 from src.active_learning.finalize import finalize_stage1
 from src.active_learning.selection import audit_geographic_leakage, select_candidates
 
@@ -106,6 +108,10 @@ def test_finalizer_accepts_complete_validated_fixture(tmp_path: Path) -> None:
         "selection_diagnostics.json",
     ):
         (tmp_path / name).write_text(json.dumps({"schema_version": 1}))
+    (tmp_path / "acquisition_preflight.json").write_text(
+        json.dumps({"schema_version": 1, "budget_valid": True}),
+        encoding="utf-8",
+    )
     pd.DataFrame(
         [
             {
@@ -152,6 +158,50 @@ def test_finalizer_accepts_complete_validated_fixture(tmp_path: Path) -> None:
     ).to_csv(tmp_path / "geographic_splits.csv", index=False)
     (tmp_path / "leakage_audit.json").write_text(
         json.dumps({"schema_version": 1, "valid": True})
+    )
+    candidate = pd.DataFrame(
+        [
+            {
+                "image_path": name,
+                "source_identity": f"fixture/{name}",
+                "satellite_path": name,
+                "terrain_path": name,
+                "region": "fixture",
+                "score_status": "scored",
+                "selector_eligible": True,
+                "heuristic_score": 4.0 + index,
+                "scenic_score": 4.0 + index,
+                "scenic_score_heuristic": 4.0 + index,
+                "regression_prediction": 5.0 + index,
+                "normalized_class_entropy": 0.5,
+                "embedding_row_index": index,
+            }
+            for index, name in enumerate(paths)
+        ]
+    )
+    candidate.to_csv(tmp_path / "candidate_pool.csv", index=False)
+    np.savez_compressed(
+        tmp_path / "feature_embeddings.npz",
+        embeddings=np.ones((len(paths), 2), dtype=np.float32),
+        row_indices=np.arange(len(paths), dtype=np.int64),
+    )
+    scoring_manifest = {
+        "schema_version": 1,
+        "state": {"ready_for_selection": True},
+        "artifacts": {
+            "candidate_pool.csv": {
+                "path": "candidate_pool.csv",
+                "sha256": sha256_file(tmp_path / "candidate_pool.csv"),
+            },
+            "feature_embeddings.npz": {
+                "path": "feature_embeddings.npz",
+                "sha256": sha256_file(tmp_path / "feature_embeddings.npz"),
+            },
+        },
+    }
+    (tmp_path / "scoring_manifest.json").write_text(
+        json.dumps(scoring_manifest),
+        encoding="utf-8",
     )
     annotations = pd.DataFrame(
         [
