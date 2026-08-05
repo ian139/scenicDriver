@@ -71,6 +71,29 @@ def test_budget_rejected_before_output(tmp_path: Path):
     assert not (tmp_path / "runs").exists()
 
 
+
+def test_existing_run_rejects_identity_drift_before_rewrite(tmp_path: Path) -> None:
+    spec = {"version": 1, "regions": [get_builtin_region_spec()["regions"][0]]}
+    first = plan_run(
+        run_name="resume",
+        spec=spec,
+        output_root=tmp_path / "runs",
+        image_root=tmp_path / "images",
+        budget=100_000,
+    )
+    manifest_path = Path(first["run_dir"]) / "region_manifest.json"
+    before = manifest_path.read_bytes()
+    with pytest.raises(ValueError, match="identity drift"):
+        plan_run(
+            run_name="resume",
+            spec=spec,
+            output_root=tmp_path / "runs",
+            image_root=tmp_path / "images",
+            zoom=15,
+            budget=100_000,
+        )
+    assert manifest_path.read_bytes() == before
+
 def test_inventory_reuses_valid_pair_and_manifest_contract(tmp_path: Path):
     image_root = tmp_path / "images"
     row = enumerate_bbox_tiles(42.49, -73.52, 42.50, -73.51, zoom=14)[0]
@@ -129,7 +152,6 @@ def test_inventory_reuses_valid_pair_and_manifest_contract(tmp_path: Path):
             "terrain_s3_uri",
         ]
 
-
 def test_s3_inventory_reuses_nonempty_canonical_pair() -> None:
     class Paginator:
         def paginate(self, *, Bucket: str, Prefix: str):
@@ -137,7 +159,8 @@ def test_s3_inventory_reuses_nonempty_canonical_pair() -> None:
             assert Bucket == "scenic"
             yield {
                 "Contents": [
-                    {"Key": f"raw/images/{style}/z14/west/10_20.png", "Size": 123}
+                    {"Key": f"raw/images/{style}/z14/west/10_20.png", "Size": 123},
+                    {"Key": f"raw/images/{style}/z14/west/nested/10_20.png", "Size": 999},
                 ]
             }
 
@@ -160,7 +183,11 @@ def test_s3_inventory_reuses_nonempty_canonical_pair() -> None:
         bucket="scenic",
         s3_client=Client(),
     )
-    assert counts["complete_pairs"] == 1
+    assert counts["complete_pairs"] == 0
+    assert counts["satellite_valid"] == 0
+    assert counts["terrain_valid"] == 0
+    assert counts["satellite_s3_objects"] == 1
+    assert counts["terrain_s3_objects"] == 1
     assert (
         rows[0]["satellite_s3_uri"]
         == "s3://scenic/raw/images/satellite/z14/west/10_20.png"
