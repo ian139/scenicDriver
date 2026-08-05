@@ -7,9 +7,11 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
 import pandas as pd
 
 from .common import atomic_write_json, jsonable, sha256_file
+from .scoring import CANDIDATE_POOL_COLUMNS, SCORING_SCHEMA_VERSION
 
 SCHEMA_VERSION = 1
 ABSOLUTE_COLUMNS = (
@@ -37,8 +39,12 @@ RUN_ARTIFACTS = {
     "region_manifest": "region_manifest.json",
     "tile_manifest": "tile_manifest.csv",
     "inventory_report": "inventory_report.json",
+    "acquisition_preflight": "acquisition_preflight.json",
     "annotation_batch": "annotation_batch.csv",
     "batch_manifest": "batch_manifest.json",
+    "candidate_pool": "candidate_pool.csv",
+    "feature_embeddings": "feature_embeddings.npz",
+    "scoring_manifest": "scoring_manifest.json",
     "selection_diagnostics": "selection_diagnostics.json",
     "geographic_splits": "geographic_splits.csv",
     "leakage_audit": "leakage_audit.json",
@@ -57,7 +63,15 @@ def _bool(value: Any) -> bool:
         pass
     if isinstance(value, (int, float)):
         return bool(value)
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "t", "on", "completed"}
+    return str(value).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "t",
+        "on",
+        "completed",
+    }
 
 
 def _read_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -76,7 +90,7 @@ def _read_csv(path: Path) -> tuple[pd.DataFrame | None, str | None]:
     if not path.exists():
         return None, f"missing artifact: {path}"
     try:
-        return pd.read_csv(path), None
+        return pd.read_csv(path, low_memory=False), None
     except (OSError, ValueError) as exc:
         return None, f"invalid CSV {path}: {exc}"
 
@@ -91,14 +105,32 @@ def _existing(root: Path, names: tuple[str, ...]) -> Path | None:
 
 def _artifact(path: Path | None, root: Path, required: bool) -> dict[str, Any]:
     if path is None:
-        return {"path": None, "exists": False, "required": required, "sha256": None, "bytes": None}
+        return {
+            "path": None,
+            "exists": False,
+            "required": required,
+            "sha256": None,
+            "bytes": None,
+        }
     try:
         name = str(path.relative_to(root))
     except ValueError:
         name = str(path)
     if not path.exists() or not path.is_file():
-        return {"path": name, "exists": False, "required": required, "sha256": None, "bytes": None}
-    return {"path": name, "exists": True, "required": required, "sha256": sha256_file(path), "bytes": int(path.stat().st_size)}
+        return {
+            "path": name,
+            "exists": False,
+            "required": required,
+            "sha256": None,
+            "bytes": None,
+        }
+    return {
+        "path": name,
+        "exists": True,
+        "required": required,
+        "sha256": sha256_file(path),
+        "bytes": int(path.stat().st_size),
+    }
 
 
 def _resolve(value: str | None, root: Path) -> Path | None:
@@ -116,8 +148,14 @@ def _previous_hashes(path: Path) -> dict[str, str]:
     except (OSError, json.JSONDecodeError):
         return {}
     result: dict[str, str] = {}
-    for entry in (value.get("artifacts", {}) if isinstance(value, dict) else {}).values():
-        if isinstance(entry, dict) and isinstance(entry.get("path"), str) and isinstance(entry.get("sha256"), str):
+    for entry in (
+        value.get("artifacts", {}) if isinstance(value, dict) else {}
+    ).values():
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("path"), str)
+            and isinstance(entry.get("sha256"), str)
+        ):
             result[entry["path"]] = entry["sha256"]
     return result
 
@@ -135,20 +173,24 @@ def _validate_tile(path: Path, root: Path, blockers: list[str]) -> tuple[bool, i
         if frame.empty:
             blockers.append("tile manifest is empty")
         return False, len(frame)
-    present = frame["satellite_present"].map(_bool) & frame["terrain_present"].map(_bool)
+
+    present = frame["satellite_present"].map(_bool) & frame["terrain_present"].map(
+        _bool
+    )
     if not bool(present.all()):
         blockers.append("tile manifest contains incomplete image pairs")
-    for column in ("satellite_path", "terrain_path"):
-        for raw in frame[column].dropna().astype(str):
-            if not raw or raw.lower() in {"nan", "none"}:
-                blockers.append(f"tile manifest contains empty {column}")
-                break
-            path_value = Path(raw)
-            if not path_value.is_absolute() and not path_value.exists():
-                path_value = root / path_value
-            if not path_value.exists():
+    for _, row in frame.iterrows():
+        for style in ("satellite", "terrain"):
+            raw = str(row.get(f"{style}_path", "")).strip()
+            local = Path(raw)
+            if not local.is_absolute() and not local.exists():
+                local = root / local
+            remote = _bool(row.get(f"{style}_s3_present")) and str(
+                row.get(f"{style}_s3_uri", "")
+            ).startswith("s3://")
+            if not local.exists() and not remote:
                 blockers.append(f"missing imagery referenced by tile manifest: {raw}")
-                break
+                return False, len(frame)
     return bool(present.all()), len(frame)
 
 
@@ -166,7 +208,9 @@ def _validate_annotations(path: Path | None, blockers: list[str]) -> tuple[bool,
     if missing:
         blockers.append(f"absolute annotations missing columns: {missing}")
     if extra:
-        blockers.append(f"absolute annotations violate seven-column contract; extra columns: {extra}")
+        blockers.append(
+            f"absolute annotations violate seven-column contract; extra columns: {extra}"
+        )
     if frame.empty:
         blockers.append("absolute annotations are empty")
         return False, 0
@@ -184,7 +228,14 @@ def _validate_batch(path: Path, blockers: list[str]) -> tuple[bool, int]:
         blockers.append(error)
         return False, 0
     assert frame is not None
-    required = {"image_path", "selection_reason", "selection_score", "selection_rank", "batch_id", "run_id"}
+    required = {
+        "image_path",
+        "selection_reason",
+        "selection_score",
+        "selection_rank",
+        "batch_id",
+        "run_id",
+    }
     missing = sorted(required - set(frame.columns))
     if missing:
         blockers.append(f"annotation batch missing columns: {missing}")
@@ -195,7 +246,9 @@ def _validate_batch(path: Path, blockers: list[str]) -> tuple[bool, int]:
     return not missing and not frame.empty, len(frame)
 
 
-def _validate_splits(split_path: Path, audit_path: Path, blockers: list[str]) -> tuple[bool, int, dict[str, Any]]:
+def _validate_splits(
+    split_path: Path, audit_path: Path, blockers: list[str]
+) -> tuple[bool, int, dict[str, Any]]:
     frame, error = _read_csv(split_path)
     if error:
         blockers.append(error)
@@ -218,12 +271,23 @@ def _validate_splits(split_path: Path, audit_path: Path, blockers: list[str]) ->
             blockers.append(f"geographic split has no {expected} rows")
     if not isinstance(audit, dict) or audit.get("valid") is not True:
         blockers.append("geographic leakage audit is invalid")
-    return not missing and not frame.empty and isinstance(audit, dict) and audit.get("valid") is True, len(frame), audit if isinstance(audit, dict) else {}
+    return (
+        not missing
+        and not frame.empty
+        and isinstance(audit, dict)
+        and audit.get("valid") is True,
+        len(frame),
+        audit if isinstance(audit, dict) else {},
+    )
 
 
-def _validate_human_table(path: Path | None, blockers: list[str], *, benchmark: bool = False) -> tuple[bool, int]:
+def _validate_human_table(
+    path: Path | None, blockers: list[str], *, benchmark: bool = False
+) -> tuple[bool, int]:
     if path is None:
-        blockers.append("missing human benchmark CSV" if benchmark else "missing mixed-label CSV")
+        blockers.append(
+            "missing human benchmark CSV" if benchmark else "missing mixed-label CSV"
+        )
         return False, 0
     frame, error = _read_csv(path)
     if error:
@@ -231,11 +295,25 @@ def _validate_human_table(path: Path | None, blockers: list[str], *, benchmark: 
         return False, 0
     assert frame is not None
     if benchmark:
-        score = "scenic_human" if "scenic_human" in frame else "scenic_human_mean" if "scenic_human_mean" in frame else None
-        valid = "image_path" in frame and score is not None and pd.to_numeric(frame[score], errors="coerce").notna().any() and not frame.empty
+        score = (
+            "scenic_human"
+            if "scenic_human" in frame
+            else "scenic_human_mean"
+            if "scenic_human_mean" in frame
+            else None
+        )
+        valid = (
+            "image_path" in frame
+            and score is not None
+            and pd.to_numeric(frame[score], errors="coerce").notna().any()
+            and not frame.empty
+        )
         if not valid:
             blockers.append("benchmark lacks non-empty human image/score rows")
-        if "label_source" in frame and frame["label_source"].astype(str).str.lower().eq("heuristic").all():
+        if (
+            "label_source" in frame
+            and frame["label_source"].astype(str).str.lower().eq("heuristic").all()
+        ):
             blockers.append("benchmark contains weak labels only")
             valid = False
         return bool(valid), len(frame)
@@ -245,7 +323,9 @@ def _validate_human_table(path: Path | None, blockers: list[str], *, benchmark: 
     return bool(valid), len(frame)
 
 
-def _validate_registry(path: Path, checkpoint: Path | None, blockers: list[str]) -> tuple[bool, dict[str, Any]]:
+def _validate_registry(
+    path: Path, checkpoint: Path | None, blockers: list[str]
+) -> tuple[bool, dict[str, Any]]:
     registry, error = _read_json(path)
     if error:
         blockers.append(error)
@@ -268,6 +348,133 @@ def _validate_registry(path: Path, checkpoint: Path | None, blockers: list[str])
     }
 
 
+def _validate_acquisition_preflight(path: Path, blockers: list[str]) -> bool:
+    payload, error = _read_json(path)
+    if error:
+        blockers.append(error)
+        return False
+    assert payload is not None
+    if payload.get("budget_valid") is not True:
+        blockers.append("acquisition preflight budget_valid is not true")
+        return False
+    return True
+
+
+def _scoring_artifact_hash(
+    manifest: Mapping[str, Any], name: str
+) -> str | None:
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        return None
+    candidates = (name, name.removesuffix(".csv"), name.removesuffix(".npz"))
+    for key in candidates:
+        entry = artifacts.get(key)
+        if isinstance(entry, Mapping) and isinstance(entry.get("sha256"), str):
+            return str(entry["sha256"])
+        if isinstance(entry, str):
+            return entry
+    return None
+
+
+def _validate_scoring_artifacts(
+    candidate_path: Path,
+    embedding_path: Path,
+    scoring_path: Path,
+    root: Path,
+    blockers: list[str],
+)-> tuple[bool, int, int]:
+    """Validate the selector handoff table, dense arrays, and their hashes."""
+    blocker_start = len(blockers)
+
+    candidate, error = _read_csv(candidate_path)
+    if error:
+        blockers.append(error)
+        return False, 0, 0
+    scoring, scoring_error = _read_json(scoring_path)
+    if scoring_error:
+        blockers.append(scoring_error)
+        return False, 0, 0
+    assert candidate is not None and scoring is not None
+    if scoring.get("schema_version") != SCORING_SCHEMA_VERSION:
+        blockers.append("scoring manifest schema version mismatch")
+    required_columns = {
+        "image_path",
+        "source_identity",
+        "satellite_path",
+        "terrain_path",
+        "score_status",
+        "selector_eligible",
+        "heuristic_score",
+        "scenic_score",
+        "scenic_score_heuristic",
+        "regression_prediction",
+        "normalized_class_entropy",
+        "embedding_row_index",
+    }
+    missing = sorted(required_columns - set(candidate.columns))
+    if missing:
+        blockers.append(f"candidate pool missing columns: {missing}")
+    if candidate.empty:
+        blockers.append("candidate pool is empty")
+    scored = (
+        candidate["score_status"].astype(str).str.lower().eq("scored")
+        if "score_status" in candidate
+        else pd.Series(False, index=candidate.index)
+    )
+    if not bool(scored.any()):
+        blockers.append("candidate pool contains no successfully scored rows")
+    if "regression_prediction" in candidate and not bool(
+        pd.to_numeric(candidate.loc[scored, "regression_prediction"], errors="coerce")
+        .notna()
+        .any()
+    ):
+        blockers.append("candidate pool contains no active regression predictions")
+    try:
+        with np.load(embedding_path, allow_pickle=False) as arrays:
+            if "embeddings" not in arrays or "row_indices" not in arrays:
+                blockers.append("feature embeddings NPZ lacks embeddings/row_indices arrays")
+                embedding_rows = 0
+            else:
+                embeddings = np.asarray(arrays["embeddings"])
+                row_indices = np.asarray(arrays["row_indices"])
+                embedding_rows = int(len(embeddings))
+                if embeddings.ndim != 2 or embedding_rows <= 0 or embeddings.shape[1] <= 0:
+                    blockers.append("feature embeddings NPZ embeddings array is empty or not 2-D")
+                if row_indices.ndim != 1 or len(row_indices) != embedding_rows:
+                    blockers.append("feature embeddings NPZ row_indices shape mismatch")
+                if not np.issubdtype(embeddings.dtype, np.number):
+                    blockers.append("feature embeddings NPZ embeddings array is not numeric")
+    except (OSError, ValueError, TypeError) as exc:
+        blockers.append(f"invalid feature embeddings NPZ: {exc}")
+        embedding_rows = 0
+    if "embedding_row_index" in candidate:
+        indices = pd.to_numeric(candidate.loc[scored, "embedding_row_index"], errors="coerce")
+        if indices.isna().any() or (indices < 0).any() or (indices >= max(embedding_rows, 1)).any():
+            blockers.append("candidate pool embedding row indices are invalid")
+    for name, path in (
+        ("candidate_pool.csv", candidate_path),
+        ("feature_embeddings.npz", embedding_path),
+    ):
+        expected = _scoring_artifact_hash(scoring, name)
+        if expected is None:
+            blockers.append(f"scoring manifest lacks hash for {name}")
+        elif sha256_file(path).lower() != expected.lower():
+            blockers.append(f"scoring artifact hash mismatch: {name}")
+    state = scoring.get("state")
+    if not isinstance(state, Mapping) or state.get("ready_for_selection") is not True:
+        blockers.append("scoring manifest is not ready for selection")
+    return (
+        not blockers[blocker_start:]
+        and not candidate.empty
+        and bool(scored.any())
+        and embedding_rows > 0
+        and isinstance(state, Mapping)
+        and state.get("ready_for_selection") is True,
+        int(len(candidate)),
+        embedding_rows,
+    )
+
+
 def finalize_stage1(
     run_root: str | Path,
     *,
@@ -286,46 +493,121 @@ def finalize_stage1(
     root.mkdir(parents=True, exist_ok=True)
     handoff_path = root / "stage1_handoff.json"
     blockers: list[str] = []
-    paths: dict[str, Path | None] = {key: root / value for key, value in RUN_ARTIFACTS.items()}
-    paths["absolute_annotations"] = Path(annotations_csv) if annotations_csv else _existing(root, ("absolute_annotations.csv", "annotations.csv"))
-    if paths["absolute_annotations"] is None and Path("data/raw/labels_human.csv").exists():
+    paths: dict[str, Path | None] = {
+        key: root / value for key, value in RUN_ARTIFACTS.items()
+    }
+    paths["absolute_annotations"] = (
+        Path(annotations_csv)
+        if annotations_csv
+        else _existing(root, ("absolute_annotations.csv", "annotations.csv"))
+    )
+    if (
+        paths["absolute_annotations"] is None
+        and Path("data/raw/labels_human.csv").exists()
+    ):
         paths["absolute_annotations"] = Path("data/raw/labels_human.csv")
-    paths["mixed_labels"] = Path(mixed_labels_csv) if mixed_labels_csv else _existing(root, ("mixed_labels.csv", "labels_mixed.csv"))
-    paths["benchmark"] = Path(benchmark_csv) if benchmark_csv else _existing(root, ("benchmark_split.csv", "benchmark.csv", "challenge_benchmark.csv"))
-    paths["baseline_registry"] = Path(registry_path) if registry_path else Path("data/processed/regression/model_registry.json")
+    paths["mixed_labels"] = (
+        Path(mixed_labels_csv)
+        if mixed_labels_csv
+        else _existing(root, ("mixed_labels.csv", "labels_mixed.csv"))
+    )
+    paths["benchmark"] = (
+        Path(benchmark_csv)
+        if benchmark_csv
+        else _existing(
+            root, ("benchmark_split.csv", "benchmark.csv", "challenge_benchmark.csv")
+        )
+    )
+    paths["baseline_registry"] = (
+        Path(registry_path)
+        if registry_path
+        else Path("data/processed/regression/model_registry.json")
+    )
     paths["baseline_checkpoint"] = Path(checkpoint_path) if checkpoint_path else None
-    required = set(RUN_ARTIFACTS) | {"absolute_annotations", "mixed_labels", "benchmark", "baseline_registry"}
-    records = {key: _artifact(path, root, key in required) for key, path in paths.items()}
+    required = set(RUN_ARTIFACTS) | {
+        "absolute_annotations",
+        "mixed_labels",
+        "benchmark",
+        "baseline_registry",
+    }
+    records = {
+        key: _artifact(path, root, key in required) for key, path in paths.items()
+    }
     for key, entry in records.items():
         if entry["required"] and not entry["exists"]:
             blockers.append(f"missing required artifact: {key}")
     previous = _previous_hashes(handoff_path)
     for relative, digest in previous.items():
         path = _resolve(relative, root)
-        if path is not None and path.exists() and path.name != handoff_path.name and sha256_file(path) != digest:
+        if (
+            path is not None
+            and path.exists()
+            and path.name != handoff_path.name
+            and sha256_file(path) != digest
+        ):
             blockers.append(f"hash mismatch against previous handoff: {relative}")
     for key, digest in (expected_hashes or {}).items():
         path = paths.get(key, root / key)
-        if path is None or not path.exists() or sha256_file(path).lower() != str(digest).lower():
+        if (
+            path is None
+            or not path.exists()
+            or sha256_file(path).lower() != str(digest).lower()
+        ):
             blockers.append(f"hash mismatch for {key}")
-    region, error = _read_json(paths["region_manifest"] or root / RUN_ARTIFACTS["region_manifest"])
+    region, error = _read_json(
+        paths["region_manifest"] or root / RUN_ARTIFACTS["region_manifest"]
+    )
     if error:
         blockers.append(error)
-    elif region is not None and region.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION:
+    elif (
+        region is not None
+        and region.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION
+    ):
         blockers.append("region manifest schema version mismatch")
-    inventory, error = _read_json(paths["inventory_report"] or root / RUN_ARTIFACTS["inventory_report"])
+    inventory, error = _read_json(
+        paths["inventory_report"] or root / RUN_ARTIFACTS["inventory_report"]
+    )
     if error:
         blockers.append(error)
-    tile_ok, tile_rows = _validate_tile(paths["tile_manifest"] or root / RUN_ARTIFACTS["tile_manifest"], root, blockers)
-    batch_ok, batch_rows = _validate_batch(paths["annotation_batch"] or root / RUN_ARTIFACTS["annotation_batch"], blockers)
-    annotation_ok, annotation_rows = _validate_annotations(paths["absolute_annotations"], blockers)
-    split_ok, split_rows, audit = _validate_splits(paths["geographic_splits"] or root / RUN_ARTIFACTS["geographic_splits"], paths["leakage_audit"] or root / RUN_ARTIFACTS["leakage_audit"], blockers)
-    benchmark_ok, benchmark_rows = _validate_human_table(paths["benchmark"], blockers, benchmark=True)
+    acquisition_budget_ok = _validate_acquisition_preflight(
+        paths["acquisition_preflight"] or root / RUN_ARTIFACTS["acquisition_preflight"],
+        blockers,
+    )
+    tile_ok, tile_rows = _validate_tile(
+        paths["tile_manifest"] or root / RUN_ARTIFACTS["tile_manifest"], root, blockers
+    )
+    batch_ok, batch_rows = _validate_batch(
+        paths["annotation_batch"] or root / RUN_ARTIFACTS["annotation_batch"], blockers
+    )
+    annotation_ok, annotation_rows = _validate_annotations(
+        paths["absolute_annotations"], blockers
+    )
+    split_ok, split_rows, audit = _validate_splits(
+        paths["geographic_splits"] or root / RUN_ARTIFACTS["geographic_splits"],
+        paths["leakage_audit"] or root / RUN_ARTIFACTS["leakage_audit"],
+        blockers,
+    )
+    benchmark_ok, benchmark_rows = _validate_human_table(
+        paths["benchmark"], blockers, benchmark=True
+    )
     mixed_ok, mixed_rows = _validate_human_table(paths["mixed_labels"], blockers)
-    registry_ok, baseline = _validate_registry(paths["baseline_registry"] or Path("data/processed/regression/model_registry.json"), paths["baseline_checkpoint"], blockers)
-    records = {key: _artifact(path, root, entry["required"]) for key, (path, entry) in ((key, (paths[key], value)) for key, value in records.items())}
+    registry_ok, baseline = _validate_registry(
+        paths["baseline_registry"]
+        or Path("data/processed/regression/model_registry.json"),
+        paths["baseline_checkpoint"],
+        blockers,
+    )
+    scoring_ok, scoring_rows, embedding_rows = _validate_scoring_artifacts(
+        paths["candidate_pool"] or root / RUN_ARTIFACTS["candidate_pool"],
+        paths["feature_embeddings"] or root / RUN_ARTIFACTS["feature_embeddings"],
+        paths["scoring_manifest"] or root / RUN_ARTIFACTS["scoring_manifest"],
+        root,
+        blockers,
+    )
     readiness = {
         "data_complete": bool(region is not None and inventory is not None and tile_ok),
+        "acquisition_budget_valid": bool(acquisition_budget_ok),
+        "scoring_valid": bool(scoring_ok),
         "annotations_valid": bool(batch_ok and annotation_ok),
         "splits_valid": bool(split_ok),
         "benchmark_valid": bool(benchmark_ok),
@@ -338,7 +620,16 @@ def finalize_stage1(
         "run_root": str(root),
         "artifacts": records,
         "artifact_hashes": {key: entry["sha256"] for key, entry in records.items()},
-        "counts": {"tile_rows": tile_rows, "batch_rows": batch_rows, "annotation_rows": annotation_rows, "split_rows": split_rows, "benchmark_rows": benchmark_rows, "mixed_label_rows": mixed_rows},
+        "counts": {
+            "tile_rows": tile_rows,
+            "batch_rows": batch_rows,
+            "annotation_rows": annotation_rows,
+            "split_rows": split_rows,
+            "benchmark_rows": benchmark_rows,
+            "mixed_label_rows": mixed_rows,
+            "candidate_pool_rows": scoring_rows,
+            "embedding_rows": embedding_rows,
+        },
         "baseline": baseline,
         "seeds": jsonable(dict(seeds or {})),
         "material_config": jsonable(dict(material_config or {})),
@@ -355,7 +646,9 @@ def finalize_stage1(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Finalize an active-learning stage-one run")
+    parser = argparse.ArgumentParser(
+        description="Finalize an active-learning stage-one run"
+    )
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--run-name")
     parser.add_argument("--annotations-csv", type=Path)
@@ -375,8 +668,26 @@ def main() -> None:
             raise SystemExit("--expected-hash uses NAME=SHA256")
         key, digest = item.split("=", 1)
         expected[key] = digest
-    result = finalize_stage1(args.run_root, run_name=args.run_name, annotations_csv=args.annotations_csv, mixed_labels_csv=args.mixed_labels_csv, benchmark_csv=args.benchmark_csv, registry_path=args.registry, checkpoint_path=args.checkpoint, expected_hashes=expected)
-    print(json.dumps({"stage1_handoff": str(Path(args.run_root) / "stage1_handoff.json"), "ready_for_stage2": result["ready_for_stage2"], "blockers": result["blockers"]}, sort_keys=True))
+    result = finalize_stage1(
+        args.run_root,
+        run_name=args.run_name,
+        annotations_csv=args.annotations_csv,
+        mixed_labels_csv=args.mixed_labels_csv,
+        benchmark_csv=args.benchmark_csv,
+        registry_path=args.registry,
+        checkpoint_path=args.checkpoint,
+        expected_hashes=expected,
+    )
+    print(
+        json.dumps(
+            {
+                "stage1_handoff": str(Path(args.run_root) / "stage1_handoff.json"),
+                "ready_for_stage2": result["ready_for_stage2"],
+                "blockers": result["blockers"],
+            },
+            sort_keys=True,
+        )
+    )
     if not result["ready_for_stage2"]:
         raise SystemExit(2)
 
