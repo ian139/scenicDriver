@@ -685,25 +685,33 @@ def _validate_geographic_leakage(
             groups[group] = split
     if not {"region", "z", "x", "y"}.issubset(rows.columns):
         return
-    coords: list[tuple[str, int, int, int, str]] = []
+    coords: dict[tuple[str, int, int, int], str] = {}
     for _, row in rows.iterrows():
         try:
-            region = _clean_text(row["region"])
-            z = int(float(row["z"]))
-            x = int(float(row["x"]))
-            y = int(float(row["y"]))
+            key = (
+                _clean_text(row["region"]),
+                int(float(row["z"])),
+                int(float(row["x"])),
+                int(float(row["y"])),
+            )
         except (TypeError, ValueError):
             continue
         image_path = _clean_text(row["image_path"])
-        coords.append((region, z, x, y, splits[image_path]))
-    for index, left in enumerate(coords):
-        for right in coords[index + 1 :]:
-            if left[:2] != right[:2] or left[4] == right[4]:
-                continue
-            if max(abs(left[2] - right[2]), abs(left[3] - right[3])) <= 1:
-                raise ActiveTrainingError(
-                    "adjacent geographic tiles leak across splits"
-                )
+        split = splits[image_path]
+        prior = coords.get(key)
+        if prior is not None and prior != split:
+            raise ActiveTrainingError(f"geographic leakage across splits for {key}")
+        coords[key] = split
+    for (region, z, x, y), split in coords.items():
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                adjacent_split = coords.get((region, z, x + dx, y + dy))
+                if adjacent_split is not None and adjacent_split != split:
+                    raise ActiveTrainingError(
+                        "adjacent geographic tiles leak across splits"
+                    )
 
 
 def _validate_splits_for_selected(

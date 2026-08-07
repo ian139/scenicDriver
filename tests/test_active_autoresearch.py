@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
+import time
+from typing import Any
 
 import pytest
 
@@ -24,8 +27,23 @@ from scripts.modeling.run_active_scenic_autoresearch import (
     validate_handoff_content,
 )
 from src.scenic_scorer.active_training import ActiveTrainingConfig
-import sys
-import time
+
+
+@pytest.fixture(autouse=True)
+def _mock_validate_handoff_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    def _mock_preflight(p: Path) -> dict[str, int]:
+        return {
+            "artifacts": 1,
+            "candidate_rows": 10,
+            "split_rows": 10,
+            "expanded_rows": 5,
+            "control_rows": 5,
+            "leakage_violations": 0,
+        }
+
+    monkeypatch.setattr(mod, "validate_handoff", _mock_preflight)
 
 
 def _handoff(path: Path, *, ready: bool = True) -> Path:
@@ -589,6 +607,8 @@ def test_resume_passes_resume_false_to_fresh_later_experiments(
     ctrl_csv.write_text("header", encoding="utf-8")
     route_json = tmp_path / "route.json"
     route_json.write_text("{}", encoding="utf-8")
+    thresh_json = tmp_path / "thresholds.json"
+    thresh_json.write_text("{}", encoding="utf-8")
 
     run_dir = (
         tmp_path / "data" / "processed" / "modeling_autoresearch" / "run_resume_test"
@@ -607,7 +627,7 @@ def test_resume_passes_resume_false_to_fresh_later_experiments(
         "expanded_benchmark_sha256": compute_sha256(exp_csv),
         "control_benchmark_sha256": compute_sha256(ctrl_csv),
         "route_qa_sha256": compute_sha256(route_json),
-        "thresholds_sha256": None,
+        "thresholds_sha256": compute_sha256(thresh_json),
         "dry_run": False,
         "promote_requested": False,
         "config": {
@@ -619,7 +639,7 @@ def test_resume_passes_resume_false_to_fresh_later_experiments(
             "expanded_benchmark_csv": str(exp_csv),
             "control_benchmark_csv": str(ctrl_csv),
             "route_qa_json": str(route_json),
-            "thresholds_json": None,
+            "thresholds_json": str(thresh_json),
         },
     }
     (run_dir / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -664,6 +684,9 @@ def test_resume_passes_resume_false_to_fresh_later_experiments(
 
     monkeypatch.setattr(mod, "evaluate_stage_two", mock_evaluate_stage_two)
 
+    thresh_json = tmp_path / "thresholds.json"
+    thresh_json.write_text("{}", encoding="utf-8")
+
     test_args = [
         "run_active_scenic_autoresearch.py",
         "--handoff",
@@ -679,9 +702,11 @@ def test_resume_passes_resume_false_to_fresh_later_experiments(
         str(ctrl_csv),
         "--route-qa-json",
         str(route_json),
+        "--thresholds-json",
+        str(thresh_json),
     ]
-    monkeypatch.setattr(sys, "argv", test_args)
 
+    monkeypatch.setattr(sys, "argv", test_args)
     mod.main()
 
     assert train_resume_calls.get("exp_01_baseline_control") is True
@@ -1253,6 +1278,8 @@ def test_resume_with_completed_summary_without_eval_decision(
     ctrl_csv.write_text("header", encoding="utf-8")
     route_json = tmp_path / "route.json"
     route_json.write_text("{}", encoding="utf-8")
+    thresh_json = tmp_path / "thresholds.json"
+    thresh_json.write_text("{}", encoding="utf-8")
 
     run_dir = (
         tmp_path
@@ -1275,7 +1302,7 @@ def test_resume_with_completed_summary_without_eval_decision(
         "expanded_benchmark_sha256": compute_sha256(exp_csv),
         "control_benchmark_sha256": compute_sha256(ctrl_csv),
         "route_qa_sha256": compute_sha256(route_json),
-        "thresholds_sha256": None,
+        "thresholds_sha256": compute_sha256(thresh_json),
         "dry_run": False,
         "promote_requested": False,
         "config": {
@@ -1287,7 +1314,7 @@ def test_resume_with_completed_summary_without_eval_decision(
             "expanded_benchmark_csv": str(exp_csv),
             "control_benchmark_csv": str(ctrl_csv),
             "route_qa_json": str(route_json),
-            "thresholds_json": None,
+            "thresholds_json": str(thresh_json),
         },
     }
     (run_dir / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -1332,6 +1359,9 @@ def test_resume_with_completed_summary_without_eval_decision(
 
     monkeypatch.setattr(mod, "evaluate_stage_two", mock_evaluate_stage_two)
 
+    thresh_json = tmp_path / "thresholds.json"
+    thresh_json.write_text("{}", encoding="utf-8")
+
     test_args = [
         "run_active_scenic_autoresearch.py",
         "--handoff",
@@ -1347,9 +1377,11 @@ def test_resume_with_completed_summary_without_eval_decision(
         str(ctrl_csv),
         "--route-qa-json",
         str(route_json),
+        "--thresholds-json",
+        str(thresh_json),
     ]
-    monkeypatch.setattr(sys, "argv", test_args)
 
+    monkeypatch.setattr(sys, "argv", test_args)
     mod.main()
 
     assert train_resume_calls.get("exp_01_baseline_control") is True
@@ -1550,3 +1582,257 @@ def test_status_mode_after_promotion(
     captured = capsys.readouterr().out
     assert "Completed Experiments: 1" in captured
     assert f"Recorded Run Baseline Checkpoint SHA256: {original_base_sha}" in captured
+
+def test_validate_handoff_preflight_called(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    handoff = _handoff(tmp_path / "handoff")
+
+    def _fail_preflight(p: Path) -> dict[str, int]:
+        raise ValueError("Deep preflight validation failed")
+
+    monkeypatch.setattr(mod, "validate_handoff", _fail_preflight)
+
+    test_args = [
+        "run_active_scenic_autoresearch.py",
+        "--handoff",
+        str(handoff),
+        "--run-name",
+        "preflight_fail_test",
+        "--dry-run",
+        "--expanded-benchmark-csv",
+        "exp.csv",
+        "--control-benchmark-csv",
+        "ctrl.csv",
+        "--route-qa-json",
+        "route.json",
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main()
+    assert exc.value.code == 1
+
+
+def test_thresholds_missing_fails_before_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    handoff = _handoff(tmp_path / "handoff")
+
+    reg_dir = tmp_path / "data" / "processed" / "regression"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = reg_dir / "baseline.pt"
+    ckpt.write_bytes(b"baseline_checkpoint_data")
+    reg_file = reg_dir / "model_registry.json"
+    reg_file.write_text(
+        json.dumps({"active": {"checkpoint": str(ckpt)}}), encoding="utf-8"
+    )
+
+    exp_csv = tmp_path / "exp.csv"
+    exp_csv.write_text("split,image_path,target\n", encoding="utf-8")
+    ctrl_csv = tmp_path / "ctrl.csv"
+    ctrl_csv.write_text("split,image_path,target\n", encoding="utf-8")
+    route_json = tmp_path / "route.json"
+    route_json.write_text("{}", encoding="utf-8")
+
+    prep_called = []
+
+    def mock_prep(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        prep_called.append(True)
+        return {"dataset_path": tmp_path / "dataset.npz", "split_path": tmp_path / "split.csv"}
+
+    monkeypatch.setattr(mod, "prepare_active_dataset", mock_prep)
+
+    test_args = [
+        "run_active_scenic_autoresearch.py",
+        "--handoff",
+        str(handoff),
+        "--run-name",
+        "thresh_missing_test",
+        "--expanded-benchmark-csv",
+        str(exp_csv),
+        "--control-benchmark-csv",
+        str(ctrl_csv),
+        "--route-qa-json",
+        str(route_json),
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+
+    with pytest.raises(ValueError, match="--thresholds-json is required for non-dry execution"):
+        mod.main()
+
+    assert len(prep_called) == 0
+
+
+def test_count_expanded_val_samples(tmp_path: Path) -> None:
+    from scripts.modeling.run_active_scenic_autoresearch import count_expanded_val_samples
+
+    exp_csv = tmp_path / "expanded_benchmark.csv"
+    exp_csv.write_text(
+        "split,image_path,scenic_human_mean\n"
+        "val,img1.jpg,7.5\n"
+        "val,img2.jpg,4.0\n"
+        "val,img1.jpg,8.0\n"
+        "val,img3.jpg,15.0\n"
+        "val,img4.jpg,nan\n"
+        "train,img5.jpg,5.0\n",
+        encoding="utf-8",
+    )
+    count = count_expanded_val_samples(exp_csv)
+    assert count == 2
+
+
+def test_data_limited_mode_skips_eval_and_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    handoff = _handoff(tmp_path / "handoff")
+
+    reg_dir = tmp_path / "data" / "processed" / "regression"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = reg_dir / "baseline.pt"
+    ckpt.write_bytes(b"baseline_checkpoint_data")
+    reg_file = reg_dir / "model_registry.json"
+    reg_file.write_text(
+        json.dumps({"active": {"checkpoint": str(ckpt)}}), encoding="utf-8"
+    )
+
+    exp_csv = tmp_path / "exp.csv"
+    exp_csv.write_text(
+        "split,image_path,scenic_human_mean\nval,img_val1.jpg,6.5\n", encoding="utf-8"
+    )
+    ctrl_csv = tmp_path / "ctrl.csv"
+    ctrl_csv.write_text("split,image_path,scenic_human_mean\n", encoding="utf-8")
+    route_json = tmp_path / "route.json"
+    route_json.write_text("{}", encoding="utf-8")
+
+    thresh_json = tmp_path / "thresholds.json"
+    thresh_json.write_text(
+        json.dumps({"min_expanded_validation_samples": 5}), encoding="utf-8"
+    )
+
+    def mock_prep(h_path: Path, out_path: Path) -> dict[str, Any]:
+        out_path.write_bytes(b"dataset_npz_data")
+        split_csv = out_path.parent / "dataset_splits.csv"
+        split_csv.write_text("split,image_path\n", encoding="utf-8")
+        return {"dataset_path": out_path, "split_path": split_csv}
+
+    monkeypatch.setattr(mod, "prepare_active_dataset", mock_prep)
+
+    cand_ckpt_path = tmp_path / "candidate_trained.pt"
+    cand_ckpt_path.write_bytes(b"cand_ckpt_data")
+
+    def mock_train(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "state": "completed",
+            "candidate_checkpoint": str(cand_ckpt_path),
+            "candidate_checkpoint_sha256": "mock_cand_sha256",
+            "metrics": {"train_loss": 0.05, "val_loss": 0.10},
+        }
+
+    eval_called = []
+    promo_called = []
+
+    def mock_eval(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        eval_called.append(True)
+        raise AssertionError("evaluate_stage_two should NEVER be called in data-limited mode!")
+
+    def mock_promo(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        promo_called.append(True)
+        raise AssertionError("promote_from_decision should NEVER be called in data-limited mode!")
+
+    monkeypatch.setattr(mod, "train_active_model", mock_train)
+    monkeypatch.setattr(mod, "evaluate_stage_two", mock_eval)
+    monkeypatch.setattr(mod, "promote_from_decision", mock_promo)
+
+    test_args = [
+        "run_active_scenic_autoresearch.py",
+        "--handoff",
+        str(handoff),
+        "--run-name",
+        "data_limited_run",
+        "--max-experiments",
+        "2",
+        "--expanded-benchmark-csv",
+        str(exp_csv),
+        "--control-benchmark-csv",
+        str(ctrl_csv),
+        "--route-qa-json",
+        str(route_json),
+        "--thresholds-json",
+        str(thresh_json),
+        "--promote",
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+
+    mod.main()
+
+    assert len(eval_called) == 0
+    assert len(promo_called) == 0
+
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / "data_limited_run"
+    assert (run_dir / "run_manifest.json").exists()
+    manifest_data = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest_data.get("data_limited") is True
+    assert manifest_data.get("expanded_val_support") == 1
+    assert manifest_data.get("min_expanded_validation_samples") == 5
+
+    exp_records = [
+        json.loads(line)
+        for line in (run_dir / "experiments.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(exp_records) == 2
+    for r in exp_records:
+        assert r["status"] == "rejected"
+        assert r["all_gates_pass"] is False
+        assert r["rejection_reason"] == "insufficient_expanded_human_validation_support"
+        assert "metrics" in r
+
+    decision_data = json.loads((run_dir / "promotion_decision.json").read_text(encoding="utf-8"))
+    assert decision_data["data_limited"] is True
+    assert decision_data["all_gates_pass"] is False
+    assert decision_data["retained_candidate"] is None
+    assert decision_data["registry_status"] == "unchanged"
+    assert decision_data["observed_expanded_val_samples"] == 1
+    assert decision_data["min_expanded_validation_samples"] == 5
+    req_batch = decision_data["requested_annotation_batch"]
+    assert req_batch["target_validation_human_rows"] >= 5
+    assert req_batch["target_test_human_rows"] >= 20
+
+    summary_data = json.loads((run_dir / "final_summary.json").read_text(encoding="utf-8"))
+    assert summary_data["data_limited"] is True
+    assert summary_data["retained_exp_id"] is None
+    assert summary_data["promoted"] is False
+    assert summary_data["registry_status"] == "unchanged"
+    assert summary_data["observed_expanded_val_samples"] == 1
+    assert summary_data["min_expanded_validation_samples"] == 5
+
+
+def test_select_best_candidate_ignores_rejected() -> None:
+    from scripts.modeling.run_active_scenic_autoresearch import select_best_candidate
+
+    records = [
+        {
+            "exp_id": "exp_01",
+            "status": "rejected",
+            "all_gates_pass": False,
+            "rejection_reason": "insufficient_expanded_human_validation_support",
+            "metrics": {"pearson_corr": 0.95, "mae": 0.1},
+        },
+        {
+            "exp_id": "exp_02",
+            "status": "completed",
+            "all_gates_pass": False,
+            "metrics": {"pearson_corr": 0.85, "mae": 0.2},
+        },
+    ]
+    assert select_best_candidate(records) is None
