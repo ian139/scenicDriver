@@ -49,6 +49,7 @@ class TerrainFeatureResult:
     relief: float
     roughness: float
     slope_mean: float
+    terrain_sea_level_fraction: float
 
 
 def compute_terrain_features(
@@ -62,7 +63,11 @@ def compute_terrain_features(
     here so callers that operate on local files and callers that operate on
     downloaded images produce identical values.
     """
-    elev = repair_terrain_zero_seam(decode_terrain_rgb(terrain_img))
+    decoded_elevation = decode_terrain_rgb(terrain_img)
+    terrain_sea_level_fraction = _terrain_sea_level_fraction_from_elevation(
+        decoded_elevation
+    )
+    elev = repair_terrain_zero_seam(decoded_elevation)
     gy, gx = np.gradient(elev)
     slope = np.sqrt(gx**2 + gy**2)
 
@@ -98,6 +103,7 @@ def compute_terrain_features(
         relief=relief,
         roughness=roughness,
         slope_mean=slope_mean,
+        terrain_sea_level_fraction=terrain_sea_level_fraction,
     )
 
 
@@ -108,6 +114,21 @@ def decode_terrain_rgb(terrain_img: TerrainImageInput) -> np.ndarray:
     g = arr[..., 1]
     b = arr[..., 2]
     return -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1
+
+
+def compute_terrain_sea_level_fraction(terrain_img: TerrainImageInput) -> float:
+    """Compute the fraction of approximately zero-meter Terrain-RGB pixels.
+
+    This is an elevation proxy, not a land/water classifier. Seam repair first
+    removes sparse zero-elevation border artifacts.
+    """
+    return _terrain_sea_level_fraction_from_elevation(decode_terrain_rgb(terrain_img))
+
+
+def _terrain_sea_level_fraction_from_elevation(elevation: np.ndarray) -> float:
+    repaired = repair_terrain_zero_seam(elevation)
+    water_mask = np.isclose(repaired, _SEAM_ZERO_ELEVATION, atol=_SEAM_ZERO_ATOL)
+    return float(water_mask.mean())
 
 
 def _as_rgb_array(image: TerrainImageInput) -> np.ndarray:
@@ -124,7 +145,9 @@ def _as_rgb_array(image: TerrainImageInput) -> np.ndarray:
         )
 
     if arr.ndim != 3 or arr.shape[-1] < 3:
-        raise ValueError(f"Expected an RGB image array with shape (H, W, 3), got {arr.shape}.")
+        raise ValueError(
+            f"Expected an RGB image array with shape (H, W, 3), got {arr.shape}."
+        )
     return np.asarray(arr[..., :3], dtype=np.float32)
 
 

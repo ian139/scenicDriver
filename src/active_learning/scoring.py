@@ -38,9 +38,16 @@ from .common import (
     sha256_bytes,
     sha256_file,
 )
+from .water import (
+    MAX_SELECTABLE_WATER_FRACTION,
+    UNUSABLE_REASON_EXCESSIVE_WATER,
+    compute_satellite_water_fraction,
+    evaluate_water_status,
+    is_excessive_water,
+)
 from src.terrain.features import compute_terrain_features
 
-SCORING_SCHEMA_VERSION = 1
+SCORING_SCHEMA_VERSION = 3
 SCHEMA_VERSION = SCORING_SCHEMA_VERSION
 CANONICAL_TILE_COLUMNS = (
     "region",
@@ -98,6 +105,10 @@ CANDIDATE_POOL_COLUMNS = (
     "water_proximity",
     "vegetation_density",
     "water_fraction",
+    "terrain_sea_level_fraction",
+    "effective_water_fraction",
+    "water_filter_status",
+    "unusable_reason",
     "regression_prediction",
     "model_prediction",
     "label_source",
@@ -134,7 +145,6 @@ _TERRAIN_METRIC_NAMES = (
     "water_proximity",
     "vegetation_density",
 )
-
 
 
 @dataclass
@@ -210,6 +220,7 @@ class _PendingRow:
     satellite_metrics: dict[str, float]
     satellite_hash: str
     terrain_hash: str
+
 
 @dataclass
 class _CacheData:
@@ -412,6 +423,7 @@ def _torch_module(value: Any) -> bool:
         hasattr(value, "state_dict") and hasattr(value, "parameters")
     )
 
+
 def _cuda_device(device: str) -> bool:
     return str(device).lower().startswith("cuda")
 
@@ -527,26 +539,26 @@ def _terrain_values(result: Any) -> tuple[np.ndarray, dict[str, float]]:
         )
         number = _finite(raw)
         metrics[name] = float(number if number is not None else 0.0)
+    twf_raw = (
+        result.get("terrain_sea_level_fraction")
+        if isinstance(result, Mapping)
+        else getattr(result, "terrain_sea_level_fraction", None)
+    )
+    if twf_raw is None:
+        twf_raw = (
+            features_obj.get("terrain_sea_level_fraction")
+            if isinstance(features_obj, Mapping)
+            else getattr(features_obj, "terrain_sea_level_fraction", None)
+        )
+    twf_num = _finite(twf_raw)
+    metrics["terrain_sea_level_fraction"] = (
+        float(twf_num) if twf_num is not None else 0.0
+    )
     return terrain_array, metrics
 
 
 def _satellite_metrics(image: Image.Image) -> dict[str, float]:
-    values = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
-    r, g, b = values[..., 0], values[..., 1], values[..., 2]
-    brightness = (r + g + b) / 3.0
-    maxc = np.maximum(r, np.maximum(g, b))
-    minc = np.minimum(r, np.minimum(g, b))
-    saturation = (maxc - minc) / np.maximum(maxc + 1e-6, 1e-6)
-    gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
-    texture = float(gray.std())
-    water_mask = (
-        (b > r * 1.2)
-        & (b > g * 1.15)
-        & (brightness < 0.65)
-        & (saturation > 0.18)
-        & (texture < 0.12)
-    )
-    return {"water_fraction": float(water_mask.mean())}
+    return {"water_fraction": compute_satellite_water_fraction(image)}
 
 
 class _ScoringDataset:
@@ -907,6 +919,7 @@ def _preprocessing_contract(
             if dependencies.classifier_transform
             else "injected_or_identity"
         ),
+        "water_filter": f"schema-{SCORING_SCHEMA_VERSION}:inclusive-{MAX_SELECTABLE_WATER_FRACTION}",
         "classifier_normalization": (
             "RESISC45" if classifier_use_resisc45_stats else "ImageNet"
         ),
@@ -932,6 +945,8 @@ def _read_cache(run_root: Path, *, pipeline_identity: str) -> _CacheData | None:
         return None
     try:
         manifest = json.loads(scoring_path.read_text(encoding="utf-8"))
+        if manifest.get("schema_version") != SCORING_SCHEMA_VERSION:
+            return None
         preprocessing = manifest.get("preprocessing", {})
         if (
             not isinstance(preprocessing, Mapping)
@@ -1471,60 +1486,118 @@ def score_tile_manifest(
                 class_names = tuple(class_names[: logits.shape[1]])
             for offset, item in enumerate(chunk):
                 result = results[item.index]
-                row_probs = probabilities[offset]
-                class_id = int(np.argmax(row_probs))
-                class_name = (
-                    class_names[class_id]
-                    if class_id < len(class_names)
-                    else f"class_{class_id}"
+                sat_wf = item.satellite_metrics.get("water_fraction")
+                terr_wf = item.terrain_metrics.get("terrain_sea_level_fraction")
+                effective_wf, water_status, unusable_reason = evaluate_water_status(
+                    sat_wf, terr_wf
                 )
-                try:
-                    from src.classifier.model import get_scenic_weight
+                if is_excessive_water(effective_wf):
+                    result.update(
+                        {
+                            "water_fraction": sat_wf,
+                            "terrain_sea_level_fraction": terr_wf,
+                            "effective_water_fraction": effective_wf,
+                            "water_filter_status": water_status,
+                            "unusable_reason": unusable_reason,
+                            "availability_state": "unusable",
+                            "score_status": "unusable",
+                            "selector_eligible": False,
+                            "error": None,
+                            "satellite_present": True,
+                            "terrain_present": True,
+                            "relief": item.terrain_metrics.get("relief"),
+                            "roughness": item.terrain_metrics.get("roughness"),
+                            "slope_mean": item.terrain_metrics.get("slope_mean"),
+                            "slope_variation": item.terrain_metrics.get(
+                                "slope_variation"
+                            ),
+                            "water_proximity": item.terrain_metrics.get(
+                                "water_proximity"
+                            ),
+                            "vegetation_density": item.terrain_metrics.get(
+                                "vegetation_density"
+                            ),
+                            "heuristic_score": None,
+                            "scenic_score": None,
+                            "scenic_score_heuristic": None,
+                            "heuristic_class_component": None,
+                            "heuristic_relief_component": None,
+                            "heuristic_roughness_component": None,
+                            "heuristic_slope_component": None,
+                            "heuristic_water_component": None,
+                            "heuristic_vegetation_component": None,
+                            "heuristic_water_fraction_penalty": None,
+                            "regression_prediction": None,
+                            "model_prediction": None,
+                            "label_source": None,
+                            "class_id": None,
+                            "class_name": None,
+                            "class_probability": None,
+                            "class_count": None,
+                            "normalized_class_entropy": None,
+                            "class_uncertainty": None,
+                            "uncertainty": None,
+                        }
+                    )
+                else:
+                    row_probs = probabilities[offset]
+                    class_id = int(np.argmax(row_probs))
+                    class_name = (
+                        class_names[class_id]
+                        if class_id < len(class_names)
+                        else f"class_{class_id}"
+                    )
+                    try:
+                        from src.classifier.model import get_scenic_weight
 
-                    class_score = float(get_scenic_weight(class_name))
-                except Exception:
-                    class_score = 0.3
-                components, entropy = (
-                    _heuristic_components(
-                        class_score, item.terrain_metrics, item.satellite_metrics
-                    ),
-                    normalized_class_entropy(row_probs),
-                )
-                result.update(
-                    {
-                        **components,
-                        **item.terrain_metrics,
-                        "water_fraction": item.satellite_metrics["water_fraction"],
-                        "regression_prediction": float(predictions[offset]),
-                        "model_prediction": float(predictions[offset]),
-                        "label_source": "active_regression_prediction",
-                        "classifier_checkpoint_sha256": classifier_hash,
-                        "regression_checkpoint_sha256": regression_hash,
-                        "class_id": class_id,
-                        "class_name": class_name,
-                        "class_probability": float(row_probs[class_id]),
-                        "class_count": int(len(row_probs)),
-                        "normalized_class_entropy": entropy,
-                        "class_uncertainty": entropy,
-                        "uncertainty": entropy,
-                        "satellite_present": True,
-                        "terrain_present": True,
-                        "availability_state": "available",
-                        "score_status": "scored",
-                        "selector_eligible": True,
-                        "error": None,
-                    }
-                )
-                vector_by_index[item.index] = embeddings[offset].astype(
-                    np.float32, copy=True
-                )
-                logits_by_index[item.index] = logits[offset].astype(
-                    np.float32, copy=True
-                )
-                probs_by_index[item.index] = row_probs.astype(np.float32, copy=True)
-                terrain_by_index[item.index] = item.terrain_features.astype(
-                    np.float32, copy=True
-                )
+                        class_score = float(get_scenic_weight(class_name))
+                    except Exception:
+                        class_score = 0.3
+                    components, entropy = (
+                        _heuristic_components(
+                            class_score, item.terrain_metrics, item.satellite_metrics
+                        ),
+                        normalized_class_entropy(row_probs),
+                    )
+                    result.update(
+                        {
+                            **components,
+                            **item.terrain_metrics,
+                            "water_fraction": sat_wf,
+                            "terrain_sea_level_fraction": terr_wf,
+                            "effective_water_fraction": effective_wf,
+                            "water_filter_status": water_status,
+                            "unusable_reason": None,
+                            "regression_prediction": float(predictions[offset]),
+                            "model_prediction": float(predictions[offset]),
+                            "label_source": "active_regression_prediction",
+                            "classifier_checkpoint_sha256": classifier_hash,
+                            "regression_checkpoint_sha256": regression_hash,
+                            "class_id": class_id,
+                            "class_name": class_name,
+                            "class_probability": float(row_probs[class_id]),
+                            "class_count": int(len(row_probs)),
+                            "normalized_class_entropy": entropy,
+                            "class_uncertainty": entropy,
+                            "uncertainty": entropy,
+                            "satellite_present": True,
+                            "terrain_present": True,
+                            "availability_state": "available",
+                            "score_status": "scored",
+                            "selector_eligible": True,
+                            "error": None,
+                        }
+                    )
+                    vector_by_index[item.index] = embeddings[offset].astype(
+                        np.float32, copy=True
+                    )
+                    logits_by_index[item.index] = logits[offset].astype(
+                        np.float32, copy=True
+                    )
+                    probs_by_index[item.index] = row_probs.astype(np.float32, copy=True)
+                    terrain_by_index[item.index] = item.terrain_features.astype(
+                        np.float32, copy=True
+                    )
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             for item in chunk:
@@ -1534,6 +1607,12 @@ def score_tile_manifest(
         if not inputs:
             return
         import torch
+        import torch.multiprocessing as mp
+
+        try:
+            mp.set_sharing_strategy("file_system")
+        except RuntimeError:
+            pass
 
         loader = torch.utils.data.DataLoader(
             _ScoringDataset(
@@ -1570,7 +1649,6 @@ def score_tile_manifest(
             score_pending(inputs)
         finally:
             inputs.clear()
-
 
     for index, (_, source_row) in enumerate(frame.iterrows()):
         row, result = source_row.to_dict(), results[index]
@@ -1622,29 +1700,77 @@ def score_tile_manifest(
                 else None
             )
             if cached_index is not None:
+                assert cached_row is not None and cache is not None
                 _copy_cached_fields(result, cached_row)
-                result.update(
-                    {
-                        "satellite_present": True,
-                        "terrain_present": True,
-                        "availability_state": "available",
-                        "score_status": "scored",
-                        "selector_eligible": True,
-                        "cache_hit": True,
-                    }
-                )
-                cache_hits += 1
-                vector_by_index[index] = np.asarray(
-                    cache.arrays["embeddings"][cached_index], dtype=np.float32
-                ).copy()
-                for name, target in (
-                    ("class_logits", logits_by_index),
-                    ("class_probs", probs_by_index),
-                    ("terrain_features", terrain_by_index),
+                sat_wf = result.get("water_fraction")
+                terr_wf = result.get("terrain_sea_level_fraction")
+                effective_wf, water_status, _ = evaluate_water_status(sat_wf, terr_wf)
+                if (
+                    is_excessive_water(effective_wf)
+                    or _clean_text(cached_row.get("unusable_reason"))
+                    == UNUSABLE_REASON_EXCESSIVE_WATER
                 ):
-                    target[index] = np.asarray(
-                        cache.arrays[name][cached_index], dtype=np.float32
+                    result.update(
+                        {
+                            "satellite_present": True,
+                            "terrain_present": True,
+                            "terrain_sea_level_fraction": terr_wf,
+                            "effective_water_fraction": effective_wf,
+                            "water_filter_status": water_status,
+                            "unusable_reason": UNUSABLE_REASON_EXCESSIVE_WATER,
+                            "availability_state": "unusable",
+                            "score_status": "unusable",
+                            "selector_eligible": False,
+                            "cache_hit": True,
+                            "heuristic_score": None,
+                            "scenic_score": None,
+                            "scenic_score_heuristic": None,
+                            "heuristic_class_component": None,
+                            "heuristic_relief_component": None,
+                            "heuristic_roughness_component": None,
+                            "heuristic_slope_component": None,
+                            "heuristic_water_component": None,
+                            "heuristic_vegetation_component": None,
+                            "heuristic_water_fraction_penalty": None,
+                            "regression_prediction": None,
+                            "model_prediction": None,
+                            "label_source": None,
+                            "class_id": None,
+                            "class_name": None,
+                            "class_probability": None,
+                            "class_count": None,
+                            "normalized_class_entropy": None,
+                            "class_uncertainty": None,
+                            "uncertainty": None,
+                        }
+                    )
+                else:
+                    result.update(
+                        {
+                            "satellite_present": True,
+                            "terrain_present": True,
+                            "terrain_sea_level_fraction": terr_wf,
+                            "effective_water_fraction": effective_wf,
+                            "water_filter_status": water_status,
+                            "unusable_reason": None,
+                            "availability_state": "available",
+                            "score_status": "scored",
+                            "selector_eligible": True,
+                            "cache_hit": True,
+                        }
+                    )
+                    vector_by_index[index] = np.asarray(
+                        cache.arrays["embeddings"][cached_index], dtype=np.float32
                     ).copy()
+                    for name, target in (
+                        ("class_logits", logits_by_index),
+                        ("class_probs", probs_by_index),
+                        ("terrain_features", terrain_by_index),
+                    ):
+                        target[index] = np.asarray(
+                            cache.arrays[name][cached_index], dtype=np.float32
+                        ).copy()
+                cache_hits += 1
                 continue
             pending_inputs.append(
                 _ScoringInput(index=index, satellite=satellite, terrain=terrain)
@@ -1769,6 +1895,7 @@ def score_tile_manifest(
     scored_count = len(scored_indices)
     missing_count = sum(result.get("score_status") == "missing" for result in results)
     error_count = sum(result.get("score_status") == "error" for result in results)
+    unusable_count = sum(result.get("score_status") == "unusable" for result in results)
     payload: dict[str, Any] = {
         "schema_version": SCORING_SCHEMA_VERSION,
         "source": {
@@ -1803,9 +1930,7 @@ def score_tile_manifest(
                 if "prefetch_factor" in loader_options
                 else None
             ),
-            "persistent_workers": bool(
-                loader_options.get("persistent_workers", False)
-            ),
+            "persistent_workers": bool(loader_options.get("persistent_workers", False)),
         },
         "uncertainty": {
             "name": UNCERTAINTY_NAME,
@@ -1835,6 +1960,7 @@ def score_tile_manifest(
             "selector_eligible_rows": int(candidate_frame["selector_eligible"].sum()),
             "missing_rows": int(missing_count),
             "error_rows": int(error_count),
+            "unusable_rows": int(unusable_count),
             "cache_hits": int(cache_hits),
             "cache_misses": int(max(0, len(frame) - cache_hits)),
         },
@@ -1853,7 +1979,10 @@ def score_tile_manifest(
             },
         },
         "state": {
-            "complete": bool(scored_count + missing_count + error_count == len(frame)),
+            "complete": bool(
+                scored_count + missing_count + error_count + unusable_count
+                == len(frame)
+            ),
             "ready_for_selection": bool(scored_count > 0),
             "readiness": "ready_for_selection"
             if scored_count > 0
@@ -1921,9 +2050,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--device", default="auto", choices=("auto", "cpu", "cuda", "mps")
     )
-    parser.add_argument(
-        "--batch-size", type=int, default=DEFAULT_SCORING_BATCH_SIZE
-    )
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_SCORING_BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_SCORING_NUM_WORKERS)
     parser.add_argument("--lsh-seed", type=int, default=0)
     parser.add_argument("--lsh-bits", type=int, default=16)

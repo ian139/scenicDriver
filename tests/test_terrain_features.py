@@ -6,6 +6,7 @@ from PIL import Image
 from src.terrain.features import (
     TerrainFeatures,
     compute_terrain_features,
+    compute_terrain_sea_level_fraction,
     decode_terrain_rgb,
     repair_terrain_zero_seam,
 )
@@ -27,8 +28,12 @@ def test_decode_terrain_rgb_uses_mapbox_channel_order_and_formula():
     rgb = np.array([[[1, 2, 3], [10, 20, 30]]], dtype=np.uint8)
 
     expected = np.array(
-        [[-10000.0 + (1 * 256 * 256 + 2 * 256 + 3) * 0.1,
-          -10000.0 + (10 * 256 * 256 + 20 * 256 + 30) * 0.1]],
+        [
+            [
+                -10000.0 + (1 * 256 * 256 + 2 * 256 + 3) * 0.1,
+                -10000.0 + (10 * 256 * 256 + 20 * 256 + 30) * 0.1,
+            ]
+        ],
         dtype=np.float32,
     )
 
@@ -51,11 +56,15 @@ def test_compute_dispatch_is_identical_for_ndarray_pil_and_path(tmp_path: Path):
     Image.fromarray(satellite).save(satellite_path)
 
     array_result = compute_terrain_features(rgb, satellite)
-    pil_result = compute_terrain_features(Image.open(terrain_path), Image.open(satellite_path))
+    pil_result = compute_terrain_features(
+        Image.open(terrain_path), Image.open(satellite_path)
+    )
     path_result = compute_terrain_features(terrain_path, satellite_path)
 
     for result in (pil_result, path_result):
-        np.testing.assert_allclose(result.features.to_array(), array_result.features.to_array())
+        np.testing.assert_allclose(
+            result.features.to_array(), array_result.features.to_array()
+        )
         np.testing.assert_allclose(
             [result.relief, result.roughness, result.slope_mean],
             [array_result.relief, array_result.roughness, array_result.slope_mean],
@@ -81,9 +90,7 @@ def test_satellite_vegetation_uses_green_channel_and_optional_default():
         ],
         dtype=np.uint8,
     )
-    expected_density = np.mean(
-        [20 / 100, 40 / 100, 25 / 100, 10 / 100]
-    )
+    expected_density = np.mean([20 / 100, 40 / 100, 25 / 100, 10 / 100])
 
     result = compute_terrain_features(terrain, satellite)
     default_result = compute_terrain_features(terrain)
@@ -117,3 +124,27 @@ def test_terrain_features_to_array_preserves_boolean_water_contract():
     features = TerrainFeatures(0.25, 80.0, 0.5, 0.75, True, False, True)
 
     np.testing.assert_allclose(features.to_array(), [0.25, 0.08, 0.5, 0.75, 1.0, 1.0])
+
+
+def test_compute_terrain_sea_level_fraction_zero_and_high_elevation():
+    # Mapbox Terrain-RGB: elevation 0.0 corresponds to R=1, G=134, B=160
+    sea_level_rgb = np.full((10, 10, 3), [1, 134, 160], dtype=np.uint8)
+    assert compute_terrain_sea_level_fraction(sea_level_rgb) == 1.0
+
+    # High land elevation
+    land_rgb = np.full((10, 10, 3), [1, 138, 112], dtype=np.uint8)
+    assert compute_terrain_sea_level_fraction(land_rgb) == 0.0
+
+
+def test_compute_terrain_sea_level_fraction_border_seam_resistance():
+    # Land elevation with 1-pixel zero-elevation border seam
+    land_rgb = np.full((100, 100, 3), [1, 138, 112], dtype=np.uint8)
+    land_rgb[:, 0] = [1, 134, 160]
+    assert compute_terrain_sea_level_fraction(land_rgb) == 0.0
+
+
+def test_compute_terrain_sea_level_fraction_mixed_tile():
+    # Half sea level, half land
+    mixed_rgb = np.full((10, 10, 3), [1, 138, 112], dtype=np.uint8)
+    mixed_rgb[:5, :] = [1, 134, 160]
+    assert compute_terrain_sea_level_fraction(mixed_rgb) == 0.5

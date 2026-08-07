@@ -36,6 +36,16 @@ from src.data_pipeline.tile_inventory import (  # noqa: E402
     scan_tile_inventory,
 )
 from src.active_learning.common import validate_run_name  # noqa: E402
+from src.active_learning.water import (  # noqa: E402
+    MAX_SELECTABLE_WATER_FRACTION,
+    compute_satellite_water_fraction,
+    evaluate_water_status,
+    WATER_FILTER_STATUS_EXCESSIVE,
+)
+from src.terrain.features import compute_terrain_sea_level_fraction  # noqa: E402
+
+
+PLANNING_SCHEMA_VERSION = 3
 
 
 COLUMNS = [
@@ -54,6 +64,11 @@ COLUMNS = [
     "terrain_s3_present",
     "satellite_s3_uri",
     "terrain_s3_uri",
+    "satellite_water_fraction",
+    "terrain_sea_level_fraction",
+    "effective_water_fraction",
+    "water_filter_status",
+    "unusable_reason",
 ]
 
 
@@ -229,6 +244,10 @@ def _manifest_rows(
                 "terrain_s3_present": False,
                 "satellite_s3_uri": "",
                 "terrain_s3_uri": "",
+                "terrain_sea_level_fraction": "",
+                "effective_water_fraction": "",
+                "water_filter_status": "unknown",
+                "unusable_reason": "",
             }
         )
     return rows
@@ -330,6 +349,58 @@ def _inventory(
     return inventoried, counts
 
 
+def _assess_water_inventory(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    assessed = 0
+    excessive = 0
+    unknown = 0
+    for row in rows:
+        satellite_path_text = row.get("satellite_path")
+        satellite_path = Path(satellite_path_text) if satellite_path_text else None
+        satellite_fraction = None
+        if row.get("satellite_present") and satellite_path and satellite_path.is_file():
+            with Image.open(satellite_path) as satellite_image:
+                satellite_fraction = compute_satellite_water_fraction(satellite_image)
+
+        terrain_path_text = row.get("terrain_path")
+        terrain_path = Path(terrain_path_text) if terrain_path_text else None
+        terrain_fraction = None
+        if row.get("terrain_present") and terrain_path and terrain_path.is_file():
+            terrain_fraction = compute_terrain_sea_level_fraction(terrain_path)
+
+        effective, status, reason = evaluate_water_status(
+            satellite_fraction,
+            terrain_fraction,
+        )
+        row["satellite_water_fraction"] = (
+            round(float(satellite_fraction), 6)
+            if satellite_fraction is not None
+            else ""
+        )
+        row["terrain_sea_level_fraction"] = (
+            round(float(terrain_fraction), 6) if terrain_fraction is not None else ""
+        )
+        row["effective_water_fraction"] = (
+            round(float(effective), 6) if effective is not None else ""
+        )
+        row["water_filter_status"] = status
+        row["unusable_reason"] = reason or ""
+
+        if effective is None:
+            unknown += 1
+        else:
+            assessed += 1
+            if status == WATER_FILTER_STATUS_EXCESSIVE:
+                excessive += 1
+
+    return {
+        "assessed": assessed,
+        "excessive": excessive,
+        "eligible": assessed - excessive,
+        "unknown": unknown,
+        "threshold": MAX_SELECTABLE_WATER_FRACTION,
+    }
+
+
 def plan_run(
     *,
     run_name: str,
@@ -377,8 +448,9 @@ def plan_run(
         s3_bucket=s3_bucket,
         s3_prefix_root=s3_prefix_root,
     )
+    water_counts = _assess_water_inventory(rows)
     preflight = {
-        "schema_version": 1,
+        "schema_version": PLANNING_SCHEMA_VERSION,
         "run_name": run_name,
         "geometry_digest": planned["geometry_digest"],
         "budget_valid": planned["unique_coordinates_count"] <= budget,
@@ -410,6 +482,11 @@ def plan_run(
         "region_spec_sha256": spec_digest,
         "app_regions_sha256": config_digest,
         "state": "planned",
+        "water_assessed": water_counts["assessed"],
+        "water_excessive": water_counts["excessive"],
+        "water_unknown": water_counts["unknown"],
+        "water_threshold": MAX_SELECTABLE_WATER_FRACTION,
+        "water_filter": water_counts,
         "storage_estimate_assumption": "256 KiB average compressed PNG per raster",
     }
     _atomic_csv(run_dir / "tile_manifest.csv", rows)
@@ -439,6 +516,7 @@ def plan_run(
                 s3_bucket=s3_bucket,
                 s3_prefix_root=s3_prefix_root,
             )
+            water_counts = _assess_water_inventory(rows)
         preflight.update(
             {
                 "existing_satellite": counts["satellite_valid"],
@@ -467,6 +545,11 @@ def plan_run(
                 )
                 * 262_144,
                 "state": "acquired",
+                "water_assessed": water_counts["assessed"],
+                "water_excessive": water_counts["excessive"],
+                "water_unknown": water_counts["unknown"],
+                "water_threshold": MAX_SELECTABLE_WATER_FRACTION,
+                "water_filter": water_counts,
             }
         )
         _atomic_json(run_dir / "acquisition_preflight.json", preflight)
@@ -481,7 +564,7 @@ def plan_run(
     )
     report = build_inventory_report(rows, counts, failures)
     manifest = {
-        "schema_version": 1,
+        "schema_version": PLANNING_SCHEMA_VERSION,
         "run_name": run_name,
         "created_at_utc": created_at or datetime.now(timezone.utc).isoformat(),
         "repository_revision": _repository_revision(),
@@ -507,6 +590,11 @@ def plan_run(
         "unique_coordinates": planned["unique_coordinates_count"],
         "total_rasters": planned["total_rasters_count"],
         "inventory_counts": counts,
+        "water_assessed": water_counts["assessed"],
+        "water_excessive": water_counts["excessive"],
+        "water_unknown": water_counts["unknown"],
+        "water_threshold": MAX_SELECTABLE_WATER_FRACTION,
+        "water_filter": water_counts,
         "acquisition_requested": acquire,
         "failures": failures,
         "inputs": {

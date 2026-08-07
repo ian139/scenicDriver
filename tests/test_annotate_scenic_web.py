@@ -11,6 +11,7 @@ import pytest
 
 from scripts.annotation.annotate_scenic_web import (
     DEFAULT_COLUMNS,
+    ApiError,
     AnnotatorConfig,
     AnnotatorState,
     PathPolicy,
@@ -268,3 +269,163 @@ def test_remote_session_bootstrap_and_authenticated_access(tmp_path: Path) -> No
         server.shutdown()
         server.server_close()
         server_thread.join()
+
+
+def test_strict_annotations_csv_schema_validation(tmp_path: Path) -> None:
+    state = fixture_state(tmp_path)
+    annotations_file = tmp_path / "raw" / "labels_human.csv"
+    # Write CSV missing required column 'confidence'
+    annotations_file.write_text(
+        "image_path,scenic_human,skip,annotator_id,timestamp,notes\ntile.png,5,False,alice,2026-01-01T00:00:00Z,note\n"
+    )
+    with pytest.raises(ApiError) as exc_info:
+        state.load_batch({})
+    assert exc_info.value.code == "invalid_annotations_schema"
+
+    annotations_file.write_text(
+        "image_path,scenic_human,confidence,skip,annotator_id,timestamp,notes\ntile.png,5,high,False,alice,2026-01-01T00:00:00Z,note\n"
+    )
+    state.load_batch({})
+
+    # Write CSV with extra column
+    annotations_file.write_text(
+        "image_path,scenic_human,confidence,skip,annotator_id,timestamp,notes,extra\ntile.png,5,high,False,alice,2026-01-01T00:00:00Z,note,extra_val\n"
+    )
+    with pytest.raises(ApiError) as exc_info:
+        state.get_annotation("tile.png")
+    assert exc_info.value.code == "invalid_annotations_schema"
+
+    # Write valid 7-column header CSV
+    annotations_file.write_text(
+        "image_path,scenic_human,confidence,skip,annotator_id,timestamp,notes\ntile.png,5,high,False,alice,2026-01-01T00:00:00Z,note\n"
+    )
+    res = state.get_annotation("tile.png")
+    assert res["found"] is True
+    assert res["record"]["notes"] == "note"
+
+
+def test_explicit_unusable_reason_persistence_and_restoration(tmp_path: Path) -> None:
+    state = fixture_state(tmp_path)
+    state.load_batch({})
+
+    # 1. Save annotation with explicit unusable reason and user notes
+    saved = state.save_annotation(
+        {
+            "image_path": "tile.png",
+            "skip": True,
+            "unusable_reason": "missing_imagery",
+            "notes": "blurry photo",
+        }
+    )
+    assert saved["saved"] is True
+
+    # Check 7-column CSV record on disk
+    df = __import__("pandas").read_csv(tmp_path / "raw" / "labels_human.csv")
+    assert list(df.columns) == DEFAULT_COLUMNS
+    assert df.iloc[0]["notes"] == "[unusable: missing_imagery] blurry photo"
+
+    # Check progress state JSON
+    progress_file = tmp_path / "raw" / "labels_human.annotation_progress.json"
+    progress_data = json.loads(progress_file.read_text(encoding="utf-8"))
+    assert (
+        progress_data["batches"][state.batch_id]["alice"]["unusable"]["tile.png"]
+        == "missing_imagery"
+    )
+
+    # 2. Get annotation with progress file intact -> restores reason and user notes
+    res = state.get_annotation("tile.png")
+    assert res["unusable_reason"] == "missing_imagery"
+    assert res["record"]["notes"] == "blurry photo"
+
+    # 3. Simulate progress state loss by removing progress JSON file
+    progress_file.unlink()
+
+    # Restoration from formatted notes in 7-column CSV record
+    res_restored = state.get_annotation("tile.png")
+    assert res_restored["unusable_reason"] == "missing_imagery"
+    assert res_restored["record"]["notes"] == "blurry photo"
+
+    # 4. Save with unusable_reason and empty notes
+    state.save_annotation(
+        {
+            "image_path": "tile.png",
+            "skip": True,
+            "unusable_reason": "excessive_water",
+            "notes": "",
+        }
+    )
+    df2 = __import__("pandas").read_csv(tmp_path / "raw" / "labels_human.csv")
+    assert list(df2.columns) == DEFAULT_COLUMNS
+    assert df2.iloc[0]["notes"] == "[unusable: excessive_water]"
+
+    progress_file.unlink()
+    res_empty_notes = state.get_annotation("tile.png")
+    assert res_empty_notes["unusable_reason"] == "excessive_water"
+    assert res_empty_notes["record"]["notes"] == ""
+
+
+def test_conflicting_csv_and_sidecar_unusable_reason_precedence(tmp_path: Path) -> None:
+    import pandas as pd
+
+    state = fixture_state(tmp_path)
+    state.load_batch({})
+
+    # 1. Save annotation initially with excessive_water in progress sidecar
+    state.save_annotation(
+        {
+            "image_path": "tile.png",
+            "skip": True,
+            "unusable_reason": "excessive_water",
+            "notes": "initial note",
+        }
+    )
+
+    csv_path = tmp_path / "raw" / "labels_human.csv"
+
+    # 2. Conflicting CSV notes reason vs sidecar reason: CSV reason must win
+    df = pd.read_csv(csv_path)
+    df.loc[df["image_path"] == "tile.png", "notes"] = (
+        "[unusable: missing_imagery] csv specific note"
+    )
+    df.to_csv(csv_path, index=False)
+
+    res_conflict = state.get_annotation("tile.png")
+    assert res_conflict["found"] is True
+    assert res_conflict["unusable_reason"] == "missing_imagery"
+    assert res_conflict["record"]["notes"] == "csv specific note"
+
+    # 3. Legacy record lacking encoded CSV reason: sidecar fallback must still work
+    df.loc[df["image_path"] == "tile.png", "notes"] = (
+        "legacy note without unusable prefix"
+    )
+    df.to_csv(csv_path, index=False)
+
+    res_legacy = state.get_annotation("tile.png")
+    assert res_legacy["found"] is True
+    assert res_legacy["unusable_reason"] == "excessive_water"
+    assert res_legacy["record"]["notes"] == "legacy note without unusable prefix"
+
+
+def test_ui_error_and_retry_markers() -> None:
+    html = Path("scripts/annotation/annotate_scenic_web.html").read_text()
+    assert "retryImage" in html
+    assert "Retry image" in html
+    assert "showImageError" in html
+    assert "clearImageError" in html
+    assert "onerror" in html
+    assert "image.onerror" in html or "onerror=()=>{}" in html
+    assert "Failed to load image" in html
+    assert "loadTileImage" in html
+    assert "dataset.navGen" in html
+    assert "dataset.imagePath" in html
+    assert "gen!==navGen" in html or "gen !== navGen" in html
+    assert "image_path!==path" in html or "image_path !== path" in html
+    assert "const loader=new Image()" in html
+    assert "requestId!==imageRequestId" in html
+    assert "tileImg.onload" not in html
+    assert "tileImg.onerror" not in html
+    assert "tileImg.removeAttribute('src')" in html
+    assert "tileImg.style.visibility='hidden'" in html
+    assert "tileImg.style.visibility='visible'" in html
+    assert html.count("<script>") == html.count("</script>") == 1
+    assert html.index("<script>") < html.index("</script>") < html.index("</body>")

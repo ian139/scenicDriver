@@ -21,13 +21,14 @@ from src.active_learning.scoring import (
     score_tile_manifest,
 )
 
+
 def _png(path: Path, color: tuple[int, int, int]) -> None:
     Image.new("RGB", (4, 4), color=color).save(path, format="PNG")
 
 
 def _manifest(root: Path) -> pd.DataFrame:
     rows = []
-    for index, color in enumerate(((40, 120, 70), (70, 90, 180), (160, 130, 80))):
+    for index, color in enumerate(((40, 120, 70), (120, 70, 90), (160, 130, 80))):
         satellite = root / f"sat-{index}.png"
         terrain = root / f"terrain-{index}.png"
         _png(satellite, color)
@@ -190,6 +191,7 @@ def test_resume_skips_unchanged_rows_and_preserves_error_state(tmp_path: Path) -
         "selector_eligible_rows": 2,
         "missing_rows": 1,
         "error_rows": 0,
+        "unusable_rows": 0,
         "cache_hits": 0,
         "cache_misses": 3,
     }
@@ -281,7 +283,7 @@ def test_scorer_flushes_pending_images_at_batch_size(tmp_path: Path) -> None:
     for index in range(5):
         sat = tmp_path / f"batch_sat_{index}.png"
         ter = tmp_path / f"batch_ter_{index}.png"
-        _png(sat, (50 + index * 10, 100, 150))
+        _png(sat, (50 + index * 10, 150, 80))
         _png(ter, (120, 120, 120))
         rows.append(
             {
@@ -358,7 +360,7 @@ def test_uncached_pending_payload_high_water_is_bounded(
     for index in range(total_rows):
         satellite = tmp_path / f"bounded_sat_{index}.png"
         terrain = tmp_path / f"bounded_ter_{index}.png"
-        _png(satellite, (50 + index, 100, 150))
+        _png(satellite, (50 + index, 150, 80))
         _png(terrain, (120, 120, 120))
         row_payload_bytes.append(satellite.stat().st_size + terrain.stat().st_size)
         rows.append(
@@ -513,3 +515,218 @@ def test_resolve_active_regression_checkpoint_sha256_read_only_validation(
     )
     with pytest.raises(ValueError, match="sha256 mismatch"):
         resolve_active_regression_checkpoint(registry_file)
+
+
+def test_water_scoring_classification_fresh_and_cache_hit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Row 0: satellite water 0.0 (green), terrain water 0.10 -> effective 0.10 (< 0.50) -> scored
+    # Row 1: satellite water 1.0 (blue), terrain water 0.10 -> effective 1.0 (>= 0.50) -> excessive_water
+    # Row 2: satellite water 0.0 (green), terrain water 0.60 -> effective 0.60 (>= 0.50) -> excessive_water
+    sat0, terr0 = tmp_path / "sat-0.png", tmp_path / "terrain-0.png"
+    sat1, terr1 = tmp_path / "sat-1.png", tmp_path / "terrain-1.png"
+    sat2, terr2 = tmp_path / "sat-2.png", tmp_path / "terrain-2.png"
+
+    _png(sat0, (40, 120, 70))  # water_fraction = 0.0
+    _png(terr0, (120, 120, 120))
+
+    _png(sat1, (70, 90, 180))  # water_fraction = 1.0
+    _png(terr1, (120, 120, 120))
+
+    _png(sat2, (41, 120, 70))  # water_fraction = 0.0
+    _png(terr2, (120, 120, 120))
+
+    manifest = pd.DataFrame(
+        [
+            {
+                "image_path": "images/satellite/z14/fixture/100_200.png",
+                "region": "fixture",
+                "z": 14,
+                "x": 100,
+                "y": 200,
+                "lat": 40.0,
+                "lon": -70.0,
+                "satellite_path": sat0.name,
+                "terrain_path": terr0.name,
+                "satellite_present": True,
+                "terrain_present": True,
+            },
+            {
+                "image_path": "images/satellite/z14/fixture/101_200.png",
+                "region": "fixture",
+                "z": 14,
+                "x": 101,
+                "y": 200,
+                "lat": 40.1,
+                "lon": -70.0,
+                "satellite_path": sat1.name,
+                "terrain_path": terr1.name,
+                "satellite_present": True,
+                "terrain_present": True,
+            },
+            {
+                "image_path": "images/satellite/z14/fixture/102_200.png",
+                "region": "fixture",
+                "z": 14,
+                "x": 102,
+                "y": 200,
+                "lat": 40.2,
+                "lon": -70.0,
+                "satellite_path": sat2.name,
+                "terrain_path": terr2.name,
+                "satellite_present": True,
+                "terrain_present": True,
+            },
+        ]
+    )
+
+    counters = {"classifier": 0, "regression": 0}
+
+    def terrain_fn(_terrain: Image.Image, satellite: Image.Image) -> dict[str, object]:
+        # Custom terrain function providing a 0.60 sea-level proxy for item 2.
+        arr = np.asarray(satellite, dtype=np.float32)
+        is_sat2 = tuple(arr[0, 0, :3]) == (41.0, 120.0, 70.0)
+        return {
+            "features": np.ones((6,), dtype=np.float32),
+            "relief": 0.5,
+            "roughness": 0.5,
+            "slope_mean": 0.5,
+            "terrain_sea_level_fraction": 0.60 if is_sat2 else 0.10,
+        }
+
+    dependencies = _dependencies(counters)
+    dependencies.terrain_feature_fn = terrain_fn
+
+    # Fresh scoring
+    fresh_root = tmp_path / "run_fresh"
+    fresh_result = score_tile_manifest(
+        manifest,
+        run_root=fresh_root,
+        dependencies=dependencies,
+    )
+    assert fresh_result["state"]["complete"] is True
+    assert fresh_result["counts"]["unusable_rows"] == 1
+
+    pool_fresh = pd.read_csv(fresh_root / "candidate_pool.csv")
+    assert len(pool_fresh) == 3
+
+    # Row 0: Shoreline / low water (< 0.50) -> scored
+    assert pool_fresh.loc[0, "score_status"] == "scored"
+    assert pool_fresh.loc[0, "availability_state"] == "available"
+    assert bool(pool_fresh.loc[0, "selector_eligible"])
+    assert pool_fresh.loc[0, "water_filter_status"] == "pass"
+    assert (
+        pd.isna(pool_fresh.loc[0, "unusable_reason"])
+        or pool_fresh.loc[0, "unusable_reason"] == ""
+    )
+    assert pd.notna(pool_fresh.loc[0, "regression_prediction"])
+
+    # Row 1: High satellite water (1.0 >= 0.50) -> unusable
+    assert pool_fresh.loc[1, "score_status"] == "unusable"
+    assert pool_fresh.loc[1, "availability_state"] == "unusable"
+    assert not bool(pool_fresh.loc[1, "selector_eligible"])
+    assert pool_fresh.loc[1, "water_filter_status"] == "excessive_water"
+    assert pool_fresh.loc[1, "unusable_reason"] == "excessive_water"
+    assert pd.isna(pool_fresh.loc[1, "regression_prediction"])
+    assert pd.isna(pool_fresh.loc[1, "heuristic_score"])
+    assert pd.isna(pool_fresh.loc[1, "normalized_class_entropy"])
+    # Evidence retained
+    assert pool_fresh.loc[1, "water_fraction"] == 1.0
+
+    # Row 2: Terrain-RGB is a sea-level proxy, but satellite imagery is
+    # authoritative when present, preventing flat sea-level land false positives.
+    assert pool_fresh.loc[2, "score_status"] == "scored"
+    assert pool_fresh.loc[2, "availability_state"] == "available"
+    assert bool(pool_fresh.loc[2, "selector_eligible"])
+    assert pool_fresh.loc[2, "water_filter_status"] == "pass"
+    assert pool_fresh.loc[2, "terrain_sea_level_fraction"] == 0.60
+    assert pool_fresh.loc[2, "effective_water_fraction"] == 0.0
+
+    # Feature embeddings exclude only the satellite-confirmed water row.
+    npz_fresh = np.load(fresh_root / "feature_embeddings.npz")
+    assert npz_fresh["embeddings"].shape[0] == 2
+    assert list(npz_fresh["row_indices"]) == [0, 2]
+
+    # Simulate a pre-filter cache containing embeddings for every row, then
+    # prove resumed scoring reclassifies cached water rows fail-closed.
+    import src.active_learning.scoring as scoring_module
+
+    original_evaluate = scoring_module.evaluate_water_status
+    original_is_excessive = scoring_module.is_excessive_water
+    legacy_root = tmp_path / "run_cached"
+    monkeypatch.setattr(
+        scoring_module,
+        "evaluate_water_status",
+        lambda sat, terrain: (
+            max(float(sat or 0.0), float(terrain or 0.0)),
+            "pass",
+            None,
+        ),
+    )
+    monkeypatch.setattr(scoring_module, "is_excessive_water", lambda _value: False)
+    score_tile_manifest(manifest, run_root=legacy_root, dependencies=dependencies)
+    monkeypatch.setattr(scoring_module, "evaluate_water_status", original_evaluate)
+    monkeypatch.setattr(scoring_module, "is_excessive_water", original_is_excessive)
+    res_cache = score_tile_manifest(
+        manifest,
+        run_root=legacy_root,
+        dependencies=dependencies,
+    )
+    assert res_cache["counts"]["cache_hits"] == 3
+    pool_cache = pd.read_csv(legacy_root / "candidate_pool.csv")
+    assert pool_cache.loc[0, "score_status"] == "scored"
+    assert pool_cache.loc[1, "score_status"] == "unusable"
+    assert pool_cache.loc[1, "unusable_reason"] == "excessive_water"
+    assert pool_cache.loc[2, "score_status"] == "scored"
+
+    scoring_manifest_path = legacy_root / "scoring_manifest.json"
+    stale_manifest = json.loads(scoring_manifest_path.read_text(encoding="utf-8"))
+    stale_manifest["schema_version"] = 1
+    scoring_manifest_path.write_text(json.dumps(stale_manifest), encoding="utf-8")
+    stale_result = score_tile_manifest(
+        manifest,
+        run_root=legacy_root,
+        dependencies=dependencies,
+    )
+    assert stale_result["counts"]["cache_hits"] == 0
+
+
+def test_all_water_manifest_scoring(tmp_path: Path) -> None:
+    sat0, terr0 = tmp_path / "sat-0.png", tmp_path / "terrain-0.png"
+    _png(sat0, (70, 90, 180))  # 100% water
+    _png(terr0, (120, 120, 120))
+
+    manifest = pd.DataFrame(
+        [
+            {
+                "image_path": "images/satellite/z14/fixture/100_200.png",
+                "region": "fixture",
+                "z": 14,
+                "x": 100,
+                "y": 200,
+                "lat": 40.0,
+                "lon": -70.0,
+                "satellite_path": sat0.name,
+                "terrain_path": terr0.name,
+                "satellite_present": True,
+                "terrain_present": True,
+            }
+        ]
+    )
+    counters = {"classifier": 0, "regression": 0}
+    dependencies = _dependencies(counters)
+    all_water_root = tmp_path / "run_all_water"
+    score_tile_manifest(
+        manifest,
+        run_root=all_water_root,
+        dependencies=dependencies,
+    )
+    pool = pd.read_csv(all_water_root / "candidate_pool.csv")
+    assert len(pool) == 1
+    assert pool.loc[0, "score_status"] == "unusable"
+    assert pool.loc[0, "unusable_reason"] == "excessive_water"
+    assert not bool(pool.loc[0, "selector_eligible"])
+
+    npz = np.load(all_water_root / "feature_embeddings.npz")
+    assert npz["embeddings"].shape[0] == 0
+    assert len(npz["row_indices"]) == 0

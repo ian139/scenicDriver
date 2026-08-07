@@ -293,11 +293,45 @@ def _atomic_write(path: Path, data: bytes) -> None:
 def _read_annotations(path: Path) -> pd.DataFrame:
     if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame(columns=DEFAULT_COLUMNS)
-    frame = pd.read_csv(path)
-    for column in DEFAULT_COLUMNS:
-        if column not in frame.columns:
-            frame[column] = None
+    try:
+        frame = pd.read_csv(path)
+    except Exception as exc:
+        raise ApiError(
+            400,
+            "invalid_annotations_schema",
+            "The annotations CSV file is unreadable",
+        ) from exc
+    if list(frame.columns) != DEFAULT_COLUMNS:
+        raise ApiError(
+            400,
+            "invalid_annotations_schema",
+            f"annotations_csv must have the exact seven columns: {', '.join(DEFAULT_COLUMNS)}",
+        )
     return frame[DEFAULT_COLUMNS].copy()
+
+
+UNUSABLE_NOTE_PREFIX = re.compile(r"^\[unusable:\s*([a-z0-9_]+)\]\s*", re.IGNORECASE)
+
+
+def _format_notes(notes: str, unusable_reason: str | None) -> str:
+    clean_notes = UNUSABLE_NOTE_PREFIX.sub("", (notes or "").strip()).strip()
+    if unusable_reason and str(unusable_reason).strip() in UNUSABLE_REASONS:
+        reason_str = str(unusable_reason).strip()
+        if clean_notes:
+            return f"[unusable: {reason_str}] {clean_notes}"
+        return f"[unusable: {reason_str}]"
+    return clean_notes
+
+
+def _parse_notes(notes: str) -> tuple[str | None, str]:
+    raw = (notes or "").strip()
+    match = UNUSABLE_NOTE_PREFIX.match(raw)
+    if match:
+        reason = match.group(1).lower()
+        if reason in UNUSABLE_REASONS:
+            clean_notes = raw[match.end() :].strip()
+            return reason, clean_notes
+    return None, raw
 
 
 def _csv_bytes(frame: pd.DataFrame) -> bytes:
@@ -830,7 +864,10 @@ class AnnotatorState:
         auxiliary = (
             self._read_batch_progress(self.batch_id).get("unusable", {}).get(safe)
         )
-        return {"found": True, "record": record, "unusable_reason": auxiliary}
+        parsed_reason, user_notes = _parse_notes(str(record.get("notes") or ""))
+        unusable_reason = parsed_reason or auxiliary
+        record["notes"] = user_notes
+        return {"found": True, "record": record, "unusable_reason": unusable_reason}
 
     def save_annotation(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):
@@ -897,6 +934,11 @@ class AnnotatorState:
             raise ApiError(
                 400, "invalid_unusable_reason", "unusable_reason requires skip=true"
             )
+        formatted_notes = _format_notes(notes, str(reason) if reason else None)
+        if len(formatted_notes) > 4000:
+            raise ApiError(
+                400, "notes_too_long", "notes must not exceed 4000 characters"
+            )
         record = {
             "image_path": image_path,
             "scenic_human": score,
@@ -904,7 +946,7 @@ class AnnotatorState:
             "skip": skip,
             "annotator_id": config.annotator_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "notes": notes,
+            "notes": formatted_notes,
         }
         annotations_path = Path(config.annotations_csv)
         with _locked_path(annotations_path, self._lock):

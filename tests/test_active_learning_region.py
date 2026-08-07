@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -149,6 +150,11 @@ def test_inventory_reuses_valid_pair_and_manifest_contract(tmp_path: Path):
             "terrain_s3_present",
             "satellite_s3_uri",
             "terrain_s3_uri",
+            "satellite_water_fraction",
+            "terrain_sea_level_fraction",
+            "effective_water_fraction",
+            "water_filter_status",
+            "unusable_reason",
         ]
 
 
@@ -339,3 +345,77 @@ def test_s3_only_readiness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert counts["reusable_pairs"] == 1
     assert counts["satellite_s3_objects"] == 1
     assert counts["terrain_s3_objects"] == 1
+
+
+def test_plan_run_water_assessment_and_counts(tmp_path: Path) -> None:
+    image_root = tmp_path / "images"
+    coords = enumerate_bbox_tiles(42.49, -73.52, 42.50, -73.47, zoom=14)
+    assert len(coords) >= 2
+    (x1, y1), (x2, y2) = coords[0], coords[1]
+
+    ter_dir = image_root / "terrain" / "z14" / "new_england_north"
+    sat_dir = image_root / "satellite" / "z14" / "new_england_north"
+    ter_dir.mkdir(parents=True)
+    sat_dir.mkdir(parents=True)
+
+    # Tile 1: Land tile (0% water)
+    Image.new("RGB", (256, 256), (1, 138, 112)).save(ter_dir / f"{x1}_{y1}.png")
+    Image.new("RGB", (256, 256), (50, 150, 80)).save(sat_dir / f"{x1}_{y1}.png")
+
+    # Tile 2: Ocean tile in both satellite imagery and Terrain-RGB.
+    Image.new("RGB", (256, 256), (1, 134, 160)).save(ter_dir / f"{x2}_{y2}.png")
+    Image.new("RGB", (256, 256), (70, 90, 180)).save(sat_dir / f"{x2}_{y2}.png")
+
+    spec = {
+        "version": 1,
+        "regions": [
+            {
+                "name": "new_england_north",
+                "type": "bbox",
+                "bbox": {
+                    "min_lat": 42.488301979602255,
+                    "min_lon": -73.5205078125,
+                    "max_lat": 47.50235895196859,
+                    "max_lon": -66.796875,
+                },
+            }
+        ],
+    }
+
+    result = plan_run(
+        run_name="water_test",
+        spec=spec,
+        output_root=tmp_path / "runs",
+        image_root=image_root,
+    )
+
+    manifest = result["region_manifest"]
+    assert manifest["water_threshold"] == 0.50
+    assert manifest["water_assessed"] >= 2
+    assert manifest["water_excessive"] >= 1
+    assert "water_filter" in manifest
+
+    preflight_path = tmp_path / "runs" / "water_test" / "acquisition_preflight.json"
+    with open(preflight_path, encoding="utf-8") as stream:
+        preflight = json.load(stream)
+    assert preflight["water_threshold"] == 0.50
+    assert preflight["water_excessive"] >= 1
+
+    with open(
+        tmp_path / "runs" / "water_test" / "tile_manifest.csv",
+        newline="",
+        encoding="utf-8",
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+
+    tile1_row = next(r for r in rows if int(r["x"]) == x1 and int(r["y"]) == y1)
+    tile2_row = next(r for r in rows if int(r["x"]) == x2 and int(r["y"]) == y2)
+
+    assert tile1_row["water_filter_status"] == "pass"
+    assert tile1_row["unusable_reason"] == ""
+    assert float(tile1_row["terrain_sea_level_fraction"]) == 0.0
+
+    assert tile2_row["water_filter_status"] == "excessive_water"
+    assert tile2_row["unusable_reason"] == "excessive_water"
+    assert float(tile2_row["terrain_sea_level_fraction"]) == 1.0
+    assert float(tile2_row["satellite_water_fraction"]) == 1.0

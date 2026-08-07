@@ -83,6 +83,27 @@
         },
         "zoom": 11.2
       }
+    },
+    {
+      "region": "new_england_expanded",
+      "display_name": "New England Expanded (740k Baseline)",
+      "description": "Baseline candidate predictions across the full 370k tile pair (740k raster) expanded region.",
+      "run_name": "run_v1_expanded_20260805",
+      "graph": "data/processed/road_graphs/new_england_north_wide/road_graph.json",
+      "tile_scores_path": "data/processed/heuristic_runs/run_v1_expanded_20260805/report/report.json",
+      "bbox": {
+        "min_lat": 41.0,
+        "min_lon": -73.5,
+        "max_lat": 47.5,
+        "max_lon": -66.8
+      },
+      "map": {
+        "center": {
+          "lat": 44.0,
+          "lon": -70.5
+        },
+        "zoom": 6.5
+      }
     }
   ]
 }

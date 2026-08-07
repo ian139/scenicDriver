@@ -137,12 +137,11 @@ class MapboxTileSource:
 
     BASE_URL = "https://api.mapbox.com/v4"
 
-    # Default rate limit: 100 requests per second is generous for Mapbox
-    DEFAULT_RATE_LIMIT = 10  # requests per second (conservative)
+    # Default rate limit: Mapbox supports 50+ requests per second for standard tile endpoints
+    DEFAULT_RATE_LIMIT = 50  # requests per second
     DEFAULT_TIMEOUT = 30  # seconds
     MAX_RETRIES = 3
     RETRY_BACKOFF = 0.5  # exponential backoff multiplier
-
     def __init__(
         self,
         cache_dir: Path,

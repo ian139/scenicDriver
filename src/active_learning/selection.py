@@ -30,6 +30,11 @@ from .common import (
     sha256_file,
     validate_run_name,
 )
+from .water import (
+    MAX_SELECTABLE_WATER_FRACTION,
+    UNUSABLE_REASON_EXCESSIVE_WATER,
+    WATER_FILTER_STATUS_EXCESSIVE,
+)
 
 SCHEMA_VERSION = 1
 
@@ -479,6 +484,31 @@ def _prepare_for_selection(
     prior_annotations: Any = None,
 ) -> pd.DataFrame:
     out = _canonicalise(candidates, seed=seed)
+    if "unusable_reason" in out.columns:
+        out = out.loc[
+            out["unusable_reason"].map(_clean_text).str.lower()
+            != UNUSABLE_REASON_EXCESSIVE_WATER
+        ].reset_index(drop=True)
+    if "water_filter_status" in out.columns:
+        out = out.loc[
+            out["water_filter_status"].map(_clean_text).str.lower()
+            != WATER_FILTER_STATUS_EXCESSIVE
+        ].reset_index(drop=True)
+    if "availability_state" in out.columns:
+        out = out.loc[
+            out["availability_state"].map(_clean_text).str.lower() != "unusable"
+        ].reset_index(drop=True)
+    effective = pd.Series(np.nan, index=out.index, dtype=float)
+    if "effective_water_fraction" in out.columns:
+        effective = pd.to_numeric(out["effective_water_fraction"], errors="coerce")
+    satellite = pd.Series(np.nan, index=out.index, dtype=float)
+    for column in ("satellite_water_fraction", "water_fraction"):
+        if column in out.columns:
+            satellite = satellite.fillna(pd.to_numeric(out[column], errors="coerce"))
+    water_fraction = effective.fillna(satellite)
+    water_mask = water_fraction >= MAX_SELECTABLE_WATER_FRACTION
+    if water_mask.any():
+        out = out.loc[~water_mask].reset_index(drop=True)
     if "satellite_present" in out.columns:
         available = out["satellite_present"].map(_to_bool)
         if "terrain_present" in out.columns:
