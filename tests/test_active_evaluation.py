@@ -10,9 +10,14 @@ import pytest
 import torch
 
 from src.scenic_scorer.active_evaluation import (
+    compute_metrics,
+    evaluate_active_baseline,
     evaluate_stage_two,
     file_sha256,
+    load_model_checkpoint,
+    predict_dataset,
     promote_from_decision,
+    read_benchmark_csv,
     rollback_registry,
 )
 from src.scenic_scorer.regression import ScenicRegressionModel
@@ -1394,3 +1399,269 @@ def test_promote_from_decision_rejects_absent_or_malformed_metrics(
                 expected_registry_sha256=reg_hash,
                 run_name="run_1",
             )
+
+
+def test_evaluate_active_baseline_success(tmp_path: Path) -> None:
+    ckpt = create_legacy_checkpoint(tmp_path / "baseline.pt")
+    npz_path = create_npz_dataset(
+        tmp_path / "dataset.npz",
+        image_paths=["img1.jpg", "img2.jpg", "img3.jpg", "img4.jpg"],
+        splits=["test", "test", "test", "test"],
+    )
+
+    exp_csv = tmp_path / "expanded.csv"
+    with open(exp_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean", "region", "slice"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "image_path": "img1.jpg",
+                "split": "test",
+                "scenic_human_mean": "5.0",
+                "region": "us_west",
+                "slice": "mountain",
+            }
+        )
+        writer.writerow(
+            {
+                "image_path": "img2.jpg",
+                "split": "test",
+                "scenic_human_mean": "6.0",
+                "region": "us_east",
+                "slice": "coastal",
+            }
+        )
+
+    ctrl_csv = tmp_path / "control.csv"
+    with open(ctrl_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean", "region", "slice"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "image_path": "img3.jpg",
+                "split": "test",
+                "scenic_human_mean": "4.5",
+                "region": "us_central",
+                "slice": "plains",
+            }
+        )
+        writer.writerow(
+            {
+                "image_path": "img4.jpg",
+                "split": "test",
+                "scenic_human_mean": "7.2",
+                "region": "us_south",
+                "slice": "forest",
+            }
+        )
+
+    output_json = tmp_path / "baseline_summary.json"
+    summary = evaluate_active_baseline(
+        dataset_path=npz_path,
+        checkpoint_path=ckpt,
+        expanded_benchmark_csv=exp_csv,
+        control_benchmark_csv=ctrl_csv,
+        output_path=output_json,
+    )
+
+    assert output_json.exists()
+    assert summary["hashes"]["dataset_sha256"] == file_sha256(npz_path)
+    assert summary["hashes"]["checkpoint_sha256"] == file_sha256(ckpt)
+    assert summary["hashes"]["expanded_benchmark_sha256"] == file_sha256(exp_csv)
+    assert summary["hashes"]["control_benchmark_sha256"] == file_sha256(ctrl_csv)
+
+    assert summary["deterministic_inference"]["tolerance"] == 1e-7
+    assert summary["deterministic_inference"]["max_absolute_difference"] <= 1e-7
+
+    assert summary["sample_counts"]["dataset_total"] == 4
+    assert summary["sample_counts"]["dataset_test"] == 4
+    assert summary["sample_counts"]["expanded_benchmark_test"] == 2
+    assert summary["sample_counts"]["control_benchmark_test"] == 2
+
+    assert "expanded_human_benchmark" in summary["benchmarks"]
+    assert "control_benchmark" in summary["benchmarks"]
+    exp_m = summary["benchmarks"]["expanded_human_benchmark"]["metrics"]
+    assert exp_m["samples"] == 2
+    assert "mae" in exp_m
+    assert "rmse" in exp_m
+    assert "pearson_corr" in exp_m
+    assert "spearman_corr" in exp_m
+
+    assert "expanded_human_benchmark" in summary["calibration_distribution_summary"]
+    cal = summary["calibration_distribution_summary"]["expanded_human_benchmark"]
+    assert "calibration_error" in cal
+    assert "prediction_mean" in cal
+
+
+def test_evaluate_active_baseline_missing_identity(tmp_path: Path) -> None:
+    ckpt = create_legacy_checkpoint(tmp_path / "baseline.pt")
+    npz_path = create_npz_dataset(
+        tmp_path / "dataset.npz",
+        image_paths=["img1.jpg", "img2.jpg"],
+        splits=["test", "test"],
+    )
+
+    exp_csv = tmp_path / "expanded.csv"
+    with open(exp_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"image_path": "img1.jpg", "split": "test", "scenic_human_mean": "5.0"}
+        )
+        writer.writerow(
+            {"image_path": "img_missing.jpg", "split": "test", "scenic_human_mean": "6.0"}
+        )
+
+    ctrl_csv = tmp_path / "control.csv"
+    with open(ctrl_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"image_path": "img2.jpg", "split": "test", "scenic_human_mean": "4.5"}
+        )
+
+    with pytest.raises(ValueError, match="absent from the prepared dataset"):
+        evaluate_active_baseline(
+            dataset_path=npz_path,
+            checkpoint_path=ckpt,
+            expanded_benchmark_csv=exp_csv,
+            control_benchmark_csv=ctrl_csv,
+        )
+
+
+def test_evaluate_active_baseline_split_mismatch(tmp_path: Path) -> None:
+    ckpt = create_legacy_checkpoint(tmp_path / "baseline.pt")
+    npz_path = create_npz_dataset(
+        tmp_path / "dataset.npz",
+        image_paths=["img1.jpg", "img2.jpg"],
+        splits=["train", "test"],
+    )
+
+    exp_csv = tmp_path / "expanded.csv"
+    with open(exp_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"image_path": "img1.jpg", "split": "test", "scenic_human_mean": "5.0"}
+        )
+
+    ctrl_csv = tmp_path / "control.csv"
+    with open(ctrl_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"image_path": "img2.jpg", "split": "test", "scenic_human_mean": "4.5"}
+        )
+
+    with pytest.raises(ValueError, match="relabels non-test prepared identity"):
+        evaluate_active_baseline(
+            dataset_path=npz_path,
+            checkpoint_path=ckpt,
+            expanded_benchmark_csv=exp_csv,
+            control_benchmark_csv=ctrl_csv,
+        )
+
+
+def test_evaluate_active_baseline_nondeterminism_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ckpt = create_legacy_checkpoint(tmp_path / "baseline.pt")
+    npz_path = create_npz_dataset(
+        tmp_path / "dataset.npz",
+        image_paths=["img1.jpg", "img2.jpg"],
+        splits=["test", "test"],
+    )
+
+    exp_csv = tmp_path / "expanded.csv"
+    with open(exp_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"image_path": "img1.jpg", "split": "test", "scenic_human_mean": "5.0"}
+        )
+
+    ctrl_csv = tmp_path / "control.csv"
+    with open(ctrl_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"image_path": "img2.jpg", "split": "test", "scenic_human_mean": "4.5"}
+        )
+
+    import src.scenic_scorer.active_evaluation
+
+    original_predict = src.scenic_scorer.active_evaluation._predict_dataset
+    call_count = 0
+
+    def mock_predict(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        res = original_predict(*args, **kwargs)
+        if call_count == 2:
+            res = res + 1e-5
+        return res
+
+    monkeypatch.setattr(
+        src.scenic_scorer.active_evaluation, "_predict_dataset", mock_predict
+    )
+
+    with pytest.raises(ValueError, match="Deterministic CPU inference failure"):
+        evaluate_active_baseline(
+            dataset_path=npz_path,
+            checkpoint_path=ckpt,
+            expanded_benchmark_csv=exp_csv,
+            control_benchmark_csv=ctrl_csv,
+        )
+
+
+def test_evaluate_active_baseline_disjoint_benchmark_overlap(tmp_path: Path) -> None:
+    ckpt = create_legacy_checkpoint(tmp_path / "baseline.pt")
+    npz_path = create_npz_dataset(
+        tmp_path / "dataset.npz",
+        image_paths=["img1.jpg", "img2.jpg"],
+        splits=["test", "test"],
+    )
+
+    exp_csv = tmp_path / "expanded.csv"
+    with open(exp_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"image_path": "img1.jpg", "split": "test", "scenic_human_mean": "5.0"}
+        )
+
+    ctrl_csv = tmp_path / "control.csv"
+    with open(ctrl_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"image_path": "img1.jpg", "split": "test", "scenic_human_mean": "4.5"}
+        )
+
+    with pytest.raises(ValueError, match="Overlap detected between expanded and control"):
+        evaluate_active_baseline(
+            dataset_path=npz_path,
+            checkpoint_path=ckpt,
+            expanded_benchmark_csv=exp_csv,
+            control_benchmark_csv=ctrl_csv,
+        )

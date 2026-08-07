@@ -221,6 +221,337 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]
         "spearman_corr": spearman_corr,
     }
 
+load_model_checkpoint = _load_model_checkpoint
+read_benchmark_csv = _read_benchmark_csv
+predict_dataset = _predict_dataset
+compute_metrics = _compute_metrics
+
+
+def evaluate_active_baseline(
+    dataset_path: str | Path,
+    checkpoint_path: str | Path,
+    expanded_benchmark_csv: str | Path,
+    control_benchmark_csv: str | Path,
+    output_path: str | Path | None = None,
+    min_supported_slice_samples: int = 5,
+) -> dict[str, Any]:
+    """
+    Perform deterministic baseline-reproduction evaluation for the active checkpoint.
+
+    Evaluates active baseline checkpoint on split=test for expanded and control human benchmark CSVs.
+    Requires exact NPZ test split matching, disjoint benchmark sets, and deterministic CPU prediction.
+    """
+    ds_path = Path(dataset_path)
+    ckpt_path = Path(checkpoint_path)
+    exp_csv_path = Path(expanded_benchmark_csv)
+    ctrl_csv_path = Path(control_benchmark_csv)
+
+    for p, name in [
+        (ds_path, "Dataset NPZ"),
+        (ckpt_path, "Checkpoint"),
+        (exp_csv_path, "Expanded benchmark CSV"),
+        (ctrl_csv_path, "Control benchmark CSV"),
+    ]:
+        if not p.exists():
+            raise FileNotFoundError(f"{name} not found: {p}")
+
+    ds_sha256 = file_sha256(ds_path)
+    ckpt_sha256 = file_sha256(ckpt_path)
+    exp_sha256 = file_sha256(exp_csv_path)
+    ctrl_sha256 = file_sha256(ctrl_csv_path)
+
+    # 1. Load and validate NPZ dataset
+    data_npz = np.load(ds_path, allow_pickle=False)
+    required_npz_keys = {
+        "vit_embeddings",
+        "terrain_features",
+        "class_logits",
+        "scenic_scores",
+        "sample_weights",
+        "image_paths",
+        "label_sources",
+        "splits",
+    }
+    missing_npz = sorted(required_npz_keys - set(data_npz.files))
+    if missing_npz:
+        raise ValueError(
+            f"Dataset NPZ {ds_path} missing required fields: {missing_npz}"
+        )
+
+    vit = data_npz["vit_embeddings"]
+    terr = data_npz["terrain_features"]
+    cls_logits = data_npz["class_logits"]
+    npz_scores = data_npz["scenic_scores"]
+    sample_weights = data_npz["sample_weights"]
+    image_paths_raw = data_npz["image_paths"]
+    splits_raw = data_npz["splits"]
+
+    n_samples = len(vit)
+    if not (
+        len(terr) == n_samples
+        and len(cls_logits) == n_samples
+        and len(npz_scores) == n_samples
+        and len(sample_weights) == n_samples
+        and len(image_paths_raw) == n_samples
+        and len(splits_raw) == n_samples
+    ):
+        raise ValueError("NPZ arrays length mismatch across required fields")
+
+    if not (
+        np.isfinite(vit).all()
+        and np.isfinite(terr).all()
+        and np.isfinite(cls_logits).all()
+        and np.isfinite(npz_scores).all()
+        and np.isfinite(sample_weights).all()
+    ):
+        raise ValueError("NPZ contains non-finite values (NaN or Inf)")
+
+    if np.any(sample_weights <= 0):
+        raise ValueError("NPZ sample_weights must be strictly positive (> 0)")
+
+    image_paths = [
+        str(p.decode("utf-8") if isinstance(p, bytes) else p) for p in image_paths_raw
+    ]
+    prepared_splits = [
+        str(value.decode("utf-8") if isinstance(value, bytes) else value)
+        .strip()
+        .lower()
+        for value in splits_raw
+    ]
+    if any(value not in {"train", "val", "test"} for value in prepared_splits):
+        raise ValueError("NPZ splits contain invalid values")
+
+    if len(image_paths) != len(set(image_paths)):
+        raise ValueError("Duplicate image_paths found in NPZ dataset")
+
+    npz_path_map = {p: i for i, p in enumerate(image_paths)}
+    npz_split_map = dict(zip(image_paths, prepared_splits, strict=True))
+
+    dataset_total_samples = len(image_paths)
+    dataset_test_samples = sum(1 for s in prepared_splits if s == "test")
+
+    # 2. Load model and run double CPU inference for determinism check
+    model = _load_model_checkpoint(ckpt_path, device="cpu", is_candidate=False)
+
+    preds_run1 = _predict_dataset(model, vit, terr, cls_logits, device="cpu")
+    preds_run2 = _predict_dataset(model, vit, terr, cls_logits, device="cpu")
+
+    max_delta = float(np.max(np.abs(preds_run1 - preds_run2)))
+    tolerance = 1e-7
+    if max_delta > tolerance:
+        raise ValueError(
+            f"Deterministic CPU inference failure: max absolute difference {max_delta} exceeds tolerance {tolerance}"
+        )
+
+    pred_map = {p: float(pred) for p, pred in zip(image_paths, preds_run1)}
+
+    # 3. Benchmark processing helper
+    def process_benchmark(csv_path: Path, name: str) -> dict[str, Any]:
+        records = _read_benchmark_csv(csv_path)
+        if any("split" not in record for record in records):
+            raise ValueError(f"Benchmark {name} requires an explicit split column")
+        test_records = [
+            record
+            for record in records
+            if str(record["split"]).strip().lower() == "test"
+        ]
+        if not test_records:
+            raise ValueError(f"Benchmark {name} contains no split=test rows")
+
+        matched_records = []
+        missing_paths = []
+        for record in test_records:
+            score_val = record.get("scenic_human_mean")
+            if score_val is None or score_val == "":
+                score_val = record.get("scenic_human")
+            if score_val is None or score_val == "":
+                raise ValueError(
+                    f"Benchmark {name} test target must be scenic_human_mean "
+                    "or scenic_human, never weak/mixed scenic_score"
+                )
+            image_path = (
+                record.get("image_path")
+                or record.get("image_paths")
+                or record.get("path")
+                or record.get("image")
+            )
+            if not image_path:
+                raise ValueError(f"Benchmark {name} record lacks image_path")
+            image_path = str(image_path)
+            if image_path not in npz_path_map:
+                missing_paths.append(image_path)
+                continue
+            if npz_split_map[image_path] != "test":
+                raise ValueError(
+                    f"Benchmark {name} relabels non-test prepared identity: {image_path}"
+                )
+            try:
+                target = float(score_val)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Benchmark {name} target must be numeric") from exc
+            if not math.isfinite(target) or not 0 <= target <= 10:
+                raise ValueError(
+                    f"Benchmark {name} human targets must be finite and in [0, 10]"
+                )
+            matched_records.append(
+                {
+                    "image_path": image_path,
+                    "target": target,
+                    "region": record.get("region", "default"),
+                    "slice": record.get(
+                        "slice",
+                        record.get("terrain_type", record.get("region", "default")),
+                    ),
+                    "pred": pred_map[image_path],
+                }
+            )
+
+        if missing_paths:
+            raise ValueError(
+                f"Benchmark {name} has {len(missing_paths)} test paths absent "
+                "from the prepared dataset"
+            )
+        benchmark_paths = [record["image_path"] for record in matched_records]
+        if len(benchmark_paths) != len(set(benchmark_paths)):
+            raise ValueError(f"Benchmark {name} contains duplicate test image paths")
+        if len(matched_records) != len(test_records):
+            raise ValueError(f"Benchmark {name} test denominator mismatch")
+
+        y_true = np.array([mr["target"] for mr in matched_records], dtype=np.float32)
+        y_pred = np.array([mr["pred"] for mr in matched_records], dtype=np.float32)
+        if not np.isfinite(y_true).all():
+            raise ValueError(f"Benchmark {name} targets must be finite")
+
+        metrics = _compute_metrics(y_true, y_pred)
+
+        sliced_results = {}
+        region_results = {}
+        for group_name, group_key in (("slice", "slice"), ("region", "region")):
+            groups: dict[str, list[dict]] = {}
+            for rec in matched_records:
+                groups.setdefault(str(rec[group_key]), []).append(rec)
+            target_results = sliced_results if group_name == "slice" else region_results
+            for s_name, s_recs in groups.items():
+                if not s_recs:
+                    raise ValueError(f"Supported {group_name} collapse: {s_name}")
+                s_yt = np.array([r["target"] for r in s_recs], dtype=np.float32)
+                s_yp = np.array([r["pred"] for r in s_recs], dtype=np.float32)
+                s_m = _compute_metrics(s_yt, s_yp)
+                is_supported = len(s_recs) >= min_supported_slice_samples
+                target_results[s_name] = {
+                    "metrics": s_m,
+                    "samples": len(s_recs),
+                    "supported": is_supported,
+                }
+
+        return {
+            "records": matched_records,
+            "metrics": metrics,
+            "sliced_metrics": sliced_results,
+            "region_metrics": region_results,
+        }
+
+    # 4. Process expanded and control benchmarks & check disjoint identities
+    exp_res = process_benchmark(exp_csv_path, "expanded_human_benchmark")
+    ctrl_res = process_benchmark(ctrl_csv_path, "control_benchmark")
+
+    exp_test_paths = {r["image_path"] for r in exp_res["records"]}
+    ctrl_test_paths = {r["image_path"] for r in ctrl_res["records"]}
+    overlap = exp_test_paths & ctrl_test_paths
+    if overlap:
+        raise ValueError(
+            f"Overlap detected between expanded and control benchmark split=test image identities: {sorted(overlap)}"
+        )
+
+    # 5. Calibration and Prediction Distribution Summary
+    exp_yt = np.array([r["target"] for r in exp_res["records"]], dtype=np.float32)
+    exp_yp = np.array([r["pred"] for r in exp_res["records"]], dtype=np.float32)
+
+    score_bins = [(0.0, 2.0), (2.0, 4.0), (4.0, 6.0), (6.0, 8.0), (8.0, 10.0)]
+    bin_errors = []
+    for bin_min, bin_max in score_bins:
+        mask = (exp_yt >= bin_min) & (
+            exp_yt < bin_max if bin_max < 10.0 else exp_yt <= bin_max
+        )
+        if np.any(mask):
+            bin_mae = float(np.mean(np.abs(exp_yp[mask] - exp_yt[mask])))
+            bin_errors.append(bin_mae)
+
+    calibration_error = float(np.mean(bin_errors)) if bin_errors else 0.0
+    pred_std = float(np.std(exp_yp))
+    target_std = float(np.std(exp_yt))
+    spread_ratio = pred_std / target_std if target_std > 1e-8 else 0.0
+    mean_drift = float(abs(np.mean(exp_yp) - np.mean(exp_yt)))
+    sat_count = int(np.sum((exp_yp <= 0.0) | (exp_yp >= 10.0)))
+    sat_ratio = float(sat_count / len(exp_yp)) if len(exp_yp) > 0 else 0.0
+    unique_vals = len(np.unique(np.round(exp_yp, 4)))
+    unique_ratio = float(unique_vals / len(exp_yp)) if len(exp_yp) > 0 else 0.0
+
+    calibration_distribution = {
+        "expanded_human_benchmark": {
+            "calibration_error": calibration_error,
+            "binned_mae": bin_errors,
+            "prediction_mean": float(np.mean(exp_yp)),
+            "prediction_std": pred_std,
+            "prediction_min": float(np.min(exp_yp)),
+            "prediction_max": float(np.max(exp_yp)),
+            "target_mean": float(np.mean(exp_yt)),
+            "target_std": target_std,
+            "spread_ratio": spread_ratio,
+            "mean_drift_vs_target": mean_drift,
+            "saturation_ratio": sat_ratio,
+            "unique_ratio": unique_ratio,
+        }
+    }
+
+    # 6. Build final response dictionary
+    summary = {
+        "hashes": {
+            "dataset_sha256": ds_sha256,
+            "checkpoint_sha256": ckpt_sha256,
+            "expanded_benchmark_sha256": exp_sha256,
+            "control_benchmark_sha256": ctrl_sha256,
+        },
+        "deterministic_inference": {
+            "tolerance": tolerance,
+            "max_absolute_difference": max_delta,
+        },
+        "sample_counts": {
+            "dataset_total": dataset_total_samples,
+            "dataset_test": dataset_test_samples,
+            "expanded_benchmark_test": len(exp_res["records"]),
+            "control_benchmark_test": len(ctrl_res["records"]),
+        },
+        "benchmarks": {
+            "expanded_human_benchmark": {
+                "metrics": exp_res["metrics"],
+                "sliced_metrics": exp_res["sliced_metrics"],
+                "region_metrics": exp_res["region_metrics"],
+            },
+            "control_benchmark": {
+                "metrics": ctrl_res["metrics"],
+                "sliced_metrics": ctrl_res["sliced_metrics"],
+                "region_metrics": ctrl_res["region_metrics"],
+            },
+        },
+        "calibration_distribution_summary": calibration_distribution,
+    }
+
+    if output_path is not None:
+        out_p = Path(output_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", dir=str(out_p.parent), delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write(json.dumps(summary, indent=2))
+            tmp_name = tmp.name
+        os.replace(tmp_name, out_p)
+
+    return summary
+
+
+reproduce_active_baseline = evaluate_active_baseline
+
 def evaluate_stage_two(
     dataset_path: str | Path,
     candidate_checkpoint: str | Path,
