@@ -907,6 +907,7 @@ def _candidate_embedding_rows(
     if candidate_values is None:
         raise ActiveTrainingError("candidate pool lacks embedding_row_index")
     mapped: dict[int, int] = {}
+    used_feature_rows: set[int] = set()
     for candidate_row, raw in enumerate(candidate_values.tolist()):
         try:
             value = int(raw)
@@ -916,9 +917,10 @@ def _candidate_embedding_rows(
             ) from exc
         if value != raw or value < 0 or value >= n_features:
             continue
-        if value in mapped.values() or int(row_indices[value]) != candidate_row:
+        if value in used_feature_rows or int(row_indices[value]) != candidate_row:
             continue
         mapped[candidate_row] = value
+        used_feature_rows.add(value)
     found = _artifact_entry(handoff, _FILTERED_INDEX_NAMES)
     if found is not None:
         filtered_path, _ = _resolve_artifact(
