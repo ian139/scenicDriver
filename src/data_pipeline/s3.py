@@ -16,11 +16,6 @@ class S3Uri:
     key: str
 
 
-
-
-
-
-
 def _client(client: Any | None) -> Any:
     if client is not None:
         return client
@@ -41,7 +36,9 @@ def _missing(bucket: str, key: str, *, required: bool) -> bool:
     return False
 
 
-def check_prefix(bucket: str, prefix: str, *, max_keys: int = 1, client: Any | None = None) -> bool:
+def check_prefix(
+    bucket: str, prefix: str, *, max_keys: int = 1, client: Any | None = None
+) -> bool:
     s3 = _client(client)
     response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=max_keys)
     return bool(response.get("Contents"))
@@ -59,7 +56,9 @@ def download_file(
     try:
         s3.head_object(Bucket=bucket, Key=key)
     except Exception as exc:
-        code = getattr(getattr(exc, "response", None), "get", lambda *_: {}) ("Error", {}).get("Code")
+        code = getattr(getattr(exc, "response", None), "get", lambda *_: {})(
+            "Error", {}
+        ).get("Code")
         if code in {"404", "NoSuchKey", "NotFound"}:
             return _missing(bucket, key, required=required)
         if required:
@@ -75,6 +74,7 @@ def _iter_objects(s3: Any, bucket: str, prefix: str) -> Any:
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         yield from page.get("Contents", [])
 
+
 def download_prefix(
     bucket: str,
     prefix: str,
@@ -84,29 +84,40 @@ def download_prefix(
     required: bool = True,
 ) -> int:
     s3 = _client(client)
-    objects = [obj for obj in _iter_objects(s3, bucket, prefix) if not obj.get("Key", "").endswith("/")]
+    objects = [
+        obj
+        for obj in _iter_objects(s3, bucket, prefix)
+        if not obj.get("Key", "").endswith("/")
+    ]
     if not objects:
         _missing(bucket, prefix, required=required)
         return 0
     count = 0
     for obj in objects:
         key = obj["Key"]
-        relative = key[len(prefix) :].lstrip("/") if key.startswith(prefix) else Path(key).name
+        relative = (
+            key[len(prefix) :].lstrip("/") if key.startswith(prefix) else Path(key).name
+        )
         target = dest / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         s3.download_file(bucket, key, str(target))
         count += 1
     return count
 
+
 def _verify_remote_object(s3: Any, bucket: str, key: str, local_path: Path) -> None:
     uri = _s3_uri(bucket, key)
     try:
         head = s3.head_object(Bucket=bucket, Key=key)
     except Exception as exc:
-        raise RuntimeError(f"Remote verification failed: object missing at {uri}") from exc
+        raise RuntimeError(
+            f"Remote verification failed: object missing at {uri}"
+        ) from exc
 
     if not isinstance(head, dict):
-        raise RuntimeError(f"Remote verification failed: invalid head metadata for {uri}")
+        raise RuntimeError(
+            f"Remote verification failed: invalid head metadata for {uri}"
+        )
 
     remote_size = head.get("ContentLength")
     local_size = local_path.stat().st_size
@@ -175,7 +186,11 @@ def upload_prefix(
         print(f"optional S3 artifact missing: {uri}")
         return 0
     s3 = _client(client)
-    files = [src] if src.is_file() else sorted(path for path in src.rglob("*") if path.is_file())
+    files = (
+        [src]
+        if src.is_file()
+        else sorted(path for path in src.rglob("*") if path.is_file())
+    )
     if not files:
         if required:
             raise FileNotFoundError(f"S3 artifact not found: {_s3_uri(bucket, prefix)}")
@@ -191,11 +206,14 @@ def upload_prefix(
         count += 1
     return count
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Transfer Scenic Drive S3 artifacts")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    check = subparsers.add_parser("check-prefix", help="Check whether an S3 prefix has objects")
+    check = subparsers.add_parser(
+        "check-prefix", help="Check whether an S3 prefix has objects"
+    )
     check.add_argument("--bucket", required=True)
     check.add_argument("--prefix", required=True)
     check.add_argument("--required", action="store_true", default=False)
@@ -208,14 +226,18 @@ def parse_args() -> argparse.Namespace:
     download_one.add_argument("--required", action="store_true", default=False)
     download_one.add_argument("--optional", action="store_true", default=False)
 
-    download_many = subparsers.add_parser("download-prefix", help="Download all objects under a prefix")
+    download_many = subparsers.add_parser(
+        "download-prefix", help="Download all objects under a prefix"
+    )
     download_many.add_argument("--bucket", required=True)
     download_many.add_argument("--prefix", required=True)
     download_many.add_argument("--dest", type=Path, required=True)
     download_many.add_argument("--required", action="store_true", default=False)
     download_many.add_argument("--optional", action="store_true", default=False)
 
-    upload = subparsers.add_parser("upload-prefix", help="Upload a local file or directory to a prefix")
+    upload = subparsers.add_parser(
+        "upload-prefix", help="Upload a local file or directory to a prefix"
+    )
     upload.add_argument("--src", type=Path, required=True)
     upload.add_argument("--bucket", required=True)
     upload.add_argument("--prefix", required=True)

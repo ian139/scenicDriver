@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import csv
 import hashlib
 import json
 import math
@@ -45,7 +46,9 @@ try:
 except (ImportError, SyntaxError):
     import importlib.util
 
-    _preflight_path = PROJECT_ROOT / "scripts" / "modeling" / "validate_stage2_preflight.py"
+    _preflight_path = (
+        PROJECT_ROOT / "scripts" / "modeling" / "validate_stage2_preflight.py"
+    )
     _spec = importlib.util.spec_from_file_location(
         "scripts_modeling_validate_stage2_preflight", _preflight_path
     )
@@ -65,6 +68,7 @@ from src.scenic_scorer.active_evaluation import (  # noqa: E402
     evaluate_stage_two,
     promote_from_decision,
 )
+
 
 class DeadlineExceededError(TimeoutError):
     """Raised when a POSIX real-time deadline guard times out."""
@@ -242,9 +246,6 @@ def validate_handoff_content(handoff_path: Path, handoff_data: Dict[str, Any]) -
                         )
 
 
-import csv
-
-
 def count_expanded_val_samples(expanded_csv_path: str | Path) -> int:
     """
     Count expanded CSV split=val rows with finite human target in [0,10], unique image_path.
@@ -391,7 +392,10 @@ def validate_experiment_record(
     if status == "rejected":
         rec_gate = rec.get("all_gates_pass")
         reason = rec.get("rejection_reason")
-        if rec_gate is not False or reason != "insufficient_expanded_human_validation_support":
+        if (
+            rec_gate is not False
+            or reason != "insufficient_expanded_human_validation_support"
+        ):
             return False
         return True
 
@@ -1209,10 +1213,9 @@ def main() -> None:
             candidate_ckpt = train_result["candidate_checkpoint"]
 
             if is_data_limited:
-                cand_sha256 = (
-                    train_result.get("candidate_checkpoint_sha256")
-                    or compute_sha256(candidate_ckpt)
-                )
+                cand_sha256 = train_result.get(
+                    "candidate_checkpoint_sha256"
+                ) or compute_sha256(candidate_ckpt)
                 training_metrics = train_result.get("metrics", {})
                 exp_record = {
                     "exp_id": exp_id,
@@ -1357,6 +1360,7 @@ def main() -> None:
         ),
     }
 
+    promoted = False
     decision_summary = {
         "run_name": args.run_name,
         "all_gates_pass": False if is_data_limited else all_gates_pass,
@@ -1372,14 +1376,16 @@ def main() -> None:
             if is_data_limited
             else None
         ),
-        "registry_status": "unchanged" if is_data_limited else ("promoted" if promoted else "unchanged"),
-        "requested_annotation_batch": requested_annotation_batch if is_data_limited else None,
+        "registry_status": "unchanged"
+        if is_data_limited
+        else ("promoted" if promoted else "unchanged"),
+        "requested_annotation_batch": requested_annotation_batch
+        if is_data_limited
+        else None,
         "decision_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    decision_path.write_text(json.dumps(decision_summary, indent=2), encoding="utf-8")
 
     # 8. Registry Promotion Safety
-    promoted = False
     PROMOTION_RESERVE_SECONDS = 5.0
     if args.promote:
         remaining_promo = global_deadline - time.time()
@@ -1388,7 +1394,17 @@ def main() -> None:
                 "Promotion requested but run is data limited (insufficient validation support). Registry unchanged."
             )
             print("METRIC promoted=0 promotion_blocked=1 data_limited=1")
+        elif not all_gates_pass or best_candidate is None:
+            print(
+                "Promotion requested but compound decision gates failed or no passing candidate found. Registry unchanged."
+            )
+            print("METRIC promoted=0 promotion_blocked=1")
         elif remaining_promo < PROMOTION_RESERVE_SECONDS:
+            print(
+                "Promotion requested without enough time for an atomic registry update. Registry unchanged."
+            )
+            print("METRIC promoted=0 promotion_blocked=1 deadline=1")
+        else:
             cand_ckpt = best_candidate["candidate_checkpoint"]
             print(f"Promoting candidate {best_candidate['exp_id']} to registry...")
             promo_res = promote_from_decision(
@@ -1402,13 +1418,10 @@ def main() -> None:
             print(
                 f"METRIC promoted=1 registry_sha256={promo_res['new_registry_sha256']}"
             )
-        else:
-            print(
-                "Promotion requested but compound decision gates failed or no passing candidate found. Registry unchanged."
-            )
-            print("METRIC promoted=0 promotion_blocked=1")
     else:
         print("METRIC promoted=0 promote_flag_absent=1")
+    decision_summary["registry_status"] = "promoted" if promoted else "unchanged"
+    decision_path.write_text(json.dumps(decision_summary, indent=2), encoding="utf-8")
 
     # 9. Final Summary
     run_state = determine_aggregate_run_state(
@@ -1420,10 +1433,14 @@ def main() -> None:
         "total_experiments": len(evaluated_records),
         "all_gates_pass": False if is_data_limited else all_gates_pass,
         "data_limited": is_data_limited,
-        "retained_exp_id": None if is_data_limited else (best_candidate["exp_id"] if best_candidate else None),
+        "retained_exp_id": None
+        if is_data_limited
+        else (best_candidate["exp_id"] if best_candidate else None),
         "retained_candidate": None if is_data_limited else best_candidate,
         "promoted": False if is_data_limited else promoted,
-        "registry_status": "unchanged" if is_data_limited else ("promoted" if promoted else "unchanged"),
+        "registry_status": "unchanged"
+        if is_data_limited
+        else ("promoted" if promoted else "unchanged"),
         "observed_expanded_val_samples": observed_val_samples,
         "min_expanded_validation_samples": min_val_samples,
         "rejection_reason": (
@@ -1431,7 +1448,9 @@ def main() -> None:
             if is_data_limited
             else None
         ),
-        "requested_annotation_batch": requested_annotation_batch if is_data_limited else None,
+        "requested_annotation_batch": requested_annotation_batch
+        if is_data_limited
+        else None,
         "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     summary_path.write_text(json.dumps(final_summary, indent=2), encoding="utf-8")

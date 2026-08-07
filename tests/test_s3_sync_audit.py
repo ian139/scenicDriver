@@ -15,12 +15,12 @@ import pytest
 
 def test_lifecycle_rule_targets_canonical_raw_images_prefix() -> None:
     lifecycle = json.loads(Path("config/s3_lifecycle.json").read_text())
-    enabled_rules = [rule for rule in lifecycle["Rules"] if rule.get("Status") == "Enabled"]
+    enabled_rules = [
+        rule for rule in lifecycle["Rules"] if rule.get("Status") == "Enabled"
+    ]
 
     raw_rules = [
-        rule
-        for rule in enabled_rules
-        if rule.get("ID") == "raw-images-transition"
+        rule for rule in enabled_rules if rule.get("ID") == "raw-images-transition"
     ]
 
     assert len(raw_rules) == 1
@@ -72,6 +72,7 @@ def test_download_bbox_rejects_noncanonical_prefix_shorthands(prefix: str) -> No
             zoom=14,
         )
 
+
 def test_labeler_s3_prefix_from_local_dir_matches_data_contract() -> None:
     from src.heuristics.labeler import _s3_prefix_from_local_dir
 
@@ -104,9 +105,7 @@ def _write_aws_shim(tmp_path: Path) -> Path:
     calls_path = tmp_path / "aws-calls.txt"
     shim = bin_dir / "aws"
     shim.write_text(
-        "#!/usr/bin/env bash\n"
-        f"printf '%s\\n' \"$*\" >> {calls_path}\n"
-        "exit 0\n"
+        f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {calls_path}\nexit 0\n"
     )
     shim.chmod(0o755)
     return calls_path
@@ -158,6 +157,8 @@ def test_s3_sync_requires_bucket(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "SCENIC_S3_BUCKET is required" in result.stdout
+
+
 def test_iter_objects_uses_canonical_paginator_across_pages() -> None:
     from src.data_pipeline.s3 import _iter_objects
 
@@ -184,8 +185,6 @@ def test_iter_objects_uses_canonical_paginator_across_pages() -> None:
         ("get_paginator", {"operation": "list_objects_v2"}),
         ("paginate", {"Bucket": "bucket", "Prefix": "prefix/"}),
     ]
-
-
 
 
 def test_report_thumbnails_use_explicit_s3_raw_dir_bucket(
@@ -236,10 +235,11 @@ def test_report_thumbnails_use_explicit_s3_raw_dir_bucket(
     assert (thumbs_dir / "00000.jpg").is_file()
 
 
-
 class _DummyLabelsFrame:
     def to_csv(self, path: Path, index: bool = False) -> None:
-        path.write_text("image_path,scenic_score,class_id\nraw/images/satellite/z14/new_england_north/1_2.png,5.0,-1\n")
+        path.write_text(
+            "image_path,scenic_score,class_id\nraw/images/satellite/z14/new_england_north/1_2.png,5.0,-1\n"
+        )
 
 
 def test_heuristic_report_region_all_tiles_delegates_uncapped_s3(
@@ -249,9 +249,15 @@ def test_heuristic_report_region_all_tiles_delegates_uncapped_s3(
 
     captured: dict[str, object] = {}
 
-    def fake_labeling(**kwargs: object) -> tuple[_DummyLabelsFrame, list[dict[str, object]], dict[str, object]]:
+    def fake_labeling(
+        **kwargs: object,
+    ) -> tuple[_DummyLabelsFrame, list[dict[str, object]], dict[str, object]]:
         captured.update(kwargs)
-        return _DummyLabelsFrame(), [], {"counts": {}, "config": {"max_tiles": kwargs["max_tiles"]}}
+        return (
+            _DummyLabelsFrame(),
+            [],
+            {"counts": {}, "config": {"max_tiles": kwargs["max_tiles"]}},
+        )
 
     def fake_report(**kwargs: object) -> dict[str, object]:
         return {"summary": {}, "histogram": {}}
@@ -281,7 +287,9 @@ def test_heuristic_report_region_all_tiles_delegates_uncapped_s3(
 
     heuristic_report_region.main()
 
-    assert captured["satellite_dir"] == "data/raw/images/satellite/z14/new_england_north"
+    assert (
+        captured["satellite_dir"] == "data/raw/images/satellite/z14/new_england_north"
+    )
     assert captured["terrain_dir"] == "data/raw/images/terrain/z14/new_england_north"
     assert captured["raw_dir"] == "s3://scenicdriver-data/raw"
     assert captured["max_tiles"] is None
@@ -294,9 +302,15 @@ def test_heuristic_report_preview_preserves_256_cap(
 
     captured: dict[str, object] = {}
 
-    def fake_labeling(**kwargs: object) -> tuple[_DummyLabelsFrame, list[dict[str, object]], dict[str, object]]:
+    def fake_labeling(
+        **kwargs: object,
+    ) -> tuple[_DummyLabelsFrame, list[dict[str, object]], dict[str, object]]:
         captured.update(kwargs)
-        return _DummyLabelsFrame(), [], {"counts": {}, "config": {"max_tiles": kwargs["max_tiles"]}}
+        return (
+            _DummyLabelsFrame(),
+            [],
+            {"counts": {}, "config": {"max_tiles": kwargs["max_tiles"]}},
+        )
 
     def fake_report(**kwargs: object) -> dict[str, object]:
         return {"summary": {}, "histogram": {}}
@@ -341,19 +355,24 @@ def test_regression_dataset_sample_weight_uses_canonical_label_sources(
 ) -> None:
     from scripts.modeling.export_regression_dataset import _sample_weight_for_row
 
-    assert _sample_weight_for_row(
-        pd.Series({"label_source": source}),
-        sample_weight_column=None,
-        label_source_column="label_source",
-        has_label_source=True,
-        has_scenic_human=False,
-        human_weight=3.0,
-        heuristic_weight=1.5,
-        default_weight=0.5,
-    ) == expected
+    assert (
+        _sample_weight_for_row(
+            pd.Series({"label_source": source}),
+            sample_weight_column=None,
+            label_source_column="label_source",
+            has_label_source=True,
+            has_scenic_human=False,
+            human_weight=3.0,
+            heuristic_weight=1.5,
+            default_weight=0.5,
+        )
+        == expected
+    )
 
 
-def test_regression_dataset_sample_weight_preserves_explicit_and_missing_behavior() -> None:
+def test_regression_dataset_sample_weight_preserves_explicit_and_missing_behavior() -> (
+    None
+):
     from scripts.modeling.export_regression_dataset import _sample_weight_for_row
 
     kwargs = {
@@ -461,7 +480,9 @@ def test_upload_prefix_checksum_mismatch(tmp_path: Path) -> None:
         upload_prefix(local_file, "mybucket", "prefix", client=FakeS3Client())
 
 
-def test_upload_prefix_directory_deterministic_and_relative_keys(tmp_path: Path) -> None:
+def test_upload_prefix_directory_deterministic_and_relative_keys(
+    tmp_path: Path,
+) -> None:
     from src.data_pipeline.s3 import upload_prefix
 
     src_dir = tmp_path / "src"

@@ -153,9 +153,7 @@ def _predict_dataset(
             tensor = tensor.pin_memory()
         return tensor.to(resolved_device, non_blocking=use_cuda)
 
-    with torch.inference_mode(), torch.autocast(
-        device_type="cuda", enabled=use_cuda
-    ):
+    with torch.inference_mode(), torch.autocast(device_type="cuda", enabled=use_cuda):
         for start_idx in range(0, n_samples, batch_size):
             end_idx = min(start_idx + batch_size, n_samples)
             out = model(
@@ -221,13 +219,16 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]
         "spearman_corr": spearman_corr,
     }
 
+
 load_model_checkpoint = _load_model_checkpoint
 read_benchmark_csv = _read_benchmark_csv
 predict_dataset = _predict_dataset
 compute_metrics = _compute_metrics
 
 
-def _load_dataset_npz(ds_path: Path, *, require_embedded_splits: bool) -> dict[str, Any]:
+def _load_dataset_npz(
+    ds_path: Path, *, require_embedded_splits: bool
+) -> dict[str, Any]:
     """Load and validate a feature NPZ and its optional embedded split contract."""
     data_npz = np.load(ds_path, allow_pickle=False)
     required_npz_keys = {
@@ -630,6 +631,7 @@ def evaluate_active_baseline(
 
 reproduce_active_baseline = evaluate_active_baseline
 
+
 def evaluate_stage_two(
     dataset_path: str | Path,
     control_dataset_path: str | Path,
@@ -686,9 +688,7 @@ def evaluate_stage_two(
 
     # Load and validate the expanded and control NPZ datasets independently
     expanded = _load_dataset_npz(dataset_path, require_embedded_splits=True)
-    control = _load_dataset_npz(
-        control_dataset_path, require_embedded_splits=False
-    )
+    control = _load_dataset_npz(control_dataset_path, require_embedded_splits=False)
 
     dataset_overlap = set(expanded["image_paths"]) & set(control["image_paths"])
     if dataset_overlap:

@@ -60,6 +60,7 @@ def csv_row_count(path: Path) -> int:
             raise ValueError(f"CSV has no header: {path}") from exc
         return sum(1 for _ in reader)
 
+
 def valid_annotation_count(path: Path) -> int:
     count = 0
     with path.open("r", encoding="utf-8", newline="") as handle:
@@ -81,12 +82,16 @@ def benchmark_identities(path: Path) -> tuple[dict[str, int], set[str]]:
         reader = csv.DictReader(handle)
         required = {"image_path", "split"}
         if not reader.fieldnames or not required.issubset(reader.fieldnames):
-            raise ValueError(f"benchmark lacks required columns {sorted(required)}: {path}")
+            raise ValueError(
+                f"benchmark lacks required columns {sorted(required)}: {path}"
+            )
         for row in reader:
             identity = (row.get("image_path") or "").strip()
             split = (row.get("split") or "").strip().lower()
             if not identity or split not in {"train", "val", "validation", "test"}:
-                raise ValueError(f"benchmark contains invalid identity or split: {path}")
+                raise ValueError(
+                    f"benchmark contains invalid identity or split: {path}"
+                )
             if identity in identities:
                 raise ValueError(f"benchmark contains duplicate image_path: {identity}")
             identities.add(identity)
@@ -152,7 +157,9 @@ def validate_handoff(handoff_path: Path) -> dict[str, int]:
             raise ValueError(f"invalid declared count: {count_name}")
         actual = csv_row_count(resolved[artifact_name])
         if actual != expected:
-            raise ValueError(f"row count mismatch for {artifact_name}: {actual} != {expected}")
+            raise ValueError(
+                f"row count mismatch for {artifact_name}: {actual} != {expected}"
+            )
     annotation_rows = valid_annotation_count(resolved["absolute_annotations"])
     if annotation_rows != counts.get("annotation_rows"):
         raise ValueError("valid human annotation row count mismatch")
@@ -177,7 +184,11 @@ def validate_handoff(handoff_path: Path) -> dict[str, int]:
     ):
         raise ValueError("stage-one leakage invariants failed")
     split_counts = leakage.get("split_counts")
-    if not isinstance(split_counts, dict) or set(split_counts) != {"train", "val", "test"}:
+    if not isinstance(split_counts, dict) or set(split_counts) != {
+        "train",
+        "val",
+        "test",
+    }:
         raise ValueError("stage-one leakage split counts are invalid")
     if any(not isinstance(value, int) or value <= 0 for value in split_counts.values()):
         raise ValueError("stage-one leakage split has no support")

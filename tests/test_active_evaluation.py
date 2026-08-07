@@ -10,14 +10,10 @@ import pytest
 import torch
 
 from src.scenic_scorer.active_evaluation import (
-    compute_metrics,
     evaluate_active_baseline,
     evaluate_stage_two,
     file_sha256,
-    load_model_checkpoint,
-    predict_dataset,
     promote_from_decision,
-    read_benchmark_csv,
     rollback_registry,
 )
 from src.scenic_scorer.regression import ScenicRegressionModel
@@ -168,14 +164,6 @@ def get_default_thresholds() -> dict[str, typing.Any]:
 
 
 def test_evaluate_stage_two_filters_only_split_test_rows(tmp_path: Path) -> None:
-    images = [
-        "img1.jpg",
-        "img2.jpg",
-        "img3.jpg",
-        "img4.jpg",
-        "img5.jpg",
-        "img6.jpg",
-    ]
     dataset_path = create_npz_dataset(
         tmp_path / "dataset.npz",
         ["img1.jpg", "img2.jpg", "img3.jpg", "img4.jpg"],
@@ -1154,7 +1142,8 @@ def test_evaluate_stage_two_rejects_dataset_overlap(tmp_path: Path) -> None:
     out_json = tmp_path / "dec.json"
 
     with pytest.raises(
-        ValueError, match="Overlap detected between expanded and control prepared datasets"
+        ValueError,
+        match="Overlap detected between expanded and control prepared datasets",
     ):
         evaluate_stage_two(
             dataset_path=ds_path,
@@ -1463,7 +1452,8 @@ def test_evaluate_active_baseline_success(tmp_path: Path) -> None:
     exp_csv = tmp_path / "expanded.csv"
     with open(exp_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["image_path", "split", "scenic_human_mean", "region", "slice"]
+            f,
+            fieldnames=["image_path", "split", "scenic_human_mean", "region", "slice"],
         )
         writer.writeheader()
         writer.writerow(
@@ -1488,7 +1478,8 @@ def test_evaluate_active_baseline_success(tmp_path: Path) -> None:
     ctrl_csv = tmp_path / "control.csv"
     with open(ctrl_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["image_path", "split", "scenic_human_mean", "region", "slice"]
+            f,
+            fieldnames=["image_path", "split", "scenic_human_mean", "region", "slice"],
         )
         writer.writeheader()
         writer.writerow(
@@ -1572,7 +1563,11 @@ def test_evaluate_active_baseline_missing_identity(tmp_path: Path) -> None:
             {"image_path": "img1.jpg", "split": "test", "scenic_human_mean": "5.0"}
         )
         writer.writerow(
-            {"image_path": "img_missing.jpg", "split": "test", "scenic_human_mean": "6.0"}
+            {
+                "image_path": "img_missing.jpg",
+                "split": "test",
+                "scenic_human_mean": "6.0",
+            }
         )
 
     ctrl_csv = tmp_path / "control.csv"
@@ -1733,7 +1728,9 @@ def test_evaluate_active_baseline_disjoint_benchmark_overlap(tmp_path: Path) -> 
             {"image_path": "img1.jpg", "split": "test", "scenic_human_mean": "4.5"}
         )
 
-    with pytest.raises(ValueError, match="Overlap detected between expanded and control"):
+    with pytest.raises(
+        ValueError, match="Overlap detected between expanded and control"
+    ):
         evaluate_active_baseline(
             dataset_path=npz_path,
             control_dataset_path=control_npz,

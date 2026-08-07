@@ -160,6 +160,7 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             pass
         raise
 
+
 def _atomic_csv(path: Path, frame: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(
@@ -1315,9 +1316,7 @@ def _metrics(
             tensor = tensor.pin_memory()
         return tensor.to(device, non_blocking=use_cuda)
 
-    with torch.inference_mode(), torch.autocast(
-        device_type="cuda", enabled=use_cuda
-    ):
+    with torch.inference_mode(), torch.autocast(device_type="cuda", enabled=use_cuda):
         vit = move(np.asarray(arrays["vit_embeddings"])[indices])
         terrain = move(np.asarray(arrays["terrain_features"])[indices])
         logits = move(np.asarray(arrays["class_logits"])[indices])
@@ -1716,9 +1715,9 @@ def train_active_model(
                 vit = move(np.asarray(arrays["vit_embeddings"])[batch_indices])
                 terrain = move(np.asarray(arrays["terrain_features"])[batch_indices])
                 logits = move(np.asarray(arrays["class_logits"])[batch_indices])
-                target = move(np.asarray(arrays["scenic_scores"])[batch_indices]).reshape(
-                    -1, 1
-                )
+                target = move(
+                    np.asarray(arrays["scenic_scores"])[batch_indices]
+                ).reshape(-1, 1)
                 weights = move(training_weights[batch_indices]).reshape(-1, 1)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type="cuda", enabled=use_cuda):

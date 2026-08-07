@@ -5,7 +5,6 @@ CLI script to reproduce active baseline evaluation metrics.
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 import sys
 
@@ -13,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.scenic_scorer.active_evaluation import evaluate_active_baseline
+from src.scenic_scorer.active_evaluation import evaluate_active_baseline  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
