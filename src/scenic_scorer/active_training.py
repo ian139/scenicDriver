@@ -160,6 +160,22 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             pass
         raise
 
+def _atomic_csv(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(fd)
+    try:
+        frame.to_csv(temporary, index=False, lineterminator="\n")
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
 
 def _atomic_npz(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -935,8 +951,29 @@ def prepare_active_dataset(
     )
     candidate_paths = [all_candidate_paths[index] for index in selected]
     split_frame = _load_csv(split_path, "geographic splits")
+    declared_splits = _split_values(split_frame)
+    unknown_split_paths = sorted(set(declared_splits) - set(all_candidate_paths))
+    if unknown_split_paths:
+        raise ActiveTrainingError(
+            "geographic splits reference identities absent from the candidate pool: "
+            f"{unknown_split_paths}"
+        )
+    retained_positions = [
+        position
+        for position, image_path in enumerate(candidate_paths)
+        if image_path in declared_splits
+    ]
+    if not retained_positions:
+        raise ActiveTrainingError(
+            "geographic splits have no identities in the filtered candidate set"
+        )
+    dropped_without_split = len(selected) - len(retained_positions)
+    selected = [selected[position] for position in retained_positions]
+    feature_rows = [feature_rows[position] for position in retained_positions]
+    candidate_paths = [candidate_paths[position] for position in retained_positions]
+    retained_path_set = set(candidate_paths)
     split_frame = split_frame.loc[
-        split_frame["image_path"].astype(str).isin(candidate_paths)
+        split_frame["image_path"].map(_clean_text).isin(retained_path_set)
     ].copy()
     split_values = _validate_splits_for_selected(split_frame, candidate, selected)
     targets, weights, labels = _mixed_label_targets(
@@ -953,6 +990,24 @@ def prepare_active_dataset(
     ]
     selected_feature_rows = np.asarray(feature_rows, dtype=np.int64)
     output = Path(output_path).expanduser().resolve()
+    filtered_index_path = output.with_suffix(".filtered_index.csv")
+    filtered_labels_path = output.with_suffix(".filtered_labels.csv")
+    filtered_index = pd.DataFrame(
+        {
+            "candidate_row_index": selected,
+            "feature_row_index": feature_rows,
+            "image_path": candidate_paths,
+            "split": [split_values[path] for path in candidate_paths],
+        }
+    )
+    filtered_labels = filtered_index.loc[
+        :, ["candidate_row_index", "image_path", "split"]
+    ].copy()
+    filtered_labels["scenic_score"] = targets
+    filtered_labels["sample_weight"] = weights
+    filtered_labels["label_source"] = labels
+    _atomic_csv(filtered_index_path, filtered_index)
+    _atomic_csv(filtered_labels_path, filtered_labels)
     output_arrays = {
         "vit_embeddings": np.asarray(arrays["embeddings"])[
             selected_feature_rows
@@ -974,6 +1029,8 @@ def prepare_active_dataset(
     }
     _atomic_npz(output, output_arrays)
     dataset_hash = _sha256_file(output)
+    filtered_index_hash = _sha256_file(filtered_index_path)
+    filtered_labels_hash = _sha256_file(filtered_labels_path)
     counts = {
         "rows": len(candidate_paths),
         "train": sum(split_values[path] == "train" for path in candidate_paths),
@@ -990,9 +1047,14 @@ def prepare_active_dataset(
             "dataset_sha256": dataset_hash,
             "split_path": str(split_path),
             "split_sha256": split_hash,
+            "filtered_index_path": str(filtered_index_path),
+            "filtered_index_sha256": filtered_index_hash,
+            "filtered_labels_path": str(filtered_labels_path),
+            "filtered_labels_sha256": filtered_labels_hash,
             "handoff_path": str(Path(handoff_path).expanduser().resolve()),
             "handoff_sha256": _sha256_file(source),
             "counts": counts,
+            "dropped_without_split": dropped_without_split,
             "sample_count": counts["rows"],
             "hashes": {
                 "candidate_pool": candidate_hash,
@@ -1001,6 +1063,8 @@ def prepare_active_dataset(
                 "mixed_labels": mixed_hash,
                 "splits": split_hash,
                 "dataset": dataset_hash,
+                "filtered_index": filtered_index_hash,
+                "filtered_labels": filtered_labels_hash,
             },
             "ordered_image_paths_sha256": _sha256_bytes(
                 "\n".join(candidate_paths).encode("utf-8")

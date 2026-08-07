@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +98,67 @@ def download_prefix(
         count += 1
     return count
 
+def _verify_remote_object(s3: Any, bucket: str, key: str, local_path: Path) -> None:
+    uri = _s3_uri(bucket, key)
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+    except Exception as exc:
+        raise RuntimeError(f"Remote verification failed: object missing at {uri}") from exc
+
+    if not isinstance(head, dict):
+        raise RuntimeError(f"Remote verification failed: invalid head metadata for {uri}")
+
+    remote_size = head.get("ContentLength")
+    local_size = local_path.stat().st_size
+    if remote_size is None:
+        raise ValueError(f"Remote verification failed: missing ContentLength for {uri}")
+    if remote_size != local_size:
+        raise ValueError(
+            f"Remote verification size mismatch for {uri}: local {local_size}, remote {remote_size}"
+        )
+
+    content: bytes | None = None
+
+    def _get_content() -> bytes:
+        nonlocal content
+        if content is None:
+            content = local_path.read_bytes()
+        return content
+
+    etag = head.get("ETag")
+    if etag is not None and isinstance(etag, str):
+        clean_etag = etag.strip('"').strip("'")
+        if clean_etag and "-" not in clean_etag and len(clean_etag) == 32:
+            local_md5 = hashlib.md5(_get_content()).hexdigest()
+            if clean_etag.lower() != local_md5.lower():
+                raise ValueError(
+                    f"Remote verification checksum mismatch for {uri}: local MD5 {local_md5}, remote ETag {clean_etag}"
+                )
+
+    sha256 = head.get("ChecksumSHA256")
+    if sha256 is not None and isinstance(sha256, str):
+        clean_sha256 = sha256.strip('"').strip("'")
+        if clean_sha256:
+            data = _get_content()
+            local_hex = hashlib.sha256(data).hexdigest()
+            local_b64 = base64.b64encode(hashlib.sha256(data).digest()).decode("ascii")
+            if clean_sha256.lower() != local_hex.lower() and clean_sha256 != local_b64:
+                raise ValueError(
+                    f"Remote verification checksum mismatch for {uri}: local SHA256 {local_hex}, remote {clean_sha256}"
+                )
+
+    sha1 = head.get("ChecksumSHA1")
+    if sha1 is not None and isinstance(sha1, str):
+        clean_sha1 = sha1.strip('"').strip("'")
+        if clean_sha1:
+            data = _get_content()
+            local_hex = hashlib.sha1(data).hexdigest()
+            local_b64 = base64.b64encode(hashlib.sha1(data).digest()).decode("ascii")
+            if clean_sha1.lower() != local_hex.lower() and clean_sha1 != local_b64:
+                raise ValueError(
+                    f"Remote verification checksum mismatch for {uri}: local SHA1 {local_hex}, remote {clean_sha1}"
+                )
+
 
 def upload_prefix(
     src: Path,
@@ -112,7 +175,7 @@ def upload_prefix(
         print(f"optional S3 artifact missing: {uri}")
         return 0
     s3 = _client(client)
-    files = [src] if src.is_file() else [path for path in src.rglob("*") if path.is_file()]
+    files = [src] if src.is_file() else sorted(path for path in src.rglob("*") if path.is_file())
     if not files:
         if required:
             raise FileNotFoundError(f"S3 artifact not found: {_s3_uri(bucket, prefix)}")
@@ -124,9 +187,9 @@ def upload_prefix(
         relative = path.name if src.is_file() else path.relative_to(src).as_posix()
         key = f"{normalized_prefix}/{relative}" if normalized_prefix else relative
         s3.upload_file(str(path), bucket, key)
+        _verify_remote_object(s3, bucket, key, path)
         count += 1
     return count
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Transfer Scenic Drive S3 artifacts")

@@ -223,6 +223,44 @@ def test_prepare_uses_hashed_filtered_index_only(tmp_path: Path) -> None:
         assert arrays["vit_embeddings"][:, 0].tolist() == [0, 8, 16]
 
 
+def test_prepare_intersects_fixed_split_and_emits_exact_filtered_artifacts(
+    tmp_path: Path,
+) -> None:
+    handoff, split_csv, run = _fixture(tmp_path)
+    splits = pd.read_csv(split_csv).iloc[[0, 2, 4]].copy()
+    splits.to_csv(split_csv, index=False)
+    payload = json.loads(handoff.read_text(encoding="utf-8"))
+    payload["artifacts"]["geographic_splits"]["sha256"] = _sha256(split_csv)
+    handoff.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = prepare_active_dataset(handoff, run / "intersected.npz")
+
+    assert result["dropped_without_split"] == 3
+    assert result["counts"] == {
+        "rows": 3,
+        "train": 1,
+        "val": 1,
+        "test": 1,
+        "human": 1,
+        "weak": 2,
+    }
+    filtered_index = pd.read_csv(result["filtered_index_path"])
+    filtered_labels = pd.read_csv(result["filtered_labels_path"])
+    assert filtered_index["candidate_row_index"].tolist() == [0, 2, 4]
+    assert filtered_index["image_path"].tolist() == [
+        "tile-0.png",
+        "tile-2.png",
+        "tile-4.png",
+    ]
+    assert filtered_labels["scenic_score"].tolist() == [8, 3, 5]
+    assert result["filtered_index_sha256"] == _sha256(
+        Path(result["filtered_index_path"])
+    )
+    assert result["filtered_labels_sha256"] == _sha256(
+        Path(result["filtered_labels_path"])
+    )
+
+
 def test_false_readiness_and_hash_mismatch_fail_closed(tmp_path: Path) -> None:
     handoff, _, run = _fixture(tmp_path)
     payload = json.loads(handoff.read_text(encoding="utf-8"))

@@ -376,3 +376,117 @@ def test_classifier_resume_requires_canonical_best_acc() -> None:
     assert _best_acc_from_checkpoint({"best_acc": 0.8, "val_acc": 0.1}) == 0.8
     with pytest.raises(ValueError, match="required 'best_acc'"):
         _best_acc_from_checkpoint({"val_acc": 0.8})
+
+
+def test_upload_prefix_verified_success(tmp_path: Path) -> None:
+    import hashlib
+    from src.data_pipeline.s3 import upload_prefix
+
+    local_file = tmp_path / "test.bin"
+    data = b"hello s3 verification"
+    local_file.write_bytes(data)
+    md5_hex = hashlib.md5(data).hexdigest()
+
+    uploaded: list[tuple[str, str, str]] = []
+    head_calls: list[tuple[str, str]] = []
+
+    class FakeS3Client:
+        def upload_file(self, Filename: str, Bucket: str, Key: str) -> None:
+            uploaded.append((Filename, Bucket, Key))
+
+        def head_object(self, Bucket: str, Key: str) -> dict[str, object]:
+            head_calls.append((Bucket, Key))
+            return {
+                "ContentLength": len(data),
+                "ETag": f'"{md5_hex}"',
+            }
+
+    count = upload_prefix(local_file, "mybucket", "artifacts/v1", client=FakeS3Client())
+    assert count == 1
+    assert uploaded == [(str(local_file), "mybucket", "artifacts/v1/test.bin")]
+    assert head_calls == [("mybucket", "artifacts/v1/test.bin")]
+
+
+def test_upload_prefix_missing_remote_object(tmp_path: Path) -> None:
+    from src.data_pipeline.s3 import upload_prefix
+
+    local_file = tmp_path / "missing.bin"
+    local_file.write_bytes(b"payload")
+
+    class FakeS3Client:
+        def upload_file(self, Filename: str, Bucket: str, Key: str) -> None:
+            pass
+
+        def head_object(self, Bucket: str, Key: str) -> dict[str, object]:
+            raise RuntimeError("404 NoSuchKey")
+
+    with pytest.raises(RuntimeError, match="Remote verification failed"):
+        upload_prefix(local_file, "mybucket", "prefix", client=FakeS3Client())
+
+
+def test_upload_prefix_size_mismatch(tmp_path: Path) -> None:
+    from src.data_pipeline.s3 import upload_prefix
+
+    local_file = tmp_path / "data.bin"
+    local_file.write_bytes(b"payload")
+
+    class FakeS3Client:
+        def upload_file(self, Filename: str, Bucket: str, Key: str) -> None:
+            pass
+
+        def head_object(self, Bucket: str, Key: str) -> dict[str, object]:
+            return {"ContentLength": 999}
+
+    with pytest.raises(ValueError, match="size mismatch"):
+        upload_prefix(local_file, "mybucket", "prefix", client=FakeS3Client())
+
+
+def test_upload_prefix_checksum_mismatch(tmp_path: Path) -> None:
+    from src.data_pipeline.s3 import upload_prefix
+
+    local_file = tmp_path / "data.bin"
+    local_file.write_bytes(b"payload")
+
+    class FakeS3Client:
+        def upload_file(self, Filename: str, Bucket: str, Key: str) -> None:
+            pass
+
+        def head_object(self, Bucket: str, Key: str) -> dict[str, object]:
+            return {
+                "ContentLength": len(b"payload"),
+                "ETag": '"00000000000000000000000000000000"',
+            }
+
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        upload_prefix(local_file, "mybucket", "prefix", client=FakeS3Client())
+
+
+def test_upload_prefix_directory_deterministic_and_relative_keys(tmp_path: Path) -> None:
+    from src.data_pipeline.s3 import upload_prefix
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    (src_dir / "b.txt").write_bytes(b"file b")
+    sub = src_dir / "sub"
+    sub.mkdir()
+    (sub / "a.txt").write_bytes(b"file a")
+
+    uploaded_keys: list[str] = []
+    verified_keys: list[str] = []
+    sizes = {
+        "prefix/b.txt": len(b"file b"),
+        "prefix/sub/a.txt": len(b"file a"),
+    }
+
+    class FakeS3Client:
+        def upload_file(self, Filename: str, Bucket: str, Key: str) -> None:
+            uploaded_keys.append(Key)
+
+        def head_object(self, Bucket: str, Key: str) -> dict[str, object]:
+            verified_keys.append(Key)
+            return {"ContentLength": sizes[Key]}
+
+    count = upload_prefix(src_dir, "bucket", "prefix", client=FakeS3Client())
+    assert count == 2
+    assert uploaded_keys == ["prefix/b.txt", "prefix/sub/a.txt"]
+    assert verified_keys == ["prefix/b.txt", "prefix/sub/a.txt"]
