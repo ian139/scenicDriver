@@ -227,40 +227,8 @@ predict_dataset = _predict_dataset
 compute_metrics = _compute_metrics
 
 
-def evaluate_active_baseline(
-    dataset_path: str | Path,
-    checkpoint_path: str | Path,
-    expanded_benchmark_csv: str | Path,
-    control_benchmark_csv: str | Path,
-    output_path: str | Path | None = None,
-    min_supported_slice_samples: int = 5,
-) -> dict[str, Any]:
-    """
-    Perform deterministic baseline-reproduction evaluation for the active checkpoint.
-
-    Evaluates active baseline checkpoint on split=test for expanded and control human benchmark CSVs.
-    Requires exact NPZ test split matching, disjoint benchmark sets, and deterministic CPU prediction.
-    """
-    ds_path = Path(dataset_path)
-    ckpt_path = Path(checkpoint_path)
-    exp_csv_path = Path(expanded_benchmark_csv)
-    ctrl_csv_path = Path(control_benchmark_csv)
-
-    for p, name in [
-        (ds_path, "Dataset NPZ"),
-        (ckpt_path, "Checkpoint"),
-        (exp_csv_path, "Expanded benchmark CSV"),
-        (ctrl_csv_path, "Control benchmark CSV"),
-    ]:
-        if not p.exists():
-            raise FileNotFoundError(f"{name} not found: {p}")
-
-    ds_sha256 = file_sha256(ds_path)
-    ckpt_sha256 = file_sha256(ckpt_path)
-    exp_sha256 = file_sha256(exp_csv_path)
-    ctrl_sha256 = file_sha256(ctrl_csv_path)
-
-    # 1. Load and validate NPZ dataset
+def _load_dataset_npz(ds_path: Path, *, require_embedded_splits: bool) -> dict[str, Any]:
+    """Load and validate a feature NPZ and its optional embedded split contract."""
     data_npz = np.load(ds_path, allow_pickle=False)
     required_npz_keys = {
         "vit_embeddings",
@@ -269,8 +237,6 @@ def evaluate_active_baseline(
         "scenic_scores",
         "sample_weights",
         "image_paths",
-        "label_sources",
-        "splits",
     }
     missing_npz = sorted(required_npz_keys - set(data_npz.files))
     if missing_npz:
@@ -284,17 +250,20 @@ def evaluate_active_baseline(
     npz_scores = data_npz["scenic_scores"]
     sample_weights = data_npz["sample_weights"]
     image_paths_raw = data_npz["image_paths"]
-    splits_raw = data_npz["splits"]
+    if require_embedded_splits and "splits" not in data_npz.files:
+        raise ValueError(f"Dataset NPZ {ds_path} lacks required embedded splits")
+    splits_raw = data_npz["splits"] if "splits" in data_npz.files else None
 
     n_samples = len(vit)
-    if not (
+    lengths_match = (
         len(terr) == n_samples
         and len(cls_logits) == n_samples
         and len(npz_scores) == n_samples
         and len(sample_weights) == n_samples
         and len(image_paths_raw) == n_samples
-        and len(splits_raw) == n_samples
-    ):
+        and (splits_raw is None or len(splits_raw) == n_samples)
+    )
+    if not lengths_match:
         raise ValueError("NPZ arrays length mismatch across required fields")
 
     if not (
@@ -312,41 +281,133 @@ def evaluate_active_baseline(
     image_paths = [
         str(p.decode("utf-8") if isinstance(p, bytes) else p) for p in image_paths_raw
     ]
-    prepared_splits = [
-        str(value.decode("utf-8") if isinstance(value, bytes) else value)
-        .strip()
-        .lower()
-        for value in splits_raw
-    ]
-    if any(value not in {"train", "val", "test"} for value in prepared_splits):
+    prepared_splits = (
+        [
+            str(value.decode("utf-8") if isinstance(value, bytes) else value)
+            .strip()
+            .lower()
+            for value in splits_raw
+        ]
+        if splits_raw is not None
+        else []
+    )
+    if prepared_splits and any(
+        value not in {"train", "val", "test"} for value in prepared_splits
+    ):
         raise ValueError("NPZ splits contain invalid values")
 
     if len(image_paths) != len(set(image_paths)):
         raise ValueError("Duplicate image_paths found in NPZ dataset")
 
-    npz_path_map = {p: i for i, p in enumerate(image_paths)}
-    npz_split_map = dict(zip(image_paths, prepared_splits, strict=True))
+    return {
+        "path": ds_path,
+        "vit": vit,
+        "terr": terr,
+        "cls_logits": cls_logits,
+        "scores": npz_scores,
+        "weights": sample_weights,
+        "image_paths": image_paths,
+        "splits": prepared_splits,
+        "path_map": {p: i for i, p in enumerate(image_paths)},
+        "split_map": (
+            dict(zip(image_paths, prepared_splits, strict=True))
+            if prepared_splits
+            else {}
+        ),
+        "total": len(image_paths),
+        "test": sum(1 for s in prepared_splits if s == "test"),
+    }
 
-    dataset_total_samples = len(image_paths)
-    dataset_test_samples = sum(1 for s in prepared_splits if s == "test")
 
-    # 2. Load model and run double CPU inference for determinism check
+def evaluate_active_baseline(
+    dataset_path: str | Path,
+    control_dataset_path: str | Path,
+    checkpoint_path: str | Path,
+    expanded_benchmark_csv: str | Path,
+    control_benchmark_csv: str | Path,
+    output_path: str | Path | None = None,
+    min_supported_slice_samples: int = 5,
+) -> dict[str, Any]:
+    """
+    Perform deterministic baseline-reproduction evaluation for the active checkpoint.
+
+    Evaluates active baseline checkpoint on split=test for expanded and control human
+    benchmark CSVs, loading and inferring the immutable expanded prepared NPZ and the
+    canonical control dataset NPZ independently. Requires exact NPZ test split matching,
+    disjoint datasets/benchmarks, and deterministic CPU prediction.
+    """
+    ds_path = Path(dataset_path)
+    ctrl_ds_path = Path(control_dataset_path)
+    ckpt_path = Path(checkpoint_path)
+    exp_csv_path = Path(expanded_benchmark_csv)
+    ctrl_csv_path = Path(control_benchmark_csv)
+
+    for p, name in [
+        (ds_path, "Dataset NPZ"),
+        (ctrl_ds_path, "Control dataset NPZ"),
+        (ckpt_path, "Checkpoint"),
+        (exp_csv_path, "Expanded benchmark CSV"),
+        (ctrl_csv_path, "Control benchmark CSV"),
+    ]:
+        if not p.exists():
+            raise FileNotFoundError(f"{name} not found: {p}")
+
+    ds_sha256 = file_sha256(ds_path)
+    ctrl_ds_sha256 = file_sha256(ctrl_ds_path)
+    ckpt_sha256 = file_sha256(ckpt_path)
+    exp_sha256 = file_sha256(exp_csv_path)
+    ctrl_sha256 = file_sha256(ctrl_csv_path)
+
+    # 1. Load and validate the expanded and control NPZ datasets independently
+    expanded = _load_dataset_npz(ds_path, require_embedded_splits=True)
+    control = _load_dataset_npz(ctrl_ds_path, require_embedded_splits=False)
+
+    dataset_overlap = set(expanded["image_paths"]) & set(control["image_paths"])
+    if dataset_overlap:
+        raise ValueError(
+            f"Overlap detected between expanded and control prepared datasets: "
+            f"{sorted(dataset_overlap)}"
+        )
+
+    # 2. Load model and run double CPU inference for determinism check on both datasets
     model = _load_model_checkpoint(ckpt_path, device="cpu", is_candidate=False)
 
-    preds_run1 = _predict_dataset(model, vit, terr, cls_logits, device="cpu")
-    preds_run2 = _predict_dataset(model, vit, terr, cls_logits, device="cpu")
+    preds_run1 = _predict_dataset(
+        model, expanded["vit"], expanded["terr"], expanded["cls_logits"], device="cpu"
+    )
+    preds_run2 = _predict_dataset(
+        model, expanded["vit"], expanded["terr"], expanded["cls_logits"], device="cpu"
+    )
+    max_delta_expanded = float(np.max(np.abs(preds_run1 - preds_run2)))
 
-    max_delta = float(np.max(np.abs(preds_run1 - preds_run2)))
+    ctrl_preds_run1 = _predict_dataset(
+        model, control["vit"], control["terr"], control["cls_logits"], device="cpu"
+    )
+    ctrl_preds_run2 = _predict_dataset(
+        model, control["vit"], control["terr"], control["cls_logits"], device="cpu"
+    )
+    max_delta_control = float(np.max(np.abs(ctrl_preds_run1 - ctrl_preds_run2)))
+
+    max_delta = max(max_delta_expanded, max_delta_control)
     tolerance = 1e-7
     if max_delta > tolerance:
         raise ValueError(
             f"Deterministic CPU inference failure: max absolute difference {max_delta} exceeds tolerance {tolerance}"
         )
 
-    pred_map = {p: float(pred) for p, pred in zip(image_paths, preds_run1)}
+    pred_map = {p: float(pred) for p, pred in zip(expanded["image_paths"], preds_run1)}
+    ctrl_pred_map = {
+        p: float(pred) for p, pred in zip(control["image_paths"], ctrl_preds_run1)
+    }
 
-    # 3. Benchmark processing helper
-    def process_benchmark(csv_path: Path, name: str) -> dict[str, Any]:
+    # 3. Benchmark processing helper: a benchmark resolves only against its own dataset
+    def process_benchmark(
+        csv_path: Path,
+        name: str,
+        path_map: dict[str, int],
+        split_map: dict[str, str],
+        dataset_pred_map: dict[str, float],
+    ) -> dict[str, Any]:
         records = _read_benchmark_csv(csv_path)
         if any("split" not in record for record in records):
             raise ValueError(f"Benchmark {name} requires an explicit split column")
@@ -378,10 +439,10 @@ def evaluate_active_baseline(
             if not image_path:
                 raise ValueError(f"Benchmark {name} record lacks image_path")
             image_path = str(image_path)
-            if image_path not in npz_path_map:
+            if image_path not in path_map:
                 missing_paths.append(image_path)
                 continue
-            if npz_split_map[image_path] != "test":
+            if split_map and split_map[image_path] != "test":
                 raise ValueError(
                     f"Benchmark {name} relabels non-test prepared identity: {image_path}"
                 )
@@ -402,7 +463,7 @@ def evaluate_active_baseline(
                         "slice",
                         record.get("terrain_type", record.get("region", "default")),
                     ),
-                    "pred": pred_map[image_path],
+                    "pred": dataset_pred_map[image_path],
                 }
             )
 
@@ -451,9 +512,21 @@ def evaluate_active_baseline(
             "region_metrics": region_results,
         }
 
-    # 4. Process expanded and control benchmarks & check disjoint identities
-    exp_res = process_benchmark(exp_csv_path, "expanded_human_benchmark")
-    ctrl_res = process_benchmark(ctrl_csv_path, "control_benchmark")
+    # 4. Evaluate each benchmark only against its corresponding dataset identity map
+    exp_res = process_benchmark(
+        exp_csv_path,
+        "expanded_human_benchmark",
+        expanded["path_map"],
+        expanded["split_map"],
+        pred_map,
+    )
+    ctrl_res = process_benchmark(
+        ctrl_csv_path,
+        "control_benchmark",
+        control["path_map"],
+        control["split_map"],
+        ctrl_pred_map,
+    )
 
     exp_test_paths = {r["image_path"] for r in exp_res["records"]}
     ctrl_test_paths = {r["image_path"] for r in ctrl_res["records"]}
@@ -508,6 +581,7 @@ def evaluate_active_baseline(
     summary = {
         "hashes": {
             "dataset_sha256": ds_sha256,
+            "control_dataset_sha256": ctrl_ds_sha256,
             "checkpoint_sha256": ckpt_sha256,
             "expanded_benchmark_sha256": exp_sha256,
             "control_benchmark_sha256": ctrl_sha256,
@@ -515,10 +589,14 @@ def evaluate_active_baseline(
         "deterministic_inference": {
             "tolerance": tolerance,
             "max_absolute_difference": max_delta,
+            "expanded_dataset_max_absolute_difference": max_delta_expanded,
+            "control_dataset_max_absolute_difference": max_delta_control,
         },
         "sample_counts": {
-            "dataset_total": dataset_total_samples,
-            "dataset_test": dataset_test_samples,
+            "dataset_total": expanded["total"],
+            "dataset_test": expanded["test"],
+            "control_dataset_total": control["total"],
+            "control_dataset_test": len(ctrl_res["records"]),
             "expanded_benchmark_test": len(exp_res["records"]),
             "control_benchmark_test": len(ctrl_res["records"]),
         },
@@ -554,6 +632,7 @@ reproduce_active_baseline = evaluate_active_baseline
 
 def evaluate_stage_two(
     dataset_path: str | Path,
+    control_dataset_path: str | Path,
     candidate_checkpoint: str | Path,
     baseline_checkpoint: str | Path,
     expanded_benchmark_csv: str | Path,
@@ -565,9 +644,14 @@ def evaluate_stage_two(
 ) -> dict[str, Any]:
     """
     Perform strict same-denominator Stage-Two evaluation of candidate vs baseline models.
-    Produces machine-readable compound decision JSON written to output_path.
+
+    Loads and infers the immutable expanded prepared NPZ and the canonical control
+    dataset NPZ independently; each benchmark is evaluated only against its own
+    dataset identity map. Produces machine-readable compound decision JSON written
+    to output_path.
     """
     dataset_path = Path(dataset_path)
+    control_dataset_path = Path(control_dataset_path)
     output_path = Path(output_path)
 
     if thresholds is None:
@@ -593,74 +677,26 @@ def evaluate_stage_two(
     # Route, stability, and complexity gates consume structured boolean evidence.
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset NPZ not found: {dataset_path}")
-    data_npz = np.load(dataset_path, allow_pickle=False)
-    required_npz_keys = {
-        "vit_embeddings",
-        "terrain_features",
-        "class_logits",
-        "scenic_scores",
-        "sample_weights",
-        "image_paths",
-        "label_sources",
-        "splits",
-    }
-    missing_npz = sorted(required_npz_keys - set(data_npz.files))
-    if missing_npz:
-        raise ValueError(
-            f"Dataset NPZ {dataset_path} missing required fields: {missing_npz}"
+    if not control_dataset_path.exists():
+        raise FileNotFoundError(
+            f"Control dataset NPZ not found: {control_dataset_path}"
         )
     if any(float(v) < 0 for v in thresh_dict.values() if isinstance(v, (int, float))):
         raise ValueError("Thresholds must not contain negative numeric values")
 
-    vit = data_npz["vit_embeddings"]
-    terr = data_npz["terrain_features"]
-    cls_logits = data_npz["class_logits"]
-    npz_scores = data_npz["scenic_scores"]
-    sample_weights = data_npz["sample_weights"]
-    image_paths_raw = data_npz["image_paths"]
-    splits_raw = data_npz["splits"]
+    # Load and validate the expanded and control NPZ datasets independently
+    expanded = _load_dataset_npz(dataset_path, require_embedded_splits=True)
+    control = _load_dataset_npz(
+        control_dataset_path, require_embedded_splits=False
+    )
 
-    n_samples = len(vit)
-    if not (
-        len(terr) == n_samples
-        and len(cls_logits) == n_samples
-        and len(npz_scores) == n_samples
-        and len(sample_weights) == n_samples
-        and len(image_paths_raw) == n_samples
-        and len(splits_raw) == n_samples
-    ):
-        raise ValueError("NPZ arrays length mismatch across required fields")
+    dataset_overlap = set(expanded["image_paths"]) & set(control["image_paths"])
+    if dataset_overlap:
+        raise ValueError(
+            f"Overlap detected between expanded and control prepared datasets: "
+            f"{sorted(dataset_overlap)}"
+        )
 
-    if not (
-        np.isfinite(vit).all()
-        and np.isfinite(terr).all()
-        and np.isfinite(cls_logits).all()
-        and np.isfinite(npz_scores).all()
-        and np.isfinite(sample_weights).all()
-    ):
-        raise ValueError("NPZ contains non-finite values (NaN or Inf)")
-
-    if np.any(sample_weights <= 0):
-        raise ValueError("NPZ sample_weights must be strictly positive (> 0)")
-
-    image_paths = [
-        str(p.decode("utf-8") if isinstance(p, bytes) else p) for p in image_paths_raw
-    ]
-    prepared_splits = [
-        str(value.decode("utf-8") if isinstance(value, bytes) else value)
-        .strip()
-        .lower()
-        for value in splits_raw
-    ]
-    if any(value not in {"train", "val", "test"} for value in prepared_splits):
-        raise ValueError("NPZ splits contain invalid values")
-
-    # Check for duplicate image_paths in NPZ
-    if len(image_paths) != len(set(image_paths)):
-        raise ValueError("Duplicate image_paths found in NPZ dataset")
-
-    npz_path_map = {p: i for i, p in enumerate(image_paths)}
-    npz_split_map = dict(zip(image_paths, prepared_splits, strict=True))
     min_supported_slice_samples = int(thresh_dict.get("min_supported_slice_samples", 5))
     resolved_device = resolve_device(device)
 
@@ -674,20 +710,61 @@ def evaluate_stage_two(
 
     candidate_sha256 = file_sha256(candidate_checkpoint)
     baseline_sha256 = file_sha256(baseline_checkpoint)
+    dataset_sha256 = file_sha256(dataset_path)
+    control_dataset_sha256 = file_sha256(control_dataset_path)
 
-    # 3. Model inference on entire NPZ
+    # 3. Model inference on both datasets independently
     cand_npz_preds = _predict_dataset(
-        candidate_model, vit, terr, cls_logits, device=resolved_device
+        candidate_model,
+        expanded["vit"],
+        expanded["terr"],
+        expanded["cls_logits"],
+        device=resolved_device,
     )
     base_npz_preds = _predict_dataset(
-        baseline_model, vit, terr, cls_logits, device=resolved_device
+        baseline_model,
+        expanded["vit"],
+        expanded["terr"],
+        expanded["cls_logits"],
+        device=resolved_device,
+    )
+    cand_ctrl_preds = _predict_dataset(
+        candidate_model,
+        control["vit"],
+        control["terr"],
+        control["cls_logits"],
+        device=resolved_device,
+    )
+    base_ctrl_preds = _predict_dataset(
+        baseline_model,
+        control["vit"],
+        control["terr"],
+        control["cls_logits"],
+        device=resolved_device,
     )
 
-    cand_pred_map = {p: float(pred) for p, pred in zip(image_paths, cand_npz_preds)}
-    base_pred_map = {p: float(pred) for p, pred in zip(image_paths, base_npz_preds)}
+    cand_pred_map = {
+        p: float(pred) for p, pred in zip(expanded["image_paths"], cand_npz_preds)
+    }
+    base_pred_map = {
+        p: float(pred) for p, pred in zip(expanded["image_paths"], base_npz_preds)
+    }
+    cand_ctrl_pred_map = {
+        p: float(pred) for p, pred in zip(control["image_paths"], cand_ctrl_preds)
+    }
+    base_ctrl_pred_map = {
+        p: float(pred) for p, pred in zip(control["image_paths"], base_ctrl_preds)
+    }
 
-    # Helper function to process benchmark CSV against NPZ predictions
-    def process_benchmark(csv_path: str | Path, name: str) -> dict[str, Any]:
+    # Helper function to process benchmark CSV against its own dataset's predictions
+    def process_benchmark(
+        csv_path: str | Path,
+        name: str,
+        path_map: dict[str, int],
+        split_map: dict[str, str],
+        cand_map: dict[str, float],
+        base_map: dict[str, float],
+    ) -> dict[str, Any]:
         records = _read_benchmark_csv(csv_path)
         if any("split" not in record for record in records):
             raise ValueError(f"Benchmark {name} requires an explicit split column")
@@ -718,10 +795,10 @@ def evaluate_stage_two(
             if not image_path:
                 raise ValueError(f"Benchmark {name} record lacks image_path")
             image_path = str(image_path)
-            if image_path not in npz_path_map:
+            if image_path not in path_map:
                 missing_paths.append(image_path)
                 continue
-            if npz_split_map[image_path] != "test":
+            if split_map and split_map[image_path] != "test":
                 raise ValueError(
                     f"Benchmark {name} relabels non-test prepared identity: "
                     f"{image_path}"
@@ -743,8 +820,8 @@ def evaluate_stage_two(
                         "slice",
                         record.get("terrain_type", record.get("region", "default")),
                     ),
-                    "cand_pred": cand_pred_map[image_path],
-                    "base_pred": base_pred_map[image_path],
+                    "cand_pred": cand_map[image_path],
+                    "base_pred": base_map[image_path],
                 }
             )
         if missing_paths:
@@ -806,9 +883,23 @@ def evaluate_stage_two(
             "worst_slice_mse": worst_slice_mse,
         }
 
-    # 4. Process Expanded Human Benchmark & Control Benchmark
-    exp_res = process_benchmark(expanded_benchmark_csv, "expanded_human_benchmark")
-    ctrl_res = process_benchmark(control_benchmark_csv, "control_benchmark")
+    # 4. Process each benchmark only against its corresponding dataset identity map
+    exp_res = process_benchmark(
+        expanded_benchmark_csv,
+        "expanded_human_benchmark",
+        expanded["path_map"],
+        expanded["split_map"],
+        cand_pred_map,
+        base_pred_map,
+    )
+    ctrl_res = process_benchmark(
+        control_benchmark_csv,
+        "control_benchmark",
+        control["path_map"],
+        control["split_map"],
+        cand_ctrl_pred_map,
+        base_ctrl_pred_map,
+    )
 
     exp_test_paths = {r["image_path"] for r in exp_res["records"]}
     ctrl_test_paths = {r["image_path"] for r in ctrl_res["records"]}
@@ -977,6 +1068,14 @@ def evaluate_stage_two(
         "baseline": {
             "checkpoint": str(baseline_checkpoint),
             "sha256": baseline_sha256,
+        },
+        "expanded_dataset": {
+            "path": str(dataset_path),
+            "sha256": dataset_sha256,
+        },
+        "control_dataset": {
+            "path": str(control_dataset_path),
+            "sha256": control_dataset_sha256,
         },
         "expanded_human_benchmark": {
             "region_metrics": exp_res["region_metrics"],

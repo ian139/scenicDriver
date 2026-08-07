@@ -141,15 +141,10 @@ def test_resume_loads_only_completed_and_valid_records(tmp_path: Path) -> None:
 def test_parse_args_max_seconds_default_and_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    test_args = [
-        "run_active_scenic_autoresearch.py",
-        "--expanded-benchmark-csv",
-        "exp.csv",
-        "--control-benchmark-csv",
-        "ctrl.csv",
-        "--route-qa-json",
-        "route.json",
-    ]
+    test_args = ["run_active_scenic_autoresearch.py",
+    "--expanded-benchmark-csv",
+    "exp.csv", "--control-benchmark-csv", "ctrl.csv", "--control-dataset", "ctrl.csv", "--route-qa-json",
+    "route.json",]
     monkeypatch.setattr(sys, "argv", test_args)
     parsed = parse_args()
     assert parsed.max_seconds == 1800.0
@@ -373,17 +368,12 @@ def test_deadline_guard_raises_immediately_if_expired() -> None:
 
 
 def test_parse_args_validates_run_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    test_args = [
-        "run_active_scenic_autoresearch.py",
-        "--run-name",
-        "valid_run_1",
-        "--expanded-benchmark-csv",
-        "exp.csv",
-        "--control-benchmark-csv",
-        "ctrl.csv",
-        "--route-qa-json",
-        "route.json",
-    ]
+    test_args = ["run_active_scenic_autoresearch.py",
+    "--run-name",
+    "valid_run_1",
+    "--expanded-benchmark-csv",
+    "exp.csv", "--control-benchmark-csv", "ctrl.csv", "--control-dataset", "ctrl.csv", "--route-qa-json",
+    "route.json",]
     monkeypatch.setattr(sys, "argv", test_args)
     parsed = parse_args()
     assert parsed.run_name == "valid_run_1"
@@ -391,43 +381,30 @@ def test_parse_args_validates_run_name(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
-        [
-            "run_active_scenic_autoresearch.py",
-            "--run-name",
-            "../traversal_run",
-            "--expanded-benchmark-csv",
-            "exp.csv",
-            "--control-benchmark-csv",
-            "ctrl.csv",
-            "--route-qa-json",
-            "route.json",
-        ],
+        ["run_active_scenic_autoresearch.py",
+        "--run-name",
+        "../traversal_run",
+        "--expanded-benchmark-csv",
+        "exp.csv", "--control-benchmark-csv", "ctrl.csv", "--control-dataset", "ctrl.csv", "--route-qa-json",
+        "route.json",],
     )
     with pytest.raises(ValueError, match="traversal"):
         parse_args()
 
 
 def test_experiment_digest_changes_on_config_or_input_change() -> None:
-    d1 = compute_experiment_digest(
-        exp_id="exp_01",
-        config={"seed": 42, "lr": 1e-4},
-        handoff_sha256="h1",
-        dataset_sha256="d1",
-        expanded_benchmark_sha256="eb1",
-        control_benchmark_sha256="cb1",
-        route_qa_sha256="rq1",
-        baseline_checkpoint_sha256="base1",
-    )
-    d2 = compute_experiment_digest(
-        exp_id="exp_01",
-        config={"seed": 43, "lr": 1e-4},
-        handoff_sha256="h1",
-        dataset_sha256="d1",
-        expanded_benchmark_sha256="eb1",
-        control_benchmark_sha256="cb1",
-        route_qa_sha256="rq1",
-        baseline_checkpoint_sha256="base1",
-    )
+    d1 = compute_experiment_digest(exp_id="exp_01",
+    config={"seed": 42, "lr": 1e-4},
+    handoff_sha256="h1", dataset_sha256="d1", control_dataset_sha256="control-dataset", expanded_benchmark_sha256="eb1",
+    control_benchmark_sha256="cb1",
+    route_qa_sha256="rq1",
+    baseline_checkpoint_sha256="base1",)
+    d2 = compute_experiment_digest(exp_id="exp_01",
+    config={"seed": 43, "lr": 1e-4},
+    handoff_sha256="h1", dataset_sha256="d1", control_dataset_sha256="control-dataset", expanded_benchmark_sha256="eb1",
+    control_benchmark_sha256="cb1",
+    route_qa_sha256="rq1",
+    baseline_checkpoint_sha256="base1",)
     assert d1 != d2
 
 
@@ -475,19 +452,14 @@ def test_run_dir_isolation_rejects_clobbering_without_resume(
     route_json = tmp_path / "route.json"
     route_json.write_text("{}", encoding="utf-8")
 
-    test_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "isolated_run",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    test_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "isolated_run",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", test_args)
 
     with pytest.raises(FileExistsError, match="already exists with run artifacts"):
@@ -519,20 +491,15 @@ def test_dry_run_never_creates_prepared_dataset_npz(
     route_json = tmp_path / "route.json"
     route_json.write_text("{}", encoding="utf-8")
 
-    test_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "dry_run_test",
-        "--dry-run",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    test_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "dry_run_test",
+    "--dry-run",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", test_args)
 
     with pytest.raises(SystemExit) as exc_info:
@@ -626,6 +593,7 @@ def test_resume_passes_resume_false_to_fresh_later_experiments(
         "baseline_checkpoint_sha256": compute_sha256(ckpt),
         "expanded_benchmark_sha256": compute_sha256(exp_csv),
         "control_benchmark_sha256": compute_sha256(ctrl_csv),
+        "control_dataset_sha256": compute_sha256(ctrl_csv),
         "route_qa_sha256": compute_sha256(route_json),
         "thresholds_sha256": compute_sha256(thresh_json),
         "dry_run": False,
@@ -638,6 +606,7 @@ def test_resume_passes_resume_false_to_fresh_later_experiments(
             "max_seconds": 1800.0,
             "expanded_benchmark_csv": str(exp_csv),
             "control_benchmark_csv": str(ctrl_csv),
+            "control_dataset": str(ctrl_csv),
             "route_qa_json": str(route_json),
             "thresholds_json": str(thresh_json),
         },
@@ -687,24 +656,19 @@ def test_resume_passes_resume_false_to_fresh_later_experiments(
     thresh_json = tmp_path / "thresholds.json"
     thresh_json.write_text("{}", encoding="utf-8")
 
-    test_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "run_resume_test",
-        "--resume",
-        "--max-experiments",
-        "2",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-        "--thresholds-json",
-        str(thresh_json),
-    ]
+    test_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "run_resume_test",
+    "--resume",
+    "--max-experiments",
+    "2",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),
+    "--thresholds-json",
+    str(thresh_json),]
 
     monkeypatch.setattr(sys, "argv", test_args)
     mod.main()
@@ -737,22 +701,17 @@ def test_resume_rejects_changed_material_config_or_input_without_manifest_overwr
     route_json = tmp_path / "route.json"
     route_json.write_text("{}", encoding="utf-8")
 
-    init_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "test_reject_drift",
-        "--dry-run",
-        "--seed",
-        "42",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    init_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "test_reject_drift",
+    "--dry-run",
+    "--seed",
+    "42",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", init_args)
 
     with pytest.raises(SystemExit) as exc:
@@ -765,22 +724,17 @@ def test_resume_rejects_changed_material_config_or_input_without_manifest_overwr
     manifest_path = run_dir / "run_manifest.json"
     original_manifest_text = manifest_path.read_text(encoding="utf-8")
 
-    resume_changed_seed_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "test_reject_drift",
-        "--resume",
-        "--seed",
-        "999",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    resume_changed_seed_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "test_reject_drift",
+    "--resume",
+    "--seed",
+    "999",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", resume_changed_seed_args)
 
     with pytest.raises(
@@ -792,22 +746,17 @@ def test_resume_rejects_changed_material_config_or_input_without_manifest_overwr
 
     exp_csv.write_text("header_modified_data", encoding="utf-8")
 
-    resume_changed_input_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "test_reject_drift",
-        "--resume",
-        "--seed",
-        "42",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    resume_changed_input_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "test_reject_drift",
+    "--resume",
+    "--seed",
+    "42",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", resume_changed_input_args)
 
     with pytest.raises(
@@ -843,22 +792,17 @@ def test_resume_allows_varying_max_seconds_timing_budget(
     route_json = tmp_path / "route.json"
     route_json.write_text("{}", encoding="utf-8")
 
-    init_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "test_timing_budget",
-        "--dry-run",
-        "--max-seconds",
-        "1000",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    init_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "test_timing_budget",
+    "--dry-run",
+    "--max-seconds",
+    "1000",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", init_args)
 
     with pytest.raises(SystemExit) as exc:
@@ -871,23 +815,18 @@ def test_resume_allows_varying_max_seconds_timing_budget(
     manifest_path = run_dir / "run_manifest.json"
     original_manifest_text = manifest_path.read_text(encoding="utf-8")
 
-    resume_timing_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "test_timing_budget",
-        "--dry-run",
-        "--resume",
-        "--max-seconds",
-        "3600",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    resume_timing_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "test_timing_budget",
+    "--dry-run",
+    "--resume",
+    "--max-seconds",
+    "3600",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", resume_timing_args)
 
     with pytest.raises(SystemExit) as exc:
@@ -931,20 +870,15 @@ def test_resume_requires_existing_manifest(
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "experiments.jsonl").write_text("", encoding="utf-8")
 
-    resume_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "missing_manifest_run",
-        "--resume",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    resume_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "missing_manifest_run",
+    "--resume",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", resume_args)
 
     with pytest.raises(FileNotFoundError, match="run manifest missing"):
@@ -975,20 +909,15 @@ def test_resume_rejects_deleted_manifest_keys(
     route_json = tmp_path / "route.json"
     route_json.write_text("{}", encoding="utf-8")
 
-    init_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "test_del_keys",
-        "--dry-run",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    init_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "test_del_keys",
+    "--dry-run",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", init_args)
 
     with pytest.raises(SystemExit) as exc:
@@ -1005,20 +934,15 @@ def test_resume_rejects_deleted_manifest_keys(
     corrupted_text = json.dumps(manifest_data)
     manifest_path.write_text(corrupted_text, encoding="utf-8")
 
-    resume_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "test_del_keys",
-        "--resume",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    resume_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "test_del_keys",
+    "--resume",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", resume_args)
 
     with pytest.raises(
@@ -1106,19 +1030,15 @@ def test_resume_uses_immutable_manifest_baseline_sha(
         encoding="utf-8",
     )
 
-    exp_digest = compute_experiment_digest(
-        exp_id="exp_01_baseline_control",
-        config=build_candidate_ladder(ActiveTrainingConfig(seed=42), 1)[0]["config"],
-        handoff_sha256=compute_sha256(handoff),
-        dataset_sha256=compute_sha256(run_dir / "prepared_dataset.npz")
-        if (run_dir / "prepared_dataset.npz").exists()
-        else "pending_preparation",
-        expanded_benchmark_sha256=compute_sha256(exp_csv),
-        control_benchmark_sha256=compute_sha256(ctrl_csv),
-        route_qa_sha256=compute_sha256(route_json),
-        baseline_checkpoint_sha256=baseline_sha,
-        thresholds_sha256=None,
-    )
+    exp_digest = compute_experiment_digest(exp_id="exp_01_baseline_control",
+    config=build_candidate_ladder(ActiveTrainingConfig(seed=42), 1)[0]["config"],
+    handoff_sha256=compute_sha256(handoff), dataset_sha256=compute_sha256(run_dir / "prepared_dataset.npz")
+    if (run_dir / "prepared_dataset.npz").exists()
+    else "pending_preparation", control_dataset_sha256="control-dataset", expanded_benchmark_sha256=compute_sha256(exp_csv),
+    control_benchmark_sha256=compute_sha256(ctrl_csv),
+    route_qa_sha256=compute_sha256(route_json),
+    baseline_checkpoint_sha256=baseline_sha,
+    thresholds_sha256=None,)
 
     exp_record = {
         "exp_id": "exp_01_baseline_control",
@@ -1142,27 +1062,22 @@ def test_resume_uses_immutable_manifest_baseline_sha(
 
 
 def test_parse_args_max_experiments_validation(monkeypatch: pytest.MonkeyPatch) -> None:
-    test_args = [
-        "run_active_scenic_autoresearch.py",
-        "--expanded-benchmark-csv",
-        "exp.csv",
-        "--control-benchmark-csv",
-        "ctrl.csv",
-        "--route-qa-json",
-        "route.json",
-        "--max-experiments",
-        "0",
-    ]
+    test_args = ["run_active_scenic_autoresearch.py",
+    "--expanded-benchmark-csv",
+    "exp.csv", "--control-benchmark-csv", "ctrl.csv", "--control-dataset", "ctrl.csv", "--route-qa-json",
+    "route.json",
+    "--max-experiments",
+    "0",]
     monkeypatch.setattr(sys, "argv", test_args)
     with pytest.raises(ValueError, match="--max-experiments must be between 1 and 5"):
         parse_args()
 
-    test_args[8] = "6"
+    test_args[10] = "6"
     monkeypatch.setattr(sys, "argv", test_args)
     with pytest.raises(ValueError, match="--max-experiments must be between 1 and 5"):
         parse_args()
 
-    test_args[8] = "3"
+    test_args[10] = "3"
     monkeypatch.setattr(sys, "argv", test_args)
     parsed = parse_args()
     assert parsed.max_experiments == 3
@@ -1193,61 +1108,46 @@ def test_resume_rejects_dry_run_or_promote_intent_drift(
     route_json.write_text("{}", encoding="utf-8")
 
     # Create dry_run manifest
-    init_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "mode_drift_test",
-        "--dry-run",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    init_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "mode_drift_test",
+    "--dry-run",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", init_args)
     with pytest.raises(SystemExit) as exc:
         mod.main()
     assert exc.value.code == 0
 
     # Attempt to resume dry_run plan into real training without --dry-run
-    resume_non_dry_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "mode_drift_test",
-        "--resume",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    resume_non_dry_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "mode_drift_test",
+    "--resume",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", resume_non_dry_args)
     with pytest.raises(ValueError, match="manifest validation failed|dry_run mismatch"):
         mod.main()
 
     # Attempt to resume with --promote when manifest had promote_requested=False
-    resume_promote_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "mode_drift_test",
-        "--dry-run",
-        "--resume",
-        "--promote",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    resume_promote_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "mode_drift_test",
+    "--dry-run",
+    "--resume",
+    "--promote",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", resume_promote_args)
     with pytest.raises(
         ValueError, match="manifest validation failed|promote_requested mismatch"
@@ -1301,6 +1201,7 @@ def test_resume_with_completed_summary_without_eval_decision(
         "baseline_checkpoint_sha256": compute_sha256(ckpt),
         "expanded_benchmark_sha256": compute_sha256(exp_csv),
         "control_benchmark_sha256": compute_sha256(ctrl_csv),
+        "control_dataset_sha256": compute_sha256(ctrl_csv),
         "route_qa_sha256": compute_sha256(route_json),
         "thresholds_sha256": compute_sha256(thresh_json),
         "dry_run": False,
@@ -1313,6 +1214,7 @@ def test_resume_with_completed_summary_without_eval_decision(
             "max_seconds": 1800.0,
             "expanded_benchmark_csv": str(exp_csv),
             "control_benchmark_csv": str(ctrl_csv),
+            "control_dataset": str(ctrl_csv),
             "route_qa_json": str(route_json),
             "thresholds_json": str(thresh_json),
         },
@@ -1362,24 +1264,19 @@ def test_resume_with_completed_summary_without_eval_decision(
     thresh_json = tmp_path / "thresholds.json"
     thresh_json.write_text("{}", encoding="utf-8")
 
-    test_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "run_completed_no_eval",
-        "--resume",
-        "--max-experiments",
-        "1",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-        "--thresholds-json",
-        str(thresh_json),
-    ]
+    test_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "run_completed_no_eval",
+    "--resume",
+    "--max-experiments",
+    "1",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),
+    "--thresholds-json",
+    str(thresh_json),]
 
     monkeypatch.setattr(sys, "argv", test_args)
     mod.main()
@@ -1421,20 +1318,15 @@ def test_status_mode_fails_closed_on_missing_or_malformed_manifest(
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "experiments.jsonl").write_text("", encoding="utf-8")
 
-    status_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "status_missing_manifest",
-        "--status",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    status_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "status_missing_manifest",
+    "--status",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", status_args)
 
     with pytest.raises(FileNotFoundError, match="manifest missing"):
@@ -1527,17 +1419,13 @@ def test_status_mode_after_promotion(
         encoding="utf-8",
     )
 
-    exp_digest = compute_experiment_digest(
-        exp_id="exp_01_baseline_control",
-        config=build_candidate_ladder(ActiveTrainingConfig(seed=42), 1)[0]["config"],
-        handoff_sha256=compute_sha256(handoff),
-        dataset_sha256="pending_preparation",
-        expanded_benchmark_sha256=compute_sha256(exp_csv),
-        control_benchmark_sha256=compute_sha256(ctrl_csv),
-        route_qa_sha256=compute_sha256(route_json),
-        baseline_checkpoint_sha256=original_base_sha,
-        thresholds_sha256=None,
-    )
+    exp_digest = compute_experiment_digest(exp_id="exp_01_baseline_control",
+    config=build_candidate_ladder(ActiveTrainingConfig(seed=42), 1)[0]["config"],
+    handoff_sha256=compute_sha256(handoff), dataset_sha256="pending_preparation", control_dataset_sha256="control-dataset", expanded_benchmark_sha256=compute_sha256(exp_csv),
+    control_benchmark_sha256=compute_sha256(ctrl_csv),
+    route_qa_sha256=compute_sha256(route_json),
+    baseline_checkpoint_sha256=original_base_sha,
+    thresholds_sha256=None,)
 
     exp_record = {
         "exp_id": "exp_01_baseline_control",
@@ -1559,20 +1447,15 @@ def test_status_mode_after_promotion(
         json.dumps({"active": {"checkpoint": str(new_promoted_ckpt)}}), encoding="utf-8"
     )
 
-    status_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "status_post_promo",
-        "--status",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    status_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "status_post_promo",
+    "--status",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", status_args)
 
     with pytest.raises(SystemExit) as exc:
@@ -1596,20 +1479,15 @@ def test_validate_handoff_preflight_called(
 
     monkeypatch.setattr(mod, "validate_handoff", _fail_preflight)
 
-    test_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "preflight_fail_test",
-        "--dry-run",
-        "--expanded-benchmark-csv",
-        "exp.csv",
-        "--control-benchmark-csv",
-        "ctrl.csv",
-        "--route-qa-json",
-        "route.json",
-    ]
+    test_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "preflight_fail_test",
+    "--dry-run",
+    "--expanded-benchmark-csv",
+    "exp.csv", "--control-benchmark-csv", "ctrl.csv", "--control-dataset", "ctrl.csv", "--route-qa-json",
+    "route.json",]
     monkeypatch.setattr(sys, "argv", test_args)
 
     with pytest.raises(SystemExit) as exc:
@@ -1649,19 +1527,14 @@ def test_thresholds_missing_fails_before_preparation(
 
     monkeypatch.setattr(mod, "prepare_active_dataset", mock_prep)
 
-    test_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "thresh_missing_test",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-    ]
+    test_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "thresh_missing_test",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),]
     monkeypatch.setattr(sys, "argv", test_args)
 
     with pytest.raises(ValueError, match="--thresholds-json is required for non-dry execution"):
@@ -1753,24 +1626,19 @@ def test_data_limited_mode_skips_eval_and_promotion(
     monkeypatch.setattr(mod, "evaluate_stage_two", mock_eval)
     monkeypatch.setattr(mod, "promote_from_decision", mock_promo)
 
-    test_args = [
-        "run_active_scenic_autoresearch.py",
-        "--handoff",
-        str(handoff),
-        "--run-name",
-        "data_limited_run",
-        "--max-experiments",
-        "2",
-        "--expanded-benchmark-csv",
-        str(exp_csv),
-        "--control-benchmark-csv",
-        str(ctrl_csv),
-        "--route-qa-json",
-        str(route_json),
-        "--thresholds-json",
-        str(thresh_json),
-        "--promote",
-    ]
+    test_args = ["run_active_scenic_autoresearch.py",
+    "--handoff",
+    str(handoff),
+    "--run-name",
+    "data_limited_run",
+    "--max-experiments",
+    "2",
+    "--expanded-benchmark-csv",
+    str(exp_csv), "--control-benchmark-csv", str(ctrl_csv), "--control-dataset", str(ctrl_csv), "--route-qa-json",
+    str(route_json),
+    "--thresholds-json",
+    str(thresh_json),
+    "--promote",]
     monkeypatch.setattr(sys, "argv", test_args)
 
     mod.main()

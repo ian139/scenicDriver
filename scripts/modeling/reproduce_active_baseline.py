@@ -24,6 +24,12 @@ def parse_args() -> argparse.Namespace:
         "--dataset", type=Path, required=True, help="Path to exported .npz dataset"
     )
     parser.add_argument(
+        "--control-dataset",
+        type=Path,
+        required=True,
+        help="Path to canonical control feature dataset .npz",
+    )
+    parser.add_argument(
         "--checkpoint",
         type=Path,
         required=True,
@@ -55,6 +61,7 @@ def main() -> None:
 
     result = evaluate_active_baseline(
         dataset_path=args.dataset,
+        control_dataset_path=args.control_dataset,
         checkpoint_path=args.checkpoint,
         expanded_benchmark_csv=args.expanded_benchmark,
         control_benchmark_csv=args.control_benchmark,
@@ -68,6 +75,8 @@ def main() -> None:
     cal = result["calibration_distribution_summary"]["expanded_human_benchmark"]
 
     print(f"METRIC dataset_test_samples={counts['dataset_test']}")
+    print(f"METRIC control_dataset_total_samples={counts['control_dataset_total']}")
+    print(f"METRIC control_dataset_test_samples={counts['control_dataset_test']}")
     print(f"METRIC expanded_benchmark_test_samples={counts['expanded_benchmark_test']}")
     print(f"METRIC control_benchmark_test_samples={counts['control_benchmark_test']}")
     print(f"METRIC expanded_mae={exp_metrics['mae']:.6f}")

@@ -114,6 +114,7 @@ def compute_experiment_digest(
     config: Any,
     handoff_sha256: str,
     dataset_sha256: str,
+    control_dataset_sha256: str,
     expanded_benchmark_sha256: str,
     control_benchmark_sha256: str,
     route_qa_sha256: str,
@@ -131,6 +132,7 @@ def compute_experiment_digest(
         "config": cfg_dict,
         "handoff_sha256": handoff_sha256,
         "dataset_sha256": dataset_sha256,
+        "control_dataset_sha256": control_dataset_sha256,
         "expanded_benchmark_sha256": expanded_benchmark_sha256,
         "control_benchmark_sha256": control_benchmark_sha256,
         "route_qa_sha256": route_qa_sha256,
@@ -542,6 +544,7 @@ def validate_run_manifest(
     handoff_sha256: str,
     baseline_registry_sha256: str,
     baseline_checkpoint_sha256: str,
+    control_dataset_sha256: str,
     expanded_benchmark_sha256: str,
     control_benchmark_sha256: str,
     route_qa_sha256: str,
@@ -572,6 +575,7 @@ def validate_run_manifest(
         ("stage1_handoff_sha256", handoff_sha256),
         ("baseline_registry_sha256", baseline_registry_sha256),
         ("baseline_checkpoint_sha256", baseline_checkpoint_sha256),
+        ("control_dataset_sha256", control_dataset_sha256),
         ("expanded_benchmark_sha256", expanded_benchmark_sha256),
         ("control_benchmark_sha256", control_benchmark_sha256),
         ("route_qa_sha256", route_qa_sha256),
@@ -598,6 +602,7 @@ def validate_run_manifest(
             ("max_steps", args.max_steps),
             ("expanded_benchmark_csv", str(args.expanded_benchmark_csv)),
             ("control_benchmark_csv", str(args.control_benchmark_csv)),
+            ("control_dataset", str(args.control_dataset)),
             ("route_qa_json", str(args.route_qa_json)),
             (
                 "thresholds_json",
@@ -734,6 +739,12 @@ def parse_args() -> argparse.Namespace:
         help="New England control benchmark CSV",
     )
     parser.add_argument(
+        "--control-dataset",
+        type=Path,
+        required=True,
+        help="Canonical control feature dataset NPZ (disjoint from expanded prepared dataset)",
+    )
+    parser.add_argument(
         "--route-qa-json",
         type=Path,
         required=True,
@@ -793,6 +804,7 @@ def main() -> None:
     required_inputs = {
         "expanded benchmark": args.expanded_benchmark_csv,
         "control benchmark": args.control_benchmark_csv,
+        "control dataset NPZ": args.control_dataset,
         "route QA evidence": args.route_qa_json,
     }
     if args.thresholds_json:
@@ -901,6 +913,7 @@ def main() -> None:
     # Compute Input Hashes
     expanded_benchmark_sha256 = compute_sha256(args.expanded_benchmark_csv)
     control_benchmark_sha256 = compute_sha256(args.control_benchmark_csv)
+    control_dataset_sha256 = compute_sha256(args.control_dataset)
     route_qa_sha256 = compute_sha256(args.route_qa_json)
     thresholds_sha256 = (
         compute_sha256(args.thresholds_json)
@@ -940,6 +953,7 @@ def main() -> None:
             handoff_sha256=handoff_sha256,
             baseline_registry_sha256=baseline_registry_sha256,
             baseline_checkpoint_sha256=baseline_checkpoint_sha256,
+            control_dataset_sha256=control_dataset_sha256,
             expanded_benchmark_sha256=expanded_benchmark_sha256,
             control_benchmark_sha256=control_benchmark_sha256,
             route_qa_sha256=route_qa_sha256,
@@ -964,6 +978,8 @@ def main() -> None:
             "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
             "expanded_benchmark_sha256": expanded_benchmark_sha256,
             "control_benchmark_sha256": control_benchmark_sha256,
+            "control_dataset_path": str(args.control_dataset),
+            "control_dataset_sha256": control_dataset_sha256,
             "route_qa_sha256": route_qa_sha256,
             "thresholds_sha256": thresholds_sha256,
             "expanded_val_support": observed_val_samples,
@@ -984,6 +1000,7 @@ def main() -> None:
                 "max_seconds": args.max_seconds,
                 "expanded_benchmark_csv": str(args.expanded_benchmark_csv),
                 "control_benchmark_csv": str(args.control_benchmark_csv),
+                "control_dataset": str(args.control_dataset),
                 "route_qa_json": str(args.route_qa_json),
                 "thresholds_json": (
                     str(args.thresholds_json) if args.thresholds_json else None
@@ -995,6 +1012,7 @@ def main() -> None:
     # 4. Build Experiment Ladder
     base_config = ActiveTrainingConfig(
         seed=args.seed,
+        device=args.device,
         max_steps=args.max_steps,
     )
     ladder = build_candidate_ladder(base_config, args.max_experiments)
@@ -1018,6 +1036,7 @@ def main() -> None:
             config=exp["config"],
             handoff_sha256=handoff_sha256,
             dataset_sha256=dataset_sha256_dry,
+            control_dataset_sha256=control_dataset_sha256,
             expanded_benchmark_sha256=expanded_benchmark_sha256,
             control_benchmark_sha256=control_benchmark_sha256,
             route_qa_sha256=route_qa_sha256,
@@ -1086,6 +1105,7 @@ def main() -> None:
             config=exp["config"],
             handoff_sha256=handoff_sha256,
             dataset_sha256=dataset_sha256,
+            control_dataset_sha256=control_dataset_sha256,
             expanded_benchmark_sha256=expanded_benchmark_sha256,
             control_benchmark_sha256=control_benchmark_sha256,
             route_qa_sha256=route_qa_sha256,
@@ -1236,6 +1256,7 @@ def main() -> None:
                 with deadline_guard(remaining_eval):
                     eval_result = evaluate_stage_two(
                         dataset_path=dataset_path,
+                        control_dataset_path=args.control_dataset,
                         candidate_checkpoint=candidate_ckpt,
                         baseline_checkpoint=baseline_checkpoint_path,
                         expanded_benchmark_csv=args.expanded_benchmark_csv,

@@ -178,8 +178,11 @@ def test_evaluate_stage_two_filters_only_split_test_rows(tmp_path: Path) -> None
     ]
     dataset_path = create_npz_dataset(
         tmp_path / "dataset.npz",
-        images,
-        splits=["test", "test", "train", "val", "test", "test"],
+        ["img1.jpg", "img2.jpg", "img3.jpg", "img4.jpg"],
+        splits=["test", "test", "train", "val"],
+    )
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img5.jpg", "img6.jpg"]
     )
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt", bias_shift=0.0)
@@ -241,6 +244,7 @@ def test_evaluate_stage_two_filters_only_split_test_rows(tmp_path: Path) -> None
 
     decision = evaluate_stage_two(
         dataset_path=dataset_path,
+        control_dataset_path=control_dataset_path,
         candidate_checkpoint=cand_ckpt,
         baseline_checkpoint=base_ckpt,
         expanded_benchmark_csv=exp_csv,
@@ -259,6 +263,9 @@ def test_evaluate_stage_two_rejects_missing_split_or_no_test_rows(
 ) -> None:
     images = ["img1.jpg", "img2.jpg"]
     dataset_path = create_npz_dataset(tmp_path / "dataset.npz", images)
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img3.jpg"]
+    )
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
     route_qa = create_route_qa_json(tmp_path / "route_qa.json")
@@ -280,7 +287,7 @@ def test_evaluate_stage_two_rejects_missing_split_or_no_test_rows(
         tmp_path / "ctrl.csv",
         [
             {
-                "image_path": "img1.jpg",
+                "image_path": "img3.jpg",
                 "split": "test",
                 "scenic_human_mean": "4.0",
                 "region": "r1",
@@ -291,6 +298,7 @@ def test_evaluate_stage_two_rejects_missing_split_or_no_test_rows(
     with pytest.raises(ValueError, match="requires an explicit split column"):
         evaluate_stage_two(
             dataset_path=dataset_path,
+            control_dataset_path=control_dataset_path,
             candidate_checkpoint=cand_ckpt,
             baseline_checkpoint=base_ckpt,
             expanded_benchmark_csv=exp_no_split,
@@ -316,6 +324,7 @@ def test_evaluate_stage_two_rejects_missing_split_or_no_test_rows(
     with pytest.raises(ValueError, match="contains no split=test rows"):
         evaluate_stage_two(
             dataset_path=dataset_path,
+            control_dataset_path=control_dataset_path,
             candidate_checkpoint=cand_ckpt,
             baseline_checkpoint=base_ckpt,
             expanded_benchmark_csv=exp_train_only,
@@ -342,6 +351,7 @@ def test_evaluate_stage_two_rejects_missing_split_or_no_test_rows(
     with pytest.raises(ValueError, match="relabels non-test prepared identity"):
         evaluate_stage_two(
             dataset_path=split_bound_dataset,
+            control_dataset_path=control_dataset_path,
             candidate_checkpoint=cand_ckpt,
             baseline_checkpoint=base_ckpt,
             expanded_benchmark_csv=exp_relabels_train,
@@ -355,6 +365,9 @@ def test_evaluate_stage_two_rejects_missing_split_or_no_test_rows(
 def test_evaluate_stage_two_rejects_weak_only_targets(tmp_path: Path) -> None:
     images = ["img1.jpg"]
     dataset_path = create_npz_dataset(tmp_path / "dataset.npz", images)
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img2.jpg"]
+    )
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
     route_qa = create_route_qa_json(tmp_path / "route_qa.json")
@@ -376,7 +389,7 @@ def test_evaluate_stage_two_rejects_weak_only_targets(tmp_path: Path) -> None:
         tmp_path / "ctrl.csv",
         [
             {
-                "image_path": "img1.jpg",
+                "image_path": "img2.jpg",
                 "split": "test",
                 "scenic_human_mean": "4.0",
                 "region": "r1",
@@ -390,6 +403,7 @@ def test_evaluate_stage_two_rejects_weak_only_targets(tmp_path: Path) -> None:
     ):
         evaluate_stage_two(
             dataset_path=dataset_path,
+            control_dataset_path=control_dataset_path,
             candidate_checkpoint=cand_ckpt,
             baseline_checkpoint=base_ckpt,
             expanded_benchmark_csv=exp_weak_only,
@@ -413,6 +427,7 @@ def test_evaluate_stage_two_rejects_weak_only_targets(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match=r"finite and in \[0, 10\]"):
         evaluate_stage_two(
             dataset_path=dataset_path,
+            control_dataset_path=control_dataset_path,
             candidate_checkpoint=cand_ckpt,
             baseline_checkpoint=base_ckpt,
             expanded_benchmark_csv=out_of_range,
@@ -424,8 +439,11 @@ def test_evaluate_stage_two_rejects_weak_only_targets(tmp_path: Path) -> None:
 
 
 def test_evaluate_stage_two_denominator_and_hash_reporting(tmp_path: Path) -> None:
-    images = ["img1.jpg", "img2.jpg", "img3.jpg", "img4.jpg"]
+    images = ["img1.jpg", "img2.jpg"]
     dataset_path = create_npz_dataset(tmp_path / "dataset.npz", images)
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img3.jpg", "img4.jpg"]
+    )
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt", bias_shift=0.0)
 
@@ -472,6 +490,7 @@ def test_evaluate_stage_two_denominator_and_hash_reporting(tmp_path: Path) -> No
 
     decision = evaluate_stage_two(
         dataset_path=dataset_path,
+        control_dataset_path=control_dataset_path,
         candidate_checkpoint=cand_ckpt,
         baseline_checkpoint=base_ckpt,
         expanded_benchmark_csv=exp_csv,
@@ -501,6 +520,7 @@ def test_evaluate_stage_two_denominator_and_hash_reporting(tmp_path: Path) -> No
     with pytest.raises(ValueError, match="absent from the prepared dataset"):
         evaluate_stage_two(
             dataset_path=dataset_path,
+            control_dataset_path=control_dataset_path,
             candidate_checkpoint=cand_ckpt,
             baseline_checkpoint=base_ckpt,
             expanded_benchmark_csv=exp_absent_path,
@@ -512,8 +532,11 @@ def test_evaluate_stage_two_denominator_and_hash_reporting(tmp_path: Path) -> No
 
 
 def test_evaluate_stage_two_passing_decision_schema_and_gates(tmp_path: Path) -> None:
-    images = ["img1.jpg", "img2.jpg", "img3.jpg", "img4.jpg"]
+    images = ["img3.jpg", "img4.jpg"]
     dataset_path = create_npz_dataset(tmp_path / "dataset.npz", images)
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img1.jpg", "img2.jpg"]
+    )
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.0)
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt", bias_shift=0.0)
 
@@ -560,6 +583,7 @@ def test_evaluate_stage_two_passing_decision_schema_and_gates(tmp_path: Path) ->
 
     decision = evaluate_stage_two(
         dataset_path=dataset_path,
+        control_dataset_path=control_dataset_path,
         candidate_checkpoint=cand_ckpt,
         baseline_checkpoint=base_ckpt,
         expanded_benchmark_csv=exp_csv,
@@ -574,6 +598,8 @@ def test_evaluate_stage_two_passing_decision_schema_and_gates(tmp_path: Path) ->
         "all_gates_pass",
         "candidate",
         "baseline",
+        "expanded_dataset",
+        "control_dataset",
         "expanded_human_benchmark",
         "control_benchmark",
         "calibration_and_distribution",
@@ -582,6 +608,8 @@ def test_evaluate_stage_two_passing_decision_schema_and_gates(tmp_path: Path) ->
         "gates",
     }
     assert set(decision.keys()) == expected_top_keys
+    assert decision["expanded_dataset"]["sha256"] == _sha(dataset_path)
+    assert decision["control_dataset"]["sha256"] == _sha(control_dataset_path)
     assert decision["all_gates_pass"], decision["gates"]
 
     # Verify structured distribution, regional, route, stability, and complexity evidence.
@@ -600,6 +628,7 @@ def test_evaluate_stage_two_passing_decision_schema_and_gates(tmp_path: Path) ->
     )
     decision_failed = evaluate_stage_two(
         dataset_path=dataset_path,
+        control_dataset_path=control_dataset_path,
         candidate_checkpoint=cand_ckpt,
         baseline_checkpoint=base_ckpt,
         expanded_benchmark_csv=exp_csv,
@@ -957,6 +986,9 @@ def test_evaluate_stage_two_rejects_paused_or_legacy_candidate(
 ) -> None:
     images = ["img1.jpg", "img2.jpg"]
     ds_path = create_npz_dataset(tmp_path / "ds.npz", images)
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img3.jpg"]
+    )
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
     exp_csv = create_benchmark_csv(
         tmp_path / "exp.csv",
@@ -1003,6 +1035,7 @@ def test_evaluate_stage_two_rejects_paused_or_legacy_candidate(
     with pytest.raises(ValueError, match="checkpoint_state must be 'completed'"):
         evaluate_stage_two(
             dataset_path=ds_path,
+            control_dataset_path=control_dataset_path,
             candidate_checkpoint=paused_cand,
             baseline_checkpoint=base_ckpt,
             expanded_benchmark_csv=exp_csv,
@@ -1017,6 +1050,7 @@ def test_evaluate_stage_two_rejects_paused_or_legacy_candidate(
     with pytest.raises(ValueError, match="missing required keys"):
         evaluate_stage_two(
             dataset_path=ds_path,
+            control_dataset_path=control_dataset_path,
             candidate_checkpoint=legacy_cand,
             baseline_checkpoint=base_ckpt,
             expanded_benchmark_csv=exp_csv,
@@ -1028,8 +1062,11 @@ def test_evaluate_stage_two_rejects_paused_or_legacy_candidate(
 
 
 def test_evaluate_stage_two_accepts_legacy_baseline(tmp_path: Path) -> None:
-    images = ["img1.jpg", "img2.jpg", "img3.jpg", "img4.jpg"]
+    images = ["img1.jpg", "img2.jpg"]
     ds_path = create_npz_dataset(tmp_path / "ds.npz", images)
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img3.jpg", "img4.jpg"]
+    )
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
     legacy_base_ckpt = create_legacy_checkpoint(tmp_path / "legacy_base.pt")
 
@@ -1062,6 +1099,7 @@ def test_evaluate_stage_two_accepts_legacy_baseline(tmp_path: Path) -> None:
 
     decision = evaluate_stage_two(
         dataset_path=ds_path,
+        control_dataset_path=control_dataset_path,
         candidate_checkpoint=cand_ckpt,
         baseline_checkpoint=legacy_base_ckpt,
         expanded_benchmark_csv=exp_csv,
@@ -1073,13 +1111,17 @@ def test_evaluate_stage_two_accepts_legacy_baseline(tmp_path: Path) -> None:
     assert decision["gates"]["integrity_pass"] is True
 
 
-def test_evaluate_stage_two_rejects_benchmark_overlap(tmp_path: Path) -> None:
+def test_evaluate_stage_two_rejects_dataset_overlap(tmp_path: Path) -> None:
     images = ["img1.jpg", "img2.jpg"]
     ds_path = create_npz_dataset(tmp_path / "ds.npz", images)
+    # Control dataset must be disjoint from the expanded prepared dataset: img1.jpg
+    # appears in both, so evaluation must fail closed before any benchmark work.
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img1.jpg"]
+    )
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
 
-    # Both expanded and control contain split=test for img1.jpg
     exp_csv = create_benchmark_csv(
         tmp_path / "exp.csv",
         [
@@ -1112,10 +1154,11 @@ def test_evaluate_stage_two_rejects_benchmark_overlap(tmp_path: Path) -> None:
     out_json = tmp_path / "dec.json"
 
     with pytest.raises(
-        ValueError, match="Overlap detected between expanded and control benchmark"
+        ValueError, match="Overlap detected between expanded and control prepared datasets"
     ):
         evaluate_stage_two(
             dataset_path=ds_path,
+            control_dataset_path=control_dataset_path,
             candidate_checkpoint=cand_ckpt,
             baseline_checkpoint=base_ckpt,
             expanded_benchmark_csv=exp_csv,
@@ -1127,8 +1170,11 @@ def test_evaluate_stage_two_rejects_benchmark_overlap(tmp_path: Path) -> None:
 
 
 def test_evaluate_stage_two_rejects_malformed_routes(tmp_path: Path) -> None:
-    images = ["img1.jpg", "img2.jpg", "img3.jpg", "img4.jpg"]
+    images = ["img1.jpg", "img2.jpg"]
     ds_path = create_npz_dataset(tmp_path / "ds.npz", images)
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img3.jpg", "img4.jpg"]
+    )
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
 
@@ -1190,6 +1236,7 @@ def test_evaluate_stage_two_rejects_malformed_routes(tmp_path: Path) -> None:
         out_json = tmp_path / f"dec_{i}.json"
         decision = evaluate_stage_two(
             dataset_path=ds_path,
+            control_dataset_path=control_dataset_path,
             candidate_checkpoint=cand_ckpt,
             baseline_checkpoint=base_ckpt,
             expanded_benchmark_csv=exp_csv,
@@ -1405,10 +1452,14 @@ def test_evaluate_active_baseline_success(tmp_path: Path) -> None:
     ckpt = create_legacy_checkpoint(tmp_path / "baseline.pt")
     npz_path = create_npz_dataset(
         tmp_path / "dataset.npz",
-        image_paths=["img1.jpg", "img2.jpg", "img3.jpg", "img4.jpg"],
-        splits=["test", "test", "test", "test"],
+        image_paths=["img1.jpg", "img2.jpg"],
+        splits=["test", "test"],
     )
-
+    control_npz = create_npz_dataset(
+        tmp_path / "control_dataset.npz",
+        image_paths=["img3.jpg", "img4.jpg"],
+        splits=["test", "test"],
+    )
     exp_csv = tmp_path / "expanded.csv"
     with open(exp_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
@@ -1462,6 +1513,7 @@ def test_evaluate_active_baseline_success(tmp_path: Path) -> None:
     output_json = tmp_path / "baseline_summary.json"
     summary = evaluate_active_baseline(
         dataset_path=npz_path,
+        control_dataset_path=control_npz,
         checkpoint_path=ckpt,
         expanded_benchmark_csv=exp_csv,
         control_benchmark_csv=ctrl_csv,
@@ -1477,8 +1529,8 @@ def test_evaluate_active_baseline_success(tmp_path: Path) -> None:
     assert summary["deterministic_inference"]["tolerance"] == 1e-7
     assert summary["deterministic_inference"]["max_absolute_difference"] <= 1e-7
 
-    assert summary["sample_counts"]["dataset_total"] == 4
-    assert summary["sample_counts"]["dataset_test"] == 4
+    assert summary["sample_counts"]["dataset_total"] == 2
+    assert summary["sample_counts"]["dataset_test"] == 2
     assert summary["sample_counts"]["expanded_benchmark_test"] == 2
     assert summary["sample_counts"]["control_benchmark_test"] == 2
 
@@ -1501,8 +1553,13 @@ def test_evaluate_active_baseline_missing_identity(tmp_path: Path) -> None:
     ckpt = create_legacy_checkpoint(tmp_path / "baseline.pt")
     npz_path = create_npz_dataset(
         tmp_path / "dataset.npz",
-        image_paths=["img1.jpg", "img2.jpg"],
-        splits=["test", "test"],
+        image_paths=["img1.jpg"],
+        splits=["test"],
+    )
+    control_npz = create_npz_dataset(
+        tmp_path / "control_dataset.npz",
+        image_paths=["img3.jpg"],
+        splits=["test"],
     )
 
     exp_csv = tmp_path / "expanded.csv"
@@ -1525,12 +1582,13 @@ def test_evaluate_active_baseline_missing_identity(tmp_path: Path) -> None:
         )
         writer.writeheader()
         writer.writerow(
-            {"image_path": "img2.jpg", "split": "test", "scenic_human_mean": "4.5"}
+            {"image_path": "img3.jpg", "split": "test", "scenic_human_mean": "4.5"}
         )
 
     with pytest.raises(ValueError, match="absent from the prepared dataset"):
         evaluate_active_baseline(
             dataset_path=npz_path,
+            control_dataset_path=control_npz,
             checkpoint_path=ckpt,
             expanded_benchmark_csv=exp_csv,
             control_benchmark_csv=ctrl_csv,
@@ -1541,8 +1599,13 @@ def test_evaluate_active_baseline_split_mismatch(tmp_path: Path) -> None:
     ckpt = create_legacy_checkpoint(tmp_path / "baseline.pt")
     npz_path = create_npz_dataset(
         tmp_path / "dataset.npz",
-        image_paths=["img1.jpg", "img2.jpg"],
-        splits=["train", "test"],
+        image_paths=["img1.jpg"],
+        splits=["train"],
+    )
+    control_npz = create_npz_dataset(
+        tmp_path / "control_dataset.npz",
+        image_paths=["img2.jpg"],
+        splits=["test"],
     )
 
     exp_csv = tmp_path / "expanded.csv"
@@ -1568,6 +1631,7 @@ def test_evaluate_active_baseline_split_mismatch(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="relabels non-test prepared identity"):
         evaluate_active_baseline(
             dataset_path=npz_path,
+            control_dataset_path=control_npz,
             checkpoint_path=ckpt,
             expanded_benchmark_csv=exp_csv,
             control_benchmark_csv=ctrl_csv,
@@ -1580,8 +1644,13 @@ def test_evaluate_active_baseline_nondeterminism_failure(
     ckpt = create_legacy_checkpoint(tmp_path / "baseline.pt")
     npz_path = create_npz_dataset(
         tmp_path / "dataset.npz",
-        image_paths=["img1.jpg", "img2.jpg"],
-        splits=["test", "test"],
+        image_paths=["img1.jpg"],
+        splits=["test"],
+    )
+    control_npz = create_npz_dataset(
+        tmp_path / "control_dataset.npz",
+        image_paths=["img2.jpg"],
+        splits=["test"],
     )
 
     exp_csv = tmp_path / "expanded.csv"
@@ -1624,6 +1693,7 @@ def test_evaluate_active_baseline_nondeterminism_failure(
     with pytest.raises(ValueError, match="Deterministic CPU inference failure"):
         evaluate_active_baseline(
             dataset_path=npz_path,
+            control_dataset_path=control_npz,
             checkpoint_path=ckpt,
             expanded_benchmark_csv=exp_csv,
             control_benchmark_csv=ctrl_csv,
@@ -1636,6 +1706,11 @@ def test_evaluate_active_baseline_disjoint_benchmark_overlap(tmp_path: Path) -> 
         tmp_path / "dataset.npz",
         image_paths=["img1.jpg", "img2.jpg"],
         splits=["test", "test"],
+    )
+    control_npz = create_npz_dataset(
+        tmp_path / "control_dataset.npz",
+        image_paths=["img1.jpg"],
+        splits=["test"],
     )
 
     exp_csv = tmp_path / "expanded.csv"
@@ -1661,6 +1736,7 @@ def test_evaluate_active_baseline_disjoint_benchmark_overlap(tmp_path: Path) -> 
     with pytest.raises(ValueError, match="Overlap detected between expanded and control"):
         evaluate_active_baseline(
             dataset_path=npz_path,
+            control_dataset_path=control_npz,
             checkpoint_path=ckpt,
             expanded_benchmark_csv=exp_csv,
             control_benchmark_csv=ctrl_csv,

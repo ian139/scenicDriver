@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
         description="Compare candidate and baseline scenic models"
     )
     p.add_argument("--dataset", required=True, type=Path)
+    p.add_argument("--control-dataset", required=True, type=Path)
     p.add_argument("--candidate-checkpoint", required=True, type=Path)
     p.add_argument("--baseline-checkpoint", required=True, type=Path)
     p.add_argument("--expanded-benchmark", required=True, type=Path)
@@ -32,14 +33,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     decision = evaluate_stage_two(
-        args.dataset,
-        args.candidate_checkpoint,
-        args.baseline_checkpoint,
-        args.expanded_benchmark,
-        args.control_benchmark,
-        args.route_qa,
-        args.thresholds,
-        args.output,
+        dataset_path=args.dataset,
+        control_dataset_path=args.control_dataset,
+        candidate_checkpoint=args.candidate_checkpoint,
+        baseline_checkpoint=args.baseline_checkpoint,
+        expanded_benchmark_csv=args.expanded_benchmark,
+        control_benchmark_csv=args.control_benchmark,
+        route_qa_json=args.route_qa,
+        thresholds=args.thresholds,
+        output_path=args.output,
     )
     print(
         json.dumps(
