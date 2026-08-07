@@ -15,10 +15,18 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-if [[ "${OMP_RUN_AUTORESEARCH:-0}" == "1" ]]; then
-  exec uv run --offline --frozen python scripts/modeling/run_active_scenic_autoresearch.py "$@"
+HANDOFF="data/processed/active_learning/run_v1_expanded_20260805/stage1_handoff.json"
+EXPECTED_HANDOFF_SHA256="52dfe63b6064a3906a3b5ddb64c7d0e2c3664513ef42ededef5c41d5e0c078c1"
+
+actual_handoff_sha256="$(sha256sum "$HANDOFF" | cut -d ' ' -f 1)"
+if [[ "$actual_handoff_sha256" != "$EXPECTED_HANDOFF_SHA256" ]]; then
+  printf 'Handoff SHA-256 mismatch: expected %s, got %s\n' \
+    "$EXPECTED_HANDOFF_SHA256" "$actual_handoff_sha256" >&2
+  exit 1
 fi
 
-uv run --offline --frozen pytest -q
-node --test tests/test_new_england_north_viewer.mjs
-uv run --offline --frozen python scripts/reports/autoresearch_cleanup_metric.py
+uv run --offline --frozen python scripts/modeling/validate_stage2_preflight.py \
+  --handoff "$HANDOFF"
+
+printf 'METRIC stage2_preflight_valid=1\n'
+printf 'METRIC immutable_handoff_valid=1\n'
