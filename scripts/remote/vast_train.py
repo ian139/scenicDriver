@@ -41,7 +41,12 @@ from scripts.remote.cmux_vast_host import (  # noqa: E402
     update_status,
 )
 
-DEFAULT_OFFER_QUERY = "num_gpus=1 dlperf>200 dph<1 verified=true direct_port_count>=1 rentable=true gpu_ram>=12 disk_space>=64"
+# High-performance Vast filter: >250 DLPerf, >200 TFLOPS, >100 DLPerf/$/hr,
+# <$8/hr, with one or more GPUs.
+DEFAULT_OFFER_QUERY = (
+    "num_gpus>=1 dlperf>250 dlperf_per_dphtotal>100 total_flops>200 dph<8 "
+    "verified=true direct_port_count>=1 rentable=true gpu_ram>=12 disk_space>=64"
+)
 DEFAULT_IMAGE = "ian139/scenicdriver-remote-training:latest"
 DEFAULT_REMOTE_REPO_DIR = "/workspace"
 DEFAULT_REMOTE_ENV_FILE = "/root/.scenic/aws.env"

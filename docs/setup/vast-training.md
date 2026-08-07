@@ -97,7 +97,7 @@ Search for a suitable offer, start a temporary instance, and verify SSH and GPU
 visibility before pulling the image:
 
 ```bash
-vastai search offers 'gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true' \
+vastai search offers 'num_gpus>=1 dlperf>250 dlperf_per_dphtotal>100 total_flops>200 dph<8 verified=true direct_port_count>=1 rentable=true gpu_ram>=12 disk_space>=64' \
   -o 'dlperf_usd-' --raw
 vastai create instance <offer-id> \
   --image nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 \

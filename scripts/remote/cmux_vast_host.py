@@ -18,7 +18,7 @@ import time
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = PROJECT_ROOT / ".cmux-vast" / "state"
 ARTIFACTS_DIR = PROJECT_ROOT / ".cmux-vast" / "artifacts"
-DEFAULT_OFFER_QUERY = "gpu_name=RTX_4090 num_gpus=1 verified=true direct_port_count>=1 rentable=true"
+DEFAULT_OFFER_QUERY = "gpu_name=RTX_4090 num_gpus>=1 verified=true direct_port_count>=1 rentable=true"
 DEFAULT_IMAGE = "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04"
 DEFAULT_BRANCH = "Ian139/RemoteTraining"
 DEFAULT_REMOTE_REPO_DIR = "/workspace/scenic-drive"
