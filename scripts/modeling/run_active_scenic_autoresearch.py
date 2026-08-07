@@ -339,13 +339,13 @@ def build_candidate_ladder(
             }
         )
 
-    # Candidate 5: Higher capacity / extra steps
+    # Candidate 5: One additional epoch at the same capacity.
     if max_experiments >= 5:
-        c5 = dataclasses.replace(base_config, epochs=15)
+        c5 = dataclasses.replace(base_config, epochs=base_config.epochs + 1)
         ladder.append(
             {
                 "exp_id": "exp_05_extended_epochs",
-                "hypothesis": "Extended training epochs improves continuous scenic score ranking.",
+                "hypothesis": "One additional epoch improves continuous scenic score ranking.",
                 "config": c5,
             }
         )
@@ -1012,6 +1012,7 @@ def main() -> None:
     # 4. Build Experiment Ladder
     base_config = ActiveTrainingConfig(
         seed=args.seed,
+        epochs=1 if is_data_limited else ActiveTrainingConfig().epochs,
         device=args.device,
         max_steps=args.max_steps,
     )
@@ -1080,17 +1081,29 @@ def main() -> None:
         print("Dry run plan written successfully. No mutations performed.")
         sys.exit(0)
 
-    # Dataset Preparation with deadline guard (executed only in non-dry-run mode)
-    remaining_prep = global_deadline - time.time()
-    try:
-        with deadline_guard(remaining_prep):
-            dataset_info = prepare_active_dataset(handoff_path, prepared_dataset_path)
-    except DeadlineExceededError:
-        print(
-            f"Time budget of {args.max_seconds}s reached during dataset preparation.",
-            file=sys.stderr,
-        )
-        sys.exit(0)
+    prepared_split_path = prepared_dataset_path.with_suffix(".filtered_index.csv")
+    if (
+        args.resume
+        and prepared_dataset_path.is_file()
+        and prepared_split_path.is_file()
+    ):
+        dataset_info = {
+            "dataset_path": str(prepared_dataset_path),
+            "split_path": str(prepared_split_path),
+        }
+    else:
+        remaining_prep = global_deadline - time.time()
+        try:
+            with deadline_guard(remaining_prep):
+                dataset_info = prepare_active_dataset(
+                    handoff_path, prepared_dataset_path
+                )
+        except DeadlineExceededError:
+            print(
+                f"Time budget of {args.max_seconds}s reached during dataset preparation.",
+                file=sys.stderr,
+            )
+            sys.exit(0)
 
     dataset_path = dataset_info["dataset_path"]
     split_csv_path = dataset_info["split_path"]
