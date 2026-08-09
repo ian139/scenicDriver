@@ -1849,10 +1849,18 @@ def main() -> None:
                 else None
             ),
         }
+    rejection_reason = None
+    if is_data_limited:
+        rejection_reason = "insufficient_expanded_human_validation_support"
+    elif finalist is not None and not all_gates_pass and not final_eval_pending:
+        rejection_reason = "selected_finalist_failed_compound_gates"
+    elif finalist is None and run_state == "completed":
+        rejection_reason = "no_validation_finalist"
+
     final_summary = {
         "run_name": args.run_name,
         "run_state": run_state,
-        "total_experiments": len(evaluated_records),
+        "total_experiments": len(ladder),
         "all_gates_pass": False if is_data_limited else all_gates_pass,
         "data_limited": is_data_limited,
         "selected_finalist": selected_finalist_summary,
@@ -1873,11 +1881,7 @@ def main() -> None:
         else ("promoted" if promoted else "unchanged"),
         "observed_expanded_val_samples": observed_val_samples,
         "min_expanded_validation_samples": min_val_samples,
-        "rejection_reason": (
-            "insufficient_expanded_human_validation_support"
-            if is_data_limited
-            else None
-        ),
+        "rejection_reason": rejection_reason,
         "requested_annotation_batch": requested_annotation_batch
         if is_data_limited
         else None,

@@ -2797,6 +2797,8 @@ def test_selection_based_only_on_validation_mse(
     assert summary["all_gates_pass"] is False
     assert summary["retained_exp_id"] is None
     assert summary["promoted"] is False
+    assert summary["total_experiments"] == 2
+    assert summary["rejection_reason"] == "selected_finalist_failed_compound_gates"
 
 
 def test_no_full_evaluation_while_any_candidate_paused(
