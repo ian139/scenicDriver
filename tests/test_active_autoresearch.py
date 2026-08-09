@@ -2799,6 +2799,10 @@ def test_selection_based_only_on_validation_mse(
     assert summary["promoted"] is False
     assert summary["total_experiments"] == 2
     assert summary["rejection_reason"] == "selected_finalist_failed_compound_gates"
+    decision = json.loads(
+        (run_dir / "promotion_decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["rejection_reason"] == "selected_finalist_failed_compound_gates"
 
 
 def test_no_full_evaluation_while_any_candidate_paused(

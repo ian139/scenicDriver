@@ -1752,6 +1752,16 @@ def main() -> None:
             "with QA overlap/confidence diversity."
         ),
     }
+    decision_rejection_reason = None
+    if is_data_limited:
+        decision_rejection_reason = (
+            "insufficient_expanded_human_validation_support"
+        )
+    elif finalist is not None and not all_gates_pass and not final_eval_pending:
+        decision_rejection_reason = "selected_finalist_failed_compound_gates"
+    elif finalist is None and not final_eval_pending:
+        decision_rejection_reason = "no_validation_finalist"
+
 
     promoted = False
     decision_summary = {
@@ -1776,11 +1786,7 @@ def main() -> None:
         "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
         "observed_expanded_val_samples": observed_val_samples,
         "min_expanded_validation_samples": min_val_samples,
-        "rejection_reason": (
-            "insufficient_expanded_human_validation_support"
-            if is_data_limited
-            else None
-        ),
+        "rejection_reason": decision_rejection_reason,
         "registry_status": "unchanged"
         if is_data_limited
         else ("promoted" if promoted else "unchanged"),
@@ -1849,13 +1855,7 @@ def main() -> None:
                 else None
             ),
         }
-    rejection_reason = None
-    if is_data_limited:
-        rejection_reason = "insufficient_expanded_human_validation_support"
-    elif finalist is not None and not all_gates_pass and not final_eval_pending:
-        rejection_reason = "selected_finalist_failed_compound_gates"
-    elif finalist is None and run_state == "completed":
-        rejection_reason = "no_validation_finalist"
+    rejection_reason = decision_rejection_reason
 
     final_summary = {
         "run_name": args.run_name,
