@@ -136,9 +136,66 @@ def create_route_qa_json(
     all_invariants_pass: bool = True,
     stability_confirmed: bool = True,
     complexity_accepted: bool = True,
+    candidate_checkpoint: Path | str | None = None,
+    baseline_checkpoint: Path | str | None = None,
+    candidate_sha256: str | None = None,
+    baseline_sha256: str | None = None,
+    routes: list[dict[str, typing.Any]] | None = None,
 ) -> Path:
+    if candidate_sha256 is None:
+        if candidate_checkpoint and Path(candidate_checkpoint).exists():
+            candidate_sha256 = file_sha256(candidate_checkpoint)
+        elif (path.parent / "cand.pt").exists():
+            candidate_sha256 = file_sha256(path.parent / "cand.pt")
+        else:
+            cand_dummy = path.parent / "_default_cand.pt"
+            if not cand_dummy.exists():
+                create_real_checkpoint(cand_dummy)
+            candidate_sha256 = file_sha256(cand_dummy)
+
+    if baseline_sha256 is None:
+        if baseline_checkpoint and Path(baseline_checkpoint).exists():
+            baseline_sha256 = file_sha256(baseline_checkpoint)
+        elif (path.parent / "base.pt").exists():
+            baseline_sha256 = file_sha256(path.parent / "base.pt")
+        else:
+            base_dummy = path.parent / "_default_base.pt"
+            if not base_dummy.exists():
+                create_real_checkpoint(base_dummy)
+            baseline_sha256 = file_sha256(base_dummy)
+
+    if routes is None:
+        cand_rep = path.parent / f"{path.stem}_cand_report.json"
+        cand_rep.write_text(json.dumps({"role": "candidate", "status": "ok"}), encoding="utf-8")
+        cand_rep_sha = file_sha256(cand_rep)
+
+        base_rep = path.parent / f"{path.stem}_base_report.json"
+        base_rep.write_text(json.dumps({"role": "baseline", "status": "ok"}), encoding="utf-8")
+        base_rep_sha = file_sha256(base_rep)
+
+        routes = [
+            {
+                "route_id": "r1",
+                "role": "candidate",
+                "checkpoint_sha256": candidate_sha256,
+                "report_path": str(cand_rep),
+                "report_sha256": cand_rep_sha,
+                "invariants_pass": True,
+            },
+            {
+                "route_id": "r2",
+                "role": "baseline",
+                "checkpoint_sha256": baseline_sha256,
+                "report_path": str(base_rep),
+                "report_sha256": base_rep_sha,
+                "invariants_pass": True,
+            },
+        ]
+
     data = {
-        "routes": [{"route_id": "r1"}],
+        "candidate_checkpoint_sha256": candidate_sha256,
+        "baseline_checkpoint_sha256": baseline_sha256,
+        "routes": routes,
         "all_invariants_pass": all_invariants_pass,
         "stability_confirmed": stability_confirmed,
         "complexity_accepted": complexity_accepted,
@@ -1959,3 +2016,306 @@ def test_evaluate_candidate_validation_exact_denominator_and_metrics(
     assert "region_metrics" in result
     assert result["candidate_metrics"]["samples"] == 2
     assert json.loads(out_json.read_text(encoding="utf-8")) == result
+
+
+def test_route_evidence_pass_bound_two_role_fixture(tmp_path: Path) -> None:
+    images = ["img1.jpg", "img2.jpg"]
+    ds_path = create_npz_dataset(tmp_path / "ds.npz", images)
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img3.jpg", "img4.jpg"]
+    )
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+
+    exp_csv = create_benchmark_csv(
+        tmp_path / "exp.csv",
+        [
+            {"image_path": "img1.jpg", "split": "test", "scenic_human": 5.0, "region": "r1"},
+            {"image_path": "img2.jpg", "split": "test", "scenic_human": 6.0, "region": "r1"},
+        ],
+    )
+    ctrl_csv = create_benchmark_csv(
+        tmp_path / "ctrl.csv",
+        [
+            {"image_path": "img3.jpg", "split": "test", "scenic_human": 5.0},
+            {"image_path": "img4.jpg", "split": "test", "scenic_human": 6.0},
+        ],
+    )
+
+    rq_path = create_route_qa_json(
+        tmp_path / "route_qa_bound.json",
+        candidate_checkpoint=cand_ckpt,
+        baseline_checkpoint=base_ckpt,
+    )
+    out_json = tmp_path / "decision_bound.json"
+    decision = evaluate_stage_two(
+        dataset_path=ds_path,
+        control_dataset_path=control_dataset_path,
+        candidate_checkpoint=cand_ckpt,
+        baseline_checkpoint=base_ckpt,
+        expanded_benchmark_csv=exp_csv,
+        control_benchmark_csv=ctrl_csv,
+        route_qa_json=rq_path,
+        thresholds=get_default_thresholds(),
+        output_path=out_json,
+    )
+    assert decision["gates"]["route_evidence_pass"] is True
+    assert decision["all_gates_pass"] is True
+
+
+def test_route_evidence_fails_baseline_only(tmp_path: Path) -> None:
+    images = ["img1.jpg", "img2.jpg"]
+    ds_path = create_npz_dataset(tmp_path / "ds.npz", images)
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img3.jpg", "img4.jpg"]
+    )
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+
+    exp_csv = create_benchmark_csv(
+        tmp_path / "exp.csv",
+        [
+            {"image_path": "img1.jpg", "split": "test", "scenic_human": 5.0, "region": "r1"},
+            {"image_path": "img2.jpg", "split": "test", "scenic_human": 6.0, "region": "r1"},
+        ],
+    )
+    ctrl_csv = create_benchmark_csv(
+        tmp_path / "ctrl.csv",
+        [
+            {"image_path": "img3.jpg", "split": "test", "scenic_human": 5.0},
+            {"image_path": "img4.jpg", "split": "test", "scenic_human": 6.0},
+        ],
+    )
+
+    base_sha = file_sha256(base_ckpt)
+    cand_sha = file_sha256(cand_ckpt)
+
+    rep = tmp_path / "base_rep.json"
+    rep.write_text("{}", encoding="utf-8")
+    rep_sha = file_sha256(rep)
+
+    data = {
+        "candidate_checkpoint_sha256": cand_sha,
+        "baseline_checkpoint_sha256": base_sha,
+        "routes": [
+            {
+                "route_id": "r1",
+                "role": "baseline",
+                "checkpoint_sha256": base_sha,
+                "report_path": str(rep),
+                "report_sha256": rep_sha,
+                "invariants_pass": True,
+            }
+        ],
+        "all_invariants_pass": True,
+        "stability_confirmed": True,
+        "complexity_accepted": True,
+    }
+    rq_path = tmp_path / "route_qa_base_only.json"
+    rq_path.write_text(json.dumps(data), encoding="utf-8")
+
+    out_json = tmp_path / "decision_base_only.json"
+    decision = evaluate_stage_two(
+        dataset_path=ds_path,
+        control_dataset_path=control_dataset_path,
+        candidate_checkpoint=cand_ckpt,
+        baseline_checkpoint=base_ckpt,
+        expanded_benchmark_csv=exp_csv,
+        control_benchmark_csv=ctrl_csv,
+        route_qa_json=rq_path,
+        thresholds=get_default_thresholds(),
+        output_path=out_json,
+    )
+    assert decision["gates"]["route_evidence_pass"] is False
+    assert decision["all_gates_pass"] is False
+
+
+def test_route_evidence_fails_mismatched_checkpoint(tmp_path: Path) -> None:
+    images = ["img1.jpg", "img2.jpg"]
+    ds_path = create_npz_dataset(tmp_path / "ds.npz", images)
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img3.jpg", "img4.jpg"]
+    )
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+
+    exp_csv = create_benchmark_csv(
+        tmp_path / "exp.csv",
+        [
+            {"image_path": "img1.jpg", "split": "test", "scenic_human": 5.0, "region": "r1"},
+            {"image_path": "img2.jpg", "split": "test", "scenic_human": 6.0, "region": "r1"},
+        ],
+    )
+    ctrl_csv = create_benchmark_csv(
+        tmp_path / "ctrl.csv",
+        [
+            {"image_path": "img3.jpg", "split": "test", "scenic_human": 5.0},
+            {"image_path": "img4.jpg", "split": "test", "scenic_human": 6.0},
+        ],
+    )
+
+    rq_path = create_route_qa_json(
+        tmp_path / "route_qa_mismatch.json",
+        candidate_checkpoint=cand_ckpt,
+        baseline_checkpoint=base_ckpt,
+        candidate_sha256="0000000000000000000000000000000000000000000000000000000000000000",
+    )
+    out_json = tmp_path / "decision_mismatch.json"
+    decision = evaluate_stage_two(
+        dataset_path=ds_path,
+        control_dataset_path=control_dataset_path,
+        candidate_checkpoint=cand_ckpt,
+        baseline_checkpoint=base_ckpt,
+        expanded_benchmark_csv=exp_csv,
+        control_benchmark_csv=ctrl_csv,
+        route_qa_json=rq_path,
+        thresholds=get_default_thresholds(),
+        output_path=out_json,
+    )
+    assert decision["gates"]["route_evidence_pass"] is False
+    assert decision["all_gates_pass"] is False
+
+
+def test_route_evidence_fails_missing_report(tmp_path: Path) -> None:
+    images = ["img1.jpg", "img2.jpg"]
+    ds_path = create_npz_dataset(tmp_path / "ds.npz", images)
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img3.jpg", "img4.jpg"]
+    )
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+
+    exp_csv = create_benchmark_csv(
+        tmp_path / "exp.csv",
+        [
+            {"image_path": "img1.jpg", "split": "test", "scenic_human": 5.0, "region": "r1"},
+            {"image_path": "img2.jpg", "split": "test", "scenic_human": 6.0, "region": "r1"},
+        ],
+    )
+    ctrl_csv = create_benchmark_csv(
+        tmp_path / "ctrl.csv",
+        [
+            {"image_path": "img3.jpg", "split": "test", "scenic_human": 5.0},
+            {"image_path": "img4.jpg", "split": "test", "scenic_human": 6.0},
+        ],
+    )
+
+    cand_sha = file_sha256(cand_ckpt)
+    base_sha = file_sha256(base_ckpt)
+
+    data = {
+        "candidate_checkpoint_sha256": cand_sha,
+        "baseline_checkpoint_sha256": base_sha,
+        "routes": [
+            {
+                "route_id": "r1",
+                "role": "candidate",
+                "checkpoint_sha256": cand_sha,
+                "report_path": str(tmp_path / "nonexistent_report.json"),
+                "report_sha256": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                "invariants_pass": True,
+            },
+            {
+                "route_id": "r2",
+                "role": "baseline",
+                "checkpoint_sha256": base_sha,
+                "report_path": str(tmp_path / "nonexistent_report2.json"),
+                "report_sha256": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                "invariants_pass": True,
+            },
+        ],
+        "all_invariants_pass": True,
+        "stability_confirmed": True,
+        "complexity_accepted": True,
+    }
+    rq_path = tmp_path / "route_qa_missing_report.json"
+    rq_path.write_text(json.dumps(data), encoding="utf-8")
+
+    out_json = tmp_path / "decision_missing_report.json"
+    decision = evaluate_stage_two(
+        dataset_path=ds_path,
+        control_dataset_path=control_dataset_path,
+        candidate_checkpoint=cand_ckpt,
+        baseline_checkpoint=base_ckpt,
+        expanded_benchmark_csv=exp_csv,
+        control_benchmark_csv=ctrl_csv,
+        route_qa_json=rq_path,
+        thresholds=get_default_thresholds(),
+        output_path=out_json,
+    )
+    assert decision["gates"]["route_evidence_pass"] is False
+    assert decision["all_gates_pass"] is False
+
+
+def test_route_evidence_fails_report_hash_mismatch(tmp_path: Path) -> None:
+    images = ["img1.jpg", "img2.jpg"]
+    ds_path = create_npz_dataset(tmp_path / "ds.npz", images)
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img3.jpg", "img4.jpg"]
+    )
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+
+    exp_csv = create_benchmark_csv(
+        tmp_path / "exp.csv",
+        [
+            {"image_path": "img1.jpg", "split": "test", "scenic_human": 5.0, "region": "r1"},
+            {"image_path": "img2.jpg", "split": "test", "scenic_human": 6.0, "region": "r1"},
+        ],
+    )
+    ctrl_csv = create_benchmark_csv(
+        tmp_path / "ctrl.csv",
+        [
+            {"image_path": "img3.jpg", "split": "test", "scenic_human": 5.0},
+            {"image_path": "img4.jpg", "split": "test", "scenic_human": 6.0},
+        ],
+    )
+
+    cand_sha = file_sha256(cand_ckpt)
+    base_sha = file_sha256(base_ckpt)
+
+    rep = tmp_path / "report_real.json"
+    rep.write_text("{}", encoding="utf-8")
+
+    data = {
+        "candidate_checkpoint_sha256": cand_sha,
+        "baseline_checkpoint_sha256": base_sha,
+        "routes": [
+            {
+                "route_id": "r1",
+                "role": "candidate",
+                "checkpoint_sha256": cand_sha,
+                "report_path": str(rep),
+                "report_sha256": "bad_report_hash_0000000000000000000000000000000000000000000000",
+                "invariants_pass": True,
+            },
+            {
+                "route_id": "r2",
+                "role": "baseline",
+                "checkpoint_sha256": base_sha,
+                "report_path": str(rep),
+                "report_sha256": file_sha256(rep),
+                "invariants_pass": True,
+            },
+        ],
+        "all_invariants_pass": True,
+        "stability_confirmed": True,
+        "complexity_accepted": True,
+    }
+    rq_path = tmp_path / "route_qa_bad_report_sha.json"
+    rq_path.write_text(json.dumps(data), encoding="utf-8")
+
+    out_json = tmp_path / "decision_bad_report_sha.json"
+    decision = evaluate_stage_two(
+        dataset_path=ds_path,
+        control_dataset_path=control_dataset_path,
+        candidate_checkpoint=cand_ckpt,
+        baseline_checkpoint=base_ckpt,
+        expanded_benchmark_csv=exp_csv,
+        control_benchmark_csv=ctrl_csv,
+        route_qa_json=rq_path,
+        thresholds=get_default_thresholds(),
+        output_path=out_json,
+    )
+    assert decision["gates"]["route_evidence_pass"] is False
+    assert decision["all_gates_pass"] is False

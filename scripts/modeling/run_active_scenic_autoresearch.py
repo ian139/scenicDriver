@@ -365,6 +365,21 @@ def build_candidate_ladder(
     return ladder[:max_experiments]
 
 
+# Aggregate candidate metrics used for validation-based selection. Records must
+# carry finite values for every one of these that is present, and each value
+# must exactly match the validation decision artifact's candidate_metrics.
+VALIDATION_SELECTION_METRIC_KEYS = (
+    "samples",
+    "mse",
+    "mae",
+    "rmse",
+    "pearson_corr",
+    "pearson",
+    "spearman_corr",
+    "spearman",
+)
+
+
 def validate_experiment_record(
     rec: Dict[str, Any],
     expected_baseline_sha256: Optional[str] = None,
@@ -376,9 +391,10 @@ def validate_experiment_record(
     Returns True only when the record carries truthful, checkable evidence:
       - the candidate checkpoint exists and its current SHA-256 matches the
         validation decision file's candidate hash,
-      - validated/completed/retained records carry validation_metrics plus a
-        validation_decision_path (legacy 'completed' records lacking validation
-        evidence never bypass validation),
+      - validated/completed/retained records carry finite validation_metrics
+        plus a validation_decision_path whose candidate_metrics exactly match
+        the record's selection metrics (legacy 'completed' records lacking
+        validation evidence never bypass validation),
       - 'completed' records additionally carry full stage-two evidence
         (eval_decision_path with matching candidate hash and gate agreement),
       - input digest and baseline identity align when expected values are given.
@@ -425,6 +441,17 @@ def validate_experiment_record(
     ):
         return False
 
+    # Aggregate candidate metrics used for selection must be finite numbers;
+    # NaN/inf are never truthful evidence.
+    for metric_key in VALIDATION_SELECTION_METRIC_KEYS:
+        if metric_key not in validation_metrics:
+            continue
+        value = validation_metrics[metric_key]
+        if not isinstance(value, (int, float)) or not math.isfinite(
+            float(value)
+        ):
+            return False
+
     val_dec_str = rec.get("validation_decision_path")
     if not val_dec_str:
         return False
@@ -453,6 +480,30 @@ def validate_experiment_record(
             if Path(val_cand_ckpt).resolve() != ckpt_path.resolve():
                 return False
         except Exception:
+            return False
+
+    # The record's complete validation_metrics values used for selection must
+    # equal the decision artifact's candidate_metrics. Stale, tampered, or
+    # missing mismatches are rejected so legacy metrics can never influence
+    # selection.
+    val_candidate_metrics = val_data.get("candidate_metrics")
+    if not isinstance(val_candidate_metrics, dict):
+        return False
+    record_metric_keys = {
+        key for key in VALIDATION_SELECTION_METRIC_KEYS if key in validation_metrics
+    }
+    artifact_metric_keys = {
+        key for key in VALIDATION_SELECTION_METRIC_KEYS if key in val_candidate_metrics
+    }
+    if record_metric_keys != artifact_metric_keys:
+        return False
+    for metric_key in record_metric_keys:
+        artifact_value = val_candidate_metrics[metric_key]
+        if not isinstance(artifact_value, (int, float)) or not math.isfinite(
+            float(artifact_value)
+        ):
+            return False
+        if float(artifact_value) != float(validation_metrics[metric_key]):
             return False
 
     if status == "completed":
@@ -570,6 +621,8 @@ def select_validation_finalist(
             validation_metrics.get("mse"), (int, float)
         ):
             return None
+        if not math.isfinite(float(validation_metrics["mse"])):
+            return None
         final_records[exp_id] = rec
 
     ladder_index = {exp_id: i for i, exp_id in enumerate(ladder_exp_ids)}
@@ -666,6 +719,86 @@ def get_completed_candidate_checkpoint(exp_dir: Path) -> Optional[str]:
     if not ckpt_path.is_file():
         return None
     return str(ckpt_path.resolve())
+
+
+EXPOSURE_REJECTION_REASON = "heldout_test_exposure_before_finalist_selection"
+EXPOSURE_MIN_FRESH_TEST_ROWS = 20
+FIXED_VALIDATION_SELECTION_ROWS = 64
+
+
+def has_validation_evidence(rec: Dict[str, Any]) -> bool:
+    """True when a record carries validation-selection evidence (finite metrics + decision path)."""
+    if not isinstance(rec, dict):
+        return False
+    validation_metrics = rec.get("validation_metrics")
+    if not isinstance(validation_metrics, dict) or not isinstance(
+        validation_metrics.get("mse"), (int, float)
+    ):
+        return False
+    if not math.isfinite(float(validation_metrics["mse"])):
+        return False
+    return bool(rec.get("validation_decision_path"))
+
+
+def detect_heldout_test_exposure(
+    records: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Return experiment records with full-eval evidence but no validation evidence.
+
+    A completed record carrying a full stage-two evaluation (which touches the
+    held-out test/control/route benchmarks) without any validation evidence
+    means the held-out test set was exposed before finalist selection. Such
+    records are returned for quarantine handling; they are never deleted.
+    """
+    exposed: List[Dict[str, Any]] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("status") != "completed":
+            continue
+        eval_path_str = rec.get("eval_decision_path")
+        if not eval_path_str or not Path(str(eval_path_str)).is_file():
+            continue
+        if has_validation_evidence(rec):
+            continue
+        exposed.append(rec)
+    return exposed
+
+
+def build_exposure_annotation_request(
+    observed_test_samples: int,
+    observed_val_samples: int,
+) -> Dict[str, Any]:
+    """Next-data request for a quarantined run.
+
+    Requests at least EXPOSURE_MIN_FRESH_TEST_ROWS fresh, untouched,
+    geographically isolated human test rows with zero overlap against
+    current-run test rows and control rows, while retaining the fixed
+    FIXED_VALIDATION_SELECTION_ROWS-row validation selection unchanged.
+    """
+    return {
+        "target_test_human_rows": EXPOSURE_MIN_FRESH_TEST_ROWS,
+        "min_fresh_test_human_rows": EXPOSURE_MIN_FRESH_TEST_ROWS,
+        "observed_expanded_test_samples": observed_test_samples,
+        "needed_fresh_test_human_rows": EXPOSURE_MIN_FRESH_TEST_ROWS,
+        "retained_validation_rows": FIXED_VALIDATION_SELECTION_ROWS,
+        "validation_selection_unchanged": True,
+        "sampling_strategy": (
+            "fresh_geographically_isolated_no_current_or_control_overlap"
+        ),
+        "overlap_constraints": {
+            "current_run_test_rows": 0,
+            "control_rows": 0,
+        },
+        "description": (
+            f"Request at least {EXPOSURE_MIN_FRESH_TEST_ROWS} fresh, untouched, "
+            f"geographically isolated human test rows with zero overlap against "
+            f"current-run test rows and control rows, while retaining the fixed "
+            f"{FIXED_VALIDATION_SELECTION_ROWS}-row validation selection unchanged "
+            f"(observed validation rows: {observed_val_samples})."
+        ),
+    }
 
 
 def validate_run_manifest(
@@ -1200,6 +1333,15 @@ def main() -> None:
                 f"    - {exp_id}: MAE={metrics.get('mae')} RMSE={metrics.get('rmse')} "
                 f"MSE={metrics.get('mse')} Corr={metrics.get('pearson_corr', metrics.get('corr'))}"
             )
+        exposure_records = detect_heldout_test_exposure(all_records)
+        if exposure_records:
+            print(
+                f"  HELDOUT TEST EXPOSURE: {len(exposure_records)} record(s) with "
+                "full-eval evidence but no validation evidence (exp_ids: "
+                + ", ".join(str(r.get("exp_id")) for r in exposure_records)
+                + "). Run is quarantined: no promotion until >=20 fresh, untouched "
+                "test rows replace the exposed held-out test set."
+            )
         sys.exit(0)
 
     print(f"METRIC expanded_val_support={observed_val_samples}")
@@ -1421,7 +1563,7 @@ def main() -> None:
         )
 
     # 5. Load truthful resume state
-    completed_map, _ = (
+    completed_map, all_records = (
         load_existing_experiments(
             experiments_jsonl,
             expected_baseline_sha256=manifest_baseline_checkpoint_sha256,
@@ -1430,10 +1572,33 @@ def main() -> None:
         if args.resume
         else ({}, [])
     )
+    # 5b. Historical preselection test exposure quarantine. Any record with
+    # full-eval evidence but no validation evidence means the held-out test
+    # set was touched before finalist selection. Such runs are quarantined:
+    # no retraining, no evaluation, no promotion, and the next-data request
+    # demands fresh untouched test rows. Historical records are never deleted.
+    exposure_records = detect_heldout_test_exposure(all_records)
+    heldout_exposure = len(exposure_records) > 0
+    exposure_exp_ids = [
+        str(rec["exp_id"]) for rec in exposure_records if rec.get("exp_id")
+    ]
+    if heldout_exposure:
+        print(
+            f"METRIC heldout_test_exposure=1 exposure_count={len(exposure_records)} "
+            f"exp_ids={','.join(exposure_exp_ids)}"
+        )
+        print(
+            "ERROR: Held-out test exposure detected before finalist selection "
+            f"({len(exposure_records)} record(s) with full-eval evidence but no "
+            "validation evidence). Run quarantined: no training or evaluation "
+            "will run and the registry stays unchanged.",
+            file=sys.stderr,
+        )
     # 6. Autoresearch Loop
     evaluated_records: List[Dict[str, Any]] = []
 
-    for exp in ladder:
+    loop_ladder: List[Dict[str, Any]] = [] if heldout_exposure else ladder
+    for exp in loop_ladder:
         exp_id = exp["exp_id"]
         exp_digest = expected_digests[exp_id]
 
@@ -1645,7 +1810,7 @@ def main() -> None:
     finalist = None
     all_gates_pass = False
     final_eval_pending = False
-    if not is_data_limited:
+    if not is_data_limited and not heldout_exposure:
         ladder_exp_ids = [exp["exp_id"] for exp in ladder]
         finalist = select_validation_finalist(evaluated_records, ladder_exp_ids)
         if finalist is not None:
@@ -1735,6 +1900,8 @@ def main() -> None:
                         )
         else:
             print("METRIC finalist_selected=0")
+    if heldout_exposure:
+        print("METRIC finalist_selected=0 heldout_test_exposure=1")
     print(f"METRIC all_gates_pass={1 if all_gates_pass else 0}")
 
     requested_annotation_batch = {
@@ -1752,8 +1919,17 @@ def main() -> None:
             "with QA overlap/confidence diversity."
         ),
     }
+    if heldout_exposure:
+        # Exposed test rows are contaminated; request only fresh untouched rows
+        # while keeping the fixed 64-row validation selection unchanged.
+        requested_annotation_batch = build_exposure_annotation_request(
+            observed_test_samples=observed_test_samples,
+            observed_val_samples=observed_val_samples,
+        )
     decision_rejection_reason = None
-    if is_data_limited:
+    if heldout_exposure:
+        decision_rejection_reason = EXPOSURE_REJECTION_REASON
+    elif is_data_limited:
         decision_rejection_reason = (
             "insufficient_expanded_human_validation_support"
         )
@@ -1766,7 +1942,9 @@ def main() -> None:
     promoted = False
     decision_summary = {
         "run_name": args.run_name,
-        "all_gates_pass": False if is_data_limited else all_gates_pass,
+        "all_gates_pass": (
+            False if (is_data_limited or heldout_exposure) else all_gates_pass
+        ),
         "data_limited": is_data_limited,
         "selected_finalist_exp_id": (
             finalist["exp_id"] if finalist is not None else None
@@ -1776,9 +1954,20 @@ def main() -> None:
             if finalist is not None
             else None
         ),
+        "promotion_evidence_valid": not heldout_exposure,
+        "heldout_test_exposure": {
+            "detected": heldout_exposure,
+            "count": len(exposure_exp_ids),
+            "exp_ids": exposure_exp_ids,
+        },
         "retained_candidate": (
             None
-            if is_data_limited or finalist is None or not all_gates_pass
+            if (
+                is_data_limited
+                or heldout_exposure
+                or finalist is None
+                or not all_gates_pass
+            )
             else finalist
         ),
         "evaluated_experiments": len(evaluated_records),
@@ -1788,17 +1977,23 @@ def main() -> None:
         "min_expanded_validation_samples": min_val_samples,
         "rejection_reason": decision_rejection_reason,
         "registry_status": "unchanged"
-        if is_data_limited
+        if (is_data_limited or heldout_exposure)
         else ("promoted" if promoted else "unchanged"),
         "requested_annotation_batch": requested_annotation_batch
-        if is_data_limited
+        if (is_data_limited or heldout_exposure)
         else None,
         "decision_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
     # 8. Registry Promotion Safety
     PROMOTION_RESERVE_SECONDS = 5.0
-    if args.promote:
+    if heldout_exposure:
+        print(
+            "Promotion blocked: held-out test exposure detected before finalist "
+            "selection. Registry unchanged."
+        )
+        print("METRIC promoted=0 promotion_blocked=1 heldout_test_exposure=1")
+    elif args.promote:
         remaining_promo = global_deadline - time.time()
         if is_data_limited:
             print(
@@ -1838,7 +2033,9 @@ def main() -> None:
     run_state = determine_aggregate_run_state(
         evaluated_records, len(ladder), timed_out=timed_out_flag
     )
-    if final_eval_pending:
+    if heldout_exposure:
+        run_state = "rejected"
+    elif final_eval_pending:
         run_state = "paused"
     selected_finalist_summary = None
     if finalist is not None:
@@ -1861,29 +2058,47 @@ def main() -> None:
         "run_name": args.run_name,
         "run_state": run_state,
         "total_experiments": len(ladder),
-        "all_gates_pass": False if is_data_limited else all_gates_pass,
+        "all_gates_pass": (
+            False if (is_data_limited or heldout_exposure) else all_gates_pass
+        ),
         "data_limited": is_data_limited,
         "selected_finalist": selected_finalist_summary,
+        "promotion_evidence_valid": not heldout_exposure,
+        "heldout_test_exposure": {
+            "detected": heldout_exposure,
+            "count": len(exposure_exp_ids),
+            "exp_ids": exposure_exp_ids,
+        },
         "retained_exp_id": (
             None
-            if (is_data_limited or finalist is None or not all_gates_pass)
+            if (
+                is_data_limited
+                or heldout_exposure
+                or finalist is None
+                or not all_gates_pass
+            )
             else finalist["exp_id"]
         ),
         "retained_candidate": (
             None
-            if (is_data_limited or finalist is None or not all_gates_pass)
+            if (
+                is_data_limited
+                or heldout_exposure
+                or finalist is None
+                or not all_gates_pass
+            )
             else finalist
         ),
-        "promoted": False if is_data_limited else promoted,
+        "promoted": False if (is_data_limited or heldout_exposure) else promoted,
         "pending_final_evaluation": final_eval_pending,
         "registry_status": "unchanged"
-        if is_data_limited
+        if (is_data_limited or heldout_exposure)
         else ("promoted" if promoted else "unchanged"),
         "observed_expanded_val_samples": observed_val_samples,
         "min_expanded_validation_samples": min_val_samples,
         "rejection_reason": rejection_reason,
         "requested_annotation_batch": requested_annotation_batch
-        if is_data_limited
+        if (is_data_limited or heldout_exposure)
         else None,
         "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }

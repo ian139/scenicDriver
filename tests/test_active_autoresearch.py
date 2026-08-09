@@ -11,12 +11,18 @@ from typing import Any
 import pytest
 
 from scripts.modeling.run_active_scenic_autoresearch import (
+    EXPOSURE_MIN_FRESH_TEST_ROWS,
+    EXPOSURE_REJECTION_REASON,
+    FIXED_VALIDATION_SELECTION_ROWS,
     DeadlineExceededError,
     build_candidate_ladder,
+    build_exposure_annotation_request,
     compute_experiment_digest,
     compute_sha256,
     deadline_guard,
+    detect_heldout_test_exposure,
     determine_aggregate_run_state,
+    has_validation_evidence,
     is_valid_paused_experiment,
     load_existing_experiments,
     parse_args,
@@ -85,6 +91,7 @@ def _create_valid_exp_files(
     *,
     all_gates_pass: bool = True,
     baseline_sha256: str = "base_sha",
+    validation_metrics: dict[str, Any] | None = None,
 ) -> tuple[Path, Path, Path, str]:
     exp_dir = tmp_path / exp_id
     exp_dir.mkdir(parents=True, exist_ok=True)
@@ -100,10 +107,13 @@ def _create_valid_exp_files(
     }
     eval_path.write_text(json.dumps(eval_data), encoding="utf-8")
 
+    metrics = dict(validation_metrics) if validation_metrics else {"mse": 0.05}
+
     validation_path = exp_dir / "validation_decision.json"
     validation_data = {
         "candidate": {"checkpoint": str(ckpt_path), "sha256": ckpt_hash},
         "baseline": {"checkpoint": "base.pt", "sha256": baseline_sha256},
+        "candidate_metrics": metrics,
     }
     validation_path.write_text(json.dumps(validation_data), encoding="utf-8")
     return ckpt_path, eval_path, validation_path, ckpt_hash
@@ -261,8 +271,12 @@ def _make_stage_two_mock(
 
 
 def test_resume_loads_only_completed_and_valid_records(tmp_path: Path) -> None:
-    ckpt1, eval1, val1, _ = _create_valid_exp_files(tmp_path, "exp_01")
-    ckpt3, eval3, val3, _ = _create_valid_exp_files(tmp_path, "exp_03")
+    ckpt1, eval1, val1, _ = _create_valid_exp_files(
+        tmp_path, "exp_01", validation_metrics={"mse": 0.05}
+    )
+    ckpt3, eval3, val3, _ = _create_valid_exp_files(
+        tmp_path, "exp_03", validation_metrics={"mse": 0.07}
+    )
 
     records = [
         {
@@ -478,6 +492,189 @@ def test_validate_experiment_record_contract(tmp_path: Path) -> None:
         )
         is False
     )
+
+
+def test_validate_experiment_record_rejects_tampered_validation_metrics(
+    tmp_path: Path,
+) -> None:
+    metrics = {
+        "samples": 64,
+        "mse": 0.05,
+        "mae": 0.22,
+        "rmse": 0.22,
+        "pearson_corr": 0.9,
+        "spearman_corr": 0.88,
+    }
+    ckpt, eval_p, val_p, _ = _create_valid_exp_files(
+        tmp_path, "exp_tamper", validation_metrics=metrics
+    )
+    rec = {
+        "exp_id": "exp_tamper",
+        "status": "completed",
+        "candidate_checkpoint": str(ckpt),
+        "eval_decision_path": str(eval_p),
+        "validation_decision_path": str(val_p),
+        "validation_metrics": dict(metrics),
+        "all_gates_pass": True,
+    }
+    # Untampered record passes: JSONL metrics exactly match the artifact.
+    assert validate_experiment_record(rec) is True
+
+    # Tampered JSONL mse no longer equals the decision artifact.
+    tampered_mse = dict(rec, validation_metrics=dict(metrics, mse=0.01))
+    assert validate_experiment_record(tampered_mse) is False
+
+    # Tampered JSONL pearson_corr no longer equals the decision artifact.
+    tampered_corr = dict(
+        rec, validation_metrics=dict(metrics, pearson_corr=0.99)
+    )
+    assert validate_experiment_record(tampered_corr) is False
+
+    # Missing selection key in the record (artifact-backed samples stripped).
+    missing_samples = dict(
+        rec,
+        validation_metrics={
+            k: v for k, v in metrics.items() if k != "samples"
+        },
+    )
+    assert validate_experiment_record(missing_samples) is False
+
+    # Missing selection key in the decision artifact (stale artifact).
+    stale_val_path = tmp_path / "stale_val.json"
+    stale_val_path.write_text(
+        json.dumps(
+            {
+                "candidate": {
+                    "checkpoint": str(ckpt),
+                    "sha256": compute_sha256(ckpt),
+                },
+                "baseline": {"sha256": "base_sha"},
+                "candidate_metrics": {
+                    k: v for k, v in metrics.items() if k != "pearson_corr"
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_rec = dict(rec, validation_decision_path=str(stale_val_path))
+    assert validate_experiment_record(stale_rec) is False
+
+    # Decision artifact without candidate_metrics entirely (missing evidence).
+    no_metrics_path = tmp_path / "no_metrics_val.json"
+    no_metrics_path.write_text(
+        json.dumps(
+            {
+                "candidate": {
+                    "checkpoint": str(ckpt),
+                    "sha256": compute_sha256(ckpt),
+                },
+                "baseline": {"sha256": "base_sha"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    no_metrics_rec = dict(rec, validation_decision_path=str(no_metrics_path))
+    assert validate_experiment_record(no_metrics_rec) is False
+
+    # Tampered artifact metrics (stale artifact with rewritten mse).
+    tampered_artifact_path = tmp_path / "tampered_artifact_val.json"
+    tampered_artifact_path.write_text(
+        json.dumps(
+            {
+                "candidate": {
+                    "checkpoint": str(ckpt),
+                    "sha256": compute_sha256(ckpt),
+                },
+                "baseline": {"sha256": "base_sha"},
+                "candidate_metrics": dict(metrics, mse=0.09),
+            }
+        ),
+        encoding="utf-8",
+    )
+    tampered_artifact_rec = dict(
+        rec, validation_decision_path=str(tampered_artifact_path)
+    )
+    assert validate_experiment_record(tampered_artifact_rec) is False
+
+
+def test_validate_experiment_record_rejects_nonfinite_metrics(
+    tmp_path: Path,
+) -> None:
+    base_metrics = {
+        "samples": 64,
+        "mse": 0.05,
+        "mae": 0.22,
+        "rmse": 0.22,
+        "pearson_corr": 0.9,
+        "spearman_corr": 0.88,
+    }
+    ckpt, eval_p, val_p, _ = _create_valid_exp_files(
+        tmp_path, "exp_finite", validation_metrics=dict(base_metrics)
+    )
+    rec = {
+        "exp_id": "exp_finite",
+        "status": "completed",
+        "candidate_checkpoint": str(ckpt),
+        "eval_decision_path": str(eval_p),
+        "validation_decision_path": str(val_p),
+        "validation_metrics": dict(base_metrics),
+        "all_gates_pass": True,
+    }
+    assert validate_experiment_record(rec) is True
+
+    # NaN mse in the record is never usable selection evidence.
+    nan_mse = dict(
+        rec, validation_metrics=dict(base_metrics, mse=float("nan"))
+    )
+    assert validate_experiment_record(nan_mse) is False
+
+    # Infinite mse in the record is rejected.
+    inf_mse = dict(
+        rec, validation_metrics=dict(base_metrics, mse=float("inf"))
+    )
+    assert validate_experiment_record(inf_mse) is False
+
+    # Non-finite mae (present selection metric) is rejected.
+    nan_mae = dict(rec, validation_metrics=dict(base_metrics, mae=float("nan")))
+    assert validate_experiment_record(nan_mae) is False
+
+    # Non-finite samples count is rejected.
+    nan_samples = dict(
+        rec, validation_metrics=dict(base_metrics, samples=float("nan"))
+    )
+    assert validate_experiment_record(nan_samples) is False
+
+    # Non-finite pearson correlation is rejected.
+    inf_corr = dict(
+        rec,
+        validation_metrics=dict(base_metrics, pearson_corr=float("inf")),
+    )
+    assert validate_experiment_record(inf_corr) is False
+
+    # Non-finite artifact candidate_metrics value is rejected even when the
+    # record itself is finite (NaN != NaN makes the equality check fail).
+    nan_artifact_path = tmp_path / "nan_artifact_val.json"
+    nan_artifact_path.write_text(
+        json.dumps(
+            {
+                "candidate": {
+                    "checkpoint": str(ckpt),
+                    "sha256": compute_sha256(ckpt),
+                },
+                "baseline": {"sha256": "base_sha"},
+                "candidate_metrics": dict(base_metrics, mse=float("nan")),
+            }
+        ),
+        encoding="utf-8",
+    )
+    nan_artifact_rec = dict(rec, validation_decision_path=str(nan_artifact_path))
+    assert validate_experiment_record(nan_artifact_rec) is False
+
+    # 'validated' records with finite matching metrics remain reusable.
+    validated_rec = dict(rec, status="validated")
+    del validated_rec["eval_decision_path"]
+    del validated_rec["all_gates_pass"]
+    assert validate_experiment_record(validated_rec) is True
 
 
 def test_string_gates_pass_not_reusable_or_selected(tmp_path: Path) -> None:
@@ -1349,6 +1546,12 @@ def test_resume_uses_immutable_manifest_baseline_sha(
             {
                 "candidate": {"checkpoint": str(exp_ckpt), "sha256": exp_ckpt_sha},
                 "baseline": {"sha256": baseline_sha},
+                "candidate_metrics": {
+                    "mse": 0.05,
+                    "mae": 0.1,
+                    "rmse": 0.2,
+                    "pearson_corr": 0.9,
+                },
             }
         ),
         encoding="utf-8",
@@ -1815,6 +2018,12 @@ def test_status_mode_after_promotion(
             {
                 "candidate": {"checkpoint": str(cand_ckpt), "sha256": cand_sha},
                 "baseline": {"sha256": original_base_sha},
+                "candidate_metrics": {
+                    "mse": 0.05,
+                    "mae": 0.1,
+                    "rmse": 0.2,
+                    "pearson_corr": 0.9,
+                },
             }
         ),
         encoding="utf-8",
@@ -2879,7 +3088,7 @@ def test_no_full_evaluation_while_any_candidate_paused(
     assert summary["retained_exp_id"] is None
 
 
-def test_legacy_completed_record_without_validation_is_revalidated_not_retrained(
+def test_legacy_full_eval_without_validation_quarantines_run_on_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from scripts.modeling import run_active_scenic_autoresearch as mod
@@ -2927,8 +3136,30 @@ def test_legacy_completed_record_without_validation_is_revalidated_not_retrained
     assert len(validation_calls) == 2
     assert len(stage_two_calls) == 1
 
-    # Simulate the invalid legacy artifact: completed records without
-    # validation_metrics (old-style full-eval-only records).
+    # Simulate the historical exposure artifact: completed records with full
+    # stage-two evaluation (eval_decision_path) but no validation evidence
+    # (old-style full-eval-only records that touched the held-out test set
+    # before finalist selection). Both eval decision files exist on disk.
+    for exp_id in ["exp_01_baseline_control", "exp_02_region_balanced"]:
+        eval_path = run_dir / exp_id / "eval_decision.json"
+        if not eval_path.exists():
+            eval_path.write_text(
+                json.dumps(
+                    {
+                        "all_gates_pass": True,
+                        "candidate": {
+                            "checkpoint": str(
+                                run_dir / exp_id / "candidate.pt"
+                            ),
+                            "sha256": compute_sha256(
+                                run_dir / exp_id / "candidate.pt"
+                            ),
+                        },
+                        "baseline": {"sha256": "base_sha"},
+                    }
+                ),
+                encoding="utf-8",
+            )
     legacy_records = []
     for exp_id in ["exp_01_baseline_control", "exp_02_region_balanced"]:
         old = validated_by_id[exp_id]
@@ -2948,20 +3179,29 @@ def test_legacy_completed_record_without_validation_is_revalidated_not_retrained
         "".join(json.dumps(r) + "\n" for r in legacy_records), encoding="utf-8"
     )
 
-    # Legacy records lacking validation evidence must never be reused/selected.
+    # Legacy records lacking validation evidence never pass the validator and
+    # are detected as held-out test exposure.
     for rec in legacy_records:
         assert validate_experiment_record(rec) is False
+    exposed = detect_heldout_test_exposure(legacy_records)
+    assert len(exposed) == 2
+    assert [r["exp_id"] for r in exposed] == [
+        "exp_01_baseline_control",
+        "exp_02_region_balanced",
+    ]
 
-    # Resume: checkpoints are reused without retraining, and validation reruns.
+    # Resume a quarantined run: nothing retrains, nothing re-validates,
+    # nothing re-runs a full evaluation, and nothing is promoted.
     validation_calls.clear()
     stage_two_calls.clear()
     monkeypatch.setattr(sys, "argv", run_args + ["--resume"])
     mod.main()
 
     assert len(train_calls) == 2  # run-1 training only; no retraining on resume
-    assert len(validation_calls) == 2  # both legacy candidates revalidated
-    assert len(stage_two_calls) == 1  # single full eval for the revalidated winner
+    assert len(validation_calls) == 0  # no revalidation on quarantined resume
+    assert len(stage_two_calls) == 0  # no full evaluation on quarantined resume
 
+    # Historical exposure records are preserved, not deleted.
     final_lines = [
         json.loads(line)
         for line in (run_dir / "experiments.jsonl")
@@ -2969,20 +3209,70 @@ def test_legacy_completed_record_without_validation_is_revalidated_not_retrained
         .splitlines()
         if line.strip()
     ]
-    final_by_id = {r["exp_id"]: r for r in final_lines}
-    assert final_by_id["exp_01_baseline_control"]["status"] == "completed"
-    assert final_by_id["exp_02_region_balanced"]["status"] == "validated"
-    # Newly written records carry full validated evidence (legacy lines are
-    # superseded, not rewritten).
-    for r in final_lines[2:]:
-        assert r.get("validation_metrics") is not None
-        assert r.get("validation_decision_path")
+    assert len(final_lines) == len(legacy_records)
+    assert detect_heldout_test_exposure(final_lines) == exposed
 
     summary = json.loads(
         (run_dir / "final_summary.json").read_text(encoding="utf-8")
     )
-    assert summary["run_state"] == "completed"
-    assert summary["selected_finalist"]["exp_id"] == "exp_01_baseline_control"
+    assert summary["run_state"] == "rejected"
+    assert summary["rejection_reason"] == EXPOSURE_REJECTION_REASON
+    assert summary["rejection_reason"] == (
+        "heldout_test_exposure_before_finalist_selection"
+    )
+    assert summary["all_gates_pass"] is False
+    assert summary["promotion_evidence_valid"] is False
+    assert summary["selected_finalist"] is None
+    assert summary["retained_exp_id"] is None
+    assert summary["retained_candidate"] is None
+    assert summary["promoted"] is False
+    assert summary["pending_final_evaluation"] is False
+    assert summary["registry_status"] == "unchanged"
+    exposure = summary["heldout_test_exposure"]
+    assert exposure["detected"] is True
+    assert exposure["count"] == 2
+    assert exposure["exp_ids"] == [
+        "exp_01_baseline_control",
+        "exp_02_region_balanced",
+    ]
+    req_batch = summary["requested_annotation_batch"]
+    assert req_batch["min_fresh_test_human_rows"] >= EXPOSURE_MIN_FRESH_TEST_ROWS
+    assert req_batch["target_test_human_rows"] >= EXPOSURE_MIN_FRESH_TEST_ROWS
+    assert (
+        req_batch["retained_validation_rows"] == FIXED_VALIDATION_SELECTION_ROWS
+    )
+    assert req_batch["validation_selection_unchanged"] is True
+    assert req_batch["overlap_constraints"] == {
+        "current_run_test_rows": 0,
+        "control_rows": 0,
+    }
+    assert "geographically" in req_batch["sampling_strategy"]
+    assert "fresh" in req_batch["sampling_strategy"]
+
+    decision = json.loads(
+        (run_dir / "promotion_decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["all_gates_pass"] is False
+    assert decision["promotion_evidence_valid"] is False
+    assert decision["rejection_reason"] == EXPOSURE_REJECTION_REASON
+    assert decision["selected_finalist_exp_id"] is None
+    assert decision["validation_mse"] is None
+    assert decision["retained_candidate"] is None
+    assert decision["registry_status"] == "unchanged"
+    assert decision["heldout_test_exposure"]["detected"] is True
+    assert decision["heldout_test_exposure"]["count"] == 2
+    assert decision["heldout_test_exposure"]["exp_ids"] == [
+        "exp_01_baseline_control",
+        "exp_02_region_balanced",
+    ]
+    assert (
+        decision["requested_annotation_batch"]["min_fresh_test_human_rows"]
+        >= EXPOSURE_MIN_FRESH_TEST_ROWS
+    )
+    assert (
+        decision["requested_annotation_batch"]["retained_validation_rows"]
+        == FIXED_VALIDATION_SELECTION_ROWS
+    )
 
 
 def test_resume_reuses_full_evidence_without_rerunning_validation_or_full_eval(
@@ -3054,3 +3344,117 @@ def test_resume_reuses_full_evidence_without_rerunning_validation_or_full_eval(
     assert summary["all_gates_pass"] is True
     assert summary["retained_exp_id"] == "exp_01_baseline_control"
     assert summary["pending_final_evaluation"] is False
+
+
+def test_exposure_annotation_request_contract() -> None:
+    req = build_exposure_annotation_request(
+        observed_test_samples=68, observed_val_samples=64
+    )
+    # At least 20 fresh, untouched test rows are requested.
+    assert req["min_fresh_test_human_rows"] >= 20
+    assert req["target_test_human_rows"] >= 20
+    assert req["needed_fresh_test_human_rows"] >= 20
+    # Exposed rows are never counted as satisfying the request.
+    assert req["observed_expanded_test_samples"] == 68
+    # Zero overlap against current-run test rows and control rows.
+    assert req["overlap_constraints"] == {
+        "current_run_test_rows": 0,
+        "control_rows": 0,
+    }
+    assert "geographically" in req["sampling_strategy"]
+    assert "fresh" in req["sampling_strategy"]
+    assert "no_current_or_control_overlap" in req["sampling_strategy"]
+    # The fixed 64-row validation selection is retained unchanged.
+    assert req["retained_validation_rows"] == 64
+    assert req["validation_selection_unchanged"] is True
+
+
+def test_clean_run_resume_remains_promotion_eligible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    env = _build_run_env(tmp_path)
+    run_name = "run_clean_promo"
+    monkeypatch.setattr(mod, "prepare_active_dataset", _mock_prepare)
+
+    train_calls: dict[str, Any] = {}
+    monkeypatch.setattr(mod, "train_active_model", _make_train_mock(train_calls))
+    validation_calls: list[str] = []
+    base_validation = _make_validation_mock(
+        {
+            "exp_01_baseline_control": 0.2,
+            "exp_02_region_balanced": 0.4,
+        }
+    )
+
+    def tracking_validation(**kwargs: Any) -> dict[str, Any]:
+        validation_calls.append(str(kwargs["candidate_checkpoint"]))
+        return base_validation(**kwargs)
+
+    monkeypatch.setattr(mod, "evaluate_candidate_validation", tracking_validation)
+    stage_two_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        mod, "evaluate_stage_two", _make_stage_two_mock(stage_two_calls)
+    )
+
+    run_args = _run_args(env, run_name, max_experiments=2)
+    monkeypatch.setattr(sys, "argv", run_args)
+    mod.main()
+
+    run_dir = (
+        tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    )
+    jsonl_path = run_dir / "experiments.jsonl"
+    first_run_lines = [
+        line
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    # Clean run: every candidate has validation evidence and exactly one
+    # validation-selected full record (the finalist) exists.
+    assert len(first_run_lines) == 3
+    assert len(validation_calls) == 2
+    assert len(stage_two_calls) == 1
+    all_records = [json.loads(line) for line in first_run_lines]
+    assert detect_heldout_test_exposure(all_records) == []
+    assert all(has_validation_evidence(r) for r in all_records)
+
+    # Resume of the clean run stays promotion-eligible: evidence valid, no
+    # exposure, retained candidate present, nothing retrains or re-evaluates.
+    monkeypatch.setattr(sys, "argv", run_args + ["--resume"])
+    mod.main()
+
+    assert len(train_calls) == 2
+    assert len(validation_calls) == 2
+    assert len(stage_two_calls) == 1
+    assert (
+        jsonl_path.read_text(encoding="utf-8").splitlines() == first_run_lines
+    )
+
+    summary = json.loads(
+        (run_dir / "final_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["run_state"] == "completed"
+    assert summary["promotion_evidence_valid"] is True
+    assert summary["heldout_test_exposure"] == {
+        "detected": False,
+        "count": 0,
+        "exp_ids": [],
+    }
+    assert summary["all_gates_pass"] is True
+    assert summary["retained_exp_id"] == "exp_01_baseline_control"
+    assert summary["retained_candidate"] is not None
+    assert summary["retained_candidate"]["exp_id"] == "exp_01_baseline_control"
+    assert summary["rejection_reason"] is None
+    assert summary["requested_annotation_batch"] is None
+
+    decision = json.loads(
+        (run_dir / "promotion_decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["promotion_evidence_valid"] is True
+    assert decision["heldout_test_exposure"]["detected"] is False
+    assert decision["all_gates_pass"] is True
+    assert decision["retained_candidate"] is not None
+    assert decision["registry_status"] == "unchanged"  # --promote not requested

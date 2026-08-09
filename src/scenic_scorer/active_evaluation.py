@@ -1004,11 +1004,36 @@ def evaluate_stage_two(
         raise ValueError(f"Route QA JSON {rq_path} must be a dictionary")
 
     routes = route_qa_data.get("routes")
-    has_nonempty_routes = (
-        isinstance(routes, list)
-        and len(routes) > 0
-        and all(isinstance(r, dict) and len(r) > 0 for r in routes)
+
+    def _get_sha(data_dict: dict[str, Any], *keys: str) -> str | None:
+        for k in keys:
+            val = data_dict.get(k)
+            if isinstance(val, str) and val.strip():
+                return val.strip().lower()
+            elif isinstance(val, dict):
+                sub = (
+                    val.get("sha256")
+                    or val.get("checkpoint_sha256")
+                    or val.get("report_sha256")
+                )
+                if isinstance(sub, str) and sub.strip():
+                    return sub.strip().lower()
+        return None
+
+    # Top-level candidate and baseline checkpoint SHA-256 validation
+    top_cand_sha = _get_sha(
+        route_qa_data, "candidate_checkpoint_sha256", "candidate_sha256", "candidate"
     )
+    top_base_sha = _get_sha(
+        route_qa_data, "baseline_checkpoint_sha256", "baseline_sha256", "baseline"
+    )
+    top_checkpoints_match = bool(
+        top_cand_sha
+        and top_base_sha
+        and top_cand_sha == candidate_sha256.lower()
+        and top_base_sha == baseline_sha256.lower()
+    )
+
     all_invariants_pass = route_qa_data.get("all_invariants_pass") is True
 
     stability_confirmed = route_qa_data.get("stability_confirmed") is True or (
@@ -1021,13 +1046,88 @@ def evaluate_stage_two(
         and route_qa_data["complexity"].get("accepted") is True
     )
 
+    # Detailed per-route validation
+    has_candidate_role = False
+    has_baseline_role = False
+    routes_valid = True
+
+    if isinstance(routes, list) and len(routes) > 0:
+        for r in routes:
+            if not isinstance(r, dict) or len(r) == 0:
+                routes_valid = False
+                break
+
+            role_str = str(
+                r.get("role")
+                or r.get("route_role")
+                or r.get("kind")
+                or r.get("route_kind")
+                or ""
+            ).strip().lower()
+
+            if role_str in ("candidate", "scenic"):
+                has_candidate_role = True
+                expected_ckpt_sha = candidate_sha256.lower()
+            elif role_str == "baseline":
+                has_baseline_role = True
+                expected_ckpt_sha = baseline_sha256.lower()
+            else:
+                routes_valid = False
+                break
+
+            # Declared route checkpoint hash
+            r_ckpt_sha = _get_sha(
+                r, "checkpoint_sha256", "checkpoint_hash", "checkpoint_sha", "sha256"
+            )
+            if not r_ckpt_sha or r_ckpt_sha != expected_ckpt_sha:
+                routes_valid = False
+                break
+
+            # Report path validation
+            rep_path_val = r.get("report_path") or r.get("report") or r.get("path")
+            if not rep_path_val:
+                routes_valid = False
+                break
+            rep_path = Path(rep_path_val)
+            if not rep_path.is_file():
+                routes_valid = False
+                break
+
+            # Report SHA-256 validation
+            declared_rep_sha = _get_sha(r, "report_sha256", "report_hash")
+            if not declared_rep_sha:
+                routes_valid = False
+                break
+            try:
+                actual_rep_sha = file_sha256(rep_path).lower()
+            except Exception:
+                routes_valid = False
+                break
+            if declared_rep_sha != actual_rep_sha:
+                routes_valid = False
+                break
+
+            # Route invariants check
+            r_inv_pass = (
+                r.get("invariants_pass") is not False
+                and r.get("invariants_passed") is not False
+                and r.get("pass") is not False
+            )
+            if not r_inv_pass:
+                routes_valid = False
+                break
+    else:
+        routes_valid = False
+
     route_evidence_pass = bool(
-        has_nonempty_routes
+        top_checkpoints_match
+        and has_candidate_role
+        and has_baseline_role
+        and routes_valid
         and all_invariants_pass
         and stability_confirmed
         and complexity_accepted
     )
-
     # 7. Compound Decision Gates Evaluation
     exp_cand_mse = exp_res["candidate_metrics"]["mse"]
     exp_base_mse = exp_res["baseline_metrics"]["mse"]
