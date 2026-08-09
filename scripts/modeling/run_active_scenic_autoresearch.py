@@ -42,7 +42,10 @@ except (ImportError, SyntaxError):
         raise
 
 try:
-    from scripts.modeling.validate_stage2_preflight import validate_handoff  # noqa: E402
+    from scripts.modeling.validate_stage2_preflight import (  # noqa: E402
+        validate_handoff,
+        validate_supplemental,
+    )
 except (ImportError, SyntaxError):
     import importlib.util
 
@@ -56,6 +59,7 @@ except (ImportError, SyntaxError):
         _mod = importlib.util.module_from_spec(_spec)
         _spec.loader.exec_module(_mod)
         validate_handoff = _mod.validate_handoff
+        validate_supplemental = getattr(_mod, "validate_supplemental", None)
     else:
         raise
 
@@ -124,6 +128,8 @@ def compute_experiment_digest(
     route_qa_sha256: str,
     baseline_checkpoint_sha256: str,
     thresholds_sha256: Optional[str] = None,
+    supplemental_annotations_sha256: Optional[str] = None,
+    supplemental_benchmark_sha256: Optional[str] = None,
 ) -> str:
     """Compute a deterministic SHA-256 digest binding experiment config and input artifact hashes."""
     cfg_dict = (
@@ -142,6 +148,8 @@ def compute_experiment_digest(
         "route_qa_sha256": route_qa_sha256,
         "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
         "thresholds_sha256": thresholds_sha256,
+        "supplemental_annotations_sha256": supplemental_annotations_sha256,
+        "supplemental_benchmark_sha256": supplemental_benchmark_sha256,
     }
     canonical = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -555,16 +563,22 @@ def validate_run_manifest(
     control_benchmark_sha256: str,
     route_qa_sha256: str,
     thresholds_sha256: Optional[str],
+    supplemental_annotations_sha256: Optional[str],
+    supplemental_benchmark_sha256: Optional[str],
+    observed_val_samples: int,
+    observed_test_samples: int,
+    is_data_limited: bool,
+    supp_metrics: Optional[Dict[str, int]],
     args: argparse.Namespace,
 ) -> None:
-    """Validate that existing run_manifest matches current invocation material config and input/baseline hashes."""
+    """Validate an existing run manifest against the current invocation."""
     mismatches = []
 
-    if "run_name" not in existing_manifest or existing_manifest["run_name"] != run_name:
+    if existing_manifest.get("run_name") != run_name:
         mismatches.append(
             f"run_name mismatch: manifest={existing_manifest.get('run_name')}, current={run_name}"
         )
-    # Material execution mode flags
+
     mode_checks = [
         ("dry_run", args.dry_run),
         ("promote_requested", args.promote),
@@ -587,6 +601,14 @@ def validate_run_manifest(
         ("route_qa_sha256", route_qa_sha256),
         ("thresholds_sha256", thresholds_sha256),
     ]
+    supplemental_enabled = args.supplemental_annotations is not None
+    if supplemental_enabled:
+        hash_checks.extend(
+            [
+                ("supplemental_annotations_sha256", supplemental_annotations_sha256),
+                ("supplemental_benchmark_sha256", supplemental_benchmark_sha256),
+            ]
+        )
     for key, current_val in hash_checks:
         if key not in existing_manifest:
             mismatches.append(f"missing key in manifest: {key}")
@@ -594,6 +616,25 @@ def validate_run_manifest(
             mismatches.append(
                 f"{key} mismatch: manifest={existing_manifest[key]}, current={current_val}"
             )
+
+    expected_supp_path = (
+        str(args.supplemental_annotations) if supplemental_enabled else None
+    )
+    if supplemental_enabled:
+        supplemental_checks = [
+            ("supplemental_annotations_path", expected_supp_path),
+            ("supplemental_metrics", supp_metrics),
+            ("expanded_val_support", observed_val_samples),
+            ("expanded_test_support", observed_test_samples),
+            ("data_limited", is_data_limited),
+        ]
+        for key, current_val in supplemental_checks:
+            if key not in existing_manifest:
+                mismatches.append(f"missing key in manifest: {key}")
+            elif existing_manifest[key] != current_val:
+                mismatches.append(
+                    f"{key} mismatch: manifest={existing_manifest[key]}, current={current_val}"
+                )
 
     if "config" not in existing_manifest or not isinstance(
         existing_manifest["config"], dict
@@ -615,6 +656,21 @@ def validate_run_manifest(
                 str(args.thresholds_json) if args.thresholds_json else None,
             ),
         ]
+        if supplemental_enabled:
+            config_checks.extend(
+                [
+                    ("supplemental_annotations", expected_supp_path),
+                    (
+                        "supplemental_annotations_sha256",
+                        supplemental_annotations_sha256,
+                    ),
+                    (
+                        "supplemental_benchmark_sha256",
+                        supplemental_benchmark_sha256,
+                    ),
+                    ("supplemental_metrics", supp_metrics),
+                ]
+            )
         for key, current_val in config_checks:
             if key not in cfg:
                 mismatches.append(f"missing config key in manifest: {key}")
@@ -627,7 +683,6 @@ def validate_run_manifest(
         raise ValueError(
             "Run manifest validation failed on resume:\n" + "\n".join(mismatches)
         )
-
 
 def load_existing_experiments(
     experiments_jsonl: Path,
@@ -767,12 +822,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Attempt registry promotion if candidate passes all evaluation gates.",
     )
+    parser.add_argument(
+        "--supplemental-annotations",
+        type=Path,
+        default=None,
+        help="Path to supplemental annotations CSV.",
+    )
+    parser.add_argument(
+        "--supplemental-annotations-sha256",
+        type=str,
+        default=None,
+        help="Expected SHA-256 hash of supplemental annotations CSV.",
+    )
+    parser.add_argument(
+        "--supplemental-benchmark-sha256",
+        type=str,
+        default=None,
+        help="Expected SHA-256 hash of supplemental benchmark CSV.",
+    )
     args = parser.parse_args()
     args.run_name = validate_run_name(args.run_name)
     if args.max_seconds is not None and args.max_seconds <= 0:
         raise ValueError("--max-seconds must be positive")
     if not (1 <= args.max_experiments <= 5):
         raise ValueError("--max-experiments must be between 1 and 5")
+
+    supp_flags = [
+        args.supplemental_annotations,
+        args.supplemental_annotations_sha256,
+        args.supplemental_benchmark_sha256,
+    ]
+    num_supplied = sum(1 for f in supp_flags if f is not None)
+    if num_supplied not in (0, 3):
+        raise ValueError(
+            "--supplemental-annotations, --supplemental-annotations-sha256, and "
+            "--supplemental-benchmark-sha256 must be provided together or all omitted."
+        )
     return args
 
 
@@ -813,11 +898,29 @@ def main() -> None:
         "control dataset NPZ": args.control_dataset,
         "route QA evidence": args.route_qa_json,
     }
+    if args.supplemental_annotations:
+        required_inputs["supplemental annotations"] = args.supplemental_annotations
     if args.thresholds_json:
         required_inputs["thresholds"] = Path(args.thresholds_json)
     for label, path in required_inputs.items():
         if not Path(path).is_file():
             raise FileNotFoundError(f"Missing {label}: {path}")
+
+    # Validate supplemental benchmark if enabled (before run directory setup)
+    supp_metrics: Optional[Dict[str, int]] = None
+    if args.supplemental_annotations is not None:
+        if validate_supplemental is None:
+            raise RuntimeError("validate_supplemental function not available in validate_stage2_preflight")
+        supp_metrics = validate_supplemental(
+            handoff_path=handoff_path,
+            supplemental_annotations=Path(args.supplemental_annotations),
+            supplemental_benchmark=Path(args.expanded_benchmark_csv),
+            annotations_sha256=args.supplemental_annotations_sha256,
+            benchmark_sha256=args.supplemental_benchmark_sha256,
+            control_benchmark=Path(args.control_benchmark_csv),
+        )
+        for name, value in supp_metrics.items():
+            print(f"METRIC {name}={value}")
 
     # 2. Setup Run Directory
     run_dir = Path("data/processed/modeling_autoresearch") / args.run_name
@@ -846,12 +949,6 @@ def main() -> None:
     ):
         raise ValueError("--thresholds-json is required for non-dry execution")
 
-    run_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = run_dir / "run_manifest.json"
-    experiments_jsonl = run_dir / "experiments.jsonl"
-    decision_path = run_dir / "promotion_decision.json"
-    summary_path = run_dir / "final_summary.json"
-
     # 3. Capture Immutable Baseline Identity
     registry_path = Path("data/processed/regression/model_registry.json")
     if not registry_path.exists():
@@ -875,6 +972,38 @@ def main() -> None:
         )
     baseline_checkpoint_sha256 = compute_sha256(baseline_checkpoint_path)
 
+    # Compute Input Hashes
+    expanded_benchmark_sha256 = compute_sha256(args.expanded_benchmark_csv)
+    control_benchmark_sha256 = compute_sha256(args.control_benchmark_csv)
+    control_dataset_sha256 = compute_sha256(args.control_dataset)
+    route_qa_sha256 = compute_sha256(args.route_qa_json)
+    thresholds_sha256 = (
+        compute_sha256(args.thresholds_json)
+        if args.thresholds_json and Path(args.thresholds_json).is_file()
+        else None
+    )
+    supplemental_annotations_sha256 = args.supplemental_annotations_sha256
+    supplemental_benchmark_sha256 = args.supplemental_benchmark_sha256
+    handoff_sha256 = compute_sha256(handoff_path)
+
+    # Count expanded val support & check threshold
+    min_val_samples = 5
+    if thresholds and isinstance(thresholds, dict):
+        raw_val = thresholds.get("min_expanded_validation_samples")
+        if isinstance(raw_val, int) and raw_val > 0 and not isinstance(raw_val, bool):
+            min_val_samples = raw_val
+
+    observed_val_samples = count_expanded_val_samples(args.expanded_benchmark_csv)
+    observed_test_samples = _count_expanded_human_samples(
+        args.expanded_benchmark_csv, split="test"
+    )
+    is_data_limited = observed_val_samples < min_val_samples
+
+    manifest_path = run_dir / "run_manifest.json"
+    experiments_jsonl = run_dir / "experiments.jsonl"
+    decision_path = run_dir / "promotion_decision.json"
+    summary_path = run_dir / "final_summary.json"
+
     # Handle --status mode
     if args.status:
         if not manifest_path.exists():
@@ -885,12 +1014,42 @@ def main() -> None:
             status_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception as err:
             raise ValueError(f"Run manifest at {manifest_path} is invalid JSON: {err}")
-        if not isinstance(status_manifest, dict) or not status_manifest.get(
-            "baseline_checkpoint_sha256"
+
+        if (
+            not isinstance(status_manifest, dict)
+            or "baseline_checkpoint_sha256" not in status_manifest
         ):
             raise ValueError(
                 f"Run manifest at {manifest_path} is malformed or lacks baseline_checkpoint_sha256"
             )
+
+        if args.supplemental_annotations is not None:
+            supplemental_status_checks = [
+                (
+                    "supplemental_annotations_sha256",
+                    supplemental_annotations_sha256,
+                ),
+                ("supplemental_benchmark_sha256", supplemental_benchmark_sha256),
+                (
+                    "supplemental_annotations_path",
+                    str(args.supplemental_annotations),
+                ),
+                ("supplemental_metrics", supp_metrics),
+                ("expanded_val_support", observed_val_samples),
+                ("expanded_test_support", observed_test_samples),
+                ("data_limited", is_data_limited),
+            ]
+            status_mismatches = [
+                f"{key}: manifest={status_manifest.get(key)}, current={current}"
+                for key, current in supplemental_status_checks
+                if status_manifest.get(key) != current
+            ]
+            if status_mismatches:
+                raise ValueError(
+                    "Run manifest validation failed on resume:\n"
+                    + "\n".join(status_mismatches)
+                )
+
         manifest_baseline_checkpoint_sha256 = status_manifest[
             "baseline_checkpoint_sha256"
         ]
@@ -916,34 +1075,11 @@ def main() -> None:
             )
         sys.exit(0)
 
-    # Compute Input Hashes
-    expanded_benchmark_sha256 = compute_sha256(args.expanded_benchmark_csv)
-    control_benchmark_sha256 = compute_sha256(args.control_benchmark_csv)
-    control_dataset_sha256 = compute_sha256(args.control_dataset)
-    route_qa_sha256 = compute_sha256(args.route_qa_json)
-    thresholds_sha256 = (
-        compute_sha256(args.thresholds_json)
-        if args.thresholds_json and Path(args.thresholds_json).is_file()
-        else None
-    )
-    handoff_sha256 = compute_sha256(handoff_path)
-
-    # Count expanded val support & check threshold
-    min_val_samples = 5
-    if thresholds and isinstance(thresholds, dict):
-        raw_val = thresholds.get("min_expanded_validation_samples")
-        if isinstance(raw_val, int) and raw_val > 0 and not isinstance(raw_val, bool):
-            min_val_samples = raw_val
-
-    observed_val_samples = count_expanded_val_samples(args.expanded_benchmark_csv)
-    observed_test_samples = _count_expanded_human_samples(
-        args.expanded_benchmark_csv, split="test"
-    )
-    is_data_limited = observed_val_samples < min_val_samples
-
     print(f"METRIC expanded_val_support={observed_val_samples}")
     print(f"METRIC min_expanded_validation_samples={min_val_samples}")
     print(f"METRIC data_limited={1 if is_data_limited else 0}")
+
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_baseline_checkpoint_sha256 = baseline_checkpoint_sha256
     # Handle Manifest (Immutable run identity/config/input hashes)
@@ -967,6 +1103,12 @@ def main() -> None:
             control_benchmark_sha256=control_benchmark_sha256,
             route_qa_sha256=route_qa_sha256,
             thresholds_sha256=thresholds_sha256,
+            supplemental_annotations_sha256=supplemental_annotations_sha256,
+            supplemental_benchmark_sha256=supplemental_benchmark_sha256,
+            observed_val_samples=observed_val_samples,
+            observed_test_samples=observed_test_samples,
+            is_data_limited=is_data_limited,
+            supp_metrics=supp_metrics,
             args=args,
         )
         if not args.dry_run and not args.status and not args.thresholds_json:
@@ -991,7 +1133,16 @@ def main() -> None:
             "control_dataset_sha256": control_dataset_sha256,
             "route_qa_sha256": route_qa_sha256,
             "thresholds_sha256": thresholds_sha256,
+            "supplemental_annotations_path": (
+                str(args.supplemental_annotations)
+                if args.supplemental_annotations
+                else None
+            ),
+            "supplemental_annotations_sha256": supplemental_annotations_sha256,
+            "supplemental_benchmark_sha256": supplemental_benchmark_sha256,
+            "supplemental_metrics": supp_metrics,
             "expanded_val_support": observed_val_samples,
+            "expanded_test_support": observed_test_samples,
             "min_expanded_validation_samples": min_val_samples,
             "data_limited": is_data_limited,
             "rejection_reason": (
@@ -1014,10 +1165,17 @@ def main() -> None:
                 "thresholds_json": (
                     str(args.thresholds_json) if args.thresholds_json else None
                 ),
+                "supplemental_annotations": (
+                    str(args.supplemental_annotations)
+                    if args.supplemental_annotations
+                    else None
+                ),
+                "supplemental_annotations_sha256": args.supplemental_annotations_sha256,
+                "supplemental_benchmark_sha256": args.supplemental_benchmark_sha256,
+                "supplemental_metrics": supp_metrics,
             },
         }
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-
     # 4. Build Experiment Ladder
     base_config = ActiveTrainingConfig(
         seed=args.seed,

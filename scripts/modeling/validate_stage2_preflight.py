@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Fail-closed validation for a Stage One handoff before Stage Two work."""
+"""Fail-closed validation for a Stage One handoff before Stage Two work.
+
+The handoff-only path is unchanged. When supplemental annotations and a
+supplemental benchmark are supplied, they are validated as supplemental
+evaluation evidence: the benchmark must be exactly reconstructible from the
+non-skipped finite annotations that hold immutable fixed split membership in
+the stage-one geographic splits artifact, with matching human targets and
+split assignments and no cross-split leakage.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +15,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -31,6 +40,11 @@ COUNT_ARTIFACTS = {
     "split_rows": "geographic_splits",
     "tile_rows": "tile_manifest",
 }
+ANNOTATION_SCORE_MIN = 0.0
+ANNOTATION_SCORE_MAX = 10.0
+ADJACENCY_RADIUS = 1
+SKIP_TRUE_VALUES = {"1", "true", "yes"}
+SKIP_PARSE_VALUES = {"", "0", "false", "no", "1", "true", "yes"}
 
 
 def sha256_file(path: Path) -> str:
@@ -98,6 +112,196 @@ def benchmark_identities(path: Path) -> tuple[dict[str, int], set[str]]:
             normalized = "val" if split == "validation" else split
             counts[normalized] = counts.get(normalized, 0) + 1
     return counts, identities
+
+
+def _normalise_split(value: str | None) -> str:
+    normalized = (value or "").strip().lower()
+    return "val" if normalized == "validation" else normalized
+
+
+def _validate_sha256_digest(value: str, name: str) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value.lower())
+    ):
+        raise ValueError(f"{name} must be a 64-character hex SHA-256 digest")
+
+
+def _parse_skip(value: str | None) -> bool:
+    normalized = (value or "").strip().lower()
+    if normalized not in SKIP_PARSE_VALUES:
+        raise ValueError(f"annotation has malformed skip decision: {value!r}")
+    return normalized in SKIP_TRUE_VALUES
+
+
+def annotation_targets(path: Path) -> tuple[dict[str, list[float]], set[str]]:
+    """Return per-identity human scores and the set of skipped identities.
+
+    A truthy skip decision takes precedence over any vestigial score value;
+    every other row must carry a finite score on the annotation contract
+    scale. Identities must be unique and non-empty.
+    """
+    targets: dict[str, list[float]] = {}
+    skipped: set[str] = set()
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {"image_path", "scenic_human", "skip"}
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            raise ValueError(f"annotation CSV lacks required columns: {path}")
+        for row in reader:
+            identity = (row.get("image_path") or "").strip()
+            if not identity:
+                raise ValueError(f"annotation contains empty image_path: {path}")
+            if identity in targets or identity in skipped:
+                raise ValueError(f"annotation contains duplicate identity: {identity}")
+            if _parse_skip(row.get("skip")):
+                skipped.add(identity)
+                continue
+            score_text = (row.get("scenic_human") or "").strip()
+            if not score_text:
+                raise ValueError(f"annotation is neither scored nor skipped: {identity}")
+            try:
+                score = float(score_text)
+            except ValueError as exc:
+                raise ValueError(f"annotation has non-numeric score: {identity}") from exc
+            if not math.isfinite(score) or not (
+                ANNOTATION_SCORE_MIN <= score <= ANNOTATION_SCORE_MAX
+            ):
+                raise ValueError(
+                    f"annotation score out of range [{ANNOTATION_SCORE_MIN}, "
+                    f"{ANNOTATION_SCORE_MAX}]: {identity}"
+                )
+            targets.setdefault(identity, []).append(score)
+    return targets, skipped
+
+
+def supplemental_benchmark_rows(path: Path) -> dict[str, tuple[str, float]]:
+    """Return supplemental benchmark identity -> (split, human target)."""
+    rows: dict[str, tuple[str, float]] = {}
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {"image_path", "scenic_human_mean", "split"}
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            raise ValueError(
+                f"benchmark lacks required columns {sorted(required)}: {path}"
+            )
+        for row in reader:
+            identity = (row.get("image_path") or "").strip()
+            split = _normalise_split(row.get("split"))
+            if not identity or split not in {"train", "val", "test"}:
+                raise ValueError(f"benchmark contains invalid identity or split: {path}")
+            if identity in rows:
+                raise ValueError(f"benchmark contains duplicate image_path: {identity}")
+            try:
+                target = float((row.get("scenic_human_mean") or "").strip())
+            except ValueError as exc:
+                raise ValueError(f"benchmark has non-numeric target: {identity}") from exc
+            if not math.isfinite(target) or not (
+                ANNOTATION_SCORE_MIN <= target <= ANNOTATION_SCORE_MAX
+            ):
+                raise ValueError(f"benchmark target out of range: {identity}")
+            rows[identity] = (split, target)
+    return rows
+
+
+def split_assignments(
+    splits_path: Path, identities: set[str]
+) -> dict[str, tuple[str, int, int, int]]:
+    """Stream the immutable geographic splits artifact for the given identities.
+
+    Returns identity -> (split, z, x, y). Streaming with a membership filter
+    keeps this linear in the artifact size rather than quadratic.
+    """
+    assignments: dict[str, tuple[str, int, int, int]] = {}
+    with splits_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {"image_path", "split", "z", "x", "y"}
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            raise ValueError(
+                f"geographic splits lacks required columns {sorted(required)}: "
+                f"{splits_path}"
+            )
+        for row in reader:
+            identity = (row.get("image_path") or "").strip()
+            if not identity or identity not in identities:
+                continue
+            split = _normalise_split(row.get("split"))
+            if split not in {"train", "val", "test"}:
+                raise ValueError(f"geographic splits contains invalid split: {identity}")
+            try:
+                z, x, y = int(row["z"]), int(row["x"]), int(row["y"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"geographic splits has non-integer tile coordinates: {identity}"
+                ) from exc
+            if identity in assignments:
+                raise ValueError(
+                    f"geographic splits assigns identity to multiple rows: {identity}"
+                )
+            assignments[identity] = (split, z, x, y)
+    return assignments
+
+
+def _load_handoff(handoff_path: Path) -> dict[str, Any]:
+    try:
+        handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid handoff JSON: {handoff_path}") from exc
+    if not isinstance(handoff, dict) or handoff.get("schema_version") != 1:
+        raise ValueError("stage-one handoff schema_version must equal 1")
+    if not isinstance(handoff.get("artifacts"), dict) or not isinstance(
+        handoff.get("artifact_hashes"), dict
+    ):
+        raise ValueError("stage-one handoff lacks artifact contracts")
+    return handoff
+
+
+def _resolve_verified_artifact(
+    handoff: Mapping[str, Any], handoff_path: Path, name: str
+) -> Path:
+    record = handoff["artifacts"].get(name)
+    if not isinstance(record, dict):
+        raise ValueError(f"stage-one handoff lacks artifact record: {name}")
+    path = resolve_artifact(handoff_path, record)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"supplemental validation requires artifact: {name}: {path}"
+        )
+    expected_hash = record.get("sha256")
+    artifact_hashes = handoff["artifact_hashes"]
+    if (
+        not isinstance(expected_hash, str)
+        or len(expected_hash) != 64
+        or artifact_hashes.get(name) != expected_hash
+        or sha256_file(path) != expected_hash
+    ):
+        raise ValueError(f"artifact SHA-256 mismatch: {name}")
+    return path
+
+
+def _check_benchmark_adjacency(
+    assignments: Mapping[str, tuple[str, int, int, int]],
+    identities: set[str],
+    radius: int = ADJACENCY_RADIUS,
+) -> None:
+    """Fail when benchmark tiles from different splits are Chebyshev-adjacent."""
+    tile_splits: dict[tuple[int, int, int], str] = {}
+    for identity in identities:
+        split, z, x, y = assignments[identity]
+        tile_splits[(z, x, y)] = split
+    for (z, x, y), split in sorted(tile_splits.items()):
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                other_split = tile_splits.get((z, x + dx, y + dy))
+                if other_split is not None and other_split != split:
+                    raise ValueError(
+                        f"adjacent tiles assigned to different splits: "
+                        f"z{z}/{x}/{y} ({split}) vs "
+                        f"z{z}/{x + dx}/{y + dy} ({other_split})"
+                    )
 
 
 def validate_handoff(handoff_path: Path) -> dict[str, int]:
@@ -226,14 +430,159 @@ def validate_handoff(handoff_path: Path) -> dict[str, int]:
     }
 
 
+def validate_supplemental(
+    handoff_path: Path,
+    supplemental_annotations: Path,
+    supplemental_benchmark: Path,
+    annotations_sha256: str,
+    benchmark_sha256: str,
+    control_benchmark: Path | None = None,
+) -> dict[str, int]:
+    """Fail-closed validation of supplemental human benchmark evidence.
+
+    The supplemental benchmark must be exactly reconstructible from the
+    supplemental annotations plus the immutable stage-one geographic splits:
+    every non-skipped, finite annotation with a fixed split assignment must
+    appear exactly once with a matching human target and split, and nothing
+    else may appear. Split support must cover train/val/test, identities must
+    be disjoint and free of adjacent cross-split tiles, and test identities
+    must be disjoint from the control benchmark. Raises ValueError on any
+    mismatch.
+    """
+    handoff_path = handoff_path.expanduser().resolve()
+    _validate_sha256_digest(annotations_sha256, "supplemental annotations SHA-256")
+    _validate_sha256_digest(benchmark_sha256, "supplemental benchmark SHA-256")
+    annotations_path = supplemental_annotations.expanduser().resolve()
+    benchmark_path = supplemental_benchmark.expanduser().resolve()
+    if not annotations_path.is_file():
+        raise FileNotFoundError(f"supplemental annotations missing: {annotations_path}")
+    if not benchmark_path.is_file():
+        raise FileNotFoundError(f"supplemental benchmark missing: {benchmark_path}")
+    if sha256_file(annotations_path) != annotations_sha256:
+        raise ValueError("supplemental annotations SHA-256 mismatch")
+    if sha256_file(benchmark_path) != benchmark_sha256:
+        raise ValueError("supplemental benchmark SHA-256 mismatch")
+
+    handoff = _load_handoff(handoff_path)
+    splits_path = _resolve_verified_artifact(handoff, handoff_path, "geographic_splits")
+    if control_benchmark is None:
+        control_path = _resolve_verified_artifact(handoff, handoff_path, "control_benchmark")
+    else:
+        control_path = control_benchmark.expanduser().resolve()
+        if not control_path.is_file():
+            raise FileNotFoundError(f"control benchmark missing: {control_path}")
+        record = handoff["artifacts"]["control_benchmark"]
+        if sha256_file(control_path) != record.get("sha256"):
+            raise ValueError("control benchmark SHA-256 mismatch with stage-one handoff")
+
+    targets, skipped = annotation_targets(annotations_path)
+    benchmark = supplemental_benchmark_rows(benchmark_path)
+    identities = set(targets) | skipped | set(benchmark)
+    assignments = split_assignments(splits_path, identities)
+
+    expected = {identity for identity in targets if identity in assignments}
+    for identity in expected:
+        if identity not in benchmark:
+            raise ValueError(f"benchmark missing annotated tile: {identity}")
+    for identity, (split, target) in benchmark.items():
+        if identity not in expected:
+            raise ValueError(
+                "benchmark tile has no valid non-skipped annotation with fixed "
+                f"split membership: {identity}"
+            )
+        assigned_split, _, _, _ = assignments[identity]
+        if assigned_split != split:
+            raise ValueError(
+                f"benchmark split mismatch for {identity}: "
+                f"{split} != assigned {assigned_split}"
+            )
+        annotation_mean = math.fsum(targets[identity]) / len(targets[identity])
+        if not math.isclose(annotation_mean, target, rel_tol=1e-9, abs_tol=1e-9):
+            raise ValueError(
+                f"benchmark target mismatch for {identity}: "
+                f"{target} != annotation mean {annotation_mean}"
+            )
+
+    split_counts: dict[str, int] = {}
+    for _, (split, _) in benchmark.items():
+        split_counts[split] = split_counts.get(split, 0) + 1
+    if set(split_counts) != {"train", "val", "test"} or any(
+        value <= 0 for value in split_counts.values()
+    ):
+        raise ValueError(
+            f"supplemental benchmark lacks train/val/test support: {split_counts}"
+        )
+
+    _check_benchmark_adjacency(assignments, set(benchmark))
+
+    _, control_identities = benchmark_identities(control_path)
+    test_identities = {
+        identity for identity, (split, _) in benchmark.items() if split == "test"
+    }
+    overlap = test_identities & control_identities
+    if overlap:
+        raise ValueError(
+            "supplemental test identities overlap control benchmark: "
+            + ", ".join(sorted(overlap)[:3])
+        )
+
+    return {
+        "supplemental_benchmark_valid": 1,
+        "supplemental_rows": len(benchmark),
+        "supplemental_val_rows": split_counts.get("val", 0),
+        "supplemental_test_rows": split_counts.get("test", 0),
+        "supplemental_skipped_rows": len(skipped),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--handoff", type=Path, required=True)
+    parser.add_argument("--supplemental-annotations", type=Path)
+    parser.add_argument("--supplemental-annotations-sha256")
+    parser.add_argument("--supplemental-benchmark", type=Path)
+    parser.add_argument("--supplemental-benchmark-sha256")
+    parser.add_argument("--control-benchmark", type=Path)
     args = parser.parse_args()
+
+    supplemental_flags = (
+        "--supplemental-annotations",
+        "--supplemental-annotations-sha256",
+        "--supplemental-benchmark",
+        "--supplemental-benchmark-sha256",
+    )
+    supplemental_args = (
+        args.supplemental_annotations,
+        args.supplemental_annotations_sha256,
+        args.supplemental_benchmark,
+        args.supplemental_benchmark_sha256,
+    )
+    if any(value is not None for value in supplemental_args):
+        missing = [
+            flag
+            for flag, value in zip(supplemental_flags, supplemental_args)
+            if value is None
+        ]
+        if missing:
+            parser.error(
+                "supplemental validation requires all of: " + ", ".join(missing)
+            )
+
     metrics = validate_handoff(args.handoff)
     print("METRIC handoff_ready=1")
     for name, value in metrics.items():
         print(f"METRIC {name}={value}")
+    if any(value is not None for value in supplemental_args):
+        supplemental_metrics = validate_supplemental(
+            args.handoff,
+            args.supplemental_annotations,
+            args.supplemental_benchmark,
+            args.supplemental_annotations_sha256,
+            args.supplemental_benchmark_sha256,
+            args.control_benchmark,
+        )
+        for name, value in supplemental_metrics.items():
+            print(f"METRIC {name}={value}")
 
 
 if __name__ == "__main__":

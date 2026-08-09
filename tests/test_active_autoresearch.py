@@ -1914,3 +1914,402 @@ def test_select_best_candidate_ignores_rejected() -> None:
         },
     ]
     assert select_best_candidate(records) is None
+
+
+def test_supplemental_args_all_or_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.modeling.run_active_scenic_autoresearch import parse_args
+
+    base_args = [
+        "run_active_scenic_autoresearch.py",
+        "--expanded-benchmark-csv",
+        "exp.csv",
+        "--control-benchmark-csv",
+        "ctrl.csv",
+        "--control-dataset",
+        "ctrl.npz",
+        "--route-qa-json",
+        "route.json",
+    ]
+    # 1 provided -> ValueError
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        base_args + ["--supplemental-annotations", "supp.csv"],
+    )
+    with pytest.raises(ValueError, match="must be provided together or all omitted"):
+        parse_args()
+
+    # 2 provided -> ValueError
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        base_args
+        + [
+            "--supplemental-annotations",
+            "supp.csv",
+            "--supplemental-annotations-sha256",
+            "hash1",
+        ],
+    )
+    with pytest.raises(ValueError, match="must be provided together or all omitted"):
+        parse_args()
+
+    # 3 provided -> Success
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        base_args
+        + [
+            "--supplemental-annotations",
+            "supp.csv",
+            "--supplemental-annotations-sha256",
+            "hash1",
+            "--supplemental-benchmark-sha256",
+            "hash2",
+        ],
+    )
+    parsed = parse_args()
+    assert str(parsed.supplemental_annotations) == "supp.csv"
+    assert parsed.supplemental_annotations_sha256 == "hash1"
+    assert parsed.supplemental_benchmark_sha256 == "hash2"
+
+    # 0 provided -> Success
+    monkeypatch.setattr(sys, "argv", base_args)
+    parsed_zero = parse_args()
+    assert parsed_zero.supplemental_annotations is None
+    assert parsed_zero.supplemental_annotations_sha256 is None
+    assert parsed_zero.supplemental_benchmark_sha256 is None
+
+
+def test_supplemental_failure_exits_before_run_dir_or_prep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    root = tmp_path / "data" / "processed" / "active_learning"
+    _handoff(root / "run_01")
+    monkeypatch.chdir(tmp_path)
+
+    exp_csv = tmp_path / "exp.csv"
+    exp_csv.write_text("split,image_path,scenic_human_mean\nval,1.jpg,5.0\n" * 5, encoding="utf-8")
+    ctrl_csv = tmp_path / "ctrl.csv"
+    ctrl_csv.write_text("split,image_path\n", encoding="utf-8")
+    ctrl_npz = tmp_path / "ctrl.npz"
+    ctrl_npz.write_bytes(b"data")
+    route_json = tmp_path / "route.json"
+    route_json.write_text("{}", encoding="utf-8")
+    supp_csv = tmp_path / "supp.csv"
+    supp_csv.write_text("supp_data", encoding="utf-8")
+
+    supp_sha = compute_sha256(supp_csv)
+    bench_sha = compute_sha256(exp_csv)
+
+    def _failing_validate_supplemental(**kwargs: Any) -> dict[str, int]:
+        raise ValueError("Supplemental validation schema mismatch")
+
+    monkeypatch.setattr(mod, "validate_supplemental", _failing_validate_supplemental)
+
+    run_name = "run_supp_fail"
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+
+    test_args = [
+        "run_active_scenic_autoresearch.py",
+        "--run-name",
+        run_name,
+        "--dry-run",
+        "--expanded-benchmark-csv",
+        str(exp_csv),
+        "--control-benchmark-csv",
+        str(ctrl_csv),
+        "--control-dataset",
+        str(ctrl_npz),
+        "--route-qa-json",
+        str(route_json),
+        "--supplemental-annotations",
+        str(supp_csv),
+        "--supplemental-annotations-sha256",
+        supp_sha,
+        "--supplemental-benchmark-sha256",
+        bench_sha,
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+
+    with pytest.raises(ValueError, match="Supplemental validation schema mismatch"):
+        mod.main()
+
+    # Verify run directory was NOT created before failure
+    assert not run_dir.exists()
+
+
+def test_supplemental_manifest_and_digest_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    # Test compute_experiment_digest changes when supplemental hashes change
+    d1 = compute_experiment_digest(
+        exp_id="exp_01",
+        config={"seed": 42},
+        handoff_sha256="h",
+        dataset_sha256="d",
+        control_dataset_sha256="cd",
+        expanded_benchmark_sha256="eb",
+        control_benchmark_sha256="cb",
+        route_qa_sha256="rq",
+        baseline_checkpoint_sha256="bc",
+        supplemental_annotations_sha256="supp_hash1",
+        supplemental_benchmark_sha256="bench_hash1",
+    )
+    d2 = compute_experiment_digest(
+        exp_id="exp_01",
+        config={"seed": 42},
+        handoff_sha256="h",
+        dataset_sha256="d",
+        control_dataset_sha256="cd",
+        expanded_benchmark_sha256="eb",
+        control_benchmark_sha256="cb",
+        route_qa_sha256="rq",
+        baseline_checkpoint_sha256="bc",
+        supplemental_annotations_sha256="supp_hash2",
+        supplemental_benchmark_sha256="bench_hash1",
+    )
+    assert d1 != d2
+
+    # Test manifest binding during dry-run
+    root = tmp_path / "data" / "processed" / "active_learning"
+    _handoff(root / "run_01")
+    monkeypatch.chdir(tmp_path)
+
+    # Setup dummy baseline model registry & checkpoint
+    reg_dir = tmp_path / "data" / "processed" / "regression"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_file = reg_dir / "base.pt"
+    ckpt_file.write_bytes(b"baseline")
+    reg_file = reg_dir / "model_registry.json"
+    reg_file.write_text(json.dumps({"active": {"checkpoint": str(ckpt_file)}}), encoding="utf-8")
+
+    exp_csv = tmp_path / "exp.csv"
+    exp_csv.write_text("split,image_path,scenic_human_mean\nval,1.jpg,5.0\n" * 5, encoding="utf-8")
+    ctrl_csv = tmp_path / "ctrl.csv"
+    ctrl_csv.write_text("split,image_path\n", encoding="utf-8")
+    ctrl_npz = tmp_path / "ctrl.npz"
+    ctrl_npz.write_bytes(b"data")
+    route_json = tmp_path / "route.json"
+    route_json.write_text("{}", encoding="utf-8")
+    supp_csv = tmp_path / "supp.csv"
+    supp_csv.write_text("supp_data", encoding="utf-8")
+
+    supp_sha = compute_sha256(supp_csv)
+    bench_sha = compute_sha256(exp_csv)
+
+    metrics_mock = {"row_count": 20, "val_count": 5, "test_count": 15, "skipped_count": 0}
+    monkeypatch.setattr(mod, "validate_supplemental", lambda **kwargs: metrics_mock)
+
+    run_name = "run_supp_manifest"
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+
+    test_args = [
+        "run_active_scenic_autoresearch.py",
+        "--run-name",
+        run_name,
+        "--dry-run",
+        "--expanded-benchmark-csv",
+        str(exp_csv),
+        "--control-benchmark-csv",
+        str(ctrl_csv),
+        "--control-dataset",
+        str(ctrl_npz),
+        "--route-qa-json",
+        str(route_json),
+        "--supplemental-annotations",
+        str(supp_csv),
+        "--supplemental-annotations-sha256",
+        supp_sha,
+        "--supplemental-benchmark-sha256",
+        bench_sha,
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main()
+    assert exc.value.code == 0
+
+    manifest_path = run_dir / "run_manifest.json"
+    assert manifest_path.is_file()
+    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest_data["supplemental_annotations_path"] == str(supp_csv)
+    assert manifest_data["supplemental_annotations_sha256"] == supp_sha
+    assert manifest_data["supplemental_benchmark_sha256"] == bench_sha
+    assert manifest_data["supplemental_metrics"] == metrics_mock
+    assert manifest_data["config"]["supplemental_annotations"] == str(supp_csv)
+    assert manifest_data["config"]["supplemental_annotations_sha256"] == supp_sha
+    assert manifest_data["config"]["supplemental_benchmark_sha256"] == bench_sha
+    assert manifest_data["config"]["supplemental_metrics"] == metrics_mock
+
+
+def test_supplemental_stale_resume_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    root = tmp_path / "data" / "processed" / "active_learning"
+    _handoff(root / "run_01")
+    monkeypatch.chdir(tmp_path)
+
+    reg_dir = tmp_path / "data" / "processed" / "regression"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_file = reg_dir / "base.pt"
+    ckpt_file.write_bytes(b"baseline")
+    reg_file = reg_dir / "model_registry.json"
+    reg_file.write_text(json.dumps({"active": {"checkpoint": str(ckpt_file)}}), encoding="utf-8")
+
+    exp_csv = tmp_path / "exp.csv"
+    exp_csv.write_text("split,image_path,scenic_human_mean\nval,1.jpg,5.0\n" * 5, encoding="utf-8")
+    ctrl_csv = tmp_path / "ctrl.csv"
+    ctrl_csv.write_text("split,image_path\n", encoding="utf-8")
+    ctrl_npz = tmp_path / "ctrl.npz"
+    ctrl_npz.write_bytes(b"data")
+    route_json = tmp_path / "route.json"
+    route_json.write_text("{}", encoding="utf-8")
+    supp_csv = tmp_path / "supp.csv"
+    supp_csv.write_text("supp_data", encoding="utf-8")
+
+    supp_sha = compute_sha256(supp_csv)
+    bench_sha = compute_sha256(exp_csv)
+
+    metrics_mock = {"row_count": 20, "val_count": 5, "test_count": 15, "skipped_count": 0}
+    monkeypatch.setattr(mod, "validate_supplemental", lambda **kwargs: metrics_mock)
+
+    run_name = "run_supp_resume"
+
+    test_args = [
+        "run_active_scenic_autoresearch.py",
+        "--run-name",
+        run_name,
+        "--dry-run",
+        "--expanded-benchmark-csv",
+        str(exp_csv),
+        "--control-benchmark-csv",
+        str(ctrl_csv),
+        "--control-dataset",
+        str(ctrl_npz),
+        "--route-qa-json",
+        str(route_json),
+        "--supplemental-annotations",
+        str(supp_csv),
+        "--supplemental-annotations-sha256",
+        supp_sha,
+        "--supplemental-benchmark-sha256",
+        bench_sha,
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+
+    # Initial dry run creates valid manifest
+    with pytest.raises(SystemExit) as exc:
+        mod.main()
+    assert exc.value.code == 0
+
+    # Resume with changed supplemental_annotations_sha256 -> ValueError
+    resume_args = [
+        "run_active_scenic_autoresearch.py",
+        "--run-name",
+        run_name,
+        "--dry-run",
+        "--resume",
+        "--expanded-benchmark-csv",
+        str(exp_csv),
+        "--control-benchmark-csv",
+        str(ctrl_csv),
+        "--control-dataset",
+        str(ctrl_npz),
+        "--route-qa-json",
+        str(route_json),
+        "--supplemental-annotations",
+        str(supp_csv),
+        "--supplemental-annotations-sha256",
+        "changed_hash",
+        "--supplemental-benchmark-sha256",
+        bench_sha,
+    ]
+    monkeypatch.setattr(sys, "argv", resume_args)
+    with pytest.raises(ValueError, match="Run manifest validation failed on resume"):
+        mod.main()
+
+    # Status mode with changed supplemental_annotations_sha256 -> ValueError
+    status_args = [a for a in resume_args if a != "--resume"] + ["--status"]
+    monkeypatch.setattr(sys, "argv", status_args)
+    with pytest.raises(ValueError, match="Run manifest validation failed on resume"):
+        mod.main()
+
+
+def test_supplemental_success_metrics_emitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    root = tmp_path / "data" / "processed" / "active_learning"
+    _handoff(root / "run_01")
+    monkeypatch.chdir(tmp_path)
+
+    reg_dir = tmp_path / "data" / "processed" / "regression"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_file = reg_dir / "base.pt"
+    ckpt_file.write_bytes(b"baseline")
+    reg_file = reg_dir / "model_registry.json"
+    reg_file.write_text(json.dumps({"active": {"checkpoint": str(ckpt_file)}}), encoding="utf-8")
+
+    exp_csv = tmp_path / "exp.csv"
+    exp_csv.write_text("split,image_path,scenic_human_mean\nval,1.jpg,5.0\n" * 5, encoding="utf-8")
+    ctrl_csv = tmp_path / "ctrl.csv"
+    ctrl_csv.write_text("split,image_path\n", encoding="utf-8")
+    ctrl_npz = tmp_path / "ctrl.npz"
+    ctrl_npz.write_bytes(b"data")
+    route_json = tmp_path / "route.json"
+    route_json.write_text("{}", encoding="utf-8")
+    supp_csv = tmp_path / "supp.csv"
+    supp_csv.write_text("supp_data", encoding="utf-8")
+
+    supp_sha = compute_sha256(supp_csv)
+    bench_sha = compute_sha256(exp_csv)
+
+    metrics_mock = {
+        "supplemental_rows": 15,
+        "supplemental_val_count": 4,
+        "supplemental_test_count": 11,
+        "supplemental_skipped_count": 0,
+    }
+    monkeypatch.setattr(mod, "validate_supplemental", lambda **kwargs: metrics_mock)
+
+    run_name = "run_supp_metrics"
+
+    test_args = [
+        "run_active_scenic_autoresearch.py",
+        "--run-name",
+        run_name,
+        "--dry-run",
+        "--expanded-benchmark-csv",
+        str(exp_csv),
+        "--control-benchmark-csv",
+        str(ctrl_csv),
+        "--control-dataset",
+        str(ctrl_npz),
+        "--route-qa-json",
+        str(route_json),
+        "--supplemental-annotations",
+        str(supp_csv),
+        "--supplemental-annotations-sha256",
+        supp_sha,
+        "--supplemental-benchmark-sha256",
+        bench_sha,
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main()
+    assert exc.value.code == 0
+
+    out = capsys.readouterr().out
+    assert "METRIC supplemental_rows=15" in out
+    assert "METRIC supplemental_val_count=4" in out
+    assert "METRIC supplemental_test_count=11" in out
+    assert "METRIC supplemental_skipped_count=0" in out
