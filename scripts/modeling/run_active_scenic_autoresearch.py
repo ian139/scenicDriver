@@ -246,19 +246,17 @@ def validate_handoff_content(handoff_path: Path, handoff_data: Dict[str, Any]) -
                         )
 
 
-def count_expanded_val_samples(expanded_csv_path: str | Path) -> int:
-    """
-    Count expanded CSV split=val rows with finite human target in [0,10], unique image_path.
-    """
+def _count_expanded_human_samples(expanded_csv_path: str | Path, *, split: str) -> int:
+    """Count unique finite human targets for one explicit benchmark split."""
     path = Path(expanded_csv_path)
     if not path.is_file():
         return 0
-    unique_val_paths = set()
+    unique_paths: set[str] = set()
     with path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             split_val = str(row.get("split", "")).strip().lower()
-            if split_val == "val":
+            if split_val == split:
                 img_path = str(
                     row.get("image_path")
                     or row.get("image_paths")
@@ -286,10 +284,14 @@ def count_expanded_val_samples(expanded_csv_path: str | Path) -> int:
                     try:
                         t = float(score_val)
                         if math.isfinite(t) and 0 <= t <= 10:
-                            unique_val_paths.add(img_path)
+                            unique_paths.add(img_path)
                     except (ValueError, TypeError):
                         pass
-    return len(unique_val_paths)
+    return len(unique_paths)
+
+
+def count_expanded_val_samples(expanded_csv_path: str | Path) -> int:
+    return _count_expanded_human_samples(expanded_csv_path, split="val")
 
 
 def build_candidate_ladder(
@@ -934,6 +936,9 @@ def main() -> None:
             min_val_samples = raw_val
 
     observed_val_samples = count_expanded_val_samples(args.expanded_benchmark_csv)
+    observed_test_samples = _count_expanded_human_samples(
+        args.expanded_benchmark_csv, split="test"
+    )
     is_data_limited = observed_val_samples < min_val_samples
 
     print(f"METRIC expanded_val_support={observed_val_samples}")
@@ -1351,12 +1356,14 @@ def main() -> None:
         "target_test_human_rows": 20,
         "min_expanded_validation_samples": min_val_samples,
         "observed_expanded_validation_samples": observed_val_samples,
+        "observed_expanded_test_samples": observed_test_samples,
         "needed_validation_human_rows": max(0, min_val_samples - observed_val_samples),
-        "needed_test_human_rows": 20,
+        "needed_test_human_rows": max(0, 20 - observed_test_samples),
         "sampling_strategy": "qa_overlap_and_confidence_diversity",
         "description": (
             f"Requesting next annotation batch targeting >=5 validation (observed: {observed_val_samples}, "
-            f"required: {min_val_samples}) and >=20 test human rows with QA overlap/confidence diversity."
+            f"required: {min_val_samples}) and >=20 test human rows (observed: {observed_test_samples}) "
+            "with QA overlap/confidence diversity."
         ),
     }
 

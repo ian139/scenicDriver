@@ -170,13 +170,36 @@ def test_ui_contract_and_structured_error_surface() -> None:
         "Scoring anchors",
         "prefetch",
         "localStorage",
-        "confidenceSummary",
         "coverageSummary",
         "overlapSummary",
         "Save and next",
         "prefers-reduced-motion",
+        "id=\"score\"",
+        "id=\"unusable\"",
+        "confidence:'medium'",
+        "notes:''",
+        "0–9</kbd> save score and advance",
+        "type <kbd>10</kbd>, then <kbd>Enter</kbd>",
+        "e.preventDefault();$('score').value=k;save();return",
     ):
         assert marker in html
+    for removed in (
+        "id=\"confidence\"",
+        "id=\"notes\"",
+        "id=\"confidenceSummary\"",
+        "H/M/L",
+        "$('confidence')",
+        "$('notes')",
+        "d.confidence",
+        "d.notes",
+    ):
+        assert removed not in html
+    assert "JSON.stringify({score:$('score').value,unusable:$('unusable').value})" in html
+    assert "if($('settings').contains(active))return" in html
+    assert "const editing=['INPUT','TEXTAREA','SELECT'].includes(active.tagName)" in html
+    assert "if(/^[0-9]$/.test(k)&&(!editing||active===$('score')))" in html
+    assert "if(editing&&k!=='enter')return" in html
+    assert "0–9 save score and advance · type 10, then Enter" in html
     assert make_handler is not None
 
 
