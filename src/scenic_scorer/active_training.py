@@ -1245,13 +1245,32 @@ def _rng_state() -> dict[str, Any]:
 
 
 def _restore_rng_state(state: Mapping[str, Any]) -> None:
-    if not {"python", "numpy", "torch"}.issubset(state):
+    if not isinstance(state, Mapping) or not {"python", "numpy", "torch"}.issubset(state):
         raise ActiveTrainingError("checkpoint RNG state is incomplete")
-    random.setstate(state["python"])
-    np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+
+    torch_state = state["torch"]
+    if not isinstance(torch_state, torch.Tensor) or torch_state.dtype != torch.uint8:
+        raise ActiveTrainingError("checkpoint torch RNG state must be a uint8 ByteTensor")
+
+    try:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(torch_state.cpu())
+    except (TypeError, ValueError, RuntimeError, SystemError, AttributeError) as exc:
+        raise ActiveTrainingError(f"invalid RNG state: {exc}") from exc
+
     if torch.cuda.is_available() and "cuda" in state:
-        torch.cuda.set_rng_state_all(state["cuda"])
+        cuda_state = state["cuda"]
+        if not isinstance(cuda_state, (list, tuple)) or not all(
+            isinstance(t, torch.Tensor) and t.dtype == torch.uint8 for t in cuda_state
+        ):
+            raise ActiveTrainingError(
+                "checkpoint CUDA RNG state must be a sequence of uint8 ByteTensors"
+            )
+        try:
+            torch.cuda.set_rng_state_all([t.cpu() for t in cuda_state])
+        except (TypeError, ValueError, RuntimeError, SystemError, AttributeError) as exc:
+            raise ActiveTrainingError(f"invalid CUDA RNG state: {exc}") from exc
 
 
 def _torch_load(path: Path, device: str) -> Mapping[str, Any]:

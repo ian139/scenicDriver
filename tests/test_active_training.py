@@ -16,6 +16,7 @@ from src.scenic_scorer.regression import ScenicRegressionModel
 from src.scenic_scorer.active_training import (
     ActiveTrainingConfig,
     ActiveTrainingError,
+    _restore_rng_state,
     prepare_active_dataset,
     train_active_model,
 )
@@ -546,3 +547,69 @@ def test_resume_validates_summary_hashes_and_cursor_consistency(
             ActiveTrainingConfig(epochs=2, batch_size=2, max_steps=5, device="cpu"),
             resume=True,
         )
+
+
+def test_restore_rng_state_normalizes_non_cpu_tensor_and_validates_types(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handoff, split_csv, run = _fixture(tmp_path)
+    dataset = run / "prepared.npz"
+    prepare_active_dataset(handoff, dataset)
+    output = run / "training"
+
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    train_active_model(
+        dataset,
+        split_csv,
+        output,
+        ActiveTrainingConfig(epochs=2, batch_size=2, max_steps=1, device=device),
+    )
+
+    resume_path = output / "resume.pt"
+    ckpt = torch.load(resume_path, weights_only=False)
+
+    if torch.backends.mps.is_available():
+        ckpt["rng_state"]["torch"] = ckpt["rng_state"]["torch"].to("mps")
+        torch.save(ckpt, resume_path)
+        summary_path = output / "training_summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary["resume_checkpoint_sha256"] = _sha256(resume_path)
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+        resumed = train_active_model(
+            dataset,
+            split_csv,
+            output,
+            ActiveTrainingConfig(epochs=2, batch_size=2, max_steps=3, device=device),
+            resume=True,
+        )
+        assert resumed["state"] == "completed"
+
+    passed_to_set_rng_state: torch.Tensor | None = None
+    orig_set_rng_state = torch.set_rng_state
+
+    def mock_set_rng_state(tensor: torch.Tensor) -> None:
+        nonlocal passed_to_set_rng_state
+        passed_to_set_rng_state = tensor
+        orig_set_rng_state(tensor)
+
+    monkeypatch.setattr(torch, "set_rng_state", mock_set_rng_state)
+
+    state = dict(ckpt["rng_state"])
+    if torch.backends.mps.is_available():
+        state["torch"] = state["torch"].to("mps")
+
+    _restore_rng_state(state)
+    assert passed_to_set_rng_state is not None
+    assert passed_to_set_rng_state.device.type == "cpu"
+
+    bad_dtype_state = dict(ckpt["rng_state"])
+    bad_dtype_state["torch"] = torch.tensor([1, 2, 3], dtype=torch.float32)
+    with pytest.raises(ActiveTrainingError, match="uint8 ByteTensor"):
+        _restore_rng_state(bad_dtype_state)
+
+    bad_type_state = dict(ckpt["rng_state"])
+    bad_type_state["torch"] = "not_a_tensor"
+    with pytest.raises(ActiveTrainingError, match="uint8 ByteTensor"):
+        _restore_rng_state(bad_type_state)
