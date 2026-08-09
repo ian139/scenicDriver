@@ -23,6 +23,7 @@ from scripts.modeling.run_active_scenic_autoresearch import (
     resolve_stage_one_handoff,
     sanitize_command,
     select_best_candidate,
+    select_validation_finalist,
     validate_experiment_record,
     validate_handoff_content,
 )
@@ -84,7 +85,7 @@ def _create_valid_exp_files(
     *,
     all_gates_pass: bool = True,
     baseline_sha256: str = "base_sha",
-) -> tuple[Path, Path, str]:
+) -> tuple[Path, Path, Path, str]:
     exp_dir = tmp_path / exp_id
     exp_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = exp_dir / "candidate_model.pt"
@@ -98,12 +99,170 @@ def _create_valid_exp_files(
         "baseline": {"checkpoint": "base.pt", "sha256": baseline_sha256},
     }
     eval_path.write_text(json.dumps(eval_data), encoding="utf-8")
-    return ckpt_path, eval_path, ckpt_hash
+
+    validation_path = exp_dir / "validation_decision.json"
+    validation_data = {
+        "candidate": {"checkpoint": str(ckpt_path), "sha256": ckpt_hash},
+        "baseline": {"checkpoint": "base.pt", "sha256": baseline_sha256},
+    }
+    validation_path.write_text(json.dumps(validation_data), encoding="utf-8")
+    return ckpt_path, eval_path, validation_path, ckpt_hash
+
+
+def _build_run_env(tmp_path: Path) -> dict[str, Any]:
+    """Create registry, handoff, benchmark inputs, and thresholds for main()."""
+    reg_dir = tmp_path / "data" / "processed" / "regression"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = reg_dir / "baseline.pt"
+    ckpt.write_bytes(b"baseline_checkpoint_data")
+    reg_file = reg_dir / "model_registry.json"
+    reg_file.write_text(
+        json.dumps({"active": {"checkpoint": str(ckpt)}}), encoding="utf-8"
+    )
+
+    handoff = _handoff(tmp_path / "handoff")
+
+    val_rows = "".join(
+        f"val,img_val_{i}.jpg,{5.0 + i * 0.5}\n" for i in range(5)
+    )
+    exp_csv = tmp_path / "exp.csv"
+    exp_csv.write_text(
+        "split,image_path,scenic_human_mean\n" + val_rows, encoding="utf-8"
+    )
+    ctrl_csv = tmp_path / "ctrl.csv"
+    ctrl_csv.write_text("split,image_path,scenic_human_mean\n", encoding="utf-8")
+    route_json = tmp_path / "route.json"
+    route_json.write_text("{}", encoding="utf-8")
+    thresh_json = tmp_path / "thresholds.json"
+    thresh_json.write_text(
+        json.dumps({"min_expanded_validation_samples": 5}), encoding="utf-8"
+    )
+
+    return {
+        "handoff": handoff,
+        "exp_csv": exp_csv,
+        "ctrl_csv": ctrl_csv,
+        "route_json": route_json,
+        "thresh_json": thresh_json,
+        "reg_file": reg_file,
+        "baseline_ckpt": ckpt,
+    }
+
+
+def _run_args(env: dict[str, Any], run_name: str, *, max_experiments: int = 2) -> list[str]:
+    return [
+        "run_active_scenic_autoresearch.py",
+        "--handoff",
+        str(env["handoff"]),
+        "--run-name",
+        run_name,
+        "--max-experiments",
+        str(max_experiments),
+        "--expanded-benchmark-csv",
+        str(env["exp_csv"]),
+        "--control-benchmark-csv",
+        str(env["ctrl_csv"]),
+        "--control-dataset",
+        str(env["ctrl_csv"]),
+        "--route-qa-json",
+        str(env["route_json"]),
+        "--thresholds-json",
+        str(env["thresh_json"]),
+    ]
+
+
+def _mock_prepare(h_path: Path, out_path: Path) -> dict[str, Any]:
+    """Realistic prepare mock: materialize NPZ plus split CSV sidecar."""
+    out_path.write_bytes(b"dataset_npz_data")
+    split_csv = out_path.parent / "prepared_split.csv"
+    split_csv.write_text("split,image_path\n", encoding="utf-8")
+    return {"dataset_path": out_path, "split_path": split_csv}
+
+
+def _make_train_mock(train_calls: dict[str, Any]):
+    """Train mock writing candidate.pt + completed training summary per exp dir."""
+
+    def _mock_train(*, dataset_path, split_csv, output_dir, config, resume):
+        exp_dir = Path(output_dir)
+        exp_name = exp_dir.name
+        train_calls[exp_name] = {"resume": resume}
+        ckpt = exp_dir / "candidate.pt"
+        ckpt.write_bytes(f"candidate_{exp_name}".encode("utf-8"))
+        (exp_dir / "training_summary.json").write_text(
+            json.dumps({"state": "completed"}), encoding="utf-8"
+        )
+        return {"state": "completed", "candidate_checkpoint": str(ckpt)}
+
+    return _mock_train
+
+
+def _make_validation_mock(mse_by_exp: dict[str, float]):
+    """Validation mock writing a truthful validation_decision.json per candidate."""
+
+    def _mock_evaluate_candidate_validation(**kwargs: Any) -> dict[str, Any]:
+        cand = str(kwargs["candidate_checkpoint"])
+        exp_name = Path(cand).parent.name
+        mse = float(mse_by_exp.get(exp_name, 0.5))
+        payload = {
+            "timestamp": "2026-08-09T00:00:00Z",
+            "candidate": {"checkpoint": cand, "sha256": compute_sha256(cand)},
+            "baseline": {
+                "checkpoint": str(kwargs["baseline_checkpoint"]),
+                "sha256": compute_sha256(kwargs["baseline_checkpoint"]),
+            },
+            "candidate_metrics": {
+                "samples": 64,
+                "mse": mse,
+                "mae": mse**0.5,
+                "rmse": mse**0.5,
+                "r2": 0.9,
+                "pearson_corr": 0.95,
+                "spearman_corr": 0.94,
+            },
+            "baseline_metrics": {"mse": mse + 0.1},
+            "mse_improvement": 0.1,
+        }
+        out = Path(kwargs["output_path"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload), encoding="utf-8")
+        return payload
+
+    return _mock_evaluate_candidate_validation
+
+
+def _make_stage_two_mock(
+    stage_two_calls: list[dict[str, Any]], *, all_gates_pass: bool = True
+):
+    """Full stage-two mock writing a truthful eval_decision.json for the winner."""
+
+    def _mock_stage_two(**kwargs: Any) -> dict[str, Any]:
+        cand = str(kwargs["candidate_checkpoint"])
+        stage_two_calls.append({"candidate_checkpoint": cand})
+        out = Path(kwargs["output_path"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "all_gates_pass": all_gates_pass,
+            "candidate": {"checkpoint": cand, "sha256": compute_sha256(cand)},
+            "baseline": {"sha256": compute_sha256(kwargs["baseline_checkpoint"])},
+            "expanded_human_benchmark": {
+                "candidate_metrics": {
+                    "samples": 68,
+                    "mse": 0.9,
+                    "mae": 0.5,
+                    "rmse": 0.95,
+                    "pearson_corr": 0.9,
+                }
+            },
+        }
+        out.write_text(json.dumps(payload), encoding="utf-8")
+        return payload
+
+    return _mock_stage_two
 
 
 def test_resume_loads_only_completed_and_valid_records(tmp_path: Path) -> None:
-    ckpt1, eval1, _ = _create_valid_exp_files(tmp_path, "exp_01")
-    ckpt3, eval3, _ = _create_valid_exp_files(tmp_path, "exp_03")
+    ckpt1, eval1, val1, _ = _create_valid_exp_files(tmp_path, "exp_01")
+    ckpt3, eval3, val3, _ = _create_valid_exp_files(tmp_path, "exp_03")
 
     records = [
         {
@@ -111,6 +270,8 @@ def test_resume_loads_only_completed_and_valid_records(tmp_path: Path) -> None:
             "status": "completed",
             "candidate_checkpoint": str(ckpt1),
             "eval_decision_path": str(eval1),
+            "validation_decision_path": str(val1),
+            "validation_metrics": {"mse": 0.05},
             "all_gates_pass": True,
         },
         {"exp_id": "exp_02", "status": "failed"},
@@ -118,6 +279,8 @@ def test_resume_loads_only_completed_and_valid_records(tmp_path: Path) -> None:
             "exp_id": "exp_03",
             "status": "retained",
             "candidate_checkpoint": str(ckpt3),
+            "validation_decision_path": str(val3),
+            "validation_metrics": {"mse": 0.07},
             "eval_decision_path": str(eval3),
             "all_gates_pass": True,
         },
@@ -126,6 +289,8 @@ def test_resume_loads_only_completed_and_valid_records(tmp_path: Path) -> None:
             "status": "completed",
             "candidate_checkpoint": str(tmp_path / "nonexistent.pt"),
             "eval_decision_path": str(eval1),
+            "validation_decision_path": str(val1),
+            "validation_metrics": {"mse": 0.09},
             "all_gates_pass": True,
         },
     ]
@@ -194,7 +359,7 @@ def test_select_best_candidate_corr_descending_mae_ascending() -> None:
 
 
 def test_validate_experiment_record_contract(tmp_path: Path) -> None:
-    ckpt, eval_p, hash_val = _create_valid_exp_files(
+    ckpt, eval_p, val_p, hash_val = _create_valid_exp_files(
         tmp_path, "exp_val", baseline_sha256="expected_base"
     )
     rec = {
@@ -202,8 +367,38 @@ def test_validate_experiment_record_contract(tmp_path: Path) -> None:
         "status": "completed",
         "candidate_checkpoint": str(ckpt),
         "eval_decision_path": str(eval_p),
+        "validation_decision_path": str(val_p),
+        "validation_metrics": {"mse": 0.05},
         "all_gates_pass": True,
     }
+    # Legacy 'completed' records lacking validation evidence never bypass validation
+    legacy_no_metrics = {k: v for k, v in rec.items() if k != "validation_metrics"}
+    assert validate_experiment_record(legacy_no_metrics) is False
+    legacy_no_path = {k: v for k, v in rec.items() if k != "validation_decision_path"}
+    assert validate_experiment_record(legacy_no_path) is False
+    # 'validated' records are reusable with validation evidence alone
+    validated_rec = dict(rec, status="validated")
+    del validated_rec["eval_decision_path"]
+    del validated_rec["all_gates_pass"]
+    assert (
+        validate_experiment_record(
+            validated_rec, expected_baseline_sha256="expected_base"
+        )
+        is True
+    )
+    # Validation decision file candidate hash must match the checkpoint
+    bad_val_path = tmp_path / "bad_val.json"
+    bad_val_path.write_text(
+        json.dumps(
+            {
+                "candidate": {"checkpoint": str(ckpt), "sha256": "wrong_hash"},
+                "baseline": {"sha256": "expected_base"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    bad_val_rec = dict(rec, validation_decision_path=str(bad_val_path))
+    assert validate_experiment_record(bad_val_rec) is False
     # Valid
     assert (
         validate_experiment_record(rec, expected_baseline_sha256="expected_base")
@@ -286,7 +481,7 @@ def test_validate_experiment_record_contract(tmp_path: Path) -> None:
 
 
 def test_string_gates_pass_not_reusable_or_selected(tmp_path: Path) -> None:
-    ckpt, eval_p, hash_val = _create_valid_exp_files(
+    ckpt, eval_p, val_p, hash_val = _create_valid_exp_files(
         tmp_path, "exp_str_gate", baseline_sha256="expected_base"
     )
     rec = {
@@ -294,6 +489,8 @@ def test_string_gates_pass_not_reusable_or_selected(tmp_path: Path) -> None:
         "status": "completed",
         "candidate_checkpoint": str(ckpt),
         "eval_decision_path": str(eval_p),
+        "validation_decision_path": str(val_p),
+        "validation_metrics": {"mse": 0.05},
         "all_gates_pass": True,
     }
 
@@ -440,12 +637,14 @@ def test_experiment_digest_changes_on_config_or_input_change() -> None:
 
 
 def test_resume_rejects_mismatched_input_digest(tmp_path: Path) -> None:
-    ckpt, eval_p, _ = _create_valid_exp_files(tmp_path, "exp_dig")
+    ckpt, eval_p, val_p, _ = _create_valid_exp_files(tmp_path, "exp_dig")
     rec = {
         "exp_id": "exp_dig",
         "status": "completed",
         "candidate_checkpoint": str(ckpt),
         "eval_decision_path": str(eval_p),
+        "validation_decision_path": str(val_p),
+        "validation_metrics": {"mse": 0.05},
         "all_gates_pass": True,
         "input_digest": "correct_digest_123",
     }
@@ -576,6 +775,11 @@ def test_determine_aggregate_run_state() -> None:
     recs_paused = [{"status": "completed"}, {"status": "paused"}]
     assert determine_aggregate_run_state(recs_paused, 2) == "paused"
 
+    recs_validated = [{"status": "validated"}, {"status": "completed"}]
+    assert determine_aggregate_run_state(recs_validated, 2) == "completed"
+    recs_validated_paused = [{"status": "validated"}, {"status": "paused"}]
+    assert determine_aggregate_run_state(recs_validated_paused, 2) == "paused"
+
 
 def test_is_valid_paused_experiment(tmp_path: Path) -> None:
     exp_dir = tmp_path / "exp_01"
@@ -697,6 +901,7 @@ def test_resume_passes_resume_false_to_fresh_later_experiments(
         }
 
     monkeypatch.setattr(mod, "evaluate_stage_two", mock_evaluate_stage_two)
+    monkeypatch.setattr(mod, "evaluate_candidate_validation", _make_validation_mock({}))
 
     thresh_json = tmp_path / "thresholds.json"
     thresh_json.write_text("{}", encoding="utf-8")
@@ -1138,6 +1343,17 @@ def test_resume_uses_immutable_manifest_baseline_sha(
         encoding="utf-8",
     )
 
+    val_dec = exp_dir / "validation_decision.json"
+    val_dec.write_text(
+        json.dumps(
+            {
+                "candidate": {"checkpoint": str(exp_ckpt), "sha256": exp_ckpt_sha},
+                "baseline": {"sha256": baseline_sha},
+            }
+        ),
+        encoding="utf-8",
+    )
+
     exp_digest = compute_experiment_digest(
         exp_id="exp_01_baseline_control",
         config=build_candidate_ladder(ActiveTrainingConfig(seed=42), 1)[0]["config"],
@@ -1158,6 +1374,8 @@ def test_resume_uses_immutable_manifest_baseline_sha(
         "status": "completed",
         "candidate_checkpoint": str(exp_ckpt),
         "eval_decision_path": str(eval_dec),
+        "validation_decision_path": str(val_dec),
+        "validation_metrics": {"mse": 0.05, "mae": 0.1, "rmse": 0.2, "pearson_corr": 0.9},
         "all_gates_pass": True,
         "metrics": {"mae": 0.1, "rmse": 0.2, "pearson_corr": 0.9},
         "input_digest": exp_digest,
@@ -1314,7 +1532,11 @@ def test_resume_with_completed_summary_without_eval_decision(
 
     handoff = _handoff(tmp_path / "handoff")
     exp_csv = tmp_path / "exp.csv"
-    exp_csv.write_text("header", encoding="utf-8")
+    exp_csv.write_text(
+        "image_path,split,scenic_human_mean\n"
+        + "".join(f"img{i}.jpg,val,5.0\n" for i in range(5)),
+        encoding="utf-8",
+    )
     ctrl_csv = tmp_path / "ctrl.csv"
     ctrl_csv.write_text("header", encoding="utf-8")
     route_json = tmp_path / "route.json"
@@ -1401,6 +1623,7 @@ def test_resume_with_completed_summary_without_eval_decision(
         }
 
     monkeypatch.setattr(mod, "evaluate_stage_two", mock_evaluate_stage_two)
+    monkeypatch.setattr(mod, "evaluate_candidate_validation", _make_validation_mock({}))
 
     thresh_json = tmp_path / "thresholds.json"
     thresh_json.write_text("{}", encoding="utf-8")
@@ -1429,7 +1652,19 @@ def test_resume_with_completed_summary_without_eval_decision(
     monkeypatch.setattr(sys, "argv", test_args)
     mod.main()
 
-    assert train_resume_calls.get("exp_01_baseline_control") is True
+    # Completed training output is reused WITHOUT retraining; only validation runs.
+    assert train_resume_calls == {}
+    exp_records = [
+        json.loads(line)
+        for line in (run_dir / "experiments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert [r["status"] for r in exp_records] == ["validated", "completed"]
+    assert exp_records[0]["candidate_checkpoint"] == str(exp01_dir / "candidate.pt")
+    assert exp_records[0]["validation_metrics"]["mse"] == 0.5
+    assert (run_dir / "final_summary.json").is_file()
 
 
 def test_status_mode_fails_closed_on_missing_or_malformed_manifest(
@@ -1574,6 +1809,17 @@ def test_status_mode_after_promotion(
         encoding="utf-8",
     )
 
+    val_dec = exp_dir / "validation_decision.json"
+    val_dec.write_text(
+        json.dumps(
+            {
+                "candidate": {"checkpoint": str(cand_ckpt), "sha256": cand_sha},
+                "baseline": {"sha256": original_base_sha},
+            }
+        ),
+        encoding="utf-8",
+    )
+
     exp_digest = compute_experiment_digest(
         exp_id="exp_01_baseline_control",
         config=build_candidate_ladder(ActiveTrainingConfig(seed=42), 1)[0]["config"],
@@ -1592,6 +1838,8 @@ def test_status_mode_after_promotion(
         "status": "completed",
         "candidate_checkpoint": str(cand_ckpt),
         "eval_decision_path": str(eval_dec),
+        "validation_decision_path": str(val_dec),
+        "validation_metrics": {"mse": 0.05, "mae": 0.1, "rmse": 0.2, "pearson_corr": 0.9},
         "all_gates_pass": True,
         "metrics": {"mae": 0.1, "rmse": 0.2, "pearson_corr": 0.9},
         "input_digest": exp_digest,
@@ -1815,8 +2063,14 @@ def test_data_limited_mode_skips_eval_and_promotion(
             "promote_from_decision should NEVER be called in data-limited mode!"
         )
 
+    def mock_validation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise AssertionError(
+            "evaluate_candidate_validation should NEVER be called in data-limited mode!"
+        )
+
     monkeypatch.setattr(mod, "train_active_model", mock_train)
     monkeypatch.setattr(mod, "evaluate_stage_two", mock_eval)
+    monkeypatch.setattr(mod, "evaluate_candidate_validation", mock_validation)
     monkeypatch.setattr(mod, "promote_from_decision", mock_promo)
 
     test_args = [
@@ -2313,3 +2567,484 @@ def test_supplemental_success_metrics_emitted(
     assert "METRIC supplemental_val_count=4" in out
     assert "METRIC supplemental_test_count=11" in out
     assert "METRIC supplemental_skipped_count=0" in out
+
+
+def test_select_validation_finalist_lowest_mse_with_ladder_tie_break() -> None:
+    ladder_ids = [
+        "exp_01_baseline_control",
+        "exp_02_region_balanced",
+        "exp_03_robust_huber_loss",
+    ]
+    records = [
+        {
+            "exp_id": "exp_03_robust_huber_loss",
+            "status": "validated",
+            "validation_metrics": {"mse": 0.3},
+        },
+        {
+            "exp_id": "exp_01_baseline_control",
+            "status": "validated",
+            "validation_metrics": {"mse": 0.5},
+        },
+        {
+            "exp_id": "exp_02_region_balanced",
+            "status": "validated",
+            "validation_metrics": {"mse": 0.4},
+        },
+    ]
+    best = select_validation_finalist(records, ladder_ids)
+    assert best is not None
+    assert best["exp_id"] == "exp_03_robust_huber_loss"
+
+    # Deterministic ladder-order tie-break on equal MSE
+    tie_records = [
+        {
+            "exp_id": "exp_02_region_balanced",
+            "status": "validated",
+            "validation_metrics": {"mse": 0.4},
+        },
+        {
+            "exp_id": "exp_01_baseline_control",
+            "status": "validated",
+            "validation_metrics": {"mse": 0.4},
+        },
+        {
+            "exp_id": "exp_03_robust_huber_loss",
+            "status": "validated",
+            "validation_metrics": {"mse": 0.5},
+        },
+    ]
+    best_tie = select_validation_finalist(tie_records, ladder_ids)
+    assert best_tie is not None
+    assert best_tie["exp_id"] == "exp_01_baseline_control"
+
+    # Any nonterminal candidate blocks selection entirely
+    paused_records = tie_records + [
+        {"exp_id": "exp_03_robust_huber_loss", "status": "paused"}
+    ]
+    assert select_validation_finalist(paused_records, ladder_ids) is None
+    stopped_records = tie_records + [
+        {"exp_id": "exp_03_robust_huber_loss", "status": "stopped"}
+    ]
+    assert select_validation_finalist(stopped_records, ladder_ids) is None
+
+    # Missing candidate blocks selection
+    two_ladder = ladder_ids[:2]
+    two_records = [
+        {
+            "exp_id": "exp_02_region_balanced",
+            "status": "validated",
+            "validation_metrics": {"mse": 0.4},
+        },
+        {
+            "exp_id": "exp_01_baseline_control",
+            "status": "validated",
+            "validation_metrics": {"mse": 0.4},
+        },
+    ]
+    assert select_validation_finalist(two_records, ladder_ids) is None
+
+    # Newest record wins for an exp_id (completed full-eval supersedes validated)
+    supersede = [
+        {
+            "exp_id": "exp_01_baseline_control",
+            "status": "validated",
+            "validation_metrics": {"mse": 0.9},
+        },
+        {
+            "exp_id": "exp_01_baseline_control",
+            "status": "completed",
+            "validation_metrics": {"mse": 0.1},
+            "eval_decision_path": "x",
+            "all_gates_pass": True,
+        },
+        {
+            "exp_id": "exp_02_region_balanced",
+            "status": "validated",
+            "validation_metrics": {"mse": 0.2},
+        },
+    ]
+    best_sup = select_validation_finalist(supersede, two_ladder)
+    assert best_sup is not None
+    assert best_sup["exp_id"] == "exp_01_baseline_control"
+
+
+def test_fresh_run_validates_all_candidates_and_full_evaluates_winner_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    env = _build_run_env(tmp_path)
+    run_name = "run_full_flow"
+    monkeypatch.setattr(mod, "prepare_active_dataset", _mock_prepare)
+
+    train_calls: dict[str, Any] = {}
+    monkeypatch.setattr(mod, "train_active_model", _make_train_mock(train_calls))
+
+    mse_by_exp = {
+        "exp_01_baseline_control": 0.40,
+        "exp_02_region_balanced": 0.30,
+        "exp_03_robust_huber_loss": 0.20,
+        "exp_04_fine_learning_rate": 0.35,
+        "exp_05_extended_epochs": 0.25,
+    }
+    monkeypatch.setattr(
+        mod, "evaluate_candidate_validation", _make_validation_mock(mse_by_exp)
+    )
+    stage_two_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        mod, "evaluate_stage_two", _make_stage_two_mock(stage_two_calls)
+    )
+
+    monkeypatch.setattr(sys, "argv", _run_args(env, run_name, max_experiments=5))
+    mod.main()
+
+    run_dir = (
+        tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    )
+    exp_records = [
+        json.loads(line)
+        for line in (run_dir / "experiments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert len(exp_records) == 6
+    validated = [r for r in exp_records if r["status"] == "validated"]
+    assert len(validated) == 5
+    for r in validated:
+        assert r["candidate_checkpoint_sha256"]
+        assert isinstance(r["validation_metrics"]["mse"], float)
+        assert r["validation_decision_path"]
+        assert Path(r["validation_decision_path"]).is_file()
+        assert r["input_digest"]
+        assert "validated_at" in r
+        assert "eval_decision_path" not in r
+
+    # Exactly one full stage-two evaluation, for the lowest-validation-MSE winner.
+    assert len(stage_two_calls) == 1
+    assert (
+        Path(stage_two_calls[0]["candidate_checkpoint"]).parent.name
+        == "exp_03_robust_huber_loss"
+    )
+    completed = [r for r in exp_records if r["status"] == "completed"]
+    assert len(completed) == 1
+    assert completed[0]["exp_id"] == "exp_03_robust_huber_loss"
+    assert completed[0]["eval_decision_path"]
+    assert completed[0]["metrics"]
+    assert completed[0]["all_gates_pass"] is True
+    assert completed[0]["validation_decision_path"]
+
+    summary = json.loads(
+        (run_dir / "final_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["run_state"] == "completed"
+    assert summary["selected_finalist"]["exp_id"] == "exp_03_robust_huber_loss"
+    assert summary["selected_finalist"]["validation_mse"] == 0.20
+    assert summary["selected_finalist"]["full_evaluation"]["all_gates_pass"] is True
+    assert summary["retained_exp_id"] == "exp_03_robust_huber_loss"
+    assert summary["all_gates_pass"] is True
+    assert summary["pending_final_evaluation"] is False
+
+
+def test_selection_based_only_on_validation_mse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    env = _build_run_env(tmp_path)
+    run_name = "run_val_selection"
+    monkeypatch.setattr(mod, "prepare_active_dataset", _mock_prepare)
+
+    train_calls: dict[str, Any] = {}
+    monkeypatch.setattr(mod, "train_active_model", _make_train_mock(train_calls))
+
+    # exp_01 wins validation (lowest MSE); exp_02 is worse on validation.
+    mse_by_exp = {
+        "exp_01_baseline_control": 0.10,
+        "exp_02_region_balanced": 0.60,
+    }
+    monkeypatch.setattr(
+        mod, "evaluate_candidate_validation", _make_validation_mock(mse_by_exp)
+    )
+    # The winner's full evaluation FAILS all compound gates. Selection is purely
+    # validation-based, so gates never re-rank: only the val-winner is tested.
+    stage_two_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        mod,
+        "evaluate_stage_two",
+        _make_stage_two_mock(stage_two_calls, all_gates_pass=False),
+    )
+
+    monkeypatch.setattr(sys, "argv", _run_args(env, run_name, max_experiments=2))
+    mod.main()
+
+    run_dir = (
+        tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    )
+    assert len(stage_two_calls) == 1
+    assert (
+        Path(stage_two_calls[0]["candidate_checkpoint"]).parent.name
+        == "exp_01_baseline_control"
+    )
+    summary = json.loads(
+        (run_dir / "final_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["selected_finalist"]["exp_id"] == "exp_01_baseline_control"
+    assert summary["selected_finalist"]["validation_mse"] == 0.10
+    assert summary["all_gates_pass"] is False
+    assert summary["retained_exp_id"] is None
+    assert summary["promoted"] is False
+
+
+def test_no_full_evaluation_while_any_candidate_paused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    env = _build_run_env(tmp_path)
+    run_name = "run_paused_candidate"
+    monkeypatch.setattr(mod, "prepare_active_dataset", _mock_prepare)
+
+    train_calls: dict[str, Any] = {}
+
+    def mock_train(*, dataset_path, split_csv, output_dir, config, resume):
+        exp_dir = Path(output_dir)
+        exp_name = exp_dir.name
+        train_calls[exp_name] = True
+        if exp_name == "exp_01_baseline_control":
+            (exp_dir / "training_summary.json").write_text(
+                json.dumps({"state": "paused"}), encoding="utf-8"
+            )
+            (exp_dir / "resume.pt").write_bytes(b"resume_state")
+            return {"state": "paused"}
+        ckpt = exp_dir / "candidate.pt"
+        ckpt.write_bytes(b"candidate_data")
+        (exp_dir / "training_summary.json").write_text(
+            json.dumps({"state": "completed"}), encoding="utf-8"
+        )
+        return {"state": "completed", "candidate_checkpoint": str(ckpt)}
+
+    monkeypatch.setattr(mod, "train_active_model", mock_train)
+
+    validation_calls: list[str] = []
+    base_validation = _make_validation_mock({})
+
+    def tracking_validation(**kwargs: Any) -> dict[str, Any]:
+        validation_calls.append(str(kwargs["candidate_checkpoint"]))
+        return base_validation(**kwargs)
+
+    monkeypatch.setattr(mod, "evaluate_candidate_validation", tracking_validation)
+    stage_two_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        mod, "evaluate_stage_two", _make_stage_two_mock(stage_two_calls)
+    )
+
+    monkeypatch.setattr(sys, "argv", _run_args(env, run_name, max_experiments=2))
+    mod.main()
+
+    # The paused candidate blocks selection: zero full evaluations.
+    assert len(stage_two_calls) == 0
+    assert len(validation_calls) == 1
+
+    run_dir = (
+        tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    )
+    exp_records = [
+        json.loads(line)
+        for line in (run_dir / "experiments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    by_id = {r["exp_id"]: r for r in exp_records}
+    assert by_id["exp_01_baseline_control"]["status"] == "paused"
+    assert by_id["exp_02_region_balanced"]["status"] == "validated"
+
+    summary = json.loads(
+        (run_dir / "final_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["run_state"] == "paused"
+    assert summary["selected_finalist"] is None
+    assert summary["all_gates_pass"] is False
+    assert summary["retained_exp_id"] is None
+
+
+def test_legacy_completed_record_without_validation_is_revalidated_not_retrained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    env = _build_run_env(tmp_path)
+    run_name = "run_legacy_resume"
+    monkeypatch.setattr(mod, "prepare_active_dataset", _mock_prepare)
+
+    train_calls: dict[str, Any] = {}
+    monkeypatch.setattr(mod, "train_active_model", _make_train_mock(train_calls))
+    validation_calls: list[str] = []
+    base_validation = _make_validation_mock(
+        {
+            "exp_01_baseline_control": 0.2,
+            "exp_02_region_balanced": 0.4,
+        }
+    )
+
+    def tracking_validation(**kwargs: Any) -> dict[str, Any]:
+        validation_calls.append(str(kwargs["candidate_checkpoint"]))
+        return base_validation(**kwargs)
+
+    monkeypatch.setattr(mod, "evaluate_candidate_validation", tracking_validation)
+    stage_two_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        mod, "evaluate_stage_two", _make_stage_two_mock(stage_two_calls)
+    )
+
+    run_args = _run_args(env, run_name, max_experiments=2)
+    monkeypatch.setattr(sys, "argv", run_args)
+    mod.main()
+
+    run_dir = (
+        tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    )
+    lines = [
+        json.loads(line)
+        for line in (run_dir / "experiments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    validated_by_id = {r["exp_id"]: r for r in lines if r["status"] == "validated"}
+    assert len(validation_calls) == 2
+    assert len(stage_two_calls) == 1
+
+    # Simulate the invalid legacy artifact: completed records without
+    # validation_metrics (old-style full-eval-only records).
+    legacy_records = []
+    for exp_id in ["exp_01_baseline_control", "exp_02_region_balanced"]:
+        old = validated_by_id[exp_id]
+        legacy_records.append(
+            {
+                "exp_id": exp_id,
+                "hypothesis": old.get("hypothesis"),
+                "status": "completed",
+                "candidate_checkpoint": old["candidate_checkpoint"],
+                "eval_decision_path": str(run_dir / exp_id / "eval_decision.json"),
+                "all_gates_pass": True,
+                "metrics": {"mae": 0.1, "rmse": 0.2, "pearson_corr": 0.9},
+                "input_digest": old["input_digest"],
+            }
+        )
+    (run_dir / "experiments.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in legacy_records), encoding="utf-8"
+    )
+
+    # Legacy records lacking validation evidence must never be reused/selected.
+    for rec in legacy_records:
+        assert validate_experiment_record(rec) is False
+
+    # Resume: checkpoints are reused without retraining, and validation reruns.
+    validation_calls.clear()
+    stage_two_calls.clear()
+    monkeypatch.setattr(sys, "argv", run_args + ["--resume"])
+    mod.main()
+
+    assert len(train_calls) == 2  # run-1 training only; no retraining on resume
+    assert len(validation_calls) == 2  # both legacy candidates revalidated
+    assert len(stage_two_calls) == 1  # single full eval for the revalidated winner
+
+    final_lines = [
+        json.loads(line)
+        for line in (run_dir / "experiments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    final_by_id = {r["exp_id"]: r for r in final_lines}
+    assert final_by_id["exp_01_baseline_control"]["status"] == "completed"
+    assert final_by_id["exp_02_region_balanced"]["status"] == "validated"
+    # Newly written records carry full validated evidence (legacy lines are
+    # superseded, not rewritten).
+    for r in final_lines[2:]:
+        assert r.get("validation_metrics") is not None
+        assert r.get("validation_decision_path")
+
+    summary = json.loads(
+        (run_dir / "final_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["run_state"] == "completed"
+    assert summary["selected_finalist"]["exp_id"] == "exp_01_baseline_control"
+
+
+def test_resume_reuses_full_evidence_without_rerunning_validation_or_full_eval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    env = _build_run_env(tmp_path)
+    run_name = "run_resume_reuse"
+    monkeypatch.setattr(mod, "prepare_active_dataset", _mock_prepare)
+
+    train_calls: dict[str, Any] = {}
+    monkeypatch.setattr(mod, "train_active_model", _make_train_mock(train_calls))
+    validation_calls: list[str] = []
+    base_validation = _make_validation_mock(
+        {
+            "exp_01_baseline_control": 0.2,
+            "exp_02_region_balanced": 0.4,
+        }
+    )
+
+    def tracking_validation(**kwargs: Any) -> dict[str, Any]:
+        validation_calls.append(str(kwargs["candidate_checkpoint"]))
+        return base_validation(**kwargs)
+
+    monkeypatch.setattr(mod, "evaluate_candidate_validation", tracking_validation)
+    stage_two_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        mod, "evaluate_stage_two", _make_stage_two_mock(stage_two_calls)
+    )
+
+    run_args = _run_args(env, run_name, max_experiments=2)
+    monkeypatch.setattr(sys, "argv", run_args)
+    mod.main()
+
+    run_dir = (
+        tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    )
+    jsonl_path = run_dir / "experiments.jsonl"
+    first_run_lines = [
+        line
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(first_run_lines) == 3  # 2 validated + 1 completed finalist
+    assert len(train_calls) == 2
+    assert len(validation_calls) == 2
+    assert len(stage_two_calls) == 1
+
+    # Resume a fully-completed run: nothing retrains, nothing re-validates,
+    # nothing re-runs the full evaluation.
+    monkeypatch.setattr(sys, "argv", run_args + ["--resume"])
+    mod.main()
+
+    assert len(train_calls) == 2
+    assert len(validation_calls) == 2
+    assert len(stage_two_calls) == 1
+    assert (
+        jsonl_path.read_text(encoding="utf-8").splitlines() == first_run_lines
+    )
+
+    summary = json.loads(
+        (run_dir / "final_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["run_state"] == "completed"
+    assert summary["selected_finalist"]["exp_id"] == "exp_01_baseline_control"
+    assert summary["selected_finalist"]["full_evaluation"]["all_gates_pass"] is True
+    assert summary["all_gates_pass"] is True
+    assert summary["retained_exp_id"] == "exp_01_baseline_control"
+    assert summary["pending_final_evaluation"] is False

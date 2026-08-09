@@ -69,6 +69,7 @@ from src.scenic_scorer.active_training import (  # noqa: E402
     train_active_model,
 )
 from src.scenic_scorer.active_evaluation import (  # noqa: E402
+    evaluate_candidate_validation,
     evaluate_stage_two,
     promote_from_decision,
 )
@@ -370,15 +371,23 @@ def validate_experiment_record(
     expected_input_digest: Optional[str] = None,
 ) -> bool:
     """
-    Validate a reused completed, retained, or rejected experiment record.
-    Returns True if candidate checkpoint exists, hashes, gates, identities,
-    and input digest align.
+    Validate a reused validated, completed, retained, or rejected experiment record.
+
+    Returns True only when the record carries truthful, checkable evidence:
+      - the candidate checkpoint exists and its current SHA-256 matches the
+        validation decision file's candidate hash,
+      - validated/completed/retained records carry validation_metrics plus a
+        validation_decision_path (legacy 'completed' records lacking validation
+        evidence never bypass validation),
+      - 'completed' records additionally carry full stage-two evidence
+        (eval_decision_path with matching candidate hash and gate agreement),
+      - input digest and baseline identity align when expected values are given.
     """
     if not isinstance(rec, dict):
         return False
 
     status = rec.get("status")
-    if status not in ("completed", "retained", "rejected"):
+    if status not in ("validated", "completed", "retained", "rejected"):
         return False
 
     if expected_input_digest:
@@ -409,53 +418,97 @@ def validate_experiment_record(
             return False
         return True
 
-    eval_dec_str = rec.get("eval_decision_path")
-    if not eval_dec_str:
+    # Validation evidence is mandatory for every terminal non-rejected record.
+    validation_metrics = rec.get("validation_metrics")
+    if not isinstance(validation_metrics, dict) or not isinstance(
+        validation_metrics.get("mse"), (int, float)
+    ):
         return False
-    eval_dec_path = Path(eval_dec_str)
-    if not eval_dec_path.is_file():
+
+    val_dec_str = rec.get("validation_decision_path")
+    if not val_dec_str:
+        return False
+    val_dec_path = Path(val_dec_str)
+    if not val_dec_path.is_file():
         return False
     try:
-        cand_sha256 = compute_sha256(ckpt_path)
+        val_data = json.loads(val_dec_path.read_text(encoding="utf-8"))
     except Exception:
         return False
 
-    try:
-        eval_data = json.loads(eval_dec_path.read_text(encoding="utf-8"))
-    except Exception:
+    if not isinstance(val_data, dict):
         return False
 
-    if not isinstance(eval_data, dict):
+    val_cand = val_data.get("candidate", {})
+    if not isinstance(val_cand, dict):
         return False
 
-    eval_cand = eval_data.get("candidate", {})
-    if not isinstance(eval_cand, dict):
+    val_cand_sha256 = val_cand.get("sha256")
+    if not val_cand_sha256 or val_cand_sha256 != cand_sha256:
         return False
 
-    eval_cand_sha256 = eval_cand.get("sha256")
-    if not eval_cand_sha256 or eval_cand_sha256 != cand_sha256:
-        return False
-
-    eval_cand_ckpt = eval_cand.get("checkpoint")
-    if eval_cand_ckpt:
+    val_cand_ckpt = val_cand.get("checkpoint")
+    if val_cand_ckpt:
         try:
-            if Path(eval_cand_ckpt).resolve() != ckpt_path.resolve():
+            if Path(val_cand_ckpt).resolve() != ckpt_path.resolve():
                 return False
         except Exception:
             return False
 
-    rec_gate = rec.get("all_gates_pass")
-    eval_gate = eval_data.get("all_gates_pass")
-    if not isinstance(rec_gate, bool) or not isinstance(eval_gate, bool):
-        return False
-    if rec_gate != eval_gate:
-        return False
-
-    if expected_baseline_sha256:
-        eval_base = eval_data.get("baseline")
-        if not isinstance(eval_base, dict):
+    if status == "completed":
+        eval_dec_str = rec.get("eval_decision_path")
+        if not eval_dec_str:
             return False
-        base_sha = eval_base.get("sha256")
+        eval_dec_path = Path(eval_dec_str)
+        if not eval_dec_path.is_file():
+            return False
+        try:
+            eval_data = json.loads(eval_dec_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+
+        if not isinstance(eval_data, dict):
+            return False
+
+        eval_cand = eval_data.get("candidate", {})
+        if not isinstance(eval_cand, dict):
+            return False
+
+        eval_cand_sha256 = eval_cand.get("sha256")
+        if not eval_cand_sha256 or eval_cand_sha256 != cand_sha256:
+            return False
+
+        eval_cand_ckpt = eval_cand.get("checkpoint")
+        if eval_cand_ckpt:
+            try:
+                if Path(eval_cand_ckpt).resolve() != ckpt_path.resolve():
+                    return False
+            except Exception:
+                return False
+
+        rec_gate = rec.get("all_gates_pass")
+        eval_gate = eval_data.get("all_gates_pass")
+        if not isinstance(rec_gate, bool) or not isinstance(eval_gate, bool):
+            return False
+        if rec_gate != eval_gate:
+            return False
+
+        if expected_baseline_sha256:
+            eval_base = eval_data.get("baseline")
+            if not isinstance(eval_base, dict):
+                return False
+            base_sha = eval_base.get("sha256")
+            if (
+                not isinstance(base_sha, str)
+                or not base_sha
+                or base_sha != expected_baseline_sha256
+            ):
+                return False
+    elif expected_baseline_sha256:
+        val_base = val_data.get("baseline")
+        if not isinstance(val_base, dict):
+            return False
+        base_sha = val_base.get("sha256")
         if (
             not isinstance(base_sha, str)
             or not base_sha
@@ -491,6 +544,45 @@ def select_best_candidate(records: List[Dict[str, Any]]) -> Optional[Dict[str, A
     return passing_candidates[0]
 
 
+def select_validation_finalist(
+    records: List[Dict[str, Any]], ladder_exp_ids: List[str]
+) -> Optional[Dict[str, Any]]:
+    """
+    Select exactly one finalist by lowest validation MSE.
+
+    Requires every ladder candidate's newest record to be a terminal
+    validated/completed/retained record carrying validation_metrics; if any
+    candidate is paused/stopped/failed/missing, returns None and no candidate
+    is selected (and therefore no full evaluation runs). Ties are broken
+    deterministically by ladder order (exp_id position in the ladder).
+    """
+    final_records: Dict[str, Dict[str, Any]] = {}
+    for exp_id in ladder_exp_ids:
+        exp_records = [r for r in records if r.get("exp_id") == exp_id]
+        if not exp_records:
+            return None
+        rec = exp_records[-1]
+        status = rec.get("status")
+        if status not in ("validated", "completed", "retained"):
+            return None
+        validation_metrics = rec.get("validation_metrics")
+        if not isinstance(validation_metrics, dict) or not isinstance(
+            validation_metrics.get("mse"), (int, float)
+        ):
+            return None
+        final_records[exp_id] = rec
+
+    ladder_index = {exp_id: i for i, exp_id in enumerate(ladder_exp_ids)}
+    ranked = sorted(
+        final_records.values(),
+        key=lambda r: (
+            float(r["validation_metrics"]["mse"]),
+            ladder_index[r["exp_id"]],
+        ),
+    )
+    return ranked[0]
+
+
 def determine_aggregate_run_state(
     evaluated_records: List[Dict[str, Any]],
     intended_count: int,
@@ -524,7 +616,7 @@ def determine_aggregate_run_state(
 
     for r in evaluated_records:
         status = r.get("status")
-        if status not in ("completed", "retained", "rejected"):
+        if status not in ("completed", "validated", "retained", "rejected"):
             return "failed"
 
     return "completed"
@@ -550,6 +642,30 @@ def is_valid_resumable_experiment(exp_dir: Path) -> bool:
 
 
 is_valid_paused_experiment = is_valid_resumable_experiment
+
+
+def get_completed_candidate_checkpoint(exp_dir: Path) -> Optional[str]:
+    """
+    Return the candidate checkpoint path when training finished a completed candidate.
+
+    Used on resume to reuse already-trained candidate checkpoints without retraining
+    (e.g. legacy records lacking validated evidence, or runs interrupted between
+    training completion and validation). Returns None when no completed candidate
+    checkpoint exists.
+    """
+    summary_path = exp_dir / "training_summary.json"
+    if not summary_path.is_file():
+        return None
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("state") != "completed":
+        return None
+    ckpt_path = exp_dir / "candidate.pt"
+    if not ckpt_path.is_file():
+        return None
+    return str(ckpt_path.resolve())
 
 
 def validate_run_manifest(
@@ -717,7 +833,7 @@ def load_existing_experiments(
                 completed_map[exp_id] = rec
             elif exp_id and rec.get("status") in ("completed", "retained", "rejected"):
                 print(
-                    f"WARNING: Stale or invalid experiment record {exp_id} in {experiments_jsonl}. Will rerun.",
+                    f"WARNING: Stale or invalid experiment record {exp_id} in {experiments_jsonl}. Will revalidate or rerun.",
                     file=sys.stderr,
                 )
         except Exception:
@@ -993,6 +1109,16 @@ def main() -> None:
         if isinstance(raw_val, int) and raw_val > 0 and not isinstance(raw_val, bool):
             min_val_samples = raw_val
 
+    validation_min_slice_samples = 5
+    if thresholds and isinstance(thresholds, dict):
+        raw_slice = thresholds.get("min_supported_slice_samples")
+        if (
+            isinstance(raw_slice, int)
+            and raw_slice > 0
+            and not isinstance(raw_slice, bool)
+        ):
+            validation_min_slice_samples = raw_slice
+
     observed_val_samples = count_expanded_val_samples(args.expanded_benchmark_csv)
     observed_test_samples = _count_expanded_human_samples(
         args.expanded_benchmark_csv, split="test"
@@ -1069,9 +1195,10 @@ def main() -> None:
         print(f"  Current Registry SHA256: {baseline_registry_sha256}")
         print(f"  Completed Experiments: {len(completed_map)}")
         for exp_id, rec in completed_map.items():
-            metrics = rec.get("metrics", {})
+            metrics = rec.get("metrics") or rec.get("validation_metrics") or {}
             print(
-                f"    - {exp_id}: MAE={metrics.get('mae')} RMSE={metrics.get('rmse')} Corr={metrics.get('pearson_corr', metrics.get('corr'))}"
+                f"    - {exp_id}: MAE={metrics.get('mae')} RMSE={metrics.get('rmse')} "
+                f"MSE={metrics.get('mse')} Corr={metrics.get('pearson_corr', metrics.get('corr'))}"
             )
         sys.exit(0)
 
@@ -1330,35 +1457,50 @@ def main() -> None:
         exp_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            experiment_config = dataclasses.replace(
-                exp["config"], max_seconds=remaining_seconds
+            # On resume, reuse an already-completed training checkpoint without
+            # retraining (legacy records lacking validated evidence, or runs
+            # interrupted between training completion and validation).
+            completed_candidate_ckpt = (
+                get_completed_candidate_checkpoint(exp_dir) if args.resume else None
             )
-            try:
-                with deadline_guard(remaining_seconds):
-                    train_result = train_active_model(
-                        dataset_path=dataset_path,
-                        split_csv=split_csv_path,
-                        output_dir=exp_dir,
-                        config=experiment_config,
-                        resume=args.resume and is_valid_resumable_experiment(exp_dir),
-                    )
-            except DeadlineExceededError:
-                print(
-                    f"Time budget of {args.max_seconds}s reached during training of {exp_id}. "
-                    "Stopping autoresearch loop.",
-                    file=sys.stderr,
-                )
-                exp_record = {
-                    "exp_id": exp_id,
-                    "hypothesis": exp["hypothesis"],
-                    "status": "stopped",
-                    "reason": "deadline_exceeded_during_training",
-                    "input_digest": exp_digest,
+            if completed_candidate_ckpt is not None:
+                candidate_ckpt = completed_candidate_ckpt
+                train_result = {
+                    "state": "completed",
+                    "candidate_checkpoint": candidate_ckpt,
                 }
-                evaluated_records.append(exp_record)
-                with experiments_jsonl.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(exp_record) + "\n")
-                break
+                print(f"METRIC exp_id={exp_id} status=training_reused")
+            else:
+                experiment_config = dataclasses.replace(
+                    exp["config"], max_seconds=remaining_seconds
+                )
+                try:
+                    with deadline_guard(remaining_seconds):
+                        train_result = train_active_model(
+                            dataset_path=dataset_path,
+                            split_csv=split_csv_path,
+                            output_dir=exp_dir,
+                            config=experiment_config,
+                            resume=args.resume
+                            and is_valid_resumable_experiment(exp_dir),
+                        )
+                except DeadlineExceededError:
+                    print(
+                        f"Time budget of {args.max_seconds}s reached during training of {exp_id}. "
+                        "Stopping autoresearch loop.",
+                        file=sys.stderr,
+                    )
+                    exp_record = {
+                        "exp_id": exp_id,
+                        "hypothesis": exp["hypothesis"],
+                        "status": "stopped",
+                        "reason": "deadline_exceeded_during_training",
+                        "input_digest": exp_digest,
+                    }
+                    evaluated_records.append(exp_record)
+                    with experiments_jsonl.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(exp_record) + "\n")
+                    break
 
             if train_result.get("state") != "completed":
                 exp_record = {
@@ -1404,18 +1546,18 @@ def main() -> None:
                 )
                 continue
 
-            # Check global deadline before in-process non-preemptible evaluation
+            # Check global deadline before in-process non-preemptible validation
             remaining_eval = global_deadline - time.time()
             if remaining_eval <= 0:
                 print(
-                    f"Time budget of {args.max_seconds}s reached before evaluation of {exp_id}. "
+                    f"Time budget of {args.max_seconds}s reached before validation of {exp_id}. "
                     "Stopping autoresearch loop."
                 )
                 exp_record = {
                     "exp_id": exp_id,
                     "hypothesis": exp["hypothesis"],
                     "status": "stopped",
-                    "reason": "deadline_exceeded_before_eval",
+                    "reason": "deadline_exceeded_before_validation",
                     "candidate_checkpoint": candidate_ckpt,
                     "input_digest": exp_digest,
                 }
@@ -1424,29 +1566,21 @@ def main() -> None:
                     f.write(json.dumps(exp_record) + "\n")
                 break
 
-            thresholds = None
-            if args.thresholds_json and Path(args.thresholds_json).exists():
-                thresholds = json.loads(
-                    Path(args.thresholds_json).read_text(encoding="utf-8")
-                )
-
-            eval_decision_path = exp_dir / "eval_decision.json"
+            validation_decision_path = exp_dir / "validation_decision.json"
             try:
                 with deadline_guard(remaining_eval):
-                    eval_result = evaluate_stage_two(
+                    validation_result = evaluate_candidate_validation(
                         dataset_path=dataset_path,
-                        control_dataset_path=args.control_dataset,
                         candidate_checkpoint=candidate_ckpt,
                         baseline_checkpoint=baseline_checkpoint_path,
                         expanded_benchmark_csv=args.expanded_benchmark_csv,
-                        control_benchmark_csv=args.control_benchmark_csv,
-                        route_qa_json=args.route_qa_json,
-                        thresholds=thresholds,
-                        output_path=eval_decision_path,
+                        output_path=validation_decision_path,
+                        min_supported_slice_samples=validation_min_slice_samples,
+                        device=args.device,
                     )
             except DeadlineExceededError:
                 print(
-                    f"Time budget of {args.max_seconds}s reached during evaluation of {exp_id}. "
+                    f"Time budget of {args.max_seconds}s reached during validation of {exp_id}. "
                     "Stopping autoresearch loop.",
                     file=sys.stderr,
                 )
@@ -1454,7 +1588,7 @@ def main() -> None:
                     "exp_id": exp_id,
                     "hypothesis": exp["hypothesis"],
                     "status": "stopped",
-                    "reason": "deadline_exceeded_during_eval",
+                    "reason": "deadline_exceeded_during_validation",
                     "candidate_checkpoint": candidate_ckpt,
                     "input_digest": exp_digest,
                 }
@@ -1463,22 +1597,21 @@ def main() -> None:
                     f.write(json.dumps(exp_record) + "\n")
                 break
 
-            all_pass = eval_result.get("all_gates_pass", False)
-            metrics = eval_result["expanded_human_benchmark"]["candidate_metrics"]
-            mae = metrics["mae"]
-            rmse = metrics["rmse"]
-            corr = metrics["pearson_corr"]
+            validation_metrics = validation_result["candidate_metrics"]
+            val_mse = validation_metrics["mse"]
+            cand_sha256 = validation_result["candidate"]["sha256"]
 
             exp_record = {
                 "exp_id": exp_id,
                 "hypothesis": exp["hypothesis"],
-                "status": "completed",
+                "status": "validated",
                 "candidate_checkpoint": candidate_ckpt,
-                "eval_decision_path": str(eval_decision_path),
-                "metrics": metrics,
-                "all_gates_pass": all_pass,
+                "candidate_checkpoint_sha256": cand_sha256,
+                "validation_decision_path": str(validation_decision_path),
+                "validation_metrics": validation_metrics,
+                "mse_improvement": validation_result.get("mse_improvement"),
                 "input_digest": exp_digest,
-                "evaluated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "validated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
             evaluated_records.append(exp_record)
 
@@ -1487,8 +1620,7 @@ def main() -> None:
                 f.write(json.dumps(exp_record) + "\n")
 
             print(
-                f"METRIC exp_id={exp_id} status=completed mae={mae:.4f} "
-                f"rmse={rmse:.4f} corr={corr:.4f} gate_pass={1 if all_pass else 0}"
+                f"METRIC exp_id={exp_id} status=validated val_mse={val_mse:.4f}"
             )
 
         except Exception as e:
@@ -1504,9 +1636,105 @@ def main() -> None:
             with experiments_jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(exp_record) + "\n")
             print(f"METRIC exp_id={exp_id} status=failed")
-    # 7. Select Best Passing Candidate
-    best_candidate = select_best_candidate(evaluated_records)
-    all_gates_pass = best_candidate is not None if not is_data_limited else False
+    # 7. Select Validation Finalist and Run Single Full Stage-Two Evaluation
+    # Only when every ladder candidate has a valid terminal validation record
+    # (and none is paused/stopped/failed) is exactly one finalist chosen by
+    # lowest validation MSE with deterministic ladder/exp_id tie-break; the
+    # held-out test/control/route/compound gates run at most once for that
+    # finalist, and only after every candidate finished.
+    finalist = None
+    all_gates_pass = False
+    final_eval_pending = False
+    if not is_data_limited:
+        ladder_exp_ids = [exp["exp_id"] for exp in ladder]
+        finalist = select_validation_finalist(evaluated_records, ladder_exp_ids)
+        if finalist is not None:
+            if finalist.get("eval_decision_path") and isinstance(
+                finalist.get("all_gates_pass"), bool
+            ):
+                # Full evaluation evidence already recorded (resume): reuse it.
+                all_gates_pass = finalist["all_gates_pass"]
+                print(
+                    f"METRIC exp_id={finalist['exp_id']} status=full_eval_reused "
+                    f"gate_pass={1 if all_gates_pass else 0}"
+                )
+            else:
+                remaining_full = global_deadline - time.time()
+                if remaining_full <= 0:
+                    print(
+                        f"Time budget of {args.max_seconds}s reached before final full "
+                        f"evaluation of {finalist['exp_id']}. Full evaluation deferred "
+                        "to a resumed run.",
+                        file=sys.stderr,
+                    )
+                    final_eval_pending = True
+                else:
+                    finalist_dir = run_dir / finalist["exp_id"]
+                    finalist_dir.mkdir(parents=True, exist_ok=True)
+                    full_eval_path = finalist_dir / "eval_decision.json"
+                    final_thresholds = None
+                    if args.thresholds_json and Path(args.thresholds_json).exists():
+                        final_thresholds = json.loads(
+                            Path(args.thresholds_json).read_text(encoding="utf-8")
+                        )
+                    try:
+                        with deadline_guard(remaining_full):
+                            full_eval_result = evaluate_stage_two(
+                                dataset_path=dataset_path,
+                                control_dataset_path=args.control_dataset,
+                                candidate_checkpoint=finalist["candidate_checkpoint"],
+                                baseline_checkpoint=baseline_checkpoint_path,
+                                expanded_benchmark_csv=args.expanded_benchmark_csv,
+                                control_benchmark_csv=args.control_benchmark_csv,
+                                route_qa_json=args.route_qa_json,
+                                thresholds=final_thresholds,
+                                output_path=full_eval_path,
+                                device=args.device,
+                            )
+                    except DeadlineExceededError:
+                        print(
+                            f"Time budget of {args.max_seconds}s reached during final full "
+                            f"evaluation of {finalist['exp_id']}. Full evaluation deferred "
+                            "to a resumed run.",
+                            file=sys.stderr,
+                        )
+                        final_eval_pending = True
+                    else:
+                        all_gates_pass = full_eval_result.get("all_gates_pass", False)
+                        full_metrics = full_eval_result["expanded_human_benchmark"][
+                            "candidate_metrics"
+                        ]
+                        finalist_record = {
+                            "exp_id": finalist["exp_id"],
+                            "hypothesis": finalist.get("hypothesis"),
+                            "status": "completed",
+                            "candidate_checkpoint": finalist["candidate_checkpoint"],
+                            "candidate_checkpoint_sha256": finalist.get(
+                                "candidate_checkpoint_sha256"
+                            ),
+                            "validation_decision_path": finalist.get(
+                                "validation_decision_path"
+                            ),
+                            "validation_metrics": finalist.get("validation_metrics"),
+                            "eval_decision_path": str(full_eval_path),
+                            "metrics": full_metrics,
+                            "all_gates_pass": all_gates_pass,
+                            "input_digest": finalist.get("input_digest"),
+                            "evaluated_at": time.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                            ),
+                        }
+                        evaluated_records.append(finalist_record)
+                        with experiments_jsonl.open("a", encoding="utf-8") as f:
+                            f.write(json.dumps(finalist_record) + "\n")
+                        # The finalist now carries the full evaluation evidence.
+                        finalist = finalist_record
+                        print(
+                            f"METRIC exp_id={finalist['exp_id']} status=completed "
+                            f"full_eval=1 gate_pass={1 if all_gates_pass else 0}"
+                        )
+        else:
+            print("METRIC finalist_selected=0")
     print(f"METRIC all_gates_pass={1 if all_gates_pass else 0}")
 
     requested_annotation_batch = {
@@ -1530,7 +1758,19 @@ def main() -> None:
         "run_name": args.run_name,
         "all_gates_pass": False if is_data_limited else all_gates_pass,
         "data_limited": is_data_limited,
-        "retained_candidate": None if is_data_limited else best_candidate,
+        "selected_finalist_exp_id": (
+            finalist["exp_id"] if finalist is not None else None
+        ),
+        "validation_mse": (
+            float(finalist["validation_metrics"]["mse"])
+            if finalist is not None
+            else None
+        ),
+        "retained_candidate": (
+            None
+            if is_data_limited or finalist is None or not all_gates_pass
+            else finalist
+        ),
         "evaluated_experiments": len(evaluated_records),
         "baseline_registry_sha256": baseline_registry_sha256,
         "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
@@ -1559,7 +1799,7 @@ def main() -> None:
                 "Promotion requested but run is data limited (insufficient validation support). Registry unchanged."
             )
             print("METRIC promoted=0 promotion_blocked=1 data_limited=1")
-        elif not all_gates_pass or best_candidate is None:
+        elif not all_gates_pass or finalist is None:
             print(
                 "Promotion requested but compound decision gates failed or no passing candidate found. Registry unchanged."
             )
@@ -1570,10 +1810,10 @@ def main() -> None:
             )
             print("METRIC promoted=0 promotion_blocked=1 deadline=1")
         else:
-            cand_ckpt = best_candidate["candidate_checkpoint"]
-            print(f"Promoting candidate {best_candidate['exp_id']} to registry...")
+            cand_ckpt = finalist["candidate_checkpoint"]
+            print(f"Promoting candidate {finalist['exp_id']} to registry...")
             promo_res = promote_from_decision(
-                decision_path=best_candidate["eval_decision_path"],
+                decision_path=finalist["eval_decision_path"],
                 candidate_checkpoint=cand_ckpt,
                 registry_path=registry_path,
                 expected_registry_sha256=baseline_registry_sha256,
@@ -1592,17 +1832,42 @@ def main() -> None:
     run_state = determine_aggregate_run_state(
         evaluated_records, len(ladder), timed_out=timed_out_flag
     )
+    if final_eval_pending:
+        run_state = "paused"
+    selected_finalist_summary = None
+    if finalist is not None:
+        selected_finalist_summary = {
+            "exp_id": finalist["exp_id"],
+            "validation_mse": float(finalist["validation_metrics"]["mse"]),
+            "validation_decision_path": finalist.get("validation_decision_path"),
+            "full_evaluation": (
+                {
+                    "eval_decision_path": finalist.get("eval_decision_path"),
+                    "all_gates_pass": finalist.get("all_gates_pass"),
+                }
+                if finalist.get("eval_decision_path")
+                else None
+            ),
+        }
     final_summary = {
         "run_name": args.run_name,
         "run_state": run_state,
         "total_experiments": len(evaluated_records),
         "all_gates_pass": False if is_data_limited else all_gates_pass,
         "data_limited": is_data_limited,
-        "retained_exp_id": None
-        if is_data_limited
-        else (best_candidate["exp_id"] if best_candidate else None),
-        "retained_candidate": None if is_data_limited else best_candidate,
+        "selected_finalist": selected_finalist_summary,
+        "retained_exp_id": (
+            None
+            if (is_data_limited or finalist is None or not all_gates_pass)
+            else finalist["exp_id"]
+        ),
+        "retained_candidate": (
+            None
+            if (is_data_limited or finalist is None or not all_gates_pass)
+            else finalist
+        ),
         "promoted": False if is_data_limited else promoted,
+        "pending_final_evaluation": final_eval_pending,
         "registry_status": "unchanged"
         if is_data_limited
         else ("promoted" if promoted else "unchanged"),

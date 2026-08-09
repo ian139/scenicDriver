@@ -1109,6 +1109,247 @@ def evaluate_stage_two(
     return decision_dict
 
 
+def evaluate_candidate_validation(
+    dataset_path: str | Path,
+    candidate_checkpoint: str | Path,
+    baseline_checkpoint: str | Path,
+    expanded_benchmark_csv: str | Path,
+    output_path: str | Path,
+    min_supported_slice_samples: int = 5,
+    device: str | None = None,
+) -> dict[str, Any]:
+    """
+    Perform validation-only screening of candidate vs baseline models on split=val.
+
+    Loads and validates the expanded dataset NPZ requiring embedded splits, verifies
+    split=val rows in expanded_benchmark_csv against NPZ split=val identities, and computes
+    candidate and baseline metrics on the exact unique split=val denominator. Held-out
+    split=test rows are not evaluated into metrics. Writes machine-readable JSON to output_path.
+    """
+    ds_path = Path(dataset_path)
+    cand_ckpt_path = Path(candidate_checkpoint)
+    base_ckpt_path = Path(baseline_checkpoint)
+    exp_csv_path = Path(expanded_benchmark_csv)
+    out_path = Path(output_path)
+
+    for p, name in [
+        (ds_path, "Dataset NPZ"),
+        (cand_ckpt_path, "Candidate checkpoint"),
+        (base_ckpt_path, "Baseline checkpoint"),
+        (exp_csv_path, "Expanded benchmark CSV"),
+    ]:
+        if not p.exists():
+            raise FileNotFoundError(f"{name} not found: {p}")
+
+    candidate_sha256 = file_sha256(cand_ckpt_path)
+    baseline_sha256 = file_sha256(base_ckpt_path)
+    dataset_sha256 = file_sha256(ds_path)
+    benchmark_sha256 = file_sha256(exp_csv_path)
+
+    # 1. Load and validate NPZ dataset requiring embedded splits
+    expanded = _load_dataset_npz(ds_path, require_embedded_splits=True)
+
+    resolved_device = resolve_device(device)
+
+    # 2. Load models
+    candidate_model = _load_model_checkpoint(
+        cand_ckpt_path, device=resolved_device, is_candidate=True
+    )
+    baseline_model = _load_model_checkpoint(
+        base_ckpt_path, device=resolved_device, is_candidate=False
+    )
+
+    # 3. Model inference over dataset arrays
+    cand_npz_preds = _predict_dataset(
+        candidate_model,
+        expanded["vit"],
+        expanded["terr"],
+        expanded["cls_logits"],
+        device=resolved_device,
+    )
+    base_npz_preds = _predict_dataset(
+        baseline_model,
+        expanded["vit"],
+        expanded["terr"],
+        expanded["cls_logits"],
+        device=resolved_device,
+    )
+
+    cand_pred_map = {
+        p: float(pred) for p, pred in zip(expanded["image_paths"], cand_npz_preds)
+    }
+    base_pred_map = {
+        p: float(pred) for p, pred in zip(expanded["image_paths"], base_npz_preds)
+    }
+
+    # 4. Read and validate expanded benchmark CSV filtering ONLY split=val rows
+    records = _read_benchmark_csv(exp_csv_path)
+    if any("split" not in record for record in records):
+        raise ValueError(
+            "Benchmark expanded_validation_benchmark requires an explicit split column"
+        )
+
+    val_records = [
+        record
+        for record in records
+        if str(record["split"]).strip().lower() == "val"
+    ]
+    if not val_records:
+        raise ValueError(
+            "Benchmark expanded_validation_benchmark contains no split=val rows"
+        )
+
+    matched_records = []
+    missing_paths = []
+    for record in val_records:
+        score_val = record.get("scenic_human_mean")
+        if score_val is None or score_val == "":
+            score_val = record.get("scenic_human")
+        if score_val is None or score_val == "":
+            raise ValueError(
+                "Benchmark expanded_validation_benchmark val target must be scenic_human_mean "
+                "or scenic_human, never weak/mixed scenic_score"
+            )
+        image_path = (
+            record.get("image_path")
+            or record.get("image_paths")
+            or record.get("path")
+            or record.get("image")
+        )
+        if not image_path:
+            raise ValueError(
+                "Benchmark expanded_validation_benchmark record lacks image_path"
+            )
+        image_path = str(image_path)
+        if image_path not in expanded["path_map"]:
+            missing_paths.append(image_path)
+            continue
+        if expanded["split_map"] and expanded["split_map"][image_path] != "val":
+            raise ValueError(
+                "Benchmark expanded_validation_benchmark relabels non-val prepared identity: "
+                f"{image_path}"
+            )
+        try:
+            target = float(score_val)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Benchmark expanded_validation_benchmark target must be numeric"
+            ) from exc
+        if not math.isfinite(target) or not 0 <= target <= 10:
+            raise ValueError(
+                "Benchmark expanded_validation_benchmark human targets must be finite and in [0, 10]"
+            )
+        matched_records.append(
+            {
+                "image_path": image_path,
+                "target": target,
+                "region": record.get("region", "default"),
+                "slice": record.get(
+                    "slice",
+                    record.get("terrain_type", record.get("region", "default")),
+                ),
+                "cand_pred": cand_pred_map[image_path],
+                "base_pred": base_pred_map[image_path],
+            }
+        )
+
+    if missing_paths:
+        raise ValueError(
+            f"Benchmark expanded_validation_benchmark has {len(missing_paths)} val paths absent "
+            "from the prepared dataset"
+        )
+    benchmark_paths = [rec["image_path"] for rec in matched_records]
+    if len(benchmark_paths) != len(set(benchmark_paths)):
+        raise ValueError(
+            "Benchmark expanded_validation_benchmark contains duplicate val image paths"
+        )
+    if len(matched_records) != len(val_records):
+        raise ValueError(
+            "Benchmark expanded_validation_benchmark val denominator mismatch"
+        )
+
+    # 5. Compute candidate & baseline metrics on exact val denominator
+    y_true = np.array([mr["target"] for mr in matched_records], dtype=np.float32)
+    y_cand = np.array([mr["cand_pred"] for mr in matched_records], dtype=np.float32)
+    y_base = np.array([mr["base_pred"] for mr in matched_records], dtype=np.float32)
+    if not np.isfinite(y_true).all():
+        raise ValueError("Benchmark expanded_validation_benchmark targets must be finite")
+
+    cand_metrics = _compute_metrics(y_true, y_cand)
+    base_metrics = _compute_metrics(y_true, y_base)
+    mse_improvement = float(base_metrics["mse"] - cand_metrics["mse"])
+
+    # 6. Sliced and region metrics
+    sliced_results = {}
+    region_results = {}
+    worst_slice_mse = 0.0
+    has_supported_slice = False
+    for group_name, group_key in (("slice", "slice"), ("region", "region")):
+        groups: dict[str, list[dict]] = {}
+        for rec in matched_records:
+            groups.setdefault(str(rec[group_key]), []).append(rec)
+        target_results = sliced_results if group_name == "slice" else region_results
+        for s_name, s_recs in groups.items():
+            if not s_recs:
+                raise ValueError(f"Supported {group_name} collapse: {s_name}")
+            s_yt = np.array([r["target"] for r in s_recs], dtype=np.float32)
+            s_yc = np.array([r["cand_pred"] for r in s_recs], dtype=np.float32)
+            s_yb = np.array([r["base_pred"] for r in s_recs], dtype=np.float32)
+            s_cand_m = _compute_metrics(s_yt, s_yc)
+            s_base_m = _compute_metrics(s_yt, s_yb)
+            is_supported = len(s_recs) >= min_supported_slice_samples
+            target_results[s_name] = {
+                "candidate": s_cand_m,
+                "baseline": s_base_m,
+                "samples": len(s_recs),
+                "supported": is_supported,
+            }
+            if group_name == "slice" and is_supported:
+                worst_slice_mse = max(worst_slice_mse, s_cand_m["mse"])
+                has_supported_slice = True
+
+    if not has_supported_slice:
+        worst_slice_mse = cand_metrics["mse"]
+
+    validation_summary = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "candidate": {
+            "checkpoint": str(candidate_checkpoint),
+            "sha256": candidate_sha256,
+        },
+        "baseline": {
+            "checkpoint": str(baseline_checkpoint),
+            "sha256": baseline_sha256,
+        },
+        "expanded_dataset": {
+            "path": str(dataset_path),
+            "sha256": dataset_sha256,
+        },
+        "expanded_benchmark": {
+            "path": str(expanded_benchmark_csv),
+            "sha256": benchmark_sha256,
+        },
+        "candidate_metrics": cand_metrics,
+        "baseline_metrics": base_metrics,
+        "mse_improvement": mse_improvement,
+        "sliced_metrics": sliced_results,
+        "region_metrics": region_results,
+        "worst_slice_mse": worst_slice_mse,
+        "expanded_validation_benchmark": {
+            "candidate_metrics": cand_metrics,
+            "baseline_metrics": base_metrics,
+            "mse_improvement": mse_improvement,
+            "sliced_metrics": sliced_results,
+            "region_metrics": region_results,
+            "worst_slice_mse": worst_slice_mse,
+        },
+    }
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(validation_summary, indent=2), encoding="utf-8")
+    return validation_summary
+
+
 def _locked_registry(reg_path: Path):
     """Hold an advisory lock for the complete registry transaction."""
     lock_path = reg_path.with_name(reg_path.name + ".lock")

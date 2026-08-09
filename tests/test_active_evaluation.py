@@ -11,6 +11,7 @@ import torch
 
 from src.scenic_scorer.active_evaluation import (
     evaluate_active_baseline,
+    evaluate_candidate_validation,
     evaluate_stage_two,
     file_sha256,
     promote_from_decision,
@@ -1738,3 +1739,223 @@ def test_evaluate_active_baseline_disjoint_benchmark_overlap(tmp_path: Path) -> 
             expanded_benchmark_csv=exp_csv,
             control_benchmark_csv=ctrl_csv,
         )
+
+
+def test_evaluate_candidate_validation_filters_only_split_val_rows(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
+    base_ckpt = create_legacy_checkpoint(tmp_path / "base.pt")
+    npz_path = create_npz_dataset(
+        tmp_path / "dataset.npz",
+        image_paths=["val1.jpg", "val2.jpg", "test1.jpg"],
+        splits=["val", "val", "test"],
+    )
+
+    exp_csv = tmp_path / "benchmark.csv"
+    with open(exp_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean", "region"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"image_path": "val1.jpg", "split": "val", "scenic_human_mean": "6.0", "region": "r1"}
+        )
+        writer.writerow(
+            {"image_path": "val2.jpg", "split": "val", "scenic_human_mean": "8.0", "region": "r1"}
+        )
+        writer.writerow(
+            {"image_path": "test1.jpg", "split": "test", "scenic_human_mean": "1.0", "region": "r2"}
+        )
+
+    out_json = tmp_path / "val_result.json"
+    result = evaluate_candidate_validation(
+        dataset_path=npz_path,
+        candidate_checkpoint=cand_ckpt,
+        baseline_checkpoint=base_ckpt,
+        expanded_benchmark_csv=exp_csv,
+        output_path=out_json,
+    )
+
+    assert result["candidate_metrics"]["samples"] == 2
+    assert result["baseline_metrics"]["samples"] == 2
+    assert out_json.exists()
+
+
+def test_evaluate_candidate_validation_rejects_missing_val_or_no_val_rows(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
+    base_ckpt = create_legacy_checkpoint(tmp_path / "base.pt")
+    npz_path = create_npz_dataset(
+        tmp_path / "dataset.npz",
+        image_paths=["img1.jpg"],
+        splits=["test"],
+    )
+
+    # 1. No split column
+    csv_no_split = tmp_path / "no_split.csv"
+    with open(csv_no_split, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["image_path", "scenic_human_mean"])
+        writer.writeheader()
+        writer.writerow({"image_path": "img1.jpg", "scenic_human_mean": "5.0"})
+
+    with pytest.raises(ValueError, match="requires an explicit split column"):
+        evaluate_candidate_validation(
+            dataset_path=npz_path,
+            candidate_checkpoint=cand_ckpt,
+            baseline_checkpoint=base_ckpt,
+            expanded_benchmark_csv=csv_no_split,
+            output_path=tmp_path / "out.json",
+        )
+
+    # 2. No split=val rows
+    csv_no_val = tmp_path / "no_val.csv"
+    with open(csv_no_val, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["image_path", "split", "scenic_human_mean"])
+        writer.writeheader()
+        writer.writerow(
+            {"image_path": "img1.jpg", "split": "test", "scenic_human_mean": "5.0"}
+        )
+
+    with pytest.raises(ValueError, match="contains no split=val rows"):
+        evaluate_candidate_validation(
+            dataset_path=npz_path,
+            candidate_checkpoint=cand_ckpt,
+            baseline_checkpoint=base_ckpt,
+            expanded_benchmark_csv=csv_no_val,
+            output_path=tmp_path / "out.json",
+        )
+
+
+def test_evaluate_candidate_validation_rejects_mislabeled_or_non_val_npz_identity(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
+    base_ckpt = create_legacy_checkpoint(tmp_path / "base.pt")
+    npz_path = create_npz_dataset(
+        tmp_path / "dataset.npz",
+        image_paths=["img1.jpg"],
+        splits=["test"],
+    )
+
+    exp_csv = tmp_path / "mislabeled.csv"
+    with open(exp_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["image_path", "split", "scenic_human_mean"])
+        writer.writeheader()
+        writer.writerow(
+            {"image_path": "img1.jpg", "split": "val", "scenic_human_mean": "5.0"}
+        )
+
+    with pytest.raises(ValueError, match="relabels non-val prepared identity"):
+        evaluate_candidate_validation(
+            dataset_path=npz_path,
+            candidate_checkpoint=cand_ckpt,
+            baseline_checkpoint=base_ckpt,
+            expanded_benchmark_csv=exp_csv,
+            output_path=tmp_path / "out.json",
+        )
+
+
+def test_evaluate_candidate_validation_rejects_weak_targets_and_nonfinite(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
+    base_ckpt = create_legacy_checkpoint(tmp_path / "base.pt")
+    npz_path = create_npz_dataset(
+        tmp_path / "dataset.npz",
+        image_paths=["val1.jpg"],
+        splits=["val"],
+    )
+
+    # 1. Weak target field only (scenic_score)
+    weak_csv = tmp_path / "weak.csv"
+    with open(weak_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["image_path", "split", "scenic_score"])
+        writer.writeheader()
+        writer.writerow({"image_path": "val1.jpg", "split": "val", "scenic_score": "5.0"})
+
+    with pytest.raises(ValueError, match="val target must be scenic_human_mean or scenic_human"):
+        evaluate_candidate_validation(
+            dataset_path=npz_path,
+            candidate_checkpoint=cand_ckpt,
+            baseline_checkpoint=base_ckpt,
+            expanded_benchmark_csv=weak_csv,
+            output_path=tmp_path / "out.json",
+        )
+
+    # 2. Out of range human target (> 10)
+    range_csv = tmp_path / "range.csv"
+    with open(range_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"image_path": "val1.jpg", "split": "val", "scenic_human_mean": "15.0"}
+        )
+
+    with pytest.raises(ValueError, match="human targets must be finite and in \\[0, 10\\]"):
+        evaluate_candidate_validation(
+            dataset_path=npz_path,
+            candidate_checkpoint=cand_ckpt,
+            baseline_checkpoint=base_ckpt,
+            expanded_benchmark_csv=range_csv,
+            output_path=tmp_path / "out.json",
+        )
+
+
+def test_evaluate_candidate_validation_exact_denominator_and_metrics(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.0)
+    base_ckpt = create_legacy_checkpoint(tmp_path / "base.pt")
+    npz_path = create_npz_dataset(
+        tmp_path / "dataset.npz",
+        image_paths=["v1.jpg", "v2.jpg"],
+        splits=["val", "val"],
+    )
+
+    exp_csv = tmp_path / "valid.csv"
+    with open(exp_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean", "region", "slice"]
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "image_path": "v1.jpg",
+                "split": "val",
+                "scenic_human_mean": "5.0",
+                "region": "r1",
+                "slice": "s1",
+            }
+        )
+        writer.writerow(
+            {
+                "image_path": "v2.jpg",
+                "split": "val",
+                "scenic_human_mean": "7.0",
+                "region": "r1",
+                "slice": "s1",
+            }
+        )
+
+    out_json = tmp_path / "decision_val.json"
+    result = evaluate_candidate_validation(
+        dataset_path=npz_path,
+        candidate_checkpoint=cand_ckpt,
+        baseline_checkpoint=base_ckpt,
+        expanded_benchmark_csv=exp_csv,
+        output_path=out_json,
+    )
+
+    assert "candidate" in result
+    assert "baseline" in result
+    assert "candidate_metrics" in result
+    assert "baseline_metrics" in result
+    assert "mse_improvement" in result
+    assert "sliced_metrics" in result
+    assert "region_metrics" in result
+    assert result["candidate_metrics"]["samples"] == 2
+    assert json.loads(out_json.read_text(encoding="utf-8")) == result
