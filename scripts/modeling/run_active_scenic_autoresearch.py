@@ -75,6 +75,30 @@ from src.scenic_scorer.active_evaluation import (  # noqa: E402
 )
 
 
+def _resolve_registry_checkpoint(registry_path: Path, raw_checkpoint: str) -> Path:
+    """Resolve a stored registry checkpoint, preferring an existing file.
+
+    Tries the value as-is (absolute or working-directory-relative), then
+    relative to the registry directory (checkpoints/<sha>.pt), then
+    project-root-relative (models/...) against the working directory.
+    Raises FileNotFoundError listing every tried candidate when none exists.
+    """
+    checkpoint_value = Path(raw_checkpoint)
+    candidates = [checkpoint_value]
+    if not checkpoint_value.is_absolute():
+        candidates += [
+            registry_path.parent / checkpoint_value,
+            Path.cwd() / checkpoint_value,
+        ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "Active baseline checkpoint missing: "
+        f"{raw_checkpoint} (tried: {', '.join(str(c) for c in candidates)})"
+    )
+
+
 class DeadlineExceededError(TimeoutError):
     """Raised when a POSIX real-time deadline guard times out."""
 
@@ -365,6 +389,655 @@ def build_candidate_ladder(
     return ladder[:max_experiments]
 
 
+def create_active_training_config(**kwargs: Any) -> ActiveTrainingConfig:
+    """Create ActiveTrainingConfig filtering fields to those supported by the dataclass."""
+    field_names = {f.name for f in dataclasses.fields(ActiveTrainingConfig)}
+    valid_kwargs = {k: v for k, v in kwargs.items() if k in field_names}
+    return ActiveTrainingConfig(**valid_kwargs)
+
+
+def build_human_finetune_candidate_ladder(
+    baseline_checkpoint_path: str | Path,
+    baseline_checkpoint_sha256: str,
+    max_experiments: int = 4,
+    seed: int = 42,
+    device: str = "cpu",
+    max_steps: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Generate deterministic 4-candidate ladder for human-only fine-tuning."""
+    base_kwargs = {
+        "human_only_training": True,
+        "batch_size": 32,
+        "epochs": 20,
+        "seed": seed,
+        "device": device,
+        "max_steps": max_steps,
+        "initial_checkpoint_path": str(baseline_checkpoint_path),
+        "initial_checkpoint_sha256": baseline_checkpoint_sha256,
+        "evaluate_test_during_training": False,
+    }
+
+    c1 = create_active_training_config(
+        loss_function="mse",
+        learning_rate=1e-5,
+        **base_kwargs,
+    )
+    c2 = create_active_training_config(
+        loss_function="mse",
+        learning_rate=5e-5,
+        **base_kwargs,
+    )
+    c3 = create_active_training_config(
+        loss_function="mse",
+        learning_rate=1e-4,
+        **base_kwargs,
+    )
+    c4 = create_active_training_config(
+        loss_function="huber",
+        learning_rate=5e-5,
+        **base_kwargs,
+    )
+
+    ladder = [
+        {
+            "exp_id": "exp_01_human_only_mse_lr1e5",
+            "hypothesis": "Human-only fine-tuning initialized from baseline checkpoint with MSE loss and learning rate 1e-5.",
+            "config": c1,
+        },
+        {
+            "exp_id": "exp_02_human_only_mse_lr5e5",
+            "hypothesis": "Human-only fine-tuning initialized from baseline checkpoint with MSE loss and learning rate 5e-5.",
+            "config": c2,
+        },
+        {
+            "exp_id": "exp_03_human_only_mse_lr1e4",
+            "hypothesis": "Human-only fine-tuning initialized from baseline checkpoint with MSE loss and learning rate 1e-4.",
+            "config": c3,
+        },
+        {
+            "exp_id": "exp_04_human_only_huber_lr5e5",
+            "hypothesis": "Human-only fine-tuning initialized from baseline checkpoint with Huber loss and learning rate 5e-5.",
+            "config": c4,
+        },
+    ]
+    return ladder[:max_experiments]
+
+
+# ---------------------------------------------------------------------------
+# Human-finetune prepared-dataset provenance manifest and seed+1 confirmation
+# ---------------------------------------------------------------------------
+PREPARED_DATASET_MANIFEST_SCHEMA_VERSION = 1
+CONFIRMATION_SUMMARY_SCHEMA_VERSION = 1
+CONFIRMATION_EXP_ID_TEMPLATE = "exp_05_confirmation_seed{seed}"
+
+
+def confirmation_exp_id(seed: int) -> str:
+    """Experiment id for the seed+1 confirmation run of a human-finetune run."""
+    return CONFIRMATION_EXP_ID_TEMPLATE.format(seed=seed)
+
+
+def _config_payload(config: Any) -> Dict[str, Any]:
+    """Serializable config payload for provenance records."""
+    if dataclasses.is_dataclass(config):
+        return dataclasses.asdict(config)
+    if isinstance(config, dict):
+        return dict(config)
+    return {"raw": str(config)}
+
+
+def _preparation_evidence(dataset_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract merged/train identity evidence from prepare_active_dataset output."""
+    return {
+        "schema_version": dataset_info.get("schema_version"),
+        "state": dataset_info.get("state"),
+        "handoff_sha256": dataset_info.get("handoff_sha256"),
+        "changed_rows": dataset_info.get("changed_rows"),
+        "counts": dataset_info.get("counts"),
+        "supplemental_benchmark": dataset_info.get("supplemental_benchmark"),
+    }
+
+
+def write_prepared_dataset_manifest(
+    prepared_manifest_path: Path,
+    *,
+    run_name: str,
+    handoff_sha256: str,
+    supplemental_benchmark_sha256: str,
+    dataset_info: Dict[str, Any],
+) -> None:
+    """Persist the human_finetune prepared-dataset provenance record.
+
+    The manifest binds the current invocation (mode, run name, Stage-One
+    handoff SHA, supplemental benchmark SHA) to the materialized prepared
+    dataset and split files (paths + SHA-256) plus the merged/train identity
+    evidence returned by preparation, so resume never trusts files by
+    presence alone.
+    """
+    manifest = {
+        "schema_version": PREPARED_DATASET_MANIFEST_SCHEMA_VERSION,
+        "mode": "human_finetune",
+        "run_name": run_name,
+        "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "stage1_handoff_sha256": handoff_sha256,
+        "supplemental_benchmark_sha256": supplemental_benchmark_sha256,
+        "dataset_path": str(dataset_info["dataset_path"]),
+        "dataset_sha256": dataset_info.get("dataset_sha256")
+        or compute_sha256(dataset_info["dataset_path"]),
+        "split_path": str(dataset_info["split_path"]),
+        "split_sha256": dataset_info.get("split_sha256")
+        or compute_sha256(dataset_info["split_path"]),
+        "preparation_evidence": _preparation_evidence(dataset_info),
+    }
+    prepared_manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def validate_prepared_dataset_manifest(
+    prepared_manifest_path: Path,
+    *,
+    run_name: str,
+    handoff_sha256: str,
+    supplemental_benchmark_sha256: str,
+    expected_dataset_path: Path,
+    run_dir: Path,
+) -> Dict[str, Any]:
+    """Verify a human_finetune prepared-dataset manifest against the invocation.
+
+    Fails closed on missing/malformed/mismatched records or files. Returns the
+    trusted dataset info (dataset_path, split_path, dataset_sha256,
+    split_sha256) with every path and hash re-verified against the real files.
+    """
+    mismatches = []
+    if not prepared_manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Resume requested but prepared dataset manifest missing at "
+            f"{prepared_manifest_path}"
+        )
+    try:
+        manifest = json.loads(prepared_manifest_path.read_text(encoding="utf-8"))
+    except Exception as err:
+        raise ValueError(
+            f"Prepared dataset manifest at {prepared_manifest_path} "
+            f"is invalid JSON: {err}"
+        )
+    if not isinstance(manifest, dict):
+        raise ValueError(
+            f"Prepared dataset manifest at {prepared_manifest_path} is malformed"
+        )
+
+    if manifest.get("schema_version") != PREPARED_DATASET_MANIFEST_SCHEMA_VERSION:
+        mismatches.append(
+            f"schema_version mismatch: manifest={manifest.get('schema_version')}, "
+            f"expected={PREPARED_DATASET_MANIFEST_SCHEMA_VERSION}"
+        )
+    for key, current in (
+        ("mode", "human_finetune"),
+        ("run_name", run_name),
+        ("stage1_handoff_sha256", handoff_sha256),
+        ("supplemental_benchmark_sha256", supplemental_benchmark_sha256),
+    ):
+        if key not in manifest:
+            mismatches.append(f"missing key in prepared dataset manifest: {key}")
+        elif manifest[key] != current:
+            mismatches.append(
+                f"{key} mismatch: manifest={manifest[key]}, current={current}"
+            )
+
+    dataset_path_str = manifest.get("dataset_path")
+    split_path_str = manifest.get("split_path")
+    dataset_sha256 = manifest.get("dataset_sha256")
+    split_sha256 = manifest.get("split_sha256")
+    for key, value in (
+        ("dataset_path", dataset_path_str),
+        ("split_path", split_path_str),
+    ):
+        if not isinstance(value, str) or not value:
+            mismatches.append(f"missing or invalid {key} in prepared dataset manifest")
+    for key, value in (
+        ("dataset_sha256", dataset_sha256),
+        ("split_sha256", split_sha256),
+    ):
+        if not isinstance(value, str) or len(value) != 64:
+            mismatches.append(f"missing or invalid {key} in prepared dataset manifest")
+
+    evidence = manifest.get("preparation_evidence")
+    if not isinstance(evidence, dict):
+        mismatches.append("missing or invalid preparation_evidence")
+    else:
+        if evidence.get("handoff_sha256") != handoff_sha256:
+            mismatches.append(
+                "preparation_evidence.handoff_sha256 mismatch: "
+                f"manifest={evidence.get('handoff_sha256')}, "
+                f"current={handoff_sha256}"
+            )
+        supp = evidence.get("supplemental_benchmark")
+        if (
+            not isinstance(supp, dict)
+            or supp.get("sha256") != supplemental_benchmark_sha256
+        ):
+            mismatches.append(
+                "preparation_evidence.supplemental_benchmark.sha256 mismatch: "
+                f"manifest={supp.get('sha256') if isinstance(supp, dict) else supp}, "
+                f"current={supplemental_benchmark_sha256}"
+            )
+        counts = evidence.get("counts")
+        if not isinstance(counts, dict):
+            mismatches.append("missing preparation_evidence.counts")
+        elif not (
+            isinstance(counts.get("train"), int)
+            and not isinstance(counts.get("train"), bool)
+            and counts.get("train") >= 1
+        ):
+            mismatches.append(
+                "preparation evidence lacks merged train rows "
+                "(preparation_evidence.counts.train)"
+            )
+        if not isinstance(evidence.get("changed_rows"), int) or isinstance(
+            evidence.get("changed_rows"), bool
+        ):
+            mismatches.append("missing or invalid preparation_evidence.changed_rows")
+
+    dataset_path = Path(dataset_path_str) if isinstance(dataset_path_str, str) else None
+    split_path = Path(split_path_str) if isinstance(split_path_str, str) else None
+    try:
+        if (
+            dataset_path is None
+            or dataset_path.resolve() != expected_dataset_path.resolve()
+        ):
+            mismatches.append(
+                "dataset_path does not match expected run-dir dataset: "
+                f"manifest={dataset_path_str}, expected={expected_dataset_path}"
+            )
+    except Exception as err:
+        mismatches.append(f"cannot resolve dataset_path: {err}")
+    try:
+        if split_path is None or not split_path.resolve().is_relative_to(
+            run_dir.resolve()
+        ):
+            mismatches.append(
+                f"split_path is outside the run directory: {split_path_str}"
+            )
+    except Exception as err:
+        mismatches.append(f"cannot resolve split_path: {err}")
+    if dataset_path is not None and not dataset_path.is_file():
+        mismatches.append(f"prepared dataset file missing: {dataset_path}")
+    if split_path is not None and not split_path.is_file():
+        mismatches.append(f"prepared split file missing: {split_path}")
+
+    if mismatches:
+        raise ValueError(
+            "Prepared dataset manifest validation failed:\n" + "\n".join(mismatches)
+        )
+
+    # Verify real file hashes against the recorded manifest before reuse.
+    actual_dataset_sha256 = compute_sha256(dataset_path)
+    actual_split_sha256 = compute_sha256(split_path)
+    if actual_dataset_sha256 != dataset_sha256:
+        raise ValueError(
+            "Prepared dataset SHA-256 mismatch: "
+            f"manifest={dataset_sha256}, actual={actual_dataset_sha256}"
+        )
+    if actual_split_sha256 != split_sha256:
+        raise ValueError(
+            "Prepared split SHA-256 mismatch: "
+            f"manifest={split_sha256}, actual={actual_split_sha256}"
+        )
+    return {
+        "dataset_path": str(dataset_path),
+        "split_path": str(split_path),
+        "dataset_sha256": dataset_sha256,
+        "split_sha256": split_sha256,
+    }
+
+
+def _write_confirmation_summary(summary_path: Path, payload: Dict[str, Any]) -> None:
+    """Persist (or update) the hash-bound confirmation summary artifact."""
+    payload = dict(payload)
+    payload.setdefault(
+        "evaluated_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    )
+    summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def validate_confirmation_summary(
+    summary_path: Path,
+    *,
+    expected_seed: int,
+    source_exp_id: str,
+    baseline_checkpoint_sha256: str,
+    dataset_sha256: str,
+    expanded_benchmark_sha256: str,
+    supplemental_benchmark_sha256: str,
+    handoff_sha256: str,
+) -> Dict[str, Any]:
+    """Validate a persisted confirmation summary for reuse on resume.
+
+    Fails closed on missing files, malformed records, mismatched bindings,
+    non-finite metrics, inconsistent state/improvement, or artifacts whose
+    real hashes no longer match. Returns the trusted summary dict.
+    """
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"Confirmation summary missing at {summary_path}")
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as err:
+        raise ValueError(
+            f"Confirmation summary at {summary_path} is invalid JSON: {err}"
+        )
+    if not isinstance(summary, dict):
+        raise ValueError("Confirmation summary is malformed (not a JSON object)")
+
+    mismatches = []
+    if summary.get("schema_version") != CONFIRMATION_SUMMARY_SCHEMA_VERSION:
+        mismatches.append(
+            f"schema_version mismatch: summary={summary.get('schema_version')}, "
+            f"expected={CONFIRMATION_SUMMARY_SCHEMA_VERSION}"
+        )
+    for key, current in (
+        ("confirmation_seed", expected_seed),
+        ("source_exp_id", source_exp_id),
+        ("baseline_checkpoint_sha256", baseline_checkpoint_sha256),
+        ("dataset_sha256", dataset_sha256),
+        ("expanded_benchmark_sha256", expanded_benchmark_sha256),
+        ("supplemental_benchmark_sha256", supplemental_benchmark_sha256),
+        ("handoff_sha256", handoff_sha256),
+    ):
+        if key not in summary:
+            mismatches.append(f"missing key in confirmation summary: {key}")
+        elif summary[key] != current:
+            mismatches.append(
+                f"{key} mismatch: summary={summary[key]}, current={current}"
+            )
+    if summary.get("heldout_test_evaluated") is not False:
+        mismatches.append(
+            "heldout_test_evaluated must be false in confirmation summary"
+        )
+    state = summary.get("state")
+    if state not in ("passed", "failed", "incomplete"):
+        mismatches.append(f"invalid confirmation state: {state!r}")
+    source_config = summary.get("source_config")
+    if not (
+        (isinstance(source_config, dict) and source_config)
+        or isinstance(source_config, str)
+    ):
+        mismatches.append("missing or invalid source_config in confirmation summary")
+
+    ckpt_str = summary.get("candidate_checkpoint")
+    ckpt_sha = summary.get("candidate_checkpoint_sha256")
+    if state in ("passed", "failed"):
+        if not isinstance(ckpt_str, str) or not ckpt_str:
+            mismatches.append("missing candidate_checkpoint in confirmation summary")
+        elif not Path(ckpt_str).is_file():
+            mismatches.append(f"candidate checkpoint missing: {ckpt_str}")
+        if not isinstance(ckpt_sha, str) or len(ckpt_sha) != 64:
+            mismatches.append(
+                "missing or invalid candidate_checkpoint_sha256 in confirmation summary"
+            )
+        reason = summary.get("reason")
+        is_validation_error = isinstance(reason, str) and reason.startswith(
+            "validation_error"
+        )
+        val_path_str = summary.get("validation_decision_path")
+        metrics = summary.get("validation_metrics")
+        raw_imp = summary.get("mse_improvement")
+        if not is_validation_error:
+            if not isinstance(val_path_str, str) or not val_path_str:
+                mismatches.append(
+                    "missing validation_decision_path in confirmation summary"
+                )
+            elif not Path(val_path_str).is_file():
+                mismatches.append(f"validation decision missing: {val_path_str}")
+            if not isinstance(metrics, dict) or not isinstance(
+                metrics.get("mse"), (int, float)
+            ):
+                mismatches.append(
+                    "missing or invalid validation_metrics in confirmation summary"
+                )
+            elif not math.isfinite(float(metrics["mse"])):
+                mismatches.append("validation_metrics.mse is not finite")
+            if not isinstance(raw_imp, (int, float)) or not math.isfinite(
+                float(raw_imp)
+            ):
+                if state == "passed":
+                    mismatches.append(
+                        "state=passed but mse_improvement is missing or not finite"
+                    )
+            elif state == "passed" and float(raw_imp) <= 0.0:
+                mismatches.append("state=passed but mse_improvement is not positive")
+            elif state == "failed" and float(raw_imp) > 0.0:
+                mismatches.append("state=failed but mse_improvement is positive")
+            # Cross-bind the validation artifact to the bound candidate,
+            # metrics and baseline so tampered decision files can never be
+            # reused as confirmation evidence.
+            if (
+                isinstance(ckpt_str, str)
+                and Path(ckpt_str).is_file()
+                and isinstance(ckpt_sha, str)
+                and isinstance(val_path_str, str)
+                and Path(val_path_str).is_file()
+                and isinstance(metrics, dict)
+            ):
+                try:
+                    val_data = json.loads(
+                        Path(val_path_str).read_text(encoding="utf-8")
+                    )
+                except Exception:
+                    val_data = None
+                if not isinstance(val_data, dict):
+                    mismatches.append(
+                        f"validation decision at {val_path_str} is invalid JSON"
+                    )
+                else:
+                    val_cand = val_data.get("candidate")
+                    if (
+                        not isinstance(val_cand, dict)
+                        or val_cand.get("sha256") != ckpt_sha
+                    ):
+                        mismatches.append(
+                            "validation decision candidate hash does not match "
+                            "confirmation summary"
+                        )
+                    val_metrics = val_data.get("candidate_metrics")
+                    if not isinstance(val_metrics, dict) or val_metrics.get(
+                        "mse"
+                    ) != metrics.get("mse"):
+                        mismatches.append(
+                            "validation decision metrics do not match "
+                            "confirmation summary"
+                        )
+                    val_base = val_data.get("baseline")
+                    if (
+                        not isinstance(val_base, dict)
+                        or val_base.get("sha256") != baseline_checkpoint_sha256
+                    ):
+                        mismatches.append(
+                            "validation decision baseline hash does not match "
+                            "confirmation summary"
+                        )
+        if (
+            isinstance(ckpt_str, str)
+            and Path(ckpt_str).is_file()
+            and isinstance(ckpt_sha, str)
+        ):
+            try:
+                actual_ckpt_sha = compute_sha256(Path(ckpt_str))
+            except Exception as err:
+                mismatches.append(f"cannot hash candidate checkpoint: {err}")
+            else:
+                if actual_ckpt_sha != ckpt_sha:
+                    mismatches.append(
+                        "candidate checkpoint SHA-256 mismatch: "
+                        f"bound={ckpt_sha}, actual={actual_ckpt_sha}"
+                    )
+    elif state == "incomplete":
+        if not isinstance(summary.get("reason"), str) or not summary["reason"]:
+            mismatches.append("incomplete confirmation summary missing reason")
+
+    if mismatches:
+        raise ValueError(
+            "Confirmation summary validation failed:\n" + "\n".join(mismatches)
+        )
+    return summary
+
+
+def _run_confirmation_experiment(
+    *,
+    summary_path: Path,
+    exp_dir: Path,
+    seed: int,
+    source_exp_id: str,
+    source_config: Any,
+    dataset_path: Path,
+    split_csv_path: Path,
+    baseline_checkpoint_path: Path,
+    baseline_checkpoint_sha256: str,
+    expanded_benchmark_csv: Path,
+    expanded_benchmark_sha256: str,
+    supplemental_benchmark_sha256: str,
+    handoff_sha256: str,
+    dataset_sha256: str,
+    validation_min_slice_samples: int,
+    device: str,
+    resume: bool,
+    deadline: Optional[float],
+) -> Dict[str, Any]:
+    """Train the seed+1 confirmation and validate it exactly once.
+
+    Writes a hash-bound confirmation_summary.json that is progressively
+    updated (incomplete -> passed/failed) so an interrupted confirmation can
+    be truthfully continued on resume. Returns the final summary payload.
+    """
+    base_payload = {
+        "schema_version": CONFIRMATION_SUMMARY_SCHEMA_VERSION,
+        "confirmation_seed": seed,
+        "source_exp_id": source_exp_id,
+        "source_config": _config_payload(source_config),
+        "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
+        "dataset_sha256": dataset_sha256,
+        "expanded_benchmark_sha256": expanded_benchmark_sha256,
+        "supplemental_benchmark_sha256": supplemental_benchmark_sha256,
+        "handoff_sha256": handoff_sha256,
+        "heldout_test_evaluated": False,
+    }
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    def _incomplete(reason: str, **extra: Any) -> Dict[str, Any]:
+        payload = {**base_payload, "state": "incomplete", "reason": reason}
+        payload.update(extra)
+        _write_confirmation_summary(summary_path, payload)
+        return payload
+
+    _write_confirmation_summary(
+        summary_path,
+        {**base_payload, "state": "incomplete", "reason": "training_in_progress"},
+    )
+
+    remaining = (deadline - time.time()) if deadline is not None else None
+    if remaining is not None and remaining <= 0:
+        return _incomplete("deadline_exceeded_before_training")
+
+    candidate_ckpt = get_completed_candidate_checkpoint(exp_dir) if resume else None
+    if candidate_ckpt is None:
+        remaining = (deadline - time.time()) if deadline is not None else None
+        if remaining is not None and remaining <= 0:
+            return _incomplete("deadline_exceeded_before_training")
+        if not dataclasses.is_dataclass(source_config):
+            raise TypeError(
+                "confirmation source config must be an ActiveTrainingConfig dataclass"
+            )
+        experiment_config = dataclasses.replace(
+            source_config,
+            seed=seed,
+            max_seconds=(
+                remaining if remaining is not None else source_config.max_seconds
+            ),
+        )
+        try:
+            with deadline_guard(remaining):
+                train_result = train_active_model(
+                    dataset_path=dataset_path,
+                    split_csv=split_csv_path,
+                    output_dir=exp_dir,
+                    config=experiment_config,
+                    resume=resume and is_valid_resumable_experiment(exp_dir),
+                )
+        except DeadlineExceededError:
+            return _incomplete("deadline_exceeded_during_training")
+        if train_result.get("state") != "completed":
+            return _incomplete(
+                f"training_not_completed_{train_result.get('state', 'unknown')}"
+            )
+        candidate_ckpt = train_result["candidate_checkpoint"]
+
+    cand_sha256 = compute_sha256(candidate_ckpt)
+    remaining = (deadline - time.time()) if deadline is not None else None
+    if remaining is not None and remaining <= 0:
+        return _incomplete(
+            "deadline_exceeded_before_validation",
+            candidate_checkpoint=str(candidate_ckpt),
+            candidate_checkpoint_sha256=cand_sha256,
+        )
+
+    validation_decision_path = exp_dir / "validation_decision.json"
+    try:
+        with deadline_guard(remaining):
+            validation_result = evaluate_candidate_validation(
+                dataset_path=dataset_path,
+                candidate_checkpoint=candidate_ckpt,
+                baseline_checkpoint=baseline_checkpoint_path,
+                expanded_benchmark_csv=expanded_benchmark_csv,
+                output_path=validation_decision_path,
+                min_supported_slice_samples=validation_min_slice_samples,
+                device=device,
+            )
+    except DeadlineExceededError:
+        return _incomplete(
+            "deadline_exceeded_during_validation",
+            candidate_checkpoint=str(candidate_ckpt),
+            candidate_checkpoint_sha256=cand_sha256,
+        )
+    except Exception as err:
+        payload = {
+            **base_payload,
+            "state": "failed",
+            "reason": f"validation_error: {err}",
+            "candidate_checkpoint": str(candidate_ckpt),
+            "candidate_checkpoint_sha256": cand_sha256,
+        }
+        if validation_decision_path.is_file():
+            payload["validation_decision_path"] = str(validation_decision_path)
+        _write_confirmation_summary(summary_path, payload)
+        return payload
+
+    validation_metrics = validation_result.get("candidate_metrics") or {}
+    raw_imp = validation_result.get("mse_improvement")
+    mse_improvement = float(raw_imp) if isinstance(raw_imp, (int, float)) else None
+    metrics_finite = (
+        isinstance(validation_metrics, dict)
+        and isinstance(validation_metrics.get("mse"), (int, float))
+        and math.isfinite(float(validation_metrics["mse"]))
+        and (mse_improvement is None or math.isfinite(mse_improvement))
+    )
+    passed = metrics_finite and mse_improvement is not None and mse_improvement > 0.0
+    if not metrics_finite:
+        reason = "nonfinite_validation_metrics"
+    elif mse_improvement is None:
+        reason = "missing_mse_improvement"
+    else:
+        reason = None if mse_improvement > 0.0 else "no_positive_mse_improvement"
+    payload = {
+        **base_payload,
+        "state": "passed" if passed else "failed",
+        "reason": reason,
+        "candidate_checkpoint": str(candidate_ckpt),
+        "candidate_checkpoint_sha256": cand_sha256,
+        "validation_decision_path": str(validation_decision_path),
+        "validation_metrics": validation_metrics,
+        "mse_improvement": mse_improvement,
+    }
+    _write_confirmation_summary(summary_path, payload)
+    return payload
+
+
 # Aggregate candidate metrics used for validation-based selection. Records must
 # carry finite values for every one of these that is present, and each value
 # must exactly match the validation decision artifact's candidate_metrics.
@@ -447,9 +1120,7 @@ def validate_experiment_record(
         if metric_key not in validation_metrics:
             continue
         value = validation_metrics[metric_key]
-        if not isinstance(value, (int, float)) or not math.isfinite(
-            float(value)
-        ):
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             return False
 
     val_dec_str = rec.get("validation_decision_path")
@@ -831,6 +1502,7 @@ def validate_run_manifest(
     mode_checks = [
         ("dry_run", args.dry_run),
         ("promote_requested", args.promote),
+        ("mode", args.mode),
     ]
     for key, current_val in mode_checks:
         if key not in existing_manifest:
@@ -933,6 +1605,7 @@ def validate_run_manifest(
             "Run manifest validation failed on resume:\n" + "\n".join(mismatches)
         )
 
+
 def load_existing_experiments(
     experiments_jsonl: Path,
     expected_baseline_sha256: Optional[str] = None,
@@ -978,6 +1651,13 @@ def load_existing_experiments(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Stage-Two Active Scenic Autoresearch Orchestrator"
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["standard", "human_finetune"],
+        default="standard",
+        help="Execution mode: standard active learning or human_finetune (validation-only completion).",
     )
     parser.add_argument(
         "--handoff",
@@ -1107,6 +1787,22 @@ def parse_args() -> argparse.Namespace:
             "--supplemental-annotations, --supplemental-annotations-sha256, and "
             "--supplemental-benchmark-sha256 must be provided together or all omitted."
         )
+    if args.mode == "human_finetune":
+        if args.promote:
+            raise ValueError(
+                "Promotion (--promote) is strictly forbidden in human_finetune mode (validation-only completion)."
+            )
+        if (
+            args.supplemental_annotations is None
+            or args.supplemental_annotations_sha256 is None
+            or args.supplemental_benchmark_sha256 is None
+            or args.expanded_benchmark_csv is None
+        ):
+            raise ValueError(
+                "human_finetune mode requires --supplemental-annotations, "
+                "--supplemental-annotations-sha256, --supplemental-benchmark-sha256, "
+                "and --expanded-benchmark-csv."
+            )
     return args
 
 
@@ -1159,7 +1855,9 @@ def main() -> None:
     supp_metrics: Optional[Dict[str, int]] = None
     if args.supplemental_annotations is not None:
         if validate_supplemental is None:
-            raise RuntimeError("validate_supplemental function not available in validate_stage2_preflight")
+            raise RuntimeError(
+                "validate_supplemental function not available in validate_stage2_preflight"
+            )
         supp_metrics = validate_supplemental(
             handoff_path=handoff_path,
             supplemental_annotations=Path(args.supplemental_annotations),
@@ -1214,11 +1912,9 @@ def main() -> None:
     active_model = registry_content.get("active")
     if not isinstance(active_model, dict) or not active_model.get("checkpoint"):
         raise ValueError("active model registry lacks active.checkpoint")
-    baseline_checkpoint_path = Path(active_model["checkpoint"])
-    if not baseline_checkpoint_path.is_file():
-        raise FileNotFoundError(
-            f"Active baseline checkpoint missing: {baseline_checkpoint_path}"
-        )
+    baseline_checkpoint_path = _resolve_registry_checkpoint(
+        registry_path, active_model["checkpoint"]
+    )
     baseline_checkpoint_sha256 = compute_sha256(baseline_checkpoint_path)
 
     # Compute Input Hashes
@@ -1388,6 +2084,12 @@ def main() -> None:
             ]
     else:
         manifest = {
+            "mode": args.mode,
+            "strategy": (
+                "human_finetune_validation_only"
+                if args.mode == "human_finetune"
+                else "standard"
+            ),
             "run_name": args.run_name,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "stage1_handoff_path": str(handoff_path),
@@ -1442,18 +2144,28 @@ def main() -> None:
                 "supplemental_annotations_sha256": args.supplemental_annotations_sha256,
                 "supplemental_benchmark_sha256": args.supplemental_benchmark_sha256,
                 "supplemental_metrics": supp_metrics,
+                "mode": args.mode,
             },
         }
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     # 4. Build Experiment Ladder
-    base_config = ActiveTrainingConfig(
-        seed=args.seed,
-        epochs=1 if is_data_limited else ActiveTrainingConfig().epochs,
-        device=args.device,
-        max_steps=args.max_steps,
-    )
-    ladder = build_candidate_ladder(base_config, args.max_experiments)
-
+    if args.mode == "human_finetune":
+        ladder = build_human_finetune_candidate_ladder(
+            baseline_checkpoint_path=baseline_checkpoint_path,
+            baseline_checkpoint_sha256=baseline_checkpoint_sha256,
+            max_experiments=min(args.max_experiments, 4),
+            seed=args.seed,
+            device=args.device,
+            max_steps=args.max_steps,
+        )
+    else:
+        base_config = ActiveTrainingConfig(
+            seed=args.seed,
+            epochs=1 if is_data_limited else ActiveTrainingConfig().epochs,
+            device=args.device,
+            max_steps=args.max_steps,
+        )
+        ladder = build_candidate_ladder(base_config, args.max_experiments)
     if time.time() >= global_deadline:
         print(f"Time budget of {args.max_seconds}s reached before dataset preparation.")
         sys.exit(0)
@@ -1518,7 +2230,45 @@ def main() -> None:
         sys.exit(0)
 
     prepared_split_path = prepared_dataset_path.with_suffix(".filtered_index.csv")
-    if (
+    prepared_manifest_path = run_dir / "prepared_dataset_manifest.json"
+    if args.mode == "human_finetune":
+        if args.resume:
+            dataset_info = validate_prepared_dataset_manifest(
+                prepared_manifest_path,
+                run_name=args.run_name,
+                handoff_sha256=handoff_sha256,
+                supplemental_benchmark_sha256=args.supplemental_benchmark_sha256,
+                expected_dataset_path=prepared_dataset_path,
+                run_dir=run_dir,
+            )
+            print(
+                f"METRIC prepared_dataset=reused "
+                f"dataset_sha256={dataset_info['dataset_sha256']}"
+            )
+        else:
+            remaining_prep = global_deadline - time.time()
+            try:
+                with deadline_guard(remaining_prep):
+                    dataset_info = prepare_active_dataset(
+                        handoff_path,
+                        prepared_dataset_path,
+                        supplemental_benchmark_path=args.expanded_benchmark_csv,
+                        supplemental_benchmark_sha256=args.supplemental_benchmark_sha256,
+                    )
+            except DeadlineExceededError:
+                print(
+                    f"Time budget of {args.max_seconds}s reached during dataset preparation.",
+                    file=sys.stderr,
+                )
+                sys.exit(0)
+            write_prepared_dataset_manifest(
+                prepared_manifest_path,
+                run_name=args.run_name,
+                handoff_sha256=handoff_sha256,
+                supplemental_benchmark_sha256=args.supplemental_benchmark_sha256,
+                dataset_info=dataset_info,
+            )
+    elif (
         args.resume
         and prepared_dataset_path.is_file()
         and prepared_split_path.is_file()
@@ -1784,9 +2534,7 @@ def main() -> None:
             with experiments_jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(exp_record) + "\n")
 
-            print(
-                f"METRIC exp_id={exp_id} status=validated val_mse={val_mse:.4f}"
-            )
+            print(f"METRIC exp_id={exp_id} status=validated val_mse={val_mse:.4f}")
 
         except Exception as e:
             print(f"ERROR: Experiment {exp_id} failed: {e}", file=sys.stderr)
@@ -1802,6 +2550,314 @@ def main() -> None:
                 f.write(json.dumps(exp_record) + "\n")
             print(f"METRIC exp_id={exp_id} status=failed")
     # 7. Select Validation Finalist and Run Single Full Stage-Two Evaluation
+
+    if args.mode == "human_finetune":
+        ladder_exp_ids = [exp["exp_id"] for exp in ladder]
+        best_validation_candidate = select_validation_finalist(
+            evaluated_records, ladder_exp_ids
+        )
+        validated_ids = {
+            record.get("exp_id")
+            for record in evaluated_records
+            if record.get("status") == "validated"
+        }
+        is_val_only_complete = best_validation_candidate is not None and all(
+            exp_id in validated_ids for exp_id in ladder_exp_ids
+        )
+        run_state = (
+            "validation_only_complete"
+            if is_val_only_complete
+            else determine_aggregate_run_state(
+                evaluated_records, len(ladder), timed_out=timed_out_flag
+            )
+        )
+
+        # 7b. Canonical seed+1 confirmation. When the best validation
+        # candidate has positive MSE improvement, the identical training
+        # configuration is re-run at seed+1 (exp_05_confirmation_seed<seed+1>),
+        # validated exactly once on the same fixed validation split, and the
+        # hash-bound confirmation_summary.json is written. On resume the
+        # summary's bindings, files and finite metrics are validated and reused
+        # without any training or evaluation. A finalist is selected only when
+        # BOTH the best candidate and its confirmation show positive
+        # improvement.
+        confirmation_summary_path = run_dir / "confirmation_summary.json"
+        confirmation_seed = args.seed + 1
+        confirmation_attempted = False
+        confirmation_passed: Optional[bool] = None
+        confirmation: Optional[Dict[str, Any]] = None
+        if best_validation_candidate is not None:
+            raw_imp = best_validation_candidate.get("mse_improvement")
+            best_improvement = (
+                float(raw_imp)
+                if isinstance(raw_imp, (int, float)) and math.isfinite(float(raw_imp))
+                else None
+            )
+        else:
+            best_improvement = None
+
+        if best_improvement is not None and best_improvement > 0.0:
+            source_entry = next(
+                (
+                    exp
+                    for exp in ladder
+                    if exp["exp_id"] == best_validation_candidate["exp_id"]
+                ),
+                None,
+            )
+            if source_entry is None:
+                raise RuntimeError(
+                    f"Best validation candidate {best_validation_candidate['exp_id']} "
+                    "not found in the experiment ladder"
+                )
+            confirmation_attempted = True
+            conf_exp_id = confirmation_exp_id(confirmation_seed)
+            if args.resume and confirmation_summary_path.is_file():
+                confirmation = validate_confirmation_summary(
+                    confirmation_summary_path,
+                    expected_seed=confirmation_seed,
+                    source_exp_id=best_validation_candidate["exp_id"],
+                    baseline_checkpoint_sha256=baseline_checkpoint_sha256,
+                    dataset_sha256=dataset_sha256,
+                    expanded_benchmark_sha256=expanded_benchmark_sha256,
+                    supplemental_benchmark_sha256=supplemental_benchmark_sha256,
+                    handoff_sha256=handoff_sha256,
+                )
+                if confirmation.get("state") == "incomplete":
+                    print(
+                        f"METRIC confirmation_seed={confirmation_seed} "
+                        "status=continuing state=incomplete"
+                    )
+                    confirmation = _run_confirmation_experiment(
+                        summary_path=confirmation_summary_path,
+                        exp_dir=run_dir / conf_exp_id,
+                        seed=confirmation_seed,
+                        source_exp_id=best_validation_candidate["exp_id"],
+                        source_config=source_entry["config"],
+                        dataset_path=dataset_path,
+                        split_csv_path=split_csv_path,
+                        baseline_checkpoint_path=baseline_checkpoint_path,
+                        baseline_checkpoint_sha256=baseline_checkpoint_sha256,
+                        expanded_benchmark_csv=args.expanded_benchmark_csv,
+                        expanded_benchmark_sha256=expanded_benchmark_sha256,
+                        supplemental_benchmark_sha256=supplemental_benchmark_sha256,
+                        handoff_sha256=handoff_sha256,
+                        dataset_sha256=dataset_sha256,
+                        validation_min_slice_samples=validation_min_slice_samples,
+                        device=args.device,
+                        resume=args.resume,
+                        deadline=global_deadline,
+                    )
+                else:
+                    print(
+                        f"METRIC confirmation_seed={confirmation_seed} "
+                        f"status=reused state={confirmation.get('state')}"
+                    )
+            else:
+                confirmation = _run_confirmation_experiment(
+                    summary_path=confirmation_summary_path,
+                    exp_dir=run_dir / conf_exp_id,
+                    seed=confirmation_seed,
+                    source_exp_id=best_validation_candidate["exp_id"],
+                    source_config=source_entry["config"],
+                    dataset_path=dataset_path,
+                    split_csv_path=split_csv_path,
+                    baseline_checkpoint_path=baseline_checkpoint_path,
+                    baseline_checkpoint_sha256=baseline_checkpoint_sha256,
+                    expanded_benchmark_csv=args.expanded_benchmark_csv,
+                    expanded_benchmark_sha256=expanded_benchmark_sha256,
+                    supplemental_benchmark_sha256=supplemental_benchmark_sha256,
+                    handoff_sha256=handoff_sha256,
+                    dataset_sha256=dataset_sha256,
+                    validation_min_slice_samples=validation_min_slice_samples,
+                    device=args.device,
+                    resume=args.resume,
+                    deadline=global_deadline,
+                )
+            confirmation_passed = confirmation.get("state") == "passed"
+            print(
+                f"METRIC confirmation_seed={confirmation_seed} "
+                f"passed={1 if confirmation_passed else 0} "
+                f"state={confirmation.get('state')}"
+            )
+
+        confirmation_incomplete = (
+            confirmation is not None and confirmation.get("state") == "incomplete"
+        )
+        if confirmation_incomplete:
+            run_state = "paused"
+
+        finalist = None
+        if best_validation_candidate is not None and confirmation_passed is True:
+            finalist = best_validation_candidate
+
+        if finalist is not None:
+            rejection_reason = "fresh_heldout_test_required"
+            pending_final_evaluation = True
+            requested_annotation_batch: Optional[Dict[str, Any]] = {
+                "target_validation_human_rows": 0,
+                "target_test_human_rows": 20,
+                "min_expanded_validation_samples": min_val_samples,
+                "observed_expanded_validation_samples": observed_val_samples,
+                "observed_expanded_test_samples": observed_test_samples,
+                "needed_validation_human_rows": 0,
+                "needed_test_human_rows": 20,
+                "sampling_strategy": "fresh_geographically_isolated_test_labels",
+                "overlap_constraints": {
+                    "current_exposed_test_rows": 0,
+                    "control_rows": 0,
+                },
+                "description": (
+                    "Requesting >=20 fresh geographically isolated human test labels "
+                    "before any candidate promotion or full evaluation."
+                ),
+            }
+        elif confirmation_attempted:
+            rejection_reason = "confirmation_seed_failed"
+            pending_final_evaluation = False
+            requested_annotation_batch = None
+        else:
+            rejection_reason = "no_validation_improvement"
+            pending_final_evaluation = False
+            requested_annotation_batch = None
+
+        decision_summary = {
+            "run_name": args.run_name,
+            "mode": args.mode,
+            "strategy": "human_finetune_validation_only",
+            "state": run_state,
+            "all_gates_pass": False,
+            "promoted": False,
+            "confirmation_seed": (
+                confirmation_seed if confirmation_attempted else None
+            ),
+            "confirmation_passed": confirmation_passed,
+            "confirmation_seed_failed": (
+                confirmation_attempted and confirmation_passed is not True
+            ),
+            "data_limited": is_data_limited,
+            "best_validation_candidate_exp_id": (
+                best_validation_candidate["exp_id"]
+                if best_validation_candidate is not None
+                else None
+            ),
+            "best_validation_candidate_mse": (
+                float(best_validation_candidate["validation_metrics"]["mse"])
+                if best_validation_candidate is not None
+                else None
+            ),
+            "selected_finalist_exp_id": (
+                finalist["exp_id"] if finalist is not None else None
+            ),
+            "selected_candidate_checkpoint": (
+                finalist["candidate_checkpoint"] if finalist is not None else None
+            ),
+            "selected_candidate_checkpoint_sha256": (
+                finalist.get("candidate_checkpoint_sha256")
+                if finalist is not None
+                else None
+            ),
+            "validation_mse": (
+                float(best_validation_candidate["validation_metrics"]["mse"])
+                if best_validation_candidate is not None
+                else None
+            ),
+            "promotion_evidence_valid": False,
+            "heldout_test_exposure": {
+                "detected": heldout_exposure,
+                "count": len(exposure_exp_ids),
+                "exp_ids": exposure_exp_ids,
+            },
+            "retained_candidate": None,
+            "evaluated_experiments": len(evaluated_records),
+            "baseline_registry_sha256": baseline_registry_sha256,
+            "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
+            "observed_expanded_val_samples": observed_val_samples,
+            "min_expanded_validation_samples": min_val_samples,
+            "rejection_reason": rejection_reason,
+            "registry_status": "unchanged",
+            "requested_annotation_batch": requested_annotation_batch,
+            "decision_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        decision_path.write_text(
+            json.dumps(decision_summary, indent=2), encoding="utf-8"
+        )
+
+        best_val_summary = None
+        if best_validation_candidate is not None:
+            best_val_summary = {
+                "exp_id": best_validation_candidate["exp_id"],
+                "candidate_checkpoint": best_validation_candidate.get(
+                    "candidate_checkpoint"
+                ),
+                "candidate_checkpoint_sha256": best_validation_candidate.get(
+                    "candidate_checkpoint_sha256"
+                ),
+                "validation_mse": float(
+                    best_validation_candidate["validation_metrics"]["mse"]
+                ),
+                "mse_improvement": (
+                    float(best_validation_candidate["mse_improvement"])
+                    if best_validation_candidate.get("mse_improvement") is not None
+                    else None
+                ),
+                "validation_decision_path": best_validation_candidate.get(
+                    "validation_decision_path"
+                ),
+            }
+
+        selected_finalist_summary = None
+        if finalist is not None:
+            selected_finalist_summary = {
+                "exp_id": finalist["exp_id"],
+                "candidate_checkpoint": finalist.get("candidate_checkpoint"),
+                "candidate_checkpoint_sha256": finalist.get(
+                    "candidate_checkpoint_sha256"
+                ),
+                "validation_mse": float(finalist["validation_metrics"]["mse"]),
+                "validation_decision_path": finalist.get("validation_decision_path"),
+                "full_evaluation": None,
+            }
+
+        final_summary = {
+            "run_name": args.run_name,
+            "mode": args.mode,
+            "strategy": "human_finetune_validation_only",
+            "run_state": run_state,
+            "total_experiments": len(ladder),
+            "all_gates_pass": False,
+            "confirmation_seed": (
+                confirmation_seed if confirmation_attempted else None
+            ),
+            "confirmation_passed": confirmation_passed,
+            "confirmation_seed_failed": (
+                confirmation_attempted and confirmation_passed is not True
+            ),
+            "data_limited": is_data_limited,
+            "best_validation_candidate": best_val_summary,
+            "selected_finalist": selected_finalist_summary,
+            "promotion_evidence_valid": False,
+            "heldout_test_exposure": {
+                "detected": heldout_exposure,
+                "count": len(exposure_exp_ids),
+                "exp_ids": exposure_exp_ids,
+            },
+            "retained_exp_id": None,
+            "retained_candidate": None,
+            "promoted": False,
+            "pending_final_evaluation": pending_final_evaluation,
+            "registry_status": "unchanged",
+            "observed_expanded_val_samples": observed_val_samples,
+            "min_expanded_validation_samples": min_val_samples,
+            "rejection_reason": rejection_reason,
+            "requested_annotation_batch": requested_annotation_batch,
+            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        summary_path.write_text(json.dumps(final_summary, indent=2), encoding="utf-8")
+        print(
+            f"METRIC run_state={run_state} retained_exp=None promoted=0 data_limited={1 if is_data_limited else 0}"
+        )
+        return
     # Only when every ladder candidate has a valid terminal validation record
     # (and none is paused/stopped/failed) is exactly one finalist chosen by
     # lowest validation MSE with deterministic ladder/exp_id tie-break; the
@@ -1930,14 +2986,11 @@ def main() -> None:
     if heldout_exposure:
         decision_rejection_reason = EXPOSURE_REJECTION_REASON
     elif is_data_limited:
-        decision_rejection_reason = (
-            "insufficient_expanded_human_validation_support"
-        )
+        decision_rejection_reason = "insufficient_expanded_human_validation_support"
     elif finalist is not None and not all_gates_pass and not final_eval_pending:
         decision_rejection_reason = "selected_finalist_failed_compound_gates"
     elif finalist is None and not final_eval_pending:
         decision_rejection_reason = "no_validation_finalist"
-
 
     promoted = False
     decision_summary = {

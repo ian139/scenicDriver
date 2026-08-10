@@ -162,6 +162,38 @@ def _resolve(value: str | None, root: Path) -> Path | None:
     return path if path.is_absolute() else root / path
 
 
+def _registry_checkpoint_candidates(
+    registry_path: Path, raw_checkpoint: str
+) -> list[Path]:
+    """Ordered candidate locations for a stored registry checkpoint.
+
+    The value itself (absolute or working-directory-relative), then relative to
+    the registry directory (checkpoints/<sha>.pt), then project-root-relative
+    (models/...) against the working directory.
+    """
+    checkpoint_value = Path(raw_checkpoint)
+    candidates = [checkpoint_value]
+    if not checkpoint_value.is_absolute():
+        candidates += [
+            registry_path.parent / checkpoint_value,
+            Path.cwd() / checkpoint_value,
+        ]
+    return candidates
+
+
+def _resolve_registry_checkpoint(
+    registry_path: Path, raw_checkpoint: str
+) -> Path | None:
+    """Resolve a stored registry checkpoint, preferring an existing file.
+
+    Returns the first existing candidate location, or None when none exists.
+    """
+    for candidate in _registry_checkpoint_candidates(registry_path, raw_checkpoint):
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
 def _previous_hashes(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
@@ -817,9 +849,16 @@ def _validate_registry(
     if not isinstance(active, dict) or not active.get("checkpoint"):
         blockers.append("baseline registry has no active checkpoint")
         return False, {}
-    checkpoint = checkpoint or _resolve(str(active["checkpoint"]), Path.cwd())
+    if checkpoint is None:
+        checkpoint = _resolve_registry_checkpoint(path, str(active["checkpoint"]))
     if checkpoint is None or not checkpoint.exists():
-        blockers.append(f"baseline checkpoint missing: {active.get('checkpoint')}")
+        candidates = _registry_checkpoint_candidates(path, str(active["checkpoint"]))
+        blockers.append(
+            "baseline checkpoint missing: "
+            f"{active.get('checkpoint')} (tried: "
+            + ", ".join(str(c) for c in candidates)
+            + ")"
+        )
         return False, {"active": active}
     checkpoint_sha256 = sha256_file(checkpoint)
     declared_sha256 = active.get("sha256")

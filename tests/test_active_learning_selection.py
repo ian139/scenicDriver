@@ -497,6 +497,90 @@ def test_prepare_for_selection_filters_scorer_columns_and_fails_closed() -> None
         _prepare_for_selection(all_ineligible, seed=42)
 
 
+def test_resolve_registry_checkpoint_prefers_existing_and_reports_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.active_learning.finalize import (
+        _registry_checkpoint_candidates,
+        _resolve_registry_checkpoint,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    registry_dir = tmp_path / "data" / "processed" / "regression"
+    registry_dir.mkdir(parents=True)
+    registry = registry_dir / "model_registry.json"
+    registry.write_text("{}", encoding="utf-8")
+
+    # Registry-relative checkpoints/<sha>.pt resolves via the registry directory
+    sha = "ab" * 32
+    reg_ckpt = registry_dir / "checkpoints" / f"{sha}.pt"
+    reg_ckpt.parent.mkdir(parents=True)
+    reg_ckpt.write_bytes(b"checkpoint")
+    assert (
+        _resolve_registry_checkpoint(registry, f"checkpoints/{sha}.pt").resolve()
+        == reg_ckpt.resolve()
+    )
+
+    # Project-root-relative models/... resolves via the working directory
+    model_ckpt = tmp_path / "models" / "baseline.pt"
+    model_ckpt.parent.mkdir(parents=True)
+    model_ckpt.write_bytes(b"model")
+    assert (
+        _resolve_registry_checkpoint(registry, "models/baseline.pt").resolve()
+        == model_ckpt.resolve()
+    )
+
+    # Missing checkpoint returns None and exposes every tried candidate
+    missing_value = "checkpoints/missing.pt"
+    assert _resolve_registry_checkpoint(registry, missing_value) is None
+    tried = _registry_checkpoint_candidates(registry, missing_value)
+    assert tried[0] == Path(missing_value)
+    assert tried[1] == reg_ckpt.parent / "missing.pt"
+    assert tried[2] == tmp_path / missing_value
+
+
+def test_validate_registry_resolves_registry_relative_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.active_learning.finalize import _validate_registry
+
+    monkeypatch.chdir(tmp_path)
+    registry_dir = tmp_path / "data" / "processed" / "regression"
+    registry_dir.mkdir(parents=True)
+    registry = registry_dir / "model_registry.json"
+    sha = "cd" * 32
+    ckpt = registry_dir / "checkpoints" / f"{sha}.pt"
+    ckpt.parent.mkdir(parents=True)
+    ckpt.write_bytes(b"checkpoint bytes")
+    registry.write_text(
+        json.dumps(
+            {
+                "active": {
+                    "checkpoint": f"checkpoints/{sha}.pt",
+                    "sha256": sha256_file(ckpt),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    blockers: list[str] = []
+    ok, baseline = _validate_registry(registry, None, blockers)
+    assert ok
+    assert blockers == []
+    assert baseline["checkpoint_path"] == str(ckpt)
+    assert baseline["checkpoint_sha256"] == sha256_file(ckpt)
+
+    # Missing checkpoint fails closed and names every tried candidate
+    registry.write_text(
+        json.dumps({"active": {"checkpoint": "checkpoints/missing.pt"}}),
+        encoding="utf-8",
+    )
+    blockers = []
+    ok, baseline = _validate_registry(registry, None, blockers)
+    assert not ok
+    assert any("tried:" in blocker for blocker in blockers)
+
+
 def test_modifying_annotation_batch_content_preserving_row_count_and_batch_id_is_rejected(
     tmp_path: Path,
 ) -> None:

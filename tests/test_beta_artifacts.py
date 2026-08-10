@@ -46,10 +46,7 @@ def _write_project(root: Path, *, graph: str) -> None:
         encoding="utf-8",
     )
     report = (
-        root
-        / "data/processed/heuristic_runs"
-        / checker.DEFAULT_RUN_NAME
-        / "report"
+        root / "data/processed/heuristic_runs" / checker.DEFAULT_RUN_NAME / "report"
     )
     report.mkdir(parents=True)
     for name in ("report.json", "route.geojson", "route_metrics.json"):
@@ -84,21 +81,27 @@ def _write_sqlite_graph(
     with sqlite3.connect(path) as connection:
         connection.executescript(
             f"""
-            CREATE TABLE metadata({schema_overrides.get(
-                "metadata", "key TEXT PRIMARY KEY, value TEXT NOT NULL"
-            )});
-            CREATE TABLE nodes({schema_overrides.get(
-                "nodes",
-                "id TEXT PRIMARY KEY, lat REAL NOT NULL, lon REAL NOT NULL",
-            )});
-            CREATE TABLE edges({schema_overrides.get(
-                "edges",
-                "id TEXT PRIMARY KEY, start_node_id TEXT NOT NULL, "
-                "end_node_id TEXT NOT NULL, distance_km REAL NOT NULL, "
-                "scenic_score REAL NOT NULL, road_name TEXT, "
-                "road_type TEXT NOT NULL, speed_limit_kmh REAL, "
-                "one_way INTEGER NOT NULL CHECK(one_way IN (0, 1))",
-            )});
+            CREATE TABLE metadata({
+                schema_overrides.get(
+                    "metadata", "key TEXT PRIMARY KEY, value TEXT NOT NULL"
+                )
+            });
+            CREATE TABLE nodes({
+                schema_overrides.get(
+                    "nodes",
+                    "id TEXT PRIMARY KEY, lat REAL NOT NULL, lon REAL NOT NULL",
+                )
+            });
+            CREATE TABLE edges({
+                schema_overrides.get(
+                    "edges",
+                    "id TEXT PRIMARY KEY, start_node_id TEXT NOT NULL, "
+                    "end_node_id TEXT NOT NULL, distance_km REAL NOT NULL, "
+                    "scenic_score REAL NOT NULL, road_name TEXT, "
+                    "road_type TEXT NOT NULL, speed_limit_kmh REAL, "
+                    "one_way INTEGER NOT NULL CHECK(one_way IN (0, 1))",
+                )
+            });
             """
         )
         connection.executemany(
@@ -127,6 +130,7 @@ def test_valid_configured_sqlite_graph_passes(tmp_path: Path) -> None:
     _write_sqlite_graph(tmp_path / relative)
 
     assert checker.check_artifacts(tmp_path) == 0
+
 
 @pytest.mark.parametrize(
     ("schema_overrides", "expected"),
@@ -169,9 +173,7 @@ def test_sqlite_schema_constraints_are_rejected(
     assert expected in capsys.readouterr().out
 
 
-def test_wrong_canonical_probe_coordinates_are_rejected(
-    tmp_path: Path, capsys
-) -> None:
+def test_wrong_canonical_probe_coordinates_are_rejected(tmp_path: Path, capsys) -> None:
     relative = "candidate.sqlite3"
     _write_project(tmp_path, graph=relative)
     probes = {
@@ -296,3 +298,79 @@ def test_cli_graph_override_returns_nonzero_for_bad_candidate(
     )
     assert checker.main() == 1
     assert "edge_count" in capsys.readouterr().out
+
+
+def test_active_checkpoint_resolves_registry_relative_and_root_relative(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path
+    registry = root / checker.REGISTRY_PATH
+    registry.parent.mkdir(parents=True)
+    sha = "ab" * 32
+
+    # Registry-relative checkpoints/<sha>.pt resolves under the registry directory
+    registry.write_text(
+        json.dumps({"active": {"checkpoint": f"checkpoints/{sha}.pt"}}),
+        encoding="utf-8",
+    )
+    reg_ckpt = registry.parent / "checkpoints" / f"{sha}.pt"
+    reg_ckpt.parent.mkdir(parents=True)
+    reg_ckpt.write_bytes(b"checkpoint")
+    resolved, issues = checker._active_checkpoint(root)
+    assert resolved == reg_ckpt
+    assert issues == []
+
+    # Project-root-relative models/... resolves against the deployment root
+    registry.write_text(
+        json.dumps({"active": {"checkpoint": "models/baseline.pt"}}),
+        encoding="utf-8",
+    )
+    root_ckpt = root / "models" / "baseline.pt"
+    root_ckpt.parent.mkdir(parents=True)
+    root_ckpt.write_bytes(b"checkpoint")
+    resolved, issues = checker._active_checkpoint(root)
+    assert resolved == root_ckpt
+    assert issues == []
+
+    # Absolute container paths are preserved as-is
+    registry.write_text(
+        json.dumps({"active": {"checkpoint": str(reg_ckpt)}}),
+        encoding="utf-8",
+    )
+    resolved, issues = checker._active_checkpoint(root)
+    assert resolved == reg_ckpt
+    assert issues == []
+
+
+def test_active_checkpoint_prefers_existing_and_reports_missing_paths(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path
+    registry = root / checker.REGISTRY_PATH
+    registry.parent.mkdir(parents=True)
+    sha = "cd" * 32
+    registry.write_text(
+        json.dumps({"active": {"checkpoint": f"checkpoints/{sha}.pt"}}),
+        encoding="utf-8",
+    )
+
+    # Only the project-root-relative copy exists -> prefer the existing file
+    root_ckpt = root / "checkpoints" / f"{sha}.pt"
+    root_ckpt.parent.mkdir(parents=True)
+    root_ckpt.write_bytes(b"checkpoint")
+    resolved, issues = checker._active_checkpoint(root)
+    assert resolved == root_ckpt
+    assert issues == []
+
+    # Neither copy exists -> registry-relative candidate plus tried paths
+    missing_sha = "ef" * 32
+    registry.write_text(
+        json.dumps({"active": {"checkpoint": f"checkpoints/{missing_sha}.pt"}}),
+        encoding="utf-8",
+    )
+    resolved, issues = checker._active_checkpoint(root)
+    assert resolved == registry.parent / "checkpoints" / f"{missing_sha}.pt"
+    assert len(issues) == 1
+    assert "tried:" in issues[0]
+    assert str(registry.parent / "checkpoints" / f"{missing_sha}.pt") in issues[0]
+    assert str(root / "checkpoints" / f"{missing_sha}.pt") in issues[0]

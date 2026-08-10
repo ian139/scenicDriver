@@ -141,7 +141,7 @@ function makeRegionHarness(search = "", payload = { regions: [] }) {
     DEFAULTS: {
       displayRange: "new_england_north",
       sourceRegion: "new_england_north",
-      workingRun: "new_england_north_z14_v6_learned",
+      workingRun: "prompt_two_candidate_exp02_fresh_test20_20260810",
       zoom: 6.2,
     },
     REGION_BOUNDS: [
@@ -156,7 +156,7 @@ function makeRegionHarness(search = "", payload = { regions: [] }) {
         new URLSearchParams(search).get("source") ||
         "new_england_north",
       workingRun: new URLSearchParams(search).get("run") ||
-        "new_england_north_z14_v6_learned",
+        "prompt_two_candidate_exp02_fresh_test20_20260810",
     },
     params: new URLSearchParams(search),
     el: { regionSelect, runSelect, regionStatus },
@@ -181,6 +181,8 @@ function makeRegionHarness(search = "", payload = { regions: [] }) {
 globalThis.resolveRegionSelection = resolveRegionSelection;
 globalThis.selectionUrl = selectionUrl;
 globalThis.validHeatmapMetadata = validHeatmapMetadata;
+globalThis.routePlanningIntentionallyDisabled = routePlanningIntentionallyDisabled;
+globalThis.routePlanningAvailable = routePlanningAvailable;
 globalThis.loadSupportedRegions = loadSupportedRegions;`,
     context
   );
@@ -246,7 +248,7 @@ const supportedRegions = {
     {
       region: "new_england_north",
       display_name: "New England North",
-      latest_run_name: "new_england_north_z14_v6_learned",
+      latest_run_name: "prompt_two_candidate_exp02_fresh_test20_20260810",
       graph_exists: true,
       is_default: true,
       bbox: {
@@ -281,7 +283,7 @@ test("default region metadata keeps canonical URL and selection unchanged", asyn
   assert.equal(harness.context.CONFIG.sourceRegion, "new_england_north");
   assert.equal(
     harness.context.CONFIG.workingRun,
-    "new_england_north_z14_v6_learned"
+    "prompt_two_candidate_exp02_fresh_test20_20260810"
   );
   assert.equal(harness.context.window.location.search, "");
   assert.deepEqual(harness.replacements, []);
@@ -308,6 +310,35 @@ test("URL-selected region resolves its run and persists source/run alignment", a
   assert.equal(
     harness.runSelect.children[0].value,
     "masswhites_z14_learned_h4_v2"
+  );
+});
+
+test("route capability distinguishes disabled routing from a missing graph", () => {
+  const harness = makeRegionHarness("", supportedRegions);
+  const intentionallyDisabled = {
+    route_planning_enabled: false,
+    graph_exists: false,
+  };
+  const missingConfiguredGraph = {
+    route_planning_enabled: true,
+    graph_exists: false,
+  };
+  assert.equal(
+    harness.context.routePlanningIntentionallyDisabled(intentionallyDisabled),
+    true
+  );
+  assert.equal(harness.context.routePlanningAvailable(intentionallyDisabled), false);
+  assert.equal(
+    harness.context.routePlanningIntentionallyDisabled(missingConfiguredGraph),
+    false
+  );
+  assert.equal(harness.context.routePlanningAvailable(missingConfiguredGraph), false);
+  assert.equal(
+    harness.context.routePlanningAvailable({
+      route_planning_enabled: true,
+      graph_exists: true,
+    }),
+    true
   );
 });
 

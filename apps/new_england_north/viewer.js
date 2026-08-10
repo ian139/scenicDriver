@@ -1,7 +1,7 @@
 const DEFAULTS = Object.freeze({
   displayRange: "new_england_north",
   sourceRegion: "new_england_north",
-  workingRun: "new_england_north_z14_v6_learned",
+  workingRun: "prompt_two_candidate_exp02_fresh_test20_20260810",
   apiBase: `${window.location.origin}/api`,
   zoom: 6.2,
   scenicWeight: 0.8,
@@ -262,6 +262,16 @@ async function loadSupportedRegions() {
     }
   }
   return selection;
+}
+
+
+function routePlanningIntentionallyDisabled(region = selectedRegionMetadata) {
+  return region?.route_planning_enabled === false;
+}
+
+
+function routePlanningAvailable(region = selectedRegionMetadata) {
+  return !routePlanningIntentionallyDisabled(region) && region?.graph_exists !== false;
 }
 
 function setText(node, text) {
@@ -784,8 +794,7 @@ function clearRoute() {
   removeSource(ROUTE_ENDPOINT_SOURCE);
   removeSource(ROUTE_SOURCE);
   if (el.submitRoute) {
-    el.submitRoute.disabled =
-      !mapReady || !CONFIG.workingRun || selectedRegionMetadata?.graph_exists === false;
+    el.submitRoute.disabled = !mapReady || !CONFIG.workingRun || !routePlanningAvailable();
     el.submitRoute.textContent = "Plan route";
   }
   setRouteOutput("Waiting for submit", "Enter start/end coordinates as <code>lat, lon</code>, then submit.");
@@ -1151,6 +1160,9 @@ async function fetchValidatedRoute() {
   const url = new URL(api("/v1/validated-route"));
   url.searchParams.set("region", CONFIG.sourceRegion);
   url.searchParams.set("run_name", CONFIG.workingRun);
+  if (routePlanningIntentionallyDisabled()) {
+    throw new Error(`Route planning is disabled for ${CONFIG.displayRange}`);
+  }
   if (selectedRegionMetadata?.graph_exists === false) {
     throw new Error(`Route graph is unavailable for ${CONFIG.displayRange}`);
   }
@@ -1615,13 +1627,36 @@ async function main() {
   } catch (error) {
     artifactErrors.push(error.message || String(error));
   }
-  try {
-    validatedRoute = await fetchValidatedRoute();
-  } catch (error) {
-    artifactErrors.push(`Validated route unavailable: ${error.message || error}`);
+  if (!routePlanningIntentionallyDisabled()) {
+    try {
+      validatedRoute = await fetchValidatedRoute();
+    } catch (error) {
+      artifactErrors.push(`Validated route unavailable: ${error.message || error}`);
+    }
   }
 
   const style = cartoVoyagerStyle();
+  if (heatmap) {
+    style.sources[HEATMAP_SOURCE] = {
+      type: "image",
+      url: heatmap.imageUrl,
+      coordinates: [
+        [heatmap.bounds.min_lon, heatmap.bounds.max_lat],
+        [heatmap.bounds.max_lon, heatmap.bounds.max_lat],
+        [heatmap.bounds.max_lon, heatmap.bounds.min_lat],
+        [heatmap.bounds.min_lon, heatmap.bounds.min_lat],
+      ],
+    };
+    style.layers.push({
+      id: HEATMAP_FILL,
+      type: "raster",
+      source: HEATMAP_SOURCE,
+      paint: {
+        "raster-opacity": 0.78,
+        "raster-resampling": "nearest",
+      },
+    });
+  }
 
   if (validatedRoute) {
     const validatedConnectors = buildRouteEndpointConnectors(
@@ -1663,35 +1698,10 @@ async function main() {
       renderRoute(pending.geojson, pending.request);
     }
     syncZoomElasticity();
-    el.submitRoute.disabled =
-      !CONFIG.workingRun || selectedRegionMetadata?.graph_exists === false;
+    el.submitRoute.disabled = !CONFIG.workingRun || !routePlanningAvailable();
   });
   map.on("resize", syncZoomElasticity);
   if (heatmap) {
-    map.once("load", () => {
-      map.addSource(HEATMAP_SOURCE, {
-        type: "image",
-        url: heatmap.imageUrl,
-        coordinates: [
-          [heatmap.bounds.min_lon, heatmap.bounds.max_lat],
-          [heatmap.bounds.max_lon, heatmap.bounds.max_lat],
-          [heatmap.bounds.max_lon, heatmap.bounds.min_lat],
-          [heatmap.bounds.min_lon, heatmap.bounds.min_lat],
-        ],
-      });
-      map.addLayer(
-        {
-          id: HEATMAP_FILL,
-          type: "raster",
-          source: HEATMAP_SOURCE,
-          paint: {
-            "raster-opacity": 0.78,
-            "raster-resampling": "nearest",
-          },
-        },
-        validatedRoute ? ROUTE_BASELINE : undefined
-      );
-    });
 
     const mapCanvas = map.getCanvas();
     mapCanvas.addEventListener("pointermove", (event) => {
@@ -1729,6 +1739,13 @@ async function main() {
   if (heatmap) {
     setText(el.inspectorScore, `${heatmap.summary.total_tiles.toLocaleString()} tiles`);
     setText(el.inspectorCoords, `Learned scores · z${heatmap.tileZoom}`);
+  }
+  if (heatmap && routePlanningIntentionallyDisabled()) {
+    const message =
+      selectedRegionMetadata.description ||
+      "Route planning is unavailable because this heatmap has no configured road graph.";
+    setText(el.regionStatus, `${CONFIG.displayRange} · heatmap only`);
+    setRouteOutput(`${CONFIG.displayRange} heatmap`, escapeHtml(message));
   }
   if (validatedRoute) {
     const title =

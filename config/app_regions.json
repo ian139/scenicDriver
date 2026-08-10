@@ -6,9 +6,9 @@
       "display_name": "New England North",
       "description": "Canonical learned coverage across the New England North full-bbox road network.",
       "graph": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3",
-      "run_name": "new_england_north_z14_v6_learned",
+      "run_name": "prompt_two_candidate_exp02_fresh_test20_20260810",
       "max_route_snap_km": 1.0,
-      "model_checkpoint": "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt",
+      "model_checkpoint": "data/processed/regression/checkpoints/0a165e429c8ac050524c7da409dd533d2de8849600c5dd8605aa1a1024d823e9.pt",
       "bbox": {
         "min_lat": 42.488301979602255,
         "min_lon": -73.5205078125,
@@ -85,24 +85,25 @@
       }
     },
     {
-      "region": "new_england_expanded",
-      "display_name": "New England Expanded (740k Baseline)",
-      "description": "Baseline candidate predictions across the full 370k tile pair (740k raster) expanded region.",
-      "run_name": "run_v1_expanded_20260805",
-      "graph": "data/processed/road_graphs/new_england_north_wide/road_graph.json",
-      "tile_scores_path": "data/processed/heuristic_runs/run_v1_expanded_20260805/report/report.json",
+      "region": "northeast_expanded",
+      "display_name": "Northeast Expanded (Prompt Two exp02)",
+      "description": "Expanded heatmap derived from 369,822 Prompt Two exp02 predictions across new_england_north (99,468) and west_south_inland (270,354). Route planning is disabled for this view because the configured road graph does not cover its western extent; select New England North for routes.",
+      "run_name": "prompt_two_candidate_exp02_expanded_20260810",
+      "graph": null,
+      "route_planning": false,
+      "tile_scores_path": "data/processed/heuristic_runs/prompt_two_candidate_exp02_expanded_20260810/report/report.json",
       "bbox": {
-        "min_lat": 41.0,
-        "min_lon": -73.5,
-        "max_lat": 47.5,
-        "max_lon": -66.8
+        "min_lat": 37.99616267972812,
+        "min_lon": -83.56201171875,
+        "max_lat": 47.50235895196859,
+        "max_lon": -66.77490234375
       },
       "map": {
         "center": {
-          "lat": 44.0,
-          "lon": -70.5
+          "lat": 42.749261,
+          "lon": -75.168457
         },
-        "zoom": 6.5
+        "zoom": 5.5
       }
     }
   ]

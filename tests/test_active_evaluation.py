@@ -15,6 +15,7 @@ from src.scenic_scorer.active_evaluation import (
     evaluate_stage_two,
     file_sha256,
     promote_from_decision,
+    promote_with_user_override,
     rollback_registry,
 )
 from src.scenic_scorer.regression import ScenicRegressionModel
@@ -131,6 +132,90 @@ def create_benchmark_csv(
     return path
 
 
+def create_override_file(
+    path: Path,
+    candidate_ckpt: Path,
+    decision_file: Path,
+    evaluation_file: Path,
+    *,
+    schema_version: int = 1,
+    action: str = "activate_rejected_candidate",
+    activation_approved: bool = True,
+    candidate: dict[str, typing.Any] | None = None,
+    evidence: dict[str, typing.Any] | None = None,
+    acknowledged_failed_gates: list[str] | None = None,
+    acknowledged_risks: list[str] | None = None,
+) -> Path:
+    """Write a schema_version 1 user-override JSON with real file hashes."""
+    if candidate is None:
+        candidate = {
+            "checkpoint": str(candidate_ckpt),
+            "sha256": _sha(candidate_ckpt),
+        }
+    if evidence is None:
+        evidence = {
+            "final_decision": {
+                "path": str(decision_file),
+                "sha256": _sha(decision_file),
+            },
+            "evaluation": {
+                "path": str(evaluation_file),
+                "sha256": _sha(evaluation_file),
+            },
+        }
+    payload = {
+        "schema_version": schema_version,
+        "action": action,
+        "activation_approved": activation_approved,
+        "candidate": candidate,
+        "evidence": evidence,
+        "acknowledged_failed_gates": (
+            acknowledged_failed_gates
+            if acknowledged_failed_gates is not None
+            else ["expanded_benchmark_improvement_pass"]
+        ),
+        "acknowledged_risks": (
+            acknowledged_risks
+            if acknowledged_risks is not None
+            else ["candidate fails the expanded benchmark improvement gate"]
+        ),
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _write_rejected_decision(path: Path, cand_ckpt: Path) -> Path:
+    """Write a realistic failed compound decision JSON for a candidate."""
+    path.write_text(
+        json.dumps(
+            {
+                "all_gates_pass": False,
+                "candidate": {
+                    "checkpoint": str(cand_ckpt),
+                    "sha256": _sha(cand_ckpt),
+                },
+                "baseline": {"checkpoint": "base.pt", "sha256": "0" * 64},
+                "fresh_human_test": {
+                    "candidate": {
+                        "samples": 20,
+                        "mse": 1.2,
+                        "mae": 0.8,
+                        "rmse": 1.0954451150103321,
+                        "pearson_corr": 0.4,
+                    }
+                },
+                "gates": {
+                    "integrity_pass": True,
+                    "expanded_benchmark_corr_pass": True,
+                    "expanded_benchmark_improvement_pass": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def create_route_qa_json(
     path: Path,
     all_invariants_pass: bool = True,
@@ -166,11 +251,15 @@ def create_route_qa_json(
 
     if routes is None:
         cand_rep = path.parent / f"{path.stem}_cand_report.json"
-        cand_rep.write_text(json.dumps({"role": "candidate", "status": "ok"}), encoding="utf-8")
+        cand_rep.write_text(
+            json.dumps({"role": "candidate", "status": "ok"}), encoding="utf-8"
+        )
         cand_rep_sha = file_sha256(cand_rep)
 
         base_rep = path.parent / f"{path.stem}_base_report.json"
-        base_rep.write_text(json.dumps({"role": "baseline", "status": "ok"}), encoding="utf-8")
+        base_rep.write_text(
+            json.dumps({"role": "baseline", "status": "ok"}), encoding="utf-8"
+        )
         base_rep_sha = file_sha256(base_rep)
 
         routes = [
@@ -927,6 +1016,51 @@ def test_rollback_to_exact_historical_checkpoint(tmp_path: Path) -> None:
         )
 
 
+def test_rollback_restores_prior_active_from_recorded_event(tmp_path: Path) -> None:
+    prior_ckpt = create_real_checkpoint(tmp_path / "prior.pt", bias_shift=0.0)
+    prior_sha = _sha(prior_ckpt)
+    promoted_ckpt = create_real_checkpoint(tmp_path / "promoted.pt", bias_shift=0.3)
+    prior_active = {
+        "checkpoint": str(prior_ckpt),
+        "run_name": "prior",
+    }
+    promoted_active = {
+        "checkpoint": str(promoted_ckpt),
+        "sha256": _sha(promoted_ckpt),
+        "run_name": "promoted",
+    }
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "active": promoted_active,
+                "history": [
+                    {
+                        "event": "promote_policy_override",
+                        "record": promoted_active,
+                        "prior_active": prior_active,
+                    }
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    result = rollback_registry(
+        registry_path=registry,
+        target_history_index=0,
+        expected_registry_sha256=_sha(registry),
+        expected_checkpoint_sha256=prior_sha,
+    )
+
+    expected_prior_active = {**prior_active, "sha256": prior_sha}
+    assert result["active"] == expected_prior_active
+    registry_data = json.loads(registry.read_text(encoding="utf-8"))
+    assert registry_data["active"] == expected_prior_active
+    assert registry_data["history"][-1]["prior_active"] == promoted_active
+
+
 def test_rejected_decision_preserves_registry_bytes(tmp_path: Path) -> None:
     registry = tmp_path / "registry.json"
     registry.write_text(
@@ -1334,7 +1468,9 @@ def test_promotion_content_addressing_isolates_from_candidate_mutation(
         expected_registry_sha256=reg_hash,
         run_name="run_1",
     )
-    published_active = Path(result["active"]["checkpoint"])
+    # Active record stores a portable registry-relative path, never host-absolute
+    assert result["active"]["checkpoint"] == f"checkpoints/{orig_cand_sha}.pt"
+    published_active = registry.parent / Path(result["active"]["checkpoint"])
     assert published_active.exists()
     assert published_active != cand_ckpt.resolve()
     assert _sha(published_active) == orig_cand_sha
@@ -1344,7 +1480,8 @@ def test_promotion_content_addressing_isolates_from_candidate_mutation(
 
     # Active checkpoint in registry and published file remain unchanged
     reg_data_after = json.loads(registry.read_text(encoding="utf-8"))
-    active_after_path = Path(reg_data_after["active"]["checkpoint"])
+    assert reg_data_after["active"]["checkpoint"] == f"checkpoints/{orig_cand_sha}.pt"
+    active_after_path = registry.parent / Path(reg_data_after["active"]["checkpoint"])
     assert active_after_path.exists()
     assert _sha(active_after_path) == orig_cand_sha
     assert active_after_path.read_bytes() != cand_ckpt.read_bytes()
@@ -1493,6 +1630,415 @@ def test_promote_from_decision_rejects_absent_or_malformed_metrics(
                 expected_registry_sha256=reg_hash,
                 run_name="run_1",
             )
+
+
+def test_promote_with_user_override_success_records_prior_active_and_hashes(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
+    evaluation_file = tmp_path / "evaluation.json"
+    evaluation_file.write_text(
+        json.dumps(
+            {
+                "candidate": {"checkpoint": str(cand_ckpt)},
+                "candidate_metrics": {"mse": 1.2},
+            }
+        ),
+        encoding="utf-8",
+    )
+    override_file = create_override_file(
+        tmp_path / "override.json", cand_ckpt, decision_file, evaluation_file
+    )
+    override_sha = _sha(override_file)
+
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "active": {"checkpoint": str(base_ckpt), "sha256": _sha(base_ckpt)},
+                "history": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    reg_hash = _sha(registry)
+
+    result = promote_with_user_override(
+        override_path=override_file,
+        candidate_checkpoint=cand_ckpt,
+        registry_path=registry,
+        expected_registry_sha256=reg_hash,
+        run_name="override_run",
+    )
+    assert result["status"] == "activated_by_user_override"
+    assert result["new_registry_sha256"] == _sha(registry)
+
+    updated = json.loads(registry.read_text(encoding="utf-8"))
+    active = updated["active"]
+    assert active["sha256"] == _sha(cand_ckpt)
+    assert active["run_name"] == "override_run"
+    assert active["metrics"] == {
+        "samples": 20,
+        "mse": 1.2,
+        "mae": 0.8,
+        "rmse": 1.0954451150103321,
+        "pearson_corr": 0.4,
+        "corr": 0.4,
+    }
+    # Registry stores a portable registry-relative path, never host-absolute
+    assert active["checkpoint"] == f"checkpoints/{_sha(cand_ckpt)}.pt"
+    published = registry.parent / Path(active["checkpoint"])
+    assert published.exists()
+    assert _sha(published) == _sha(cand_ckpt)
+    assert active["override_path"] == str(override_file.resolve())
+    assert active["override_sha256"] == override_sha
+    assert active["evidence"]["final_decision"]["sha256"] == _sha(decision_file)
+    assert active["evidence"]["evaluation"]["sha256"] == _sha(evaluation_file)
+    assert active["acknowledged_failed_gates"] == [
+        "expanded_benchmark_improvement_pass"
+    ]
+
+    assert len(updated["history"]) == 1
+    event = updated["history"][0]
+    assert event["event"] == "promote_user_override"
+    assert event["override"]["path"] == str(override_file.resolve())
+    assert event["override"]["sha256"] == override_sha
+    assert event["prior_active"]["checkpoint"] == str(base_ckpt)
+    assert event["prior_active"]["sha256"] == _sha(base_ckpt)
+    assert event["evidence"]["final_decision"]["sha256"] == _sha(decision_file)
+    assert event["evidence"]["evaluation"]["sha256"] == _sha(evaluation_file)
+
+
+def test_promote_with_user_override_false_approval_leaves_registry_unchanged(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
+    evaluation_file = tmp_path / "evaluation.json"
+    evaluation_file.write_text(
+        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    )
+    override_file = create_override_file(
+        tmp_path / "override.json",
+        cand_ckpt,
+        decision_file,
+        evaluation_file,
+        activation_approved=False,
+    )
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "active": {"checkpoint": str(base_ckpt), "sha256": _sha(base_ckpt)},
+                "history": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = registry.read_bytes()
+    with pytest.raises(ValueError, match="activation_approved"):
+        promote_with_user_override(
+            override_path=override_file,
+            candidate_checkpoint=cand_ckpt,
+            registry_path=registry,
+            expected_registry_sha256=_sha(registry),
+            run_name="run",
+        )
+    assert registry.read_bytes() == before
+
+
+def test_promote_with_user_override_missing_metrics_leaves_registry_unchanged(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
+    decision_data = json.loads(decision_file.read_text(encoding="utf-8"))
+    del decision_data["fresh_human_test"]
+    decision_file.write_text(json.dumps(decision_data), encoding="utf-8")
+    evaluation_file = tmp_path / "evaluation.json"
+    evaluation_file.write_text(
+        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    )
+    override_file = create_override_file(
+        tmp_path / "override.json", cand_ckpt, decision_file, evaluation_file
+    )
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "active": {"checkpoint": str(base_ckpt), "sha256": _sha(base_ckpt)},
+                "history": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = registry.read_bytes()
+
+    with pytest.raises(ValueError, match="fresh_human_test candidate metrics"):
+        promote_with_user_override(
+            override_path=override_file,
+            candidate_checkpoint=cand_ckpt,
+            registry_path=registry,
+            expected_registry_sha256=_sha(registry),
+            run_name="run",
+        )
+
+    assert registry.read_bytes() == before
+
+
+def test_promote_with_user_override_evidence_hash_mismatch_leaves_registry_unchanged(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
+    evaluation_file = tmp_path / "evaluation.json"
+    evaluation_file.write_text(
+        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    )
+    override_file = create_override_file(
+        tmp_path / "override.json",
+        cand_ckpt,
+        decision_file,
+        evaluation_file,
+        evidence={
+            "final_decision": {"path": str(decision_file), "sha256": "0" * 64},
+            "evaluation": {
+                "path": str(evaluation_file),
+                "sha256": _sha(evaluation_file),
+            },
+        },
+    )
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "active": {"checkpoint": str(base_ckpt), "sha256": _sha(base_ckpt)},
+                "history": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = registry.read_bytes()
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        promote_with_user_override(
+            override_path=override_file,
+            candidate_checkpoint=cand_ckpt,
+            registry_path=registry,
+            expected_registry_sha256=_sha(registry),
+            run_name="run",
+        )
+    assert registry.read_bytes() == before
+
+
+def test_promote_with_user_override_candidate_mismatch_leaves_registry_unchanged(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
+    other_ckpt = create_real_checkpoint(tmp_path / "other.pt", bias_shift=0.2)
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
+    evaluation_file = tmp_path / "evaluation.json"
+    evaluation_file.write_text(
+        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    )
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "active": {"checkpoint": str(base_ckpt), "sha256": _sha(base_ckpt)},
+                "history": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = registry.read_bytes()
+
+    # CLI checkpoint path differs from the override declaration
+    override_path_mismatch = create_override_file(
+        tmp_path / "override_path.json", cand_ckpt, decision_file, evaluation_file
+    )
+    with pytest.raises(ValueError, match="candidate checkpoint path"):
+        promote_with_user_override(
+            override_path=override_path_mismatch,
+            candidate_checkpoint=other_ckpt,
+            registry_path=registry,
+            expected_registry_sha256=_sha(registry),
+            run_name="run",
+        )
+    assert registry.read_bytes() == before
+
+    # Declared candidate SHA256 does not match the file at the declared path
+    override_sha_mismatch = create_override_file(
+        tmp_path / "override_sha.json",
+        cand_ckpt,
+        decision_file,
+        evaluation_file,
+        candidate={"checkpoint": str(cand_ckpt), "sha256": "0" * 64},
+    )
+    with pytest.raises(ValueError, match="candidate SHA256 mismatch"):
+        promote_with_user_override(
+            override_path=override_sha_mismatch,
+            candidate_checkpoint=cand_ckpt,
+            registry_path=registry,
+            expected_registry_sha256=_sha(registry),
+            run_name="run",
+        )
+    assert registry.read_bytes() == before
+
+
+def test_promote_with_user_override_registry_mismatch_leaves_registry_unchanged(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
+    evaluation_file = tmp_path / "evaluation.json"
+    evaluation_file.write_text(
+        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    )
+    override_file = create_override_file(
+        tmp_path / "override.json", cand_ckpt, decision_file, evaluation_file
+    )
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "active": {"checkpoint": str(base_ckpt), "sha256": _sha(base_ckpt)},
+                "history": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = registry.read_bytes()
+    with pytest.raises(ValueError, match="Registry SHA256 mismatch"):
+        promote_with_user_override(
+            override_path=override_file,
+            candidate_checkpoint=cand_ckpt,
+            registry_path=registry,
+            expected_registry_sha256="0" * 64,
+            run_name="run",
+        )
+    assert registry.read_bytes() == before
+
+
+def test_promote_with_user_override_rejects_malformed_schema_and_acknowledgements(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
+    evaluation_file = tmp_path / "evaluation.json"
+    evaluation_file.write_text(
+        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    )
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "active": {"checkpoint": str(base_ckpt), "sha256": _sha(base_ckpt)},
+                "history": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = registry.read_bytes()
+    cases = [
+        {"schema_version": 2},
+        {"schema_version": "1"},
+        {"action": "activate_candidate"},
+        {"activation_approved": "true"},
+        {"acknowledged_failed_gates": []},
+        {"acknowledged_risks": []},
+    ]
+    for i, overrides in enumerate(cases):
+        override_file = create_override_file(
+            tmp_path / f"override_{i}.json",
+            cand_ckpt,
+            decision_file,
+            evaluation_file,
+            **overrides,
+        )
+        with pytest.raises(ValueError):
+            promote_with_user_override(
+                override_path=override_file,
+                candidate_checkpoint=cand_ckpt,
+                registry_path=registry,
+                expected_registry_sha256=_sha(registry),
+                run_name="run",
+            )
+        assert registry.read_bytes() == before
+
+
+def test_promote_with_user_override_stores_portable_path_and_rollback_resolves_it(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
+    evaluation_file = tmp_path / "evaluation.json"
+    evaluation_file.write_text(
+        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    )
+    override_file = create_override_file(
+        tmp_path / "override.json", cand_ckpt, decision_file, evaluation_file
+    )
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "active": {"checkpoint": str(base_ckpt), "sha256": _sha(base_ckpt)},
+                "history": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = promote_with_user_override(
+        override_path=override_file,
+        candidate_checkpoint=cand_ckpt,
+        registry_path=registry,
+        expected_registry_sha256=_sha(registry),
+        run_name="override_run",
+    )
+    # Portable registry-relative value, not a host-absolute path
+    portable = result["active"]["checkpoint"]
+    assert portable == f"checkpoints/{_sha(cand_ckpt)}.pt"
+    assert not Path(portable).is_absolute()
+    resolved = registry.parent / Path(portable)
+    assert resolved.is_file()
+    assert _sha(resolved) == _sha(cand_ckpt)
+    assert (
+        json.loads(registry.read_text(encoding="utf-8"))["active"]["checkpoint"]
+        == portable
+    )
+
+    # Rollback restores the prior active (absolute base path still resolves)
+    rollback_result = rollback_registry(
+        registry,
+        target_history_index=0,
+        expected_registry_sha256=result["new_registry_sha256"],
+    )
+    assert rollback_result["active"]["checkpoint"] == str(base_ckpt)
+    reg_after_first = json.loads(registry.read_text(encoding="utf-8"))
+
+    # The rollback event recorded the override active (portable path) as its
+    # prior_active; rolling back again must resolve it against the registry.
+    assert reg_after_first["history"][1]["prior_active"]["checkpoint"] == portable
+    rollback_result2 = rollback_registry(
+        registry,
+        target_history_index=1,
+        expected_registry_sha256=_sha(registry),
+    )
+    assert rollback_result2["active"]["checkpoint"] == portable
+    assert rollback_result2["active"]["sha256"] == _sha(cand_ckpt)
+    restored = registry.parent / Path(rollback_result2["active"]["checkpoint"])
+    assert restored.is_file()
+    assert _sha(restored) == _sha(cand_ckpt)
 
 
 def test_evaluate_active_baseline_success(tmp_path: Path) -> None:
@@ -1816,13 +2362,28 @@ def test_evaluate_candidate_validation_filters_only_split_val_rows(
         )
         writer.writeheader()
         writer.writerow(
-            {"image_path": "val1.jpg", "split": "val", "scenic_human_mean": "6.0", "region": "r1"}
+            {
+                "image_path": "val1.jpg",
+                "split": "val",
+                "scenic_human_mean": "6.0",
+                "region": "r1",
+            }
         )
         writer.writerow(
-            {"image_path": "val2.jpg", "split": "val", "scenic_human_mean": "8.0", "region": "r1"}
+            {
+                "image_path": "val2.jpg",
+                "split": "val",
+                "scenic_human_mean": "8.0",
+                "region": "r1",
+            }
         )
         writer.writerow(
-            {"image_path": "test1.jpg", "split": "test", "scenic_human_mean": "1.0", "region": "r2"}
+            {
+                "image_path": "test1.jpg",
+                "split": "test",
+                "scenic_human_mean": "1.0",
+                "region": "r2",
+            }
         )
 
     out_json = tmp_path / "val_result.json"
@@ -1869,7 +2430,9 @@ def test_evaluate_candidate_validation_rejects_missing_val_or_no_val_rows(
     # 2. No split=val rows
     csv_no_val = tmp_path / "no_val.csv"
     with open(csv_no_val, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["image_path", "split", "scenic_human_mean"])
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean"]
+        )
         writer.writeheader()
         writer.writerow(
             {"image_path": "img1.jpg", "split": "test", "scenic_human_mean": "5.0"}
@@ -1898,7 +2461,9 @@ def test_evaluate_candidate_validation_rejects_mislabeled_or_non_val_npz_identit
 
     exp_csv = tmp_path / "mislabeled.csv"
     with open(exp_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["image_path", "split", "scenic_human_mean"])
+        writer = csv.DictWriter(
+            f, fieldnames=["image_path", "split", "scenic_human_mean"]
+        )
         writer.writeheader()
         writer.writerow(
             {"image_path": "img1.jpg", "split": "val", "scenic_human_mean": "5.0"}
@@ -1930,9 +2495,13 @@ def test_evaluate_candidate_validation_rejects_weak_targets_and_nonfinite(
     with open(weak_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["image_path", "split", "scenic_score"])
         writer.writeheader()
-        writer.writerow({"image_path": "val1.jpg", "split": "val", "scenic_score": "5.0"})
+        writer.writerow(
+            {"image_path": "val1.jpg", "split": "val", "scenic_score": "5.0"}
+        )
 
-    with pytest.raises(ValueError, match="val target must be scenic_human_mean or scenic_human"):
+    with pytest.raises(
+        ValueError, match="val target must be scenic_human_mean or scenic_human"
+    ):
         evaluate_candidate_validation(
             dataset_path=npz_path,
             candidate_checkpoint=cand_ckpt,
@@ -1952,7 +2521,9 @@ def test_evaluate_candidate_validation_rejects_weak_targets_and_nonfinite(
             {"image_path": "val1.jpg", "split": "val", "scenic_human_mean": "15.0"}
         )
 
-    with pytest.raises(ValueError, match="human targets must be finite and in \\[0, 10\\]"):
+    with pytest.raises(
+        ValueError, match="human targets must be finite and in \\[0, 10\\]"
+    ):
         evaluate_candidate_validation(
             dataset_path=npz_path,
             candidate_checkpoint=cand_ckpt,
@@ -1976,7 +2547,8 @@ def test_evaluate_candidate_validation_exact_denominator_and_metrics(
     exp_csv = tmp_path / "valid.csv"
     with open(exp_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["image_path", "split", "scenic_human_mean", "region", "slice"]
+            f,
+            fieldnames=["image_path", "split", "scenic_human_mean", "region", "slice"],
         )
         writer.writeheader()
         writer.writerow(
@@ -2030,8 +2602,18 @@ def test_route_evidence_pass_bound_two_role_fixture(tmp_path: Path) -> None:
     exp_csv = create_benchmark_csv(
         tmp_path / "exp.csv",
         [
-            {"image_path": "img1.jpg", "split": "test", "scenic_human": 5.0, "region": "r1"},
-            {"image_path": "img2.jpg", "split": "test", "scenic_human": 6.0, "region": "r1"},
+            {
+                "image_path": "img1.jpg",
+                "split": "test",
+                "scenic_human": 5.0,
+                "region": "r1",
+            },
+            {
+                "image_path": "img2.jpg",
+                "split": "test",
+                "scenic_human": 6.0,
+                "region": "r1",
+            },
         ],
     )
     ctrl_csv = create_benchmark_csv(
@@ -2075,8 +2657,18 @@ def test_route_evidence_fails_baseline_only(tmp_path: Path) -> None:
     exp_csv = create_benchmark_csv(
         tmp_path / "exp.csv",
         [
-            {"image_path": "img1.jpg", "split": "test", "scenic_human": 5.0, "region": "r1"},
-            {"image_path": "img2.jpg", "split": "test", "scenic_human": 6.0, "region": "r1"},
+            {
+                "image_path": "img1.jpg",
+                "split": "test",
+                "scenic_human": 5.0,
+                "region": "r1",
+            },
+            {
+                "image_path": "img2.jpg",
+                "split": "test",
+                "scenic_human": 6.0,
+                "region": "r1",
+            },
         ],
     )
     ctrl_csv = create_benchmark_csv(
@@ -2142,8 +2734,18 @@ def test_route_evidence_fails_mismatched_checkpoint(tmp_path: Path) -> None:
     exp_csv = create_benchmark_csv(
         tmp_path / "exp.csv",
         [
-            {"image_path": "img1.jpg", "split": "test", "scenic_human": 5.0, "region": "r1"},
-            {"image_path": "img2.jpg", "split": "test", "scenic_human": 6.0, "region": "r1"},
+            {
+                "image_path": "img1.jpg",
+                "split": "test",
+                "scenic_human": 5.0,
+                "region": "r1",
+            },
+            {
+                "image_path": "img2.jpg",
+                "split": "test",
+                "scenic_human": 6.0,
+                "region": "r1",
+            },
         ],
     )
     ctrl_csv = create_benchmark_csv(
@@ -2188,8 +2790,18 @@ def test_route_evidence_fails_missing_report(tmp_path: Path) -> None:
     exp_csv = create_benchmark_csv(
         tmp_path / "exp.csv",
         [
-            {"image_path": "img1.jpg", "split": "test", "scenic_human": 5.0, "region": "r1"},
-            {"image_path": "img2.jpg", "split": "test", "scenic_human": 6.0, "region": "r1"},
+            {
+                "image_path": "img1.jpg",
+                "split": "test",
+                "scenic_human": 5.0,
+                "region": "r1",
+            },
+            {
+                "image_path": "img2.jpg",
+                "split": "test",
+                "scenic_human": 6.0,
+                "region": "r1",
+            },
         ],
     )
     ctrl_csv = create_benchmark_csv(
@@ -2259,8 +2871,18 @@ def test_route_evidence_fails_report_hash_mismatch(tmp_path: Path) -> None:
     exp_csv = create_benchmark_csv(
         tmp_path / "exp.csv",
         [
-            {"image_path": "img1.jpg", "split": "test", "scenic_human": 5.0, "region": "r1"},
-            {"image_path": "img2.jpg", "split": "test", "scenic_human": 6.0, "region": "r1"},
+            {
+                "image_path": "img1.jpg",
+                "split": "test",
+                "scenic_human": 5.0,
+                "region": "r1",
+            },
+            {
+                "image_path": "img2.jpg",
+                "split": "test",
+                "scenic_human": 6.0,
+                "region": "r1",
+            },
         ],
     )
     ctrl_csv = create_benchmark_csv(

@@ -5,6 +5,7 @@ one preloaded graph/report and records every point in the q/kappa matrix.  It
 never silently drops a case: a timeout or a no-route response is a row with an
 exact reason.  Large output belongs under ignored ``data/processed``.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -59,7 +60,7 @@ DEFAULT_GRAPH = Path(
     "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3"
 )
 DEFAULT_REPORT = Path(
-    "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json"
+    "data/processed/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report/report.json"
 )
 
 _BENCHMARK_IMPLEMENTATION_PATHS = {
@@ -103,6 +104,7 @@ class CaseTimeout(TimeoutError):
 _SUPERVISOR_GRACE_SECONDS = 2.0
 _HAS_POSIX_FORK = hasattr(os, "fork")
 
+
 def _process_peak_rss_bytes() -> int:
     """Return this process's peak resident set in platform-independent bytes."""
     peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
@@ -135,6 +137,7 @@ def _case_deadline(seconds: float) -> Iterator[RoutingDeadline]:
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         signal.signal(signal.SIGALRM, old_handler)
+
 
 def _reap_child(pid: int) -> None:
     try:
@@ -170,7 +173,9 @@ class _PersistentPlanningChild:
 
     def __init__(
         self,
-        context: tuple[dict[str, Any], ScenicRoutePlanner, dict[str, Any], dict[str, Any]],
+        context: tuple[
+            dict[str, Any], ScenicRoutePlanner, dict[str, Any], dict[str, Any]
+        ],
         route_error_cache: dict[tuple[str, bool], tuple[str, str]],
         grace_seconds: float = _SUPERVISOR_GRACE_SECONDS,
     ):
@@ -225,9 +230,7 @@ class _PersistentPlanningChild:
                     },
                 )
 
-    def _write_all(
-        self, fd: int, data: bytes, timeout: float | None
-    ) -> None:
+    def _write_all(self, fd: int, data: bytes, timeout: float | None) -> None:
         deadline = monotonic() + timeout if timeout is not None else None
         while data:
             if deadline is not None:
@@ -260,9 +263,7 @@ class _PersistentPlanningChild:
             raise RuntimeError("incomplete payload from planning child")
         return pickle.loads(payload)
 
-    def _read_exact(
-        self, fd: int, n: int, timeout: float | None
-    ) -> bytes | None:
+    def _read_exact(self, fd: int, n: int, timeout: float | None) -> bytes | None:
         deadline = monotonic() + timeout if timeout is not None else None
         seen = 0
         chunks: list[bytes] = []
@@ -357,6 +358,7 @@ class _PersistentPlanningChild:
         self._kill_and_reap()
         self._close_fds()
 
+
 def _as_float(value: Any, default: float | None = None) -> float | None:
     try:
         result = float(value)
@@ -382,9 +384,8 @@ def _path_identity(path: Path) -> dict[str, Any]:
             digest.update(chunk)
             size_bytes += len(chunk)
     after = path.stat()
-    if (
-        int(before.st_size) != int(after.st_size)
-        or int(before.st_mtime_ns) != int(after.st_mtime_ns)
+    if int(before.st_size) != int(after.st_size) or int(before.st_mtime_ns) != int(
+        after.st_mtime_ns
     ):
         raise RuntimeError(f"artifact changed while fingerprinting: {path}")
     return {
@@ -430,7 +431,10 @@ def _haversine_km(first: tuple[float, float], second: tuple[float, float]) -> fl
     lat1, lon1, lat2, lon2 = map(math.radians, (*first, *second))
     dlat = lat2 - lat1
     dlon = lon2 - lon1
-    h = math.sin(dlat / 2.0) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
+    h = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
+    )
     return 6371.0 * 2.0 * math.asin(min(1.0, math.sqrt(h)))
 
 
@@ -577,9 +581,7 @@ def _edge_partial_metrics_consistent(
     if not _close_enough(row_distance, edge_distance * fraction):
         return False
     row_duration = _as_float(row.get("duration_minutes"))
-    edge_duration = _as_float(
-        getattr(edge, "travel_time_minutes", None)
-    )
+    edge_duration = _as_float(getattr(edge, "travel_time_minutes", None))
     return (
         row_duration is not None
         and row_duration >= 0.0
@@ -600,16 +602,12 @@ def _segment_parameter(
     delta_lon = (end[1] - start[1]) * lon_scale
     denominator = delta_lat * delta_lat + delta_lon * delta_lon
     if denominator <= 1e-24:
-        if _close_enough(point[0], start[0]) and _close_enough(
-            point[1], start[1]
-        ):
+        if _close_enough(point[0], start[0]) and _close_enough(point[1], start[1]):
             return 0.0
         return None
     point_lat = point[0] - start[0]
     point_lon = (point[1] - start[1]) * lon_scale
-    fraction = (
-        point_lat * delta_lat + point_lon * delta_lon
-    ) / denominator
+    fraction = (point_lat * delta_lat + point_lon * delta_lon) / denominator
     if fraction < -1e-8 or fraction > 1.0 + 1e-8:
         return None
     fraction = min(1.0, max(0.0, fraction))
@@ -646,9 +644,7 @@ def _partial_edge_geometry_consistent(
             and _close_enough(row_end[0], canonical_start[0])
             and _close_enough(row_end[1], canonical_start[1])
         )
-    start_fraction = _segment_parameter(
-        row_start, canonical_start, canonical_end
-    )
+    start_fraction = _segment_parameter(row_start, canonical_start, canonical_end)
     end_fraction = _segment_parameter(row_end, canonical_start, canonical_end)
     if start_fraction is None or end_fraction is None:
         return False
@@ -665,7 +661,6 @@ def _partial_edge_geometry_consistent(
     if direction == "reverse":
         return end_fraction <= start_fraction + 1e-8
     return start_fraction <= end_fraction + 1e-8
-
 
 
 def _topology_point_key(
@@ -701,17 +696,13 @@ def _edge_topology_pair(
     end_node = node_index.get(str(edge.end_node_id))
     row_start = _metadata_coordinate(row.get("start"))
     row_end = _metadata_coordinate(row.get("end"))
-    if (
-        start_node is None
-        or end_node is None
-        or row_start is None
-        or row_end is None
-    ):
+    if start_node is None or end_node is None or row_start is None or row_end is None:
         return None
     return (
         _topology_point_key(row_start, start_node, end_node),
         _topology_point_key(row_end, start_node, end_node),
     )
+
 
 def _edge_segment_consistent(
     edge_id: str,
@@ -734,9 +725,7 @@ def _edge_segment_consistent(
     ):
         return False
     row_duration = _as_float(row.get("duration_minutes"))
-    edge_duration_value = _as_float(
-        getattr(edge, "travel_time_minutes", None)
-    )
+    edge_duration_value = _as_float(getattr(edge, "travel_time_minutes", None))
     if row_duration is None:
         if partial or node_index is not None:
             return False
@@ -745,9 +734,10 @@ def _edge_segment_consistent(
         pass
     elif not _close_enough(row_duration, edge_duration_value):
         return False
-    if str(row.get("road_type", "")).lower() != str(
-        getattr(edge, "road_type", "")
-    ).lower():
+    if (
+        str(row.get("road_type", "")).lower()
+        != str(getattr(edge, "road_type", "")).lower()
+    ):
         return False
     direction = str(row.get("direction", "forward")).lower()
     if direction not in {"forward", "reverse"}:
@@ -800,12 +790,10 @@ def recompute_feature_metrics(
     properties = feature.get("properties", {})
     rows = _segment_rows(feature)
     traversal_ids = [
-        str(row.get("traversal_id", row.get("edge_id", "")))
-        for row in rows
+        str(row.get("traversal_id", row.get("edge_id", ""))) for row in rows
     ]
     canonical_ids = [
-        str(row.get("canonical_edge_id", row.get("edge_id", "")))
-        for row in rows
+        str(row.get("canonical_edge_id", row.get("edge_id", ""))) for row in rows
     ]
     edge_ids = traversal_ids
     declared_edge_ids = properties.get("edge_ids")
@@ -821,12 +809,10 @@ def recompute_feature_metrics(
         else None
     )
     top_level_edge_ids_match = (
-        declared_edge_ids == canonical_ids
-        and declared_traversal_ids == traversal_ids
+        declared_edge_ids == canonical_ids and declared_traversal_ids == traversal_ids
     )
     segment_distance = sum(
-        max(0.0, _as_float(row.get("distance_km"), 0.0) or 0.0)
-        for row in rows
+        max(0.0, _as_float(row.get("distance_km"), 0.0) or 0.0) for row in rows
     )
     segment_scenic_distance = sum(
         max(0.0, _as_float(row.get("distance_km"), 0.0) or 0.0)
@@ -834,9 +820,7 @@ def recompute_feature_metrics(
         for row in rows
     )
     segment_raw_score = (
-        segment_scenic_distance / segment_distance
-        if segment_distance > 0.0
-        else 0.0
+        segment_scenic_distance / segment_distance if segment_distance > 0.0 else 0.0
     )
     segment_normalized_score = _normalise_score(segment_raw_score)
     geometry_value = feature.get("geometry", {})
@@ -850,9 +834,7 @@ def recompute_feature_metrics(
         if isinstance(geometry_coordinates, list)
         else []
     )
-    actual_snapped_start = (
-        _metadata_coordinate(properties.get("snapped_start"))
-    )
+    actual_snapped_start = _metadata_coordinate(properties.get("snapped_start"))
     actual_snapped_end = _metadata_coordinate(properties.get("snapped_end"))
     snapped_endpoints_ok = (
         len(geometry_points) >= 2
@@ -862,14 +844,11 @@ def recompute_feature_metrics(
     )
     expected_requested_start = _metadata_coordinate(requested_start)
     expected_requested_end = _metadata_coordinate(requested_end)
-    actual_requested_start = _metadata_coordinate(
-        properties.get("requested_start")
-    )
+    actual_requested_start = _metadata_coordinate(properties.get("requested_start"))
     actual_requested_end = _metadata_coordinate(properties.get("requested_end"))
     if requested_start is None and requested_end is None:
         requested_endpoints_ok = (
-            actual_requested_start is not None
-            and actual_requested_end is not None
+            actual_requested_start is not None and actual_requested_end is not None
         )
     else:
         requested_endpoints_ok = (
@@ -882,25 +861,13 @@ def recompute_feature_metrics(
         not rows
         and len(geometry_points) == 2
         and all(point is not None for point in geometry_points)
-        and _close_enough(
-            geometry_points[0][0], geometry_points[1][0]
-        )
-        and _close_enough(
-            geometry_points[0][1], geometry_points[1][1]
-        )
+        and _close_enough(geometry_points[0][0], geometry_points[1][0])
+        and _close_enough(geometry_points[0][1], geometry_points[1][1])
     )
     zero_edge_route = zero_edge_geometry_ok
-    segment_durations = [
-        _as_float(row.get("duration_minutes")) for row in rows
-    ]
-    segment_duration_available = (
-        zero_edge_route
-        or (
-            bool(rows)
-            and all(
-                duration is not None for duration in segment_durations
-            )
-        )
+    segment_durations = [_as_float(row.get("duration_minutes")) for row in rows]
+    segment_duration_available = zero_edge_route or (
+        bool(rows) and all(duration is not None for duration in segment_durations)
     )
     segment_duration = (
         0.0
@@ -912,14 +879,9 @@ def recompute_feature_metrics(
         )
     )
     segment_highway_count = sum(
-        1
-        for row in rows
-        if str(row.get("road_type", "")).lower() in HIGHWAY_TYPES
+        1 for row in rows if str(row.get("road_type", "")).lower() in HIGHWAY_TYPES
     )
-    canonical_edges = [
-        _edge_from_identity(row, edge_index)
-        for row in rows
-    ]
+    canonical_edges = [_edge_from_identity(row, edge_index) for row in rows]
     edge_metrics_available = bool(edge_ids) and all(
         edge is not None for edge in canonical_edges
     )
@@ -960,13 +922,8 @@ def recompute_feature_metrics(
         for index, (row, canonical_id) in enumerate(zip(rows, canonical_ids))
     )
     segment_geometry = (
-        [
-            [float(rows[0]["start"][1]), float(rows[0]["start"][0])]
-        ]
-        + [
-            [float(row["end"][1]), float(row["end"][0])]
-            for row in rows
-        ]
+        [[float(rows[0]["start"][1]), float(rows[0]["start"][0])]]
+        + [[float(row["end"][1]), float(row["end"][0])] for row in rows]
         if rows
         and all(
             isinstance(row.get("start"), (list, tuple))
@@ -978,14 +935,8 @@ def recompute_feature_metrics(
         else []
     )
     segment_start_continuity_ok = all(
-        (
-            (previous_end := _metadata_coordinate(previous.get("end")))
-            is not None
-        )
-        and (
-            (current_start := _metadata_coordinate(current.get("start")))
-            is not None
-        )
+        ((previous_end := _metadata_coordinate(previous.get("end"))) is not None)
+        and ((current_start := _metadata_coordinate(current.get("start"))) is not None)
         and _close_enough(previous_end[0], current_start[0])
         and _close_enough(previous_end[1], current_start[1])
         for previous, current in zip(rows, rows[1:])
@@ -994,10 +945,7 @@ def recompute_feature_metrics(
         geometry_sequence_coordinates = (
             _dedupe_geometry_coordinates(geometry_coordinates)
             if isinstance(geometry_coordinates, list)
-            and all(
-                isinstance(coordinate, list)
-                for coordinate in geometry_coordinates
-            )
+            and all(isinstance(coordinate, list) for coordinate in geometry_coordinates)
             else geometry_coordinates
         )
         expected_geometry = _dedupe_geometry_coordinates(segment_geometry)
@@ -1009,26 +957,16 @@ def recompute_feature_metrics(
         geometry_sequence_ok = zero_edge_geometry_ok
     edge_segment_consistency = (
         all(
-            _edge_segment_consistent(
-                edge_id, row, edge, node_index
-            )
-            for edge_id, row, edge in zip(
-                edge_ids, rows, canonical_edges
-            )
+            _edge_segment_consistent(edge_id, row, edge, node_index)
+            for edge_id, row, edge in zip(edge_ids, rows, canonical_edges)
         )
         if edge_metrics_available
         else False
     )
-    partial_rows = (
-        edge_metrics_available
-        and any(
-            _edge_row_is_partial(row, edge)
-            for row, edge in zip(rows, canonical_edges)
-        )
+    partial_rows = edge_metrics_available and any(
+        _edge_row_is_partial(row, edge) for row, edge in zip(rows, canonical_edges)
     )
-    emitted_partial_metrics_trusted = (
-        bool(partial_rows) and edge_segment_consistency
-    )
+    emitted_partial_metrics_trusted = bool(partial_rows) and edge_segment_consistency
     edge_distance = (
         segment_distance
         if emitted_partial_metrics_trusted
@@ -1055,11 +993,7 @@ def recompute_feature_metrics(
         if edge_scenic_distance is not None
         and edge_distance is not None
         and edge_distance > 0.0
-        else (
-            0.0
-            if edge_scenic_distance == 0.0 and edge_distance == 0.0
-            else None
-        )
+        else (0.0 if edge_scenic_distance == 0.0 and edge_distance == 0.0 else None)
     )
     edge_duration = (
         segment_duration
@@ -1104,18 +1038,14 @@ def recompute_feature_metrics(
     declared_distance = _as_float(properties.get("total_distance_km"))
     declared_raw_score = _as_float(properties.get("raw_scenic_score"))
     declared_average_score = _as_float(properties.get("average_scenic_score"))
-    declared_normalized_score = _as_float(
-        properties.get("normalized_scenic_score")
-    )
+    declared_normalized_score = _as_float(properties.get("normalized_scenic_score"))
     declared_duration = _as_float(properties.get("estimated_duration_minutes"))
     declared_highway_count = int(properties.get("highway_count", 0) or 0)
     segment_consistency = {
         "top_level_edge_ids": top_level_edge_ids_match,
         "distance": _close_enough(segment_distance, declared_distance),
         "segments": True,
-        "raw_scenic_score": _close_enough(
-            segment_raw_score, declared_raw_score
-        ),
+        "raw_scenic_score": _close_enough(segment_raw_score, declared_raw_score),
         "average_scenic_score": _close_enough(
             segment_raw_score, declared_average_score
         ),
@@ -1143,13 +1073,9 @@ def recompute_feature_metrics(
             and _close_enough(edge_distance, segment_distance),
             "raw_scenic_score": segment_consistency["raw_scenic_score"]
             and _close_enough(edge_raw_score, segment_raw_score),
-            "average_scenic_score": segment_consistency[
-                "average_scenic_score"
-            ]
+            "average_scenic_score": segment_consistency["average_scenic_score"]
             and _close_enough(edge_raw_score, segment_raw_score),
-            "normalized_scenic_score": segment_consistency[
-                "normalized_scenic_score"
-            ]
+            "normalized_scenic_score": segment_consistency["normalized_scenic_score"]
             and _close_enough(
                 _normalise_score(edge_raw_score or 0.0),
                 segment_normalized_score,
@@ -1159,19 +1085,21 @@ def recompute_feature_metrics(
             "highway_count": segment_consistency["highway_count"]
             and edge_highway_count == segment_highway_count,
         }
-        if node_index is None and rows and not any(
-            "duration_minutes" in row
-            or "direction" in row
-            or "canonical_edge_id" in row
-            or "traversal_id" in row
-            for row in rows
+        if (
+            node_index is None
+            and rows
+            and not any(
+                "duration_minutes" in row
+                or "direction" in row
+                or "canonical_edge_id" in row
+                or "traversal_id" in row
+                for row in rows
+            )
         ):
             edge_consistency = {
                 "distance": bool(edge_consistency["distance"]),
                 "scenic_score": bool(edge_consistency["raw_scenic_score"]),
-                "duration": _close_enough(
-                    edge_duration, declared_duration
-                ),
+                "duration": _close_enough(edge_duration, declared_duration),
                 "highway_count": bool(edge_consistency["highway_count"]),
                 "requested_endpoints": requested_endpoints_ok,
                 "snapped_endpoints": snapped_endpoints_ok,
@@ -1179,19 +1107,11 @@ def recompute_feature_metrics(
     else:
         edge_consistency = segment_consistency
     distance = edge_distance if edge_distance is not None else segment_distance
-    raw_score = (
-        edge_raw_score if edge_raw_score is not None else segment_raw_score
-    )
+    raw_score = edge_raw_score if edge_raw_score is not None else segment_raw_score
     highway_count = (
-        edge_highway_count
-        if edge_highway_count is not None
-        else segment_highway_count
+        edge_highway_count if edge_highway_count is not None else segment_highway_count
     )
-    duration = (
-        edge_duration
-        if edge_duration is not None
-        else segment_duration
-    )
+    duration = edge_duration if edge_duration is not None else segment_duration
     highway_duration = (
         edge_highway_duration
         if edge_highway_duration is not None
@@ -1199,9 +1119,7 @@ def recompute_feature_metrics(
     )
     geometry = feature.get("geometry", {})
     coordinates = (
-        geometry.get("coordinates", [])
-        if isinstance(geometry, Mapping)
-        else []
+        geometry.get("coordinates", []) if isinstance(geometry, Mapping) else []
     )
     return {
         "distance_km": float(distance),
@@ -1240,19 +1158,13 @@ def recompute_feature_metrics(
         "exactness_status": properties.get("exactness_status"),
         "objective_value_declared": _as_float(properties.get("objective_value")),
         "optimality_gap": _as_float(properties.get("optimality_gap")),
-        "certified_upper_bound": _as_float(
-            properties.get("certified_upper_bound")
-        ),
+        "certified_upper_bound": _as_float(properties.get("certified_upper_bound")),
         "edge_ids": edge_ids,
         "canonical_edge_ids": canonical_ids,
         "traversal_ids": traversal_ids,
         "segment_identity": [dict(row) for row in rows],
-        "requested_scenic_weight": _as_float(
-            properties.get("requested_scenic_weight")
-        ),
-        "applied_scenic_weight": _as_float(
-            properties.get("applied_scenic_weight")
-        ),
+        "requested_scenic_weight": _as_float(properties.get("requested_scenic_weight")),
+        "applied_scenic_weight": _as_float(properties.get("applied_scenic_weight")),
         "requested_max_detour_factor": _as_float(
             properties.get("requested_max_detour_factor")
         ),
@@ -1282,9 +1194,9 @@ def _duration_utility(
         return 1.0 if scenic_duration == fastest_duration else 0.0
     if fastest_duration == 0.0:
         return 1.0 if scenic_duration == 0.0 else 0.0
-    value = (
-        kappa * fastest_duration - scenic_duration
-    ) / ((kappa - 1.0) * fastest_duration)
+    value = (kappa * fastest_duration - scenic_duration) / (
+        (kappa - 1.0) * fastest_duration
+    )
     return min(1.0, max(0.0, value))
 
 
@@ -1299,9 +1211,7 @@ def recompute_objective(
 ) -> dict[str, float | None]:
     """Recompute service objective components from independent path metrics."""
     scenic_duration = _as_float(scenic.get("duration_minutes_recomputed"))
-    fastest_duration = _as_float(
-        scenic.get("fastest_duration_minutes_declared")
-    )
+    fastest_duration = _as_float(scenic.get("fastest_duration_minutes_declared"))
     if (
         fastest_duration is None
         or (
@@ -1310,18 +1220,14 @@ def recompute_objective(
             and scenic_duration > 0.0
         )
     ) and baseline is not None:
-        fastest_duration = _as_float(
-            baseline.get("duration_minutes_recomputed")
-        )
+        fastest_duration = _as_float(baseline.get("duration_minutes_recomputed"))
     if fastest_duration is None:
         fastest_duration = scenic_duration
     scenic_utility = _normalise_score(
         _as_float(scenic.get("raw_scenic_score"), 0.0) or 0.0
     )
     baseline_raw = (
-        _as_float(baseline.get("raw_scenic_score"))
-        if baseline is not None
-        else None
+        _as_float(baseline.get("raw_scenic_score")) if baseline is not None else None
     )
     absolute = (
         (_as_float(scenic.get("raw_scenic_score"), 0.0) or 0.0) - baseline_raw
@@ -1329,9 +1235,7 @@ def recompute_objective(
         else None
     )
     relative = (
-        absolute / abs(baseline_raw)
-        if absolute is not None and baseline_raw
-        else None
+        absolute / abs(baseline_raw) if absolute is not None and baseline_raw else None
     )
     if scenic_duration is None or fastest_duration is None:
         return {
@@ -1347,12 +1251,8 @@ def recompute_objective(
         if fastest_duration > 0.0
         else (1.0 if scenic_duration == 0.0 else math.inf)
     )
-    duration_utility = _duration_utility(
-        scenic_duration, fastest_duration, kappa
-    )
-    highway_duration = (
-        _as_float(scenic.get("highway_duration_minutes"), 0.0) or 0.0
-    )
+    duration_utility = _duration_utility(scenic_duration, fastest_duration, kappa)
+    highway_duration = _as_float(scenic.get("highway_duration_minutes"), 0.0) or 0.0
     highway_cost = (
         float(highway_preference)
         * highway_duration
@@ -1444,19 +1344,17 @@ def _certification_consistent(
         return False
     if status == "exact":
         return (gap is None or _close_enough(gap, 0.0)) and (
-            upper_bound is None
-            or _close_enough(upper_bound, float(objective_value))
+            upper_bound is None or _close_enough(upper_bound, float(objective_value))
         )
     if status == "approximate-certified":
         return (
             gap is not None
             and upper_bound is not None
             and upper_bound + 1e-8 >= float(objective_value)
-            and _close_enough(
-                gap, upper_bound - float(objective_value)
-            )
+            and _close_enough(gap, upper_bound - float(objective_value))
         )
     return False
+
 
 def _no_better_reason_consistent(
     route: Mapping[str, Any],
@@ -1475,6 +1373,7 @@ def _no_better_reason_consistent(
             return reason == "approximation_did_not_find_scenic_improvement"
         return reason == "no_better_route"
     return reason is None
+
 
 def evaluate_service_response(
     result: Mapping[str, Any],
@@ -1549,9 +1448,7 @@ def evaluate_service_response(
         else None
     )
     scenic_duration = _as_float(scenic.get("duration_minutes"))
-    fastest_duration = _as_float(
-        scenic.get("fastest_duration_minutes_declared")
-    )
+    fastest_duration = _as_float(scenic.get("fastest_duration_minutes_declared"))
     duration_cap = _as_float(scenic.get("duration_cap_minutes_declared"))
     if (
         fastest_duration is None
@@ -1571,18 +1468,13 @@ def evaluate_service_response(
         )
     ) and fastest_duration is not None:
         duration_cap = fastest_duration * kappa
-    duration_available = (
-        scenic_duration is not None
-        and fastest_duration is not None
-    )
+    duration_available = scenic_duration is not None and fastest_duration is not None
     if duration_available:
         ratio = (
             1.0
             if scenic_duration == 0.0 and fastest_duration == 0.0
             else (
-                scenic_duration / fastest_duration
-                if fastest_duration > 0.0
-                else None
+                scenic_duration / fastest_duration if fastest_duration > 0.0 else None
             )
         )
     else:
@@ -1635,9 +1527,7 @@ def evaluate_service_response(
     )
     baseline_present = baseline is not None
     baseline_duration = (
-        _as_float(baseline.get("duration_minutes"))
-        if baseline is not None
-        else None
+        _as_float(baseline.get("duration_minutes")) if baseline is not None else None
     )
     cap_ok = (
         baseline_present
@@ -1647,16 +1537,10 @@ def evaluate_service_response(
         and _close_enough(duration_cap, fastest_duration * kappa)
         and scenic_duration <= duration_cap + 1e-9
     )
-    highway_ok = (
-        baseline_present
-        and (
-            not avoid_highways
-            or avoidance_fallback
-            or (
-                avoidance_applied
-                and scenic["highway_count"] == 0
-            )
-        )
+    highway_ok = baseline_present and (
+        not avoid_highways
+        or avoidance_fallback
+        or (avoidance_applied and scenic["highway_count"] == 0)
     )
     q0_fastest = (
         baseline_present
@@ -1676,9 +1560,7 @@ def evaluate_service_response(
         all(consistency.values()) for consistency in edge_consistency
     )
     route_metrics_ok = all(
-        _route_metrics_row_consistent(
-            routes.get(route_kind), feature
-        )
+        _route_metrics_row_consistent(routes.get(route_kind), feature)
         for route_kind, feature in (
             ("scenic", scenic_feature),
             ("baseline", baseline_feature),
@@ -1688,9 +1570,7 @@ def evaluate_service_response(
     settings_ok = (
         isinstance(request_payload, Mapping)
         and _close_enough(_as_float(request_payload.get("scenic_weight")), q)
-        and _close_enough(
-            _as_float(request_payload.get("max_detour_factor")), kappa
-        )
+        and _close_enough(_as_float(request_payload.get("max_detour_factor")), kappa)
         and request_payload.get("avoid_highways") is bool(avoid_highways)
         and all(
             _close_enough(route.get("requested_scenic_weight"), q)
@@ -1717,16 +1597,11 @@ def evaluate_service_response(
         )
         and avoidance_reporting_ok
     )
-    derived_same_route = (
-        baseline is not None
-        and scenic.get("traversal_ids") == baseline.get("traversal_ids")
-    )
-    recomputed_absolute = _as_float(
-        recomputed.get("scenic_score_delta_absolute")
-    )
-    recomputed_relative = _as_float(
-        recomputed.get("scenic_score_delta_relative")
-    )
+    derived_same_route = baseline is not None and scenic.get(
+        "traversal_ids"
+    ) == baseline.get("traversal_ids")
+    recomputed_absolute = _as_float(recomputed.get("scenic_score_delta_absolute"))
+    recomputed_relative = _as_float(recomputed.get("scenic_score_delta_relative"))
     declared_comparison_ok = (
         scenic.get("same_route") is derived_same_route
         and _close_enough(
@@ -1759,9 +1634,7 @@ def evaluate_service_response(
     certification_ok = certification_data_finite and _certification_consistent(
         scenic, recomputed_objective
     )
-    reason_ok = _no_better_reason_consistent(
-        scenic, recomputed_objective
-    )
+    reason_ok = _no_better_reason_consistent(scenic, recomputed_objective)
     expected_highway_preference = 2.0 if avoidance_fallback else 0.0
     expected_optimization_mode = (
         "scenic_score_with_best_effort_highway_avoidance_under_duration_cap"
@@ -1810,8 +1683,7 @@ def evaluate_service_response(
                 _as_float(scenic.get("scenic_score_delta_relative")),
             )
         )
-        and diagnostics_payload.get("same_route")
-        == scenic.get("same_route")
+        and diagnostics_payload.get("same_route") == scenic.get("same_route")
         and diagnostics_payload.get("no_better_route_reason")
         == scenic.get("no_better_route_reason")
         and _close_enough(
@@ -1822,16 +1694,10 @@ def evaluate_service_response(
             _as_float(diagnostics_payload.get("highway_avoidance_cost")),
             _as_float(recomputed.get("highway_avoidance_cost")),
         )
-        and diagnostics_payload.get("optimization_mode")
-        == expected_optimization_mode
-        and diagnostics_payload.get("hard_highway_count")
-        == scenic.get("highway_count")
+        and diagnostics_payload.get("optimization_mode") == expected_optimization_mode
+        and diagnostics_payload.get("hard_highway_count") == scenic.get("highway_count")
         and _close_enough(
-            _as_float(
-                diagnostics_payload.get(
-                    "detour_reference_duration_minutes"
-                )
-            ),
+            _as_float(diagnostics_payload.get("detour_reference_duration_minutes")),
             fastest_duration,
         )
         and _close_enough(
@@ -1893,9 +1759,7 @@ def evaluate_service_response(
             "baseline_present": bool(baseline_present),
             "duration_cap": bool(cap_ok),
             "prohibited_highways": bool(highway_ok),
-            "highway_avoidance_reporting": bool(
-                avoidance_reporting_ok
-            ),
+            "highway_avoidance_reporting": bool(avoidance_reporting_ok),
             "q0_fastest": bool(q0_fastest),
             "objective_recomputation": objective_error is not None
             and objective_error <= 1e-8,
@@ -1954,37 +1818,29 @@ def _evaluations_match(
         ) and isinstance(direct_route, Mapping)
         if not checks[f"{route_kind}_present"]:
             continue
-        checks[f"{route_kind}_traversal_ids"] = (
-            strict_route.get("traversal_ids") == direct_route.get("traversal_ids")
-        )
-        checks[f"{route_kind}_canonical_edge_ids"] = (
-            strict_route.get("canonical_edge_ids")
-            == direct_route.get("canonical_edge_ids")
-        )
+        checks[f"{route_kind}_traversal_ids"] = strict_route.get(
+            "traversal_ids"
+        ) == direct_route.get("traversal_ids")
+        checks[f"{route_kind}_canonical_edge_ids"] = strict_route.get(
+            "canonical_edge_ids"
+        ) == direct_route.get("canonical_edge_ids")
         for metric in ("distance_km", "duration_minutes", "raw_scenic_score"):
             checks[f"{route_kind}_{metric}"] = _close_enough(
                 _as_float(strict_route.get(metric)),
                 _as_float(direct_route.get(metric)),
             )
-        checks[f"{route_kind}_exactness"] = (
-            strict_route.get("exactness_status")
-            == direct_route.get("exactness_status")
-        )
-        checks[f"{route_kind}_reason"] = (
-            strict_route.get("no_better_route_reason")
-            == direct_route.get("no_better_route_reason")
-        )
-        checks[f"{route_kind}_same_route"] = (
-            strict_route.get("same_route") == direct_route.get("same_route")
-        )
-        approximate_pair = (
-            str(strict_route.get("exactness_status") or "").startswith(
-                "approximate"
-            )
-            and str(direct_route.get("exactness_status") or "").startswith(
-                "approximate"
-            )
-        )
+        checks[f"{route_kind}_exactness"] = strict_route.get(
+            "exactness_status"
+        ) == direct_route.get("exactness_status")
+        checks[f"{route_kind}_reason"] = strict_route.get(
+            "no_better_route_reason"
+        ) == direct_route.get("no_better_route_reason")
+        checks[f"{route_kind}_same_route"] = strict_route.get(
+            "same_route"
+        ) == direct_route.get("same_route")
+        approximate_pair = str(strict_route.get("exactness_status") or "").startswith(
+            "approximate"
+        ) and str(direct_route.get("exactness_status") or "").startswith("approximate")
         for metric in (
             "objective_value_declared",
             "optimality_gap",
@@ -2003,13 +1859,12 @@ def _evaluations_match(
             )
     strict_scenic = strict_evaluation.get("routes", {}).get("scenic", {})
     direct_scenic = direct_evaluation.get("routes", {}).get("scenic", {})
-    checks["same_route"] = (
-        strict_scenic.get("same_route") == direct_scenic.get("same_route")
+    checks["same_route"] = strict_scenic.get("same_route") == direct_scenic.get(
+        "same_route"
     )
-    checks["highway_count"] = (
-        strict_evaluation.get("highway_count")
-        == direct_evaluation.get("highway_count")
-    )
+    checks["highway_count"] = strict_evaluation.get(
+        "highway_count"
+    ) == direct_evaluation.get("highway_count")
     checks["normalized_scenic_score"] = _close_enough(
         _as_float(strict_evaluation.get("normalized_scenic_score")),
         _as_float(direct_evaluation.get("normalized_scenic_score")),
@@ -2041,7 +1896,9 @@ def _classify_pairs(
     for pair in corpus["pairs"]:
         pair_id = str(pair["id"])
         pair_rows = by_pair[pair_id]
-        successful = [row for row in pair_rows if row.get("evaluation", {}).get("status") == "ok"]
+        successful = [
+            row for row in pair_rows if row.get("evaluation", {}).get("status") == "ok"
+        ]
         if not successful:
             continue
         distance = _pair_distance(pair)
@@ -2052,9 +1909,7 @@ def _classify_pairs(
         else:
             discovered["long regional"].append(pair_id)
         if pair_id == "checked_in_default_reproduction" and any(
-            row["q"] == 0.8
-            and row["kappa"] == 1.8
-            and row["avoid_highways"] is False
+            row["q"] == 0.8 and row["kappa"] == 1.8 and row["avoid_highways"] is False
             for row in successful
         ):
             discovered["checked-in default reproduction"].append(pair_id)
@@ -2069,7 +1924,9 @@ def _classify_pairs(
                 row["evaluation"]["routes"]["scenic"]["segment_identity_sha256"]
                 for row in true_rows
             }
-            if false_ids != true_ids or any(row["evaluation"]["highway_count"] > 0 for row in false_rows):
+            if false_ids != true_ids or any(
+                row["evaluation"]["highway_count"] > 0 for row in false_rows
+            ):
                 discovered["highway-sensitive"].append(pair_id)
         unrestricted_succeeds = any(
             row["avoid_highways"] is False
@@ -2077,10 +1934,7 @@ def _classify_pairs(
             for row in pair_rows
         )
         strict_no_route = any(
-            (
-                row["avoid_highways"]
-                and row.get("reason") == "no_route"
-            )
+            (row["avoid_highways"] and row.get("reason") == "no_route")
             or (
                 row["avoid_highways"]
                 and row.get("evaluation", {})
@@ -2098,7 +1952,9 @@ def _classify_pairs(
             and (row["evaluation"].get("optimality_gap") or 0.0) <= 1e-12
             and (row["evaluation"].get("uplift_absolute") or 0.0) > 1e-6
             and row["evaluation"]["routes"]["scenic"]["segment_identity_sha256"]
-            != (row["evaluation"]["routes"]["baseline"] or {}).get("segment_identity_sha256")
+            != (row["evaluation"]["routes"]["baseline"] or {}).get(
+                "segment_identity_sha256"
+            )
             for row in successful
         )
         if scenic_improvement:
@@ -2108,17 +1964,43 @@ def _classify_pairs(
             for row in successful
             if row["q"] > 0.0 and abs(row["kappa"] - 1.0) < 1e-9
         ]
-        if any(abs((row["evaluation"].get("duration_ratio") or 1.0) - 1.0) <= 1e-8 for row in q1):
+        if any(
+            abs((row["evaluation"].get("duration_ratio") or 1.0) - 1.0) <= 1e-8
+            for row in q1
+        ):
             discovered["detour1.0 binding"].append(pair_id)
         unlock = False
         for q in Q_VALUES[1:]:
-            at_1 = next((row for row in successful if row["q"] == q and row["kappa"] == 1.0 and not row["avoid_highways"]), None)
-            at_18 = next((row for row in successful if row["q"] == q and row["kappa"] == 1.8 and not row["avoid_highways"]), None)
-            if at_1 and at_18 and at_1["evaluation"].get("uplift_absolute", 0.0) <= 1e-6 < at_18["evaluation"].get("uplift_absolute", 0.0):
-                if (
-                    (at_1["evaluation"].get("optimality_gap") or 0.0) > 1e-12
-                    or (at_18["evaluation"].get("optimality_gap") or 0.0) > 1e-12
-                ):
+            at_1 = next(
+                (
+                    row
+                    for row in successful
+                    if row["q"] == q
+                    and row["kappa"] == 1.0
+                    and not row["avoid_highways"]
+                ),
+                None,
+            )
+            at_18 = next(
+                (
+                    row
+                    for row in successful
+                    if row["q"] == q
+                    and row["kappa"] == 1.8
+                    and not row["avoid_highways"]
+                ),
+                None,
+            )
+            if (
+                at_1
+                and at_18
+                and at_1["evaluation"].get("uplift_absolute", 0.0)
+                <= 1e-6
+                < at_18["evaluation"].get("uplift_absolute", 0.0)
+            ):
+                if (at_1["evaluation"].get("optimality_gap") or 0.0) > 1e-12 or (
+                    at_18["evaluation"].get("optimality_gap") or 0.0
+                ) > 1e-12:
                     continue
                 unlock = True
                 break
@@ -2149,17 +2031,20 @@ def _invariant_summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
     groups_q: dict[tuple[str, float, bool], list[Mapping[str, Any]]] = defaultdict(list)
     groups_k: dict[tuple[str, float, bool], list[Mapping[str, Any]]] = defaultdict(list)
     for row in completed:
-        groups_q[(str(row["pair_id"]), float(row["kappa"]), bool(row["avoid_highways"]))].append(row)
-        groups_k[(str(row["pair_id"]), float(row["q"]), bool(row["avoid_highways"]))].append(row)
+        groups_q[
+            (str(row["pair_id"]), float(row["kappa"]), bool(row["avoid_highways"]))
+        ].append(row)
+        groups_k[
+            (str(row["pair_id"]), float(row["q"]), bool(row["avoid_highways"]))
+        ].append(row)
     for group in groups_q.values():
         ordered = sorted(group, key=lambda row: row["q"])
         for previous, current in zip(ordered, ordered[1:]):
             prev_value = previous["evaluation"].get("normalized_scenic_score")
             current_value = current["evaluation"].get("normalized_scenic_score")
-            if (
-                (previous["evaluation"].get("optimality_gap") or 0.0) > 0.0
-                or (current["evaluation"].get("optimality_gap") or 0.0) > 0.0
-            ):
+            if (previous["evaluation"].get("optimality_gap") or 0.0) > 0.0 or (
+                current["evaluation"].get("optimality_gap") or 0.0
+            ) > 0.0:
                 counts["monotonic_best_utility_q"]["not_proven_positive_gap"] += 1
                 continue
             if prev_value is None or current_value is None:
@@ -2175,10 +2060,9 @@ def _invariant_summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
         for previous, current in zip(ordered, ordered[1:]):
             prev_value = previous["evaluation"]["objective"].get("recomputed")
             current_value = current["evaluation"]["objective"].get("recomputed")
-            if (
-                (previous["evaluation"].get("optimality_gap") or 0.0) > 0.0
-                or (current["evaluation"].get("optimality_gap") or 0.0) > 0.0
-            ):
+            if (previous["evaluation"].get("optimality_gap") or 0.0) > 0.0 or (
+                current["evaluation"].get("optimality_gap") or 0.0
+            ) > 0.0:
                 counts["monotonic_best_utility_kappa"]["not_proven_positive_gap"] += 1
                 continue
             if current_value + 1e-8 >= prev_value:
@@ -2191,12 +2075,8 @@ def _invariant_summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
     # assertions for this single-report benchmark.
     signature_pairs = {
         (
-            row.get("evaluation", {}).get("score_mapping", {}).get(
-                "graph_signature"
-            ),
-            row.get("evaluation", {}).get("score_mapping", {}).get(
-                "report_signature"
-            ),
+            row.get("evaluation", {}).get("score_mapping", {}).get("graph_signature"),
+            row.get("evaluation", {}).get("score_mapping", {}).get("report_signature"),
         )
         for row in completed
     }
@@ -2206,9 +2086,7 @@ def _invariant_summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
     )
     counts["cache_boundaries"][
         "pass"
-        if completed
-        and not missing_signature
-        and len(signature_pairs) <= 1
+        if completed and not missing_signature and len(signature_pairs) <= 1
         else "fail"
     ] += 1
     counts["cache_isolation"]["not_proven_single_variant"] += 1
@@ -2219,13 +2097,13 @@ def _invariant_summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
         hits = all(
             row.get("evaluation", {}).get("diagnostics", {}).get("graph_cache_hit")
             is True
-            and row.get("evaluation", {}).get("diagnostics", {}).get(
-                "tile_score_cache_hit"
-            )
+            and row.get("evaluation", {})
+            .get("diagnostics", {})
+            .get("tile_score_cache_hit")
             is True
-            and row.get("evaluation", {}).get("diagnostics", {}).get(
-                "scored_graph_cache_hit"
-            )
+            and row.get("evaluation", {})
+            .get("diagnostics", {})
+            .get("scored_graph_cache_hit")
             is True
             for row in strict_completed[1:]
         )
@@ -2278,8 +2156,6 @@ def _case_specs(corpus: Mapping[str, Any]) -> list[CaseSpec]:
     return specs
 
 
-
-
 def _direct_planner_response(
     planner: ScenicRoutePlanner,
     request: RouteRequest,
@@ -2317,15 +2193,11 @@ def _direct_planner_response(
         scenic_route,
         strict_highway_avoidance_applied,
         highway_avoidance_fallback_reason,
-    ) = (
-        route_service._find_scenic_route_with_best_effort_avoidance(
-            planner,
-            request,
-            detour_reference_duration_minutes=(
-                detour_reference_duration_minutes
-            ),
-            deadline=deadline,
-        )
+    ) = route_service._find_scenic_route_with_best_effort_avoidance(
+        planner,
+        request,
+        detour_reference_duration_minutes=(detour_reference_duration_minutes),
+        deadline=deadline,
     )
     highway_avoidance_fallback = (
         request.avoid_highways and not strict_highway_avoidance_applied
@@ -2352,9 +2224,7 @@ def _direct_planner_response(
     features = [scenic_feature]
     routes = [{"route_kind": "scenic", "metrics": scenic_feature["properties"]}]
     if baseline_route is not None:
-        baseline_normalized = _normalise_score(
-            baseline_route.average_scenic_score
-        )
+        baseline_normalized = _normalise_score(baseline_route.average_scenic_score)
         baseline_objective = {
             "duration_utility": 1.0,
             "scenic_utility": baseline_normalized,
@@ -2391,9 +2261,7 @@ def _direct_planner_response(
     fastest_duration = route_service._detour_reference_duration(
         scenic_route, baseline_route
     )
-    duration_cap = float(
-        getattr(scenic_route, "duration_cap_minutes", 0.0) or 0.0
-    )
+    duration_cap = float(getattr(scenic_route, "duration_cap_minutes", 0.0) or 0.0)
     if duration_cap <= 0.0:
         duration_cap = fastest_duration * request.max_detour_factor
     duration_cap_tolerance = 1e-12 * max(1.0, abs(duration_cap))
@@ -2415,23 +2283,17 @@ def _direct_planner_response(
             "applied_scenic_weight": float(request.scenic_weight),
             "requested_max_detour_factor": float(request.max_detour_factor),
             "applied_max_detour_factor": float(request.max_detour_factor),
-            "hard_highway_count": scenic_feature["properties"].get(
-                "highway_count"
-            ),
+            "hard_highway_count": scenic_feature["properties"].get("highway_count"),
             "avoid_highways_applied": strict_highway_avoidance_applied,
             "highway_avoidance_fallback": highway_avoidance_fallback,
-            "highway_avoidance_fallback_reason": (
-                highway_avoidance_fallback_reason
-            ),
+            "highway_avoidance_fallback_reason": (highway_avoidance_fallback_reason),
             "highway_avoidance_mode": (
                 "best_effort_fallback"
                 if highway_avoidance_fallback
                 else ("strict" if request.avoid_highways else "off")
             ),
             "highway_preference": objective["highway_preference"],
-            "highway_avoidance_cost": objective[
-                "highway_avoidance_cost"
-            ],
+            "highway_avoidance_cost": objective["highway_avoidance_cost"],
             "optimization_mode": objective["optimization_mode"],
             "baseline_avoid_highways_applied": (
                 False if baseline_route is not None else None
@@ -2449,12 +2311,8 @@ def _direct_planner_response(
             "tile_score_load_elapsed_ms": 0.0,
             "score_application_elapsed_ms": 0.0,
             "planning_elapsed_ms": 0.0,
-            "exactness_status": scenic_feature["properties"].get(
-                "exactness_status"
-            ),
-            "optimality_gap": scenic_feature["properties"].get(
-                "optimality_gap"
-            ),
+            "exactness_status": scenic_feature["properties"].get("exactness_status"),
+            "optimality_gap": scenic_feature["properties"].get("optimality_gap"),
             "certified_upper_bound": scenic_feature["properties"].get(
                 "certified_upper_bound"
             ),
@@ -2478,8 +2336,6 @@ def _direct_planner_response(
     }
 
 
-
-
 def _case_id(spec: CaseSpec) -> str:
     return (
         f"{spec.pair_id}|q={spec.q:g}|kappa={spec.kappa:g}|"
@@ -2498,7 +2354,6 @@ def _validate_execution_options(workers: int, group_size: int) -> None:
         raise ValueError("group_size must be a positive integer or zero")
 
 
-
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
@@ -2511,6 +2366,7 @@ def _group_size_arg(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be zero or a positive integer")
     return parsed
+
 
 def _repair_checkpoint_tail(jsonl_path: Path) -> None:
     if not jsonl_path.exists():
@@ -2789,8 +2645,12 @@ def _execute_case(
             "graph_cache_hit": diagnostics.get("graph_cache_hit"),
             "tile_score_cache_hit": diagnostics.get("tile_score_cache_hit"),
             "scored_graph_cache_hit": diagnostics.get("scored_graph_cache_hit"),
-            "report_signature": evaluation.get("score_mapping", {}).get("report_signature"),
-            "graph_signature": evaluation.get("score_mapping", {}).get("graph_signature"),
+            "report_signature": evaluation.get("score_mapping", {}).get(
+                "report_signature"
+            ),
+            "graph_signature": evaluation.get("score_mapping", {}).get(
+                "graph_signature"
+            ),
         }
     else:
         row["phase_ms"] = {}
@@ -2798,10 +2658,9 @@ def _execute_case(
     return row
 
 
-
-_WORKER_CONTEXT: tuple[
-    dict[str, Any], ScenicRoutePlanner, dict[str, Any], dict[str, Any]
-] | None = None
+_WORKER_CONTEXT: (
+    tuple[dict[str, Any], ScenicRoutePlanner, dict[str, Any], dict[str, Any]] | None
+) = None
 _WORKER_SUPERVISOR: _PersistentPlanningChild | None = None
 _WORKER_ERRORS: dict[tuple[str, bool], tuple[str, str]] = {}
 _WORKER_PRELOAD: dict[str, Any] = {}
@@ -2810,7 +2669,13 @@ _WORKER_PLANNER_PRELOAD: dict[str, Any] = {}
 
 
 def _init_case_worker(graph_path: Path, report_path: Path) -> None:
-    global _WORKER_CONTEXT, _WORKER_SUPERVISOR, _WORKER_ERRORS, _WORKER_PRELOAD, _WORKER_PRELOAD_WALL_MS, _WORKER_PLANNER_PRELOAD
+    global \
+        _WORKER_CONTEXT, \
+        _WORKER_SUPERVISOR, \
+        _WORKER_ERRORS, \
+        _WORKER_PRELOAD, \
+        _WORKER_PRELOAD_WALL_MS, \
+        _WORKER_PLANNER_PRELOAD
     (
         preload,
         preload_wall_ms,
@@ -2825,9 +2690,7 @@ def _init_case_worker(graph_path: Path, report_path: Path) -> None:
     _WORKER_PRELOAD_WALL_MS = preload_wall_ms
     _WORKER_PLANNER_PRELOAD = planner_preload
     if _HAS_POSIX_FORK:
-        _WORKER_SUPERVISOR = _PersistentPlanningChild(
-            _WORKER_CONTEXT, _WORKER_ERRORS
-        )
+        _WORKER_SUPERVISOR = _PersistentPlanningChild(_WORKER_CONTEXT, _WORKER_ERRORS)
         atexit.register(_close_worker_supervisor)
 
 
@@ -2849,7 +2712,7 @@ def _worker_context_snapshot() -> dict[str, Any]:
 
 
 def _run_case_worker(
-    args: tuple[int, CaseSpec, Path, Path, float, bool]
+    args: tuple[int, CaseSpec, Path, Path, float, bool],
 ) -> dict[str, Any]:
     if _WORKER_CONTEXT is None:
         raise RuntimeError("case worker was not initialized")
@@ -2881,6 +2744,7 @@ def _run_case_worker(
         context=_WORKER_CONTEXT,
         route_error_cache=_WORKER_ERRORS,
     )
+
 
 def _timeout_row(
     index: int,
@@ -2942,6 +2806,7 @@ def _worker_failure_row(
         "phase_ms": {},
         "cache": {"route_error_cache_hit": False},
     }
+
 
 def run_benchmark(
     *,
@@ -3031,6 +2896,7 @@ def run_benchmark(
         supervisor = _PersistentPlanningChild(context, route_error_cache)
     try:
         with jsonl_path.open(stream_mode, encoding="utf-8") as stream:
+
             def persist(row: dict[str, Any]) -> None:
                 row = dict(row)
                 row["checkpoint_fingerprint"] = checkpoint_fingerprint
@@ -3074,9 +2940,8 @@ def run_benchmark(
                             wall_ms,
                         )
                     persist(row)
-                    if (
-                        row.get("reason") == "no_route"
-                        and not row.get("route_error_cache_hit")
+                    if row.get("reason") == "no_route" and not row.get(
+                        "route_error_cache_hit"
                     ):
                         route_error_cache[(spec.pair_id, spec.avoid_highways)] = (
                             str(row["reason"]),
@@ -3154,10 +3019,12 @@ def run_benchmark(
                 "under_10s_count": 0,
                 "under_10s_rate": None,
             }
+
         def percentile(fraction: float) -> float:
             return ordered[
                 min(len(ordered) - 1, int(math.ceil(fraction * len(ordered))) - 1)
             ]
+
         under = sum(1 for value in ordered if value < 10000.0)
         return {
             "count": len(ordered),
@@ -3167,10 +3034,19 @@ def run_benchmark(
             "under_10s_count": under,
             "under_10s_rate": under / len(ordered),
         }
-    improvements = [float(row["evaluation"].get("uplift_absolute") or 0.0) for row in completed]
+
+    improvements = [
+        float(row["evaluation"].get("uplift_absolute") or 0.0) for row in completed
+    ]
     gaps = [row["evaluation"].get("optimality_gap") for row in completed]
-    exact = sum(1 for row in completed if row["evaluation"].get("exactness_status") == "exact")
-    approx = sum(1 for row in completed if str(row["evaluation"].get("exactness_status", "")).startswith("approximate"))
+    exact = sum(
+        1 for row in completed if row["evaluation"].get("exactness_status") == "exact"
+    )
+    approx = sum(
+        1
+        for row in completed
+        if str(row["evaluation"].get("exactness_status", "")).startswith("approximate")
+    )
     no_route_reasons: dict[str, int] = defaultdict(int)
     for row in rows:
         if row.get("reason"):
@@ -3186,8 +3062,7 @@ def run_benchmark(
     invariant_summary = _invariant_summary(rows)
     if case_timeout_seconds > 0.0:
         latency_pass = all(
-            _row_within_case_deadline(row, case_timeout_seconds)
-            for row in rows
+            _row_within_case_deadline(row, case_timeout_seconds) for row in rows
         )
         invariant_summary["all_case_latency_sla"] = {
             "pass" if latency_pass else "fail": 1
@@ -3201,7 +3076,9 @@ def run_benchmark(
         "graph_path": str(graph_path),
         "report_path": str(report_path),
         "checkpoint_fingerprint": checkpoint_fingerprint,
-        "historical_screenshot_coordinates": corpus.get("historical_screenshot_coordinates"),
+        "historical_screenshot_coordinates": corpus.get(
+            "historical_screenshot_coordinates"
+        ),
         "historical_screenshot_blocker": corpus.get("historical_screenshot_blocker"),
         "matrix": {
             "pair_count": len(corpus["pairs"]),
@@ -3253,7 +3130,11 @@ def run_benchmark(
                 sorted(improvements)[len(improvements) // 2] if improvements else None
             ),
             "relative_uplift_max": max(
-                [float(row["evaluation"].get("uplift_relative")) for row in completed if row["evaluation"].get("uplift_relative") is not None],
+                [
+                    float(row["evaluation"].get("uplift_relative"))
+                    for row in completed
+                    if row["evaluation"].get("uplift_relative") is not None
+                ],
                 default=None,
             ),
             "positive_gap_rows_not_proof": sum(
@@ -3267,25 +3148,23 @@ def run_benchmark(
             "timeouts": latency_stats(timeout_wall),
             "all_cases": latency_stats(wall_values),
         },
-        "exactness": {"exact_count": exact, "approximate_count": approx, "completed_count": len(completed)},
+        "exactness": {
+            "exact_count": exact,
+            "approximate_count": approx,
+            "completed_count": len(completed),
+        },
         "no_route_reasons": dict(sorted(no_route_reasons.items())),
         "ui_reproduction_parity": ui_reproduction_parity,
         "results_jsonl": str(jsonl_path),
     }
     if payload["matrix"]["all_cases_persisted"]:
-        jsonl_text = "".join(
-            json.dumps(row, sort_keys=True) + "\n" for row in rows
-        )
+        jsonl_text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
         _atomic_write_text(jsonl_path, jsonl_text)
         _atomic_write_text(
             output_path,
             json.dumps({**payload, "results": rows}, indent=2, sort_keys=True),
         )
     return payload
-
-
-
-
 
 
 def parse_args() -> argparse.Namespace:
@@ -3338,7 +3217,13 @@ def main() -> None:
         workers=args.workers,
         group_size=args.group_size,
     )
-    print(json.dumps({key: value for key, value in payload.items() if key != "results"}, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {key: value for key, value in payload.items() if key != "results"},
+            indent=2,
+            sort_keys=True,
+        )
+    )
     print(f"Wrote {args.output}")
     print(f"Wrote {args.output.with_suffix('.jsonl')}")
 

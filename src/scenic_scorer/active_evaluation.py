@@ -1057,13 +1057,17 @@ def evaluate_stage_two(
                 routes_valid = False
                 break
 
-            role_str = str(
-                r.get("role")
-                or r.get("route_role")
-                or r.get("kind")
-                or r.get("route_kind")
-                or ""
-            ).strip().lower()
+            role_str = (
+                str(
+                    r.get("role")
+                    or r.get("route_role")
+                    or r.get("kind")
+                    or r.get("route_kind")
+                    or ""
+                )
+                .strip()
+                .lower()
+            )
 
             if role_str in ("candidate", "scenic"):
                 has_candidate_role = True
@@ -1290,9 +1294,7 @@ def evaluate_candidate_validation(
         )
 
     val_records = [
-        record
-        for record in records
-        if str(record["split"]).strip().lower() == "val"
+        record for record in records if str(record["split"]).strip().lower() == "val"
     ]
     if not val_records:
         raise ValueError(
@@ -1373,7 +1375,9 @@ def evaluate_candidate_validation(
     y_cand = np.array([mr["cand_pred"] for mr in matched_records], dtype=np.float32)
     y_base = np.array([mr["base_pred"] for mr in matched_records], dtype=np.float32)
     if not np.isfinite(y_true).all():
-        raise ValueError("Benchmark expanded_validation_benchmark targets must be finite")
+        raise ValueError(
+            "Benchmark expanded_validation_benchmark targets must be finite"
+        )
 
     cand_metrics = _compute_metrics(y_true, y_cand)
     base_metrics = _compute_metrics(y_true, y_base)
@@ -1488,6 +1492,45 @@ def _write_registry_locked(reg_path: Path, registry_data: dict[str, Any]) -> str
                 os.unlink(temp_name)
             except FileNotFoundError:
                 pass
+
+
+def _publish_checkpoint(cand_path: Path, cand_sha: str, ckpt_dir: Path) -> Path:
+    """Atomically publish a content-addressed checkpoint copy into ckpt_dir."""
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    published_ckpt_path = ckpt_dir / f"{cand_sha.lower()}.pt"
+    if published_ckpt_path.exists():
+        if file_sha256(published_ckpt_path).lower() != cand_sha.lower():
+            raise ValueError(
+                f"Existing content-addressed checkpoint at {published_ckpt_path} hash mismatch"
+            )
+    else:
+        temp_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile("wb", dir=ckpt_dir, delete=False) as tf:
+                temp_name = tf.name
+                with open(cand_path, "rb") as cf:
+                    while chunk := cf.read(65536):
+                        tf.write(chunk)
+                tf.flush()
+                os.fsync(tf.fileno())
+            os.replace(temp_name, published_ckpt_path)
+            temp_name = None
+            dir_fd = os.open(ckpt_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            if temp_name is not None:
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
+        if file_sha256(published_ckpt_path).lower() != cand_sha.lower():
+            raise ValueError(
+                f"Published checkpoint hash mismatch at {published_ckpt_path}"
+            )
+    return published_ckpt_path
 
 
 def promote_from_decision(
@@ -1608,46 +1651,11 @@ def promote_from_decision(
                 "registry-active checkpoint"
             )
         ckpt_dir = reg_path.parent / "checkpoints"
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        published_ckpt_path = ckpt_dir / f"{cand_sha.lower()}.pt"
-        if published_ckpt_path.exists():
-            if file_sha256(published_ckpt_path).lower() != cand_sha.lower():
-                raise ValueError(
-                    f"Existing content-addressed checkpoint at {published_ckpt_path} hash mismatch"
-                )
-        else:
-            temp_name: str | None = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    "wb", dir=ckpt_dir, delete=False
-                ) as tf:
-                    temp_name = tf.name
-                    with open(cand_path, "rb") as cf:
-                        while chunk := cf.read(65536):
-                            tf.write(chunk)
-                    tf.flush()
-                    os.fsync(tf.fileno())
-                os.replace(temp_name, published_ckpt_path)
-                temp_name = None
-                dir_fd = os.open(ckpt_dir, os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            finally:
-                if temp_name is not None:
-                    try:
-                        os.unlink(temp_name)
-                    except FileNotFoundError:
-                        pass
-            if file_sha256(published_ckpt_path).lower() != cand_sha.lower():
-                raise ValueError(
-                    f"Published checkpoint hash mismatch at {published_ckpt_path}"
-                )
+        _publish_checkpoint(cand_path, cand_sha, ckpt_dir)
 
         now_iso = datetime.now(timezone.utc).isoformat()
         new_active = {
-            "checkpoint": str(published_ckpt_path.resolve()),
+            "checkpoint": f"checkpoints/{cand_sha.lower()}.pt",
             "promoted_at": now_iso,
             "updated_at": now_iso,
             "run_name": run_name,
@@ -1676,12 +1684,266 @@ def promote_from_decision(
         lock.close()
 
 
+def promote_with_user_override(
+    override_path: str | Path,
+    candidate_checkpoint: str | Path,
+    registry_path: str | Path,
+    expected_registry_sha256: str,
+    run_name: str,
+) -> dict[str, Any]:
+    """
+    Activate a rejected candidate via an explicit, hash-guarded user override.
+
+    The override JSON MUST declare schema_version 1, action
+    'activate_rejected_candidate', activation_approved exactly True, the candidate
+    checkpoint path and SHA-256, hash bindings to the existing final decision and
+    evaluation evidence files, and nonempty acknowledged failed-gates and risk
+    lists. Every mismatch fails before any registry mutation. On success the
+    candidate is atomically activated under the registry lock, the event
+    'promote_user_override' is appended binding the override file/hash and
+    evidence, and prior_active is preserved with its verified checkpoint SHA.
+    """
+    ovr_path, cand_path, reg_path = (
+        Path(override_path),
+        Path(candidate_checkpoint),
+        Path(registry_path),
+    )
+    if not ovr_path.exists():
+        raise FileNotFoundError(f"Override file not found: {ovr_path}")
+    if not cand_path.exists():
+        raise FileNotFoundError(f"Candidate checkpoint not found: {cand_path}")
+    if not reg_path.exists():
+        raise FileNotFoundError(f"Registry file not found: {reg_path}")
+    try:
+        override_data = json.loads(ovr_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Malformed override JSON at {ovr_path}: {exc}") from exc
+    if not isinstance(override_data, dict):
+        raise ValueError(f"Override at {ovr_path} is not a dictionary")
+
+    # 1. Exact schema, action, and boolean approval
+    if override_data.get("schema_version") != 1 or isinstance(
+        override_data.get("schema_version"), bool
+    ):
+        raise ValueError(
+            f"Override rejected: schema_version must be 1, "
+            f"got {override_data.get('schema_version')!r}"
+        )
+    if override_data.get("action") != "activate_rejected_candidate":
+        raise ValueError(
+            f"Override rejected: action must be 'activate_rejected_candidate', "
+            f"got {override_data.get('action')!r}"
+        )
+    if override_data.get("activation_approved") is not True:
+        raise ValueError(
+            f"Override rejected: activation_approved must be exactly True, "
+            f"got {override_data.get('activation_approved')!r}"
+        )
+
+    # 2. Candidate checkpoint path and SHA-256
+    candidate = override_data.get("candidate")
+    if not isinstance(candidate, dict):
+        raise ValueError("Override rejected: candidate evidence is missing")
+    declared_cand_path = candidate.get("checkpoint")
+    declared_cand_sha = candidate.get("sha256")
+    if not isinstance(declared_cand_path, str) or not declared_cand_path.strip():
+        raise ValueError("Override rejected: candidate checkpoint path is missing")
+    if not isinstance(declared_cand_sha, str) or not declared_cand_sha.strip():
+        raise ValueError("Override rejected: candidate sha256 is missing")
+    if Path(declared_cand_path).resolve() != cand_path.resolve():
+        raise ValueError(
+            "Override rejected: candidate checkpoint path does not match "
+            "the override declaration"
+        )
+    cand_sha = file_sha256(cand_path)
+    if declared_cand_sha.lower() != cand_sha.lower():
+        raise ValueError("Override rejected: candidate SHA256 mismatch")
+
+    # 3. Nonempty failed-gate and risk acknowledgements
+    failed_gates = override_data.get("acknowledged_failed_gates")
+    if (
+        not isinstance(failed_gates, list)
+        or not failed_gates
+        or any(not isinstance(g, str) or not g.strip() for g in failed_gates)
+    ):
+        raise ValueError(
+            "Override rejected: acknowledged_failed_gates must be a "
+            "nonempty list of strings"
+        )
+    risks = override_data.get("acknowledged_risks")
+    if (
+        not isinstance(risks, list)
+        or not risks
+        or any(not isinstance(r, str) or not r.strip() for r in risks)
+    ):
+        raise ValueError(
+            "Override rejected: acknowledged_risks must be a nonempty list of strings"
+        )
+
+    # 4. Evidence bindings to the existing final decision/evaluation files
+    evidence = override_data.get("evidence")
+    if not isinstance(evidence, dict):
+        raise ValueError("Override rejected: evidence is missing")
+    bound_files: dict[str, tuple[Path, str]] = {}
+    for key in ("final_decision", "evaluation"):
+        binding = evidence.get(key)
+        if not isinstance(binding, dict):
+            raise ValueError(f"Override rejected: evidence.{key} binding is missing")
+        ev_path_val = binding.get("path")
+        ev_sha_val = binding.get("sha256")
+        if not isinstance(ev_path_val, str) or not ev_path_val.strip():
+            raise ValueError(f"Override rejected: evidence.{key} path is missing")
+        if not isinstance(ev_sha_val, str) or not ev_sha_val.strip():
+            raise ValueError(f"Override rejected: evidence.{key} sha256 is missing")
+        ev_file = Path(ev_path_val)
+        if not ev_file.is_file():
+            raise FileNotFoundError(
+                f"Override rejected: evidence file not found: {ev_file}"
+            )
+        actual_sha = file_sha256(ev_file)
+        if ev_sha_val.lower() != actual_sha.lower():
+            raise ValueError(
+                f"Override rejected: evidence.{key} SHA256 mismatch at {ev_file}"
+            )
+        bound_files[key] = (ev_file, ev_sha_val)
+
+    try:
+        decision_evidence = json.loads(
+            bound_files["final_decision"][0].read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "Override rejected: final decision evidence is not valid JSON"
+        ) from exc
+    if not isinstance(decision_evidence, dict):
+        raise ValueError("Override rejected: final decision evidence is not an object")
+    fresh_human_test = decision_evidence.get("fresh_human_test")
+    if not isinstance(fresh_human_test, dict) or not isinstance(
+        fresh_human_test.get("candidate"), dict
+    ):
+        raise ValueError(
+            "Override rejected: final decision lacks fresh_human_test candidate metrics"
+        )
+    raw_metrics = fresh_human_test["candidate"]
+    corr_val = raw_metrics.get("corr", raw_metrics.get("pearson_corr"))
+    mae_val = raw_metrics.get("mae")
+    rmse_val = raw_metrics.get("rmse")
+    samples_val = raw_metrics.get("samples")
+    for name, value in (("corr", corr_val), ("mae", mae_val), ("rmse", rmse_val)):
+        if (
+            value is None
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float, np.integer, np.floating))
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(
+                f"Override rejected: candidate metric {name!r} is missing or non-finite"
+            )
+    if (
+        samples_val is None
+        or isinstance(samples_val, bool)
+        or not isinstance(samples_val, (int, np.integer))
+        or int(samples_val) < 1
+    ):
+        raise ValueError(
+            "Override rejected: candidate metric 'samples' is missing or not a positive integer"
+        )
+    candidate_metrics = dict(raw_metrics)
+    candidate_metrics["corr"] = float(corr_val)
+    candidate_metrics["mae"] = float(mae_val)
+    candidate_metrics["rmse"] = float(rmse_val)
+    candidate_metrics["samples"] = int(samples_val)
+
+    # 5. Candidate must be a valid canonical checkpoint
+    _load_model_checkpoint(cand_path, is_candidate=True)
+
+    override_sha = file_sha256(ovr_path)
+    lock = _locked_registry(reg_path)
+    try:
+        actual = file_sha256(reg_path)
+        if actual != expected_registry_sha256:
+            raise ValueError(
+                f"Registry SHA256 mismatch: expected {expected_registry_sha256}, got {actual}"
+            )
+        registry_data = json.loads(reg_path.read_text(encoding="utf-8"))
+        if not isinstance(registry_data.get("active"), dict):
+            raise ValueError(f"Malformed registry at {reg_path}: missing active entry")
+        history = registry_data.get("history", [])
+        if not isinstance(history, list):
+            raise ValueError("Malformed registry history")
+        prior_active = dict(registry_data["active"])
+        raw_active_ckpt = str(prior_active.get("checkpoint", ""))
+        active_checkpoint = Path(raw_active_ckpt)
+        if not active_checkpoint.is_absolute():
+            cand = reg_path.parent / active_checkpoint
+            if cand.is_file():
+                active_checkpoint = cand
+        if not active_checkpoint.is_file():
+            raise ValueError("Override rejected: registry-active checkpoint is absent")
+        actual_active_sha = file_sha256(active_checkpoint)
+        recorded_active_sha = prior_active.get("sha256")
+        if isinstance(recorded_active_sha, str) and recorded_active_sha.strip():
+            if recorded_active_sha.lower() != actual_active_sha.lower():
+                raise ValueError(
+                    "Override rejected: registry-active checkpoint hash mismatch"
+                )
+        # Preserve prior active bound to its verified checkpoint SHA
+        prior_active["sha256"] = actual_active_sha
+
+        ckpt_dir = reg_path.parent / "checkpoints"
+        _publish_checkpoint(cand_path, cand_sha, ckpt_dir)
+
+        evidence_bindings = {
+            key: {"path": str(ev_file.resolve()), "sha256": ev_sha}
+            for key, (ev_file, ev_sha) in bound_files.items()
+        }
+        now_iso = datetime.now(timezone.utc).isoformat()
+        new_active = {
+            "checkpoint": f"checkpoints/{cand_sha.lower()}.pt",
+            "promoted_at": now_iso,
+            "updated_at": now_iso,
+            "run_name": run_name,
+            "sha256": cand_sha,
+            "metrics": candidate_metrics,
+            "override_path": str(ovr_path.resolve()),
+            "override_sha256": override_sha,
+            "evidence": evidence_bindings,
+            "acknowledged_failed_gates": failed_gates,
+            "acknowledged_risks": risks,
+            "decision_path": str(bound_files["final_decision"][0].resolve()),
+        }
+        history.append(
+            {
+                "event": "promote_user_override",
+                "record": new_active,
+                "prior_active": prior_active,
+                "override": {
+                    "path": str(ovr_path.resolve()),
+                    "sha256": override_sha,
+                },
+                "evidence": evidence_bindings,
+            }
+        )
+        registry_data["active"], registry_data["history"] = new_active, history
+        new_hash = _write_registry_locked(reg_path, registry_data)
+        return {
+            "status": "activated_by_user_override",
+            "run_name": run_name,
+            "new_registry_sha256": new_hash,
+            "active": new_active,
+        }
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+
 def rollback_registry(
     registry_path: str | Path,
     target_history_index: int,
     expected_registry_sha256: str,
+    expected_checkpoint_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Restore a validated historical raw record and append a rollback event."""
+    """Restore the state before a recorded event, or its historical model record."""
     reg_path = Path(registry_path)
     if not reg_path.exists():
         raise FileNotFoundError(f"Registry file not found: {reg_path}")
@@ -1708,19 +1970,34 @@ def rollback_registry(
             target_event = history[target_history_index]
         except IndexError as exc:
             raise ValueError("Invalid target history index") from exc
-        if not isinstance(target_event, dict) or not isinstance(
-            target_event.get("record"), dict
-        ):
+        if not isinstance(target_event, dict):
             raise ValueError("Historical registry event has no model record")
-        new_active = dict(target_event["record"])
+        prior_active = target_event.get("prior_active")
+        historical_record = target_event.get("record")
+        if isinstance(prior_active, dict):
+            new_active = dict(prior_active)
+        elif isinstance(historical_record, dict):
+            new_active = dict(historical_record)
+        else:
+            raise ValueError("Historical registry event has no model record")
         checkpoint = Path(str(new_active.get("checkpoint", "")))
-        target_sha = new_active.get("sha256")
+        if not checkpoint.is_absolute():
+            cand = reg_path.parent / checkpoint
+            if cand.is_file():
+                checkpoint = cand
+        recorded_sha = new_active.get("sha256")
+        target_sha = (
+            recorded_sha
+            if isinstance(recorded_sha, str)
+            else expected_checkpoint_sha256
+        )
         if (
             not checkpoint.is_file()
             or not isinstance(target_sha, str)
             or file_sha256(checkpoint) != target_sha
         ):
             raise ValueError("Historical checkpoint identity validation failed")
+        new_active["sha256"] = target_sha
         _load_model_checkpoint(checkpoint, is_candidate=False)
         prior = dict(data["active"])
         history.append(

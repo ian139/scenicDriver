@@ -25,7 +25,55 @@ CONTROL_BENCHMARK="data/processed/regression/masswhites_human_benchmark_v4/bench
 CONTROL_DATASET="data/processed/regression/features_masswhites_z14_mixed5000_v5_h4.npz"
 ROUTE_QA="data/processed/modeling_autoresearch/prompt_two_20260807/route_qa.json"
 THRESHOLDS="data/processed/modeling_autoresearch/prompt_two_post_annotation_20260809/thresholds.json"
-RUN_NAME="prompt_two_supplemental_20260809"
+RUN_NAME="prompt_two_human_only_finetune_20260809"
+
+usage() {
+  printf 'Usage: %s [--handoff PATH] [--handoff-sha256 SHA256] [--run-name NAME] [--dry-run|--resume|--status|--preflight-only]\n' "$0"
+}
+
+action="run"
+force_resume=0
+while (( $# )); do
+  case "$1" in
+    --handoff)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      HANDOFF="$2"
+      shift 2
+      ;;
+    --handoff-sha256)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      EXPECTED_HANDOFF_SHA256="$2"
+      shift 2
+      ;;
+    --run-name)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      RUN_NAME="$2"
+      shift 2
+      ;;
+    --dry-run|--status|--preflight-only)
+      [[ "$action" == "run" ]] || { usage >&2; exit 2; }
+      action="${1#--}"
+      shift
+      ;;
+    --resume)
+      force_resume=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$action" != "run" && "$force_resume" == 1 ]]; then
+  usage >&2
+  exit 2
+fi
 
 actual_handoff_sha256="$(sha256sum "$HANDOFF" | cut -d ' ' -f 1)"
 if [[ "$actual_handoff_sha256" != "$EXPECTED_HANDOFF_SHA256" ]]; then
@@ -42,28 +90,39 @@ uv run --offline --frozen python scripts/modeling/validate_stage2_preflight.py \
   --supplemental-benchmark-sha256 "$SUPPLEMENTAL_BENCHMARK_SHA256" \
   --control-benchmark "$CONTROL_BENCHMARK"
 
-resume_args=()
-if [[ -f "data/processed/modeling_autoresearch/$RUN_NAME/run_manifest.json" ]]; then
-  resume_args=(--resume)
+printf 'METRIC stage2_preflight_valid=1\n'
+printf 'METRIC immutable_handoff_valid=1\n'
+
+if [[ "$action" == "preflight-only" ]]; then
+  exit 0
+fi
+
+stage_two_args=(
+  --mode human_finetune
+  --handoff "$HANDOFF"
+  --run-name "$RUN_NAME"
+  --max-experiments 4
+  --max-steps 6000
+  --max-seconds 3600
+  --seed 42
+  --device mps
+  --expanded-benchmark-csv "$SUPPLEMENTAL_BENCHMARK"
+  --control-benchmark-csv "$CONTROL_BENCHMARK"
+  --control-dataset "$CONTROL_DATASET"
+  --route-qa-json "$ROUTE_QA"
+  --thresholds-json "$THRESHOLDS"
+  --supplemental-annotations "$SUPPLEMENTAL_ANNOTATIONS"
+  --supplemental-annotations-sha256 "$SUPPLEMENTAL_ANNOTATIONS_SHA256"
+  --supplemental-benchmark-sha256 "$SUPPLEMENTAL_BENCHMARK_SHA256"
+)
+
+if [[ "$action" == "status" ]]; then
+  stage_two_args+=(--status)
+elif [[ "$action" == "dry-run" ]]; then
+  stage_two_args+=(--dry-run)
+elif [[ "$force_resume" == 1 || -f "data/processed/modeling_autoresearch/$RUN_NAME/run_manifest.json" ]]; then
+  stage_two_args+=(--resume)
 fi
 
 uv run --offline --frozen python scripts/modeling/run_active_scenic_autoresearch.py \
-  --handoff "$HANDOFF" \
-  --run-name "$RUN_NAME" \
-  --max-experiments 5 \
-  --max-steps 2000 \
-  --max-seconds 3600 \
-  --seed 42 \
-  --device mps \
-  --expanded-benchmark-csv "$SUPPLEMENTAL_BENCHMARK" \
-  --control-benchmark-csv "$CONTROL_BENCHMARK" \
-  --control-dataset "$CONTROL_DATASET" \
-  --route-qa-json "$ROUTE_QA" \
-  --thresholds-json "$THRESHOLDS" \
-  --supplemental-annotations "$SUPPLEMENTAL_ANNOTATIONS" \
-  --supplemental-annotations-sha256 "$SUPPLEMENTAL_ANNOTATIONS_SHA256" \
-  --supplemental-benchmark-sha256 "$SUPPLEMENTAL_BENCHMARK_SHA256" \
-  "${resume_args[@]}"
-
-printf 'METRIC stage2_preflight_valid=1\n'
-printf 'METRIC immutable_handoff_valid=1\n'
+  "${stage_two_args[@]}"

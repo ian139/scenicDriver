@@ -502,7 +502,14 @@ def _load_learned_regressor(
     except ImportError as exc:
         raise ImportError("Learned scoring requires scenic regression dependencies.") from exc
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    numpy_safe_globals = [
+        np.core.multiarray._reconstruct,
+        np.ndarray,
+        np.dtype,
+        type(np.dtype(np.uint32)),
+    ]
+    with torch.serialization.safe_globals(numpy_safe_globals):
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     required = {"model_state_dict", "vit_dim", "terrain_dim", "num_classes"}
     missing = required - set(ckpt.keys())
     if missing:

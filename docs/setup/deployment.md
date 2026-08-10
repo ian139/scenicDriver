@@ -10,13 +10,14 @@ The current beta expects:
 
 - `data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3`
 - `data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3.edge_projection_index`
-- `data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json`
-- `data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route.geojson`
-- `data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/route_metrics.json`
+- `data/processed/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report/report.json`
+- `data/processed/heuristic_runs/prompt_two_candidate_exp02_expanded_20260810/report/report.json` (derived visualization; not promotion evidence)
+- `data/processed/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report/route.geojson`
+- `data/processed/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report/route_metrics.json`
 - `data/processed/regression/model_registry.json`
-- the active checkpoint named by the registry under `models/`
+- `data/processed/regression/checkpoints/0a165e429c8ac050524c7da409dd533d2de8849600c5dd8605aa1a1024d823e9.pt`
 
-Do not rename or substitute the active checkpoint without promoting it through the model workflow and updating the release manifest.
+Do not rename or substitute the active checkpoint without activating it through the model workflow and updating the release manifest.
 
 ## Bootstrap and validate
 
@@ -24,7 +25,7 @@ Provide AWS credentials through the runtime environment or an external credentia
 
 ```bash
 export SCENIC_S3_BUCKET=scenicdriver-data
-export SCENIC_S3_PREFIX=releases/routeOptimizer/75ee0431/
+export SCENIC_S3_PREFIX=releases/routeOptimizer/prompt-two-exp02-20260810/
 
 uv run python scripts/deploy/bootstrap_beta_artifacts.py
 uv run python scripts/deploy/bootstrap_beta_artifacts.py --check-only

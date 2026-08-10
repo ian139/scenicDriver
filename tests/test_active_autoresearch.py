@@ -17,8 +17,10 @@ from scripts.modeling.run_active_scenic_autoresearch import (
     DeadlineExceededError,
     build_candidate_ladder,
     build_exposure_annotation_request,
+    build_human_finetune_candidate_ladder,
     compute_experiment_digest,
     compute_sha256,
+    confirmation_exp_id,
     deadline_guard,
     detect_heldout_test_exposure,
     determine_aggregate_run_state,
@@ -30,8 +32,11 @@ from scripts.modeling.run_active_scenic_autoresearch import (
     sanitize_command,
     select_best_candidate,
     select_validation_finalist,
+    validate_confirmation_summary,
     validate_experiment_record,
     validate_handoff_content,
+    validate_prepared_dataset_manifest,
+    write_prepared_dataset_manifest,
 )
 from src.scenic_scorer.active_training import ActiveTrainingConfig
 
@@ -132,9 +137,7 @@ def _build_run_env(tmp_path: Path) -> dict[str, Any]:
 
     handoff = _handoff(tmp_path / "handoff")
 
-    val_rows = "".join(
-        f"val,img_val_{i}.jpg,{5.0 + i * 0.5}\n" for i in range(5)
-    )
+    val_rows = "".join(f"val,img_val_{i}.jpg,{5.0 + i * 0.5}\n" for i in range(5))
     exp_csv = tmp_path / "exp.csv"
     exp_csv.write_text(
         "split,image_path,scenic_human_mean\n" + val_rows, encoding="utf-8"
@@ -147,6 +150,11 @@ def _build_run_env(tmp_path: Path) -> dict[str, Any]:
     thresh_json.write_text(
         json.dumps({"min_expanded_validation_samples": 5}), encoding="utf-8"
     )
+    supplemental_annotations = tmp_path / "supplemental_annotations.csv"
+    supplemental_annotations.write_text(
+        "image_path,scenic_human,skip\nimg_train.jpg,5.0,False\n",
+        encoding="utf-8",
+    )
 
     return {
         "handoff": handoff,
@@ -156,10 +164,20 @@ def _build_run_env(tmp_path: Path) -> dict[str, Any]:
         "thresh_json": thresh_json,
         "reg_file": reg_file,
         "baseline_ckpt": ckpt,
+        "expanded_benchmark": exp_csv,
+        "control_benchmark": ctrl_csv,
+        "control_dataset": ctrl_csv,
+        "route_qa": route_json,
+        "thresholds": thresh_json,
+        "supplemental_annotations": supplemental_annotations,
+        "supplemental_annotations_sha256": compute_sha256(supplemental_annotations),
+        "supplemental_benchmark_sha256": compute_sha256(exp_csv),
     }
 
 
-def _run_args(env: dict[str, Any], run_name: str, *, max_experiments: int = 2) -> list[str]:
+def _run_args(
+    env: dict[str, Any], run_name: str, *, max_experiments: int = 2
+) -> list[str]:
     return [
         "run_active_scenic_autoresearch.py",
         "--handoff",
@@ -181,12 +199,47 @@ def _run_args(env: dict[str, Any], run_name: str, *, max_experiments: int = 2) -
     ]
 
 
-def _mock_prepare(h_path: Path, out_path: Path) -> dict[str, Any]:
+def _mock_prepare(
+    h_path: Path,
+    out_path: Path,
+    *,
+    supplemental_benchmark_sha256: str | None = None,
+) -> dict[str, Any]:
     """Realistic prepare mock: materialize NPZ plus split CSV sidecar."""
     out_path.write_bytes(b"dataset_npz_data")
     split_csv = out_path.parent / "prepared_split.csv"
     split_csv.write_text("split,image_path\n", encoding="utf-8")
-    return {"dataset_path": out_path, "split_path": split_csv}
+    return {
+        "schema_version": 1,
+        "state": "prepared",
+        "dataset_path": str(out_path),
+        "dataset_sha256": compute_sha256(out_path),
+        "split_path": str(split_csv),
+        "split_sha256": compute_sha256(split_csv),
+        "handoff_sha256": compute_sha256(h_path),
+        "changed_rows": 1,
+        "counts": {
+            "rows": 6,
+            "train": 1,
+            "val": 5,
+            "test": 0,
+            "human": 1,
+            "weak": 5,
+        },
+        "supplemental_benchmark": (
+            {
+                "path": "supp.csv",
+                "sha256": supplemental_benchmark_sha256,
+                "expected_sha256": supplemental_benchmark_sha256,
+                "rows": 6,
+                "train": 1,
+                "val": 5,
+                "test": 0,
+            }
+            if supplemental_benchmark_sha256 is not None
+            else None
+        ),
+    }
 
 
 def _make_train_mock(train_calls: dict[str, Any]):
@@ -525,17 +578,13 @@ def test_validate_experiment_record_rejects_tampered_validation_metrics(
     assert validate_experiment_record(tampered_mse) is False
 
     # Tampered JSONL pearson_corr no longer equals the decision artifact.
-    tampered_corr = dict(
-        rec, validation_metrics=dict(metrics, pearson_corr=0.99)
-    )
+    tampered_corr = dict(rec, validation_metrics=dict(metrics, pearson_corr=0.99))
     assert validate_experiment_record(tampered_corr) is False
 
     # Missing selection key in the record (artifact-backed samples stripped).
     missing_samples = dict(
         rec,
-        validation_metrics={
-            k: v for k, v in metrics.items() if k != "samples"
-        },
+        validation_metrics={k: v for k, v in metrics.items() if k != "samples"},
     )
     assert validate_experiment_record(missing_samples) is False
 
@@ -623,15 +672,11 @@ def test_validate_experiment_record_rejects_nonfinite_metrics(
     assert validate_experiment_record(rec) is True
 
     # NaN mse in the record is never usable selection evidence.
-    nan_mse = dict(
-        rec, validation_metrics=dict(base_metrics, mse=float("nan"))
-    )
+    nan_mse = dict(rec, validation_metrics=dict(base_metrics, mse=float("nan")))
     assert validate_experiment_record(nan_mse) is False
 
     # Infinite mse in the record is rejected.
-    inf_mse = dict(
-        rec, validation_metrics=dict(base_metrics, mse=float("inf"))
-    )
+    inf_mse = dict(rec, validation_metrics=dict(base_metrics, mse=float("inf")))
     assert validate_experiment_record(inf_mse) is False
 
     # Non-finite mae (present selection metric) is rejected.
@@ -639,9 +684,7 @@ def test_validate_experiment_record_rejects_nonfinite_metrics(
     assert validate_experiment_record(nan_mae) is False
 
     # Non-finite samples count is rejected.
-    nan_samples = dict(
-        rec, validation_metrics=dict(base_metrics, samples=float("nan"))
-    )
+    nan_samples = dict(rec, validation_metrics=dict(base_metrics, samples=float("nan")))
     assert validate_experiment_record(nan_samples) is False
 
     # Non-finite pearson correlation is rejected.
@@ -743,6 +786,50 @@ def test_candidate_ladder_is_bounded_and_deterministic() -> None:
         "exp_02_region_balanced",
         "exp_03_robust_huber_loss",
     ]
+
+
+def test_resolve_registry_checkpoint_prefers_existing_and_reports_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    registry_dir = tmp_path / "data" / "processed" / "regression"
+    registry_dir.mkdir(parents=True)
+    registry = registry_dir / "model_registry.json"
+    registry.write_text("{}", encoding="utf-8")
+
+    # Registry-relative checkpoints/<sha>.pt resolves via the registry directory
+    sha = "ab" * 32
+    reg_ckpt = registry_dir / "checkpoints" / f"{sha}.pt"
+    reg_ckpt.parent.mkdir(parents=True)
+    reg_ckpt.write_bytes(b"checkpoint")
+
+    def resolved(value: str) -> Path:
+        return mod._resolve_registry_checkpoint(registry, value).resolve()
+
+    assert resolved(f"checkpoints/{sha}.pt") == reg_ckpt.resolve()
+
+    # Project-root-relative models/... resolves via the working directory
+    model_ckpt = tmp_path / "models" / "baseline.pt"
+    model_ckpt.parent.mkdir(parents=True)
+    model_ckpt.write_bytes(b"model")
+    assert resolved("models/baseline.pt") == model_ckpt.resolve()
+
+    # When multiple candidates exist, the earliest in the ordered list wins
+    # (value as-is first, then registry-relative, then working-directory)
+    both_ckpt = tmp_path / "checkpoints" / f"{sha}.pt"
+    both_ckpt.parent.mkdir(parents=True)
+    both_ckpt.write_bytes(b"other")
+    assert resolved(f"checkpoints/{sha}.pt") == both_ckpt.resolve()
+
+    # Registry-relative still resolves when no working-directory copy exists
+    both_ckpt.unlink()
+    assert resolved(f"checkpoints/{sha}.pt") == reg_ckpt.resolve()
+
+    # Missing checkpoint reports every tried candidate
+    with pytest.raises(FileNotFoundError, match="tried:"):
+        mod._resolve_registry_checkpoint(registry, "checkpoints/missing.pt")
 
 
 def test_command_sanitization_redacts_secrets() -> None:
@@ -1044,6 +1131,7 @@ def test_resume_passes_resume_false_to_fresh_later_experiments(
         "thresholds_sha256": compute_sha256(thresh_json),
         "dry_run": False,
         "promote_requested": False,
+        "mode": "standard",
         "config": {
             "seed": 42,
             "device": "cpu",
@@ -1578,7 +1666,12 @@ def test_resume_uses_immutable_manifest_baseline_sha(
         "candidate_checkpoint": str(exp_ckpt),
         "eval_decision_path": str(eval_dec),
         "validation_decision_path": str(val_dec),
-        "validation_metrics": {"mse": 0.05, "mae": 0.1, "rmse": 0.2, "pearson_corr": 0.9},
+        "validation_metrics": {
+            "mse": 0.05,
+            "mae": 0.1,
+            "rmse": 0.2,
+            "pearson_corr": 0.9,
+        },
         "all_gates_pass": True,
         "metrics": {"mae": 0.1, "rmse": 0.2, "pearson_corr": 0.9},
         "input_digest": exp_digest,
@@ -1772,6 +1865,7 @@ def test_resume_with_completed_summary_without_eval_decision(
         "thresholds_sha256": compute_sha256(thresh_json),
         "dry_run": False,
         "promote_requested": False,
+        "mode": "standard",
         "config": {
             "seed": 42,
             "device": "cpu",
@@ -2048,7 +2142,12 @@ def test_status_mode_after_promotion(
         "candidate_checkpoint": str(cand_ckpt),
         "eval_decision_path": str(eval_dec),
         "validation_decision_path": str(val_dec),
-        "validation_metrics": {"mse": 0.05, "mae": 0.1, "rmse": 0.2, "pearson_corr": 0.9},
+        "validation_metrics": {
+            "mse": 0.05,
+            "mae": 0.1,
+            "rmse": 0.2,
+            "pearson_corr": 0.9,
+        },
         "all_gates_pass": True,
         "metrics": {"mae": 0.1, "rmse": 0.2, "pearson_corr": 0.9},
         "input_digest": exp_digest,
@@ -2454,7 +2553,9 @@ def test_supplemental_failure_exits_before_run_dir_or_prep(
     monkeypatch.chdir(tmp_path)
 
     exp_csv = tmp_path / "exp.csv"
-    exp_csv.write_text("split,image_path,scenic_human_mean\nval,1.jpg,5.0\n" * 5, encoding="utf-8")
+    exp_csv.write_text(
+        "split,image_path,scenic_human_mean\nval,1.jpg,5.0\n" * 5, encoding="utf-8"
+    )
     ctrl_csv = tmp_path / "ctrl.csv"
     ctrl_csv.write_text("split,image_path\n", encoding="utf-8")
     ctrl_npz = tmp_path / "ctrl.npz"
@@ -2549,10 +2650,14 @@ def test_supplemental_manifest_and_digest_binding(
     ckpt_file = reg_dir / "base.pt"
     ckpt_file.write_bytes(b"baseline")
     reg_file = reg_dir / "model_registry.json"
-    reg_file.write_text(json.dumps({"active": {"checkpoint": str(ckpt_file)}}), encoding="utf-8")
+    reg_file.write_text(
+        json.dumps({"active": {"checkpoint": str(ckpt_file)}}), encoding="utf-8"
+    )
 
     exp_csv = tmp_path / "exp.csv"
-    exp_csv.write_text("split,image_path,scenic_human_mean\nval,1.jpg,5.0\n" * 5, encoding="utf-8")
+    exp_csv.write_text(
+        "split,image_path,scenic_human_mean\nval,1.jpg,5.0\n" * 5, encoding="utf-8"
+    )
     ctrl_csv = tmp_path / "ctrl.csv"
     ctrl_csv.write_text("split,image_path\n", encoding="utf-8")
     ctrl_npz = tmp_path / "ctrl.npz"
@@ -2565,7 +2670,12 @@ def test_supplemental_manifest_and_digest_binding(
     supp_sha = compute_sha256(supp_csv)
     bench_sha = compute_sha256(exp_csv)
 
-    metrics_mock = {"row_count": 20, "val_count": 5, "test_count": 15, "skipped_count": 0}
+    metrics_mock = {
+        "row_count": 20,
+        "val_count": 5,
+        "test_count": 15,
+        "skipped_count": 0,
+    }
     monkeypatch.setattr(mod, "validate_supplemental", lambda **kwargs: metrics_mock)
 
     run_name = "run_supp_manifest"
@@ -2624,10 +2734,14 @@ def test_supplemental_stale_resume_rejection(
     ckpt_file = reg_dir / "base.pt"
     ckpt_file.write_bytes(b"baseline")
     reg_file = reg_dir / "model_registry.json"
-    reg_file.write_text(json.dumps({"active": {"checkpoint": str(ckpt_file)}}), encoding="utf-8")
+    reg_file.write_text(
+        json.dumps({"active": {"checkpoint": str(ckpt_file)}}), encoding="utf-8"
+    )
 
     exp_csv = tmp_path / "exp.csv"
-    exp_csv.write_text("split,image_path,scenic_human_mean\nval,1.jpg,5.0\n" * 5, encoding="utf-8")
+    exp_csv.write_text(
+        "split,image_path,scenic_human_mean\nval,1.jpg,5.0\n" * 5, encoding="utf-8"
+    )
     ctrl_csv = tmp_path / "ctrl.csv"
     ctrl_csv.write_text("split,image_path\n", encoding="utf-8")
     ctrl_npz = tmp_path / "ctrl.npz"
@@ -2640,7 +2754,12 @@ def test_supplemental_stale_resume_rejection(
     supp_sha = compute_sha256(supp_csv)
     bench_sha = compute_sha256(exp_csv)
 
-    metrics_mock = {"row_count": 20, "val_count": 5, "test_count": 15, "skipped_count": 0}
+    metrics_mock = {
+        "row_count": 20,
+        "val_count": 5,
+        "test_count": 15,
+        "skipped_count": 0,
+    }
     monkeypatch.setattr(mod, "validate_supplemental", lambda **kwargs: metrics_mock)
 
     run_name = "run_supp_resume"
@@ -2719,10 +2838,14 @@ def test_supplemental_success_metrics_emitted(
     ckpt_file = reg_dir / "base.pt"
     ckpt_file.write_bytes(b"baseline")
     reg_file = reg_dir / "model_registry.json"
-    reg_file.write_text(json.dumps({"active": {"checkpoint": str(ckpt_file)}}), encoding="utf-8")
+    reg_file.write_text(
+        json.dumps({"active": {"checkpoint": str(ckpt_file)}}), encoding="utf-8"
+    )
 
     exp_csv = tmp_path / "exp.csv"
-    exp_csv.write_text("split,image_path,scenic_human_mean\nval,1.jpg,5.0\n" * 5, encoding="utf-8")
+    exp_csv.write_text(
+        "split,image_path,scenic_human_mean\nval,1.jpg,5.0\n" * 5, encoding="utf-8"
+    )
     ctrl_csv = tmp_path / "ctrl.csv"
     ctrl_csv.write_text("split,image_path\n", encoding="utf-8")
     ctrl_npz = tmp_path / "ctrl.npz"
@@ -2909,9 +3032,7 @@ def test_fresh_run_validates_all_candidates_and_full_evaluates_winner_once(
     monkeypatch.setattr(sys, "argv", _run_args(env, run_name, max_experiments=5))
     mod.main()
 
-    run_dir = (
-        tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
-    )
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
     exp_records = [
         json.loads(line)
         for line in (run_dir / "experiments.jsonl")
@@ -2945,9 +3066,7 @@ def test_fresh_run_validates_all_candidates_and_full_evaluates_winner_once(
     assert completed[0]["all_gates_pass"] is True
     assert completed[0]["validation_decision_path"]
 
-    summary = json.loads(
-        (run_dir / "final_summary.json").read_text(encoding="utf-8")
-    )
+    summary = json.loads((run_dir / "final_summary.json").read_text(encoding="utf-8"))
     assert summary["run_state"] == "completed"
     assert summary["selected_finalist"]["exp_id"] == "exp_03_robust_huber_loss"
     assert summary["selected_finalist"]["validation_mse"] == 0.20
@@ -2990,17 +3109,13 @@ def test_selection_based_only_on_validation_mse(
     monkeypatch.setattr(sys, "argv", _run_args(env, run_name, max_experiments=2))
     mod.main()
 
-    run_dir = (
-        tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
-    )
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
     assert len(stage_two_calls) == 1
     assert (
         Path(stage_two_calls[0]["candidate_checkpoint"]).parent.name
         == "exp_01_baseline_control"
     )
-    summary = json.loads(
-        (run_dir / "final_summary.json").read_text(encoding="utf-8")
-    )
+    summary = json.loads((run_dir / "final_summary.json").read_text(encoding="utf-8"))
     assert summary["selected_finalist"]["exp_id"] == "exp_01_baseline_control"
     assert summary["selected_finalist"]["validation_mse"] == 0.10
     assert summary["all_gates_pass"] is False
@@ -3065,9 +3180,7 @@ def test_no_full_evaluation_while_any_candidate_paused(
     assert len(stage_two_calls) == 0
     assert len(validation_calls) == 1
 
-    run_dir = (
-        tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
-    )
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
     exp_records = [
         json.loads(line)
         for line in (run_dir / "experiments.jsonl")
@@ -3079,9 +3192,7 @@ def test_no_full_evaluation_while_any_candidate_paused(
     assert by_id["exp_01_baseline_control"]["status"] == "paused"
     assert by_id["exp_02_region_balanced"]["status"] == "validated"
 
-    summary = json.loads(
-        (run_dir / "final_summary.json").read_text(encoding="utf-8")
-    )
+    summary = json.loads((run_dir / "final_summary.json").read_text(encoding="utf-8"))
     assert summary["run_state"] == "paused"
     assert summary["selected_finalist"] is None
     assert summary["all_gates_pass"] is False
@@ -3122,9 +3233,7 @@ def test_legacy_full_eval_without_validation_quarantines_run_on_resume(
     monkeypatch.setattr(sys, "argv", run_args)
     mod.main()
 
-    run_dir = (
-        tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
-    )
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
     lines = [
         json.loads(line)
         for line in (run_dir / "experiments.jsonl")
@@ -3148,12 +3257,8 @@ def test_legacy_full_eval_without_validation_quarantines_run_on_resume(
                     {
                         "all_gates_pass": True,
                         "candidate": {
-                            "checkpoint": str(
-                                run_dir / exp_id / "candidate.pt"
-                            ),
-                            "sha256": compute_sha256(
-                                run_dir / exp_id / "candidate.pt"
-                            ),
+                            "checkpoint": str(run_dir / exp_id / "candidate.pt"),
+                            "sha256": compute_sha256(run_dir / exp_id / "candidate.pt"),
                         },
                         "baseline": {"sha256": "base_sha"},
                     }
@@ -3212,9 +3317,7 @@ def test_legacy_full_eval_without_validation_quarantines_run_on_resume(
     assert len(final_lines) == len(legacy_records)
     assert detect_heldout_test_exposure(final_lines) == exposed
 
-    summary = json.loads(
-        (run_dir / "final_summary.json").read_text(encoding="utf-8")
-    )
+    summary = json.loads((run_dir / "final_summary.json").read_text(encoding="utf-8"))
     assert summary["run_state"] == "rejected"
     assert summary["rejection_reason"] == EXPOSURE_REJECTION_REASON
     assert summary["rejection_reason"] == (
@@ -3238,9 +3341,7 @@ def test_legacy_full_eval_without_validation_quarantines_run_on_resume(
     req_batch = summary["requested_annotation_batch"]
     assert req_batch["min_fresh_test_human_rows"] >= EXPOSURE_MIN_FRESH_TEST_ROWS
     assert req_batch["target_test_human_rows"] >= EXPOSURE_MIN_FRESH_TEST_ROWS
-    assert (
-        req_batch["retained_validation_rows"] == FIXED_VALIDATION_SELECTION_ROWS
-    )
+    assert req_batch["retained_validation_rows"] == FIXED_VALIDATION_SELECTION_ROWS
     assert req_batch["validation_selection_unchanged"] is True
     assert req_batch["overlap_constraints"] == {
         "current_run_test_rows": 0,
@@ -3309,9 +3410,7 @@ def test_resume_reuses_full_evidence_without_rerunning_validation_or_full_eval(
     monkeypatch.setattr(sys, "argv", run_args)
     mod.main()
 
-    run_dir = (
-        tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
-    )
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
     jsonl_path = run_dir / "experiments.jsonl"
     first_run_lines = [
         line
@@ -3331,13 +3430,9 @@ def test_resume_reuses_full_evidence_without_rerunning_validation_or_full_eval(
     assert len(train_calls) == 2
     assert len(validation_calls) == 2
     assert len(stage_two_calls) == 1
-    assert (
-        jsonl_path.read_text(encoding="utf-8").splitlines() == first_run_lines
-    )
+    assert jsonl_path.read_text(encoding="utf-8").splitlines() == first_run_lines
 
-    summary = json.loads(
-        (run_dir / "final_summary.json").read_text(encoding="utf-8")
-    )
+    summary = json.loads((run_dir / "final_summary.json").read_text(encoding="utf-8"))
     assert summary["run_state"] == "completed"
     assert summary["selected_finalist"]["exp_id"] == "exp_01_baseline_control"
     assert summary["selected_finalist"]["full_evaluation"]["all_gates_pass"] is True
@@ -3403,9 +3498,7 @@ def test_clean_run_resume_remains_promotion_eligible(
     monkeypatch.setattr(sys, "argv", run_args)
     mod.main()
 
-    run_dir = (
-        tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
-    )
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
     jsonl_path = run_dir / "experiments.jsonl"
     first_run_lines = [
         line
@@ -3429,13 +3522,9 @@ def test_clean_run_resume_remains_promotion_eligible(
     assert len(train_calls) == 2
     assert len(validation_calls) == 2
     assert len(stage_two_calls) == 1
-    assert (
-        jsonl_path.read_text(encoding="utf-8").splitlines() == first_run_lines
-    )
+    assert jsonl_path.read_text(encoding="utf-8").splitlines() == first_run_lines
 
-    summary = json.loads(
-        (run_dir / "final_summary.json").read_text(encoding="utf-8")
-    )
+    summary = json.loads((run_dir / "final_summary.json").read_text(encoding="utf-8"))
     assert summary["run_state"] == "completed"
     assert summary["promotion_evidence_valid"] is True
     assert summary["heldout_test_exposure"] == {
@@ -3458,3 +3547,1341 @@ def test_clean_run_resume_remains_promotion_eligible(
     assert decision["all_gates_pass"] is True
     assert decision["retained_candidate"] is not None
     assert decision["registry_status"] == "unchanged"  # --promote not requested
+
+
+def test_human_finetune_candidate_ladder_four_configs() -> None:
+    ladder = build_human_finetune_candidate_ladder(
+        baseline_checkpoint_path="baseline.pt",
+        baseline_checkpoint_sha256="base_sha256",
+        max_experiments=4,
+        seed=42,
+        device="cpu",
+    )
+    assert len(ladder) == 4
+    exp_ids = [cand["exp_id"] for cand in ladder]
+    assert exp_ids == [
+        "exp_01_human_only_mse_lr1e5",
+        "exp_02_human_only_mse_lr5e5",
+        "exp_03_human_only_mse_lr1e4",
+        "exp_04_human_only_huber_lr5e5",
+    ]
+
+    # Verify configs
+    c1 = ladder[0]["config"]
+    assert getattr(c1, "human_only_training", False) is True
+    assert getattr(c1, "batch_size", 256) == 32
+    assert getattr(c1, "epochs", 5) == 20
+    assert getattr(c1, "learning_rate", 5e-5) == 1e-5
+    assert getattr(c1, "seed", 42) == 42
+    assert getattr(c1, "loss_function", "mse") == "mse"
+
+    c2 = ladder[1]["config"]
+    assert getattr(c2, "learning_rate", 5e-5) == 5e-5
+
+    c3 = ladder[2]["config"]
+    assert getattr(c3, "learning_rate", 5e-5) == 1e-4
+
+    c4 = ladder[3]["config"]
+    assert getattr(c4, "learning_rate", 5e-5) == 5e-5
+    assert getattr(c4, "loss_function", "huber") == "huber"
+
+
+def test_human_finetune_mode_cli_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Test --mode human_finetune with --promote is rejected
+    test_args = [
+        "run_active_scenic_autoresearch.py",
+        "--mode",
+        "human_finetune",
+        "--promote",
+        "--expanded-benchmark-csv",
+        "exp.csv",
+        "--control-benchmark-csv",
+        "ctrl.csv",
+        "--control-dataset",
+        "ctrl.csv",
+        "--route-qa-json",
+        "route.json",
+        "--supplemental-annotations",
+        "supp.csv",
+        "--supplemental-annotations-sha256",
+        "a" * 64,
+        "--supplemental-benchmark-sha256",
+        "b" * 64,
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+    with pytest.raises(ValueError, match="strictly forbidden in human_finetune mode"):
+        parse_args()
+
+    # Test --mode human_finetune without supplemental flags is rejected
+    missing_supp_args = [
+        "run_active_scenic_autoresearch.py",
+        "--mode",
+        "human_finetune",
+        "--expanded-benchmark-csv",
+        "exp.csv",
+        "--control-benchmark-csv",
+        "ctrl.csv",
+        "--control-dataset",
+        "ctrl.csv",
+        "--route-qa-json",
+        "route.json",
+    ]
+    monkeypatch.setattr(sys, "argv", missing_supp_args)
+    with pytest.raises(ValueError, match="requires --supplemental-annotations"):
+        parse_args()
+
+
+def test_human_finetune_orchestrator_execution_and_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+
+    env = _build_run_env(tmp_path)
+    run_name = "test_human_finetune_run"
+
+    # Mocks
+    train_calls = []
+    validation_calls = []
+    stage_two_calls = []
+    promo_calls = []
+
+    def _mock_train(dataset_path, split_csv, output_dir, config, resume):
+        train_calls.append((output_dir.name, config))
+        ckpt = output_dir / "candidate_model.pt"
+        ckpt.write_bytes(f"ckpt_{output_dir.name}".encode("utf-8"))
+        return {
+            "state": "completed",
+            "candidate_checkpoint": str(ckpt),
+            "candidate_checkpoint_sha256": compute_sha256(ckpt),
+            "metrics": {"train_loss": 0.01},
+        }
+
+    def _mock_val_eval(
+        dataset_path,
+        candidate_checkpoint,
+        baseline_checkpoint,
+        expanded_benchmark_csv,
+        output_path,
+        min_supported_slice_samples=5,
+        device=None,
+    ):
+        exp_id = Path(candidate_checkpoint).parent.name
+        validation_calls.append(exp_id)
+
+        # MSE values for deterministic selection: exp_03 has lowest MSE (0.02)
+        mse_map = {
+            "exp_01_human_only_mse_lr1e5": 0.08,
+            "exp_02_human_only_mse_lr5e5": 0.05,
+            "exp_03_human_only_mse_lr1e4": 0.02,
+            "exp_04_human_only_huber_lr5e5": 0.03,
+        }
+        mse_val = mse_map.get(exp_id, 0.10)
+        res = {
+            "candidate": {
+                "checkpoint": str(candidate_checkpoint),
+                "sha256": compute_sha256(candidate_checkpoint),
+            },
+            "baseline": {
+                "checkpoint": str(baseline_checkpoint),
+                "sha256": compute_sha256(baseline_checkpoint),
+            },
+            "candidate_metrics": {"mse": mse_val, "samples": 64},
+            "mse_improvement": 0.01,
+        }
+        Path(output_path).write_text(json.dumps(res), encoding="utf-8")
+        return res
+
+    def _mock_stage_two(*args, **kwargs):
+        stage_two_calls.append(args)
+        raise AssertionError(
+            "evaluate_stage_two must NEVER be called in human_finetune mode"
+        )
+
+    def _mock_promote(*args, **kwargs):
+        promo_calls.append(args)
+        raise AssertionError(
+            "promote_from_decision must NEVER be called in human_finetune mode"
+        )
+
+    monkeypatch.setattr(mod, "train_active_model", _mock_train)
+    monkeypatch.setattr(mod, "evaluate_candidate_validation", _mock_val_eval)
+    monkeypatch.setattr(mod, "evaluate_stage_two", _mock_stage_two)
+    monkeypatch.setattr(mod, "promote_from_decision", _mock_promote)
+    monkeypatch.setattr(mod, "count_expanded_val_samples", lambda p: 64)
+    monkeypatch.setattr(
+        mod,
+        "validate_supplemental",
+        lambda **kwargs: {
+            "supplemental_benchmark_valid": 1,
+            "supplemental_rows": 5,
+            "supplemental_val_rows": 5,
+            "supplemental_test_rows": 0,
+            "supplemental_skipped_rows": 0,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "prepare_active_dataset",
+        lambda handoff, output, **kwargs: _mock_prepare(
+            handoff,
+            output,
+            supplemental_benchmark_sha256=kwargs.get("supplemental_benchmark_sha256"),
+        ),
+    )
+
+    run_args = [
+        "run_active_scenic_autoresearch.py",
+        "--mode",
+        "human_finetune",
+        "--handoff",
+        str(env["handoff"]),
+        "--run-name",
+        run_name,
+        "--max-experiments",
+        "4",
+        "--expanded-benchmark-csv",
+        str(env["expanded_benchmark"]),
+        "--control-benchmark-csv",
+        str(env["control_benchmark"]),
+        "--control-dataset",
+        str(env["control_dataset"]),
+        "--route-qa-json",
+        str(env["route_qa"]),
+        "--thresholds-json",
+        str(env["thresholds"]),
+        "--supplemental-annotations",
+        str(env["supplemental_annotations"]),
+        "--supplemental-annotations-sha256",
+        env["supplemental_annotations_sha256"],
+        "--supplemental-benchmark-sha256",
+        env["supplemental_benchmark_sha256"],
+    ]
+
+    monkeypatch.setattr(sys, "argv", run_args)
+    mod.main()
+
+    # Proof: No full evaluation or promotion calls were made
+    assert len(stage_two_calls) == 0
+    assert len(promo_calls) == 0
+    # 4 ladder candidates + 1 canonical seed+1 confirmation run
+    assert len(train_calls) == 5
+    assert len(validation_calls) == 5
+    assert "exp_05_confirmation_seed43" in [c[0] for c in train_calls]
+
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+
+    # Check final summary artifact
+    summary = json.loads((run_dir / "final_summary.json").read_text(encoding="utf-8"))
+    assert summary["mode"] == "human_finetune"
+    assert summary["strategy"] == "human_finetune_validation_only"
+    assert summary["run_state"] == "validation_only_complete"
+    assert summary["promoted"] is False
+    assert summary["registry_status"] == "unchanged"
+    assert summary["rejection_reason"] == "fresh_heldout_test_required"
+    assert summary["selected_finalist"] is not None
+    assert summary["selected_finalist"]["exp_id"] == "exp_03_human_only_mse_lr1e4"
+    assert (
+        summary["best_validation_candidate"]["exp_id"] == "exp_03_human_only_mse_lr1e4"
+    )
+    assert summary["pending_final_evaluation"] is True
+    assert summary["selected_finalist"]["validation_mse"] == 0.02
+    assert summary["requested_annotation_batch"]["target_test_human_rows"] == 20
+    assert (
+        summary["requested_annotation_batch"]["sampling_strategy"]
+        == "fresh_geographically_isolated_test_labels"
+    )
+
+    # Check promotion decision artifact
+    decision = json.loads(
+        (run_dir / "promotion_decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["mode"] == "human_finetune"
+    assert decision["state"] == "validation_only_complete"
+    assert decision["promoted"] is False
+    assert decision["registry_status"] == "unchanged"
+    assert decision["selected_finalist_exp_id"] == "exp_03_human_only_mse_lr1e4"
+    assert decision["best_validation_candidate_exp_id"] == "exp_03_human_only_mse_lr1e4"
+    assert decision["validation_mse"] == 0.02
+    assert decision["rejection_reason"] == "fresh_heldout_test_required"
+
+    # Canonical seed+1 confirmation evidence is generated, bound, and gating.
+    conf_summary = json.loads(
+        (run_dir / "confirmation_summary.json").read_text(encoding="utf-8")
+    )
+    assert conf_summary["state"] == "passed"
+    assert conf_summary["confirmation_seed"] == 43
+    assert conf_summary["source_exp_id"] == "exp_03_human_only_mse_lr1e4"
+    assert conf_summary["source_config"]["seed"] == 42
+    assert conf_summary["heldout_test_evaluated"] is False
+    assert conf_summary["mse_improvement"] == 0.01
+    assert conf_summary["baseline_checkpoint_sha256"] == compute_sha256(
+        env["baseline_ckpt"]
+    )
+    assert conf_summary["expanded_benchmark_sha256"] == compute_sha256(
+        env["expanded_benchmark"]
+    )
+    assert (
+        conf_summary["supplemental_benchmark_sha256"]
+        == env["supplemental_benchmark_sha256"]
+    )
+    assert summary["confirmation_seed"] == 43
+    assert summary["confirmation_passed"] is True
+    assert summary["confirmation_seed_failed"] is False
+    assert decision["confirmation_seed"] == 43
+    assert decision["confirmation_passed"] is True
+    assert decision["confirmation_seed_failed"] is False
+
+    # Prepared-dataset provenance manifest exists for verified resume reuse.
+    prep_manifest = json.loads(
+        (run_dir / "prepared_dataset_manifest.json").read_text(encoding="utf-8")
+    )
+    assert prep_manifest["mode"] == "human_finetune"
+    assert prep_manifest["dataset_sha256"] == compute_sha256(
+        run_dir / "prepared_dataset.npz"
+    )
+    assert (
+        prep_manifest["preparation_evidence"]["supplemental_benchmark"]["sha256"]
+        == env["supplemental_benchmark_sha256"]
+    )
+
+
+def test_human_finetune_orchestrator_no_validation_improvement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+
+    env = _build_run_env(tmp_path)
+    run_name = "test_human_finetune_no_improve_run"
+
+    train_calls = []
+    validation_calls = []
+
+    def _mock_train(dataset_path, split_csv, output_dir, config, resume):
+        train_calls.append(output_dir.name)
+        ckpt = output_dir / "candidate_model.pt"
+        ckpt.write_bytes(f"ckpt_{output_dir.name}".encode("utf-8"))
+        return {
+            "state": "completed",
+            "candidate_checkpoint": str(ckpt),
+            "candidate_checkpoint_sha256": compute_sha256(ckpt),
+            "metrics": {"train_loss": 0.05},
+        }
+
+    def _mock_val_eval(
+        dataset_path,
+        candidate_checkpoint,
+        baseline_checkpoint,
+        expanded_benchmark_csv,
+        output_path,
+        min_supported_slice_samples=5,
+        device=None,
+    ):
+        exp_id = Path(candidate_checkpoint).parent.name
+        validation_calls.append(exp_id)
+        res = {
+            "candidate": {
+                "checkpoint": str(candidate_checkpoint),
+                "sha256": compute_sha256(candidate_checkpoint),
+            },
+            "baseline": {
+                "checkpoint": str(baseline_checkpoint),
+                "sha256": compute_sha256(baseline_checkpoint),
+            },
+            "candidate_metrics": {"mse": 2.92},
+            "mse_improvement": -0.48,
+        }
+        Path(output_path).write_text(json.dumps(res), encoding="utf-8")
+        return res
+
+    monkeypatch.setattr(mod, "train_active_model", _mock_train)
+    monkeypatch.setattr(mod, "evaluate_candidate_validation", _mock_val_eval)
+    monkeypatch.setattr(
+        mod,
+        "evaluate_stage_two",
+        lambda *a, **k: pytest.fail("Should not call evaluate_stage_two"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "promote_from_decision",
+        lambda *a, **k: pytest.fail("Should not call promote"),
+    )
+    monkeypatch.setattr(mod, "count_expanded_val_samples", lambda p: 64)
+    monkeypatch.setattr(
+        mod,
+        "validate_supplemental",
+        lambda **kwargs: {
+            "supplemental_benchmark_valid": 1,
+            "supplemental_rows": 5,
+            "supplemental_val_rows": 5,
+            "supplemental_test_rows": 0,
+            "supplemental_skipped_rows": 0,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "prepare_active_dataset",
+        lambda handoff, output, **kwargs: _mock_prepare(
+            handoff,
+            output,
+            supplemental_benchmark_sha256=kwargs.get("supplemental_benchmark_sha256"),
+        ),
+    )
+
+    run_args = [
+        "run_active_scenic_autoresearch.py",
+        "--mode",
+        "human_finetune",
+        "--handoff",
+        str(env["handoff"]),
+        "--run-name",
+        run_name,
+        "--max-experiments",
+        "4",
+        "--expanded-benchmark-csv",
+        str(env["expanded_benchmark"]),
+        "--control-benchmark-csv",
+        str(env["control_benchmark"]),
+        "--control-dataset",
+        str(env["control_dataset"]),
+        "--route-qa-json",
+        str(env["route_qa"]),
+        "--thresholds-json",
+        str(env["thresholds"]),
+        "--supplemental-annotations",
+        str(env["supplemental_annotations"]),
+        "--supplemental-annotations-sha256",
+        env["supplemental_annotations_sha256"],
+        "--supplemental-benchmark-sha256",
+        env["supplemental_benchmark_sha256"],
+    ]
+
+    monkeypatch.setattr(sys, "argv", run_args)
+    mod.main()
+
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    summary = json.loads((run_dir / "final_summary.json").read_text(encoding="utf-8"))
+    assert summary["run_state"] == "validation_only_complete"
+    assert summary["promoted"] is False
+    assert summary["pending_final_evaluation"] is False
+    assert summary["rejection_reason"] == "no_validation_improvement"
+    assert summary["selected_finalist"] is None
+    assert summary["best_validation_candidate"] is not None
+    assert summary["requested_annotation_batch"] is None
+
+    decision = json.loads(
+        (run_dir / "promotion_decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["rejection_reason"] == "no_validation_improvement"
+    assert decision["selected_finalist_exp_id"] is None
+    assert decision["best_validation_candidate_exp_id"] is not None
+    assert decision["requested_annotation_batch"] is None
+
+    # Without a positive best-candidate improvement no confirmation is attempted
+    # and the terminal artifacts still carry the confirmation fields.
+    assert not (run_dir / "confirmation_summary.json").exists()
+    assert summary["confirmation_seed"] is None
+    assert summary["confirmation_passed"] is None
+    assert summary["confirmation_seed_failed"] is False
+    assert decision["confirmation_seed"] is None
+    assert decision["confirmation_passed"] is None
+
+
+def test_human_finetune_resume_behavior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+
+    env = _build_run_env(tmp_path)
+    run_name = "test_human_finetune_resume_run"
+
+    train_calls = []
+    val_calls = []
+
+    def _mock_train(dataset_path, split_csv, output_dir, config, resume):
+        train_calls.append(output_dir.name)
+        ckpt = output_dir / "candidate_model.pt"
+        ckpt.write_bytes(f"ckpt_{output_dir.name}".encode("utf-8"))
+        return {
+            "state": "completed",
+            "candidate_checkpoint": str(ckpt),
+            "candidate_checkpoint_sha256": compute_sha256(ckpt),
+        }
+
+    def _mock_val_eval(
+        dataset_path,
+        candidate_checkpoint,
+        baseline_checkpoint,
+        expanded_benchmark_csv,
+        output_path,
+        **kwargs,
+    ):
+        exp_id = Path(candidate_checkpoint).parent.name
+        val_calls.append(exp_id)
+        res = {
+            "candidate": {
+                "checkpoint": str(candidate_checkpoint),
+                "sha256": compute_sha256(candidate_checkpoint),
+            },
+            "baseline": {
+                "checkpoint": str(baseline_checkpoint),
+                "sha256": compute_sha256(baseline_checkpoint),
+            },
+            "candidate_metrics": {"mse": 0.04},
+            "mse_improvement": 0.01,
+        }
+        Path(output_path).write_text(json.dumps(res), encoding="utf-8")
+        return res
+
+    monkeypatch.setattr(mod, "train_active_model", _mock_train)
+    monkeypatch.setattr(mod, "evaluate_candidate_validation", _mock_val_eval)
+    monkeypatch.setattr(
+        mod,
+        "evaluate_stage_two",
+        lambda *a, **k: pytest.fail("Should not call evaluate_stage_two"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "promote_from_decision",
+        lambda *a, **k: pytest.fail("Should not call promote"),
+    )
+    monkeypatch.setattr(mod, "count_expanded_val_samples", lambda p: 64)
+    monkeypatch.setattr(
+        mod,
+        "validate_supplemental",
+        lambda **kwargs: {
+            "supplemental_benchmark_valid": 1,
+            "supplemental_rows": 5,
+            "supplemental_val_rows": 5,
+            "supplemental_test_rows": 0,
+            "supplemental_skipped_rows": 0,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "prepare_active_dataset",
+        lambda handoff, output, **kwargs: _mock_prepare(
+            handoff,
+            output,
+            supplemental_benchmark_sha256=kwargs.get("supplemental_benchmark_sha256"),
+        ),
+    )
+
+    run_args = [
+        "run_active_scenic_autoresearch.py",
+        "--mode",
+        "human_finetune",
+        "--handoff",
+        str(env["handoff"]),
+        "--run-name",
+        run_name,
+        "--max-experiments",
+        "4",
+        "--expanded-benchmark-csv",
+        str(env["expanded_benchmark"]),
+        "--control-benchmark-csv",
+        str(env["control_benchmark"]),
+        "--control-dataset",
+        str(env["control_dataset"]),
+        "--route-qa-json",
+        str(env["route_qa"]),
+        "--thresholds-json",
+        str(env["thresholds"]),
+        "--supplemental-annotations",
+        str(env["supplemental_annotations"]),
+        "--supplemental-annotations-sha256",
+        env["supplemental_annotations_sha256"],
+        "--supplemental-benchmark-sha256",
+        env["supplemental_benchmark_sha256"],
+    ]
+
+    # Initial run
+    monkeypatch.setattr(sys, "argv", run_args)
+    mod.main()
+
+    assert len(train_calls) == 5
+    assert len(val_calls) == 5
+    assert "exp_05_confirmation_seed43" in val_calls
+
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    conf_path = run_dir / "confirmation_summary.json"
+    assert conf_path.is_file()
+    conf_before = conf_path.read_text(encoding="utf-8")
+    summary_before = json.loads(
+        (run_dir / "final_summary.json").read_text(encoding="utf-8")
+    )
+
+    # Resume run: nothing retrained or re-evaluated
+    monkeypatch.setattr(sys, "argv", run_args + ["--resume"])
+    mod.main()
+
+    assert len(train_calls) == 5
+    assert len(val_calls) == 5
+
+    summary = json.loads((run_dir / "final_summary.json").read_text(encoding="utf-8"))
+    assert summary["run_state"] == "validation_only_complete"
+    assert summary["mode"] == "human_finetune"
+    # Confirmation evidence is preserved byte-for-byte on an unchanged resume.
+    assert conf_path.read_text(encoding="utf-8") == conf_before
+    assert summary["confirmation_seed"] == 43
+    assert summary["confirmation_passed"] is True
+    assert summary["confirmation_seed_failed"] is False
+    assert summary["confirmation_seed"] == summary_before["confirmation_seed"]
+    assert summary["confirmation_passed"] == summary_before["confirmation_passed"]
+
+    # Test manifest mode mismatch on resume (attempting standard mode on human_finetune run)
+    mismatch_args = [a for a in run_args if a not in ("--mode", "human_finetune")] + [
+        "--resume"
+    ]
+    monkeypatch.setattr(sys, "argv", mismatch_args)
+    with pytest.raises(ValueError, match="mode mismatch"):
+        mod.main()
+
+
+def _install_human_mocks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    train_calls: list[str],
+    val_calls: list[str],
+    mse_by_exp: dict[str, float],
+    improvement_by_exp: dict[str, float],
+) -> dict[str, Any]:
+    """Install the standard human_finetune mocks; returns the run env."""
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    env = _build_run_env(tmp_path)
+
+    def _mock_train(dataset_path, split_csv, output_dir, config, resume):
+        train_calls.append(output_dir.name)
+        ckpt = output_dir / "candidate.pt"
+        ckpt.write_bytes(f"ckpt_{output_dir.name}".encode("utf-8"))
+        return {
+            "state": "completed",
+            "candidate_checkpoint": str(ckpt),
+            "candidate_checkpoint_sha256": compute_sha256(ckpt),
+            "metrics": {"train_loss": 0.01},
+        }
+
+    def _mock_val_eval(
+        dataset_path,
+        candidate_checkpoint,
+        baseline_checkpoint,
+        expanded_benchmark_csv,
+        output_path,
+        min_supported_slice_samples=5,
+        device=None,
+    ):
+        exp_id = Path(candidate_checkpoint).parent.name
+        val_calls.append(exp_id)
+        mse = float(mse_by_exp.get(exp_id, 0.5))
+        improvement = float(improvement_by_exp.get(exp_id, 0.0))
+        res = {
+            "candidate": {
+                "checkpoint": str(candidate_checkpoint),
+                "sha256": compute_sha256(candidate_checkpoint),
+            },
+            "baseline": {
+                "checkpoint": str(baseline_checkpoint),
+                "sha256": compute_sha256(baseline_checkpoint),
+            },
+            "candidate_metrics": {"mse": mse, "samples": 64},
+            "mse_improvement": improvement,
+        }
+        Path(output_path).write_text(json.dumps(res), encoding="utf-8")
+        return res
+
+    monkeypatch.setattr(mod, "train_active_model", _mock_train)
+    monkeypatch.setattr(mod, "evaluate_candidate_validation", _mock_val_eval)
+    monkeypatch.setattr(
+        mod,
+        "evaluate_stage_two",
+        lambda *a, **k: pytest.fail(
+            "evaluate_stage_two must never run in human_finetune mode"
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "promote_from_decision",
+        lambda *a, **k: pytest.fail(
+            "promote_from_decision must never run in human_finetune mode"
+        ),
+    )
+    monkeypatch.setattr(mod, "count_expanded_val_samples", lambda p: 64)
+    monkeypatch.setattr(
+        mod,
+        "validate_supplemental",
+        lambda **kwargs: {
+            "supplemental_benchmark_valid": 1,
+            "supplemental_rows": 5,
+            "supplemental_val_rows": 5,
+            "supplemental_test_rows": 0,
+            "supplemental_skipped_rows": 0,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "prepare_active_dataset",
+        lambda handoff, output, **kwargs: _mock_prepare(
+            handoff,
+            output,
+            supplemental_benchmark_sha256=kwargs.get("supplemental_benchmark_sha256"),
+        ),
+    )
+    return env
+
+
+def _human_run_args(env: dict[str, Any], run_name: str) -> list[str]:
+    return [
+        "run_active_scenic_autoresearch.py",
+        "--mode",
+        "human_finetune",
+        "--handoff",
+        str(env["handoff"]),
+        "--run-name",
+        run_name,
+        "--max-experiments",
+        "4",
+        "--expanded-benchmark-csv",
+        str(env["expanded_benchmark"]),
+        "--control-benchmark-csv",
+        str(env["control_benchmark"]),
+        "--control-dataset",
+        str(env["control_dataset"]),
+        "--route-qa-json",
+        str(env["route_qa"]),
+        "--thresholds-json",
+        str(env["thresholds"]),
+        "--supplemental-annotations",
+        str(env["supplemental_annotations"]),
+        "--supplemental-annotations-sha256",
+        env["supplemental_annotations_sha256"],
+        "--supplemental-benchmark-sha256",
+        env["supplemental_benchmark_sha256"],
+    ]
+
+
+def _write_valid_prepared_manifest(root: Path) -> tuple[Path, dict[str, Any]]:
+    """Create a valid prepared dataset manifest fixture under root."""
+    run_dir = root / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dataset = run_dir / "prepared_dataset.npz"
+    dataset.write_bytes(b"dataset_npz_data")
+    split = run_dir / "prepared_split.csv"
+    split.write_text("split,image_path\n", encoding="utf-8")
+    handoff = root / "stage1_handoff.json"
+    handoff.write_text("{}", encoding="utf-8")
+    handoff_sha = compute_sha256(handoff)
+    supp_sha = "b" * 64
+    info = {
+        "dataset_path": str(dataset),
+        "dataset_sha256": compute_sha256(dataset),
+        "split_path": str(split),
+        "split_sha256": compute_sha256(split),
+        "handoff_sha256": handoff_sha,
+        "changed_rows": 1,
+        "counts": {
+            "rows": 6,
+            "train": 1,
+            "val": 5,
+            "test": 0,
+            "human": 1,
+            "weak": 5,
+        },
+        "supplemental_benchmark": {
+            "path": "supp.csv",
+            "sha256": supp_sha,
+            "expected_sha256": supp_sha,
+            "rows": 6,
+            "train": 1,
+            "val": 5,
+            "test": 0,
+        },
+    }
+    manifest_path = run_dir / "prepared_dataset_manifest.json"
+    write_prepared_dataset_manifest(
+        manifest_path,
+        run_name="run_x",
+        handoff_sha256=handoff_sha,
+        supplemental_benchmark_sha256=supp_sha,
+        dataset_info=info,
+    )
+    return manifest_path, {
+        "run_name": "run_x",
+        "handoff_sha256": handoff_sha,
+        "supplemental_benchmark_sha256": supp_sha,
+    }
+
+
+def test_human_finetune_prepared_manifest_valid_reuse(tmp_path: Path) -> None:
+    manifest_path, env_vals = _write_valid_prepared_manifest(tmp_path / "valid")
+    run_dir = manifest_path.parent
+    result = validate_prepared_dataset_manifest(
+        manifest_path,
+        run_name=env_vals["run_name"],
+        handoff_sha256=env_vals["handoff_sha256"],
+        supplemental_benchmark_sha256=env_vals["supplemental_benchmark_sha256"],
+        expected_dataset_path=run_dir / "prepared_dataset.npz",
+        run_dir=run_dir,
+    )
+    assert result["dataset_sha256"] == compute_sha256(run_dir / "prepared_dataset.npz")
+    assert result["split_sha256"] == compute_sha256(run_dir / "prepared_split.csv")
+    assert result["split_path"] == str(run_dir / "prepared_split.csv")
+
+
+def test_human_finetune_prepared_manifest_missing_fails_closed(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    missing = run_dir / "prepared_dataset_manifest.json"
+    with pytest.raises(FileNotFoundError, match="prepared dataset manifest missing"):
+        validate_prepared_dataset_manifest(
+            missing,
+            run_name="run_x",
+            handoff_sha256="a" * 64,
+            supplemental_benchmark_sha256="b" * 64,
+            expected_dataset_path=run_dir / "prepared_dataset.npz",
+            run_dir=run_dir,
+        )
+
+
+def test_human_finetune_prepared_manifest_tampering_fails_closed(
+    tmp_path: Path,
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    def _validate(root: Path, **overrides) -> tuple[Path, dict[str, Any]]:
+        manifest_path, env_vals = _write_valid_prepared_manifest(root)
+        run_dir = manifest_path.parent
+        kwargs = dict(
+            run_name=env_vals["run_name"],
+            handoff_sha256=env_vals["handoff_sha256"],
+            supplemental_benchmark_sha256=env_vals["supplemental_benchmark_sha256"],
+            expected_dataset_path=run_dir / "prepared_dataset.npz",
+            run_dir=run_dir,
+        )
+        kwargs.update(overrides)
+        return manifest_path, kwargs
+
+    # dataset file content tampered -> real file hash mismatch
+    manifest_path, kwargs = _validate(tmp_path / "s1")
+    (manifest_path.parent / "prepared_dataset.npz").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="Prepared dataset SHA-256 mismatch"):
+        validate_prepared_dataset_manifest(manifest_path, **kwargs)
+
+    # recorded dataset_sha256 tampered -> mismatch against real file
+    manifest_path, kwargs = _validate(tmp_path / "s2")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["dataset_sha256"] = "f" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        validate_prepared_dataset_manifest(manifest_path, **kwargs)
+
+    # mode tampered
+    manifest_path, kwargs = _validate(tmp_path / "s3")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["mode"] = "standard"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="mode mismatch"):
+        validate_prepared_dataset_manifest(manifest_path, **kwargs)
+
+    # input binding mismatch: Stage-One handoff SHA
+    manifest_path, kwargs = _validate(tmp_path / "s4")
+    kwargs["handoff_sha256"] = "a" * 64
+    with pytest.raises(ValueError, match="stage1_handoff_sha256 mismatch"):
+        validate_prepared_dataset_manifest(manifest_path, **kwargs)
+
+    # input binding mismatch: supplemental benchmark SHA
+    manifest_path, kwargs = _validate(tmp_path / "s5")
+    kwargs["supplemental_benchmark_sha256"] = "c" * 64
+    with pytest.raises(ValueError, match="supplemental_benchmark_sha256 mismatch"):
+        validate_prepared_dataset_manifest(manifest_path, **kwargs)
+
+    # split sidecar deleted -> missing file fails closed
+    manifest_path, kwargs = _validate(tmp_path / "s6")
+    (manifest_path.parent / "prepared_split.csv").unlink()
+    with pytest.raises(ValueError, match="prepared split file missing"):
+        validate_prepared_dataset_manifest(manifest_path, **kwargs)
+
+    # preparation evidence (merged train identity) stripped
+    manifest_path, kwargs = _validate(tmp_path / "s7")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["preparation_evidence"] = {}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="preparation_evidence"):
+        validate_prepared_dataset_manifest(manifest_path, **kwargs)
+
+    # malformed JSON fails closed
+    manifest_path, kwargs = _validate(tmp_path / "s8")
+    manifest_path.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid JSON"):
+        validate_prepared_dataset_manifest(manifest_path, **kwargs)
+
+    # prepared dataset file itself missing
+    manifest_path, kwargs = _validate(tmp_path / "s9")
+    (manifest_path.parent / "prepared_dataset.npz").unlink()
+    with pytest.raises(ValueError, match="prepared dataset file missing"):
+        validate_prepared_dataset_manifest(manifest_path, **kwargs)
+
+    assert confirmation_exp_id(42) == "exp_05_confirmation_seed42"
+    assert mod.PREPARED_DATASET_MANIFEST_SCHEMA_VERSION == 1
+
+
+def _valid_confirmation_fixture(root: Path) -> tuple[Path, dict[str, Any]]:
+    """Create a valid passed confirmation summary fixture under root."""
+    run_dir = root / "run"
+    conf_dir = run_dir / "exp_05_confirmation_seed43"
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = conf_dir / "candidate.pt"
+    ckpt.write_bytes(b"confirmation_candidate")
+    ckpt_sha = compute_sha256(ckpt)
+    base_sha = "base" * 16
+    val_path = conf_dir / "validation_decision.json"
+    val_data = {
+        "candidate": {"checkpoint": str(ckpt), "sha256": ckpt_sha},
+        "baseline": {"checkpoint": "base.pt", "sha256": base_sha},
+        "candidate_metrics": {"mse": 1.1, "samples": 64},
+        "mse_improvement": 0.4,
+    }
+    val_path.write_text(json.dumps(val_data), encoding="utf-8")
+    summary = {
+        "schema_version": 1,
+        "state": "passed",
+        "confirmation_seed": 43,
+        "source_exp_id": "exp_03_human_only_mse_lr1e4",
+        "source_config": {"seed": 42, "learning_rate": 1e-4},
+        "candidate_checkpoint": str(ckpt),
+        "candidate_checkpoint_sha256": ckpt_sha,
+        "validation_decision_path": str(val_path),
+        "validation_metrics": {"mse": 1.1, "samples": 64},
+        "mse_improvement": 0.4,
+        "baseline_checkpoint_sha256": base_sha,
+        "dataset_sha256": "d" * 64,
+        "expanded_benchmark_sha256": "e" * 64,
+        "supplemental_benchmark_sha256": "s" * 64,
+        "handoff_sha256": "h" * 64,
+        "heldout_test_evaluated": False,
+    }
+    summary_path = run_dir / "confirmation_summary.json"
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    expected = {
+        "expected_seed": 43,
+        "source_exp_id": "exp_03_human_only_mse_lr1e4",
+        "baseline_checkpoint_sha256": base_sha,
+        "dataset_sha256": "d" * 64,
+        "expanded_benchmark_sha256": "e" * 64,
+        "supplemental_benchmark_sha256": "s" * 64,
+        "handoff_sha256": "h" * 64,
+    }
+    return summary_path, expected
+
+
+def test_human_finetune_confirmation_summary_valid_reuse(tmp_path: Path) -> None:
+    summary_path, expected = _valid_confirmation_fixture(tmp_path / "valid")
+    result = validate_confirmation_summary(summary_path, **expected)
+    assert result["state"] == "passed"
+    assert result["confirmation_seed"] == 43
+    assert result["heldout_test_evaluated"] is False
+
+
+def test_human_finetune_confirmation_summary_tampering_fails_closed(
+    tmp_path: Path,
+) -> None:
+    # candidate checkpoint content tampered -> real hash mismatch
+    summary_path, expected = _valid_confirmation_fixture(tmp_path / "s1")
+    ckpt = Path(json.loads(summary_path.read_text())["candidate_checkpoint"])
+    ckpt.write_bytes(b"tampered_candidate")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        validate_confirmation_summary(summary_path, **expected)
+
+    # recorded candidate hash tampered
+    summary_path, expected = _valid_confirmation_fixture(tmp_path / "s2")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["candidate_checkpoint_sha256"] = "f" * 64
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        validate_confirmation_summary(summary_path, **expected)
+
+    # seed binding mismatch
+    summary_path, expected = _valid_confirmation_fixture(tmp_path / "s3")
+    expected["expected_seed"] = 44
+    with pytest.raises(ValueError, match="confirmation_seed mismatch"):
+        validate_confirmation_summary(summary_path, **expected)
+
+    # state flipped passed -> failed while improvement is positive
+    summary_path, expected = _valid_confirmation_fixture(tmp_path / "s4")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["state"] = "failed"
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    with pytest.raises(
+        ValueError, match="state=failed but mse_improvement is positive"
+    ):
+        validate_confirmation_summary(summary_path, **expected)
+
+    # non-finite validation metrics
+    summary_path, expected = _valid_confirmation_fixture(tmp_path / "s5")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["validation_metrics"]["mse"] = float("nan")
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    with pytest.raises(ValueError, match="not finite"):
+        validate_confirmation_summary(summary_path, **expected)
+
+    # validation decision artifact tampered (candidate hash)
+    summary_path, expected = _valid_confirmation_fixture(tmp_path / "s6")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    val_path = Path(summary["validation_decision_path"])
+    val_data = json.loads(val_path.read_text(encoding="utf-8"))
+    val_data["candidate"]["sha256"] = "e" * 64
+    val_path.write_text(json.dumps(val_data), encoding="utf-8")
+    with pytest.raises(
+        ValueError, match="validation decision candidate hash does not match"
+    ):
+        validate_confirmation_summary(summary_path, **expected)
+
+    # candidate checkpoint deleted
+    summary_path, expected = _valid_confirmation_fixture(tmp_path / "s7")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    Path(summary["candidate_checkpoint"]).unlink()
+    with pytest.raises(ValueError, match="candidate checkpoint missing"):
+        validate_confirmation_summary(summary_path, **expected)
+
+
+def test_human_finetune_confirmation_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    train_calls: list[str] = []
+    val_calls: list[str] = []
+    mse_by_exp = {
+        "exp_01_human_only_mse_lr1e5": 0.08,
+        "exp_02_human_only_mse_lr5e5": 0.05,
+        "exp_03_human_only_mse_lr1e4": 0.02,
+        "exp_04_human_only_huber_lr5e5": 0.03,
+        "exp_05_confirmation_seed43": 0.015,
+    }
+    improvement_by_exp = {
+        "exp_01_human_only_mse_lr1e5": 0.01,
+        "exp_02_human_only_mse_lr5e5": 0.01,
+        "exp_03_human_only_mse_lr1e4": 0.01,
+        "exp_04_human_only_huber_lr5e5": 0.01,
+        "exp_05_confirmation_seed43": 0.02,
+    }
+    env = _install_human_mocks(
+        monkeypatch,
+        tmp_path,
+        train_calls=train_calls,
+        val_calls=val_calls,
+        mse_by_exp=mse_by_exp,
+        improvement_by_exp=improvement_by_exp,
+    )
+    run_name = "confirmation_generation"
+    monkeypatch.setattr(sys, "argv", _human_run_args(env, run_name))
+    mod.main()
+
+    # Fresh canonical run: 4 ladder candidates + 1 confirmation, each validated.
+    assert len(train_calls) == 5
+    assert len(val_calls) == 5
+    assert "exp_05_confirmation_seed43" in train_calls
+    assert "exp_05_confirmation_seed43" in val_calls
+
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    conf_summary = json.loads(
+        (run_dir / "confirmation_summary.json").read_text(encoding="utf-8")
+    )
+    assert conf_summary["state"] == "passed"
+    assert conf_summary["confirmation_seed"] == 43
+    assert conf_summary["source_exp_id"] == "exp_03_human_only_mse_lr1e4"
+    assert conf_summary["source_config"]["seed"] == 42
+    assert conf_summary["heldout_test_evaluated"] is False
+    assert conf_summary["mse_improvement"] == 0.02
+    assert conf_summary["baseline_checkpoint_sha256"] == compute_sha256(
+        env["baseline_ckpt"]
+    )
+    assert conf_summary["expanded_benchmark_sha256"] == compute_sha256(
+        env["expanded_benchmark"]
+    )
+    assert (
+        conf_summary["supplemental_benchmark_sha256"]
+        == env["supplemental_benchmark_sha256"]
+    )
+    assert Path(conf_summary["candidate_checkpoint"]).is_file()
+    assert Path(conf_summary["validation_decision_path"]).is_file()
+
+    summary = json.loads((run_dir / "final_summary.json").read_text(encoding="utf-8"))
+    assert summary["confirmation_seed"] == 43
+    assert summary["confirmation_passed"] is True
+    assert summary["confirmation_seed_failed"] is False
+    assert summary["selected_finalist"]["exp_id"] == "exp_03_human_only_mse_lr1e4"
+    assert summary["rejection_reason"] == "fresh_heldout_test_required"
+    assert summary["pending_final_evaluation"] is True
+
+    decision = json.loads(
+        (run_dir / "promotion_decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["confirmation_seed"] == 43
+    assert decision["confirmation_passed"] is True
+    assert decision["confirmation_seed_failed"] is False
+    assert decision["selected_finalist_exp_id"] == "exp_03_human_only_mse_lr1e4"
+
+
+def test_human_finetune_confirmation_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    train_calls: list[str] = []
+    val_calls: list[str] = []
+    mse_by_exp = {
+        "exp_01_human_only_mse_lr1e5": 0.08,
+        "exp_02_human_only_mse_lr5e5": 0.05,
+        "exp_03_human_only_mse_lr1e4": 0.02,
+        "exp_04_human_only_huber_lr5e5": 0.03,
+        "exp_05_confirmation_seed43": 2.9,
+    }
+    improvement_by_exp = {
+        "exp_01_human_only_mse_lr1e5": 0.01,
+        "exp_02_human_only_mse_lr5e5": 0.01,
+        "exp_03_human_only_mse_lr1e4": 0.01,
+        "exp_04_human_only_huber_lr5e5": 0.01,
+        "exp_05_confirmation_seed43": -0.45,
+    }
+    env = _install_human_mocks(
+        monkeypatch,
+        tmp_path,
+        train_calls=train_calls,
+        val_calls=val_calls,
+        mse_by_exp=mse_by_exp,
+        improvement_by_exp=improvement_by_exp,
+    )
+    run_name = "confirmation_validation_failure"
+    monkeypatch.setattr(sys, "argv", _human_run_args(env, run_name))
+    mod.main()
+
+    # Confirmation was attempted but its validation showed no improvement:
+    # no finalist, and the failure is recorded as confirmation_seed_failed.
+    assert len(train_calls) == 5
+    assert len(val_calls) == 5
+
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    conf_summary = json.loads(
+        (run_dir / "confirmation_summary.json").read_text(encoding="utf-8")
+    )
+    assert conf_summary["state"] == "failed"
+    assert conf_summary["confirmation_seed"] == 43
+    assert conf_summary["mse_improvement"] == -0.45
+    assert conf_summary["heldout_test_evaluated"] is False
+
+    summary = json.loads((run_dir / "final_summary.json").read_text(encoding="utf-8"))
+    assert summary["confirmation_seed"] == 43
+    assert summary["confirmation_passed"] is False
+    assert summary["confirmation_seed_failed"] is True
+    assert summary["selected_finalist"] is None
+    assert summary["rejection_reason"] == "confirmation_seed_failed"
+    assert summary["pending_final_evaluation"] is False
+    assert summary["requested_annotation_batch"] is None
+
+    decision = json.loads(
+        (run_dir / "promotion_decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["confirmation_passed"] is False
+    assert decision["confirmation_seed_failed"] is True
+    assert decision["selected_finalist_exp_id"] is None
+    assert decision["rejection_reason"] == "confirmation_seed_failed"
+
+
+def test_human_finetune_resume_zero_call_preserves_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    train_calls: list[str] = []
+    val_calls: list[str] = []
+    mse_by_exp = {
+        "exp_01_human_only_mse_lr1e5": 0.08,
+        "exp_02_human_only_mse_lr5e5": 0.05,
+        "exp_03_human_only_mse_lr1e4": 0.02,
+        "exp_04_human_only_huber_lr5e5": 0.03,
+        "exp_05_confirmation_seed43": 0.015,
+    }
+    improvement_by_exp = {
+        "exp_01_human_only_mse_lr1e5": 0.01,
+        "exp_02_human_only_mse_lr5e5": 0.01,
+        "exp_03_human_only_mse_lr1e4": 0.01,
+        "exp_04_human_only_huber_lr5e5": 0.01,
+        "exp_05_confirmation_seed43": 0.02,
+    }
+    env = _install_human_mocks(
+        monkeypatch,
+        tmp_path,
+        train_calls=train_calls,
+        val_calls=val_calls,
+        mse_by_exp=mse_by_exp,
+        improvement_by_exp=improvement_by_exp,
+    )
+    run_name = "zero_call_resume"
+    monkeypatch.setattr(sys, "argv", _human_run_args(env, run_name))
+    mod.main()
+    assert len(train_calls) == 5
+    assert len(val_calls) == 5
+
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    conf_path = run_dir / "confirmation_summary.json"
+    conf_before = conf_path.read_text(encoding="utf-8")
+    final_before = json.loads(
+        (run_dir / "final_summary.json").read_text(encoding="utf-8")
+    )
+
+    # Unchanged resume: zero training/validation calls and identical evidence.
+    monkeypatch.setattr(sys, "argv", _human_run_args(env, run_name) + ["--resume"])
+    mod.main()
+
+    assert len(train_calls) == 5
+    assert len(val_calls) == 5
+    assert conf_path.read_text(encoding="utf-8") == conf_before
+
+    final_after = json.loads(
+        (run_dir / "final_summary.json").read_text(encoding="utf-8")
+    )
+    for key in ("confirmation_seed", "confirmation_passed", "confirmation_seed_failed"):
+        assert final_after[key] == final_before[key]
+    assert final_after["confirmation_passed"] is True
+    assert final_after["rejection_reason"] == "fresh_heldout_test_required"
+
+
+def test_human_finetune_resume_rejects_tampered_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    train_calls: list[str] = []
+    val_calls: list[str] = []
+    mse_by_exp = {
+        "exp_01_human_only_mse_lr1e5": 0.08,
+        "exp_02_human_only_mse_lr5e5": 0.05,
+        "exp_03_human_only_mse_lr1e4": 0.02,
+        "exp_04_human_only_huber_lr5e5": 0.03,
+        "exp_05_confirmation_seed43": 0.015,
+    }
+    improvement_by_exp = {k: 0.01 for k in mse_by_exp}
+    improvement_by_exp["exp_05_confirmation_seed43"] = 0.02
+    env = _install_human_mocks(
+        monkeypatch,
+        tmp_path,
+        train_calls=train_calls,
+        val_calls=val_calls,
+        mse_by_exp=mse_by_exp,
+        improvement_by_exp=improvement_by_exp,
+    )
+    run_name = "tampered_confirmation_resume"
+    monkeypatch.setattr(sys, "argv", _human_run_args(env, run_name))
+    mod.main()
+    assert len(train_calls) == 5
+    assert len(val_calls) == 5
+
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    conf_path = run_dir / "confirmation_summary.json"
+    conf = json.loads(conf_path.read_text(encoding="utf-8"))
+    conf["confirmation_seed"] = 99
+    conf_path.write_text(json.dumps(conf), encoding="utf-8")
+
+    monkeypatch.setattr(sys, "argv", _human_run_args(env, run_name) + ["--resume"])
+    with pytest.raises(ValueError, match="Confirmation summary validation failed"):
+        mod.main()
+    # Fail closed: no training or evaluation ran despite the tampered evidence.
+    assert len(train_calls) == 5
+    assert len(val_calls) == 5
+
+
+def test_human_finetune_resume_requires_prepared_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    train_calls: list[str] = []
+    val_calls: list[str] = []
+    mse_by_exp = {
+        "exp_01_human_only_mse_lr1e5": 0.08,
+        "exp_02_human_only_mse_lr5e5": 0.05,
+        "exp_03_human_only_mse_lr1e4": 0.02,
+        "exp_04_human_only_huber_lr5e5": 0.03,
+        "exp_05_confirmation_seed43": 0.015,
+    }
+    improvement_by_exp = {k: 0.01 for k in mse_by_exp}
+    improvement_by_exp["exp_05_confirmation_seed43"] = 0.02
+    env = _install_human_mocks(
+        monkeypatch,
+        tmp_path,
+        train_calls=train_calls,
+        val_calls=val_calls,
+        mse_by_exp=mse_by_exp,
+        improvement_by_exp=improvement_by_exp,
+    )
+    run_name = "missing_prepared_manifest_resume"
+    monkeypatch.setattr(sys, "argv", _human_run_args(env, run_name))
+    mod.main()
+    assert len(train_calls) == 5
+
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    (run_dir / "prepared_dataset_manifest.json").unlink()
+
+    monkeypatch.setattr(sys, "argv", _human_run_args(env, run_name) + ["--resume"])
+    with pytest.raises(FileNotFoundError, match="prepared dataset manifest missing"):
+        mod.main()
+    assert len(train_calls) == 5
+    assert len(val_calls) == 5
+
+
+def test_human_finetune_resume_rejects_tampered_prepared_dataset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.modeling import run_active_scenic_autoresearch as mod
+
+    monkeypatch.chdir(tmp_path)
+    train_calls: list[str] = []
+    val_calls: list[str] = []
+    mse_by_exp = {
+        "exp_01_human_only_mse_lr1e5": 0.08,
+        "exp_02_human_only_mse_lr5e5": 0.05,
+        "exp_03_human_only_mse_lr1e4": 0.02,
+        "exp_04_human_only_huber_lr5e5": 0.03,
+        "exp_05_confirmation_seed43": 0.015,
+    }
+    improvement_by_exp = {k: 0.01 for k in mse_by_exp}
+    improvement_by_exp["exp_05_confirmation_seed43"] = 0.02
+    env = _install_human_mocks(
+        monkeypatch,
+        tmp_path,
+        train_calls=train_calls,
+        val_calls=val_calls,
+        mse_by_exp=mse_by_exp,
+        improvement_by_exp=improvement_by_exp,
+    )
+    run_name = "tampered_prepared_resume"
+    monkeypatch.setattr(sys, "argv", _human_run_args(env, run_name))
+    mod.main()
+    assert len(train_calls) == 5
+    assert len(val_calls) == 5
+
+    run_dir = tmp_path / "data" / "processed" / "modeling_autoresearch" / run_name
+    (run_dir / "prepared_dataset.npz").write_bytes(b"tampered_prepared_dataset")
+
+    monkeypatch.setattr(sys, "argv", _human_run_args(env, run_name) + ["--resume"])
+    with pytest.raises(ValueError, match="Prepared dataset SHA-256 mismatch"):
+        mod.main()
+    # Fail closed before any training/validation could trust the tampered data.
+    assert len(train_calls) == 5
+    assert len(val_calls) == 5

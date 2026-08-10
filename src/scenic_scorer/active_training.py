@@ -4,7 +4,9 @@ This module is strict at the stage-one boundary. It consumes the scorer's
 ordered candidate pool and feature cache, overlays absolute human labels, and
 trains the existing :class:`ScenicRegressionModel` on fixed geographic
 assignments supplied by stage one. No random split or implicit row filter is
-performed here.
+performed here. An explicit ``human_only_training`` config option narrows the
+train rows to human-labeled rows only and never changes validation or test
+membership.
 """
 
 from __future__ import annotations
@@ -62,6 +64,9 @@ class ActiveTrainingConfig:
     ``max_steps`` and ``max_seconds`` are per-invocation continuation budgets;
     the checkpoint's global step remains cumulative. They are excluded from
     ``config_hash`` so a paused run can continue with a larger budget.
+    ``human_only_training`` narrows the train index array to rows whose
+    ``label_source`` is exactly ``human``; it is included in ``config_hash``
+    and never changes validation or test membership.
     """
 
     epochs: int = 20
@@ -76,6 +81,11 @@ class ActiveTrainingConfig:
     loss_function: str = "mse"
     max_steps: int | None = None
     max_seconds: float | None = None
+    initial_checkpoint_path: str | None = None
+    initial_checkpoint_sha256: str | None = None
+    human_sample_weight_multiplier: float = 1.0
+    evaluate_test_during_training: bool = False
+    human_only_training: bool = False
 
     def validate(self) -> None:
         if isinstance(self.epochs, bool) or int(self.epochs) < 1:
@@ -108,6 +118,32 @@ class ActiveTrainingConfig:
             )
         if self.loss_function not in {"mse", "huber"}:
             raise ValueError("loss_function must be 'mse' or 'huber'")
+        if (self.initial_checkpoint_path is None) != (
+            self.initial_checkpoint_sha256 is None
+        ):
+            raise ValueError(
+                "initial_checkpoint_path and initial_checkpoint_sha256 "
+                "must be provided together"
+            )
+        if self.initial_checkpoint_path is not None:
+            if not str(self.initial_checkpoint_path).strip():
+                raise ValueError("initial_checkpoint_path must be a non-empty path")
+            expected = str(self.initial_checkpoint_sha256).lower()
+            if len(expected) != 64 or any(
+                char not in "0123456789abcdef" for char in expected
+            ):
+                raise ValueError(
+                    "initial_checkpoint_sha256 must be a 64-character hex digest"
+                )
+        multiplier = float(self.human_sample_weight_multiplier)
+        if not math.isfinite(multiplier) or multiplier <= 0:
+            raise ValueError(
+                "human_sample_weight_multiplier must be finite and positive"
+            )
+        if not isinstance(self.evaluate_test_during_training, bool):
+            raise ValueError("evaluate_test_during_training must be boolean")
+        if not isinstance(self.human_only_training, bool):
+            raise ValueError("human_only_training must be boolean")
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -119,6 +155,15 @@ class ActiveTrainingConfig:
             value["max_steps"] = int(value["max_steps"])
         if value["max_seconds"] is not None:
             value["max_seconds"] = float(value["max_seconds"])
+        if value["initial_checkpoint_path"] is not None:
+            value["initial_checkpoint_path"] = str(value["initial_checkpoint_path"])
+        if value["initial_checkpoint_sha256"] is not None:
+            value["initial_checkpoint_sha256"] = str(
+                value["initial_checkpoint_sha256"]
+            ).lower()
+        value["human_sample_weight_multiplier"] = float(
+            value["human_sample_weight_multiplier"]
+        )
         return value
 
 
@@ -272,6 +317,15 @@ def _finite_float(value: Any, field: str) -> float:
     if not math.isfinite(parsed):
         raise ActiveTrainingError(f"{field} must be finite")
     return parsed
+
+
+def _optional_sha256(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    text = _clean_text(value).lower()
+    if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
+        raise ActiveTrainingError(f"{field} must be null or a 64-character hex digest")
+    return text
 
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:
@@ -944,9 +998,22 @@ def _candidate_embedding_rows(
 
 
 def prepare_active_dataset(
-    handoff_path: str | Path, output_path: str | Path
+    handoff_path: str | Path,
+    output_path: str | Path,
+    supplemental_benchmark_path: str | Path | None = None,
+    supplemental_benchmark_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Validate a stage-one handoff and materialize its ordered training NPZ."""
+    """Validate a stage-one handoff and materialize its ordered training NPZ.
+
+    When ``supplemental_benchmark_path`` and ``supplemental_benchmark_sha256``
+    are both supplied, the canonical supplemental benchmark CSV is hash-verified
+    before use and cross-validated: unique nonempty identities, only
+    train/val/test split names, identities known to the candidate pool, split
+    assignments exactly equal to the immutable geographic splits, finite human
+    means in [0, 10], and nonempty train rows. Only ``split=train`` identities
+    merge into the output targets with base weight 4 and ``label_source``
+    ``"human"``; val/test output rows are never rewritten.
+    """
 
     handoff, source, resolved = _validate_handoff(handoff_path)
     candidate_path, candidate_hash = resolved["candidate_pool"]
@@ -969,6 +1036,114 @@ def prepare_active_dataset(
             "geographic splits reference identities absent from the candidate pool: "
             f"{unknown_split_paths}"
         )
+    supplemental: dict[str, Any] | None = None
+    if supplemental_benchmark_path is not None or supplemental_benchmark_sha256 is not None:
+        if (
+            supplemental_benchmark_path is None
+            or supplemental_benchmark_sha256 is None
+        ):
+            raise ActiveTrainingError(
+                "supplemental benchmark path and expected SHA must be provided together"
+            )
+        benchmark_path = Path(supplemental_benchmark_path).expanduser().resolve()
+        if not benchmark_path.exists() or not benchmark_path.is_file():
+            raise ActiveTrainingError(
+                f"supplemental benchmark not found: {benchmark_path}"
+            )
+        expected_benchmark_sha = _optional_sha256(
+            supplemental_benchmark_sha256, "supplemental benchmark expected SHA"
+        )
+        assert expected_benchmark_sha is not None
+        actual_benchmark_sha = _sha256_file(benchmark_path).lower()
+        if actual_benchmark_sha != expected_benchmark_sha:
+            raise ActiveTrainingError("supplemental benchmark hash mismatch")
+        benchmark = _load_csv(benchmark_path, "supplemental benchmark")
+        required_benchmark = {"image_path", "scenic_human_mean", "split"}
+        missing_benchmark = required_benchmark - set(benchmark.columns)
+        if missing_benchmark:
+            raise ActiveTrainingError(
+                "supplemental benchmark CSV missing required columns: "
+                f"{sorted(missing_benchmark)}"
+            )
+        benchmark_paths = [
+            _clean_text(value) for value in benchmark["image_path"].tolist()
+        ]
+        if any(not value for value in benchmark_paths):
+            raise ActiveTrainingError(
+                "supplemental benchmark contains empty image_path"
+            )
+        if len(set(benchmark_paths)) != len(benchmark_paths):
+            raise ActiveTrainingError(
+                "supplemental benchmark contains duplicate image IDs"
+            )
+        benchmark_splits: dict[str, str] = {}
+        for image_path, raw_split in zip(
+            benchmark_paths, benchmark["split"].tolist(), strict=True
+        ):
+            split = _clean_text(raw_split).lower()
+            if split not in _ALLOWED_SPLITS:
+                raise ActiveTrainingError(
+                    f"invalid supplemental benchmark split: {raw_split}"
+                )
+            benchmark_splits[image_path] = "val" if split == "validation" else split
+        unknown_benchmark = sorted(
+            set(benchmark_paths) - set(all_candidate_paths)
+        )
+        if unknown_benchmark:
+            raise ActiveTrainingError(
+                "supplemental benchmark references unknown image IDs: "
+                f"{unknown_benchmark}"
+            )
+        for image_path in benchmark_paths:
+            declared = declared_splits.get(image_path)
+            if declared is None:
+                raise ActiveTrainingError(
+                    "supplemental benchmark identity is absent from the geographic "
+                    f"splits: {image_path}"
+                )
+            if declared != benchmark_splits[image_path]:
+                raise ActiveTrainingError(
+                    f"supplemental benchmark split mismatch for {image_path}: "
+                    f"{benchmark_splits[image_path]} != {declared}"
+                )
+        benchmark_means: dict[str, float] = {}
+        for image_path, raw_mean in zip(
+            benchmark_paths, benchmark["scenic_human_mean"].tolist(), strict=True
+        ):
+            mean = _finite_float(
+                raw_mean, "supplemental benchmark scenic_human_mean"
+            )
+            if not 0 <= mean <= 10:
+                raise ActiveTrainingError(
+                    "supplemental benchmark scenic_human_mean must be in [0, 10]"
+                )
+            benchmark_means[image_path] = mean
+        benchmark_train_paths = [
+            image_path
+            for image_path in benchmark_paths
+            if benchmark_splits[image_path] == "train"
+        ]
+        if not benchmark_train_paths:
+            raise ActiveTrainingError(
+                "supplemental benchmark must contain train rows"
+            )
+        supplemental = {
+            "path": benchmark_path,
+            "actual": actual_benchmark_sha,
+            "expected": expected_benchmark_sha,
+            "means": benchmark_means,
+            "train_paths": benchmark_train_paths,
+            "rows": len(benchmark_paths),
+            "train": len(benchmark_train_paths),
+            "val": sum(
+                benchmark_splits[image_path] == "val"
+                for image_path in benchmark_paths
+            ),
+            "test": sum(
+                benchmark_splits[image_path] == "test"
+                for image_path in benchmark_paths
+            ),
+        }
     retained_positions = [
         position
         for position, image_path in enumerate(candidate_paths)
@@ -995,6 +1170,28 @@ def prepare_active_dataset(
         candidate_paths,
         all_candidate_paths,
     )
+    changed_rows = 0
+    if supplemental is not None:
+        positions = {path: index for index, path in enumerate(candidate_paths)}
+        missing_train = sorted(
+            path for path in supplemental["train_paths"] if path not in positions
+        )
+        if missing_train:
+            raise ActiveTrainingError(
+                "supplemental benchmark train identities absent from prepared "
+                f"dataset: {missing_train}"
+            )
+        for image_path in supplemental["train_paths"]:
+            index = positions[image_path]
+            if split_values[image_path] != "train":
+                raise ActiveTrainingError(
+                    "supplemental benchmark identity is not a train row: "
+                    f"{image_path}"
+                )
+            targets[index] = supplemental["means"][image_path]
+            weights[index] = 4.0
+            labels[index] = "human"
+            changed_rows += 1
     regions = [
         _clean_text(candidate.iloc[index].get("region")) or "unknown"
         for index in selected
@@ -1068,6 +1265,20 @@ def prepare_active_dataset(
             "handoff_sha256": _sha256_file(source),
             "counts": counts,
             "dropped_without_split": dropped_without_split,
+            "changed_rows": changed_rows,
+            "supplemental_benchmark": (
+                {
+                    "path": str(supplemental["path"]),
+                    "sha256": supplemental["actual"],
+                    "expected_sha256": supplemental["expected"],
+                    "rows": supplemental["rows"],
+                    "train": supplemental["train"],
+                    "val": supplemental["val"],
+                    "test": supplemental["test"],
+                }
+                if supplemental is not None
+                else None
+            ),
             "sample_count": counts["rows"],
             "hashes": {
                 "candidate_pool": candidate_hash,
@@ -1079,6 +1290,11 @@ def prepare_active_dataset(
                 "dataset": dataset_hash,
                 "filtered_index": filtered_index_hash,
                 "filtered_labels": filtered_labels_hash,
+                **(
+                    {"supplemental_benchmark": supplemental["actual"]}
+                    if supplemental is not None
+                    else {}
+                ),
             },
             "ordered_image_paths_sha256": _sha256_bytes(
                 "\n".join(candidate_paths).encode("utf-8")
@@ -1275,9 +1491,12 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
 
 def _torch_load(path: Path, device: str) -> Mapping[str, Any]:
     try:
-        value = torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        value = torch.load(path, map_location=device)
+        try:
+            value = torch.load(path, map_location=device, weights_only=False)
+        except TypeError:
+            value = torch.load(path, map_location=device)
+    except Exception as exc:
+        raise ActiveTrainingError(f"invalid checkpoint: {path}: {exc}") from exc
     if not isinstance(value, Mapping):
         raise ActiveTrainingError(f"checkpoint is not a mapping: {path}")
     return value
@@ -1298,6 +1517,9 @@ def _checkpoint_payload(
     architecture: Mapping[str, int],
     counts: Mapping[str, int],
     history: Sequence[Mapping[str, Any]],
+    initial_checkpoint_sha256: str | None,
+    human_sample_weight_multiplier: float,
+    human_only_training: bool,
 ) -> dict[str, Any]:
     return {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -1312,6 +1534,9 @@ def _checkpoint_payload(
         "dataset_sha256": dataset_hash,
         "split_sha256": split_hash,
         "config_hash": config_hash,
+        "initial_checkpoint_sha256": initial_checkpoint_sha256,
+        "human_sample_weight_multiplier": float(human_sample_weight_multiplier),
+        "human_only_training": bool(human_only_training),
         **{key: int(value) for key, value in architecture.items()},
         "counts": dict(counts),
         "history": list(history),
@@ -1376,6 +1601,10 @@ def _load_completed_summary(
     split_hash: str,
     config_hash: str,
     architecture: Mapping[str, int],
+    *,
+    initial_checkpoint_sha256: str | None,
+    human_sample_weight_multiplier: float,
+    human_only_training: bool,
 ) -> dict[str, Any]:
     summary = _load_json(summary_path, "training summary")
     required_summary = {
@@ -1386,6 +1615,8 @@ def _load_completed_summary(
         "config_hash",
         "candidate_checkpoint_sha256",
         "architecture",
+        "human_sample_weight_multiplier",
+        "human_only_training",
     }
     missing_summary = sorted(required_summary - set(summary))
     if missing_summary:
@@ -1405,6 +1636,40 @@ def _load_completed_summary(
     ):
         raise ActiveTrainingError(
             "completed summary hashes do not match requested inputs"
+        )
+    summary_initial = summary.get("initial_checkpoint")
+    if initial_checkpoint_sha256 is None:
+        if summary_initial is not None:
+            raise ActiveTrainingError(
+                "completed summary initialization identity is invalid"
+            )
+    else:
+        if (
+            not isinstance(summary_initial, Mapping)
+            or _optional_sha256(
+                summary_initial.get("sha256"),
+                "completed summary initial_checkpoint sha256",
+            )
+            != initial_checkpoint_sha256
+        ):
+            raise ActiveTrainingError(
+                "completed summary initialization identity is invalid"
+            )
+    summary_multiplier = summary.get("human_sample_weight_multiplier")
+    if (
+        not isinstance(summary_multiplier, (int, float, np.integer, np.floating))
+        or not math.isfinite(float(summary_multiplier))
+        or float(summary_multiplier) != float(human_sample_weight_multiplier)
+    ):
+        raise ActiveTrainingError(
+            "completed summary human weight multiplier is invalid"
+        )
+    recorded_human_only = summary.get("human_only_training")
+    if not isinstance(recorded_human_only, bool) or (
+        recorded_human_only != human_only_training
+    ):
+        raise ActiveTrainingError(
+            "completed summary human_only_training is invalid"
         )
     summary_architecture = summary.get("architecture")
     if not isinstance(summary_architecture, Mapping) or dict(
@@ -1437,6 +1702,9 @@ def _load_completed_summary(
         "split_sha256",
         "config_hash",
         "rng_state",
+        "initial_checkpoint_sha256",
+        "human_sample_weight_multiplier",
+        "human_only_training",
         *architecture,
     }
     missing_checkpoint = sorted(required_checkpoint - set(checkpoint))
@@ -1456,6 +1724,33 @@ def _load_completed_summary(
         or checkpoint.get("config_hash") != config_hash
     ):
         raise ActiveTrainingError("completed candidate checkpoint hashes are invalid")
+    if (
+        _optional_sha256(
+            checkpoint.get("initial_checkpoint_sha256"),
+            "completed candidate checkpoint initial_checkpoint_sha256",
+        )
+        != initial_checkpoint_sha256
+    ):
+        raise ActiveTrainingError(
+            "completed candidate checkpoint initialization identity is invalid"
+        )
+    recorded_multiplier = checkpoint.get("human_sample_weight_multiplier")
+    if (
+        not isinstance(recorded_multiplier, (int, float, np.integer, np.floating))
+        or not math.isfinite(float(recorded_multiplier))
+        or float(recorded_multiplier) <= 0
+        or float(recorded_multiplier) != float(human_sample_weight_multiplier)
+    ):
+        raise ActiveTrainingError(
+            "completed candidate checkpoint human weight multiplier is invalid"
+        )
+    recorded_human_only = checkpoint.get("human_only_training")
+    if not isinstance(recorded_human_only, bool) or (
+        recorded_human_only != human_only_training
+    ):
+        raise ActiveTrainingError(
+            "completed candidate checkpoint human_only_training is invalid"
+        )
     for key, expected_dimension in architecture.items():
         value = checkpoint.get(key)
         if (
@@ -1516,11 +1811,24 @@ def train_active_model(
     config: ActiveTrainingConfig,
     resume: bool = False,
 ) -> dict[str, Any]:
-    """Train the configured bounded loss on fixed geographic splits."""
+    """Train the configured bounded loss on fixed geographic splits.
+
+    When ``human_only_training`` is enabled, the train index array is narrowed
+    to rows whose ``label_source`` is exactly ``human`` after the fixed splits
+    load and before counts, batching, and resume-cursor validation. Validation
+    and test membership is never altered, and an empty filtered train set
+    fails closed.
+    """
 
     if not isinstance(config, ActiveTrainingConfig):
         raise TypeError("config must be an ActiveTrainingConfig")
     config.validate()
+    expected_initial_sha = _optional_sha256(
+        config.initial_checkpoint_sha256, "initial_checkpoint_sha256"
+    )
+    initial_checkpoint_sha256: str | None = None
+    initial_evidence_path: str | None = None
+    human_weight_multiplier = float(config.human_sample_weight_multiplier)
     dataset = Path(dataset_path).expanduser().resolve()
     split_path = Path(split_csv).expanduser().resolve()
     if not dataset.exists() or not dataset.is_file():
@@ -1530,6 +1838,20 @@ def train_active_model(
     arrays = _load_prepared_dataset(dataset)
     splits = _load_training_splits(
         split_path, arrays["image_paths"].tolist(), arrays["splits"].tolist()
+    )
+    human_only_training = bool(config.human_only_training)
+    total_train_rows = int(len(splits["train"]))
+    if human_only_training:
+        human_train_mask = (
+            np.asarray(arrays["label_sources"])[splits["train"]] == "human"
+        )
+        if not human_train_mask.any():
+            raise ActiveTrainingError(
+                "human_only_training requires at least one human-labeled train row"
+            )
+        splits["train"] = splits["train"][human_train_mask]
+    human_train_rows = int(
+        (np.asarray(arrays["label_sources"])[splits["train"]] == "human").sum()
     )
     dataset_hash = _sha256_file(dataset)
     split_hash = _sha256_file(split_path)
@@ -1564,6 +1886,9 @@ def train_active_model(
                 split_hash,
                 config_hash,
                 architecture,
+                initial_checkpoint_sha256=expected_initial_sha,
+                human_sample_weight_multiplier=human_weight_multiplier,
+                human_only_training=human_only_training,
             )
         if summary_state == "failed":
             raise ActiveTrainingError("failed training run is not resumable")
@@ -1596,9 +1921,16 @@ def train_active_model(
                 "resume checkpoint hash mismatch against training summary"
             )
     splits_counts = {key: int(len(value)) for key, value in splits.items()}
+    metric_splits = (
+        ("train", "val", "test")
+        if config.evaluate_test_during_training
+        else ("train", "val")
+    )
     training_weights = np.asarray(arrays["sample_weights"]).astype(
         np.float32, copy=True
     )
+    human_rows = np.asarray(arrays["label_sources"]) == "human"
+    training_weights[human_rows] *= human_weight_multiplier
     if config.sample_weight_scheme == "region_balanced":
         train_regions = np.asarray(arrays["regions"])[splits["train"]]
         unique_regions, region_counts = np.unique(train_regions, return_counts=True)
@@ -1612,6 +1944,44 @@ def train_active_model(
     np.random.seed(int(config.seed))
     random.seed(int(config.seed))
     model = ScenicRegressionModel(**architecture).to(device)
+    if not resume and config.initial_checkpoint_path is not None:
+        initial_path = Path(config.initial_checkpoint_path).expanduser().resolve()
+        if not initial_path.exists() or not initial_path.is_file():
+            raise ActiveTrainingError(f"initial checkpoint not found: {initial_path}")
+        actual_initial = _sha256_file(initial_path).lower()
+        if actual_initial != expected_initial_sha:
+            raise ActiveTrainingError("initial checkpoint hash mismatch")
+        initial_checkpoint_sha256 = actual_initial
+        initial_evidence_path = str(initial_path)
+        initial_checkpoint = _torch_load(initial_path, device)
+        initial_state = initial_checkpoint.get("model_state_dict")
+        if not isinstance(initial_state, Mapping):
+            raise ActiveTrainingError("initial checkpoint lacks a model state dict")
+        required_declared = ("vit_dim", "terrain_dim", "num_classes")
+        invalid_initial = [
+            key
+            for key in required_declared
+            if isinstance(initial_checkpoint.get(key), (bool, np.bool_))
+            or not isinstance(initial_checkpoint.get(key), Integral)
+            or int(initial_checkpoint[key]) != int(architecture[key])
+        ]
+        declared_hidden = initial_checkpoint.get("hidden_dim")
+        if declared_hidden is not None and (
+            isinstance(declared_hidden, (bool, np.bool_))
+            or not isinstance(declared_hidden, Integral)
+            or int(declared_hidden) != int(architecture["hidden_dim"])
+        ):
+            invalid_initial.append("hidden_dim")
+        if invalid_initial:
+            raise ActiveTrainingError(
+                f"initial checkpoint architecture is incompatible: {invalid_initial}"
+            )
+        try:
+            model.load_state_dict(initial_state, strict=True)
+        except (RuntimeError, TypeError, ValueError, KeyError) as exc:
+            raise ActiveTrainingError(
+                "initial checkpoint model state is incompatible"
+            ) from exc
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(config.learning_rate),
@@ -1636,6 +2006,9 @@ def train_active_model(
             "split_sha256",
             "config_hash",
             "rng_state",
+            "initial_checkpoint_sha256",
+            "human_sample_weight_multiplier",
+            "human_only_training",
             *architecture,
         }
         if (
@@ -1656,6 +2029,37 @@ def train_active_model(
         checkpoint_architecture = {key: checkpoint.get(key) for key in architecture}
         if checkpoint_architecture != architecture:
             raise ActiveTrainingError("resume checkpoint architecture mismatch")
+        recorded_initial_sha = _optional_sha256(
+            checkpoint.get("initial_checkpoint_sha256"),
+            "resume checkpoint initial_checkpoint_sha256",
+        )
+        if recorded_initial_sha != expected_initial_sha:
+            raise ActiveTrainingError(
+                "resume checkpoint initialization identity mismatch"
+            )
+        recorded_multiplier = checkpoint.get("human_sample_weight_multiplier")
+        if (
+            not isinstance(recorded_multiplier, (int, float, np.integer, np.floating))
+            or not math.isfinite(float(recorded_multiplier))
+            or float(recorded_multiplier) <= 0
+            or float(recorded_multiplier) != human_weight_multiplier
+        ):
+            raise ActiveTrainingError(
+                "resume checkpoint human weight multiplier mismatch"
+            )
+        recorded_human_only = checkpoint.get("human_only_training")
+        if not isinstance(recorded_human_only, bool) or (
+            recorded_human_only != human_only_training
+        ):
+            raise ActiveTrainingError(
+                "resume checkpoint human_only_training mismatch"
+            )
+        initial_checkpoint_sha256 = recorded_initial_sha
+        human_weight_multiplier = float(recorded_multiplier)
+        if config.initial_checkpoint_path is not None:
+            initial_evidence_path = str(
+                Path(config.initial_checkpoint_path).expanduser().resolve()
+            )
         try:
             model.load_state_dict(checkpoint["model_state_dict"])
             scaler_state = checkpoint.get("scaler_state_dict")
@@ -1697,6 +2101,9 @@ def train_active_model(
                 architecture=architecture,
                 counts=splits_counts,
                 history=history,
+                initial_checkpoint_sha256=initial_checkpoint_sha256,
+                human_sample_weight_multiplier=human_weight_multiplier,
+                human_only_training=human_only_training,
             ),
         )
 
@@ -1778,6 +2185,9 @@ def train_active_model(
                         architecture=architecture,
                         counts=splits_counts,
                         history=history,
+                        initial_checkpoint_sha256=initial_checkpoint_sha256,
+                        human_sample_weight_multiplier=human_weight_multiplier,
+                        human_only_training=human_only_training,
                     ),
                 )
                 if next_batch * int(config.batch_size) >= len(train_indices):
@@ -1811,7 +2221,7 @@ def train_active_model(
                             device,
                             config.use_sample_weights,
                         )
-                        for split in ("train", "val", "test")
+                        for split in metric_splits
                     },
                 }
             )
@@ -1850,6 +2260,7 @@ def train_active_model(
                     "dataset_sha256": dataset_hash,
                     "split_sha256": split_hash,
                     "config_hash": config_hash,
+                    "human_only_training": human_only_training,
                     "counts": splits_counts,
                     "global_step": global_step,
                     "hashes": {"dataset": dataset_hash, "split": split_hash},
@@ -1862,7 +2273,7 @@ def train_active_model(
             split: _metrics(
                 model, arrays, splits[split], device, config.use_sample_weights
             )
-            for split in ("train", "val", "test")
+            for split in metric_splits
         }
         if state == "completed"
         else {}
@@ -1879,6 +2290,23 @@ def train_active_model(
         "config_hash": config_hash,
         "config": config.as_dict(),
         "resolved_device": device,
+        "initial_checkpoint": (
+            {
+                "path": initial_evidence_path,
+                "sha256": initial_checkpoint_sha256,
+                "requested_sha256": expected_initial_sha,
+            }
+            if initial_checkpoint_sha256 is not None
+            else None
+        ),
+        "human_sample_weight_multiplier": human_weight_multiplier,
+        "human_only_training": human_only_training,
+        "train_scope": {
+            "mode": "human_only" if human_only_training else "all",
+            "total_train_rows": total_train_rows,
+            "human_train_rows": human_train_rows,
+        },
+        "evaluated_splits": list(metric_splits),
         "architecture": architecture,
         "counts": splits_counts,
         "global_step": int(global_step),
@@ -1909,6 +2337,9 @@ def train_active_model(
             architecture=architecture,
             counts=splits_counts,
             history=history,
+            initial_checkpoint_sha256=initial_checkpoint_sha256,
+            human_sample_weight_multiplier=human_weight_multiplier,
+            human_only_training=human_only_training,
         )
         _atomic_torch(candidate_path, payload)
         _atomic_torch(resume_path, payload)
@@ -1939,6 +2370,9 @@ def train_active_model(
                 architecture=architecture,
                 counts=splits_counts,
                 history=history,
+                initial_checkpoint_sha256=initial_checkpoint_sha256,
+                human_sample_weight_multiplier=human_weight_multiplier,
+                human_only_training=human_only_training,
             ),
         )
         summary["candidate_checkpoint_sha256"] = None
@@ -1983,13 +2417,32 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--loss-function", choices=["mse", "huber"], default="mse")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--no-sample-weights", action="store_true")
+    parser.add_argument("--supplemental-benchmark", type=Path, default=None)
+    parser.add_argument("--supplemental-benchmark-sha256", type=str, default=None)
+    parser.add_argument(
+        "--initial-checkpoint",
+        dest="initial_checkpoint_path",
+        type=Path,
+        default=None,
+    )
+    parser.add_argument("--initial-checkpoint-sha256", type=str, default=None)
+    parser.add_argument(
+        "--human-sample-weight-multiplier", type=float, default=1.0
+    )
+    parser.add_argument("--evaluate-test-during-training", action="store_true")
+    parser.add_argument("--human-only-training", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
     dataset_path = args.dataset or (args.output_dir / "active_dataset.npz")
-    prepared = prepare_active_dataset(args.handoff, dataset_path)
+    prepared = prepare_active_dataset(
+        args.handoff,
+        dataset_path,
+        supplemental_benchmark_path=args.supplemental_benchmark,
+        supplemental_benchmark_sha256=args.supplemental_benchmark_sha256,
+    )
     split_csv = args.split_csv or Path(prepared["split_path"])
     config = ActiveTrainingConfig(
         epochs=args.epochs,
@@ -2004,6 +2457,15 @@ def main() -> None:
         use_sample_weights=not args.no_sample_weights,
         sample_weight_scheme=args.sample_weight_scheme,
         loss_function=args.loss_function,
+        initial_checkpoint_path=(
+            str(args.initial_checkpoint_path)
+            if args.initial_checkpoint_path is not None
+            else None
+        ),
+        initial_checkpoint_sha256=args.initial_checkpoint_sha256,
+        human_sample_weight_multiplier=args.human_sample_weight_multiplier,
+        evaluate_test_during_training=args.evaluate_test_during_training,
+        human_only_training=args.human_only_training,
     )
     result = train_active_model(
         dataset_path, split_csv, args.output_dir, config, resume=args.resume

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "description": "Deterministic production-artifact routing benchmark endpoints. Coordinates are graph-node coordinates except the checked-in UI default reproduction, which intentionally preserves its historical request values. Categories are assigned only from completed response metrics by the runner.",
   "graph": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3",
-  "report": "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json",
+  "report": "data/processed/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report/report.json",
   "historical_screenshot_coordinates": null,
   "historical_screenshot_blocker": "Historical screenshot coordinates were not available in the checked-in repository or request context.",
   "pairs": [

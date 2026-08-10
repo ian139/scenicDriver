@@ -42,6 +42,7 @@ def test_offer_and_worker_config_validation() -> None:
     with pytest.raises(ValueError, match="group-size"):
         benchmark.validate_worker_overrides(4, 2)
 
+
 def test_allocation_retries_distinct_offers(monkeypatch: pytest.MonkeyPatch) -> None:
     selected: list[int] = []
     created: list[int] = []
@@ -75,23 +76,23 @@ def test_remote_script_has_checkpoint_resume_and_final_guard() -> None:
     assert "required manifest edge projection index is missing" in script
     assert "exit 21" in script
     assert "--resume" in script
-    assert "aws s3 cp \"$CHECKPOINT\"" in script or "aws s3 cp \"$tmp\"" in script
+    assert 'aws s3 cp "$CHECKPOINT"' in script or 'aws s3 cp "$tmp"' in script
     assert "matrix.all_cases_persisted" in script
     assert "refusing final upload" in script
-    assert "s3://scenic-test/outputs/vast/bbox-test-run/checkpoints/bbox-test/bbox-test.jsonl" in script
+    assert (
+        "s3://scenic-test/outputs/vast/bbox-test-run/checkpoints/bbox-test/bbox-test.jsonl"
+        in script
+    )
     assert "s3://scenic-test/outputs/vast/bbox-test-run/bbox-test.json" in script
+
 
 def test_generated_checkpoint_validators_reject_missing_fingerprint(
     tmp_path: Path,
 ) -> None:
     script = benchmark.build_remote_script(config(), workers=1, group_size=1)
 
-    checkpoint_marker = (
-        "  python - \"${1:-$CHECKPOINT}\" <<'PY'\n"
-    )
-    checkpoint_start = script.index(checkpoint_marker) + len(
-        checkpoint_marker
-    )
+    checkpoint_marker = "  python - \"${1:-$CHECKPOINT}\" <<'PY'\n"
+    checkpoint_start = script.index(checkpoint_marker) + len(checkpoint_marker)
     checkpoint_validator = script[
         checkpoint_start : script.index("\nPY\n", checkpoint_start)
     ]
@@ -195,8 +196,11 @@ def test_generated_checkpoint_validators_reject_missing_fingerprint(
 
 
 def test_remote_script_propagates_strict_service_mode() -> None:
-    script = benchmark.build_remote_script(config(strict_service_full=True), workers=1, group_size=1)
+    script = benchmark.build_remote_script(
+        config(strict_service_full=True), workers=1, group_size=1
+    )
     assert "--strict-service-full" in script
+
 
 def test_preflight_checks_required_tools_and_resources() -> None:
     script = benchmark.build_preflight_script(config())
@@ -206,18 +210,28 @@ def test_preflight_checks_required_tools_and_resources() -> None:
     assert "command -v uv" in script
     assert "aws sts get-caller-identity" in script
     assert "check_beta_artifacts.py" in script
-    assert benchmark.parse_resource_probe("nproc=8\nMemTotal_kB=33554432\n") == (8, 32768)
+    assert benchmark.parse_resource_probe("nproc=8\nMemTotal_kB=33554432\n") == (
+        8,
+        32768,
+    )
 
-def test_bootstrap_uses_explicit_canonical_artifact_source(monkeypatch: pytest.MonkeyPatch) -> None:
+
+def test_bootstrap_uses_explicit_canonical_artifact_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     commands: list[str] = []
-    monkeypatch.setattr(benchmark, "ssh", lambda _target, command: commands.append(command))
+    monkeypatch.setattr(
+        benchmark, "ssh", lambda _target, command: commands.append(command)
+    )
     benchmark.bootstrap_remote_project(
         benchmark.SshTarget("198.51.100.10", 2200, "root", "/tmp/id"),
         config(),
     )
     assert commands
     assert "--s3-bucket scenicdriver-data" in commands[0]
-    assert "--s3-prefix releases/routeOptimizer/75ee0431/" in commands[0]
+    assert (
+        "--s3-prefix releases/routeOptimizer/prompt-two-exp02-20260810/" in commands[0]
+    )
 
 
 def test_parser_exposes_lifecycle_commands_and_dry_run() -> None:
@@ -229,7 +243,9 @@ def test_parser_exposes_lifecycle_commands_and_dry_run() -> None:
     assert args.command == "cleanup" and args.destroy and args.yes
 
 
-def test_initial_state_contains_required_groups(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_initial_state_contains_required_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(benchmark, "STATE_DIR", tmp_path / "state")
     state = benchmark.build_initial_state(
         config(),
@@ -252,11 +268,17 @@ def test_initial_state_contains_required_groups(tmp_path: Path, monkeypatch: pyt
     assert loaded["status"] == "creating"
 
 
-def test_cleanup_recovers_before_printing_destroy_without_confirmation(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cleanup_recovers_before_printing_destroy_without_confirmation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     state = {"task_name": "bbox-test", "status": "training_running", "instance_id": 77}
     monkeypatch.setattr(benchmark, "load_state", lambda _: state)
     order: list[str] = []
-    monkeypatch.setattr(benchmark, "recover_outputs", lambda *_args, **_kwargs: order.append("recover") or [])
+    monkeypatch.setattr(
+        benchmark,
+        "recover_outputs",
+        lambda *_args, **_kwargs: order.append("recover") or [],
+    )
     args = SimpleNamespace(task_name="bbox-test", destroy=False, yes=False)
     assert benchmark.handle_cleanup(args) == 0
     assert order == ["recover"]

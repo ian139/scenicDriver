@@ -52,7 +52,7 @@ DEFAULT_REMOTE_ENV_FILE = "/root/.scenic/aws.env"
 DEFAULT_REMOTE_RUN_ROOT = "/workspace/scenic_artifacts/vast-route"
 DEFAULT_S3_CHECKPOINT_PREFIX = "checkpoints"
 DEFAULT_ARTIFACT_S3_BUCKET = "scenicdriver-data"
-DEFAULT_ARTIFACT_S3_PREFIX = "releases/routeOptimizer/75ee0431/"
+DEFAULT_ARTIFACT_S3_PREFIX = "releases/routeOptimizer/prompt-two-exp02-20260810/"
 DEFAULT_PER_WORKER_RAM_MB = 24_576
 DEFAULT_RESERVED_RAM_MB = 8_192
 DEFAULT_MAX_WORKERS = 32
@@ -78,8 +78,10 @@ class VastRouteConfig:
     remote_env_file: str = DEFAULT_REMOTE_ENV_FILE
     remote_repo_dir: str = DEFAULT_REMOTE_REPO_DIR
     corpus: str = "scripts/routing/production_benchmark_pairs.json"
-    graph: str = "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3"
-    report: str = "data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json"
+    graph: str = (
+        "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3"
+    )
+    report: str = "data/processed/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report/report.json"
     output: str = "data/processed/routing_benchmarks/production_artifact_benchmark.json"
     workers: int | None = None
     group_size: int | None = None
@@ -129,7 +131,9 @@ def write_state(state: dict[str, Any]) -> None:
     state["updated_at"] = utc_now()
     path = state_path(str(state["task_name"]))
     temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     temporary.replace(path)
 
 
@@ -174,7 +178,9 @@ def validate_worker_overrides(
     if workers is not None and ram_mb is not None:
         capacity = max(0, (ram_mb - reserved_ram_mb) // per_worker_ram_mb)
         if workers > capacity:
-            raise ValueError(f"workers={workers} exceeds conservative RAM capacity={capacity}")
+            raise ValueError(
+                f"workers={workers} exceeds conservative RAM capacity={capacity}"
+            )
     if workers is not None and workers > max_workers:
         raise ValueError(f"workers={workers} exceeds max-workers={max_workers}")
 
@@ -198,15 +204,16 @@ def derive_worker_count(
         reserved_ram_mb=reserved_ram_mb,
         max_workers=max_workers,
     )
-    capacity = min(cpu_count, max(0, (ram_mb - reserved_ram_mb) // per_worker_ram_mb), max_workers)
+    capacity = min(
+        cpu_count, max(0, (ram_mb - reserved_ram_mb) // per_worker_ram_mb), max_workers
+    )
     if capacity < 1:
-        raise ValueError("remote host has insufficient CPU/RAM for one benchmark worker")
+        raise ValueError(
+            "remote host has insufficient CPU/RAM for one benchmark worker"
+        )
     if explicit_workers is not None:
         return explicit_workers
     return capacity
-
-
- 
 
 
 def remote_paths(config: VastRouteConfig) -> dict[str, str]:
@@ -215,7 +222,9 @@ def remote_paths(config: VastRouteConfig) -> dict[str, str]:
     checkpoint = output.with_suffix(".jsonl")
     run_root = PurePosixPath(DEFAULT_REMOTE_RUN_ROOT) / config.run_id
     s3_prefix = config.s3_prefix.strip("/")
-    checkpoint_key = f"{s3_prefix}/{DEFAULT_S3_CHECKPOINT_PREFIX}/{config.task_name}/{config.task_name}.jsonl".strip("/")
+    checkpoint_key = f"{s3_prefix}/{DEFAULT_S3_CHECKPOINT_PREFIX}/{config.task_name}/{config.task_name}.jsonl".strip(
+        "/"
+    )
     final_key = f"{s3_prefix}/{config.task_name}.json".strip("/")
     return {
         "repo": str(root),
@@ -269,13 +278,19 @@ def remote_preflight(target: SshTarget, config: VastRouteConfig) -> tuple[int, i
     return parse_resource_probe(result.stdout)
 
 
-def build_remote_script(config: VastRouteConfig, *, workers: int, group_size: int) -> str:
+def build_remote_script(
+    config: VastRouteConfig, *, workers: int, group_size: int
+) -> str:
     """Build a detached, resumable benchmark script without embedding secret values."""
     paths = remote_paths(config)
     repo = quote(paths["repo"])
     env = quote(config.remote_env_file)
     corpus = quote(str(PurePosixPath(config.remote_repo_dir) / config.corpus))
-    graph = quote(str(PurePosixPath(config.remote_repo_dir) / config.graph)) if config.graph else ""
+    graph = (
+        quote(str(PurePosixPath(config.remote_repo_dir) / config.graph))
+        if config.graph
+        else ""
+    )
     report = quote(str(PurePosixPath(config.remote_repo_dir) / config.report))
     output = quote(paths["output"])
     checkpoint = quote(paths["checkpoint"])
@@ -291,7 +306,8 @@ fi"""
         if graph
         else ""
     )
-    return f"""#!/usr/bin/env bash
+    return (
+        f"""#!/usr/bin/env bash
 set -Eeuo pipefail
 # Probe raw host capacity before depending on the project, env, or uv.
 printf 'nproc='; nproc
@@ -303,7 +319,7 @@ export UV_PYTHON=3.11
 set -a
 source {env}
 set +a
-mkdir -p {quote(str(PurePosixPath(paths['log']).parent))} "$(dirname {output})"
+mkdir -p {quote(str(PurePosixPath(paths["log"]).parent))} "$(dirname {output})"
 {spatial_index_guard}
 CHECKPOINT={checkpoint}
 OUTPUT={output}
@@ -397,7 +413,9 @@ if matrix.get("all_cases_persisted") is not True:
     raise SystemExit("refusing final upload: matrix.all_cases_persisted is not true")
 PY
 aws s3 cp "$OUTPUT" "$FINAL_S3" --only-show-errors
-""".strip() + "\n"
+""".strip()
+        + "\n"
+    )
 
 
 def build_script(config: VastRouteConfig, workers: int, group_size: int) -> str:
@@ -444,7 +462,11 @@ def build_initial_state(
     # instance/SSH/run/checkpoint/worker/group contract explicit.
     state.update(
         instance={"id": int(instance_id), "offer_id": int(offer_id)},
-        ssh={"host": state["ssh_host"], "port": state["ssh_port"], "user": state["ssh_user"]},
+        ssh={
+            "host": state["ssh_host"],
+            "port": state["ssh_port"],
+            "user": state["ssh_user"],
+        },
         run={"id": config.run_id, "status": state["status"], "pid": None},
         checkpoint={"path": paths["checkpoint"], "s3": paths["checkpoint_s3"]},
         worker={"count": workers, "cpu_count": cpu_count, "ram_mb": ram_mb},
@@ -462,13 +484,17 @@ def upload_source_overlay(target: SshTarget, remote_repo_dir: str) -> None:
         overlay.unlink(missing_ok=True)
     ssh(
         target,
-        "mkdir -p {repo} && tar -xzf /tmp/scenic-drive-overlay.tar.gz -C {repo} && rm -f /tmp/scenic-drive-overlay.tar.gz".format(repo=quote(remote_repo_dir)),
+        "mkdir -p {repo} && tar -xzf /tmp/scenic-drive-overlay.tar.gz -C {repo} && rm -f /tmp/scenic-drive-overlay.tar.gz".format(
+            repo=quote(remote_repo_dir)
+        ),
     )
 
 
 def bootstrap_remote_project(target: SshTarget, config: VastRouteConfig) -> None:
     repo = quote(config.remote_repo_dir)
-    manifest = quote(str(PurePosixPath(config.remote_repo_dir) / "deploy/beta_artifacts.json"))
+    manifest = quote(
+        str(PurePosixPath(config.remote_repo_dir) / "deploy/beta_artifacts.json")
+    )
     env = quote(config.remote_env_file)
     script = f"""set -Eeuo pipefail
 if command -v apt-get >/dev/null 2>&1; then
@@ -495,10 +521,15 @@ uv run python scripts/deploy/bootstrap_beta_artifacts.py --manifest {manifest} -
     ssh(target, "bash -lc " + quote(script))
 
 
-def upload_remote_script(target: SshTarget, config: VastRouteConfig, script_text: str) -> None:
+def upload_remote_script(
+    target: SshTarget, config: VastRouteConfig, script_text: str
+) -> None:
     paths = remote_paths(config)
     run_command(
-        [*ssh_base(target), f"mkdir -p {quote(str(PurePosixPath(paths['script']).parent))} && cat > {quote(paths['script'])}"],
+        [
+            *ssh_base(target),
+            f"mkdir -p {quote(str(PurePosixPath(paths['script']).parent))} && cat > {quote(paths['script'])}",
+        ],
         input_text=script_text,
     )
     ssh(target, f"chmod 700 {quote(paths['script'])}")
@@ -528,7 +559,11 @@ def recover_outputs(state: dict[str, Any], *, required: bool = False) -> list[Pa
     local_dir = ARTIFACTS_DIR / str(state["task_name"])
     local_dir.mkdir(parents=True, exist_ok=True)
     copied: list[Path] = []
-    for field, name in (("checkpoint_path", "checkpoint.jsonl"), ("remote_log", "benchmark.log"), ("output_path", "final.json")):
+    for field, name in (
+        ("checkpoint_path", "checkpoint.jsonl"),
+        ("remote_log", "benchmark.log"),
+        ("output_path", "final.json"),
+    ):
         remote = state.get(field)
         if not remote:
             continue
@@ -542,11 +577,17 @@ def destroy_instance(state: dict[str, Any]) -> bool:
     instance_id = state.get("instance_id")
     if instance_id is None:
         return False
-    result = run_command(["vastai", "destroy", "instance", str(instance_id), "--yes"], check=False)
+    result = run_command(
+        ["vastai", "destroy", "instance", str(instance_id), "--yes"], check=False
+    )
     if result.returncode == 0:
         update_state(state, status="destroyed", destroyed_at=utc_now())
         return True
-    update_state(state, status="failed_kept", destroy_error=(result.stderr or result.stdout).strip())
+    update_state(
+        state,
+        status="failed_kept",
+        destroy_error=(result.stderr or result.stdout).strip(),
+    )
     return False
 
 
@@ -558,8 +599,10 @@ def config_from_args(args: argparse.Namespace) -> VastRouteConfig:
         run_id=run_id,
         s3_bucket=args.s3_bucket or os.environ.get("SCENIC_S3_BUCKET", ""),
         s3_prefix=prefix,
-        artifact_s3_bucket=args.artifact_s3_bucket or os.environ.get("SCENIC_ARTIFACT_S3_BUCKET", DEFAULT_ARTIFACT_S3_BUCKET),
-        artifact_s3_prefix=args.artifact_s3_prefix or os.environ.get("SCENIC_ARTIFACT_S3_PREFIX", DEFAULT_ARTIFACT_S3_PREFIX),
+        artifact_s3_bucket=args.artifact_s3_bucket
+        or os.environ.get("SCENIC_ARTIFACT_S3_BUCKET", DEFAULT_ARTIFACT_S3_BUCKET),
+        artifact_s3_prefix=args.artifact_s3_prefix
+        or os.environ.get("SCENIC_ARTIFACT_S3_PREFIX", DEFAULT_ARTIFACT_S3_PREFIX),
         image=args.image,
         offer_query=args.offer_query,
         offer_id=args.offer_id,
@@ -590,7 +633,13 @@ def config_from_args(args: argparse.Namespace) -> VastRouteConfig:
 def validate_config(config: VastRouteConfig, *, check_files: bool = True) -> None:
     validate_task_name(config.task_name)
     validate_offer_config(config.offer_query, config.offer_id)
-    validate_worker_overrides(config.workers, config.group_size, per_worker_ram_mb=config.per_worker_ram_mb, reserved_ram_mb=config.reserved_ram_mb, max_workers=config.max_workers)
+    validate_worker_overrides(
+        config.workers,
+        config.group_size,
+        per_worker_ram_mb=config.per_worker_ram_mb,
+        reserved_ram_mb=config.reserved_ram_mb,
+        max_workers=config.max_workers,
+    )
     if not config.s3_bucket.strip():
         raise ValueError("--s3-bucket or SCENIC_S3_BUCKET is required")
     if config.disk_gb < 1:
@@ -598,7 +647,11 @@ def validate_config(config: VastRouteConfig, *, check_files: bool = True) -> Non
     if config.allocation_attempts < 1:
         raise ValueError("allocation-attempts must be at least 1")
     if check_files:
-        for path, label in ((config.identity_file, "identity file"), (config.ssh_public_key, "SSH public key"), (config.local_secrets_env_file, "local secrets env file")):
+        for path, label in (
+            (config.identity_file, "identity file"),
+            (config.ssh_public_key, "SSH public key"),
+            (config.local_secrets_env_file, "local secrets env file"),
+        ):
             if not Path(path).is_file():
                 raise ValueError(f"{label} not found: {path}")
 
@@ -635,7 +688,9 @@ def handle_run(args: argparse.Namespace) -> int:
         return 0
     existing = state_path(config.task_name)
     if existing.exists():
-        raise SystemExit(f"State exists: {existing}; use recover/cleanup or choose another task")
+        raise SystemExit(
+            f"State exists: {existing}; use recover/cleanup or choose another task"
+        )
     require_commands(["vastai", "ssh", "scp", "tar"])
     state: dict[str, Any] | None = None
     try:
@@ -644,7 +699,9 @@ def handle_run(args: argparse.Namespace) -> int:
         write_state(state)
         attach_ssh_key(instance_id, config.ssh_public_key)
         host, port = wait_for_instance_endpoint(instance_id, config.timeout_seconds)
-        target = SshTarget(host=host, port=port, user="root", identity_file=config.identity_file)
+        target = SshTarget(
+            host=host, port=port, user="root", identity_file=config.identity_file
+        )
         update_state(state, status="ssh_wait", ssh_host=host, ssh_port=port)
         wait_for_ssh(target, config.timeout_seconds)
         update_state(state, status="provisioning")
@@ -655,7 +712,14 @@ def handle_run(args: argparse.Namespace) -> int:
         bootstrap_remote_project(target, config)
         update_state(state, status="provisioning")
         cpu_count, ram_mb = remote_preflight(target, config)
-        workers = derive_worker_count(ram_mb, cpu_count, per_worker_ram_mb=config.per_worker_ram_mb, reserved_ram_mb=config.reserved_ram_mb, max_workers=config.max_workers, explicit_workers=config.workers)
+        workers = derive_worker_count(
+            ram_mb,
+            cpu_count,
+            per_worker_ram_mb=config.per_worker_ram_mb,
+            reserved_ram_mb=config.reserved_ram_mb,
+            max_workers=config.max_workers,
+            explicit_workers=config.workers,
+        )
         group_size = config.group_size or workers
         validate_worker_overrides(workers, group_size)
         state.update(
@@ -672,7 +736,9 @@ def handle_run(args: argparse.Namespace) -> int:
         upload_remote_script(target, config, script)
         pid = launch_remote_script(target, config)
         state["run"] = {"id": config.run_id, "status": "training_running", "pid": pid}
-        update_state(state, status="training_running", remote_pid=pid, launched_at=utc_now())
+        update_state(
+            state, status="training_running", remote_pid=pid, launched_at=utc_now()
+        )
         print(f"Vast CPU benchmark launched: {config.task_name}")
         print(f"State: {state_path(config.task_name)}")
         return 0
@@ -692,7 +758,12 @@ def handle_status(args: argparse.Namespace) -> int:
 def handle_recover(args: argparse.Namespace) -> int:
     state = load_state(args.task_name)
     copied = recover_outputs(state, required=False)
-    print(json.dumps({"task_name": args.task_name, "recovered": [str(path) for path in copied]}, sort_keys=True))
+    print(
+        json.dumps(
+            {"task_name": args.task_name, "recovered": [str(path) for path in copied]},
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -712,9 +783,13 @@ def handle_cleanup(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run a resumable full-bbox routing benchmark on a Vast.ai CPU host")
+    parser = argparse.ArgumentParser(
+        description="Run a resumable full-bbox routing benchmark on a Vast.ai CPU host"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
-    run = sub.add_parser("run", help="allocate a CPU host and launch a detached benchmark")
+    run = sub.add_parser(
+        "run", help="allocate a CPU host and launch a detached benchmark"
+    )
     run.add_argument("task_name")
     run.add_argument("--artifact-s3-bucket", default=None)
     run.add_argument("--artifact-s3-prefix", default=None)
@@ -733,26 +808,46 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--local-secrets-env-file", default=".secrets/aws.env")
     run.add_argument("--remote-env-file", default=DEFAULT_REMOTE_ENV_FILE)
     run.add_argument("--remote-repo-dir", default=DEFAULT_REMOTE_REPO_DIR)
-    run.add_argument("--corpus", default="scripts/routing/production_benchmark_pairs.json")
-    run.add_argument("--graph", default="data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3")
-    run.add_argument("--report", default="data/processed/heuristic_runs/new_england_north_z14_v6_learned/report/report.json")
-    run.add_argument("--output", default="data/processed/routing_benchmarks/production_artifact_benchmark.json")
+    run.add_argument(
+        "--corpus", default="scripts/routing/production_benchmark_pairs.json"
+    )
+    run.add_argument(
+        "--graph",
+        default="data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3",
+    )
+    run.add_argument(
+        "--report",
+        default="data/processed/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report/report.json",
+    )
+    run.add_argument(
+        "--output",
+        default="data/processed/routing_benchmarks/production_artifact_benchmark.json",
+    )
     run.add_argument("--workers", type=int)
     run.add_argument("--group-size", type=int)
     run.add_argument("--per-worker-ram-mb", type=int, default=DEFAULT_PER_WORKER_RAM_MB)
     run.add_argument("--reserved-ram-mb", type=int, default=DEFAULT_RESERVED_RAM_MB)
     run.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
-    run.add_argument("--checkpoint-interval-seconds", type=int, default=DEFAULT_CHECKPOINT_INTERVAL_SECONDS)
+    run.add_argument(
+        "--checkpoint-interval-seconds",
+        type=int,
+        default=DEFAULT_CHECKPOINT_INTERVAL_SECONDS,
+    )
     run.add_argument("--case-timeout-seconds", type=float, default=10.0)
     run.add_argument("--strict-service-full", action="store_true")
     run.add_argument("--timeout-seconds", type=int, default=1800)
     run.add_argument("--destroy", action="store_true")
     run.set_defaults(func=handle_run)
-    for name, handler, help_text in (("status", handle_status, "print persisted state"), ("recover", handle_recover, "copy remote checkpoint/log/final outputs")):
+    for name, handler, help_text in (
+        ("status", handle_status, "print persisted state"),
+        ("recover", handle_recover, "copy remote checkpoint/log/final outputs"),
+    ):
         command = sub.add_parser(name, help=help_text)
         command.add_argument("task_name")
         command.set_defaults(func=handler)
-    cleanup = sub.add_parser("cleanup", help="recover and optionally destroy the CPU host")
+    cleanup = sub.add_parser(
+        "cleanup", help="recover and optionally destroy the CPU host"
+    )
     cleanup.add_argument("task_name")
     cleanup.add_argument("--destroy", action="store_true")
     cleanup.add_argument("--yes", action="store_true")

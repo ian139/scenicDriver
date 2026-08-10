@@ -18,9 +18,9 @@ REGISTRY_PATH = Path("data/processed/regression/model_registry.json")
 DEFAULT_GRAPH_PATH = Path(
     "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3"
 )
-DEFAULT_RUN_NAME = "new_england_north_z14_v6_learned"
+DEFAULT_RUN_NAME = "prompt_two_candidate_exp02_fresh_test20_20260810"
 DEFAULT_CHECKPOINT_PATH = Path(
-    "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt"
+    "data/processed/regression/checkpoints/0a165e429c8ac050524c7da409dd533d2de8849600c5dd8605aa1a1024d823e9.pt"
 )
 
 _SQLITE_GRAPH_FORMAT = "scenic-roadgraph-sqlite"
@@ -87,12 +87,37 @@ _REQUIRED_SQLITE_DECLARATIONS = {
 }
 
 
-
 def _project_path(root: Path, value: str | Path) -> Path:
     """Resolve a configured path while preserving absolute container paths."""
 
     path = Path(value)
     return path if path.is_absolute() else root / path
+
+
+def _resolve_active_checkpoint(
+    root: Path, registry_path: Path, value: str
+) -> tuple[Path, list[str]]:
+    """Resolve a stored active checkpoint, preferring an existing file.
+
+    Preserves absolute container paths; otherwise tries the registry-relative
+    location (checkpoints/<sha>.pt) before the project-root-relative location
+    (models/...). Returns the first existing candidate; when none exists,
+    returns the registry-relative candidate and reports every tried path.
+    """
+    path = Path(value)
+    if path.is_absolute():
+        return path, []
+    candidates = [
+        registry_path.parent / path,
+        root / path,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate, []
+    return candidates[0], [
+        f"invalid: active checkpoint missing: {value} "
+        f"(tried: {candidates[0]}, {candidates[1]})"
+    ]
 
 
 def _configured_region(root: Path) -> tuple[dict[str, Any] | None, list[str]]:
@@ -115,9 +140,7 @@ def _configured_region(root: Path) -> tuple[dict[str, Any] | None, list[str]]:
         None,
     )
     if not isinstance(region, dict):
-        return None, [
-            f"invalid: {CONFIG_PATH} (new_england_north is not configured)"
-        ]
+        return None, [f"invalid: {CONFIG_PATH} (new_england_north is not configured)"]
     return region, []
 
 
@@ -138,9 +161,7 @@ def _configured_new_england(root: Path) -> tuple[Path, str, list[str]]:
     if isinstance(configured_run, str) and configured_run:
         run_name = configured_run
     else:
-        issues.append(
-            f"invalid: {CONFIG_PATH} (new_england_north run_name is missing)"
-        )
+        issues.append(f"invalid: {CONFIG_PATH} (new_england_north run_name is missing)")
     return graph_path, run_name, issues
 
 
@@ -193,14 +214,10 @@ def _validate_sqlite_graph(
             return [f"invalid: {label} ({'; '.join(details)})"]
 
         for table, expected_columns in _REQUIRED_SQLITE_COLUMNS.items():
-            schema_rows = tuple(
-                connection.execute(f"PRAGMA table_info({table})")
-            )
+            schema_rows = tuple(connection.execute(f"PRAGMA table_info({table})"))
             columns = tuple(str(row[1]) for row in schema_rows)
             types = tuple(str(row[2]).upper() for row in schema_rows)
-            declarations = tuple(
-                (int(row[3]), int(row[5])) for row in schema_rows
-            )
+            declarations = tuple((int(row[3]), int(row[5])) for row in schema_rows)
             if (
                 columns != expected_columns
                 or types != _REQUIRED_SQLITE_TYPES[table]
@@ -220,8 +237,7 @@ def _validate_sqlite_graph(
             flags=re.IGNORECASE,
         ):
             return [
-                f"invalid: {label} (edges schema is missing "
-                "CHECK(one_way IN (0, 1)))"
+                f"invalid: {label} (edges schema is missing CHECK(one_way IN (0, 1)))"
             ]
 
         metadata: dict[str, Any] = {}
@@ -240,10 +256,7 @@ def _validate_sqlite_graph(
             ]
         schema_version = metadata.get("schema_version")
         if isinstance(schema_version, bool) or schema_version != _SQLITE_SCHEMA_VERSION:
-            return [
-                f"invalid: {label} (unsupported schema_version "
-                f"{schema_version!r})"
-            ]
+            return [f"invalid: {label} (unsupported schema_version {schema_version!r})"]
         if not _metadata_bbox_matches(metadata.get("bbox"), region.get("bbox")):
             return [f"invalid: {label} (bbox does not match configured region)"]
 
@@ -251,7 +264,9 @@ def _validate_sqlite_graph(
             value = metadata.get(name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 return [f"invalid: {label} ({name} metadata count is not positive)"]
-            actual = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            actual = int(
+                connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            )
             if actual != value:
                 return [
                     f"invalid: {label} ({name} metadata count {value} "
@@ -345,9 +360,14 @@ def _active_checkpoint(root: Path) -> tuple[Path, list[str]]:
         return checkpoint_path, issues
 
     active = payload.get("active") if isinstance(payload, dict) else None
-    configured_checkpoint = active.get("checkpoint") if isinstance(active, dict) else None
+    configured_checkpoint = (
+        active.get("checkpoint") if isinstance(active, dict) else None
+    )
     if isinstance(configured_checkpoint, str) and configured_checkpoint:
-        checkpoint_path = _project_path(root, configured_checkpoint)
+        checkpoint_path, resolve_issues = _resolve_active_checkpoint(
+            root, registry_path, configured_checkpoint
+        )
+        issues.extend(resolve_issues)
     else:
         issues.append(f"invalid: {REGISTRY_PATH} (active checkpoint is missing)")
     return checkpoint_path, issues

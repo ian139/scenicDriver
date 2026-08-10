@@ -43,12 +43,14 @@ def test_healthz() -> None:
     assert payload["ok"] is True
     assert "regions_available" in payload
 
+
 def test_scalar_docs() -> None:
     resp = client.get("/scalar")
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/html")
     assert "ScenicDrive API Scalar Reference" in resp.text
     assert "/openapi.json" in resp.text
+
 
 def test_root_advertises_scalar_docs() -> None:
     payload = client.get("/").json()
@@ -133,12 +135,85 @@ def test_route_compare_missing_graph_does_not_leak_path(monkeypatch) -> None:
     detail = response.json()["detail"]
     assert "/private/secret" not in detail
     assert detail == "Route assets are unavailable for region 'philadelphia'"
+
+
 def test_regions_list() -> None:
     resp = client.get("/v1/regions")
     assert resp.status_code == 200
     payload = resp.json()
     assert "regions" in payload
     assert isinstance(payload["regions"], list)
+
+
+def test_northeast_expanded_region_configuration_and_discovery() -> None:
+    resp = client.get("/v1/regions")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert "regions" in payload
+    regions = payload["regions"]
+    region_map = {r["region"]: r for r in regions}
+
+    # Stale new_england_expanded key must no longer be present
+    assert "new_england_expanded" not in region_map
+
+    # Truthful northeast_expanded region must be present
+    assert "northeast_expanded" in region_map
+    ne_region = region_map["northeast_expanded"]
+    assert ne_region["display_name"] == "Northeast Expanded (Prompt Two exp02)"
+    assert (
+        ne_region["latest_run_name"] == "prompt_two_candidate_exp02_expanded_20260810"
+    )
+    assert ne_region["is_default"] is False
+    assert ne_region["source"] == "config"
+    assert ne_region["graph_exists"] is False
+    assert ne_region["route_planning_enabled"] is False
+
+    # Counts and graph limits are explicit; this visualization is not route coverage.
+    desc = ne_region["description"]
+    assert "369,822" in desc
+    assert "new_england_north (99,468)" in desc
+    assert "west_south_inland (270,354)" in desc
+    assert "Route planning is disabled for this view" in desc
+
+    # The configured bounds match the full Stage One candidate-pool extent.
+    assert ne_region["bbox"] == {
+        "min_lat": 37.99616267972812,
+        "min_lon": -83.56201171875,
+        "max_lat": 47.50235895196859,
+        "max_lon": -66.77490234375,
+    }
+
+    # Check map center and zoom for full extent visualization
+    assert ne_region["map"]["center"]["lat"] == 42.749261
+    assert ne_region["map"]["center"]["lon"] == -75.168457
+    assert ne_region["map"]["zoom"] == 5.5
+
+    # Verify canonical default region remains unchanged and is default
+    default_region = region_map.get("new_england_north")
+    assert default_region is not None
+    assert default_region["is_default"] is True
+
+
+def test_northeast_expanded_report_availability_semantics() -> None:
+    # Ensure northeast_expanded is configured with expected report path
+    item = app_api._app_region("northeast_expanded")
+    assert item is not None
+    assert item["run_name"] == "prompt_two_candidate_exp02_expanded_20260810"
+    assert (
+        item["tile_scores_path"]
+        == "data/processed/heuristic_runs/prompt_two_candidate_exp02_expanded_20260810/report/report.json"
+    )
+
+    # Validate preload diagnostics: optional region handling
+    diag = app_api._preload_configured_route_assets(mode="best_effort")
+    assert (
+        "northeast_expanded" in diag["skipped_regions"]
+        or "northeast_expanded" in diag["loaded_regions"]
+    )
+    assert (
+        "new_england_north" in diag["loaded_regions"]
+        or "new_england_north" in diag["skipped_regions"]
+    )
 
 
 def test_region_graph_fallback_and_discovery_support_sqlite(
@@ -191,6 +266,7 @@ def test_latest_run_for_region_preserves_configured_run_name(monkeypatch) -> Non
 
     assert app_api._latest_run_for_region("pittsfield") == "canonical-run"
 
+
 def test_training_results_projects_active_record(tmp_path, monkeypatch) -> None:
     registry = tmp_path / "model_registry.json"
     registry.write_text(
@@ -229,6 +305,7 @@ def test_training_results_returns_404_without_registry(tmp_path, monkeypatch) ->
     assert response.status_code == 404
     assert response.json() == {"detail": "Active training result is unavailable"}
 
+
 def test_heatmap_uses_report_score_range(tmp_path, monkeypatch) -> None:
     run_name = "new-england-test"
     report_dir = tmp_path / run_name / "report"
@@ -261,6 +338,7 @@ def test_heatmap_uses_report_score_range(tmp_path, monkeypatch) -> None:
         "score": 4.0,
         "score_norm": 0.5,
     }
+
 
 def test_heatmap_image_preserves_z14_tile_grid(tmp_path, monkeypatch) -> None:
     run_name = "new-england-test"
@@ -381,12 +459,17 @@ def test_validated_route_projects_canonical_artifacts(tmp_path, monkeypatch) -> 
             {
                 "type": "Feature",
                 "properties": {"route_kind": route_kind},
-                "geometry": {"type": "LineString", "coordinates": [[-73, 44], [-69, 45]]},
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[-73, 44], [-69, 45]],
+                },
             }
             for route_kind in ("scenic", "baseline")
         ],
     }
-    (report_dir / "route.geojson").write_text(json.dumps(route_geojson), encoding="utf-8")
+    (report_dir / "route.geojson").write_text(
+        json.dumps(route_geojson), encoding="utf-8"
+    )
     (report_dir / "route_metrics.json").write_text(
         json.dumps(
             {
@@ -416,9 +499,7 @@ def test_validated_route_projects_canonical_artifacts(tmp_path, monkeypatch) -> 
         json.dumps(
             {
                 "default_region": "new_england_north",
-                "regions": [
-                    {"region": "new_england_north", "run_name": run_name}
-                ],
+                "regions": [{"region": "new_england_north", "run_name": run_name}],
             }
         ),
         encoding="utf-8",
@@ -448,7 +529,11 @@ def test_validated_route_projects_canonical_artifacts(tmp_path, monkeypatch) -> 
 def test_contrib_session_and_label_flow() -> None:
     start = client.post(
         "/v1/contrib/session/start",
-        json={"contributor_id": "tester_api", "display_name": "Tester API", "region": "philadelphia"},
+        json={
+            "contributor_id": "tester_api",
+            "display_name": "Tester API",
+            "region": "philadelphia",
+        },
     )
     assert start.status_code == 200
     s_payload = start.json()
@@ -548,6 +633,7 @@ def _strict_route_metrics(
         "snapped_end": [40.065, -75.19],
         "no_route_reason": None,
     }
+
 
 def _strict_geojson(*metrics: dict[str, object]) -> dict[str, object]:
     return {
@@ -711,9 +797,7 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
     assert payload["geojson"] == _strict_geojson(scenic_metrics, baseline_metrics)
 
 
-def _strict_geometry_request(
-    *, include_baseline: bool = False
-) -> app_api.RouteRequest:
+def _strict_geometry_request(*, include_baseline: bool = False) -> app_api.RouteRequest:
     return app_api.RouteRequest(
         graph_geojson="test-graph",
         start=(40.03, -75.22),
@@ -821,7 +905,6 @@ def test_route_geometry_rejects_discontinuous_segments_and_wrong_endpoint() -> N
             request=_strict_geometry_request(),
             routes={"scenic": endpoint_metrics},
         )
-    
 
 
 def test_route_geometry_rejects_requested_metadata_mismatch() -> None:
@@ -877,12 +960,16 @@ def test_route_geometry_accepts_zero_edge_with_distinct_requested_points() -> No
         ],
     }
 
-    assert app_api._validate_route_geometry(
-        geojson,
-        request=request,
-        routes={"scenic": {"segment_identity": []}},
-    )["scenic"] == geojson["features"][0]
-    
+    assert (
+        app_api._validate_route_geometry(
+            geojson,
+            request=request,
+            routes={"scenic": {"segment_identity": []}},
+        )["scenic"]
+        == geojson["features"][0]
+    )
+
+
 def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
     plan_calls: list[object] = []
     diagnosis_calls: list[object] = []
@@ -976,6 +1063,7 @@ def test_route_compare_reports_endpoint_coverage_error(monkeypatch) -> None:
         "snap_distance_km": 1.234,
         "max_snap_distance_km": 1.0,
     }
+
 
 def test_route_compare_reports_invalid_route_configuration(monkeypatch) -> None:
     monkeypatch.setattr(
@@ -1080,6 +1168,7 @@ def test_route_compare_request_rejects_nonfinite_controls(field, value) -> None:
             end={"lat": 40.065, "lon": -75.19},
             **{field: value},
         )
+
 
 @pytest.mark.parametrize(
     ("start", "end"),
@@ -1246,6 +1335,8 @@ def test_route_compare_redacts_private_asset_paths(monkeypatch) -> None:
         "source"
         not in payload["geojson"]["features"][0]["properties"]["score_provenance"]
     )
+
+
 def test_invalid_frontier_configuration_fails_startup_even_when_preload_off(
     monkeypatch,
 ) -> None:
@@ -1253,7 +1344,8 @@ def test_invalid_frontier_configuration_fails_startup_even_when_preload_off(
     monkeypatch.setenv("SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS", "nan")
 
     with pytest.raises(
-        app_api.RouteConfigurationError, match="SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS"
+        app_api.RouteConfigurationError,
+        match="SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS",
     ):
         with TestClient(create_app()):
             pass
@@ -1317,9 +1409,7 @@ def test_route_preload_lifespan_calls_once_and_skips_missing_optional(
     preload_calls: list[tuple[Path, Path, object, object, bool]] = []
 
     def fake_preload(graph_path, tile_path, zoom, fallback, *, exclusive_scoring):
-        preload_calls.append(
-            (graph_path, tile_path, zoom, fallback, exclusive_scoring)
-        )
+        preload_calls.append((graph_path, tile_path, zoom, fallback, exclusive_scoring))
         return {
             "graph_cache_hit": False,
             "tile_score_cache_hit": False,
@@ -1445,6 +1535,7 @@ def test_route_preload_off_skips_all_assets(tmp_path, monkeypatch) -> None:
     }
     assert preload_calls == []
 
+
 def test_route_supervisor_starts_after_preload_and_closes_on_lifespan_exit(
     monkeypatch,
 ) -> None:
@@ -1498,7 +1589,9 @@ def test_route_supervisor_not_started_when_preload_is_off(monkeypatch) -> None:
         pass
 
 
-def test_route_preload_required_fails_for_missing_default(tmp_path, monkeypatch) -> None:
+def test_route_preload_required_fails_for_missing_default(
+    tmp_path, monkeypatch
+) -> None:
     monkeypatch.setattr(
         app_api,
         "_configured_regions",
@@ -1614,7 +1707,9 @@ def test_route_compare_passes_one_deadline_to_plan_routes_and_diagnostics(
     assert diagnosis_captured[0][1] is deadline
 
 
-def test_route_compare_fallback_diagnose_maps_routing_timeout_to_504(monkeypatch) -> None:
+def test_route_compare_fallback_diagnose_maps_routing_timeout_to_504(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(
         app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
     )
@@ -1645,7 +1740,9 @@ def test_route_compare_fallback_diagnose_maps_routing_timeout_to_504(monkeypatch
     assert response.json()["detail"]["error"] == "routing_deadline_exceeded"
 
 
-def test_route_compare_fallback_diagnose_maps_routing_cancelled_to_non_no_route(monkeypatch) -> None:
+def test_route_compare_fallback_diagnose_maps_routing_cancelled_to_non_no_route(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(
         app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
     )
@@ -1694,9 +1791,7 @@ def _stub_route_compare_assets(monkeypatch) -> None:
         "_region_to_graph",
         lambda region: Path("/tmp/fake-road-graph.geojson"),
     )
-    monkeypatch.setattr(
-        app_api, "_latest_run_for_region", lambda region: "test-run"
-    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
 
 
 def test_route_compare_supervisor_receives_parent_deadline_without_in_process_plan(
