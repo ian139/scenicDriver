@@ -1,0 +1,84 @@
+{
+  "author": "omp",
+  "rejected": [
+    {
+      "reason": "The nearly all-white panel has extremely low contrast and too little recoverable visual information at preview resolution, risking weak interface legibility.",
+      "reference_id": "ref_2011212381729313085"
+    },
+    {
+      "reason": "This repeated oversized ivory-glyph specimen duplicates the selected black-and-ivory typographic territory while offering less numeric variety and a less adaptable crop.",
+      "reference_id": "ref_2011143967275102331_4"
+    },
+    {
+      "reason": "The extreme cropped word fragment is a close duplicate from the same specimen family and is less useful for a legible map interface than the selected numeric specimen.",
+      "reference_id": "ref_2011143967275102331_2"
+    },
+    {
+      "reason": "Its isolated orange and burgundy isometric spot icons are more playful and pictorial than the desired restraint; the selected technical axonometric study provides a more coherent illustration language.",
+      "reference_id": "ref_2009706489225851001_2"
+    },
+    {
+      "reason": "The high-saturation cyberpunk token palette is vivid but conflicts with the restrained warm-neutral, graphite, alpine-mint mapping system.",
+      "reference_id": "ref_2009099215520329744"
+    },
+    {
+      "reason": "The dense cyan-on-black terminal treatment reads as retro cyber UI and conflicts with scenic warmth; the selected type specimen covers numeric hierarchy more compatibly.",
+      "reference_id": "ref_2009085079289745625_3"
+    }
+  ],
+  "retrieval_candidate_digest": "611634caa1dba728868edbfbf7630c3be0c37b1f0437c5a0039dca97e8f80ccd",
+  "run_id": "20260807T182908851954Z-create-a-polished-visual-brand-kit-board",
+  "schema_version": 1,
+  "selected": [
+    {
+      "rationale": "The angled black-and-ivory publication spread combines a dimensional terrain model with contour-like linework, supplying the strongest map/topographic cue, editorial restraint, and tactile texture without dictating a literal interface.",
+      "reference_id": "ref_2011143967275102331_3",
+      "roles": [
+        "composition",
+        "texture",
+        "illustration language"
+      ]
+    },
+    {
+      "rationale": "The black-and-ivory specimen pairs oversized monospaced or slab-like type, a clear numeral run, repeated glyphs, small annotations, and a strict modular split; it supports legible coordinates, measurements, labels, and disciplined editorial hierarchy.",
+      "reference_id": "ref_2011143967275102331_1",
+      "roles": [
+        "typography",
+        "composition"
+      ]
+    },
+    {
+      "rationale": "Four precise axonometric technical drawings alternate across light and dark fields, providing an implementable line language for terrain tiles, map insets, and system diagrams while retaining geometric restraint.",
+      "reference_id": "ref_2009085079289745625_1",
+      "roles": [
+        "illustration language",
+        "composition"
+      ]
+    },
+    {
+      "rationale": "The spacious white principles sheet uses repeated columns, small circular diagrams, short captions, and generous whitespace, making it a practical model for brand-kit modules, legends, route attributes, and explanatory states.",
+      "reference_id": "ref_2009085079289745625_2",
+      "roles": [
+        "composition",
+        "product/interface framing"
+      ]
+    },
+    {
+      "rationale": "A graphite presentation canvas frames clean content cards and an orderly warm swatch matrix, contributing a useful token-presentation structure and warm-neutral support colors to be adapted rather than copied.",
+      "reference_id": "ref_2009706489225851001_1",
+      "roles": [
+        "color",
+        "product/interface framing"
+      ]
+    },
+    {
+      "rationale": "The softly lit scene uses desaturated mint and blue-gray surfaces, dusty rose accents, off-white objects, and diffuse ambient light; borrow its alpine-adjacent softness and color balance, not its office subject.",
+      "reference_id": "ref_2009085079289745625_4",
+      "roles": [
+        "color",
+        "lighting",
+        "texture"
+      ]
+    }
+  ]
+}

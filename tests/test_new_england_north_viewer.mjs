@@ -12,7 +12,7 @@ const installEnd = viewerSource.indexOf("\n\nasync function planRoute", installS
 assert.ok(installStart >= 0 && installEnd > installStart);
 const installSource = viewerSource.slice(installStart, installEnd);
 
-const routeStart = viewerSource.indexOf("function routeLayer");
+const routeStart = viewerSource.indexOf("function routeCorridorLayer");
 const routeEnd = viewerSource.indexOf("\n\nfunction clearRoute", routeStart);
 assert.ok(routeStart >= 0 && routeEnd > routeStart);
 const routeSource = viewerSource.slice(routeStart, routeEnd);
@@ -478,8 +478,12 @@ function makeRouteHarness() {
     ROUTE_SOURCE: "route-source",
     ROUTE_BASELINE: "route-baseline",
     ROUTE_SCENIC: "route-scenic",
+    ROUTE_SCENIC_CORRIDOR: "route-scenic-corridor",
     ROUTE_ENDPOINT_SOURCE: "route-endpoint-source",
     ROUTE_ENDPOINT_CONNECTORS: "route-endpoint-connectors",
+    ROUTE_MARKERS_SOURCE: "route-markers-source",
+    ROUTE_MARKER_START: "route-marker-start",
+    ROUTE_MARKER_END: "route-marker-end",
     map,
     removeLayer: (id) => {
       if (map.getLayer(id)) map.removeLayer(id);
@@ -493,7 +497,8 @@ function makeRouteHarness() {
     `${routeSource}
 globalThis.renderRoute = renderRoute;
 globalThis.validateRouteGeojson = validateRouteGeojson;
-globalThis.buildRouteEndpointConnectors = buildRouteEndpointConnectors;`,
+globalThis.buildRouteEndpointConnectors = buildRouteEndpointConnectors;
+globalThis.buildRouteEndpoints = buildRouteEndpoints;`,
     context
   );
   return { context, layers, sources, operations, fitted, previousSource };
@@ -534,13 +539,51 @@ test("route rendering preserves long road geometry and installs separate endpoin
       },
     },
   ]);
-  assert.equal(harness.layers.size, 3);
-  assert.equal(harness.layers.get("route-endpoint-connectors").paint["line-color"], "#f5c66b");
+  const markerSource = harness.sources.get("route-markers-source");
+  assert.deepEqual(JSON.parse(JSON.stringify(markerSource.data.features)), [
+    {
+      type: "Feature",
+      properties: { point_kind: "start" },
+      geometry: {
+        type: "Point",
+        coordinates: [-75.22, 40.03],
+      },
+    },
+    {
+      type: "Feature",
+      properties: { point_kind: "end" },
+      geometry: {
+        type: "Point",
+        coordinates: [-75.19, 40.065],
+      },
+    },
+  ]);
+  assert.equal(harness.layers.size, 6);
+  assert.equal(harness.layers.get("route-scenic-corridor").paint["line-color"], "#7BC8A4");
+  assert.equal(harness.layers.get("route-scenic").paint["line-color"], "#2E7AF8");
+  assert.equal(harness.layers.get("route-baseline").paint["line-color"], "#F39C12");
+  assert.equal(harness.layers.get("route-endpoint-connectors").paint["line-color"], "#9AA1A6");
+  assert.equal(harness.layers.get("route-marker-start").paint["circle-color"], "#7BC8A4");
+  assert.equal(harness.layers.get("route-marker-start").paint["circle-stroke-color"], "#F6F4EF");
+  assert.equal(harness.layers.get("route-marker-end").paint["circle-color"], "#2E7AF8");
+  assert.equal(harness.layers.get("route-marker-end").paint["circle-stroke-color"], "#F6F4EF");
   assert.deepEqual(
-    JSON.parse(JSON.stringify(harness.fitted[0].features.slice(-2))),
-    JSON.parse(JSON.stringify(connectorSource.data.features))
+    JSON.parse(JSON.stringify(harness.fitted[0].features.slice(-4))),
+    [
+      ...JSON.parse(JSON.stringify(connectorSource.data.features)),
+      ...JSON.parse(JSON.stringify(markerSource.data.features)),
+    ]
+  );
+  assert.equal(harness.layers.get("route-scenic").paint["line-width"], 6);
+  assert.equal(harness.layers.get("route-scenic").paint["line-opacity"], 1);
+  assert.equal(harness.layers.get("route-baseline").paint["line-width"], 3);
+  assert.equal(harness.layers.get("route-baseline").paint["line-opacity"], 1);
+  assert.deepEqual(
+    Array.from(harness.layers.get("route-baseline").paint["line-dasharray"]),
+    [2, 2]
   );
 });
+
 
 test("connector builder accepts artifact arrays and omits zero-length connectors", () => {
   const harness = makeRouteHarness();
@@ -616,14 +659,21 @@ test("rendering snapped endpoints removes stale connector source and layer", () 
   assert.equal(harness.sources.has("route-endpoint-source"), false);
   assert.equal(harness.layers.has("route-endpoint-connectors"), false);
 });
-test("pending renders retain their request and clear removes both route sources", () => {
+test("pending renders retain their request and clear removes all route sources and layers", () => {
   assert.match(
     viewerSource,
     /pendingRouteRender = \{ requestId, geojson: routeGeojson, request: payload\.request \}/
   );
   assert.match(viewerSource, /renderRoute\(pending\.geojson, pending\.request\)/);
   assert.match(viewerSource, /removeLayer\(ROUTE_ENDPOINT_CONNECTORS\)/);
+  assert.match(viewerSource, /removeLayer\(ROUTE_MARKER_START\)/);
+  assert.match(viewerSource, /removeLayer\(ROUTE_MARKER_END\)/);
+  assert.match(viewerSource, /removeLayer\(ROUTE_SCENIC\)/);
+  assert.match(viewerSource, /removeLayer\(ROUTE_BASELINE\)/);
+  assert.match(viewerSource, /removeLayer\(ROUTE_SCENIC_CORRIDOR\)/);
   assert.match(viewerSource, /removeSource\(ROUTE_ENDPOINT_SOURCE\)/);
+  assert.match(viewerSource, /removeSource\(ROUTE_MARKERS_SOURCE\)/);
+  assert.match(viewerSource, /removeSource\(ROUTE_SOURCE\)/);
 });
 
 

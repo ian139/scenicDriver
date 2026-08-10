@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Scenic Drive</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css?v=route-popup-v1" />
+    <link rel="stylesheet" href="./styles.css?v=scenic-brand-v2" />
   </head>
   <body>
     <main class="viewer-shell">
@@ -14,23 +14,25 @@
 
       </section>
 
+      <div class="top-overlays" aria-label="Map status">
+        <div id="inspector" class="top-overlay inspector" role="group" aria-label="Scenic score readout" aria-live="off">
+          <span class="overline">Scenic score</span>
+          <strong id="inspectorScore">--</strong>
+          <span id="inspectorCoords">Move over a heatmap cell</span>
+        </div>
+        <span class="top-overlay status-chip" id="apiStatus">API: checking</span>
+      </div>
+
       <div class="bottom-overlay">
         <aside class="control-panel" aria-label="Route controls">
-          <header class="panel-header">
-            <div class="panel-meta">
-              <div id="inspector" class="inspector" role="group" aria-label="Scenic score readout" aria-live="off">
-                <span class="overline">Scenic score</span>
-                <strong id="inspectorScore">--</strong>
-                <span id="inspectorCoords">Move over a heatmap cell</span>
-              </div>
-              <span class="status-chip" id="apiStatus">API: checking</span>
-            </div>
-          </header>
-
           <form id="routeForm" class="route-form">
             <label class="field">
               <span class="field-label">Start point</span>
               <span class="input-shell">
+                <svg class="field-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="12" cy="12" r="5"></circle>
+                  <path d="M12 2v3M12 19v3M2 12h3M19 12h3"></path>
+                </svg>
                 <input id="startInput" name="start" autocomplete="off" value="44.475884, -73.214003" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="startSuggestions" />
                 <button id="clearStartBtn" type="button" class="input-clear" aria-label="Clear start point" title="Clear start point">×</button>
               </span>
@@ -39,6 +41,10 @@
             <label class="field">
               <span class="field-label">End point</span>
               <span class="input-shell">
+                <svg class="field-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 21s6-5.2 6-11a6 6 0 1 0-12 0c0 5.8 6 11 6 11Z"></path>
+                  <circle cx="12" cy="10" r="2"></circle>
+                </svg>
                 <input id="endInput" name="end" autocomplete="off" value="44.801616, -68.771305" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="endSuggestions" />
                 <button id="clearEndBtn" type="button" class="input-clear" aria-label="Clear end point" title="Clear end point">×</button>
               </span>

@@ -49,8 +49,12 @@ const HEATMAP_FILL = "scenic-heatmap-fill";
 const ROUTE_SOURCE = "route-source";
 const ROUTE_BASELINE = "route-baseline";
 const ROUTE_SCENIC = "route-scenic";
+const ROUTE_SCENIC_CORRIDOR = "route-scenic-corridor";
 const ROUTE_ENDPOINT_SOURCE = "route-endpoint-source";
 const ROUTE_ENDPOINT_CONNECTORS = "route-endpoint-connectors";
+const ROUTE_MARKERS_SOURCE = "route-markers-source";
+const ROUTE_MARKER_START = "route-marker-start";
+const ROUTE_MARKER_END = "route-marker-end";
 
 const el = {
   apiStatus: document.getElementById("apiStatus"),
@@ -387,7 +391,25 @@ function cartoVoyagerStyle() {
         attribution: "© OpenStreetMap contributors © CARTO",
       },
     },
-    layers: [{ id: "voyager", type: "raster", source: "voyager" }],
+    layers: [
+      {
+        id: "background",
+        type: "background",
+        paint: {
+          "background-color": "#F6F4EF",
+        },
+      },
+      {
+        id: "voyager",
+        type: "raster",
+        source: "voyager",
+        paint: {
+          "raster-opacity": 1,
+          "raster-contrast": 0.05,
+          "raster-fade-duration": 0,
+        },
+      },
+    ],
   };
 }
 
@@ -585,17 +607,93 @@ async function checkApiHealth() {
 
 
 
+class HeatmapToggleControl {
+  onAdd(map) {
+    this._map = map;
+    this._container = document.createElement("div");
+    this._container.className = "maplibregl-ctrl maplibregl-ctrl-group";
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "maplibregl-ctrl-heatmap active";
+    button.setAttribute("aria-label", "Toggle scenic heatmap visibility");
+    button.setAttribute("title", "Toggle scenic heatmap visibility");
+    button.setAttribute("aria-pressed", "true");
+
+    button.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>`;
+
+    button.addEventListener("click", () => {
+      this.toggle();
+    });
+
+    this._button = button;
+    this._container.appendChild(button);
+    this.updateState();
+    return this._container;
+  }
+
+  onRemove() {
+    this._container?.parentNode?.removeChild(this._container);
+    this._map = undefined;
+  }
+
+  toggle() {
+    if (!this._map || !this._map.getLayer(HEATMAP_FILL)) return;
+    const current = this._map.getLayoutProperty(HEATMAP_FILL, "visibility");
+    const nextVisibility = current === "none" ? "visible" : "none";
+    this._map.setLayoutProperty(HEATMAP_FILL, "visibility", nextVisibility);
+    this.updateState();
+  }
+
+  updateState() {
+    if (!this._button) return;
+    if (!this._map || !this._map.getLayer(HEATMAP_FILL)) {
+      this._button.disabled = true;
+      this._button.classList.remove("active");
+      this._button.setAttribute("aria-pressed", "false");
+      return;
+    }
+    this._button.disabled = false;
+    const visibility = this._map.getLayoutProperty(HEATMAP_FILL, "visibility");
+    const isVisible = visibility !== "none";
+    if (isVisible) {
+      this._button.classList.add("active");
+      this._button.setAttribute("aria-pressed", "true");
+    } else {
+      this._button.classList.remove("active");
+      this._button.setAttribute("aria-pressed", "false");
+    }
+  }
+}
+let heatmapToggleControl = null;
+
+function routeCorridorLayer() {
+  return {
+    id: ROUTE_SCENIC_CORRIDOR,
+    type: "line",
+    source: ROUTE_SOURCE,
+    filter: ["==", ["get", "route_kind"], "scenic"],
+    layout: { "line-join": "round", "line-cap": "round" },
+    paint: {
+      "line-color": "#7BC8A4",
+      "line-width": 14,
+      "line-opacity": 0.3,
+    },
+  };
+}
+
 function routeLayer(filterKind, color, width, opacity) {
+  const isScenic = filterKind === "scenic";
   const paint = {
-    "line-color": color,
-    "line-width": width,
-    "line-opacity": opacity,
+    "line-color": color ?? (isScenic ? "#2E7AF8" : "#F39C12"),
+    "line-width": width ?? (isScenic ? 6 : 3),
+    "line-opacity": opacity ?? 1,
   };
   if (filterKind === "baseline") {
     paint["line-dasharray"] = [2, 2];
   }
   return {
-    id: filterKind === "scenic" ? ROUTE_SCENIC : ROUTE_BASELINE,
+    id: isScenic ? ROUTE_SCENIC : ROUTE_BASELINE,
     type: "line",
     source: ROUTE_SOURCE,
     filter: ["==", ["get", "route_kind"], filterKind],
@@ -610,10 +708,27 @@ function routeEndpointConnectorLayer() {
     source: ROUTE_ENDPOINT_SOURCE,
     layout: { "line-join": "round", "line-cap": "round" },
     paint: {
-      "line-color": "#f5c66b",
+      "line-color": "#9AA1A6",
       "line-width": 3,
-      "line-opacity": 0.9,
+      "line-opacity": 0.8,
       "line-dasharray": [1.5, 1.5],
+    },
+  };
+}
+
+function routeMarkerLayer(pointKind) {
+  const isStart = pointKind === "start";
+  return {
+    id: isStart ? ROUTE_MARKER_START : ROUTE_MARKER_END,
+    type: "circle",
+    source: ROUTE_MARKERS_SOURCE,
+    filter: ["==", ["get", "point_kind"], pointKind],
+    paint: {
+      "circle-color": isStart ? "#7BC8A4" : "#2E7AF8",
+      "circle-radius": 6.5,
+      "circle-stroke-color": "#F6F4EF",
+      "circle-stroke-width": 2.5,
+      "circle-stroke-opacity": 1.0,
     },
   };
 }
@@ -676,6 +791,25 @@ function buildRouteEndpointConnectors(geojson, request) {
   return connectors;
 }
 
+function buildRouteEndpoints(request) {
+  const points = { type: "FeatureCollection", features: [] };
+  if (request === null || request === undefined) return points;
+  const requestedStart = routeRequestCoordinate(request, "start");
+  const requestedEnd = routeRequestCoordinate(request, "end");
+  points.features.push(
+    {
+      type: "Feature",
+      properties: { point_kind: "start" },
+      geometry: { type: "Point", coordinates: requestedStart },
+    },
+    {
+      type: "Feature",
+      properties: { point_kind: "end" },
+      geometry: { type: "Point", coordinates: requestedEnd },
+    }
+  );
+  return points;
+}
 
 function validateRouteGeojson(geojson) {
   if (
@@ -731,10 +865,11 @@ function validateRouteGeojson(geojson) {
 function renderRoute(geojson, request = null) {
   validateRouteGeojson(geojson);
   const connectors = buildRouteEndpointConnectors(geojson, request);
+  const markers = buildRouteEndpoints(request);
   if (
     !map ||
     (typeof mapReady !== "undefined" && !mapReady) ||
-    typeof map.isStyleLoaded === "function" && !map.isStyleLoaded()
+    (typeof map.isStyleLoaded === "function" && !map.isStyleLoaded())
   ) {
     return;
   }
@@ -744,11 +879,14 @@ function renderRoute(geojson, request = null) {
   } else {
     if (source) removeSource(ROUTE_SOURCE);
     map.addSource(ROUTE_SOURCE, { type: "geojson", data: geojson });
+    if (!map.getLayer(ROUTE_SCENIC_CORRIDOR)) {
+      map.addLayer(routeCorridorLayer());
+    }
     if (!map.getLayer(ROUTE_BASELINE)) {
-      map.addLayer(routeLayer("baseline", "#ffffff", 4, 0.62));
+      map.addLayer(routeLayer("baseline"));
     }
     if (!map.getLayer(ROUTE_SCENIC)) {
-      map.addLayer(routeLayer("scenic", "#62c58a", 5.5, 0.96));
+      map.addLayer(routeLayer("scenic"));
     }
   }
   const connectorSource = map.getSource(ROUTE_ENDPOINT_SOURCE);
@@ -766,8 +904,27 @@ function renderRoute(geojson, request = null) {
     removeLayer(ROUTE_ENDPOINT_CONNECTORS);
     removeSource(ROUTE_ENDPOINT_SOURCE);
   }
+  const markerSource = map.getSource(ROUTE_MARKERS_SOURCE);
+  if (markers.features.length) {
+    if (markerSource && typeof markerSource.setData === "function") {
+      markerSource.setData(markers);
+    } else {
+      if (markerSource) removeSource(ROUTE_MARKERS_SOURCE);
+      map.addSource(ROUTE_MARKERS_SOURCE, { type: "geojson", data: markers });
+    }
+    if (!map.getLayer(ROUTE_MARKER_START)) {
+      map.addLayer(routeMarkerLayer("start"));
+    }
+    if (!map.getLayer(ROUTE_MARKER_END)) {
+      map.addLayer(routeMarkerLayer("end"));
+    }
+  } else {
+    removeLayer(ROUTE_MARKER_START);
+    removeLayer(ROUTE_MARKER_END);
+    removeSource(ROUTE_MARKERS_SOURCE);
+  }
   fitToGeojson(
-    { type: "FeatureCollection", features: [...geojson.features, ...connectors.features] },
+    { type: "FeatureCollection", features: [...geojson.features, ...connectors.features, ...markers.features] },
     { maxZoom: 12 }
   );
 }
@@ -779,9 +936,13 @@ function clearRoute() {
   activeRouteRequest = null;
   latestRoutePayload = null;
   removeLayer(ROUTE_ENDPOINT_CONNECTORS);
+  removeLayer(ROUTE_MARKER_START);
+  removeLayer(ROUTE_MARKER_END);
   removeLayer(ROUTE_SCENIC);
   removeLayer(ROUTE_BASELINE);
+  removeLayer(ROUTE_SCENIC_CORRIDOR);
   removeSource(ROUTE_ENDPOINT_SOURCE);
+  removeSource(ROUTE_MARKERS_SOURCE);
   removeSource(ROUTE_SOURCE);
   if (el.submitRoute) {
     el.submitRoute.disabled =
@@ -1628,10 +1789,12 @@ async function main() {
       validatedRoute.geojson,
       validatedRoute.request
     );
+    const validatedMarkers = buildRouteEndpoints(validatedRoute.request);
     style.sources[ROUTE_SOURCE] = { type: "geojson", data: validatedRoute.geojson };
     style.layers.push(
-      routeLayer("baseline", "#ffffff", 4, 0.62),
-      routeLayer("scenic", "#62c58a", 5.5, 0.96)
+      routeCorridorLayer(),
+      routeLayer("baseline"),
+      routeLayer("scenic")
     );
     if (validatedConnectors.features.length) {
       style.sources[ROUTE_ENDPOINT_SOURCE] = {
@@ -1639,6 +1802,13 @@ async function main() {
         data: validatedConnectors,
       };
       style.layers.push(routeEndpointConnectorLayer());
+    }
+    if (validatedMarkers.features.length) {
+      style.sources[ROUTE_MARKERS_SOURCE] = {
+        type: "geojson",
+        data: validatedMarkers,
+      };
+      style.layers.push(routeMarkerLayer("start"), routeMarkerLayer("end"));
     }
   }
 
@@ -1652,7 +1822,19 @@ async function main() {
     dragRotate: false,
     pitchWithRotate: false,
   });
-  map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), "top-right");
+  map.addControl(
+    new maplibregl.GeolocateControl({
+      positionOptions: { enableHighAccuracy: true },
+      trackUserLocation: false,
+    }),
+    "top-right"
+  );
+  map.addControl(
+    new maplibregl.NavigationControl({ visualizePitch: false }),
+    "top-right"
+  );
+  heatmapToggleControl = new HeatmapToggleControl();
+  map.addControl(heatmapToggleControl, "top-right");
   map.on("zoomstart", handleZoomStart);
   map.on("zoomend", handleZoomEnd);
   map.on("load", () => {
@@ -1685,12 +1867,15 @@ async function main() {
           type: "raster",
           source: HEATMAP_SOURCE,
           paint: {
-            "raster-opacity": 0.78,
-            "raster-resampling": "nearest",
+            "raster-opacity": 0.42,
+            "raster-resampling": "linear",
+            "raster-contrast": 0.1,
+            "raster-fade-duration": 300,
           },
         },
-        validatedRoute ? ROUTE_BASELINE : undefined
+        validatedRoute ? ROUTE_SCENIC_CORRIDOR : undefined
       );
+      heatmapToggleControl?.updateState();
     });
 
     const mapCanvas = map.getCanvas();

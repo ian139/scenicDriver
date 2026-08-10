@@ -1,0 +1,61 @@
+{
+  "objective": "Redesign the supplied scenic-route webapp as a high-fidelity desktop website mockup that applies the accepted brand system. Preserve its real purpose: a lightweight tool for finding a scenic route between two points, shown as a focused demonstration rather than a fully built-out product or business. This is an implementable frontend design target, not production raster UI.",
+  "deliverable_type": "high-fidelity desktop webapp mockup",
+  "target_aspect_ratio": "6:5",
+  "subject_content": "A full-viewport northeastern North America map with route and scenic-analysis overlays, a compact floating route-composer, start and end coordinate fields, one Plan route action, Max detour slider with 1.80× value, checked highway-avoidance option, compact scenic-score state, API status, collapsed developer diagnostics, map controls, and proper map attribution. Present the actual tool, not a landing page or dashboard.",
+  "required_text": [
+    "SCENIC SCORE",
+    "--",
+    "No learned score for this tile",
+    "API: online",
+    "Start point",
+    "44.475884, -73.214003",
+    "End point",
+    "44.801616, -68.771305",
+    "Plan route",
+    "Max detour",
+    "1.80×",
+    "Avoid highways and major roads when possible",
+    "Developer panel",
+    "Diagnostics & route output",
+    "© OpenStreetMap contributors © CARTO"
+  ],
+  "audience": "Desktop users exploring scenic driving routes and technical evaluators viewing a lightweight demonstration tool.",
+  "visual_direction": "Map-first, restrained, modern, quietly outdoors-aware, and production-feasible. Apply the accepted SCENIC ROUTE design system: warm Paper canvas, high-opacity Graphite/Ink glass, Alpine Mint interactions, Route Blue geometry, 24 px primary panel radius, 1 px hairline border, short soft elevation, Inter-style UI typography, and Space Mono-style coordinate numerals. Borrow only broad liquid-glass ideas: one or two translucent high-contrast surfaces, modest blur, fine edge light, subtle depth, and calm motion cues. Do not imitate a proprietary OS interface 1:1 and do not default to generic AI glassmorphism.",
+  "composition": "Realistic 1440×1200 desktop webapp viewport. The map occupies the complete canvas. Keep the route visible and padded clear of overlays. Use one low-profile floating route composer near the bottom center, with clear left-to-right start, end, and Plan route flow; place preferences in a compact second row and diagnostics in a visually demoted collapsed footer. Put scenic score and status in compact map-overlay chips instead of consuming an entire panel row if this improves hierarchy. Keep map utilities at upper right and attribution safely inset. No persistent sidebar, hero copy, marketing navigation, or extra content sections.",
+  "color": "Use the accepted brand tokens coherently: Graphite #0F1214, Ink #1E2326, Stone #E9E6DE, Paper #F6F4EF, Alpine Mint #7BC8A4, Route Blue #4EA3FF, Success #2EBB85, Warning #E6A23C, Error #D9534F. Keep the basemap warm and pale; use a high-opacity graphite route composer with accessible off-white text and mint focus/action states. Distinguish the blue planned route, orange dashed avoided roads, and green scenic overlay by hue plus line pattern. Avoid a muddy green veil over the whole map.",
+  "typography": "Apply the accepted system's contemporary Inter-like humanist UI hierarchy with crisp Space Mono-like coordinate and numeric treatment. Labels and controls must be readable at realistic desktop sizes; exact required copy must be spelled correctly.",
+  "materials_texture": "Subtle high-opacity liquid-glass material on the route composer, score chip, and map controls only: modest backdrop blur, 1 px cool-light edge, slight inner highlight, short soft shadow, and opaque fallback behavior. Terrain texture belongs in the map or barely visible contour detail, not as decorative chrome.",
+  "reference_query": "restrained modern desktop map application route planner interface translucent graphite floating controls editorial typography",
+  "positive_constraints": [
+    "Preserve the full-viewport map, route overlays, compact route composer, start-to-end sequencing, one Plan route CTA, explicit detour value, checked road-avoidance preference, score state, API state, developer disclosure, map controls, and attribution.",
+    "Use every required string exactly where included; do not substitute place names or marketing copy for the coordinate values.",
+    "Show visible start and end affordances and clear route direction without inventing unsupported route metrics or product claims.",
+    "Keep route and map content visible above and around the composer through appropriate map padding.",
+    "Use accessible contrast over variable map luminance, visible focus treatment, and at least 44 px-equivalent primary hit targets.",
+    "Make the composition responsive-friendly: controls could stack into a bottom sheet on narrow screens even though only the desktop target is shown.",
+    "Use standard web layout, backdrop-filter with fallback, SVG icons, and common web-map overlay techniques.",
+    "Apply references as abstract guidance and maintain an original design."
+  ],
+  "negative_constraints": [
+    "Do not copy any reference logo, trademark, artwork, or exact layout.",
+    "Do not invent a product name, product claims, pricing, social proof, accounts, saved routes, analytics, business navigation, or route statistics.",
+    "Do not turn the tool into a landing page, dashboard, or generic mood board.",
+    "Do not use excessive transparency, rainbow refraction, neon, purple-blue gradients, nested glass cards, huge rounded pills, unreadable labels, fake browser chrome, impossible effects, watermarks, or signatures.",
+    "Do not allow the composer to obscure route endpoints or attribution.",
+    "Do not leave the scenic layer as an unexplained hard-edged muddy rectangle; visually integrate or clearly contain its state without inventing meaning.",
+    "Do not rely on color alone to distinguish route overlays."
+  ],
+  "success_criteria": [
+    "The first glance communicates an interactive scenic-route map, followed by the start/end/Plan route task.",
+    "All exact UI copy is legible and accurate, including coordinates, 1.80×, and attribution.",
+    "The accepted brand system is coherent across typography, palette, spacing, radius, border, and elevation.",
+    "The mockup is restrained, original, accessible in implication, responsive-friendly, and feasible to implement.",
+    "Route, scenic overlay, map labels, controls, and attribution remain visually distinct and unobstructed.",
+    "The result scores at least 2 of 3 for purpose, hierarchy, composition, restraint, coherence, and production realism, with 3 for purpose or hierarchy.",
+    "No copied identity, unintended watermark, illegible pseudo-copy in important labels, or obvious image-generation artifact is present."
+  ],
+  "candidate_count": 4,
+  "max_iterations": 3,
+  "output_directory": "/Users/ian/Projects/twitter/runs"
+}

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "run_id": "20260807T182908851954Z-create-a-polished-visual-brand-kit-board",
+  "round_number": 1,
+  "candidate_set_digest": "6ce3b9e7267ac22e6fc99bf8e63a07b7f9ebc9d0be4822d77c6a9511ebb45a4e",
+  "author": "codex",
+  "decision": "accept",
+  "selected_candidate_id": "c4",
+  "audits": {
+    "brief_compliance": {"passed": true, "evidence": ["Candidate c4 is a complete SCENIC ROUTE — DESIGN SYSTEM board with primary and numeric typography, named hex swatches, spacing/grid/radius/border/elevation tokens, components, map layers, icon and illustration language, texture, motion, focus states, accessibility guidance, and a realistic product application."]},
+    "composition_hierarchy": {"passed": true, "evidence": ["The light editorial grid makes typography and palette primary, then components and tokens, with the desktop product example as a dominant right-side proof; every module fits within the frame with intentional padding."]},
+    "contrast": {"passed": true, "evidence": ["Warm paper surfaces, graphite text, mint focus and action states, blue route strokes, and orange avoided-road dashes remain distinct and readable; the board explicitly demonstrates focus and contrast behavior."]},
+    "reference_alignment": {"passed": true, "evidence": ["The strict modular presentation, mono numeric treatment, warm-neutral palette blocks, technical axonometric terrain tiles, and restrained mint-gray materials synthesize the selected references without copying a logo, layout, or artwork."]},
+    "required_text_accuracy": {"passed": true, "evidence": ["The complete product example visibly preserves SCENIC SCORE, --, No learned score for this tile, API: online, Start point, 44.475884, -73.214003, End point, 44.801616, -68.771305, Plan route, Max detour, 1.80×, Avoid highways and major roads when possible, Developer panel, Diagnostics & route output, and © OpenStreetMap contributors © CARTO."]},
+    "technical_artifacts": {"passed": true, "evidence": ["No clipped module, malformed control, impossible perspective, duplicated panel, or broken map overlay is visible at full resolution."]},
+    "unintended_watermarks": {"passed": true, "evidence": ["No watermark, signature, copied logo, trademark, or reference attribution appears."]}
+  },
+  "evidence": [
+    "Candidate c4 is the strongest source-faithful direction: complete, restrained, legible, original, and directly translatable into CSS tokens, SVG icons, and common web-map layers.",
+    "Candidates c1 and c2 introduce unsupported component content; c3 is coherent but significantly darker and denser than the requested lightweight direction."
+  ],
+  "preserved_invariants": [],
+  "highest_impact_mismatch": null,
+  "precise_adjustment": null
+}

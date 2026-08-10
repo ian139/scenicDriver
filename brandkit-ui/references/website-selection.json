@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "run_id": "20260807T183743801418Z-redesign-the-supplied-scenic-route-webap",
+  "retrieval_candidate_digest": "1e690ac6f70a0d479a15097d465e2df959ca76afd90706c9c3bdbf50c4f6ce7e",
+  "author": "omp",
+  "selected": [
+    {
+      "reference_id": "ref_2004842269900149192_2",
+      "roles": ["composition", "typography", "product/interface framing"],
+      "rationale": "The near-black interface uses one strong left-side information block, restrained navigation, compact metrics, generous negative space, and quiet off-white typography; borrow its disciplined dark framing and hierarchy for the floating graphite route composer, not its landing-page content."
+    },
+    {
+      "reference_id": "ref_2009085079289745625_4",
+      "roles": ["color", "lighting", "texture"],
+      "rationale": "The softly lit mint, blue-gray, dusty rose, and off-white environment provides the most relevant low-saturation alpine color balance and diffuse material softness for a warm map under graphite glass; do not borrow the office subject."
+    },
+    {
+      "reference_id": "ref_2009085079289745625_1",
+      "roles": ["illustration language", "product/interface framing"],
+      "rationale": "The precise axonometric line studies on alternating light and dark fields support restrained terrain-layer symbols, map utilities, and technical route geometry without introducing decorative pictograms."
+    },
+    {
+      "reference_id": "ref_2009085079289745625_2",
+      "roles": ["composition", "product/interface framing"],
+      "rationale": "The spacious white principles sheet uses sparse circular diagrams, short captions, consistent spacing, and clear grouping; translate that economy into compact score/status chips and a low-profile task surface over the map."
+    }
+  ],
+  "rejected": [
+    {"reference_id": "ref_2011212381729313085", "reason": "The nearly blank pale interface has too little contrast and recoverable component detail at preview size to guide a variable-luminance map UI."},
+    {"reference_id": "ref_2004842269900149192_1", "reason": "The centered radial pattern and circular hero are ornamental and page-like rather than useful for a focused route-composer overlay."},
+    {"reference_id": "ref_2004842269900149192_3", "reason": "The dense dark code/document page offers weak spatial guidance for a lightweight map-first application."},
+    {"reference_id": "ref_2004842269900149192_4", "reason": "This second dense code/document screen duplicates the same text-heavy territory and would encourage dashboard density."},
+    {"reference_id": "ref_2009099215520329744", "reason": "The red-green cyberpunk terminal palette conflicts with the accepted warm Paper, Graphite, Alpine Mint, and Route Blue system."},
+    {"reference_id": "ref_2008456416886223174_1", "reason": "The branded campaign photograph with large overlaid copy is not relevant to an implementable map interface and introduces avoidable trademark risk."},
+    {"reference_id": "ref_2008456416886223174_2", "reason": "The saturated wildlife campaign image and display copy are visually dominant but unrelated to route planning, hierarchy, or translucent controls."},
+    {"reference_id": "ref_2008456416886223174_3", "reason": "The branded lifestyle campaign crop and overlaid text would pull the result toward advertising rather than a restrained desktop tool."}
+  ]
+}

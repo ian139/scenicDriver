@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "run_id": "20260807T183743801418Z-redesign-the-supplied-scenic-route-webap",
+  "round_number": 1,
+  "candidate_set_digest": "67a98b32b1990f89eb7905721a96b93c2e6c41fd45c2655868cb927afe2a81eb",
+  "author": "codex",
+  "decision": "accept",
+  "selected_candidate_id": "c1",
+  "audits": {
+    "brief_compliance": {"passed": true, "evidence": ["Candidate c1 is a realistic map-first desktop tool with one compact bottom route composer, separate score and API chips, clear start-to-end flow, one Plan route action, detour and road-avoidance controls, collapsed diagnostics, map utilities, route/scenic overlays, and attribution; it adds no business or marketing surface."]},
+    "composition_hierarchy": {"passed": true, "evidence": ["The map and visible cross-state route dominate first, the low-profile bottom composer presents the task second, and score/status chips plus utilities remain compact tertiary overlays; the route and both endpoints stay clear of every panel."]},
+    "contrast": {"passed": true, "evidence": ["High-opacity graphite glass, off-white text, mint focus/action states, blue route line, orange dashed avoided roads, green scenic corridor, and pale warm map remain distinct by both hue and line treatment."]},
+    "reference_alignment": {"passed": true, "evidence": ["The restrained dark framing, spacious grouping, softly desaturated material palette, and precise technical map controls translate the four selected reference roles without copying their layouts or subjects."]},
+    "required_text_accuracy": {"passed": true, "evidence": ["Full-resolution inspection verifies SCENIC SCORE, --, No learned score for this tile, API: online, Start point, 44.475884, -73.214003, End point, 44.801616, -68.771305, Plan route, Max detour, 1.80×, Avoid highways and major roads when possible, Developer panel, Diagnostics & route output, and © OpenStreetMap contributors © CARTO."]},
+    "technical_artifacts": {"passed": true, "evidence": ["No clipped controls, broken geometry, malformed route line, duplicated endpoint, impossible material, stray overlay, or unintended image seam is visible at 1374×1145."]},
+    "unintended_watermarks": {"passed": true, "evidence": ["No watermark, signature, copied logo, trademark, or reference artwork appears; only the required map attribution is present."]}
+  },
+  "evidence": [
+    "Candidate c1 best balances production realism, readable control sizing, complete map utilities, route visibility, brand coherence, and the requested restrained liquid-glass feel.",
+    "Candidate c2 omits the layer control; c3 introduces an unsupported swap control; c4 has less explicit input affordance than c1."
+  ],
+  "preserved_invariants": [],
+  "highest_impact_mismatch": null,
+  "precise_adjustment": null
+}
