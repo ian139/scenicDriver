@@ -1562,6 +1562,11 @@ def create_app() -> FastAPI:
     @app.post("/v1/route/compare")
     def route_compare(request: Request, payload: RouteCompareRequest) -> dict[str, Any]:
         configured = _app_region(payload.region)
+        if configured is not None and configured.get("route_planning") is False:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Route planning is disabled for region '{payload.region}'",
+            )
         _safe_asset_name(payload.region, kind="region")
         try:
             graph_path = _region_to_graph(payload.region)

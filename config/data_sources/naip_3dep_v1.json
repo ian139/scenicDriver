@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "contract_id": "naip_3dep_v1",
+  "description": "Open-data acquisition contract: USDA NAIP naip-visualization 3-band RGB COG imagery plus USGS 3DEP 1/3 arc-second seamless elevation, both rendered onto an exact Web Mercator z14 512x512 grid. Deterministic, fail-closed, requester-pays-aware. No Mapbox and no unknown billable provider is admissible under this contract.",
+  "imagery": {
+    "provider": "usda_naip",
+    "collection": "naip-visualization",
+    "style": "satellite",
+    "bucket": "naip-visualization",
+    "region": "us-west-2",
+    "requester_pays": true,
+    "allowed_states": ["ct", "dc", "de", "ma", "md", "me", "mi", "nh", "nj", "ny", "oh", "pa", "ri", "va", "vt", "wv"],
+    "license": "Public Domain with Attribution",
+    "attribution": "USDA Farm Service Agency NAIP",
+    "provider_url": "https://registry.opendata.aws/naip/",
+    "access_date": "2026-08-10",
+    "catalog_snapshot": "data/raw/sources/naip_3dep_v1/catalog/naip_visualization_catalog.json",
+    "catalog_sha256": null,
+    "catalog_format": "naip_visualization_normalized",
+    "discovery_prefixes": ["ct/", "dc/", "de/", "ma/", "md/", "me/", "mi/", "nh/", "nj/", "ny/", "oh/", "pa/", "ri/", "va/", "vt/", "wv/"],
+    "manifest_key": "manifest.txt",
+    "manifest_bytes_upper_bound": 268435456,
+    "download_mode": "whole_object",
+    "estimates": {
+      "per_asset_requests": 2,
+      "per_asset_bytes_upper_bound": 268435456,
+      "per_tile_output_bytes_upper_bound": 1048576
+    }
+  },
+  "terrain": {
+    "provider": "usgs",
+    "collection": "usgs-3dep-13as",
+    "product": "3DEP 1/3 arc-second seamless",
+    "style": "terrain",
+    "bucket": "prd-tnm",
+    "region": null,
+    "requester_pays": false,
+    "license": "Public Domain",
+    "attribution": "USGS 3D Elevation Program",
+    "provider_url": "https://www.usgs.gov/3d-elevation-program",
+    "access_date": "2026-08-10",
+    "catalog_snapshot": "data/raw/sources/naip_3dep_v1/catalog/usgs_3dep_13as_catalog.json",
+    "catalog_sha256": null,
+    "catalog_format": "usgs_3dep_13as_records",
+    "discovery_prefixes": ["StagedProducts/Elevation/13/TIFF/current/"],
+    "catalog_max_objects": 50000,
+    "catalog_page_size": 1000,
+    "page_response_bytes_upper_bound": 1048576,
+    "companion_metadata_bytes_upper_bound": 1048576,
+    "download_mode": "whole_object",
+    "estimates": {
+      "per_asset_requests": 2,
+      "per_asset_bytes_upper_bound": 268435456,
+      "per_tile_output_bytes_upper_bound": 1048576
+    }
+  },
+  "preprocessing": {
+    "contract_id": "naip_3dep_v1.preprocess.1",
+    "target_crs": "EPSG:3857",
+    "zoom": 14,
+    "tile_width": 512,
+    "tile_height": 512,
+    "satellite_resampling": "cubic",
+    "terrain_resampling": "bilinear",
+    "terrain_rgb_version": "terrain-rgb-v1",
+    "terrain_rgb_formula": "h = -10000.0 + 0.1 * (R * 65536 + G * 256 + B); q = floor((h + 10000.0) * 10.0 + 0.5) in float64; R=(q>>16)&255, G=(q>>8)&255, B=q&255",
+    "terrain_round_trip_tolerance_m": 0.0500001,
+    "target_vertical_datum": "NAVD88",
+    "target_vertical_crs": "EPSG:5703",
+    "vertical_transform_grid": null,
+    "outside_land_elevation": -10000.0,
+    "satellite_fill": [0, 0, 0],
+    "mosaic_order": "first",
+    "nodata_policy": "zero no-data pixels allowed on land; outside-land fill only after masking",
+    "output_format": "deterministic 8-bit RGB PNG, exactly 512x512, no alpha",
+    "tile_asset_rule": {
+      "naip_vintage_selection": "per tile, intersect chosen-state assets with positive-area footprint intersection; keep only assets of the maximum acquisition year present (single-vintage preference); order follows the adapter's declared ordering (year desc, capture date desc, resolution asc, canonical uri)",
+      "state_selection": "argmax over allowed states of the maximum positive-area bbox intersection of that state's catalog assets with the tile bounds; ties resolve lexicographically by state code",
+      "3dep_selection": "all catalog records whose footprint bbox intersects the tile bounds, ordered by (asset_id, canonical_uri)"
+    },
+    "satellite_qc": {
+      "reject_all_black": true,
+      "reject_all_white": true,
+      "min_land_variance": 1.0
+    }
+  },
+  "boundaries": {
+    "provider": "us_census_bureau",
+    "collection": "tigerweb_2025_state_county",
+    "provider_url": "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/State_County/MapServer/0/query",
+    "access_date": "2026-08-10"
+  },
+  "rate_card": {
+    "source": "AWS S3 public pricing (us-west-2 GET/HEAD $0.0004 per 1000 requests; transfer to internet $0.09/GB, first 10 TB) — declared conservative estimate; MUST be refreshed and pinned at discovery authorization",
+    "date": "2026-08-10",
+    "provider_url": "https://aws.amazon.com/s3/pricing/",
+    "access_date": "2026-08-10",
+    "request_cost_usd": "0.0000004",
+    "transfer_cost_per_gb_usd": "0.09"
+  },
+  "limits": {
+    "max_coordinates": 370000,
+    "max_rasters": 740000,
+    "pilot_max_coordinates": 500,
+    "pilot_selection_seed": 42
+  },
+  "storage": {
+    "layered_source_cache": "data/raw/sources/naip_3dep_v1/cache",
+    "images_root": "data/raw/sources/naip_3dep_v1/images"
+  },
+  "authorization": {
+    "currency": "USD",
+    "default_requester_pays_allowed": false,
+    "note": "No cap values in this file authorize network spend. Positive caps must be supplied explicitly at --execute-plan time together with --allow-requester-pays for the requester-pays NAIP bucket."
+  }
+}

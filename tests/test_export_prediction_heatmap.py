@@ -144,9 +144,40 @@ def pool(tmp_path: Path) -> dict[str, object]:
     return _make_pool(tmp_path)
 
 
+def _make_valid_manifest(
+    pool: dict[str, object], tmp_path: Path | None = None, **overrides
+) -> Path:
+    ds_sha = _sha256(pool["npz"])
+    meta_sha = _sha256(pool["meta"])
+    ckpt_sha = _sha256(pool["ckpt"])
+    parent = tmp_path if tmp_path is not None else pool["npz"].parent
+    man_path = (
+        parent
+        / f"test_manifest_{hashlib.md5(str(overrides).encode()).hexdigest()[:8]}.json"
+    )
+    content = {
+        "dataset_sha256": ds_sha,
+        "metadata_sha256": meta_sha,
+        "regression_checkpoint_sha256": ckpt_sha,
+        "source_contract_sha256": "1" * 64,
+        "preprocessing_contract_sha256": "2" * 64,
+        "grid_contract_sha256": "3" * 64,
+        "classifier_checkpoint_sha256": "4" * 64,
+        "calibration_artifact_sha256": "5" * 64,
+        "score_schema_version": "scenic_score_v1",
+        "label_schema_version": "scenic_label_v1",
+        "zoom": ZOOM,
+    }
+    content.update(overrides)
+    man_path.write_text(json.dumps(content), encoding="utf-8")
+    return man_path
+
+
 def _export(
     pool: dict[str, object], out_root: Path, run_name: str = "test_run", **kwargs
 ):
+    if "identity_manifest_path" not in kwargs:
+        kwargs["identity_manifest_path"] = _make_valid_manifest(pool)
     return export_heatmap_run(
         dataset_path=pool["npz"],
         metadata_path=pool["meta"],
@@ -229,11 +260,29 @@ def test_export_writes_standard_outputs(
             "visualization, not evaluation evidence."
         ),
     }
-    assert run_info["hashes"] == {
-        "dataset_sha256": _sha256(pool["npz"]),
-        "metadata_sha256": _sha256(pool["meta"]),
-        "checkpoint_sha256": _sha256(pool["ckpt"]),
+    assert run_info["hashes"]["dataset_sha256"] == _sha256(pool["npz"])
+    assert run_info["hashes"]["metadata_sha256"] == _sha256(pool["meta"])
+    assert run_info["hashes"]["checkpoint_sha256"] == _sha256(pool["ckpt"])
+    assert run_info["hashes"]["source_contract_sha256"] == "1" * 64
+    assert run_info["hashes"]["preprocessing_contract_sha256"] == "2" * 64
+    assert run_info["hashes"]["grid_contract_sha256"] == "3" * 64
+    assert run_info["hashes"]["classifier_checkpoint_sha256"] == "4" * 64
+    assert run_info["hashes"]["regression_checkpoint_sha256"] == _sha256(pool["ckpt"])
+    assert run_info["hashes"]["calibration_artifact_sha256"] == "5" * 64
+    assert "identity_manifest_sha256" in run_info["hashes"]
+
+    assert set(run_info["identity"].keys()) == {
+        "source_contract_sha256",
+        "preprocessing_contract_sha256",
+        "grid_contract_sha256",
+        "classifier_checkpoint_sha256",
+        "regression_checkpoint_sha256",
+        "score_schema_version",
+        "label_schema_version",
+        "calibration_artifact_sha256",
     }
+    assert run_info["identity"]["grid_contract_sha256"] == "3" * 64
+    assert run_info["identity"]["regression_checkpoint_sha256"] == _sha256(pool["ckpt"])
     assert run_info["counts"]["total"] == N_TILES
     assert run_info["counts"]["per_region"] == {
         "new_england_north": 12,
@@ -305,6 +354,7 @@ def test_hash_mismatch_fails_closed(
             output_root=out_root,
             device="cpu",
             batch_size=7,
+            identity_manifest_path=_make_valid_manifest(pool, tmp_path),
         )
     assert not (out_root / "test_run").exists()
     assert not list(out_root.glob(".test_run.tmp-*"))
@@ -334,6 +384,7 @@ def test_duplicate_coordinate_fails_closed(
             output_root=tmp_path / "runs",
             device="cpu",
             batch_size=7,
+            identity_manifest_path=_make_valid_manifest(pool, tmp_path),
         )
 
 
@@ -356,6 +407,7 @@ def test_class_id_mismatch_fails_closed(
             output_root=tmp_path / "runs",
             device="cpu",
             batch_size=7,
+            identity_manifest_path=_make_valid_manifest(pool, tmp_path),
         )
 
 
@@ -377,6 +429,7 @@ def test_missing_row_index_fails_closed(
             output_root=tmp_path / "runs",
             device="cpu",
             batch_size=7,
+            identity_manifest_path=_make_valid_manifest(pool, tmp_path),
         )
 
 
@@ -397,6 +450,7 @@ def test_path_grammar_fails_closed(pool: dict[str, object], tmp_path: Path) -> N
             output_root=tmp_path / "runs",
             device="cpu",
             batch_size=7,
+            identity_manifest_path=_make_valid_manifest(pool, tmp_path),
         )
 
 
@@ -422,6 +476,7 @@ def test_out_of_domain_tile_coordinate_fails_closed(
             output_root=tmp_path / "runs",
             device="cpu",
             batch_size=7,
+            identity_manifest_path=_make_valid_manifest(pool, tmp_path),
         )
 
 
@@ -444,6 +499,7 @@ def test_mismatched_tile_center_fails_closed(
             output_root=tmp_path / "runs",
             device="cpu",
             batch_size=7,
+            identity_manifest_path=_make_valid_manifest(pool, tmp_path),
         )
 
 
@@ -468,6 +524,7 @@ def test_multiple_zooms_fails_closed(pool: dict[str, object], tmp_path: Path) ->
             output_root=tmp_path / "runs",
             device="cpu",
             batch_size=7,
+            identity_manifest_path=_make_valid_manifest(pool, tmp_path),
         )
 
 
@@ -501,3 +558,160 @@ def test_deterministic_output(pool: dict[str, object], tmp_path: Path) -> None:
     report1 = (out1 / "test_run" / "report" / "report.json").read_bytes()
     report2 = (out2 / "test_run" / "report" / "report.json").read_bytes()
     assert report1 == report2
+
+
+def test_absent_identity_manifest_fails_closed(
+    pool: dict[str, object], tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="requires an explicit --identity-manifest"):
+        export_heatmap_run(
+            dataset_path=pool["npz"],
+            metadata_path=pool["meta"],
+            checkpoint_path=pool["ckpt"],
+            expected_dataset_sha256=_sha256(pool["npz"]),
+            expected_metadata_sha256=_sha256(pool["meta"]),
+            expected_checkpoint_sha256=_sha256(pool["ckpt"]),
+            run_name="no_man_run",
+            output_root=tmp_path / "runs",
+            identity_manifest_path=None,
+        )
+
+
+def test_identity_manifest_validates_before_model_loading_or_inference(
+    pool: dict[str, object], tmp_path: Path
+) -> None:
+    corrupt_ckpt = tmp_path / "corrupt_checkpoint.pt"
+    corrupt_ckpt.write_bytes(b"not a PyTorch checkpoint")
+    ckpt_sha = _sha256(corrupt_ckpt)
+
+    man = _make_valid_manifest(
+        pool,
+        tmp_path,
+        regression_checkpoint_sha256=ckpt_sha,
+        source_contract_sha256="not_a_sha",
+    )
+
+    with pytest.raises(ValueError, match="source_contract_sha256"):
+        export_heatmap_run(
+            dataset_path=pool["npz"],
+            metadata_path=pool["meta"],
+            checkpoint_path=corrupt_ckpt,
+            expected_dataset_sha256=_sha256(pool["npz"]),
+            expected_metadata_sha256=_sha256(pool["meta"]),
+            expected_checkpoint_sha256=ckpt_sha,
+            run_name="fail_fast_run",
+            output_root=tmp_path / "runs",
+            identity_manifest_path=man,
+        )
+
+
+def test_mismatched_dataset_sha_in_manifest_fails_closed(
+    pool: dict[str, object], tmp_path: Path
+) -> None:
+    man = _make_valid_manifest(pool, tmp_path, dataset_sha256="0" * 64)
+    with pytest.raises(ValueError, match="dataset_sha256 mismatch"):
+        _export(pool, tmp_path / "runs", identity_manifest_path=man)
+
+
+def test_mismatched_metadata_sha_in_manifest_fails_closed(
+    pool: dict[str, object], tmp_path: Path
+) -> None:
+    man = _make_valid_manifest(pool, tmp_path, metadata_sha256="0" * 64)
+    with pytest.raises(ValueError, match="metadata_sha256 mismatch"):
+        _export(pool, tmp_path / "runs", identity_manifest_path=man)
+
+
+def test_mismatched_checkpoint_sha_in_manifest_fails_closed(
+    pool: dict[str, object], tmp_path: Path
+) -> None:
+    man = _make_valid_manifest(pool, tmp_path, regression_checkpoint_sha256="0" * 64)
+    with pytest.raises(ValueError, match="regression_checkpoint_sha256 mismatch"):
+        _export(pool, tmp_path / "runs", identity_manifest_path=man)
+
+
+def test_invalid_or_missing_64hex_sha_in_manifest_fails_closed(
+    pool: dict[str, object], tmp_path: Path
+) -> None:
+    ds_sha = _sha256(pool["npz"])
+    meta_sha = _sha256(pool["meta"])
+    ckpt_sha = _sha256(pool["ckpt"])
+
+    # Non-64-hex string
+    man1 = _make_valid_manifest(pool, tmp_path, source_contract_sha256="not_a_sha")
+    with pytest.raises(ValueError, match="source_contract_sha256"):
+        _export(pool, tmp_path / "runs", identity_manifest_path=man1)
+
+    # Missing required contract SHA
+    bad_man = tmp_path / "bad_man.json"
+    bad_man.write_text(
+        json.dumps(
+            {
+                "dataset_sha256": ds_sha,
+                "metadata_sha256": meta_sha,
+                "regression_checkpoint_sha256": ckpt_sha,
+                "source_contract_sha256": "1" * 64,
+                "preprocessing_contract_sha256": "2" * 64,
+                "grid_contract_sha256": "3" * 64,
+                # missing classifier_checkpoint_sha256
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="classifier_checkpoint_sha256"):
+        _export(pool, tmp_path / "runs", identity_manifest_path=bad_man)
+
+
+def test_mismatched_declared_zoom_in_manifest_fails_closed(
+    pool: dict[str, object], tmp_path: Path
+) -> None:
+    man = _make_valid_manifest(pool, tmp_path, zoom=99)
+    with pytest.raises(ValueError, match="declared zoom 99 does not match"):
+        _export(pool, tmp_path / "runs", identity_manifest_path=man)
+
+
+def test_export_with_identity_manifest(pool: dict[str, object], tmp_path: Path) -> None:
+    manifest_path = _make_valid_manifest(
+        pool,
+        tmp_path,
+        source_contract_sha256="a" * 64,
+        grid_contract_sha256="b" * 64,
+        classifier_checkpoint_sha256="c" * 64,
+    )
+
+    out_root = tmp_path / "manifest_runs"
+    _export(
+        pool,
+        out_root,
+        run_name="manifest_run",
+        identity_manifest_path=manifest_path,
+    )
+
+    run_record = json.loads((out_root / "manifest_run" / "run.json").read_text())
+    identity = run_record["run_info"]["identity"]
+    assert identity["source_contract_sha256"] == "a" * 64
+    assert identity["grid_contract_sha256"] == "b" * 64
+    assert identity["classifier_checkpoint_sha256"] == "c" * 64
+
+
+def test_export_union_compatibility(pool: dict[str, object], tmp_path: Path) -> None:
+    from src.heuristics.report import union_reports
+
+    out_root = tmp_path / "union_runs"
+    _export(pool, out_root, run_name="run_a")
+    _export(pool, out_root, run_name="run_b")
+
+    # Matching identity contracts union successfully
+    res = union_reports([out_root / "run_a", out_root / "run_b"])
+    man_path = _make_valid_manifest(
+        pool, tmp_path, classifier_checkpoint_sha256="e" * 64
+    )
+    _export(
+        pool,
+        out_root,
+        run_name="run_c",
+        identity_manifest_path=man_path,
+    )
+
+    with pytest.raises(ValueError, match="'classifier_checkpoint'"):
+        union_reports([out_root / "run_a", out_root / "run_c"])
+    assert res["summary"]["total_tiles"] == N_TILES

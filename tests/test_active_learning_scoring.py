@@ -730,3 +730,66 @@ def test_all_water_manifest_scoring(tmp_path: Path) -> None:
     npz = np.load(all_water_root / "feature_embeddings.npz")
     assert npz["embeddings"].shape[0] == 0
     assert len(npz["row_indices"]) == 0
+
+
+def test_stale_old_cache_invalidation_and_no_source_model_collision(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+    counters = {"classifier": 0, "regression": 0}
+    deps1 = _dependencies(counters)
+
+    run_dir = tmp_path / "run_source_test"
+    # 1. Score with mapbox source contract
+    manifest_mapbox = manifest.copy()
+    manifest_mapbox["provider"] = "mapbox"
+    manifest_mapbox["satellite_source"] = "mapbox.satellite"
+    manifest_mapbox["source_contract_sha256"] = "a" * 64
+
+    res1 = score_tile_manifest(manifest_mapbox, run_root=run_dir, dependencies=deps1)
+    assert res1["counts"]["cache_hits"] == 0
+    assert res1["source"]["provider"] == "mapbox"
+
+    # 2. Rescore with same mapbox source contract -> cache hit
+    res2 = score_tile_manifest(manifest_mapbox, run_root=run_dir, dependencies=deps1)
+    assert res2["counts"]["cache_hits"] == 2
+
+    # 3. Rescore with naip source contract -> stale cache invalidated, 0 hits
+    manifest_naip = manifest.copy()
+    manifest_naip["provider"] = "naip"
+    manifest_naip["satellite_source"] = "naip-visualization"
+    manifest_naip["source_contract_sha256"] = "b" * 64
+
+    res3 = score_tile_manifest(manifest_naip, run_root=run_dir, dependencies=deps1)
+    assert res3["counts"]["cache_hits"] == 0
+    assert res3["source"]["provider"] == "naip"
+
+
+def test_old_active_data_readable_only_as_explicit_mapbox_v1_identities(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+    counters = {"classifier": 0, "regression": 0}
+    deps = _dependencies(counters)
+    run_dir = tmp_path / "run_explicit_mapbox"
+
+    # Explicit mapbox-v1 canonical fields
+    manifest_explicit = manifest.copy()
+    manifest_explicit["provider"] = "mapbox"
+    manifest_explicit["satellite_source"] = "mapbox.satellite"
+
+    res1 = score_tile_manifest(manifest_explicit, run_root=run_dir, dependencies=deps)
+    assert res1["counts"]["cache_hits"] == 0
+
+    res2 = score_tile_manifest(manifest_explicit, run_root=run_dir, dependencies=deps)
+    assert res2["counts"]["cache_hits"] == 2
+
+    # If canonical fields are missing when NAIP contract requested, no shimming/guessing mapbox
+    manifest_missing_canonical = manifest.copy()
+    manifest_missing_canonical["provider"] = "naip"
+    manifest_missing_canonical["satellite_source"] = "naip-visualization"
+
+    res3 = score_tile_manifest(
+        manifest_missing_canonical, run_root=run_dir, dependencies=deps
+    )
+    assert res3["counts"]["cache_hits"] == 0

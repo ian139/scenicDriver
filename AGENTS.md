@@ -19,7 +19,7 @@ Scenic Drive scores scenic beauty from satellite imagery and terrain data, then 
 - `uv run marimo edit notebooks/regression.mo.py`
 - `uv run marimo edit notebooks/learned_scoring.mo.py`
 - `uv run marimo edit notebooks/annotate_scenic.mo.py`
-- `uv run python scripts/ingest/download_bbox_tiles.py ...`
+- `uv run python scripts/ingest/plan_active_learning_region.py ...`
 - `uv run python scripts/reports/heuristic_report.py ...`
 - `uv run python scripts/routing/route_compare_service.py ...`
 

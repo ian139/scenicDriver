@@ -18,6 +18,25 @@ No extra nested zoom folder under region.
 
 Lifecycle rules target the parent `raw/images/` prefix so both satellite and terrain tiles share the same raw image transition policy.
 
+## Open-Data Acquisition Layout
+
+The active ML acquisition contract is `config/data_sources/naip_3dep_v1.json`.
+It writes only beneath the source-versioned root:
+
+- `data/raw/sources/naip_3dep_v1/images/satellite/z14/<region>/<x>_<y>.png`
+- `data/raw/sources/naip_3dep_v1/images/terrain/z14/<region>/<x>_<y>.png`
+- `data/raw/sources/naip_3dep_v1/cache/` for content-addressed source objects
+- `data/raw/sources/naip_3dep_v1/catalog/` for hash-pinned local catalog snapshots
+
+The region contract is `config/data_sources/regions_v1.json`; its ignored
+Census jurisdiction and GSHHG land artifacts live under
+`data/raw/boundaries/` and must match the SHA-256 values in that contract.
+Planning is offline by default. Missing catalogs produce a
+`discovery_authorization_request.json`; no requester-pays access occurs until
+positive caps and the explicit requester-pays acknowledgement are supplied.
+Legacy Mapbox images remain historical inputs only and must never share cache,
+feature, prediction, or report identities with NAIP/3DEP artifacts.
+
 Report tooling defaults (unless overridden in env):
 - `SCENIC_S3_BUCKET=scenicdriver-data`
 - `SCENIC_S3_ONLY=1`

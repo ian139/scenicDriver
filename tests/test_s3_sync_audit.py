@@ -32,47 +32,6 @@ def test_lifecycle_rule_targets_canonical_raw_images_prefix() -> None:
     ]
 
 
-def test_download_bbox_resolves_canonical_prefixes() -> None:
-    from scripts.ingest.download_bbox_tiles import _resolve_s3_prefix
-
-    output_dir = Path("data/raw/images/satellite/z14/masswhites")
-
-    assert (
-        _resolve_s3_prefix(
-            prefix=None,
-            style="mapbox.satellite",
-            output_dir=output_dir,
-            zoom=14,
-        )
-        == "raw/images/satellite/z14/masswhites"
-    )
-    assert (
-        _resolve_s3_prefix(
-            prefix="/raw/images/terrain/",
-            style="mapbox.terrain-rgb",
-            output_dir=Path("data/raw/images/terrain/z14/masswhites"),
-            zoom=14,
-        )
-        == "raw/images/terrain/z14/masswhites"
-    )
-
-
-@pytest.mark.parametrize(
-    "prefix",
-    ["satellite", "terrain", "images/satellite", "images/terrain", "raw/images"],
-)
-def test_download_bbox_rejects_noncanonical_prefix_shorthands(prefix: str) -> None:
-    from scripts.ingest.download_bbox_tiles import _resolve_s3_prefix
-
-    with pytest.raises(ValueError, match="canonical"):
-        _resolve_s3_prefix(
-            prefix=prefix,
-            style="mapbox.satellite",
-            output_dir=Path("data/raw/images/satellite/z14/masswhites"),
-            zoom=14,
-        )
-
-
 def test_labeler_s3_prefix_from_local_dir_matches_data_contract() -> None:
     from src.heuristics.labeler import _s3_prefix_from_local_dir
 

@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "description": "Pinned land-only z14 active-learning region: preserve New England North and cover the authorized west/south U.S. expansion without extending north or east.",
+  "land_fraction_threshold": 0.05,
+  "baseline_land_geometry_file": "data/raw/boundaries/gshhg_2_3_7_target_land.geojson",
+  "baseline_land_geometry_sha256": "3e13bfd0a64ebe0a198d0babe240568d4426504274d5ca5799037b20becac3ff",
+  "baseline_jurisdiction_geometry_file": "data/raw/boundaries/census_tigerweb_2025_target_jurisdictions.geojson",
+  "baseline_jurisdiction_geometry_sha256": "9af74704d18da8bac59195cf02be63df35a15eb989aabd0757a557961be35e66",
+  "included_jurisdictions": [
+    "Connecticut",
+    "Delaware",
+    "District of Columbia",
+    "Maine",
+    "Maryland",
+    "Massachusetts",
+    "Michigan",
+    "New Hampshire",
+    "New Jersey",
+    "New York",
+    "Ohio",
+    "Pennsylvania",
+    "Rhode Island",
+    "Vermont",
+    "Virginia",
+    "West Virginia"
+  ],
+  "excluded_jurisdictions": [
+    "U.S. states outside the pinned target geometry"
+  ],
+  "known_non_target_coverage": [
+    "Atlantic Ocean",
+    "Great Lakes and inland water represented by GSHHG hierarchy levels L2 and L4"
+  ],
+  "geometry_provenance": {
+    "jurisdictions": {
+      "provider": "U.S. Census Bureau TIGERweb",
+      "dataset": "2025 States",
+      "source_url": "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/State_County/MapServer/0/query",
+      "artifact": "data/raw/boundaries/census_tigerweb_2025_target_jurisdictions.geojson",
+      "sha256": "9af74704d18da8bac59195cf02be63df35a15eb989aabd0757a557961be35e66"
+    },
+    "land": {
+      "provider": "GSHHG",
+      "version": "2.3.7",
+      "resolution": "full",
+      "hierarchy_expression": "L1-L2+L3-L4",
+      "source_url": "https://www.soest.hawaii.edu/pwessel/gshhg/gshhg-shp-2.3.7.zip",
+      "source_archive_sha256": "8dbbe7e071e77e9e75f2d639239099ebca8d5c16d6a07df8169729d49f15cf41",
+      "artifact": "data/raw/boundaries/gshhg_2_3_7_target_land.geojson",
+      "sha256": "3e13bfd0a64ebe0a198d0babe240568d4426504274d5ca5799037b20becac3ff"
+    }
+  },
+  "regions": [
+    {
+      "name": "authorized_us_land",
+      "type": "jurisdiction_land_intersection",
+      "jurisdiction_geometry_file": "data/raw/boundaries/census_tigerweb_2025_target_jurisdictions.geojson",
+      "jurisdiction_geometry_sha256": "9af74704d18da8bac59195cf02be63df35a15eb989aabd0757a557961be35e66",
+      "jurisdiction_field": "STATE",
+      "included_jurisdictions": [
+        "09",
+        "10",
+        "11",
+        "23",
+        "24",
+        "25",
+        "26",
+        "33",
+        "34",
+        "36",
+        "39",
+        "42",
+        "44",
+        "50",
+        "51",
+        "54"
+      ],
+      "land_geometry_file": "data/raw/boundaries/gshhg_2_3_7_target_land.geojson",
+      "land_geometry_sha256": "3e13bfd0a64ebe0a198d0babe240568d4426504274d5ca5799037b20becac3ff",
+      "threshold": 0.05
+    }
+  ]
+}

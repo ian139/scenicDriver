@@ -32,20 +32,24 @@ from .planner import (
     _normalize_search_diagnostics,
 )
 
+from src.data_pipeline.web_mercator import lat_lon_to_tile
 
 _DEFAULT_SCENIC_WEIGHT = 0.8
 _DEFAULT_AVOID_HIGHWAYS = False
 _DEFAULT_MAX_DETOUR_FACTOR = 1.8
 _DEFAULT_INCLUDE_BASELINE = True
 
-_DEFAULT_SCENIC_ROUTE_DEADLINE_SECONDS = 10.0
+_DEFAULT_SCENIC_ROUTE_DEADLINE_SECONDS = 20.0
 _DEADLINE_CHECK_INTERVAL = 256
 _ENDPOINT_NODE_DIAGNOSTIC_MAX_NODES = 1_000_000
 """Avoid materializing a full nearest-node index for production graphs."""
 
 
 def _maybe_check_deadline(
-    deadline: RoutingDeadline | None, counter: int, *, interval: int = _DEADLINE_CHECK_INTERVAL
+    deadline: RoutingDeadline | None,
+    counter: int,
+    *,
+    interval: int = _DEADLINE_CHECK_INTERVAL,
 ) -> None:
     if deadline is not None and counter % interval == 0:
         deadline.check()
@@ -87,8 +91,6 @@ class RouteCoverageError(ValueError):
         super().__init__(
             f"The {self.endpoint} point is too far from the supported road network."
         )
-
-
 
 
 def _frontier_time_limit_from_env() -> float | None:
@@ -146,9 +148,7 @@ class RouteRequest:
                 not math.isfinite(self.max_snap_distance_km)
                 or self.max_snap_distance_km < 0.0
             ):
-                raise ValueError(
-                    "max_snap_distance_km must be finite and nonnegative"
-                )
+                raise ValueError("max_snap_distance_km must be finite and nonnegative")
         else:
             self.max_snap_distance_km = None
         self.avoid_highways = _parse_bool(
@@ -171,9 +171,7 @@ class RouteRequest:
             graph_geojson=str(payload["graph_geojson"]),
             start=_parse_point(payload["start"], field_name="start"),
             end=_parse_point(payload["end"], field_name="end"),
-            scenic_weight=float(
-                payload.get("scenic_weight", _DEFAULT_SCENIC_WEIGHT)
-            ),
+            scenic_weight=float(payload.get("scenic_weight", _DEFAULT_SCENIC_WEIGHT)),
             avoid_highways=_parse_bool(
                 payload.get("avoid_highways", _DEFAULT_AVOID_HIGHWAYS),
                 field_name="avoid_highways",
@@ -253,12 +251,10 @@ def _parse_point(value: Any, *, field_name: str) -> tuple[float, float]:
     return lat, lon
 
 
-
 def _score_run_identity(path: Path) -> str:
     if path.parent.name.lower() in {"report", "reports"} and path.parent.parent.name:
         return path.parent.parent.name
     return path.stem
-
 
 
 _FileSignature = tuple[int, int, int, int, int]
@@ -279,17 +275,14 @@ def _signature_digest(path_key: str, signature: _FileSignature) -> str:
 # requests already using an evicted variant keep their own reference.
 _GRAPH_CACHE: OrderedDict[_GraphCacheKey, RoadGraph] = OrderedDict()
 _TILE_SCORE_CACHE: OrderedDict[_GraphCacheKey, _TileCacheValue] = OrderedDict()
-_ScoredGraphCacheKey = tuple[
-    _GraphCacheKey, _GraphCacheKey, int, float | None, str
-]
-_SCORED_GRAPH_CACHE: OrderedDict[
-    _ScoredGraphCacheKey, RoadGraph
-] = OrderedDict()
+_ScoredGraphCacheKey = tuple[_GraphCacheKey, _GraphCacheKey, int, float | None, str]
+_SCORED_GRAPH_CACHE: OrderedDict[_ScoredGraphCacheKey, RoadGraph] = OrderedDict()
 _ACTIVE_GRAPH_VARIANT_KEY: _ScoredGraphCacheKey | None = None
 _CACHE_CAPACITY = 1
 _TILE_CACHE_CAPACITY = 1
 _SCORED_GRAPH_CACHE_CAPACITY = 1
 _CACHE_LOCK = RLock()
+
 
 def _resolved_path_key(path: Path) -> str:
     return str(path.expanduser().resolve())
@@ -341,7 +334,6 @@ def _apply_tile_scores_to_graph_native(
 
     if deadline is not None:
         deadline.check()
-
 
     matched = 0
     total = 0
@@ -594,7 +586,9 @@ def _get_scored_graph(
         # fetched before this lock).  Normal requests always score a clone;
         # startup may explicitly score this source graph in place.
         scored_graph = (
-            graph if exclusive_source else _clone_graph_for_scoring(graph, deadline=deadline)
+            graph
+            if exclusive_source
+            else _clone_graph_for_scoring(graph, deadline=deadline)
         )
         matched, total = _apply_tile_scores_to_graph_native(
             scored_graph,
@@ -660,13 +654,16 @@ def preload_route_assets(
         "total_edges": 0,
         "matched_ratio": 0.0,
     }
-    tile_context: tuple[
-        Mapping[tuple[int, int, int], float],
-        str,
-        _FileSignature,
-        int,
-        float | None,
-    ] | None = None
+    tile_context: (
+        tuple[
+            Mapping[tuple[int, int, int], float],
+            str,
+            _FileSignature,
+            int,
+            float | None,
+        ]
+        | None
+    ) = None
 
     if tile_scores_path is not None:
         tile_file = Path(tile_scores_path)
@@ -680,9 +677,7 @@ def preload_route_assets(
             tile_score_cache_hit,
         ) = _load_cached_tile_scores(tile_file, deadline=deadline)
         zoom = (
-            int(tile_score_zoom)
-            if tile_score_zoom is not None
-            else int(inferred_zoom)
+            int(tile_score_zoom) if tile_score_zoom is not None else int(inferred_zoom)
         )
         tile_context = (
             score_map,
@@ -794,6 +789,7 @@ def preload_route_assets(
         "preload_elapsed_ms": (perf_counter() - started_at) * 1000.0,
     }
 
+
 def _normalized_score(raw_score: float) -> float:
     """Use the canonical immutable ``linear-v1`` score normalization."""
     return float(normalize_scenic_score(raw_score))
@@ -805,6 +801,8 @@ def _segment_identity(segment: Any, index: int) -> str:
     if str(edge_id) == "":
         raise ValueError("Route segment edge_id must not be empty")
     return str(edge_id)
+
+
 def _route_comparison_identity(
     route: Route,
     deadline: RoutingDeadline | None = None,
@@ -830,12 +828,8 @@ def _route_comparison_identity(
         if traversal_id is None or str(traversal_id) == "":
             traversal_id = ""
         direction = segment.direction
-        identities.append(
-            (canonical_id, str(traversal_id), str(direction))
-        )
+        identities.append((canonical_id, str(traversal_id), str(direction)))
     return tuple(identities)
-
-
 
 
 def _route_highway_count(
@@ -930,9 +924,7 @@ def route_to_feature(
         "requested_scenic_weight": objective_values.get(
             "requested_scenic_weight", None
         ),
-        "applied_scenic_weight": objective_values.get(
-            "applied_scenic_weight", None
-        ),
+        "applied_scenic_weight": objective_values.get("applied_scenic_weight", None),
         "estimated_duration_minutes": float(route.estimated_duration_minutes),
         "highway_count": _route_highway_count(route, deadline=deadline),
         "requested_max_detour_factor": objective_values.get(
@@ -984,9 +976,7 @@ def route_to_feature(
         "objective_value": objective_values.get(
             "objective_value", route.objective_value
         ),
-        "objective": objective_values.get(
-            "objective_value", route.objective_value
-        ),
+        "objective": objective_values.get("objective_value", route.objective_value),
         "scenic_score_delta_absolute": objective_values.get(
             "scenic_score_delta_absolute"
         ),
@@ -1001,9 +991,7 @@ def route_to_feature(
         "zero_improvement_reason": route.zero_improvement_reason,
         "no_route_reason": route.no_route_reason,
         "score_run": route.score_run,
-        "search_diagnostics": _normalize_search_diagnostics(
-            route.search_diagnostics
-        ),
+        "search_diagnostics": _normalize_search_diagnostics(route.search_diagnostics),
     }
     if objective is not None:
         properties["objective_components"] = dict(objective)
@@ -1016,20 +1004,6 @@ def route_to_feature(
         "properties": properties,
         "geometry": {"type": "LineString", "coordinates": coords},
     }
-
-
-def lat_lon_to_tile(lat: float, lon: float, zoom: int) -> tuple[int, int]:
-    n = 2**zoom
-    x = int((lon + 180.0) / 360.0 * n)
-    lat_rad = math.radians(lat)
-    y = int(
-        (1.0 - math.log(math.tan(lat_rad) + (1.0 / math.cos(lat_rad))) / math.pi)
-        / 2.0
-        * n
-    )
-    return x, y
-
-
 
 
 def apply_tile_scores_to_graph(
@@ -1141,9 +1115,7 @@ def _endpoint_snap_diagnostics(
 
     check_cancelled = deadline.check if deadline is not None else None
 
-    excluded_road_types = (
-        HIGHWAY_ROAD_TYPES if request.avoid_highways else frozenset()
-    )
+    excluded_road_types = HIGHWAY_ROAD_TYPES if request.avoid_highways else frozenset()
     diagnostics: dict[str, Any] = {
         "start_snap_km": None,
         "end_snap_km": None,
@@ -1177,8 +1149,7 @@ def _endpoint_snap_diagnostics(
 
         all_road_distance: float | None = None
         if max_snap_distance_km is not None and (
-            eligible_distance is None
-            or eligible_distance > max_snap_distance_km
+            eligible_distance is None or eligible_distance > max_snap_distance_km
         ):
             try:
                 all_projections, raw_distance = (
@@ -1216,8 +1187,6 @@ def _endpoint_snap_diagnostics(
     return diagnostics
 
 
-
-
 def _detour_reference_duration(
     scenic_route: Route,
     baseline_route: Route | None,
@@ -1248,9 +1217,7 @@ def _objective_components(
 
     scenic_duration = float(scenic_route.estimated_duration_minutes)
     scenic_raw = float(scenic_route.average_scenic_score)
-    fastest_duration = _detour_reference_duration(
-        scenic_route, baseline_route
-    )
+    fastest_duration = _detour_reference_duration(scenic_route, baseline_route)
     ratio = (
         scenic_duration / fastest_duration
         if fastest_duration > 0.0
@@ -1282,17 +1249,13 @@ def _objective_components(
         if absolute_delta is not None and baseline_raw != 0.0
         else None
     )
-    scenic_identity = _route_comparison_identity(
-        scenic_route, deadline=deadline
-    )
+    scenic_identity = _route_comparison_identity(scenic_route, deadline=deadline)
     baseline_identity = (
         _route_comparison_identity(baseline_route, deadline=deadline)
         if baseline_route is not None
         else None
     )
-    same_route = (
-        baseline_identity is not None and scenic_identity == baseline_identity
-    )
+    same_route = baseline_identity is not None and scenic_identity == baseline_identity
     no_better_reason = None
     certified = bool(scenic_route.exact) or scenic_route.optimality_gap == 0.0
     if same_route:
@@ -1318,9 +1281,7 @@ def _objective_components(
         "optimization_mode": optimization_mode,
         "highway_avoidance_cost": highway_cost,
         "highway_preference": (
-            _BEST_EFFORT_HIGHWAY_PREFERENCE
-            if highway_avoidance_fallback
-            else 0.0
+            _BEST_EFFORT_HIGHWAY_PREFERENCE if highway_avoidance_fallback else 0.0
         ),
         "normalized_scenic_score": normalized,
         "requested_scenic_weight": float(request.scenic_weight),
@@ -1357,9 +1318,7 @@ def _find_scenic_route_with_best_effort_avoidance(
                 avoid_highways=request.avoid_highways,
                 max_detour_factor=request.max_detour_factor,
                 scenic_priority=True,
-                detour_reference_duration_minutes=(
-                    detour_reference_duration_minutes
-                ),
+                detour_reference_duration_minutes=(detour_reference_duration_minutes),
                 deadline=deadline,
             )
             return route, bool(request.avoid_highways), None
@@ -1420,13 +1379,16 @@ def plan_routes(
         "matched_ratio": 0.0,
     }
 
-    tile_context: tuple[
-        Mapping[tuple[int, int, int], float],
-        str,
-        _FileSignature,
-        int,
-        float | None,
-    ] | None = None
+    tile_context: (
+        tuple[
+            Mapping[tuple[int, int, int], float],
+            str,
+            _FileSignature,
+            int,
+            float | None,
+        ]
+        | None
+    ) = None
     if request.tile_scores_json:
         score_path = Path(request.tile_scores_json)
         tile_load_started = perf_counter()
@@ -1522,9 +1484,7 @@ def plan_routes(
     if max_snap_distance_km is not None:
         for endpoint in ("start", "end"):
             eligible_distance = snap_diagnostics.get(f"{endpoint}_snap_km")
-            all_road_distance = snap_diagnostics.get(
-                f"{endpoint}_all_road_snap_km"
-            )
+            all_road_distance = snap_diagnostics.get(f"{endpoint}_all_road_snap_km")
             eligible_exceeds = (
                 eligible_distance is None
                 or float(eligible_distance) > max_snap_distance_km
@@ -1541,9 +1501,7 @@ def plan_routes(
                     or float(all_road_distance) <= max_snap_distance_km
                 )
             ):
-                strict_highway_avoidance_skip_reason = (
-                    "strict_snap_outside_limit"
-                )
+                strict_highway_avoidance_skip_reason = "strict_snap_outside_limit"
             if eligible_exceeds and all_road_exceeds:
                 snap_distance = (
                     eligible_distance
@@ -1610,29 +1568,19 @@ def plan_routes(
         scenic_route,
         strict_highway_avoidance_applied,
         highway_avoidance_fallback_reason,
-    ) = (
-        _find_scenic_route_with_best_effort_avoidance(
-            planner,
-            request,
-            detour_reference_duration_minutes=(
-                detour_reference_duration_minutes
-            ),
-            strict_avoidance_skip_reason=(
-                strict_highway_avoidance_skip_reason
-            ),
-            deadline=deadline,
-        )
+    ) = _find_scenic_route_with_best_effort_avoidance(
+        planner,
+        request,
+        detour_reference_duration_minutes=(detour_reference_duration_minutes),
+        strict_avoidance_skip_reason=(strict_highway_avoidance_skip_reason),
+        deadline=deadline,
     )
     highway_avoidance_fallback = (
         request.avoid_highways and not strict_highway_avoidance_applied
     )
-    diagnostics["avoid_highways_applied"] = (
-        strict_highway_avoidance_applied
-    )
+    diagnostics["avoid_highways_applied"] = strict_highway_avoidance_applied
     diagnostics["highway_avoidance_fallback"] = highway_avoidance_fallback
-    diagnostics["highway_avoidance_fallback_reason"] = (
-        highway_avoidance_fallback_reason
-    )
+    diagnostics["highway_avoidance_fallback_reason"] = highway_avoidance_fallback_reason
     diagnostics["highway_avoidance_mode"] = (
         "best_effort_fallback"
         if highway_avoidance_fallback
@@ -1695,9 +1643,7 @@ def plan_routes(
             {"route_kind": "baseline", "metrics": baseline_feature["properties"]}
         )
 
-    fastest_duration = _detour_reference_duration(
-        scenic_route, baseline_route
-    )
+    fastest_duration = _detour_reference_duration(scenic_route, baseline_route)
     comparison_baseline_duration = (
         float(baseline_route.estimated_duration_minutes)
         if baseline_route is not None
@@ -1705,9 +1651,7 @@ def plan_routes(
     )
     scenic_duration = float(scenic_route.estimated_duration_minutes)
     fastest_distance = (
-        float(baseline_route.total_distance_km)
-        if baseline_route is not None
-        else None
+        float(baseline_route.total_distance_km) if baseline_route is not None else None
     )
     scenic_distance = float(scenic_route.total_distance_km)
     duration_cap = float(scenic_route.duration_cap_minutes or 0.0)
@@ -1737,9 +1681,7 @@ def plan_routes(
                 "optimization_mode", "distance_weighted_scenic"
             ),
             "highway_preference": objective["highway_preference"],
-            "highway_avoidance_cost": objective[
-                "highway_avoidance_cost"
-            ],
+            "highway_avoidance_cost": objective["highway_avoidance_cost"],
             "optimization_status": scenic_route.exactness_status,
             "optimality_gap": scenic_route.optimality_gap,
             "certified_upper_bound": scenic_route.certified_upper_bound,

@@ -149,6 +149,12 @@ def parse_args() -> argparse.Namespace:
         default=256,
         help="Inference batch size (default: 256)",
     )
+    parser.add_argument(
+        "--identity-manifest",
+        required=True,
+        type=Path,
+        help="JSON manifest providing explicit identity contract fields (required)",
+    )
     args = parser.parse_args()
     if args.batch_size < 1:
         parser.error("--batch-size must be >= 1")
@@ -389,6 +395,154 @@ def _validate_class_ids(rows: list[dict[str, Any]], class_logits: np.ndarray) ->
         )
 
 
+HEX_64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _validate_hex_sha256(val: Any, name: str) -> str:
+    if not isinstance(val, str) or not HEX_64_RE.match(val.strip()):
+        raise ValueError(
+            f"Identity manifest field {name!r} must be a 64-character hex SHA-256 string, got {val!r}"
+        )
+    return val.strip().lower()
+
+
+def _resolve_identity_contract(
+    *,
+    dataset_path: Path,
+    metadata_path: Path,
+    checkpoint_path: Path,
+    ds_sha: str,
+    meta_sha: str,
+    ckpt_sha: str,
+    zoom: int,
+    identity_manifest_path: str | Path | None,
+) -> tuple[dict[str, str], str, Path]:
+    """Load, validate, and hash-bind the required identity manifest for learned heatmap export."""
+    if identity_manifest_path is None:
+        raise ValueError(
+            "Learned export requires an explicit --identity-manifest JSON file"
+        )
+    man_p = Path(identity_manifest_path)
+    if not man_p.exists() or not man_p.is_file():
+        raise FileNotFoundError(f"Identity manifest not found: {man_p}")
+
+    try:
+        manifest_data = json.loads(man_p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Invalid JSON in identity manifest {man_p}: {exc}") from exc
+
+    if not isinstance(manifest_data, dict):
+        raise ValueError(f"Identity manifest {man_p} must be a JSON object")
+
+    manifest_ds_sha = _validate_hex_sha256(
+        manifest_data.get("dataset_sha256"), "dataset_sha256"
+    )
+    if manifest_ds_sha != ds_sha.lower():
+        raise ValueError(
+            f"Identity manifest dataset_sha256 mismatch: manifest declared {manifest_ds_sha}, "
+            f"actual dataset NPZ SHA-256 is {ds_sha}"
+        )
+
+    manifest_meta_sha = _validate_hex_sha256(
+        manifest_data.get("metadata_sha256"), "metadata_sha256"
+    )
+    if manifest_meta_sha != meta_sha.lower():
+        raise ValueError(
+            f"Identity manifest metadata_sha256 mismatch: manifest declared {manifest_meta_sha}, "
+            f"actual metadata CSV SHA-256 is {meta_sha}"
+        )
+
+    manifest_ckpt_sha = _validate_hex_sha256(
+        manifest_data.get("regression_checkpoint_sha256"),
+        "regression_checkpoint_sha256",
+    )
+    if manifest_ckpt_sha != ckpt_sha.lower():
+        raise ValueError(
+            f"Identity manifest regression_checkpoint_sha256 mismatch: manifest declared {manifest_ckpt_sha}, "
+            f"actual checkpoint SHA-256 is {ckpt_sha}"
+        )
+
+    source_contract_sha256 = _validate_hex_sha256(
+        manifest_data.get("source_contract_sha256"), "source_contract_sha256"
+    )
+    preprocessing_contract_sha256 = _validate_hex_sha256(
+        manifest_data.get("preprocessing_contract_sha256"),
+        "preprocessing_contract_sha256",
+    )
+    grid_contract_sha256 = _validate_hex_sha256(
+        manifest_data.get("grid_contract_sha256"), "grid_contract_sha256"
+    )
+    classifier_checkpoint_sha256 = _validate_hex_sha256(
+        manifest_data.get("classifier_checkpoint_sha256"),
+        "classifier_checkpoint_sha256",
+    )
+    calibration_artifact_sha256 = _validate_hex_sha256(
+        manifest_data.get("calibration_artifact_sha256"),
+        "calibration_artifact_sha256",
+    )
+
+    score_schema_version = manifest_data.get("score_schema_version")
+    if not isinstance(score_schema_version, str) or not score_schema_version.strip():
+        raise ValueError(
+            "Identity manifest missing or empty required field 'score_schema_version'"
+        )
+    score_schema_version = score_schema_version.strip()
+
+    label_schema_version = manifest_data.get("label_schema_version")
+    if not isinstance(label_schema_version, str) or not label_schema_version.strip():
+        raise ValueError(
+            "Identity manifest missing or empty required field 'label_schema_version'"
+        )
+    label_schema_version = label_schema_version.strip()
+
+    if "zoom" in manifest_data and manifest_data["zoom"] is not None:
+        try:
+            m_zoom = int(manifest_data["zoom"])
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"Identity manifest field 'zoom' must be an integer, got {manifest_data['zoom']!r}"
+            ) from None
+        if m_zoom != zoom:
+            raise ValueError(
+                f"Identity manifest declared zoom {m_zoom} does not match "
+                f"feature pool coverage zoom {zoom}"
+            )
+    if "tile_size" in manifest_data and manifest_data["tile_size"] is not None:
+        try:
+            tsize = int(manifest_data["tile_size"])
+            if tsize <= 0:
+                raise ValueError("tile_size must be positive")
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"Identity manifest field 'tile_size' must be a positive integer, got {manifest_data['tile_size']!r}"
+            ) from None
+
+    if "size" in manifest_data and manifest_data["size"] is not None:
+        try:
+            size_val = int(manifest_data["size"])
+            if size_val <= 0:
+                raise ValueError("size must be positive")
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"Identity manifest field 'size' must be a positive integer, got {manifest_data['size']!r}"
+            ) from None
+
+    identity_manifest_sha = file_sha256(man_p)
+
+    identities = {
+        "source_contract_sha256": source_contract_sha256,
+        "preprocessing_contract_sha256": preprocessing_contract_sha256,
+        "grid_contract_sha256": grid_contract_sha256,
+        "classifier_checkpoint_sha256": classifier_checkpoint_sha256,
+        "regression_checkpoint_sha256": manifest_ckpt_sha,
+        "calibration_artifact_sha256": calibration_artifact_sha256,
+        "score_schema_version": score_schema_version,
+        "label_schema_version": label_schema_version,
+    }
+
+    return identities, identity_manifest_sha, man_p
+
+
 def _build_run_info(
     *,
     rows: list[dict[str, Any]],
@@ -396,11 +550,14 @@ def _build_run_info(
     ds_path: Path,
     meta_path: Path,
     ckpt_path: Path,
+    man_path: Path,
     ds_sha: str,
     meta_sha: str,
     ckpt_sha: str,
+    man_sha: str,
     device: str,
     batch_size: int,
+    identity_contract: dict[str, str],
 ) -> dict[str, Any]:
     region_counts: dict[str, int] = {}
     lats: list[float] = []
@@ -413,7 +570,35 @@ def _build_run_info(
         lons.append(row["lon"])
         xs.append(row["x"])
         ys.append(row["y"])
-    return {
+
+    hashes = {
+        "dataset_sha256": ds_sha,
+        "metadata_sha256": meta_sha,
+        "checkpoint_sha256": ckpt_sha,
+        "identity_manifest_sha256": man_sha,
+        "source_contract_sha256": identity_contract["source_contract_sha256"],
+        "preprocessing_contract_sha256": identity_contract[
+            "preprocessing_contract_sha256"
+        ],
+        "grid_contract_sha256": identity_contract["grid_contract_sha256"],
+        "classifier_checkpoint_sha256": identity_contract[
+            "classifier_checkpoint_sha256"
+        ],
+        "regression_checkpoint_sha256": identity_contract[
+            "regression_checkpoint_sha256"
+        ],
+        "calibration_artifact_sha256": identity_contract["calibration_artifact_sha256"],
+    }
+
+    inputs = {
+        "dataset_path": str(ds_path),
+        "metadata_path": str(meta_path),
+        "checkpoint_path": str(ckpt_path),
+        "identity_manifest_path": str(man_path),
+        "identity_manifest_sha256": man_sha,
+    }
+
+    run_info = {
         "scoring_mode": "learned",
         "derived_visualization": True,
         "purpose": "derived_expanded_heatmap_coverage",
@@ -431,16 +616,9 @@ def _build_run_info(
                 "visualization, not evaluation evidence."
             ),
         },
-        "hashes": {
-            "dataset_sha256": ds_sha,
-            "metadata_sha256": meta_sha,
-            "checkpoint_sha256": ckpt_sha,
-        },
-        "inputs": {
-            "dataset_path": str(ds_path),
-            "metadata_path": str(meta_path),
-            "checkpoint_path": str(ckpt_path),
-        },
+        "identity": dict(identity_contract),
+        "hashes": hashes,
+        "inputs": inputs,
         "row_alignment": "embedding_row_index",
         "counts": {"total": len(rows), "per_region": region_counts},
         "bounds": {
@@ -457,6 +635,8 @@ def _build_run_info(
         "device": device,
         "batch_size": batch_size,
     }
+    run_info.update(identity_contract)
+    return run_info
 
 
 def _build_tiles(rows: list[dict[str, Any]], preds: np.ndarray) -> list[dict[str, Any]]:
@@ -493,6 +673,7 @@ def export_heatmap_run(
     expected_metadata_sha256: str,
     expected_checkpoint_sha256: str,
     run_name: str,
+    identity_manifest_path: str | Path,
     output_root: str | Path = "data/processed/heuristic_runs",
     device: str = "cpu",
     batch_size: int = 256,
@@ -537,6 +718,16 @@ def export_heatmap_run(
     rows = _load_metadata(meta_path, pool["n"])
     zoom = _validate_coverage(rows, pool["n"])
     _validate_class_ids(rows, pool["class_logits"])
+    identity_contract, man_sha, man_path = _resolve_identity_contract(
+        dataset_path=ds_path,
+        metadata_path=meta_path,
+        checkpoint_path=ckpt_path,
+        ds_sha=ds_sha,
+        meta_sha=meta_sha,
+        ckpt_sha=ckpt_sha,
+        zoom=zoom,
+        identity_manifest_path=identity_manifest_path,
+    )
 
     resolved_device = resolve_device(device)
     model = load_model_checkpoint(ckpt_path, device=resolved_device, is_candidate=True)
@@ -552,20 +743,22 @@ def export_heatmap_run(
         raise ValueError(f"Prediction shape {preds.shape} != expected {(pool['n'],)}")
     if not np.isfinite(preds).all():
         raise ValueError("Model inference produced non-finite predictions")
-
-    tiles = _build_tiles(rows, preds)
     run_info = _build_run_info(
         rows=rows,
         zoom=zoom,
         ds_path=ds_path,
         meta_path=meta_path,
         ckpt_path=ckpt_path,
+        man_path=man_path,
         ds_sha=ds_sha,
         meta_sha=meta_sha,
         ckpt_sha=ckpt_sha,
+        man_sha=man_sha,
         device=resolved_device,
         batch_size=batch_size,
+        identity_contract=identity_contract,
     )
+    tiles = _build_tiles(rows, preds)
 
     root.mkdir(parents=True, exist_ok=True)
     staged: Path | None = None
@@ -634,6 +827,7 @@ def main() -> int:
             output_root=args.output_root,
             device=args.device,
             batch_size=args.batch_size,
+            identity_manifest_path=args.identity_manifest,
         )
     except (ValueError, FileNotFoundError, FileExistsError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

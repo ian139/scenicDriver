@@ -2,13 +2,455 @@ from __future__ import annotations
 
 from pathlib import Path
 import shutil
-from typing import Any
+import re
+from typing import Any, Sequence
 import json
 import os
 from io import BytesIO
 
 import numpy as np
 from PIL import Image
+
+
+def union_report_tiles(
+    tile_groups: Sequence[Sequence[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Deterministic additive union of report tiles keyed by (z, x, y, image_path).
+
+    Rejects coordinate disagreement within rows and preserves dataset origin columns.
+    """
+    merged: dict[tuple[int, int, int, str], dict[str, Any]] = {}
+
+    for group in tile_groups:
+        for tile in group:
+            img_path = str(tile.get("image_path") or "").strip()
+            z = tile.get("z")
+            x = tile.get("x")
+            y = tile.get("y")
+            if z is None or x is None or y is None:
+                m = re.search(
+                    r"z(\d+)[/_-]+(?:x)?(\d+)[/_-]+(?:y)?(\d+)",
+                    img_path,
+                    re.IGNORECASE,
+                )
+                if m:
+                    z = int(m.group(1))
+                    x = int(m.group(2))
+                    y = int(m.group(3))
+                else:
+                    m2 = re.search(r"(\d+)[_-](\d+)", Path(img_path).stem)
+                    if m2:
+                        z = z if z is not None else 14
+                        x = int(m2.group(1))
+                        y = int(m2.group(2))
+
+            z_val = int(z) if z is not None else 0
+            x_val = int(x) if x is not None else 0
+            y_val = int(y) if y is not None else 0
+
+            key = (z_val, x_val, y_val, img_path)
+
+            if key in merged:
+                existing = merged[key]
+                # Reject coordinate disagreement within rows
+                for coord_col in ("lat", "lon", "x", "y", "z"):
+                    v1 = existing.get(coord_col)
+                    v2 = tile.get(coord_col)
+                    if v1 is not None and v2 is not None:
+                        try:
+                            f1 = float(v1)
+                            f2 = float(v2)
+                            if abs(f1 - f2) > 1e-5:
+                                raise ValueError(
+                                    f"Coordinate disagreement for column {coord_col!r} "
+                                    f"in tile key {key}: {f1} != {f2}"
+                                )
+                        except (TypeError, ValueError):
+                            if str(v1).strip() != str(v2).strip():
+                                raise ValueError(
+                                    f"Coordinate disagreement for column {coord_col!r} "
+                                    f"in tile key {key}: {v1!r} != {v2!r}"
+                                )
+                # Preserve dataset origin columns
+                for origin_col in (
+                    "dataset_origin",
+                    "source_dataset",
+                    "origin_run",
+                    "dataset",
+                    "source_identity",
+                ):
+                    if origin_col in tile and origin_col not in existing:
+                        existing[origin_col] = tile[origin_col]
+                    elif (
+                        origin_col in tile
+                        and origin_col in existing
+                        and existing[origin_col] != tile[origin_col]
+                    ):
+                        if isinstance(existing[origin_col], list):
+                            if tile[origin_col] not in existing[origin_col]:
+                                existing[origin_col].append(tile[origin_col])
+                        else:
+                            existing[origin_col] = (
+                                f"{existing[origin_col]},{tile[origin_col]}"
+                            )
+            else:
+                row_copy = dict(tile)
+                row_copy["z"] = z_val
+                row_copy["x"] = x_val
+                row_copy["y"] = y_val
+                row_copy["image_path"] = img_path
+                merged[key] = row_copy
+
+    sorted_keys = sorted(merged.keys())
+    result_tiles = [merged[k] for k in sorted_keys]
+    for idx, tile in enumerate(result_tiles):
+        tile["index"] = idx
+    return result_tiles
+
+
+_IDENTITY_DIMENSIONS: dict[str, tuple[str, ...]] = {
+    "source_contract": (
+        "source_contract_sha256",
+        "source_contract_identity",
+        "source_contract",
+        "source_identity",
+        "source",
+    ),
+    "preprocessing": (
+        "preprocessing_contract_sha256",
+        "preprocessing_contract_identity",
+        "preprocessing_identity",
+        "preprocessing_contract",
+        "classifier_preprocessing_sha256",
+    ),
+    "grid": (
+        "grid_contract_sha256",
+        "grid_identity",
+        "grid_contract",
+        "grid_sha256",
+        "grid_spec",
+        "grid",
+    ),
+    "classifier_checkpoint": (
+        "classifier_checkpoint_sha256",
+        "classifier_checkpoint_identity",
+        "classifier_checkpoint",
+    ),
+    "regression_checkpoint": (
+        "regression_checkpoint_sha256",
+        "regression_checkpoint_identity",
+        "regression_checkpoint",
+        "checkpoint_sha256",
+        "learned_checkpoint_identity",
+        "checkpoint_path",
+        "checkpoint",
+    ),
+    "score_schema": (
+        "score_schema_version",
+        "score_schema_identity",
+        "score_schema",
+    ),
+    "label_schema": (
+        "label_schema_version",
+        "label_schema_identity",
+        "label_schema",
+    ),
+    "calibration": (
+        "calibration_artifact_sha256",
+        "calibration_identity",
+        "calibration_mode",
+        "calibration_type",
+        "scoring_mode",
+        "calibration_config_sha256",
+    ),
+}
+
+REQUIRED_LEARNED_FIELDS: dict[str, str] = {
+    "source_contract": "source_contract_sha256",
+    "preprocessing": "preprocessing_contract_sha256",
+    "grid": "grid_contract_sha256",
+    "classifier_checkpoint": "classifier_checkpoint_sha256",
+    "regression_checkpoint": "regression_checkpoint_sha256",
+    "score_schema": "score_schema_version",
+    "label_schema": "label_schema_version",
+    "calibration": "calibration_artifact_sha256",
+}
+
+
+def _is_learned_report(
+    content: dict[str, Any], dim_map: dict[str, Any], field_map: dict[str, Any]
+) -> bool:
+    run_info = (
+        content.get("run_info") if isinstance(content.get("run_info"), dict) else {}
+    )
+    scoring_mode = (
+        str(run_info.get("scoring_mode") or content.get("scoring_mode") or "")
+        .strip()
+        .lower()
+    )
+    if scoring_mode == "learned":
+        return True
+    if (
+        run_info.get("derived_visualization") is True
+        or content.get("derived_visualization") is True
+    ):
+        return True
+    for k in (
+        "classifier_checkpoint_sha256",
+        "regression_checkpoint_sha256",
+        "checkpoint_sha256",
+        "learned_checkpoint_identity",
+        "learned_checkpoint",
+    ):
+        if k in field_map:
+            return True
+    return False
+
+
+def _extract_report_identities(
+    content: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Extract dimension map and field map from report dict."""
+    candidate_dicts = []
+
+    # 1. run_info
+    if "run_info" in content and isinstance(content["run_info"], dict):
+        candidate_dicts.append(content["run_info"])
+        if "identity" in content["run_info"] and isinstance(
+            content["run_info"]["identity"], dict
+        ):
+            candidate_dicts.append(content["run_info"]["identity"])
+        if "metadata" in content["run_info"] and isinstance(
+            content["run_info"]["metadata"], dict
+        ):
+            candidate_dicts.append(content["run_info"]["metadata"])
+
+    # 2. metadata
+    if "metadata" in content and isinstance(content["metadata"], dict):
+        candidate_dicts.append(content["metadata"])
+
+    # 3. identity
+    if "identity" in content and isinstance(content["identity"], dict):
+        candidate_dicts.append(content["identity"])
+
+    # 4. content top-level
+    candidate_dicts.append(content)
+
+    dim_map: dict[str, Any] = {}
+    field_map: dict[str, Any] = {}
+
+    for dim_name, key_tuple in _IDENTITY_DIMENSIONS.items():
+        for d in candidate_dicts:
+            for key in key_tuple:
+                if key in d and d[key] is not None:
+                    val = str(d[key]).strip()
+                    if val:
+                        if dim_name not in dim_map:
+                            dim_map[dim_name] = val
+                        if key in field_map and field_map[key] != val:
+                            raise ValueError(
+                                f"Conflicting identity field {key!r} within one report: "
+                                f"{field_map[key]!r} != {val!r}"
+                            )
+                        field_map[key] = val
+
+    # Also capture any other identity/contract/sha256 keys from candidate dicts
+    all_keys = tuple(
+        k for key_tuple in _IDENTITY_DIMENSIONS.values() for k in key_tuple
+    )
+    for d in candidate_dicts:
+        for k, v in d.items():
+            if v is not None and (
+                k in all_keys
+                or k.endswith("_identity")
+                or k.endswith("_contract")
+                or k.endswith("_sha256")
+            ):
+                val = str(v).strip()
+                if val:
+                    if k in field_map and field_map[k] != val:
+                        raise ValueError(
+                            f"Conflicting identity field {k!r} within one report: "
+                            f"{field_map[k]!r} != {val!r}"
+                        )
+                    field_map[k] = val
+
+    return dim_map, field_map
+
+
+def validate_report_union_compatibility(
+    reports_or_contents: Sequence[dict[str, Any]],
+) -> None:
+    """Validate report-union compatibility across multiple report dictionaries.
+
+    Fails closed with ValueError if:
+    - Any learned report lacks any of the 8 required identity dimensions
+      (source_contract, preprocessing, grid, classifier_checkpoint,
+       regression_checkpoint, score_schema, label_schema, calibration).
+    - Reports have incompatible identities across declared dimensions.
+    - There is a one-sided missing identity for any declared dimension.
+    - Learned and non-learned (heuristic) reports are mixed in a union.
+
+    Preserves purely heuristic legacy unions ONLY when every input is non-learned
+    and uniformly lacks learned identities across all dimensions.
+    """
+    if not reports_or_contents:
+        return
+
+    extracted = [_extract_report_identities(item) for item in reports_or_contents]
+    dim_maps = [dim_map for dim_map, _ in extracted]
+    field_maps = [field_map for _, field_map in extracted]
+    is_learned_flags = [
+        _is_learned_report(content, dim_map, field_map)
+        for content, (dim_map, field_map) in zip(
+            reports_or_contents, extracted, strict=True
+        )
+    ]
+
+    any_learned = any(is_learned_flags)
+    all_learned = all(is_learned_flags)
+
+    if any_learned and not all_learned:
+        learned_idx = is_learned_flags.index(True)
+        heuristic_idx = is_learned_flags.index(False)
+        raise ValueError(
+            f"Cannot union learned report (input {learned_idx}) with "
+            f"non-learned/heuristic report (input {heuristic_idx})"
+        )
+
+    if any_learned:
+        for idx, field_map in enumerate(field_maps):
+            if is_learned_flags[idx]:
+                for dimension, field in REQUIRED_LEARNED_FIELDS.items():
+                    if field not in field_map:
+                        raise ValueError(
+                            f"Learned report at input {idx} missing required "
+                            f"identity dimension {dimension!r}: exact field {field!r}"
+                        )
+
+    for dim_name in _IDENTITY_DIMENSIONS:
+        declared = [
+            (idx, d[dim_name]) for idx, d in enumerate(dim_maps) if dim_name in d
+        ]
+        if not declared:
+            continue
+        if len(declared) < len(reports_or_contents):
+            declared_idx, val = declared[0]
+            missing_indices = [
+                i
+                for i in range(len(reports_or_contents))
+                if dim_name not in dim_maps[i]
+            ]
+            raise ValueError(
+                f"One-sided missing identity for {dim_name!r}: input {declared_idx} "
+                f"declares {val!r} while input {missing_indices[0]} lacks it"
+            )
+        first_val = declared[0][1]
+        for idx, val in declared[1:]:
+            if val != first_val:
+                raise ValueError(
+                    f"Incompatible {dim_name!r} identity across reports: "
+                    f"{first_val!r} != {val!r}"
+                )
+
+    all_fields = sorted({k for f in field_maps for k in f.keys()})
+    for key in all_fields:
+        declared = [(idx, f[key]) for idx, f in enumerate(field_maps) if key in f]
+        if not declared:
+            continue
+        if len(declared) < len(reports_or_contents):
+            declared_idx, val = declared[0]
+            missing_indices = [
+                i for i in range(len(reports_or_contents)) if key not in field_maps[i]
+            ]
+            raise ValueError(
+                f"One-sided missing identity field {key!r}: input {declared_idx} "
+                f"declares {val!r} while input {missing_indices[0]} lacks it"
+            )
+        first_val = declared[0][1]
+        for idx, val in declared[1:]:
+            if val != first_val:
+                raise ValueError(
+                    f"Incompatible identity field {key!r} across reports: "
+                    f"{first_val!r} != {val!r}"
+                )
+
+
+def union_reports(
+    reports_or_paths: Sequence[dict[str, Any] | str | Path],
+    *,
+    report_dir: str | Path | None = None,
+    raw_dir: str | Path | None = None,
+    run_info: dict[str, Any] | None = None,
+    include_thumbs: bool = False,
+) -> dict[str, Any]:
+    """Union multiple reports or tile lists into one deterministic report."""
+    contents = []
+    tile_groups = []
+    merged_run_info = dict(run_info or {})
+    for item in reports_or_paths:
+        if isinstance(item, (str, Path)):
+            p = Path(item)
+            if p.is_dir():
+                if (p / "report" / "report.json").is_file():
+                    p = p / "report" / "report.json"
+                else:
+                    p = p / "report.json"
+            content = json.loads(p.read_text(encoding="utf-8"))
+            contents.append(content)
+            tile_groups.append(content.get("tiles", []))
+            if "run_info" in content and isinstance(content["run_info"], dict):
+                merged_run_info.update(content["run_info"])
+        elif isinstance(item, dict):
+            content = item
+            contents.append(content)
+            tile_groups.append(content.get("tiles", []))
+            if "run_info" in item and isinstance(item["run_info"], dict):
+                merged_run_info.update(item["run_info"])
+        else:
+            raise ValueError(f"Invalid report item: {type(item)}")
+
+    to_validate = list(contents)
+    if run_info and isinstance(run_info, dict):
+        to_validate.append({"run_info": run_info})
+    validate_report_union_compatibility(to_validate)
+
+    unified_tiles = union_report_tiles(tile_groups)
+    if report_dir is not None:
+        return build_report(
+            tiles=unified_tiles,
+            report_dir=report_dir,
+            raw_dir=raw_dir or report_dir,
+            run_info=merged_run_info,
+            include_thumbs=include_thumbs,
+        )
+    scores = (
+        np.array([float(t["scenic_score"]) for t in unified_tiles], dtype=np.float32)
+        if unified_tiles
+        else np.array([0.0], dtype=np.float32)
+    )
+    hist_counts, hist_edges = np.histogram(scores, bins=20, range=(0.0, 10.0))
+    summary = {
+        "total_tiles": int(len(unified_tiles)),
+        "mean": float(scores.mean()) if len(unified_tiles) else 0.0,
+        "median": float(np.median(scores)) if len(unified_tiles) else 0.0,
+        "std": float(scores.std()) if len(unified_tiles) else 0.0,
+        "min": float(scores.min()) if len(unified_tiles) else 0.0,
+        "max": float(scores.max()) if len(unified_tiles) else 0.0,
+    }
+    grid = _build_grid_mapping(unified_tiles)
+    feature_summary = _build_feature_summary(unified_tiles)
+    return {
+        "summary": summary,
+        "feature_summary": feature_summary,
+        "histogram": {
+            "counts": [int(c) for c in hist_counts.tolist()],
+            "edges": [float(e) for e in hist_edges.tolist()],
+        },
+        "tiles": unified_tiles,
+        "grid": grid,
+        "run_info": merged_run_info,
+    }
 
 
 def build_report(
@@ -21,6 +463,9 @@ def build_report(
     thumb_size: int = 128,
     include_thumbs: bool = True,
 ) -> dict[str, Any]:
+    if run_info and isinstance(run_info, dict):
+        validate_report_union_compatibility([{"run_info": run_info}])
+    tiles = union_report_tiles([tiles])
     report_path = Path(report_dir)
     report_path.mkdir(parents=True, exist_ok=True)
 
@@ -33,7 +478,9 @@ def build_report(
             tile["index"] = idx
 
     scores = np.array([float(t["scenic_score"]) for t in tiles], dtype=np.float32)
-    hist_counts, hist_edges = np.histogram(scores, bins=histogram_bins, range=(0.0, 10.0))
+    hist_counts, hist_edges = np.histogram(
+        scores, bins=histogram_bins, range=(0.0, 10.0)
+    )
 
     summary = {
         "total_tiles": int(len(tiles)),
@@ -94,7 +541,9 @@ def _attach_thumbnails(
     s3 = None
     if s3_only:
         if not s3_bucket:
-            raise ValueError("SCENIC_S3_BUCKET and s3:// raw_dir required for S3-only mode.")
+            raise ValueError(
+                "SCENIC_S3_BUCKET and s3:// raw_dir required for S3-only mode."
+            )
         import boto3
 
         # Reuse a single client for all thumbnail fetches.
@@ -106,7 +555,9 @@ def _attach_thumbnails(
         thumb_path = thumbs_dir / thumb_name
 
         if s3_only:
-            key = f"{s3_prefix}/{tile['image_path']}" if s3_prefix else tile["image_path"]
+            key = (
+                f"{s3_prefix}/{tile['image_path']}" if s3_prefix else tile["image_path"]
+            )
             resp = s3.get_object(Bucket=s3_bucket, Key=key)
             image = Image.open(BytesIO(resp["Body"].read())).convert("RGB")
         else:
@@ -120,7 +571,9 @@ def _attach_thumbnails(
 
 def _build_grid_mapping(tiles: list[dict[str, Any]]) -> dict[str, Any]:
     coords = [(t.get("x"), t.get("y"), t.get("z")) for t in tiles]
-    has_coords = all(x is not None and y is not None and z is not None for x, y, z in coords)
+    has_coords = all(
+        x is not None and y is not None and z is not None for x, y, z in coords
+    )
     if not has_coords:
         return {"has_coords": False, "index_by_coord": {}}
 

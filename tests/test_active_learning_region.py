@@ -1,421 +1,474 @@
+"""Focused tests for the canonical open-data planner CLI
+(scripts/ingest/plan_active_learning_region.py).
+
+Covers: exact flag contract with no Mapbox options, plan-only behavior,
+missing-catalog discovery authorization, cap-required execution mode, budget
+and pilot bounds, identity drift, and the extended manifest contract.
+"""
+
 from __future__ import annotations
 
 import csv
 import json
-import threading
-import time
-from types import SimpleNamespace
 from pathlib import Path
 
-import numpy as np
 import pytest
-from PIL import Image
 
 from scripts.ingest import plan_active_learning_region as planner
-from scripts.ingest.plan_active_learning_region import acquire_missing, plan_run
-from src.data_pipeline.region_planning import (
-    enumerate_bbox_tiles,
-    get_builtin_region_spec,
-    parse_and_validate_region_spec,
+from scripts.ingest.naip_3dep_workflow import PLAN_SCHEMA_VERSION
+from tests.naip3dep_fixtures import (
+    CT_BBOX,
+    NAIP_SAT_KEY,
+    TILE_COORDS,
+    fake_planned_dict,
+    make_naip_catalog,
+    naip_asset,
+    tnm_record,
+    write_contract_with_catalogs,
 )
-from src.data_pipeline.tile_inventory import scan_s3_inventory, validate_png_image
 
 
-def test_builtin_spec_covers_baseline_and_stays_under_budget():
-    planned = parse_and_validate_region_spec(get_builtin_region_spec())
-    assert planned["nen_tile_count"] > 0
-    assert planned["unique_coordinates_count"] <= 370_000
-    assert planned["unique_coordinates_count"] >= 360_000
-    assert planned["total_rasters_count"] == planned["unique_coordinates_count"] * 2
-    spec = get_builtin_region_spec()
-    assert spec["geographic_source"]
-    assert spec["included_jurisdictions"]
-    assert spec["known_non_target_coverage"]
-    assert spec["limitations"]
+@pytest.fixture(autouse=True)
+def _fast_region_planning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plan tests use a tiny planned dict instead of the full built-in region
+    (which would enumerate tens of thousands of coordinates)."""
+
+    def fake_parse(
+        spec_data,
+        app_regions_path="config/app_regions.json",
+        max_budget_coords=370000,
+        zoom=14,
+    ):
+        planned = fake_planned_dict()
+        planned["spec_data"] = spec_data
+        return planned
+
+    monkeypatch.setattr(planner, "parse_and_validate_region_spec", fake_parse)
 
 
-def test_overlapping_regions_dedupe_coordinates():
-    baseline = get_builtin_region_spec()["regions"][0]
-    spec = {"version": 1, "regions": [baseline, baseline]}
-    planned = parse_and_validate_region_spec(spec)
-    assert planned["unique_coordinates_count"] == planned["nen_tile_count"]
-
-
-def test_north_expansion_rejected():
-    spec = get_builtin_region_spec()
-    spec["regions"].append(
-        {
-            "name": "north",
-            "type": "bbox",
-            "bbox": {
-                "min_lat": 47.5,
-                "min_lon": -73.5,
-                "max_lat": 48.0,
-                "max_lon": -73.0,
-            },
-        }
-    )
-    with pytest.raises(ValueError, match="North"):
-        parse_and_validate_region_spec(spec)
-
-
-def test_budget_rejected_before_output(tmp_path: Path):
-    spec = {"version": 1, "regions": [get_builtin_region_spec()["regions"][0]]}
-    with pytest.raises(ValueError, match="budget cap"):
-        plan_run(
-            run_name="over",
-            spec=spec,
-            output_root=tmp_path / "runs",
-            image_root=tmp_path / "images",
-            budget=1,
-        )
-    assert not (tmp_path / "runs").exists()
-
-
-def test_existing_run_rejects_identity_drift_before_rewrite(tmp_path: Path) -> None:
-    spec = {"version": 1, "regions": [get_builtin_region_spec()["regions"][0]]}
-    first = plan_run(
-        run_name="resume",
-        spec=spec,
-        output_root=tmp_path / "runs",
-        image_root=tmp_path / "images",
-        budget=100_000,
-    )
-    manifest_path = Path(first["run_dir"]) / "region_manifest.json"
-    before = manifest_path.read_bytes()
-    with pytest.raises(ValueError, match="identity drift"):
-        plan_run(
-            run_name="resume",
-            spec=spec,
-            output_root=tmp_path / "runs",
-            image_root=tmp_path / "images",
-            budget=100_001,
-        )
-    assert manifest_path.read_bytes() == before
-
-
-def test_inventory_reuses_valid_pair_and_manifest_contract(tmp_path: Path):
-    image_root = tmp_path / "images"
-    row = enumerate_bbox_tiles(42.49, -73.52, 42.50, -73.51, zoom=14)[0]
-    x, y = row
-    region_dir_sat = image_root / "satellite" / "z14" / "new_england_north"
-    region_dir_ter = image_root / "terrain" / "z14" / "new_england_north"
-    region_dir_sat.mkdir(parents=True)
-    region_dir_ter.mkdir(parents=True)
-    Image.new("RGB", (256, 256), (1, 2, 3)).save(region_dir_sat / f"{x}_{y}.png")
-    Image.new("RGB", (256, 256), (1, 2, 3)).save(region_dir_ter / f"{x}_{y}.png")
-    assert validate_png_image(region_dir_sat / f"{x}_{y}.png")["valid"]
-
-    spec = {
+def _spec() -> dict:
+    return {
         "version": 1,
+        "geographic_source": "fixture",
+        "included_jurisdictions": ["Connecticut"],
+        "excluded_jurisdictions": [],
+        "known_non_target_coverage": [],
+        "limitations": ["fixture geometry"],
         "regions": [
             {
-                "name": "new_england_north",
+                "name": "sne_pilot",
                 "type": "bbox",
                 "bbox": {
-                    "min_lat": 42.488301979602255,
-                    "min_lon": -73.5205078125,
-                    "max_lat": 47.50235895196859,
-                    "max_lon": -66.796875,
+                    "min_lat": 41.60,
+                    "min_lon": -72.75,
+                    "max_lat": 41.80,
+                    "max_lon": -72.60,
                 },
             }
         ],
     }
-    result = plan_run(
-        run_name="inventory",
-        spec=spec,
-        output_root=tmp_path / "runs",
-        image_root=image_root,
+
+
+def _plan_run(tmp_path: Path, **overrides) -> dict:
+    catalog = make_naip_catalog(
+        [naip_asset("ct", 2021, "m_4107201_ne_18_060-20210816", CT_BBOX)]
     )
-    assert result["inventory_report"]["counts"]["complete_pairs"] >= 1
+    contract_path = write_contract_with_catalogs(
+        tmp_path, imagery_catalog=catalog, terrain_records=[tnm_record(CT_BBOX)]
+    )
+    kwargs = dict(
+        run_name="pilot",
+        spec=_spec(),
+        output_root=tmp_path / "runs",
+        image_root=tmp_path / "images",
+        config_path="config/app_regions.json",
+        source_contract_path=contract_path,
+        budget=370000,
+        pilot_budget=500,
+    )
+    kwargs.update(overrides)
+    return planner.plan_run(**kwargs)
+
+
+def test_parse_args_exposes_canonical_flags_and_no_mapbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.argv", ["plan_active_learning_region.py"])
+    args = planner.parse_args()
+    namespace = vars(args)
+    for flag in (
+        "run_name",
+        "region_spec",
+        "region_source",
+        "imagery_source",
+        "terrain_source",
+        "source_contract",
+        "image_root",
+        "output_root",
+        "budget",
+        "pilot_budget",
+        "execute_plan",
+        "expected_plan_sha256",
+        "allow_requester_pays",
+        "max_source_requests",
+        "max_transfer_bytes",
+        "max_local_bytes",
+        "max_requester_pays_usd",
+        "workers",
+        "max_runtime_minutes",
+    ):
+        assert flag in namespace, f"missing canonical flag --{flag.replace('_', '-')}"
+    # No active Mapbox acquisition option may exist.
+    for forbidden in ("acquire", "mapbox", "s3_bucket", "s3_prefix_root"):
+        assert forbidden not in namespace, (
+            f"obsolete Mapbox-era option {forbidden} present"
+        )
+    assert args.imagery_source == "naip-visualization"
+    assert args.terrain_source == "usgs-3dep-13as"
+    assert args.budget == 370_000
+
+
+def test_plan_only_writes_immutable_plan_and_authorization(tmp_path: Path) -> None:
+    result = _plan_run(tmp_path)
+    assert result["plan_state"] == "planned"
+    assert result["missing_catalogs"] == []
+    run_dir = tmp_path / "runs" / "pilot"
+
+    plan_path = Path(result["execution_plan_path"])
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    assert plan["schema_version"] == PLAN_SCHEMA_VERSION
+    assert plan["coordinate_count"] == len(TILE_COORDS)
+    assert plan["missing_satellite"] == len(TILE_COORDS)
+    assert plan["missing_terrain"] == len(TILE_COORDS)
+    assert plan["caps"] == {
+        "max_requests": None,
+        "max_transfer_bytes": None,
+        "max_local_bytes": None,
+        "max_requester_pays_usd": None,
+        "allow_requester_pays": False,
+    }
+    assert plan["requester_pays"]["imagery"] is True
+    assert plan["requester_pays"]["terrain"] is False
+    sha_file = (run_dir / "execution_plan.sha256").read_text().strip()
+    assert sha_file == result["execution_plan_sha256"]
+    assert sha_file == planner.plan_digest(plan)
+    # The digest is the SHA-256 of the plan file bytes themselves.
+    import hashlib
+
+    assert hashlib.sha256(plan_path.read_bytes()).hexdigest() == sha_file
+
+    auth = json.loads(
+        (run_dir / "acquisition_authorization_request.json").read_text(encoding="utf-8")
+    )
+    assert auth["authorization_type"] == "acquisition_authorization_request"
+    assert auth["execution_plan_sha256"] == sha_file
+    assert auth["required_authorization"]["currency"] == "USD"
+    assert auth["policy"]["requester_pays"] is False
+    assert auth["policy"]["network_call_made"] is False
+
+    preflight = json.loads(
+        (run_dir / "acquisition_preflight.json").read_text(encoding="utf-8")
+    )
+    assert preflight["state"] == "planned"
+    assert preflight["pilot_budget"] == 500
+
+    pilot_frame = json.loads((run_dir / "pilot_frame.json").read_text(encoding="utf-8"))
+    assert len(pilot_frame["coordinates"]) == len(TILE_COORDS)
+    assert pilot_frame["seed"] == 42
+
+
+def test_plan_only_writes_extended_manifest(tmp_path: Path) -> None:
+    _plan_run(tmp_path)
     with open(
-        tmp_path / "runs" / "inventory" / "tile_manifest.csv",
+        tmp_path / "runs" / "pilot" / "tile_manifest.csv",
         newline="",
         encoding="utf-8",
     ) as stream:
         reader = csv.DictReader(stream)
-        assert reader.fieldnames == [
-            "region",
-            "z",
-            "x",
-            "y",
-            "lat",
-            "lon",
-            "image_path",
-            "satellite_path",
-            "terrain_path",
-            "satellite_present",
-            "terrain_present",
-            "satellite_s3_present",
-            "terrain_s3_present",
-            "satellite_s3_uri",
-            "terrain_s3_uri",
-            "satellite_water_fraction",
-            "terrain_sea_level_fraction",
-            "effective_water_fraction",
-            "water_filter_status",
-            "unusable_reason",
-        ]
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    assert fieldnames == planner.COLUMNS
+    assert len(rows) == len(TILE_COORDS)
+    row = rows[0]
+    assert row["satellite_asset_ids"] == json.dumps([NAIP_SAT_KEY])
+    assert row["state"] == "ct"
+    assert row["admission_reason"] == "center_on_land"
+    assert row["source_contract_sha256"]
+    assert row["preprocessing_contract_sha256"]
+    assert row["boundary_geometry_sha256"]
+    assert row["satellite_provider"] == "usda_naip"
+    assert row["terrain_provider"] == "usgs"
+    assert row["processing_version"]
+    # Provenance scalars are populated only after execution.
+    assert row["satellite_output_sha256"] == ""
+    assert row["grid_sha256"] == ""
 
 
-def test_s3_inventory_reuses_nonempty_canonical_pair() -> None:
-    class Paginator:
-        def paginate(self, *, Bucket: str, Prefix: str):
-            style = "satellite" if "/satellite/" in Prefix else "terrain"
-            assert Bucket == "scenic"
-            yield {
-                "Contents": [
-                    {"Key": f"raw/images/{style}/z14/west/10_20.png", "Size": 123},
-                    {
-                        "Key": f"raw/images/{style}/z14/west/nested/10_20.png",
-                        "Size": 999,
-                    },
-                ]
-            }
-
-    class Client:
-        def get_paginator(self, name: str):
-            assert name == "list_objects_v2"
-            return Paginator()
-
-    rows, counts = scan_s3_inventory(
-        [
-            {
-                "region": "west",
-                "z": 14,
-                "x": 10,
-                "y": 20,
-                "satellite_present": False,
-                "terrain_present": False,
-            }
-        ],
-        bucket="scenic",
-        s3_client=Client(),
+def test_missing_catalog_emits_discovery_authorization(tmp_path: Path) -> None:
+    contract_path = write_contract_with_catalogs(
+        tmp_path, imagery_catalog=None, terrain_records=None
     )
-    assert counts["complete_pairs"] == 0
-    assert counts["satellite_valid"] == 0
-    assert counts["terrain_valid"] == 0
-    assert counts["satellite_s3_objects"] == 1
-    assert counts["terrain_s3_objects"] == 1
-    assert (
-        rows[0]["satellite_s3_uri"]
-        == "s3://scenic/raw/images/satellite/z14/west/10_20.png"
+    result = planner.plan_run(
+        run_name="disc",
+        spec=_spec(),
+        output_root=tmp_path / "runs",
+        image_root=tmp_path / "images",
+        config_path="config/app_regions.json",
+        source_contract_path=contract_path,
+        budget=370000,
     )
-
-
-def test_acquisition_uses_bounded_workers_and_writes_pairs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    state_lock = threading.Lock()
-    state = {"active": 0, "maximum": 0}
-
-    class Source:
-        DEFAULT_RATE_LIMIT = 10
-
-        def __init__(self, **kwargs):
-            assert kwargs["rate_limit"] == 5
-
-        def get_tile(self, x: int, y: int, zoom: int):
-            with state_lock:
-                state["active"] += 1
-                state["maximum"] = max(state["maximum"], state["active"])
-            time.sleep(0.02)
-            with state_lock:
-                state["active"] -= 1
-            return SimpleNamespace(image=np.zeros((8, 8, 3), dtype=np.uint8))
-
-    monkeypatch.setattr(planner, "MapboxTileSource", Source)
-    rows = [
-        {
-            "region": "fixture",
-            "z": 14,
-            "x": index,
-            "y": 20,
-            "satellite_path": str(tmp_path / "satellite" / f"{index}.png"),
-            "terrain_path": str(tmp_path / "terrain" / f"{index}.png"),
-            "satellite_present": False,
-            "terrain_present": False,
-        }
-        for index in range(4)
-    ]
-    failures: list[dict] = []
-
-    acquire_missing(
-        rows,
-        image_root=tmp_path,
-        zoom=14,
-        failures=failures,
-        max_workers=2,
+    assert result["plan_state"] == "needs_discovery"
+    assert result["execution_plan_path"] is None
+    assert result["execution_plan_sha256"] is None
+    disc = json.loads(
+        (tmp_path / "runs" / "disc" / "discovery_authorization_request.json").read_text(
+            encoding="utf-8"
+        )
     )
+    assert disc["authorization_type"] == "discovery_authorization_request"
+    assert set(disc["missing_catalogs"]) == {"imagery", "terrain"}
+    assert disc["policy"]["network_call_made"] is False
+    assert isinstance(disc["required_authorization"]["max_requests"], int)
+    assert disc["required_authorization"]["max_requests"] > 0
+    assert isinstance(disc["required_authorization"]["max_spend_usd"], str)
+    assert disc["required_authorization"]["currency"] == "USD"
+    assert len(disc["proposed_operations"]) == 2
+    preflight = json.loads(
+        (tmp_path / "runs" / "disc" / "acquisition_preflight.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert preflight["state"] == "needs_discovery"
 
-    assert not failures
-    assert state["maximum"] == 2
-    assert all(row["satellite_present"] and row["terrain_present"] for row in rows)
-    assert all(Path(row["satellite_path"]).is_file() for row in rows)
-    assert all(Path(row["terrain_path"]).is_file() for row in rows)
+
+def test_unknown_or_paid_sources_refused(tmp_path: Path) -> None:
+    from scripts.ingest.naip_3dep_workflow import SourceContractError
+
+    with pytest.raises(SourceContractError, match="not supported"):
+        planner.plan_run(
+            run_name="bad",
+            spec=_spec(),
+            output_root=tmp_path / "runs",
+            image_root=tmp_path / "images",
+            source_contract_path="config/data_sources/naip_3dep_v1.json",
+            imagery_source="mapbox.satellite",
+        )
+    with pytest.raises(SourceContractError, match="not supported"):
+        planner.plan_run(
+            run_name="bad",
+            spec=_spec(),
+            output_root=tmp_path / "runs",
+            image_root=tmp_path / "images",
+            source_contract_path="config/data_sources/naip_3dep_v1.json",
+            terrain_source="unknown-provider",
+        )
+
+
+def test_budget_and_pilot_bounds_enforced(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="budget"):
+        _plan_run(tmp_path, budget=370_001)
+    with pytest.raises(ValueError, match="pilot_budget"):
+        _plan_run(tmp_path, pilot_budget=501)
+    with pytest.raises(ValueError, match="pilot_budget"):
+        _plan_run(tmp_path, pilot_budget=0)
+    with pytest.raises(ValueError, match="exceed"):
+        _plan_run(tmp_path, budget=200, pilot_budget=500)
 
 
 def test_plan_run_rejects_invalid_run_names(tmp_path: Path) -> None:
-    spec = get_builtin_region_spec()
-    for bad_name in (
-        "",
-        "/abs/path",
-        "../traversal",
-        "dot/dot",
-        ".",
-        "..",
-        "invalid name",
-    ):
+    for bad in ("", "../traversal", "a/b", "invalid name"):
         with pytest.raises(ValueError):
-            plan_run(
-                run_name=bad_name,
-                spec=spec,
-                output_root=tmp_path / "runs",
-                image_root=tmp_path / "images",
-            )
+            _plan_run(tmp_path, run_name=bad)
 
 
-def test_plan_run_fully_cached_requires_no_mapbox_token(
+def test_existing_run_rejects_identity_drift(tmp_path: Path) -> None:
+    first = _plan_run(tmp_path)
+    manifest_path = Path(first["run_dir"]) / "region_manifest.json"
+    before = manifest_path.read_bytes()
+    with pytest.raises(ValueError, match="identity drift"):
+        _plan_run(tmp_path, budget=300_000)
+    assert manifest_path.read_bytes() == before
+
+    manifest_data = json.loads(before.decode("utf-8"))
+    manifest_data["inputs"]["repository_source_tree_digest"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest_data, indent=2))
+    with pytest.raises(
+        ValueError, match="existing run identity drift: repository_source_tree_digest"
+    ):
+        _plan_run(tmp_path)
+
+    manifest_path.write_bytes(before)
+    # Identical inputs re-plan deterministically (same plan digest).
+    again = _plan_run(tmp_path)
+    assert again["execution_plan_sha256"] == first["execution_plan_sha256"]
+
+
+def test_execute_mode_requires_plan_hash_and_positive_caps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("MAPBOX_ACCESS_TOKEN", raising=False)
-    image_root = tmp_path / "images"
-    spec = {"version": 1, "regions": [get_builtin_region_spec()["regions"][0]]}
-    planned = parse_and_validate_region_spec(spec)
-    for x, y in planned["ordered_coords"]:
-        region = planned["coord_to_region"][(x, y)]
-        sat = image_root / "satellite" / "z14" / region / f"{x}_{y}.png"
-        ter = image_root / "terrain" / "z14" / region / f"{x}_{y}.png"
-        sat.parent.mkdir(parents=True, exist_ok=True)
-        ter.parent.mkdir(parents=True, exist_ok=True)
-        Image.new("RGB", (4, 4), color="blue").save(sat, format="PNG")
-        Image.new("RGB", (4, 4), color="green").save(ter, format="PNG")
+    executed = {}
 
-    res = plan_run(
-        run_name="cached_run",
-        spec=spec,
-        output_root=tmp_path / "runs",
-        image_root=image_root,
-        acquire=True,
-    )
-    assert res["region_manifest"]["stage_state"] == "acquired"
-    assert res["region_manifest"]["ready_for_selection"] is True
+    def fake_execute(plan_path, **kwargs):
+        executed["plan_path"] = plan_path
+        executed["kwargs"] = kwargs
+        return {
+            "run_dir": "run",
+            "plan_sha256": "0" * 64,
+            "state": "acquired",
+            "completed_coordinates": 1,
+            "failed_coordinates": 0,
+            "pending_coordinates": 0,
+            "counters": {},
+        }
 
+    monkeypatch.setattr(planner, "execute_plan", fake_execute)
 
-def test_s3_only_readiness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    class DummyPaginator:
-        def __init__(self, key: str):
-            self.key = key
-
-        def paginate(self, Bucket: str, Prefix: str):
-            filename = "100_100.png"
-            return [
-                {
-                    "Contents": [
-                        {
-                            "Key": f"{Prefix}{filename}",
-                            "Size": 1024,
-                        }
-                    ]
-                }
-            ]
-
-    class DummyS3Client:
-        def get_paginator(self, name: str):
-            return DummyPaginator(name)
-
-    monkeypatch.setattr("boto3.client", lambda name: DummyS3Client())
-    inv_rows, counts = scan_s3_inventory(
+    # Execute mode without --expected-plan-sha256 -> SystemExit before any work.
+    monkeypatch.setattr(
+        "sys.argv",
         [
-            {
-                "region": "west",
-                "z": 14,
-                "x": 100,
-                "y": 100,
-                "satellite_present": False,
-                "terrain_present": False,
-            }
+            "plan_active_learning_region.py",
+            "--execute-plan",
+            "execution_plan.json",
+            "--allow-requester-pays",
+            "--max-source-requests",
+            "10",
+            "--max-transfer-bytes",
+            "1000",
+            "--max-local-bytes",
+            "1000",
+            "--max-requester-pays-usd",
+            "1",
         ],
-        bucket="test-bucket",
-        s3_client=DummyS3Client(),
     )
-    assert counts["satellite_valid"] == 0
-    assert counts["terrain_valid"] == 0
-    assert counts["complete_pairs"] == 0
-    assert counts["reusable_pairs"] == 1
-    assert counts["satellite_s3_objects"] == 1
-    assert counts["terrain_s3_objects"] == 1
+    with pytest.raises(SystemExit):
+        planner.main()
 
-
-def test_plan_run_water_assessment_and_counts(tmp_path: Path) -> None:
-    image_root = tmp_path / "images"
-    coords = enumerate_bbox_tiles(42.49, -73.52, 42.50, -73.47, zoom=14)
-    assert len(coords) >= 2
-    (x1, y1), (x2, y2) = coords[0], coords[1]
-
-    ter_dir = image_root / "terrain" / "z14" / "new_england_north"
-    sat_dir = image_root / "satellite" / "z14" / "new_england_north"
-    ter_dir.mkdir(parents=True)
-    sat_dir.mkdir(parents=True)
-
-    # Tile 1: Land tile (0% water)
-    Image.new("RGB", (256, 256), (1, 138, 112)).save(ter_dir / f"{x1}_{y1}.png")
-    Image.new("RGB", (256, 256), (50, 150, 80)).save(sat_dir / f"{x1}_{y1}.png")
-
-    # Tile 2: Ocean tile in both satellite imagery and Terrain-RGB.
-    Image.new("RGB", (256, 256), (1, 134, 160)).save(ter_dir / f"{x2}_{y2}.png")
-    Image.new("RGB", (256, 256), (70, 90, 180)).save(sat_dir / f"{x2}_{y2}.png")
-
-    spec = {
-        "version": 1,
-        "regions": [
-            {
-                "name": "new_england_north",
-                "type": "bbox",
-                "bbox": {
-                    "min_lat": 42.488301979602255,
-                    "min_lon": -73.5205078125,
-                    "max_lat": 47.50235895196859,
-                    "max_lon": -66.796875,
-                },
-            }
+    # Execute mode without --allow-requester-pays -> SystemExit.
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "plan_active_learning_region.py",
+            "--execute-plan",
+            "execution_plan.json",
+            "--expected-plan-sha256",
+            "0" * 64,
+            "--max-source-requests",
+            "10",
+            "--max-transfer-bytes",
+            "1000",
+            "--max-local-bytes",
+            "1000",
+            "--max-requester-pays-usd",
+            "1",
         ],
-    }
+    )
+    with pytest.raises(SystemExit):
+        planner.main()
 
-    result = plan_run(
-        run_name="water_test",
-        spec=spec,
-        output_root=tmp_path / "runs",
-        image_root=image_root,
+    # Execute mode with zero request cap -> SystemExit.
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "plan_active_learning_region.py",
+            "--execute-plan",
+            "execution_plan.json",
+            "--expected-plan-sha256",
+            "0" * 64,
+            "--allow-requester-pays",
+            "--max-source-requests",
+            "0",
+            "--max-transfer-bytes",
+            "1000",
+            "--max-local-bytes",
+            "1000",
+            "--max-requester-pays-usd",
+            "1",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        planner.main()
+
+    # A fully-specified execute invocation reaches execute_plan.
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "plan_active_learning_region.py",
+            "--execute-plan",
+            str(tmp_path / "execution_plan.json"),
+            "--expected-plan-sha256",
+            "0" * 64,
+            "--allow-requester-pays",
+            "--max-source-requests",
+            "10",
+            "--max-transfer-bytes",
+            "1000",
+            "--max-local-bytes",
+            "1000",
+            "--max-requester-pays-usd",
+            "1",
+            "--workers",
+            "2",
+        ],
+    )
+    planner.main()
+    assert executed["plan_path"] == str(tmp_path / "execution_plan.json")
+    assert executed["kwargs"]["max_source_requests"] == 10
+    assert executed["kwargs"]["allow_requester_pays"] is True
+
+
+def test_source_contract_and_preprocessing_artifacts_written(tmp_path: Path) -> None:
+    _plan_run(tmp_path)
+    run_dir = tmp_path / "runs" / "pilot"
+    source_contract = json.loads(
+        (run_dir / "source_contract.json").read_text(encoding="utf-8")
+    )
+    preprocessing = json.loads(
+        (run_dir / "preprocessing_contract.json").read_text(encoding="utf-8")
+    )
+    assert source_contract["contract_id"] == "naip_3dep_v1"
+    assert preprocessing["zoom"] == 14
+    assert (preprocessing["tile_width"], preprocessing["tile_height"]) == (512, 512)
+    manifest = json.loads(
+        (run_dir / "region_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["sources"]["satellite"]["collection"] == "naip-visualization"
+    assert manifest["sources"]["mapbox"]["used"] is False
+    assert manifest["stage_state"] == "planned"
+    assert manifest["ready_for_selection"] is False
+
+    assert len(manifest["repository_source_tree_digest"]) == 64
+    assert (
+        manifest["inputs"]["repository_source_tree_digest"]
+        == manifest["repository_source_tree_digest"]
     )
 
-    manifest = result["region_manifest"]
-    assert manifest["water_threshold"] == 0.50
-    assert manifest["water_assessed"] >= 2
-    assert manifest["water_excessive"] >= 1
-    assert "water_filter" in manifest
+    provider_urls = manifest["sources"]["provider_urls"]
+    assert provider_urls is not None
+    assert provider_urls["naip_registry"] == "https://registry.opendata.aws/naip/"
+    assert provider_urls["usgs_3dep"] == "https://www.usgs.gov/3d-elevation-program"
+    assert (
+        provider_urls["census_boundaries"]
+        == "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/State_County/MapServer/0/query"
+    )
+    assert provider_urls["aws_s3_pricing"] == "https://aws.amazon.com/s3/pricing/"
 
-    preflight_path = tmp_path / "runs" / "water_test" / "acquisition_preflight.json"
-    with open(preflight_path, encoding="utf-8") as stream:
-        preflight = json.load(stream)
-    assert preflight["water_threshold"] == 0.50
-    assert preflight["water_excessive"] >= 1
+    access_dates = manifest["sources"]["access_dates"]
+    assert access_dates["naip_registry"] == "2026-08-10"
+    assert access_dates["usgs_3dep"] == "2026-08-10"
+    assert access_dates["census_boundaries"] == "2026-08-10"
+    assert access_dates["aws_s3_pricing"] == "2026-08-10"
 
-    with open(
-        tmp_path / "runs" / "water_test" / "tile_manifest.csv",
-        newline="",
-        encoding="utf-8",
-    ) as stream:
-        rows = list(csv.DictReader(stream))
+    plan = json.loads((run_dir / "execution_plan.json").read_text(encoding="utf-8"))
+    assert (
+        plan["hashes"]["repository_source_tree_digest"]
+        == manifest["repository_source_tree_digest"]
+    )
 
-    tile1_row = next(r for r in rows if int(r["x"]) == x1 and int(r["y"]) == y1)
-    tile2_row = next(r for r in rows if int(r["x"]) == x2 and int(r["y"]) == y2)
-
-    assert tile1_row["water_filter_status"] == "pass"
-    assert tile1_row["unusable_reason"] == ""
-    assert float(tile1_row["terrain_sea_level_fraction"]) == 0.0
-
-    assert tile2_row["water_filter_status"] == "excessive_water"
-    assert tile2_row["unusable_reason"] == "excessive_water"
-    assert float(tile2_row["terrain_sea_level_fraction"]) == 1.0
-    assert float(tile2_row["satellite_water_fraction"]) == 1.0
+    auth = json.loads(
+        (run_dir / "acquisition_authorization_request.json").read_text(encoding="utf-8")
+    )
+    assert (
+        auth["identities"]["repository_source_tree_digest"]
+        == manifest["repository_source_tree_digest"]
+    )

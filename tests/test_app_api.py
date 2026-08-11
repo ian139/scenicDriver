@@ -99,6 +99,11 @@ def test_healthz_redacts_preload_asset_paths(tmp_path, monkeypatch) -> None:
             "preload_elapsed_ms": 1.5,
         },
     )
+    monkeypatch.setattr(
+        app_api.PreloadedRouteSupervisor,
+        "start",
+        lambda **_kwargs: type("StubSupervisor", (), {"close": lambda self: None})(),
+    )
     with TestClient(create_app()) as test_client:
         payload = test_client.get("/v1/healthz").json()
     serialized = json.dumps(payload)
@@ -234,6 +239,7 @@ def test_region_graph_fallback_and_discovery_support_sqlite(
             "region": "sqlite_region",
             "display_name": "sqlite_region",
             "graph_exists": True,
+            "route_planning_enabled": True,
             "latest_run_name": None,
             "bbox": None,
             "is_default": False,
@@ -1417,6 +1423,11 @@ def test_route_preload_lifespan_calls_once_and_skips_missing_optional(
         }
 
     monkeypatch.setattr(app_api, "preload_route_assets", fake_preload)
+    monkeypatch.setattr(
+        app_api.PreloadedRouteSupervisor,
+        "start",
+        lambda **_kwargs: type("StubSupervisor", (), {"close": lambda self: None})(),
+    )
     with TestClient(create_app()) as test_client:
         health = test_client.get("/v1/healthz")
         assert health.status_code == 200

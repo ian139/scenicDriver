@@ -11,7 +11,8 @@ import pytest
 from src.route_planner.cost import CostWeights, ScenicCostFunction
 from src.route_planner.graph import Edge, Node, RoadGraph
 from src.route_planner.planner import ScenicRoutePlanner
-from src.route_planner.service import apply_tile_scores_to_graph, lat_lon_to_tile
+from src.data_pipeline.web_mercator import lat_lon_to_tile
+from src.route_planner.service import apply_tile_scores_to_graph
 
 
 def test_graph_bidirectional_edges() -> None:
@@ -82,6 +83,7 @@ def test_cost_function_weight_behavior() -> None:
     assert distance_only.calculate(short_ugly) < distance_only.calculate(long_scenic)
     assert scenic_only.calculate(long_scenic) < scenic_only.calculate(short_ugly)
 
+
 def test_scenic_byway_discount_stays_positive_and_duration_sensitive() -> None:
     short_byway = Edge(
         id="short-byway",
@@ -122,9 +124,8 @@ def test_scenic_byway_discount_stays_positive_and_duration_sensitive() -> None:
         scenic_weight=0.5,
         weights=CostWeights(scenic_byway_bonus=0.5),
     )
-    assert uncapped.calculate(long_byway) == pytest.approx(
-        capped.calculate(long_byway)
-    )
+    assert uncapped.calculate(long_byway) == pytest.approx(capped.calculate(long_byway))
+
 
 def test_perfect_scenic_byway_still_scales_with_duration() -> None:
     short_byway = Edge(
@@ -273,7 +274,6 @@ def test_geojson_bidirectional_override(tmp_path: Path) -> None:
     assert len(end_edges) == 1
 
 
-
 def test_graph_load_cancellation_before_file_decode_preserves_exception(
     tmp_path: Path,
 ) -> None:
@@ -356,6 +356,8 @@ def test_sqlite_load_mid_build_cancellation_returns_no_partial_graph(
 
     assert raised.value is error
     assert calls == 18
+
+
 def test_constrained_search_keeps_feasible_pareto_label() -> None:
     """A cheap long label can reach X but becomes infeasible only on its final edge."""
     graph = RoadGraph()
@@ -366,10 +368,42 @@ def test_constrained_search_keeps_feasible_pareto_label() -> None:
     # label has lower cost but longer duration, so neither dominates the other.
     # Its final edge would exceed the cap; the costlier short label remains
     # feasible through that same final edge.
-    long = Edge(id="long", start_node_id="S", end_node_id="X", distance_km=5.0, scenic_score=10.0, speed_limit_kmh=100, one_way=True)
-    short_1 = Edge(id="short-1", start_node_id="S", end_node_id="L", distance_km=2.0, scenic_score=1.0, speed_limit_kmh=120, one_way=True)
-    short_2 = Edge(id="short-2", start_node_id="L", end_node_id="X", distance_km=2.0, scenic_score=1.0, speed_limit_kmh=120, one_way=True)
-    finish = Edge(id="finish", start_node_id="X", end_node_id="G", distance_km=2.0, scenic_score=5.0, speed_limit_kmh=60, one_way=True)
+    long = Edge(
+        id="long",
+        start_node_id="S",
+        end_node_id="X",
+        distance_km=5.0,
+        scenic_score=10.0,
+        speed_limit_kmh=100,
+        one_way=True,
+    )
+    short_1 = Edge(
+        id="short-1",
+        start_node_id="S",
+        end_node_id="L",
+        distance_km=2.0,
+        scenic_score=1.0,
+        speed_limit_kmh=120,
+        one_way=True,
+    )
+    short_2 = Edge(
+        id="short-2",
+        start_node_id="L",
+        end_node_id="X",
+        distance_km=2.0,
+        scenic_score=1.0,
+        speed_limit_kmh=120,
+        one_way=True,
+    )
+    finish = Edge(
+        id="finish",
+        start_node_id="X",
+        end_node_id="G",
+        distance_km=2.0,
+        scenic_score=5.0,
+        speed_limit_kmh=60,
+        one_way=True,
+    )
     for edge in (long, short_1, short_2, finish):
         graph.add_edge(edge)
 
@@ -400,20 +434,55 @@ def test_scenic_weight_zero_matches_fastest_and_nonzero_selects_scenic() -> None
     graph = RoadGraph()
     for node_id, lat in (("S", 42.0), ("M", 42.01), ("G", 42.02)):
         graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
-    graph.add_edge(Edge(id="fast-ugly", start_node_id="S", end_node_id="G", distance_km=10.0, scenic_score=0.0, speed_limit_kmh=100, one_way=True))
-    graph.add_edge(Edge(id="scenic-1", start_node_id="S", end_node_id="M", distance_km=6.0, scenic_score=10.0, speed_limit_kmh=50, one_way=True))
-    graph.add_edge(Edge(id="scenic-2", start_node_id="M", end_node_id="G", distance_km=6.0, scenic_score=10.0, speed_limit_kmh=50, one_way=True))
+    graph.add_edge(
+        Edge(
+            id="fast-ugly",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=10.0,
+            scenic_score=0.0,
+            speed_limit_kmh=100,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="scenic-1",
+            start_node_id="S",
+            end_node_id="M",
+            distance_km=6.0,
+            scenic_score=10.0,
+            speed_limit_kmh=50,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="scenic-2",
+            start_node_id="M",
+            end_node_id="G",
+            distance_km=6.0,
+            scenic_score=10.0,
+            speed_limit_kmh=50,
+            one_way=True,
+        )
+    )
 
     planner = ScenicRoutePlanner(graph=graph)
     fastest = planner.find_fastest_route((42.0, -72.0), (42.02, -72.0))
-    zero_weight = planner.find_scenic_route((42.0, -72.0), (42.02, -72.0), scenic_weight=0.0)
-    scenic = planner.find_scenic_route((42.0, -72.0), (42.02, -72.0), scenic_weight=0.8, max_detour_factor=2.4)
+    zero_weight = planner.find_scenic_route(
+        (42.0, -72.0), (42.02, -72.0), scenic_weight=0.0
+    )
+    scenic = planner.find_scenic_route(
+        (42.0, -72.0), (42.02, -72.0), scenic_weight=0.8, max_detour_factor=2.4
+    )
 
     assert zero_weight.waypoints == fastest.waypoints
     assert zero_weight.total_distance_km == fastest.total_distance_km == 10.0
     assert scenic.total_distance_km == 12.0
     assert scenic.average_scenic_score == pytest.approx(10.0)
     assert scenic.estimated_duration_minutes <= fastest.estimated_duration_minutes * 2.4
+
 
 def test_scenic_duration_cap_factor_one_cannot_exceed_fastest() -> None:
     graph = RoadGraph()
@@ -605,12 +674,38 @@ def test_route_average_scenic_score_uses_distance_weighting() -> None:
 
 
 def test_scenic_cost_is_invariant_under_equivalent_edge_split() -> None:
-    whole = Edge(id="whole", start_node_id="A", end_node_id="B", distance_km=10.0, scenic_score=7.0, road_type="highway", speed_limit_kmh=50)
-    first = Edge(id="first", start_node_id="A", end_node_id="M", distance_km=4.0, scenic_score=7.0, road_type="highway", speed_limit_kmh=50)
-    second = Edge(id="second", start_node_id="M", end_node_id="B", distance_km=6.0, scenic_score=7.0, road_type="highway", speed_limit_kmh=50)
+    whole = Edge(
+        id="whole",
+        start_node_id="A",
+        end_node_id="B",
+        distance_km=10.0,
+        scenic_score=7.0,
+        road_type="highway",
+        speed_limit_kmh=50,
+    )
+    first = Edge(
+        id="first",
+        start_node_id="A",
+        end_node_id="M",
+        distance_km=4.0,
+        scenic_score=7.0,
+        road_type="highway",
+        speed_limit_kmh=50,
+    )
+    second = Edge(
+        id="second",
+        start_node_id="M",
+        end_node_id="B",
+        distance_km=6.0,
+        scenic_score=7.0,
+        road_type="highway",
+        speed_limit_kmh=50,
+    )
     cost = ScenicCostFunction(scenic_weight=0.7, avoid_highways=True)
 
-    assert cost.calculate(whole) == pytest.approx(cost.calculate(first) + cost.calculate(second))
+    assert cost.calculate(whole) == pytest.approx(
+        cost.calculate(first) + cost.calculate(second)
+    )
 
 
 def test_osm_linestring_intermediate_coordinates_survive_route_feature() -> None:
@@ -643,7 +738,12 @@ def test_osm_linestring_intermediate_coordinates_survive_route_feature() -> None
     planner = ScenicRoutePlanner(graph=graph)
     start = graph.get_node("u")
     goal = graph.get_node("v")
-    edges = planner._a_star(start, goal, cost_function=ScenicCostFunction(scenic_weight=0.0), max_path_minutes=None)
+    edges = planner._a_star(
+        start,
+        goal,
+        cost_function=ScenicCostFunction(scenic_weight=0.0),
+        max_path_minutes=None,
+    )
     assert edges is not None
     feature = route_to_feature(planner._path_to_route(edges), "scenic")
 
@@ -666,7 +766,6 @@ def test_zero_edge_route_feature_uses_snapped_road_geometry() -> None:
         )
 
 
-
 def test_zero_edge_equal_endpoint_route_feature_has_two_positions() -> None:
     from src.route_planner.service import route_to_feature
 
@@ -687,6 +786,7 @@ def test_zero_edge_equal_endpoint_route_feature_has_two_positions() -> None:
         [-72.0, 42.0],
         [-72.0, 42.0],
     ]
+
 
 def test_osm_length_is_authoritative_for_curves_and_geometryless_edges() -> None:
     from src.route_planner.graph import _graph_from_osmnx, _haversine_km
@@ -726,9 +826,7 @@ def test_osm_length_is_authoritative_for_curves_and_geometryless_edges() -> None
     )
 
     graph = _graph_from_osmnx(osm_graph, {})
-    curved = [
-        edge for edge in graph.edges.values() if edge.id.startswith("u-v-0")
-    ]
+    curved = [edge for edge in graph.edges.values() if edge.id.startswith("u-v-0")]
     geometryless = graph.edges["c-d-0-segment-0"]
 
     assert sum(edge.distance_km for edge in curved) == pytest.approx(2.5)
@@ -760,9 +858,7 @@ def test_osm_invalid_length_falls_back_to_chord_total() -> None:
 
     graph = _graph_from_osmnx(osm_graph, {})
     edge = graph.edges["u-v-0-segment-0"]
-    assert edge.distance_km == pytest.approx(
-        _haversine_km(42.0, -72.0, 42.01, -71.98)
-    )
+    assert edge.distance_km == pytest.approx(_haversine_km(42.0, -72.0, 42.01, -71.98))
 
 
 def test_load_legacy_omitted_speed_uses_road_type_parser_default(
@@ -867,6 +963,7 @@ def test_kd_cutoff_preserves_exact_ties_and_compact_arrays(monkeypatch) -> None:
             )
             selected = graph.find_nearest_node(*query)
             assert selected.id == expected.id
+
 
 def test_nearest_node_selects_exact_closest_coordinate() -> None:
     graph = RoadGraph()
@@ -1075,6 +1172,7 @@ def test_nearest_edge_projection_ties_remain_deterministic() -> None:
     assert [projection.fraction for projection in projections] == [0.5, 0.5]
     assert distance == pytest.approx(0.0)
 
+
 def test_nearest_node_kd_matches_seeded_bruteforce_with_duplicate_coordinates() -> None:
     rng = random.Random(20260710)
     graph = RoadGraph()
@@ -1092,8 +1190,7 @@ def test_nearest_node_kd_matches_seeded_bruteforce_with_duplicate_coordinates() 
 
     queries = [coordinates[0], coordinates[64], coordinates[129]]
     queries.extend(
-        (rng.uniform(-70.0, 70.0), rng.uniform(-170.0, 170.0))
-        for _ in range(256)
+        (rng.uniform(-70.0, 70.0), rng.uniform(-170.0, 170.0)) for _ in range(256)
     )
     nodes = tuple(graph.nodes.values())
 
@@ -1101,14 +1198,11 @@ def test_nearest_node_kd_matches_seeded_bruteforce_with_duplicate_coordinates() 
         _expected_rank, expected = min(
             enumerate(nodes),
             key=lambda item: (
-                (item[1].lat - query_lat) ** 2
-                + (item[1].lon - query_lon) ** 2,
+                (item[1].lat - query_lat) ** 2 + (item[1].lon - query_lon) ** 2,
                 item[0],
             ),
         )
-        selected, snap_km = graph.find_nearest_node_with_distance(
-            query_lat, query_lon
-        )
+        selected, snap_km = graph.find_nearest_node_with_distance(query_lat, query_lon)
 
         assert selected.id == expected.id
 
@@ -1147,6 +1241,7 @@ def test_nearest_node_index_invalidates_after_add_and_overwrite() -> None:
     graph.add_node(Node(id="a", lat=42.091, lon=-72.091))
     assert graph.find_nearest_node(*query).id == "a"
 
+
 def test_nearest_node_index_rebuilds_after_public_node_coordinate_mutation() -> None:
     graph = RoadGraph()
     moved = Node(id="moved", lat=42.0, lon=-72.0)
@@ -1175,9 +1270,36 @@ def test_tile_scores_apply_to_repeated_midpoint_tile_edges_and_fallback() -> Non
         ("f", 70.0, 100.1),
     ):
         graph.add_node(Node(id=node_id, lat=lat, lon=lon))
-    graph.add_edge(Edge(id="first", start_node_id="a", end_node_id="b", distance_km=1.0, scenic_score=1.0, one_way=True))
-    graph.add_edge(Edge(id="second", start_node_id="c", end_node_id="d", distance_km=1.0, scenic_score=2.0, one_way=True))
-    graph.add_edge(Edge(id="fallback", start_node_id="e", end_node_id="f", distance_km=1.0, scenic_score=3.0, one_way=True))
+    graph.add_edge(
+        Edge(
+            id="first",
+            start_node_id="a",
+            end_node_id="b",
+            distance_km=1.0,
+            scenic_score=1.0,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="second",
+            start_node_id="c",
+            end_node_id="d",
+            distance_km=1.0,
+            scenic_score=2.0,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="fallback",
+            start_node_id="e",
+            end_node_id="f",
+            distance_km=1.0,
+            scenic_score=3.0,
+            one_way=True,
+        )
+    )
 
     zoom = 4
     tile_x, tile_y = lat_lon_to_tile(0.1, 0.05, zoom)
@@ -1205,12 +1327,60 @@ def test_constrained_search_matches_exhaustive_feasible_optimum() -> None:
     ):
         graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
     edges = (
-        Edge(id="long", start_node_id="S", end_node_id="X", distance_km=4.0, scenic_score=5.0, speed_limit_kmh=240, one_way=True),
-        Edge(id="short-1", start_node_id="S", end_node_id="A", distance_km=1.0, scenic_score=5.0, speed_limit_kmh=20, one_way=True),
-        Edge(id="short-2", start_node_id="A", end_node_id="X", distance_km=1.0, scenic_score=5.0, speed_limit_kmh=20, one_way=True),
-        Edge(id="alternate-1", start_node_id="S", end_node_id="B", distance_km=0.5, scenic_score=5.0, speed_limit_kmh=10, one_way=True),
-        Edge(id="alternate-2", start_node_id="B", end_node_id="G", distance_km=1.5, scenic_score=5.0, speed_limit_kmh=10, one_way=True),
-        Edge(id="finish", start_node_id="X", end_node_id="G", distance_km=1.0, scenic_score=5.0, speed_limit_kmh=60, one_way=True),
+        Edge(
+            id="long",
+            start_node_id="S",
+            end_node_id="X",
+            distance_km=4.0,
+            scenic_score=5.0,
+            speed_limit_kmh=240,
+            one_way=True,
+        ),
+        Edge(
+            id="short-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=1.0,
+            scenic_score=5.0,
+            speed_limit_kmh=20,
+            one_way=True,
+        ),
+        Edge(
+            id="short-2",
+            start_node_id="A",
+            end_node_id="X",
+            distance_km=1.0,
+            scenic_score=5.0,
+            speed_limit_kmh=20,
+            one_way=True,
+        ),
+        Edge(
+            id="alternate-1",
+            start_node_id="S",
+            end_node_id="B",
+            distance_km=0.5,
+            scenic_score=5.0,
+            speed_limit_kmh=10,
+            one_way=True,
+        ),
+        Edge(
+            id="alternate-2",
+            start_node_id="B",
+            end_node_id="G",
+            distance_km=1.5,
+            scenic_score=5.0,
+            speed_limit_kmh=10,
+            one_way=True,
+        ),
+        Edge(
+            id="finish",
+            start_node_id="X",
+            end_node_id="G",
+            distance_km=1.0,
+            scenic_score=5.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        ),
     )
     for edge in edges:
         graph.add_edge(edge)
@@ -1225,7 +1395,10 @@ def test_constrained_search_matches_exhaustive_feasible_optimum() -> None:
             return [path]
         paths: list[list[Edge]] = []
         for edge in graph.get_edges(node_id):
-            if edge.end_node_id in {item.start_node_id for item in path} or edge.end_node_id == "S":
+            if (
+                edge.end_node_id in {item.start_node_id for item in path}
+                or edge.end_node_id == "S"
+            ):
                 continue
             next_duration = duration_minutes + edge.travel_time_minutes
             if next_duration <= cap_minutes:
@@ -1235,9 +1408,16 @@ def test_constrained_search_matches_exhaustive_feasible_optimum() -> None:
         return paths
 
     feasible = enumerate_paths("S", [], 0.0)
-    expected = min(feasible, key=lambda path: sum(cost.calculate(edge) for edge in path))
+    expected = min(
+        feasible, key=lambda path: sum(cost.calculate(edge) for edge in path)
+    )
     planner = ScenicRoutePlanner(graph=graph)
-    actual = planner._a_star(graph.get_node("S"), graph.get_node("G"), cost_function=cost, max_path_minutes=cap_minutes)
+    actual = planner._a_star(
+        graph.get_node("S"),
+        graph.get_node("G"),
+        cost_function=cost,
+        max_path_minutes=cap_minutes,
+    )
 
     assert actual is not None
     assert [edge.id for edge in actual] == [edge.id for edge in expected]
@@ -1396,7 +1576,9 @@ def test_scenic_route_keeps_a_path_equal_to_incumbent_cost() -> None:
     assert route.average_scenic_score == pytest.approx(7.5)
 
 
-def test_reverse_cost_bound_handles_generated_reverse_and_literal_id_collision() -> None:
+def test_reverse_cost_bound_handles_generated_reverse_and_literal_id_collision() -> (
+    None
+):
     graph = RoadGraph()
     for node_id, lat, lon in (
         ("S", 0.0, 0.0),
@@ -1453,15 +1635,45 @@ def test_reverse_cost_bound_handles_generated_reverse_and_literal_id_collision()
     assert sum(edge.travel_time_minutes for edge in path) == pytest.approx(1.2)
 
 
-def test_custom_mutable_cost_changes_constrained_route_without_cost_bound_cache() -> None:
+def test_custom_mutable_cost_changes_constrained_route_without_cost_bound_cache() -> (
+    None
+):
     graph = RoadGraph()
     for node_id, lat in (("S", 42.0), ("A", 42.01), ("B", 42.02), ("G", 42.03)):
         graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
     for edge in (
-        Edge(id="A-1", start_node_id="S", end_node_id="A", distance_km=1.0, scenic_score=5.0, one_way=True),
-        Edge(id="A-2", start_node_id="A", end_node_id="G", distance_km=1.0, scenic_score=5.0, one_way=True),
-        Edge(id="B-1", start_node_id="S", end_node_id="B", distance_km=1.0, scenic_score=5.0, one_way=True),
-        Edge(id="B-2", start_node_id="B", end_node_id="G", distance_km=1.0, scenic_score=5.0, one_way=True),
+        Edge(
+            id="A-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=1.0,
+            scenic_score=5.0,
+            one_way=True,
+        ),
+        Edge(
+            id="A-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=1.0,
+            scenic_score=5.0,
+            one_way=True,
+        ),
+        Edge(
+            id="B-1",
+            start_node_id="S",
+            end_node_id="B",
+            distance_km=1.0,
+            scenic_score=5.0,
+            one_way=True,
+        ),
+        Edge(
+            id="B-2",
+            start_node_id="B",
+            end_node_id="G",
+            distance_km=1.0,
+            scenic_score=5.0,
+            one_way=True,
+        ),
     ):
         graph.add_edge(edge)
 
@@ -1495,6 +1707,7 @@ def test_custom_mutable_cost_changes_constrained_route_without_cost_bound_cache(
     )
     assert second is not None
     assert [edge.id for edge in second] == ["B-1", "B-2"]
+
 
 def test_reverse_resource_bound_keeps_exact_one_way_optimum_at_cap() -> None:
     graph = RoadGraph()
@@ -1605,7 +1818,9 @@ def test_reverse_resource_bound_keeps_exact_one_way_optimum_at_cap() -> None:
 
     class RouteCost:
         def calculate(self, edge: Edge) -> float:
-            return 1.0 if edge.end_node_id == "G" and edge.start_node_id == "A" else 10.0
+            return (
+                1.0 if edge.end_node_id == "G" and edge.start_node_id == "A" else 10.0
+            )
 
     planner = ScenicRoutePlanner(graph=graph)
     path = planner._a_star(
@@ -1636,15 +1851,67 @@ def test_reverse_resource_bound_prunes_geodesically_near_road_detour() -> None:
 
     # N is only about a kilometre from G, but the directed road continuation
     # from N to G takes too long to fit after S -> N under the cap.
-    graph.add_edge(Edge(id="S-N", start_node_id="S", end_node_id="N", distance_km=1.0, scenic_score=10.0, speed_limit_kmh=100, one_way=True))
-    graph.add_edge(Edge(id="N-D", start_node_id="N", end_node_id="D", distance_km=3.0, scenic_score=10.0, speed_limit_kmh=40, one_way=True))
-    graph.add_edge(Edge(id="D-G", start_node_id="D", end_node_id="G", distance_km=3.0, scenic_score=10.0, speed_limit_kmh=40, one_way=True))
-    graph.add_edge(Edge(id="S-A", start_node_id="S", end_node_id="A", distance_km=1.5, scenic_score=1.0, speed_limit_kmh=50, one_way=True))
-    graph.add_edge(Edge(id="A-G", start_node_id="A", end_node_id="G", distance_km=2.5, scenic_score=1.0, speed_limit_kmh=50, one_way=True))
+    graph.add_edge(
+        Edge(
+            id="S-N",
+            start_node_id="S",
+            end_node_id="N",
+            distance_km=1.0,
+            scenic_score=10.0,
+            speed_limit_kmh=100,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="N-D",
+            start_node_id="N",
+            end_node_id="D",
+            distance_km=3.0,
+            scenic_score=10.0,
+            speed_limit_kmh=40,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="D-G",
+            start_node_id="D",
+            end_node_id="G",
+            distance_km=3.0,
+            scenic_score=10.0,
+            speed_limit_kmh=40,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="S-A",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=1.5,
+            scenic_score=1.0,
+            speed_limit_kmh=50,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="A-G",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=2.5,
+            scenic_score=1.0,
+            speed_limit_kmh=50,
+            one_way=True,
+        )
+    )
 
     class RouteCost:
         def calculate(self, edge: Edge) -> float:
-            return 0.0 if edge.start_node_id == "S" and edge.end_node_id == "N" else 10.0
+            return (
+                0.0 if edge.start_node_id == "S" and edge.end_node_id == "N" else 10.0
+            )
 
     path = ScenicRoutePlanner(graph=graph)._a_star(
         graph.get_node("S"),
@@ -1658,14 +1925,43 @@ def test_reverse_resource_bound_prunes_geodesically_near_road_detour() -> None:
     assert sum(edge.travel_time_minutes for edge in path) == pytest.approx(4.8)
 
 
-
 def test_constrained_duration_cap_keeps_feasible_path() -> None:
     graph = RoadGraph()
     for node_id, lat in (("S", 42.0), ("A", 42.01), ("G", 42.02)):
         graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
-    graph.add_edge(Edge(id="over-cap", start_node_id="S", end_node_id="G", distance_km=5.0, scenic_score=10.0, speed_limit_kmh=30, one_way=True))
-    graph.add_edge(Edge(id="feasible-1", start_node_id="S", end_node_id="A", distance_km=1.2, scenic_score=1.0, speed_limit_kmh=60, one_way=True))
-    graph.add_edge(Edge(id="feasible-2", start_node_id="A", end_node_id="G", distance_km=1.2, scenic_score=1.0, speed_limit_kmh=60, one_way=True))
+    graph.add_edge(
+        Edge(
+            id="over-cap",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=5.0,
+            scenic_score=10.0,
+            speed_limit_kmh=30,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="feasible-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=1.2,
+            scenic_score=1.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="feasible-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=1.2,
+            scenic_score=1.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
 
     planner = ScenicRoutePlanner(graph=graph)
     edges = planner._a_star(
@@ -1678,8 +1974,6 @@ def test_constrained_duration_cap_keeps_feasible_path() -> None:
     assert edges is not None
     assert [edge.id for edge in edges] == ["feasible-1", "feasible-2"]
     assert sum(edge.travel_time_minutes for edge in edges) <= 3.0
-
-
 
 
 def test_builtin_cost_ratio_scan_is_reused_without_graph_mutation() -> None:
@@ -1715,6 +2009,7 @@ def test_builtin_cost_ratio_scan_is_reused_without_graph_mutation() -> None:
     assert first == second
     assert values_calls_after_first == 2
     assert graph.edges.values_calls == values_calls_after_first
+
 
 def test_class_level_cost_monkeypatch_bypasses_ratio_cache(
     monkeypatch: pytest.MonkeyPatch,
@@ -1753,7 +2048,9 @@ def test_class_level_cost_monkeypatch_bypasses_ratio_cache(
     assert calls == 2
 
 
-@pytest.mark.parametrize("cost_value", [-1.0, float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "cost_value", [-1.0, float("nan"), float("inf"), float("-inf")]
+)
 def test_constrained_search_rejects_invalid_edge_cost(cost_value: float) -> None:
     class InvalidCost:
         def calculate(self, edge: Edge) -> float:
@@ -1781,8 +2078,13 @@ def test_constrained_search_rejects_invalid_edge_cost(cost_value: float) -> None
             max_path_minutes=2.0,
         )
 
-@pytest.mark.parametrize("max_path_minutes", [-1.0, float("nan"), float("inf"), float("-inf")])
-def test_constrained_search_rejects_invalid_duration_cap(max_path_minutes: float) -> None:
+
+@pytest.mark.parametrize(
+    "max_path_minutes", [-1.0, float("nan"), float("inf"), float("-inf")]
+)
+def test_constrained_search_rejects_invalid_duration_cap(
+    max_path_minutes: float,
+) -> None:
     graph = RoadGraph()
     graph.add_node(Node(id="S", lat=42.0, lon=-72.0))
     graph.add_node(Node(id="G", lat=42.01, lon=-72.0))
@@ -1794,6 +2096,7 @@ def test_constrained_search_rejects_invalid_duration_cap(max_path_minutes: float
             cost_function=ScenicCostFunction(scenic_weight=0.0),
             max_path_minutes=max_path_minutes,
         )
+
 
 @pytest.mark.parametrize(
     ("field", "value"),
@@ -1836,6 +2139,7 @@ def test_constrained_search_rejects_invalid_optional_bounds(
             max_path_minutes=2.0,
             **kwargs,
         )
+
 
 @pytest.mark.parametrize("invalid_value", [-1.0, float("nan"), float("inf")])
 def test_invalid_cost_is_rejected_before_cyclic_label_expansion(
@@ -1887,6 +2191,7 @@ def test_invalid_cost_is_rejected_before_cyclic_label_expansion(
             max_path_minutes=2.0,
         )
 
+
 def test_infinitesimally_under_geodesic_distance_disables_positive_heuristic() -> None:
     graph = RoadGraph()
     graph.add_node(Node(id="S", lat=0.0, lon=0.0))
@@ -1908,6 +2213,7 @@ def test_infinitesimally_under_geodesic_distance_disables_positive_heuristic() -
     assert stored_distance_km < geodesic_km
     assert planner._edge_distances_are_geodesic_lower_bounds() is False
     assert planner._minimum_cost_per_km(ScenicCostFunction(scenic_weight=0.0)) == 0.0
+
 
 @pytest.mark.parametrize("bound", ["duration", "cost", "augmented"])
 def test_reverse_bound_snapshot_is_disabled_by_graph_mutation(
@@ -1961,6 +2267,7 @@ def test_reverse_bound_snapshot_is_disabled_by_graph_mutation(
 
     assert result is None
 
+
 def test_ratio_cache_is_bounded_over_many_weight_signatures() -> None:
     graph = RoadGraph()
     graph.add_node(Node(id="S", lat=42.0, lon=-72.0))
@@ -1978,11 +2285,10 @@ def test_ratio_cache_is_bounded_over_many_weight_signatures() -> None:
     planner = ScenicRoutePlanner(graph=graph)
 
     for index in range(40):
-        planner._minimum_cost_per_km(
-            ScenicCostFunction(scenic_weight=index / 39.0)
-        )
+        planner._minimum_cost_per_km(ScenicCostFunction(scenic_weight=index / 39.0))
 
     assert len(planner._minimum_cost_per_km_cache) <= 8
+
 
 def test_reverse_preprocessing_enumerates_traversals_once_per_request(
     monkeypatch: pytest.MonkeyPatch,
@@ -2050,6 +2356,7 @@ def test_reverse_preprocessing_enumerates_traversals_once_per_request(
     assert [edge.id for edge in path] == ["S-A", "A-G"]
     assert snapshot_calls == 1
     assert forward_calls > 0
+
 
 def test_instance_shadowed_base_cost_calculate_bypasses_ratio_cache() -> None:
     class MutableCalculate:
@@ -2162,6 +2469,7 @@ def test_scenic_score_application_invalidates_cost_ratio_cache() -> None:
     after_mutation = planner._minimum_cost_per_km(cost)
     assert after_mutation != after_application
 
+
 def test_public_edge_mapping_replacement_and_deletion_invalidate_ratio_cache() -> None:
     graph = RoadGraph()
     graph.add_node(Node(id="S", lat=42.0, lon=-72.0))
@@ -2194,7 +2502,6 @@ def test_public_edge_mapping_replacement_and_deletion_invalidate_ratio_cache() -
 
     assert after_replacement != before
     assert after_deletion == 0.0
-
 
 
 def test_node_coordinate_mutation_invalidates_geodesic_safety_cache() -> None:
@@ -2294,7 +2601,9 @@ def test_custom_mutable_cost_function_is_not_ratio_cache_reused() -> None:
     assert cost.calls == 2
 
 
-def test_geodesic_safety_scan_is_reused_without_graph_mutation(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_geodesic_safety_scan_is_reused_without_graph_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     graph = RoadGraph()
     graph.add_node(Node(id="S", lat=42.0, lon=-72.0))
     graph.add_node(Node(id="G", lat=42.1, lon=-72.0))
@@ -2436,6 +2745,7 @@ def test_zero_distance_zero_cost_cycle_rejects_duplicate_resource_labels() -> No
     assert path is not None
     assert [edge.id for edge in path] == ["finish"]
 
+
 def test_load_legacy_json_applies_all_omitted_edge_defaults(tmp_path: Path) -> None:
     payload = {
         "nodes": [
@@ -2498,7 +2808,9 @@ def test_load_legacy_json_preserves_order_and_reverse_views(tmp_path: Path) -> N
     assert list(graph.nodes) == ["A", "B", "C"]
     assert list(graph.edges) == ["AB", "BC"]
     middle_edges = graph.get_edges("B")
-    assert [(edge.id, edge.start_node_id, edge.end_node_id) for edge in middle_edges] == [
+    assert [
+        (edge.id, edge.start_node_id, edge.end_node_id) for edge in middle_edges
+    ] == [
         ("AB::rev", "B", "A"),
         ("BC", "B", "C"),
     ]
@@ -2556,6 +2868,7 @@ def test_load_legacy_json_rejects_bad_endpoints_and_duplicate_ids(
     with pytest.raises(ValueError, match=error_match):
         RoadGraph.load(path)
 
+
 def test_load_legacy_json_normalizes_historical_field_representations(
     tmp_path: Path,
 ) -> None:
@@ -2589,9 +2902,9 @@ def test_load_legacy_json_normalizes_historical_field_representations(
     assert edge.scenic_score == 8.5
     assert edge.speed_limit_kmh == 56
     assert edge.one_way is False
-    assert [(item.id, item.start_node_id, item.end_node_id) for item in graph.get_edges("B")] == [
-        ("7::rev", "B", "1")
-    ]
+    assert [
+        (item.id, item.start_node_id, item.end_node_id) for item in graph.get_edges("B")
+    ] == [("7::rev", "B", "1")]
 
 
 def test_load_legacy_json_duplicate_node_overwrite_preserves_order_and_adjacency(
@@ -2620,12 +2933,12 @@ def test_load_legacy_json_duplicate_node_overwrite_preserves_order_and_adjacency
 
     assert list(graph.nodes) == ["A", "B"]
     assert graph.nodes["A"].coords == (43.0, -71.0)
-    assert [(item.id, item.start_node_id, item.end_node_id) for item in graph.get_edges("A")] == [
-        ("AB", "A", "B")
-    ]
-    assert [(item.id, item.start_node_id, item.end_node_id) for item in graph.get_edges("B")] == [
-        ("AB::rev", "B", "A")
-    ]
+    assert [
+        (item.id, item.start_node_id, item.end_node_id) for item in graph.get_edges("A")
+    ] == [("AB", "A", "B")]
+    assert [
+        (item.id, item.start_node_id, item.end_node_id) for item in graph.get_edges("B")
+    ] == [("AB::rev", "B", "A")]
 
 
 @pytest.mark.parametrize(
@@ -2732,7 +3045,9 @@ def test_builtin_lagrangian_bound_matches_exhaustive_optimum_in_both_orientation
         return paths
 
     feasible = enumerate_paths("S", [], 0.0)
-    expected = min(feasible, key=lambda path: sum(cost.calculate(edge) for edge in path))
+    expected = min(
+        feasible, key=lambda path: sum(cost.calculate(edge) for edge in path)
+    )
     expected_cost = sum(cost.calculate(edge) for edge in expected)
     actual = ScenicRoutePlanner(graph=graph)._a_star(
         graph.get_node("S"),
@@ -2806,10 +3121,38 @@ def test_mutable_custom_cost_remains_exact_fallback_with_constrained_bound() -> 
     for node_id, lat in (("S", 42.0), ("A", 42.01), ("B", 42.02), ("G", 42.03)):
         graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
     for edge in (
-        Edge(id="A-1", start_node_id="S", end_node_id="A", distance_km=1.0, scenic_score=5.0, one_way=True),
-        Edge(id="A-2", start_node_id="A", end_node_id="G", distance_km=1.0, scenic_score=5.0, one_way=True),
-        Edge(id="B-1", start_node_id="S", end_node_id="B", distance_km=1.0, scenic_score=5.0, one_way=True),
-        Edge(id="B-2", start_node_id="B", end_node_id="G", distance_km=1.0, scenic_score=5.0, one_way=True),
+        Edge(
+            id="A-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=1.0,
+            scenic_score=5.0,
+            one_way=True,
+        ),
+        Edge(
+            id="A-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=1.0,
+            scenic_score=5.0,
+            one_way=True,
+        ),
+        Edge(
+            id="B-1",
+            start_node_id="S",
+            end_node_id="B",
+            distance_km=1.0,
+            scenic_score=5.0,
+            one_way=True,
+        ),
+        Edge(
+            id="B-2",
+            start_node_id="B",
+            end_node_id="G",
+            distance_km=1.0,
+            scenic_score=5.0,
+            one_way=True,
+        ),
     ):
         graph.add_edge(edge)
     cost = MutableCost()
@@ -2852,10 +3195,38 @@ def test_subclassed_builtin_cost_remains_exact_fallback() -> None:
     for node_id, lat in (("S", 42.0), ("A", 42.01), ("B", 42.02), ("G", 42.03)):
         graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
     for edge in (
-        Edge(id="A-1", start_node_id="S", end_node_id="A", distance_km=1.0, scenic_score=5.0, one_way=True),
-        Edge(id="A-2", start_node_id="A", end_node_id="G", distance_km=1.0, scenic_score=5.0, one_way=True),
-        Edge(id="B-1", start_node_id="S", end_node_id="B", distance_km=1.0, scenic_score=5.0, one_way=True),
-        Edge(id="B-2", start_node_id="B", end_node_id="G", distance_km=1.0, scenic_score=5.0, one_way=True),
+        Edge(
+            id="A-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=1.0,
+            scenic_score=5.0,
+            one_way=True,
+        ),
+        Edge(
+            id="A-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=1.0,
+            scenic_score=5.0,
+            one_way=True,
+        ),
+        Edge(
+            id="B-1",
+            start_node_id="S",
+            end_node_id="B",
+            distance_km=1.0,
+            scenic_score=5.0,
+            one_way=True,
+        ),
+        Edge(
+            id="B-2",
+            start_node_id="B",
+            end_node_id="G",
+            distance_km=1.0,
+            scenic_score=5.0,
+            one_way=True,
+        ),
     ):
         graph.add_edge(edge)
     cost = SubclassCost()
@@ -2877,11 +3248,51 @@ def test_duration_constrained_search_matches_exhaustive_feasible_optimum() -> No
     for node_id, lat in (("S", 42.0), ("A", 42.01), ("B", 42.02), ("G", 42.03)):
         graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
     for edge in (
-        Edge(id="fast-ugly", start_node_id="S", end_node_id="G", distance_km=10.0, scenic_score=0.0, speed_limit_kmh=100, one_way=True),
-        Edge(id="best-1", start_node_id="S", end_node_id="A", distance_km=4.0, scenic_score=9.0, speed_limit_kmh=60, one_way=True),
-        Edge(id="best-2", start_node_id="A", end_node_id="G", distance_km=4.0, scenic_score=9.0, speed_limit_kmh=60, one_way=True),
-        Edge(id="over-1", start_node_id="S", end_node_id="B", distance_km=6.0, scenic_score=10.0, speed_limit_kmh=40, one_way=True),
-        Edge(id="over-2", start_node_id="B", end_node_id="G", distance_km=6.0, scenic_score=10.0, speed_limit_kmh=40, one_way=True),
+        Edge(
+            id="fast-ugly",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=10.0,
+            scenic_score=0.0,
+            speed_limit_kmh=100,
+            one_way=True,
+        ),
+        Edge(
+            id="best-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=4.0,
+            scenic_score=9.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        ),
+        Edge(
+            id="best-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=4.0,
+            scenic_score=9.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        ),
+        Edge(
+            id="over-1",
+            start_node_id="S",
+            end_node_id="B",
+            distance_km=6.0,
+            scenic_score=10.0,
+            speed_limit_kmh=40,
+            one_way=True,
+        ),
+        Edge(
+            id="over-2",
+            start_node_id="B",
+            end_node_id="G",
+            distance_km=6.0,
+            scenic_score=10.0,
+            speed_limit_kmh=40,
+            one_way=True,
+        ),
     ):
         graph.add_edge(edge)
     cost = ScenicCostFunction(scenic_weight=1.0)
@@ -2898,7 +3309,9 @@ def test_duration_constrained_search_matches_exhaustive_feasible_optimum() -> No
         return paths
 
     feasible = enumerate_paths("S", [])
-    expected = min(feasible, key=lambda path: sum(cost.calculate(edge) for edge in path))
+    expected = min(
+        feasible, key=lambda path: sum(cost.calculate(edge) for edge in path)
+    )
     actual = ScenicRoutePlanner(graph=graph)._a_star(
         graph.get_node("S"),
         graph.get_node("G"),
@@ -2915,11 +3328,45 @@ def test_fastest_baseline_does_not_discount_scenic_byways() -> None:
     graph = RoadGraph()
     for node_id, lat in (("S", 42.0), ("A", 42.01), ("G", 42.02)):
         graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
-    graph.add_edge(Edge(id="ordinary", start_node_id="S", end_node_id="G", distance_km=10.0, scenic_score=0.0, speed_limit_kmh=60, one_way=True))
-    graph.add_edge(Edge(id="byway-1", start_node_id="S", end_node_id="A", distance_km=7.5, scenic_score=10.0, road_type="scenic_byway", speed_limit_kmh=60, one_way=True))
-    graph.add_edge(Edge(id="byway-2", start_node_id="A", end_node_id="G", distance_km=7.5, scenic_score=10.0, road_type="scenic_byway", speed_limit_kmh=60, one_way=True))
+    graph.add_edge(
+        Edge(
+            id="ordinary",
+            start_node_id="S",
+            end_node_id="G",
+            distance_km=10.0,
+            scenic_score=0.0,
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="byway-1",
+            start_node_id="S",
+            end_node_id="A",
+            distance_km=7.5,
+            scenic_score=10.0,
+            road_type="scenic_byway",
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="byway-2",
+            start_node_id="A",
+            end_node_id="G",
+            distance_km=7.5,
+            scenic_score=10.0,
+            road_type="scenic_byway",
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
 
-    fastest = ScenicRoutePlanner(graph=graph).find_fastest_route((42.0, -72.0), (42.02, -72.0))
+    fastest = ScenicRoutePlanner(graph=graph).find_fastest_route(
+        (42.0, -72.0), (42.02, -72.0)
+    )
     capped = ScenicRoutePlanner(graph=graph).find_scenic_route(
         (42.0, -72.0), (42.02, -72.0), scenic_weight=1.0, max_detour_factor=1.0
     )
@@ -2932,15 +3379,55 @@ def test_duration_mode_keeps_equal_cost_faster_label() -> None:
     graph = RoadGraph()
     for node_id, lat in (("S", 42.0), ("X", 42.01), ("G", 42.02)):
         graph.add_node(Node(id=node_id, lat=lat, lon=-72.0))
-    graph.add_edge(Edge(id="slow-byway", start_node_id="S", end_node_id="X", distance_km=2.0, scenic_score=5.0, road_type="scenic_byway", speed_limit_kmh=60, one_way=True))
-    graph.add_edge(Edge(id="fast-ordinary", start_node_id="S", end_node_id="X", distance_km=2.0, scenic_score=5.0, speed_limit_kmh=120, one_way=True))
-    graph.add_edge(Edge(id="finish", start_node_id="X", end_node_id="G", distance_km=3.0, scenic_score=5.0, speed_limit_kmh=90, one_way=True))
+    graph.add_edge(
+        Edge(
+            id="slow-byway",
+            start_node_id="S",
+            end_node_id="X",
+            distance_km=2.0,
+            scenic_score=5.0,
+            road_type="scenic_byway",
+            speed_limit_kmh=60,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="fast-ordinary",
+            start_node_id="S",
+            end_node_id="X",
+            distance_km=2.0,
+            scenic_score=5.0,
+            speed_limit_kmh=120,
+            one_way=True,
+        )
+    )
+    graph.add_edge(
+        Edge(
+            id="finish",
+            start_node_id="X",
+            end_node_id="G",
+            distance_km=3.0,
+            scenic_score=5.0,
+            speed_limit_kmh=90,
+            one_way=True,
+        )
+    )
     for index in range(257):
         start_id = f"d{index}a"
         end_id = f"d{index}b"
         graph.add_node(Node(id=start_id, lat=0.0, lon=float(index) / 1000))
         graph.add_node(Node(id=end_id, lat=0.0, lon=float(index + 1) / 1000))
-        graph.add_edge(Edge(id=f"dummy-{index}", start_node_id=start_id, end_node_id=end_id, distance_km=1.0, scenic_score=5.0, one_way=True))
+        graph.add_edge(
+            Edge(
+                id=f"dummy-{index}",
+                start_node_id=start_id,
+                end_node_id=end_id,
+                distance_km=1.0,
+                scenic_score=5.0,
+                one_way=True,
+            )
+        )
 
     path = ScenicRoutePlanner(graph=graph)._a_star(
         graph.get_node("S"),
@@ -3317,9 +3804,10 @@ def test_compiled_csr_handles_reverse_traversals_and_hard_highway_filter() -> No
         ("S", "A"),
         ("A", "G"),
     ]
-    assert planner._compiled_builtin_path(
-        graph.get_node("G"), graph.get_node("S"), cost
-    ) is None
+    assert (
+        planner._compiled_builtin_path(graph.get_node("G"), graph.get_node("S"), cost)
+        is None
+    )
 
 
 def test_compiled_csr_cache_invalidates_on_graph_stamp_and_cost_signature() -> None:
@@ -3350,9 +3838,7 @@ def test_compiled_csr_cache_invalidates_on_graph_stamp_and_cost_signature() -> N
         graph.get_node("S"), graph.get_node("G"), cost
     )
     second_data = next(
-        item
-        for item in planner._csr_data_cache.values()
-        if item.signature[0] == 0.8
+        item for item in planner._csr_data_cache.values() if item.signature[0] == 0.8
     )
     assert planner._csr_topology_cache is first_topology
     assert second_data is not first_data
@@ -3408,9 +3894,7 @@ def test_scenic_shortcut_skips_resource_solver_when_unconstrained_is_feasible(
     def fail_resource_solver(*args: object, **kwargs: object) -> None:
         raise AssertionError("feasible unconstrained optimum should shortcut")
 
-    monkeypatch.setattr(
-        planner, "_resource_constrained_path", fail_resource_solver
-    )
+    monkeypatch.setattr(planner, "_resource_constrained_path", fail_resource_solver)
     route = planner.find_scenic_route(
         (42.0, -72.0),
         (42.02, -72.0),
@@ -3470,9 +3954,7 @@ def test_scenic_factor_one_uses_shortest_duration_optimizer(
         calls += 1
         return original_solver(*args, **kwargs)
 
-    monkeypatch.setattr(
-        planner, "_resource_constrained_path", count_resource_solver
-    )
+    monkeypatch.setattr(planner, "_resource_constrained_path", count_resource_solver)
     route = planner.find_scenic_route(
         (42.0, -72.0),
         (42.02, -72.0),
@@ -3510,15 +3992,11 @@ def test_shared_compiled_caches_isolate_graphs_and_mutations() -> None:
 
     second_graph = make_graph("second", 10.0)
     second_planner = ScenicRoutePlanner(graph=second_graph)
-    second_route = second_planner.find_fastest_route(
-        (42.0, -72.0), (42.1, -72.0)
-    )
+    second_route = second_planner.find_fastest_route((42.0, -72.0), (42.1, -72.0))
     assert second_route.total_distance_km == pytest.approx(10.0)
     assert [segment.road_name for segment in second_route.segments] == [None]
 
     first_graph.edges["first"].distance_km = 2.0
     refreshed_planner = ScenicRoutePlanner(graph=first_graph)
-    refreshed_route = refreshed_planner.find_fastest_route(
-        (42.0, -72.0), (42.1, -72.0)
-    )
+    refreshed_route = refreshed_planner.find_fastest_route((42.0, -72.0), (42.1, -72.0))
     assert refreshed_route.total_distance_km == pytest.approx(2.0)

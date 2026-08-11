@@ -7,7 +7,7 @@ Scenic Drive separates expensive regional preparation from latency-sensitive rou
 ```mermaid
 flowchart TB
     subgraph Offline
-        M[Mapbox satellite + Terrain-RGB] --> T[Tile and terrain processing]
+        M[USDA NAIP imagery + USGS 3DEP elevation] --> T[Tile and terrain processing]
         T --> L[Heuristic and human labels]
         L --> R[Learned scenic regression]
         R --> P[Scored regional report]

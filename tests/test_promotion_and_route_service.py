@@ -9,6 +9,7 @@ import sys
 from threading import Event, Lock
 import pytest
 
+from src.data_pipeline.web_mercator import lat_lon_to_tile
 from src.route_planner import service as route_service
 from src.route_planner.cancellation import (
     RoutingCancelled,
@@ -100,6 +101,8 @@ def test_promote_regression_model_smoke(tmp_path: Path) -> None:
     assert registry["active"] is not None
     assert registry["active"]["run_name"] == "smoke_vx"
     assert registry["active"]["sha256"] == cand_sha
+
+
 def test_route_compare_service_smoke(tmp_path: Path) -> None:
     graph = {
         "type": "FeatureCollection",
@@ -206,9 +209,7 @@ def test_plan_routes_uses_unrestricted_baseline_for_filtered_scenic_cap(
 
         def find_scenic_route(self, **kwargs: object) -> Route:
             self.calls.append(("scenic", bool(kwargs["avoid_highways"])))
-            assert kwargs["detour_reference_duration_minutes"] == pytest.approx(
-                10.0
-            )
+            assert kwargs["detour_reference_duration_minutes"] == pytest.approx(10.0)
             result = route(12.0, 10.0, 8.0)
             result.fastest_duration_minutes = 10.0
             result.duration_cap_minutes = 15.0
@@ -235,9 +236,7 @@ def test_plan_routes_uses_unrestricted_baseline_for_filtered_scenic_cap(
     assert diagnostics["requested_max_detour_factor"] == pytest.approx(1.5)
     assert diagnostics["applied_max_detour_factor"] == pytest.approx(1.5)
     assert diagnostics["scenic_fastest_duration_ratio"] == pytest.approx(1.2)
-    assert diagnostics["detour_reference_duration_minutes"] == pytest.approx(
-        10.0
-    )
+    assert diagnostics["detour_reference_duration_minutes"] == pytest.approx(10.0)
     assert diagnostics["duration_cap_minutes"] == pytest.approx(15.0)
     assert diagnostics["duration_cap_satisfied"] is True
     assert diagnostics["scenic_fastest_distance_ratio"] == pytest.approx(1.25)
@@ -401,8 +400,7 @@ def test_best_effort_avoidance_retries_strict_over_unrestricted_cap() -> None:
         for call in FakePlanner.calls
     )
     assert all(
-        call["max_detour_factor"] == pytest.approx(1.8)
-        for call in FakePlanner.calls
+        call["max_detour_factor"] == pytest.approx(1.8) for call in FakePlanner.calls
     )
     assert FakePlanner.calls[1]["highway_preference"] == pytest.approx(2.0)
 
@@ -455,8 +453,6 @@ def test_route_request_snap_limit_serializes_and_validates() -> None:
             )
 
 
-
-
 def test_service_uses_canonical_normalization_version() -> None:
     assert route_service._NORMALIZATION_VERSION == "linear-v1"
 
@@ -491,9 +487,9 @@ def test_plan_routes_without_baseline_uses_route_fastest_duration(
     )
     diagnostics = result["diagnostics"]
     assert diagnostics["scenic_fastest_duration_ratio"] == pytest.approx(1.2)
-    assert result["routes"][0]["metrics"]["actual_duration_ratio"] == pytest.approx(
-        1.2
-    )
+    assert result["routes"][0]["metrics"]["actual_duration_ratio"] == pytest.approx(1.2)
+
+
 def test_empty_route_comparison_preserves_same_route_identity() -> None:
     request = route_service.RouteRequest(
         graph_geojson="unused",
@@ -605,12 +601,8 @@ class _LargeEndpointGraph:
             return [object()], self.projection_distance
         return [], self.projection_distance
 
-    def find_nearest_node_with_distance(
-        self, *args: object, **kwargs: object
-    ) -> None:
-        raise AssertionError(
-            "large endpoint graph must not build nearest-node index"
-        )
+    def find_nearest_node_with_distance(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError("large endpoint graph must not build nearest-node index")
 
 
 def test_endpoint_snap_diagnostics_use_edge_projections(
@@ -676,7 +668,7 @@ def test_endpoint_snap_diagnostics_bound_large_projection_failure() -> None:
 
 
 def _write_cache_tiles(path: Path, score: float) -> None:
-    x, y = route_service.lat_lon_to_tile(42.05, -72.0, 14)
+    x, y = lat_lon_to_tile(42.05, -72.0, 14)
     path.write_text(
         json.dumps({"tiles": [{"z": 14, "x": x, "y": y, "scenic_score": score}]}),
         encoding="utf-8",
@@ -706,14 +698,12 @@ def _cache_test_route(score: float) -> Route:
 
 def test_frontier_time_limit_constructor_validates_finite_bounds() -> None:
     assert ScenicRoutePlanner()._frontier_time_limit_seconds == pytest.approx(4.0)
-    assert (
-        ScenicRoutePlanner(frontier_time_limit_seconds=0.0)._frontier_time_limit_seconds
-        == pytest.approx(0.0)
-    )
-    assert (
-        ScenicRoutePlanner(frontier_time_limit_seconds=60.0)._frontier_time_limit_seconds
-        == pytest.approx(60.0)
-    )
+    assert ScenicRoutePlanner(
+        frontier_time_limit_seconds=0.0
+    )._frontier_time_limit_seconds == pytest.approx(0.0)
+    assert ScenicRoutePlanner(
+        frontier_time_limit_seconds=60.0
+    )._frontier_time_limit_seconds == pytest.approx(60.0)
     for value in ("nan", "inf", "-inf", -0.1, 60.1, "not-a-number"):
         with pytest.raises(ValueError, match="finite and between 0 and 60"):
             ScenicRoutePlanner(frontier_time_limit_seconds=value)
@@ -779,6 +769,7 @@ def test_frontier_time_limit_env_wires_plan_and_preload(
 
         def prewarm_routing_cache(self) -> dict[str, object]:
             return {}
+
         def find_scenic_route(self, **kwargs: object) -> Route:
             del kwargs
             return _cache_test_route(1.0)
@@ -797,6 +788,7 @@ def test_frontier_time_limit_env_wires_plan_and_preload(
     )
 
     assert constructor_limits == [2.5, 2.5]
+
 
 def test_clear_route_caches_releases_planner_graph_references() -> None:
     retained_graph = object()
@@ -863,7 +855,13 @@ def test_plan_routes_caches_graph_and_tile_parsing_and_preserves_response_shape(
     assert tile_loads == 1
     assert first["routes"] == second["routes"]
     assert first["geojson"] == second["geojson"]
-    assert set(first) == {"request", "diagnostics", "score_mapping", "routes", "geojson"}
+    assert set(first) == {
+        "request",
+        "diagnostics",
+        "score_mapping",
+        "routes",
+        "geojson",
+    }
     assert second["diagnostics"]["graph_cache_hit"] is True
     assert second["diagnostics"]["tile_score_cache_hit"] is True
     assert second["diagnostics"]["scored_graph_cache_hit"] is True
@@ -878,7 +876,6 @@ def test_plan_routes_invalidates_graph_and_tile_caches_when_files_change(
     _write_cache_graph(graph_path)
     _write_cache_tiles(tile_path, 8.0)
     route_service.clear_route_caches()
-
 
     scores: list[float] = []
 
@@ -913,10 +910,11 @@ def test_plan_routes_invalidates_graph_and_tile_caches_when_files_change(
         response["routes"][0]["metrics"]["average_scenic_score"]
         for response in responses
     ] == [8.0, 8.0, 4.0]
-    assert [
-        response["score_mapping"]["matched_edges"]
-        for response in responses
-    ] == [1, 1, 1]
+    assert [response["score_mapping"]["matched_edges"] for response in responses] == [
+        1,
+        1,
+        1,
+    ]
 
 
 def test_plan_routes_tile_score_overlay_does_not_leak_between_requests(
@@ -1010,6 +1008,7 @@ def test_preload_route_assets_populates_cache_before_first_request(
     assert diagnostics["scored_graph_cache_hit"] is True
     assert result["routes"][0]["metrics"]["average_scenic_score"] == pytest.approx(8.0)
 
+
 def test_diagnose_reuses_exclusive_scored_graph_after_control_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1044,13 +1043,12 @@ def test_diagnose_reuses_exclusive_scored_graph_after_control_failure(
     assert diagnostics["graph_edges"] == 1
 
 
-
 def test_scored_graph_default_clone_and_exclusive_source_modes(
     tmp_path: Path,
 ) -> None:
     graph_path = tmp_path / "graph.geojson"
     _write_cache_graph(graph_path)
-    tile = route_service.lat_lon_to_tile(42.05, -72.0, 14)
+    tile = lat_lon_to_tile(42.05, -72.0, 14)
     score_map = {(14, tile[0], tile[1]): 8.0}
     graph_key = (
         route_service._resolved_path_key(graph_path),
@@ -1084,10 +1082,9 @@ def test_scored_graph_default_clone_and_exclusive_source_modes(
         exclusive_source=True,
     )
     assert scored_graph is exclusive_graph
-    assert next(iter(exclusive_graph.edges.values())).scenic_score == pytest.approx(
-        8.0
-    )
+    assert next(iter(exclusive_graph.edges.values())).scenic_score == pytest.approx(8.0)
     route_service.clear_route_caches()
+
 
 def test_plan_routes_accepts_snap_limit_boundary_and_rejects_coverage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1151,7 +1148,6 @@ def test_plan_routes_accepts_snap_limit_boundary_and_rejects_coverage(
     assert caught.value.max_snap_distance_km == pytest.approx(1.0)
 
 
-
 def test_plan_routes_skips_strict_avoidance_when_only_all_road_snap_is_near(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1210,8 +1206,7 @@ def test_plan_routes_skips_strict_avoidance_when_only_all_road_snap_is_near(
     assert diagnostics["highway_avoidance_fallback"] is True
     assert diagnostics["highway_avoidance_mode"] == "best_effort_fallback"
     assert (
-        diagnostics["highway_avoidance_fallback_reason"]
-        == "strict_snap_outside_limit"
+        diagnostics["highway_avoidance_fallback_reason"] == "strict_snap_outside_limit"
     )
 
 
@@ -1293,18 +1288,18 @@ def test_concurrent_report_builds_publish_isolated_native_variants(
     assert len(builder_graphs) == 2
     first_variant, second_variant = builder_graphs
     assert first_variant is not second_variant
-    assert float(next(iter(first_variant.edges.values())).scenic_score) == pytest.approx(
-        9.0
-    )
-    assert float(next(iter(second_variant.edges.values())).scenic_score) == pytest.approx(
-        3.0
-    )
-    assert float(next(iter(first_variant.edges.values())).scenic_score) == pytest.approx(
-        9.0
-    )
-    assert first_result["routes"][0]["metrics"]["average_scenic_score"] == pytest.approx(
-        9.0
-    )
+    assert float(
+        next(iter(first_variant.edges.values())).scenic_score
+    ) == pytest.approx(9.0)
+    assert float(
+        next(iter(second_variant.edges.values())).scenic_score
+    ) == pytest.approx(3.0)
+    assert float(
+        next(iter(first_variant.edges.values())).scenic_score
+    ) == pytest.approx(9.0)
+    assert first_result["routes"][0]["metrics"][
+        "average_scenic_score"
+    ] == pytest.approx(9.0)
     assert second_result["routes"][0]["metrics"][
         "average_scenic_score"
     ] == pytest.approx(3.0)
@@ -1312,12 +1307,14 @@ def test_concurrent_report_builds_publish_isolated_native_variants(
     assert planned_graphs[0] is not planned_graphs[1]
 
     canonical = route_service._load_cached_graph(graph_path)[0]
-    assert float(next(iter(canonical.edges.values())).scenic_score) == pytest.approx(1.0)
+    assert float(next(iter(canonical.edges.values())).scenic_score) == pytest.approx(
+        1.0
+    )
 
 
 def test_deadline_seconds_from_env_default_and_validation() -> None:
     route_service.clear_route_caches()
-    assert route_service._deadline_seconds_from_env() == 10.0
+    assert route_service._deadline_seconds_from_env() == 20.0
     assert route_service.validate_route_configuration() is None
 
     with pytest.raises(route_service.RouteConfigurationError, match="finite"):
@@ -1366,7 +1363,9 @@ def test_deadline_propagated_by_identity_to_planner_and_serialization(
     captured_highway_deadline: list[RoutingDeadline | None] = []
     original_highway_count = route_service._route_highway_count
 
-    def counting_highway_count(route: Route, *, deadline: RoutingDeadline | None = None) -> int:
+    def counting_highway_count(
+        route: Route, *, deadline: RoutingDeadline | None = None
+    ) -> int:
         captured_highway_deadline.append(deadline)
         return original_highway_count(route, deadline=deadline)
 
@@ -1417,7 +1416,9 @@ def test_routing_cancelled_during_scoring_is_not_swallowed(
     def exploding_apply(*args: object, **kwargs: object) -> None:
         raise RoutingCancelled("cancelled during scoring")
 
-    monkeypatch.setattr(route_service, "_apply_tile_scores_to_graph_native", exploding_apply)
+    monkeypatch.setattr(
+        route_service, "_apply_tile_scores_to_graph_native", exploding_apply
+    )
     monkeypatch.setattr(route_service, "ScenicRoutePlanner", _UnexpectedPlanner)
 
     with pytest.raises(RoutingCancelled, match="cancelled during scoring"):
@@ -1442,7 +1443,9 @@ def test_routing_timeout_during_diagnostics_is_not_swallowed(
     def timeout_diagnostics(*args: object, **kwargs: object) -> None:
         raise RoutingTimeout("deadline in diagnostics")
 
-    monkeypatch.setattr(route_service, "_endpoint_snap_diagnostics", timeout_diagnostics)
+    monkeypatch.setattr(
+        route_service, "_endpoint_snap_diagnostics", timeout_diagnostics
+    )
     monkeypatch.setattr(route_service, "ScenicRoutePlanner", _UnexpectedPlanner)
 
     with pytest.raises(RoutingTimeout, match="deadline in diagnostics"):

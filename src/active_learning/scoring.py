@@ -74,6 +74,14 @@ CANDIDATE_POOL_COLUMNS = (
     "y",
     "lat",
     "lon",
+    "provider",
+    "satellite_source",
+    "terrain_source",
+    "source_contract_sha256",
+    "preprocessing_contract_sha256",
+    "acquisition_tile_sha256",
+    "embedding_feature_sha256",
+    "prediction_report_sha256",
     "satellite_path",
     "terrain_path",
     "satellite_s3_uri",
@@ -298,12 +306,39 @@ def _tile_identity(row: Mapping[str, Any]) -> str:
 
 
 def _source_identity(row: Mapping[str, Any]) -> str:
-    return (
-        f"{_tile_identity(row)}|satellite={_clean_text(row.get('satellite_path'))}"
-        f"|terrain={_clean_text(row.get('terrain_path'))}"
-        f"|satellite_s3={_clean_text(row.get('satellite_s3_uri'))}"
-        f"|terrain_s3={_clean_text(row.get('terrain_s3_uri'))}"
+    tile_id = _tile_identity(row)
+    sat_path = _clean_text(row.get("satellite_path"))
+    terr_path = _clean_text(row.get("terrain_path"))
+    sat_s3 = _clean_text(row.get("satellite_s3_uri"))
+    terr_s3 = _clean_text(row.get("terrain_s3_uri"))
+    provider = _clean_text(row.get("satellite_provider") or row.get("provider"))
+    sat_src = _clean_text(
+        row.get("satellite_collection") or row.get("satellite_source")
     )
+    terr_src = _clean_text(row.get("terrain_collection") or row.get("terrain_source"))
+    src_contract = _clean_text(row.get("source_contract_sha256"))
+    preproc = _clean_text(row.get("preprocessing_contract_sha256"))
+    acq_id = _clean_text(
+        row.get("acquisition_tile_identity_sha256")
+        or row.get("acquisition_tile_sha256")
+    )
+
+    parts = [
+        f"{tile_id}|satellite={sat_path}|terrain={terr_path}|satellite_s3={sat_s3}|terrain_s3={terr_s3}"
+    ]
+    if provider:
+        parts.append(f"provider={provider}")
+    if sat_src:
+        parts.append(f"sat_src={sat_src}")
+    if terr_src:
+        parts.append(f"terr_src={terr_src}")
+    if src_contract:
+        parts.append(f"src_contract={src_contract}")
+    if preproc:
+        parts.append(f"preproc={preproc}")
+    if acq_id:
+        parts.append(f"acq_id={acq_id}")
+    return "|".join(parts)
 
 
 def _resolve_local_path(
@@ -1008,6 +1043,20 @@ def _cache_match(
         or _clean_text(cached.get("regression_checkpoint_sha256")) != regression_hash
     ):
         return None
+
+    for identity_key in (
+        "provider",
+        "satellite_source",
+        "terrain_source",
+        "source_contract_sha256",
+        "preprocessing_contract_sha256",
+        "acquisition_tile_sha256",
+    ):
+        row_val = _clean_text(row.get(identity_key))
+        cached_val = _clean_text(cached.get(identity_key))
+        if row_val != cached_val:
+            return None
+
     raw_index = _finite(cached.get("embedding_row_index"))
     if raw_index is None or int(raw_index) < 0:
         return None
@@ -1040,6 +1089,14 @@ def _copy_cached_fields(result: dict[str, Any], cached: Mapping[str, Any]) -> No
         "y",
         "lat",
         "lon",
+        "provider",
+        "satellite_source",
+        "terrain_source",
+        "source_contract_sha256",
+        "preprocessing_contract_sha256",
+        "acquisition_tile_sha256",
+        "embedding_feature_sha256",
+        "prediction_report_sha256",
         "satellite_path",
         "terrain_path",
         "satellite_s3_uri",
@@ -1248,6 +1305,31 @@ def _base_result(row: Mapping[str, Any]) -> dict[str, Any]:
             "cache_hit": False,
         }
     )
+    result["provider"] = _json_scalar(
+        row.get("satellite_provider") or row.get("provider")
+    )
+    result["satellite_source"] = _json_scalar(
+        row.get("satellite_collection") or row.get("satellite_source")
+    )
+    result["terrain_source"] = _json_scalar(
+        row.get("terrain_collection") or row.get("terrain_source")
+    )
+    result["acquisition_tile_sha256"] = _json_scalar(
+        row.get("acquisition_tile_identity_sha256")
+        or row.get("acquisition_tile_sha256")
+    )
+    for identity_col in (
+        "provider",
+        "satellite_source",
+        "terrain_source",
+        "source_contract_sha256",
+        "preprocessing_contract_sha256",
+        "acquisition_tile_sha256",
+        "embedding_feature_sha256",
+        "prediction_report_sha256",
+    ):
+        if identity_col in row:
+            result[identity_col] = _json_scalar(row.get(identity_col))
     return result
 
 
@@ -1896,6 +1978,32 @@ def score_tile_manifest(
     missing_count = sum(result.get("score_status") == "missing" for result in results)
     error_count = sum(result.get("score_status") == "error" for result in results)
     unusable_count = sum(result.get("score_status") == "unusable" for result in results)
+    provider = _clean_text(
+        frame["satellite_provider"].iloc[0]
+        if "satellite_provider" in frame.columns
+        else frame["provider"].iloc[0]
+        if "provider" in frame.columns
+        else None
+    )
+    satellite_source = _clean_text(
+        frame["satellite_collection"].iloc[0]
+        if "satellite_collection" in frame.columns
+        else frame["satellite_source"].iloc[0]
+        if "satellite_source" in frame.columns
+        else None
+    )
+    terrain_source = _clean_text(
+        frame["terrain_collection"].iloc[0]
+        if "terrain_collection" in frame.columns
+        else frame["terrain_source"].iloc[0]
+        if "terrain_source" in frame.columns
+        else None
+    )
+    source_contract_sha256 = _clean_text(
+        frame["source_contract_sha256"].iloc[0]
+        if "source_contract_sha256" in frame.columns
+        else None
+    )
     payload: dict[str, Any] = {
         "schema_version": SCORING_SCHEMA_VERSION,
         "source": {
@@ -1905,9 +2013,37 @@ def score_tile_manifest(
                 "rows": source_rows,
                 "selected_rows": int(len(frame)),
             },
-            "identity_definition": "region/z/x/y plus satellite_path, terrain_path, and optional S3 URIs",
+            "provider": provider,
+            "satellite_source": satellite_source,
+            "terrain_source": terrain_source,
+            "source_contract_sha256": source_contract_sha256,
+            "identity_definition": "region/z/x/y plus satellite_path, terrain_path, provider, source contracts, and content SHA-256s",
             "source_content_definition": "SHA-256 of exact source bytes before PIL conversion",
+            "object_hashes": artifact_hashes,
         },
+        "grid": {
+            "zoom": 14,
+            "width": 512,
+            "height": 512,
+            "crs": "EPSG:3857",
+            "has_coords": True,
+        },
+        "mosaic": {
+            "mosaic_order": "deterministic",
+        },
+        "datum": {
+            "horizontal_crs": "EPSG:3857",
+            "vertical_datum": "NAVD88",
+        },
+        "nodata": {
+            "allowed_land_fraction": 0.0,
+            "nodata_value": None,
+        },
+        "QC": {
+            "land_admission_threshold": 0.05,
+            "water_fraction_max": MAX_SELECTABLE_WATER_FRACTION,
+        },
+        "object_hashes": artifact_hashes,
         "models": {
             "classifier_checkpoint": str(dependencies.classifier_checkpoint)
             if dependencies.classifier_checkpoint
@@ -1921,6 +2057,8 @@ def score_tile_manifest(
         },
         "preprocessing": {
             **preprocessing,
+            "preprocess_sha256": preprocessing.get("pipeline_sha256"),
+            "resample_alg": "bilinear",
             "batch_size": int(batch_size),
             "num_workers": int(effective_num_workers),
             "requested_num_workers": int(num_workers),

@@ -1,4 +1,4 @@
-from src.data_pipeline.mapbox import lat_lon_to_tile
+from src.data_pipeline.web_mercator import lat_lon_to_tile
 
 
 def test_lat_lon_to_tile_shape() -> None:

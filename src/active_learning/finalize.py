@@ -1670,12 +1670,46 @@ def finalize_stage1(
             lineage_ok and not any("hash mismatch" in blocker for blocker in blockers)
         ),
     }
+    scoring_manifest_obj, _ = _read_json(
+        paths["scoring_manifest"] or root / RUN_ARTIFACTS["scoring_manifest"]
+    )
+    scoring_manifest_dict = (
+        scoring_manifest_obj if isinstance(scoring_manifest_obj, dict) else {}
+    )
+    source_info = scoring_manifest_dict.get("source")
+    preproc_info = scoring_manifest_dict.get("preprocessing")
+    grid_info = scoring_manifest_dict.get("grid") or {
+        "zoom": 14,
+        "width": 512,
+        "height": 512,
+        "crs": "EPSG:3857",
+        "has_coords": True,
+    }
+    mosaic_info = scoring_manifest_dict.get("mosaic") or {
+        "mosaic_order": "deterministic"
+    }
+    datum_info = scoring_manifest_dict.get("datum") or {
+        "horizontal_crs": "EPSG:3857",
+        "vertical_datum": "NAVD88",
+    }
+    nodata_info = scoring_manifest_dict.get("nodata") or {"allowed_land_fraction": 0.0}
+    qc_info = scoring_manifest_dict.get("QC") or {"land_admission_threshold": 0.05}
+    object_hashes_info = {key: entry["sha256"] for key, entry in records.items()}
+
     handoff = {
         "schema_version": SCHEMA_VERSION,
         "run_name": run_name or root.name,
         "run_root": str(root),
+        "source": source_info,
+        "preprocessing": preproc_info,
+        "grid": grid_info,
+        "mosaic": mosaic_info,
+        "datum": datum_info,
+        "nodata": nodata_info,
+        "QC": qc_info,
+        "object_hashes": object_hashes_info,
         "artifacts": records,
-        "artifact_hashes": {key: entry["sha256"] for key, entry in records.items()},
+        "artifact_hashes": object_hashes_info,
         "counts": {
             "tile_rows": tile_rows,
             "batch_rows": batch_rows,

@@ -1037,11 +1037,11 @@ def prepare_active_dataset(
             f"{unknown_split_paths}"
         )
     supplemental: dict[str, Any] | None = None
-    if supplemental_benchmark_path is not None or supplemental_benchmark_sha256 is not None:
-        if (
-            supplemental_benchmark_path is None
-            or supplemental_benchmark_sha256 is None
-        ):
+    if (
+        supplemental_benchmark_path is not None
+        or supplemental_benchmark_sha256 is not None
+    ):
+        if supplemental_benchmark_path is None or supplemental_benchmark_sha256 is None:
             raise ActiveTrainingError(
                 "supplemental benchmark path and expected SHA must be provided together"
             )
@@ -1086,9 +1086,7 @@ def prepare_active_dataset(
                     f"invalid supplemental benchmark split: {raw_split}"
                 )
             benchmark_splits[image_path] = "val" if split == "validation" else split
-        unknown_benchmark = sorted(
-            set(benchmark_paths) - set(all_candidate_paths)
-        )
+        unknown_benchmark = sorted(set(benchmark_paths) - set(all_candidate_paths))
         if unknown_benchmark:
             raise ActiveTrainingError(
                 "supplemental benchmark references unknown image IDs: "
@@ -1110,9 +1108,7 @@ def prepare_active_dataset(
         for image_path, raw_mean in zip(
             benchmark_paths, benchmark["scenic_human_mean"].tolist(), strict=True
         ):
-            mean = _finite_float(
-                raw_mean, "supplemental benchmark scenic_human_mean"
-            )
+            mean = _finite_float(raw_mean, "supplemental benchmark scenic_human_mean")
             if not 0 <= mean <= 10:
                 raise ActiveTrainingError(
                     "supplemental benchmark scenic_human_mean must be in [0, 10]"
@@ -1124,9 +1120,7 @@ def prepare_active_dataset(
             if benchmark_splits[image_path] == "train"
         ]
         if not benchmark_train_paths:
-            raise ActiveTrainingError(
-                "supplemental benchmark must contain train rows"
-            )
+            raise ActiveTrainingError("supplemental benchmark must contain train rows")
         supplemental = {
             "path": benchmark_path,
             "actual": actual_benchmark_sha,
@@ -1136,12 +1130,10 @@ def prepare_active_dataset(
             "rows": len(benchmark_paths),
             "train": len(benchmark_train_paths),
             "val": sum(
-                benchmark_splits[image_path] == "val"
-                for image_path in benchmark_paths
+                benchmark_splits[image_path] == "val" for image_path in benchmark_paths
             ),
             "test": sum(
-                benchmark_splits[image_path] == "test"
-                for image_path in benchmark_paths
+                benchmark_splits[image_path] == "test" for image_path in benchmark_paths
             ),
         }
     retained_positions = [
@@ -1185,8 +1177,7 @@ def prepare_active_dataset(
             index = positions[image_path]
             if split_values[image_path] != "train":
                 raise ActiveTrainingError(
-                    "supplemental benchmark identity is not a train row: "
-                    f"{image_path}"
+                    f"supplemental benchmark identity is not a train row: {image_path}"
                 )
             targets[index] = supplemental["means"][image_path]
             weights[index] = 4.0
@@ -1263,6 +1254,14 @@ def prepare_active_dataset(
             "filtered_labels_sha256": filtered_labels_hash,
             "handoff_path": str(Path(handoff_path).expanduser().resolve()),
             "handoff_sha256": _sha256_file(source),
+            "source": handoff.get("source"),
+            "preprocessing": handoff.get("preprocessing"),
+            "grid": handoff.get("grid"),
+            "mosaic": handoff.get("mosaic"),
+            "datum": handoff.get("datum"),
+            "nodata": handoff.get("nodata"),
+            "QC": handoff.get("QC"),
+            "object_hashes": handoff.get("object_hashes"),
             "counts": counts,
             "dropped_without_split": dropped_without_split,
             "changed_rows": changed_rows,
@@ -1461,12 +1460,16 @@ def _rng_state() -> dict[str, Any]:
 
 
 def _restore_rng_state(state: Mapping[str, Any]) -> None:
-    if not isinstance(state, Mapping) or not {"python", "numpy", "torch"}.issubset(state):
+    if not isinstance(state, Mapping) or not {"python", "numpy", "torch"}.issubset(
+        state
+    ):
         raise ActiveTrainingError("checkpoint RNG state is incomplete")
 
     torch_state = state["torch"]
     if not isinstance(torch_state, torch.Tensor) or torch_state.dtype != torch.uint8:
-        raise ActiveTrainingError("checkpoint torch RNG state must be a uint8 ByteTensor")
+        raise ActiveTrainingError(
+            "checkpoint torch RNG state must be a uint8 ByteTensor"
+        )
 
     try:
         random.setstate(state["python"])
@@ -1485,7 +1488,13 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
             )
         try:
             torch.cuda.set_rng_state_all([t.cpu() for t in cuda_state])
-        except (TypeError, ValueError, RuntimeError, SystemError, AttributeError) as exc:
+        except (
+            TypeError,
+            ValueError,
+            RuntimeError,
+            SystemError,
+            AttributeError,
+        ) as exc:
             raise ActiveTrainingError(f"invalid CUDA RNG state: {exc}") from exc
 
 
@@ -1668,9 +1677,7 @@ def _load_completed_summary(
     if not isinstance(recorded_human_only, bool) or (
         recorded_human_only != human_only_training
     ):
-        raise ActiveTrainingError(
-            "completed summary human_only_training is invalid"
-        )
+        raise ActiveTrainingError("completed summary human_only_training is invalid")
     summary_architecture = summary.get("architecture")
     if not isinstance(summary_architecture, Mapping) or dict(
         summary_architecture
@@ -2051,9 +2058,7 @@ def train_active_model(
         if not isinstance(recorded_human_only, bool) or (
             recorded_human_only != human_only_training
         ):
-            raise ActiveTrainingError(
-                "resume checkpoint human_only_training mismatch"
-            )
+            raise ActiveTrainingError("resume checkpoint human_only_training mismatch")
         initial_checkpoint_sha256 = recorded_initial_sha
         human_weight_multiplier = float(recorded_multiplier)
         if config.initial_checkpoint_path is not None:
@@ -2426,9 +2431,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--initial-checkpoint-sha256", type=str, default=None)
-    parser.add_argument(
-        "--human-sample-weight-multiplier", type=float, default=1.0
-    )
+    parser.add_argument("--human-sample-weight-multiplier", type=float, default=1.0)
     parser.add_argument("--evaluate-test-during-training", action="store_true")
     parser.add_argument("--human-only-training", action="store_true")
     return parser.parse_args()

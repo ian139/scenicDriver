@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Iterable
-from collections import defaultdict
 
 from PIL import Image
 
@@ -90,97 +89,6 @@ def scan_tile_inventory(
         )
         output.append(row)
     output.sort(key=lambda r: (r["region"], int(r["z"]), int(r["x"]), int(r["y"])))
-    return output, counts
-
-
-def scan_s3_inventory(
-    rows: Iterable[dict[str, Any]],
-    *,
-    bucket: str,
-    prefix_root: str = "raw/images",
-    s3_client: Any | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Merge canonical non-empty S3 objects into an existing local inventory."""
-    if not bucket or "/" in bucket or bucket.startswith("s3://"):
-        raise ValueError("bucket must be a bare S3 bucket name")
-    prefix_root = prefix_root.strip().strip("/")
-    if not prefix_root:
-        raise ValueError("prefix_root is required")
-    if s3_client is None:
-        import boto3
-
-        s3_client = boto3.client("s3")
-
-    output = [dict(row) for row in rows]
-    regions_by_style: dict[str, set[str]] = defaultdict(set)
-    for row in output:
-        for style in ("satellite", "terrain"):
-            regions_by_style[style].add(str(row["region"]))
-
-    objects: dict[tuple[str, str], dict[str, int]] = {}
-    paginator = s3_client.get_paginator("list_objects_v2")
-    for style in ("satellite", "terrain"):
-        for region in sorted(regions_by_style[style]):
-            prefix = f"{prefix_root}/{style}/z{int(output[0]['z'])}/{region}/"
-            found: dict[str, int] = {}
-            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                for item in page.get("Contents", []):
-                    key = str(item.get("Key", ""))
-                    size = int(item.get("Size", 0))
-                    if size > 0 and key.startswith(prefix):
-                        rel = key[len(prefix) :]
-                        if rel and "/" not in rel and rel.endswith(".png"):
-                            found[rel] = size
-            objects[(style, region)] = found
-
-    for row in output:
-        for style in ("satellite", "terrain"):
-            filename = f"{int(row['x'])}_{int(row['y'])}.png"
-            size = objects.get((style, str(row["region"])), {}).get(filename)
-            s3_present = size is not None
-            row[f"{style}_s3_present"] = s3_present
-            row[f"{style}_s3_bytes"] = size
-            row[f"{style}_s3_uri"] = (
-                f"s3://{bucket}/{prefix_root}/{style}/z{int(row['z'])}/{row['region']}/{filename}"
-                if s3_present
-                else ""
-            )
-    counts = {
-        "coordinates": len(output),
-        "satellite_valid": sum(bool(row.get("satellite_present")) for row in output),
-        "terrain_valid": sum(bool(row.get("terrain_present")) for row in output),
-        "complete_pairs": sum(
-            bool(row.get("satellite_present")) and bool(row.get("terrain_present"))
-            for row in output
-        ),
-        "reusable_pairs": sum(
-            (
-                bool(row.get("satellite_present"))
-                or bool(row.get("satellite_s3_present"))
-            )
-            and (
-                bool(row.get("terrain_present")) or bool(row.get("terrain_s3_present"))
-            )
-            for row in output
-        ),
-        "incomplete_pairs": sum(
-            not (
-                bool(row.get("satellite_present")) and bool(row.get("terrain_present"))
-            )
-            for row in output
-        ),
-        "invalid_files": sum(
-            str(row.get(f"{style}_reason", "")).startswith("invalid_png")
-            for row in output
-            for style in ("satellite", "terrain")
-        ),
-        "satellite_s3_objects": sum(
-            bool(row.get("satellite_s3_present")) for row in output
-        ),
-        "terrain_s3_objects": sum(
-            bool(row.get("terrain_s3_present")) for row in output
-        ),
-    }
     return output, counts
 
 

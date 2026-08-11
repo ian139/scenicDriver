@@ -82,7 +82,7 @@ archive/                 Curated historical material
 
 | Goal | Entry point |
 |---|---|
-| Download regional tiles | `scripts/ingest/download_bbox_tiles.py` |
+| Plan or execute source-versioned NAIP/3DEP tiles | `scripts/ingest/plan_active_learning_region.py` |
 | Annotate scenic labels | `notebooks/annotate_scenic.mo.py` or `scripts/annotation/annotate_scenic_web.py` |
 | Plan, score, select, and annotate an active-learning batch | `scripts/ingest/plan_active_learning_region.py`, `scripts/modeling/score_active_learning_pool.py`, and `scripts/annotation/select_active_learning.py` |
 | Train and evaluate scoring | `notebooks/regression.mo.py` and `scripts/modeling/` |
@@ -98,12 +98,38 @@ uv run marimo edit notebooks/regression.mo.py
 ```
 
 Stage-One active-learning runs are isolated under
-`data/processed/active_learning/<run_name>/`. Plan before acquisition, then
-score, select, annotate, and finalize the same run:
-```bash
+`data/processed/active_learning/<run_name>/`. The active acquisition planner is
+NAIP/3DEP-only and performs no network access by default:
 
-uv run python scripts/ingest/plan_active_learning_region.py --run-name <run_name>
-uv run python scripts/ingest/plan_active_learning_region.py --run-name <run_name> --acquire --workers 8
+```bash
+uv run python scripts/ingest/plan_active_learning_region.py \
+  --run-name <run_name> \
+  --region-spec config/data_sources/regions_v1.json \
+  --region-source config/app_regions.json \
+  --imagery-source naip-visualization \
+  --terrain-source usgs-3dep-13as \
+  --source-contract config/data_sources/naip_3dep_v1.json \
+  --image-root data/raw/sources/naip_3dep_v1/images \
+  --output-root data/processed/active_learning \
+  --budget 370000
+```
+
+When catalogs are absent, execute only the exact hash-bound `resume_command`
+written to `<run_name>/discovery_authorization_request.json`, and only after
+its positive discovery caps are explicitly authorized. Once discovery has
+produced a pinned catalog and immutable plan, acquisition is separately
+authorized:
+
+```bash
+uv run python scripts/ingest/plan_active_learning_region.py \
+  --execute-plan data/processed/active_learning/<run_name>/execution_plan.json \
+  --expected-plan-sha256 <execution_plan_sha256> \
+  --allow-requester-pays \
+  --max-source-requests <count> \
+  --max-transfer-bytes <bytes> \
+  --max-local-bytes <bytes> \
+  --max-requester-pays-usd <usd> \
+  --workers 8
 uv run python scripts/modeling/score_active_learning_pool.py --manifest data/processed/active_learning/<run_name>/tile_manifest.csv --run-name <run_name>
 uv run python scripts/annotation/select_active_learning.py --candidate-input data/processed/active_learning/<run_name>/candidate_pool.csv --prior-annotations data/raw/labels_human.csv --run-name <run_name>
 uv run python scripts/annotation/annotate_scenic_web.py --batch-csv data/processed/active_learning/<run_name>/annotation_batch.csv --annotations-csv data/raw/labels_human.csv
@@ -142,6 +168,44 @@ validate inputs and persist only the planned experiment ladder.
 The finalizer fails closed unless acquisition, scoring, human annotation,
 fixed geographic splits, human benchmark, mixed labels, artifact hashes, and
 the active baseline identity all validate.
+
+After a bounded NAIP/3DEP pilot exists, freeze the matched source-pair batch
+before annotation, then evaluate the unchanged model against the completed
+human labels. Source identities must be explicit in both tile manifests:
+
+```bash
+uv run python scripts/annotation/build_source_shift_batch.py \
+  --old-manifest <mapbox_tile_manifest.csv> \
+  --new-manifest data/processed/active_learning/<run_name>/tile_manifest.csv \
+  --old-source-identity <mapbox_source_contract_sha256> \
+  --new-source-identity <naip_3dep_source_contract_sha256> \
+  --output-batch-csv data/processed/active_learning/<run_name>/source_shift_batch.csv \
+  --output-summary-json data/processed/active_learning/<run_name>/source_shift_batch.summary.json \
+  --sample-size 200 --seed 42
+uv run python scripts/modeling/evaluate_source_shift.py \
+  --batch-summary-json data/processed/active_learning/<run_name>/source_shift_batch.summary.json \
+  --annotations-csv data/raw/labels_human.csv \
+  --old-predictions-csv <mapbox_predictions.csv> \
+  --new-predictions-csv <naip_3dep_predictions.csv> \
+  --output-report-json data/processed/active_learning/<run_name>/baseline_source_shift.json \
+  --seed 42 --n-bootstrap 1000 --strict
+```
+
+Learned heatmap export requires a JSON identity manifest that hash-binds the
+dataset, metadata, source, preprocessing, grid, classifier, regression,
+calibration, score schema, and label schema. It never infers these identities:
+
+```bash
+uv run python scripts/modeling/export_prediction_heatmap.py \
+  --dataset <feature_embeddings.npz> \
+  --expected-dataset-sha256 <sha256> \
+  --metadata-csv <candidate_pool.csv> \
+  --expected-metadata-sha256 <sha256> \
+  --checkpoint <checkpoint.pt> \
+  --expected-checkpoint-sha256 <sha256> \
+  --identity-manifest <prediction_identity.json> \
+  --run-name <experimental_run_name>
+```
 
 ## Documentation
 
