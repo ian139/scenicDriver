@@ -23,6 +23,7 @@ The promoted v6 learned regressor remains the baseline. Its metrics and provenan
 - Add a repeatable region pipeline from tile acquisition through labels, reports, and deployment metadata.
 - Extend visual QA and learned reports to additional representative regions.
 - Keep data provenance, hashes, and generated outputs under the canonical paths in [`data/README.md`](../data/README.md).
+- Evaluate the [nationwide streaming score-map proposal](research/nationwide-streaming-score-map.md) through parity, human source-shift, and metered cost pilots before any CONUS execution.
 
 ## Routing
 

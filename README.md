@@ -216,6 +216,7 @@ uv run python scripts/modeling/export_prediction_heatmap.py \
 - [Remote training](docs/setup/vast-training.md) — container and Vast.ai lifecycle
 - [Roadmap](docs/roadmap.md) — current product, model, data, and routing priorities
 - [ML research log](docs/research/ml-research-log.md) — learned-score model history and promotion evidence
+- [Nationwide streaming score-map proposal](docs/research/nationwide-streaming-score-map.md) — proposed score-only CONUS architecture, cost hypothesis, and required gates
 - [Routing performance log](docs/research/routing-performance-autoresearch.md) — benchmark results and retained experiments
 - [Archive manifest](archive/archive.md) — historical, non-primary material
 
