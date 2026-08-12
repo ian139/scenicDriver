@@ -607,6 +607,9 @@ def test_compact_scored_plan_routes_avoids_native_clone(
             request,
             deadline=RoutingDeadline(cancel_event=cancel_event),
         )
+    monkeypatch.setattr(route_service.pickle, "dumps", real_dumps)
+    uncached = route_service.plan_routes(request)
+    assert uncached["diagnostics"]["route_response_cache_hit"] is False
 
 
 def test_compact_load_honours_cancellation(tmp_path: Path) -> None:

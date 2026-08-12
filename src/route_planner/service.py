@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from copy import copy, deepcopy
+from copy import copy
 from dataclasses import dataclass
 import gc
 import hashlib
@@ -2071,11 +2071,16 @@ def plan_routes(
         "routes": routes,
         "geojson": {"type": "FeatureCollection", "features": features},
     }
+    cached_response = pickle.dumps(
+        response,
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+    if deadline is not None:
+        deadline.check()
     with _CACHE_LOCK:
-        _ROUTE_RESPONSE_CACHE[response_cache_key] = pickle.dumps(
-            response,
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
+        if deadline is not None:
+            deadline.check()
+        _ROUTE_RESPONSE_CACHE[response_cache_key] = cached_response
         _ROUTE_RESPONSE_CACHE.move_to_end(response_cache_key)
         while len(_ROUTE_RESPONSE_CACHE) > _ROUTE_RESPONSE_CACHE_CAPACITY:
             _ROUTE_RESPONSE_CACHE.popitem(last=False)
