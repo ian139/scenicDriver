@@ -2,16 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from array import array
+from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from types import MappingProxyType
+import hashlib
 import json
 import math
+import mmap
 import os
 from pathlib import Path
 import re
 import sqlite3
 import tempfile
-from typing import Any, Callable, ClassVar, Dict, Generic, List, Optional, Tuple, TypeVar, overload
+from typing import Any, Callable, ClassVar, Dict, Generic, List, Optional, Tuple, TypeVar, Union, overload
+import zlib
 
 from ._edge_projection import (
     EdgeProjection,
@@ -333,8 +337,32 @@ class RoadGraph:
         ):
             self._edge_projection_index_status = "stale"
             self._edge_projection_index_invalid_reason = "graph_mutated"
+        epi = getattr(self, "_nearest_edge_projection_index", None)
+        if epi is not None:
+            if hasattr(epi, "close"):
+                try:
+                    epi.close()
+                except Exception:
+                    pass
         self._nearest_edge_projection_index = None
         self._edge_projection_index_stamp = None
+    def close(self) -> None:
+        """Close backing resources, if any."""
+        epi = getattr(self, "_nearest_edge_projection_index", None)
+        if epi is not None:
+            if hasattr(epi, "close"):
+                try:
+                    epi.close()
+                except Exception:
+                    pass
+            self._nearest_edge_projection_index = None
+
+    def __enter__(self) -> "RoadGraph":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
 
 
     def _build_nearest_edge_projection_index(
@@ -404,6 +432,7 @@ class RoadGraph:
         path: Path,
         *,
         check_cancelled: Callable[[], None] | None = None,
+        verify: bool = True,
     ) -> str:
         """Attempt a compatible sidecar load; fall back to lazy rebuild."""
         sidecar_path = EdgeProjectionIndex.sidecar_path(path)
@@ -424,7 +453,7 @@ class RoadGraph:
             return self._edge_projection_index_status
         try:
             index = EdgeProjectionIndex.load(
-                sidecar_path, path, check_cancelled=check_cancelled
+                sidecar_path, path, check_cancelled=check_cancelled, verify=verify
             )
             index.attach(self)
             self._nearest_edge_projection_index = index
@@ -955,6 +984,15 @@ class RoadGraph:
         path = Path(path)
         if check_cancelled is not None:
             check_cancelled()
+        if path.name.endswith(".compact.json"):
+            # Deployment admission validates payload/source digests once before
+            # startup. Runtime loads validate the signed manifest structure,
+            # exact sizes, and mmap bounds without rereading both multi-GB files.
+            return CompactRoadGraph.load(
+                path,
+                check_cancelled=check_cancelled,
+                verify=False,
+            )
         if path.suffix.lower() == ".sqlite3":
             return _load_sqlite_graph(path, check_cancelled=check_cancelled)
         # Decode bytes directly into compact typed rows.  This avoids a
@@ -1842,6 +1880,1912 @@ def _graph_from_osmnx(G: Any, scenic_scores: Dict[str, float]) -> RoadGraph:
         else:
             graph.add_edge(row)  # type: ignore[arg-type]
     return graph
+
+
+# ---------------------------------------------------------------------------
+# Canonical compact runtime
+# ---------------------------------------------------------------------------
+#
+# ``road_graph.compact.json`` is the explicit runtime entry point for large
+# graphs.  It references a little-endian binary section payload
+# (``road_graph.compact.bin``) plus the source SQLite audit artifact, and it
+# never materializes Node/Edge objects: nodes, canonical edges, and directed
+# traversals are mmap-backed numeric/string-table arrays.  A deterministic
+# per-report score sidecar (``road_graph.compact.score.<signature>*.bin``)
+# stores scenic costs keyed by canonical edge rank.
+
+_COMPACT_FORMAT = "scenic-roadgraph-compact"
+_COMPACT_SCHEMA_VERSION = 1
+_COMPACT_SCORE_FORMAT = "scenic-roadgraph-compact-score"
+_COMPACT_SCORE_SCHEMA_VERSION = 1
+_COMPACT_BIN_SUFFIX = ".compact.bin"
+_COMPACT_MANIFEST_SUFFIX = ".compact.json"
+_COMPACT_ID_CACHE_CAPACITY = 65_536
+_COMPACT_SCENIC_BYWAY_ROAD_TYPE = "scenic_byway"
+# Mirrors ``src.route_planner.cost.HIGHWAY_ROAD_TYPES``.  Both the converter
+# and the runtime derive the mask from the same module (lazy import avoids the
+# cost<->graph import cycle); the manifest records the joined set so a stale
+# artifact is rejected instead of silently re-masked.
+_COMPACT_HIGHWAY_ROAD_TYPES = frozenset(
+    {
+        "highway",
+        "motorway",
+        "motorway_link",
+        "primary",
+        "primary_link",
+        "trunk",
+        "trunk_link",
+    }
+)
+
+
+def _compact_highway_road_types() -> frozenset:
+    # ``cost`` imports this module, so the import must stay deferred.
+    from .cost import HIGHWAY_ROAD_TYPES
+
+    return frozenset(HIGHWAY_ROAD_TYPES)
+
+
+_COMPACT_SECTION_SPECS: Tuple[Tuple[str, str], ...] = (
+    ("node_lat", "f8"),
+    ("node_lon", "f8"),
+    ("node_id_strings", "raw"),
+    ("node_id_offsets", "i8"),
+    ("node_hash_keys", "u8"),
+    ("node_hash_values", "i8"),
+    ("edge_id_strings", "raw"),
+    ("edge_id_offsets", "i8"),
+    ("edge_hash_keys", "u8"),
+    ("edge_hash_values", "i8"),
+    ("edge_start_rank", "i4"),
+    ("edge_end_rank", "i4"),
+    ("edge_distance_km", "f8"),
+    ("edge_scenic_score", "f8"),
+    ("edge_speed_limit_kmh", "f8"),
+    ("edge_one_way", "u1"),
+    ("edge_road_type_codes", "i4"),
+    ("road_type_strings", "raw"),
+    ("road_type_offsets", "i8"),
+    ("edge_road_name_strings", "raw"),
+    ("edge_road_name_offsets", "i8"),
+    ("forward_indptr", "i8"),
+    ("forward_indices", "i4"),
+    ("reverse_indptr", "i8"),
+    ("reverse_indices", "i4"),
+    ("reverse_positions", "i8"),
+    ("trav_edge_rank", "i4"),
+    ("trav_reverse", "u1"),
+    ("trav_distance_km", "f8"),
+    ("trav_travel_time_minutes", "f8"),
+    ("trav_scenic_score", "f8"),
+    ("trav_highway_mask", "u1"),
+    ("trav_scenic_byway_mask", "u1"),
+)
+
+_COMPACT_SECTION_NAMES = frozenset(name for name, _dtype in _COMPACT_SECTION_SPECS)
+_COMPACT_DTYPE_ITEMSIZE = {
+    "f8": 8,
+    "i8": 8,
+    "i4": 4,
+    "u8": 8,
+    "u1": 1,
+    "raw": None,
+}
+
+
+def _compact_hash_slots(count: int) -> int:
+    """Return the deterministic open-addressing table size for ``count`` keys."""
+    if count <= 0:
+        return 8
+    size = 1 << (2 * count - 1).bit_length()
+    return max(8, size)
+
+
+def _compact_id_hash(key_bytes: bytes) -> int:
+    # crc32 is deterministic across processes and platforms; ``+1`` reserves
+    # zero as the empty-slot sentinel.
+    return (zlib.crc32(key_bytes) & 0xFFFFFFFF) + 1
+
+
+def _sha256_file(path: Path, check_cancelled: Callable[[], None] | None = None) -> bytes:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while True:
+            if check_cancelled is not None:
+                check_cancelled()
+            chunk = stream.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    if check_cancelled is not None:
+        check_cancelled()
+    return digest.digest()
+
+
+def _fsync_parent(path: Path) -> None:
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(path.parent, directory_flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _write_atomic_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+        _fsync_parent(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _iter_sqlite_edge_rank_rows(
+    connection: sqlite3.Connection,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> Iterator[tuple[int, ...]]:
+    """Stream canonical edge rows with resolved node ranks in rowid order.
+
+    Rank resolution uses the rowid ordering contract of ``_bulk_load``: node
+    rank equals ``rowid - 1`` (the writer never deletes rows).  The JOIN
+    rejects edges whose endpoints are absent from the node table.
+    """
+    cursor = connection.execute(
+        """
+        SELECT
+            e.id, e.start_node_id, e.end_node_id,
+            e.distance_km, e.scenic_score, e.road_name, e.road_type,
+            e.speed_limit_kmh, e.one_way,
+            ns.rowid - 1 AS start_rank,
+            ne.rowid - 1 AS end_rank,
+            e.rowid - 1 AS edge_rank
+        FROM edges AS e
+        JOIN nodes AS ns ON ns.id = e.start_node_id
+        JOIN nodes AS ne ON ne.id = e.end_node_id
+        ORDER BY e.rowid
+        """
+    )
+    row_index = 0
+    while True:
+        if check_cancelled is not None:
+            check_cancelled()
+        batch = cursor.fetchmany(_SQLITE_BATCH_SIZE)
+        if check_cancelled is not None:
+            check_cancelled()
+        if not batch:
+            return
+        for row in batch:
+            if (
+                check_cancelled is not None
+                and row_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+            ):
+                check_cancelled()
+            row_index += 1
+            yield row
+
+
+def _compact_string_tables(
+    values: Sequence[str],
+) -> tuple[bytearray, array]:
+    """Build a deterministic concatenated UTF-8 string table with offsets."""
+    data = bytearray()
+    offsets = array("q", [0])
+    for value in values:
+        encoded = str(value).encode("utf-8")
+        data.extend(encoded)
+        offsets.append(len(data))
+    return data, offsets
+
+
+def write_compact_graph(
+    sqlite_path: Path,
+    manifest_path: Path,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Build the canonical compact runtime artifacts from a SQLite graph.
+
+    The SQLite artifact is the authoritative source; this converter streams
+    its rows in deterministic rowid order and never rebuilds Node/Edge
+    objects.  All sections are little-endian, digest-signed, and published
+    atomically next to the manifest.
+    """
+    if array("q").itemsize != 8 or array("i").itemsize != 4:
+        raise RuntimeError("compact artifact requires 64-bit array support")
+    from urllib.parse import quote
+
+    sqlite_path = Path(sqlite_path)
+    manifest_path = Path(manifest_path)
+    if check_cancelled is not None:
+        check_cancelled()
+    resolved_source = sqlite_path.expanduser().resolve()
+    uri = f"file:{quote(str(resolved_source), safe='/')}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+    except sqlite3.DatabaseError as exc:
+        raise ValueError(f"Invalid SQLite road graph: {sqlite_path}") from exc
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        metadata = _sqlite_metadata(connection, check_cancelled=check_cancelled)
+        if check_cancelled is not None:
+            check_cancelled()
+        node_total = connection.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        node_max_rowid = connection.execute("SELECT MAX(rowid) FROM nodes").fetchone()[0]
+        edge_total = connection.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        edge_max_rowid = connection.execute("SELECT MAX(rowid) FROM edges").fetchone()[0]
+        if int(node_max_rowid) != int(node_total):
+            raise ValueError(
+                "Compact conversion requires gapless node rowids "
+                f"(count {node_total}, max rowid {node_max_rowid})"
+            )
+        if int(edge_max_rowid) != int(edge_total):
+            raise ValueError(
+                "Compact conversion requires gapless edge rowids "
+                f"(count {edge_total}, max rowid {edge_max_rowid})"
+            )
+        if check_cancelled is not None:
+            check_cancelled()
+
+        # --- Node sections -------------------------------------------------
+        node_lat = array("d")
+        node_lon = array("d")
+        node_id_data = bytearray()
+        node_id_offsets = array("q", [0])
+        node_hash_size = _compact_hash_slots(node_total)
+        node_hash_keys = array("Q", [0]) * node_hash_size
+        node_hash_values = array("q", [-1]) * node_hash_size
+        node_cursor = connection.execute(
+            "SELECT id, lat, lon FROM nodes ORDER BY rowid"
+        )
+        node_index = 0
+        while True:
+            if check_cancelled is not None:
+                check_cancelled()
+            batch = node_cursor.fetchmany(_SQLITE_BATCH_SIZE)
+            if check_cancelled is not None:
+                check_cancelled()
+            if not batch:
+                break
+            for node_id, lat, lon in batch:
+                if (
+                    check_cancelled is not None
+                    and node_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+                ):
+                    check_cancelled()
+                lat_value = float(lat)
+                lon_value = float(lon)
+                if not (math.isfinite(lat_value) and math.isfinite(lon_value)):
+                    raise ValueError(
+                        f"Node {node_id!r} has non-finite coordinates"
+                    )
+                node_lat.append(lat_value)
+                node_lon.append(lon_value)
+                encoded = str(node_id).encode("utf-8")
+                node_id_data.extend(encoded)
+                node_id_offsets.append(len(node_id_data))
+                hash_value = _compact_id_hash(encoded)
+                slot = (hash_value - 1) & (node_hash_size - 1)
+                while node_hash_keys[slot] != 0:
+                    slot = (slot + 1) & (node_hash_size - 1)
+                node_hash_keys[slot] = hash_value
+                node_hash_values[slot] = node_index
+                node_index += 1
+        if node_index != node_total:
+            raise ValueError(
+                f"Node count mismatch during conversion: {node_index} != {node_total}"
+            )
+        if check_cancelled is not None:
+            check_cancelled()
+
+        # --- Edge traversal counting ---------------------------------------
+        forward_counts = array("q", [0]) * (node_total + 1)
+        reverse_counts = array("q", [0]) * (node_total + 1)
+        road_type_index: Dict[str, int] = {}
+        road_type_names: List[str] = []
+        edge_id_data = bytearray()
+        edge_id_offsets = array("q", [0])
+        edge_hash_size = _compact_hash_slots(edge_total)
+        edge_hash_keys = array("Q", [0]) * edge_hash_size
+        edge_hash_values = array("q", [-1]) * edge_hash_size
+        road_name_data = bytearray()
+        road_name_offsets = array("q", [0])
+        edge_start_rank = array("i")
+        edge_end_rank = array("i")
+        edge_distance_km = array("d")
+        edge_scenic_score = array("d")
+        edge_speed_limit_kmh = array("d")
+        edge_one_way = array("B")
+        edge_road_type_codes = array("i")
+        geodesic_valid_all = True
+        geodesic_max_speed_all = 1.0
+        geodesic_valid_avoid_highways = True
+        geodesic_max_speed_avoid_highways = 1.0
+        highway_types = _compact_highway_road_types()
+        edge_index = 0
+        for row in _iter_sqlite_edge_rank_rows(
+            connection, check_cancelled=check_cancelled
+        ):
+            (
+                _edge_id,
+                _start_id,
+                _end_id,
+                distance,
+                scenic,
+                _road_name,
+                road_type,
+                speed,
+                one_way,
+                start_rank,
+                end_rank,
+                edge_rank,
+            ) = row
+            start_rank = int(start_rank)
+            end_rank = int(end_rank)
+            edge_rank = int(edge_rank)
+            if edge_rank != edge_index:
+                raise ValueError(
+                    f"Edge rowid order mismatch at rank {edge_rank}"
+                )
+            distance_value = float(distance)
+            scenic_value = float(scenic)
+            if not math.isfinite(distance_value) or distance_value < 0.0:
+                raise ValueError(f"Edge {_edge_id!r} has invalid distance")
+            if not math.isfinite(scenic_value):
+                raise ValueError(f"Edge {_edge_id!r} has non-finite scenic score")
+            one_way_value = _parse_one_way(one_way, default=True)
+            road_type_value = str(road_type)
+            speed_value = int(
+                _parse_speed_limit_kmh(speed, road_type_value)
+            )
+            if speed_value <= 0:
+                raise ValueError(f"Edge {_edge_id!r} has invalid speed limit")
+            edge_start_rank.append(start_rank)
+            edge_end_rank.append(end_rank)
+            edge_distance_km.append(distance_value)
+            edge_scenic_score.append(scenic_value)
+            edge_speed_limit_kmh.append(float(speed_value))
+            edge_one_way.append(1 if one_way_value else 0)
+            type_code = road_type_index.get(road_type_value)
+            if type_code is None:
+                type_code = len(road_type_names)
+                road_type_index[road_type_value] = type_code
+                road_type_names.append(road_type_value)
+            edge_road_type_codes.append(type_code)
+            encoded_id = str(_edge_id).encode("utf-8")
+            edge_id_data.extend(encoded_id)
+            edge_id_offsets.append(len(edge_id_data))
+            hash_value = _compact_id_hash(encoded_id)
+            slot = (hash_value - 1) & (edge_hash_size - 1)
+            while edge_hash_keys[slot] != 0:
+                slot = (slot + 1) & (edge_hash_size - 1)
+            edge_hash_keys[slot] = hash_value
+            edge_hash_values[slot] = edge_index
+            encoded_name = (
+                b"" if _road_name is None else str(_road_name).encode("utf-8")
+            )
+            road_name_data.extend(encoded_name)
+            road_name_offsets.append(len(road_name_data))
+            forward_counts[start_rank + 1] += 1
+            reverse_counts[end_rank + 1] += 1
+            if not one_way_value:
+                forward_counts[end_rank + 1] += 1
+                reverse_counts[start_rank + 1] += 1
+            start_lat = node_lat[start_rank]
+            start_lon = node_lon[start_rank]
+            end_lat = node_lat[end_rank]
+            end_lon = node_lon[end_rank]
+            endpoint_km = _haversine_km(start_lat, start_lon, end_lat, end_lon)
+            highway = road_type_value.lower() in highway_types
+            is_valid_geodesic = (
+                math.isfinite(distance_value)
+                and distance_value >= 0.0
+                and math.isfinite(speed_value)
+                and math.isfinite(endpoint_km)
+                and endpoint_km >= 0.0
+                and distance_value >= (endpoint_km - 1e-9)
+            )
+            if is_valid_geodesic:
+                geodesic_max_speed_all = max(geodesic_max_speed_all, float(speed_value))
+            else:
+                geodesic_valid_all = False
+
+            if not highway:
+                if is_valid_geodesic:
+                    geodesic_max_speed_avoid_highways = max(
+                        geodesic_max_speed_avoid_highways, float(speed_value)
+                    )
+                else:
+                    geodesic_valid_avoid_highways = False
+            edge_index += 1
+        if edge_index != edge_total:
+            raise ValueError(
+                f"Edge count mismatch during conversion: {edge_index} != {edge_total}"
+            )
+        # Note: reverse rows are indexed by the forward traversal target, so
+        # ``reverse_counts[target + 1]`` counts one reverse row per forward
+        # traversal exactly as ``_build_csr_topology`` does.
+        forward_indptr = array("q", [0]) * (node_total + 1)
+        for index in range(node_total):
+            forward_indptr[index + 1] = (
+                forward_indptr[index] + forward_counts[index + 1]
+            )
+        traversal_total = int(forward_indptr[-1])
+        reverse_indptr = array("q", [0]) * (node_total + 1)
+        for index in range(node_total):
+            reverse_indptr[index + 1] = (
+                reverse_indptr[index] + reverse_counts[index + 1]
+            )
+        reverse_total = int(reverse_indptr[-1])
+        if reverse_total != traversal_total:
+            raise ValueError(
+                "Reverse traversal count mismatch "
+                f"({reverse_total} != {traversal_total})"
+            )
+        forward_cursor = array("q", forward_indptr[:-1])
+        forward_indices = array("i", [0]) * traversal_total
+        trav_edge_rank = array("i", [0]) * traversal_total
+        trav_reverse = array("B", [0]) * traversal_total
+        trav_distance_km = array("d", [0.0]) * traversal_total
+        trav_travel_time_minutes = array("d", [0.0]) * traversal_total
+        trav_scenic_score = array("d", [0.0]) * traversal_total
+        trav_highway_mask = array("B", [0]) * traversal_total
+        trav_scenic_byway_mask = array("B", [0]) * traversal_total
+        highway_types = _compact_highway_road_types()
+        edge_index = 0
+        for row in _iter_sqlite_edge_rank_rows(
+            connection, check_cancelled=check_cancelled
+        ):
+            (
+                _edge_id,
+                _start_id,
+                _end_id,
+                distance,
+                scenic,
+                _road_name,
+                road_type,
+                speed,
+                one_way,
+                start_rank,
+                end_rank,
+                edge_rank,
+            ) = row
+            start_rank = int(start_rank)
+            end_rank = int(end_rank)
+            edge_rank = int(edge_rank)
+            if edge_rank != edge_index:
+                raise ValueError(
+                    f"Edge rowid order mismatch at rank {edge_rank}"
+                )
+            one_way_value = _parse_one_way(one_way, default=True)
+            road_type_value = str(road_type)
+            distance_value = float(distance)
+            speed_value = int(_parse_speed_limit_kmh(speed, road_type_value))
+            duration_value = (distance_value / max(speed_value, 1.0)) * 60.0
+            if not math.isfinite(duration_value) or duration_value < 0.0:
+                raise ValueError(f"Edge {_edge_id!r} has invalid duration")
+            scenic_value = float(scenic)
+            road_type_lower = road_type_value.lower()
+            highway = road_type_lower in highway_types
+            byway = road_type_lower == _COMPACT_SCENIC_BYWAY_ROAD_TYPE
+
+            def emit_traversal(
+                source_rank: int,
+                target_rank: int,
+                reverse: bool,
+            ) -> None:
+                position = int(forward_cursor[source_rank])
+                forward_cursor[source_rank] += 1
+                forward_indices[position] = target_rank
+                trav_edge_rank[position] = edge_rank
+                trav_reverse[position] = 1 if reverse else 0
+                trav_distance_km[position] = distance_value
+                trav_travel_time_minutes[position] = duration_value
+                trav_scenic_score[position] = scenic_value
+                trav_highway_mask[position] = 1 if highway else 0
+                trav_scenic_byway_mask[position] = 1 if byway else 0
+
+            emit_traversal(start_rank, end_rank, False)
+            if not one_way_value:
+                emit_traversal(end_rank, start_rank, True)
+            edge_index += 1
+        if check_cancelled is not None:
+            check_cancelled()
+        for rank in range(node_total):
+            if forward_cursor[rank] != forward_indptr[rank + 1]:
+                raise ValueError(
+                    f"Forward row {rank} was not fully populated during conversion"
+                )
+        # Reverse rows are filled in forward-position order exactly like
+        # ``_build_csr_topology``: one reverse row per forward traversal,
+        # indexed by the forward target, storing the predecessor node and the
+        # forward position.
+        reverse_indices = array("i", [0]) * reverse_total
+        reverse_positions = array("q", [0]) * reverse_total
+        reverse_cursor = array("q", reverse_indptr[:-1])
+        for source_rank in range(node_total):
+            row_start = int(forward_indptr[source_rank])
+            row_end = int(forward_indptr[source_rank + 1])
+            for position in range(row_start, row_end):
+                if (
+                    check_cancelled is not None
+                    and position & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
+                ):
+                    check_cancelled()
+                target_rank = int(forward_indices[position])
+                reverse_position = int(reverse_cursor[target_rank])
+                reverse_cursor[target_rank] += 1
+                reverse_indices[reverse_position] = source_rank
+                reverse_positions[reverse_position] = position
+        for rank in range(node_total):
+            if reverse_cursor[rank] != reverse_indptr[rank + 1]:
+                raise ValueError(
+                    f"Reverse row {rank} was not fully populated during conversion"
+                )
+        if check_cancelled is not None:
+            check_cancelled()
+
+        # --- Section payloads ----------------------------------------------
+        road_type_data, road_type_offsets = _compact_string_tables(road_type_names)
+
+        def array_bytes(values: array, dtype: str) -> bytes:
+            if len(values) == 0:
+                return b""
+            return np.frombuffer(values, dtype="<" + dtype, count=len(values)).tobytes()
+
+        section_payloads: Dict[str, bytes] = {
+            "node_lat": array_bytes(node_lat, "f8"),
+            "node_lon": array_bytes(node_lon, "f8"),
+            "node_id_strings": bytes(node_id_data),
+            "node_id_offsets": array_bytes(node_id_offsets, "i8"),
+            "node_hash_keys": array_bytes(node_hash_keys, "u8"),
+            "node_hash_values": array_bytes(node_hash_values, "i8"),
+            "edge_id_strings": bytes(edge_id_data),
+            "edge_id_offsets": array_bytes(edge_id_offsets, "i8"),
+            "edge_hash_keys": array_bytes(edge_hash_keys, "u8"),
+            "edge_hash_values": array_bytes(edge_hash_values, "i8"),
+            "edge_start_rank": array_bytes(edge_start_rank, "i4"),
+            "edge_end_rank": array_bytes(edge_end_rank, "i4"),
+            "edge_distance_km": array_bytes(edge_distance_km, "f8"),
+            "edge_scenic_score": array_bytes(edge_scenic_score, "f8"),
+            "edge_speed_limit_kmh": array_bytes(edge_speed_limit_kmh, "f8"),
+            "edge_one_way": array_bytes(edge_one_way, "u1"),
+            "edge_road_type_codes": array_bytes(edge_road_type_codes, "i4"),
+            "road_type_strings": bytes(road_type_data),
+            "road_type_offsets": array_bytes(road_type_offsets, "i8"),
+            "edge_road_name_strings": bytes(road_name_data),
+            "edge_road_name_offsets": array_bytes(road_name_offsets, "i8"),
+            "forward_indptr": array_bytes(forward_indptr, "i8"),
+            "forward_indices": array_bytes(forward_indices, "i4"),
+            "reverse_indptr": array_bytes(reverse_indptr, "i8"),
+            "reverse_indices": array_bytes(reverse_indices, "i4"),
+            "reverse_positions": array_bytes(reverse_positions, "i8"),
+            "trav_edge_rank": array_bytes(trav_edge_rank, "i4"),
+            "trav_reverse": array_bytes(trav_reverse, "u1"),
+            "trav_distance_km": array_bytes(trav_distance_km, "f8"),
+            "trav_travel_time_minutes": array_bytes(
+                trav_travel_time_minutes, "f8"
+            ),
+            "trav_scenic_score": array_bytes(trav_scenic_score, "f8"),
+            "trav_highway_mask": array_bytes(trav_highway_mask, "u1"),
+            "trav_scenic_byway_mask": array_bytes(
+                trav_scenic_byway_mask, "u1"
+            ),
+        }
+        for name, _dtype in _COMPACT_SECTION_SPECS:
+            if name not in section_payloads:
+                raise AssertionError(f"missing compact section {name}")
+
+        if check_cancelled is not None:
+            check_cancelled()
+        source_sha256 = _sha256_file(
+            resolved_source, check_cancelled=check_cancelled
+        )
+        if check_cancelled is not None:
+            check_cancelled()
+
+        # --- Binary payload with per-section digests ------------------------
+        bin_path = manifest_path.with_name(
+            manifest_path.name[: -len(_COMPACT_MANIFEST_SUFFIX)] + _COMPACT_BIN_SUFFIX
+        )
+        section_descriptors: Dict[str, Dict[str, Any]] = {}
+        bin_offset = 0
+        bin_digest = hashlib.sha256()
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{bin_path.name}.",
+            suffix=".tmp",
+            dir=bin_path.parent,
+            delete=False,
+        ) as stream:
+            temporary_bin = Path(stream.name)
+            try:
+                for name, dtype in _COMPACT_SECTION_SPECS:
+                    if check_cancelled is not None:
+                        check_cancelled()
+                    payload = section_payloads[name]
+                    if dtype == "raw":
+                        count = len(payload)
+                    else:
+                        itemsize = _COMPACT_DTYPE_ITEMSIZE[dtype]
+                        if len(payload) % itemsize != 0:
+                            raise AssertionError(
+                                f"compact section {name} has misaligned payload"
+                            )
+                        count = len(payload) // itemsize
+                    section_digest = hashlib.sha256(payload).hexdigest()
+                    section_descriptors[name] = {
+                        "offset": bin_offset,
+                        "length": len(payload),
+                        "count": count,
+                        "dtype": dtype,
+                        "sha256": section_digest,
+                    }
+                    stream.write(payload)
+                    bin_digest.update(payload)
+                    bin_offset += len(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            except Exception:
+                temporary_bin.unlink(missing_ok=True)
+                raise
+        os.replace(temporary_bin, bin_path)
+        _fsync_parent(bin_path)
+        if check_cancelled is not None:
+            check_cancelled()
+        projection_path = EdgeProjectionIndex.sidecar_path(resolved_source)
+        projection_info: dict[str, Any] = {
+            "path": projection_path.name,
+        }
+        if projection_path.is_file():
+            projection_info["sha256"] = _sha256_file(
+                projection_path, check_cancelled=check_cancelled
+            ).hex()
+            projection_info["size_bytes"] = int(projection_path.stat().st_size)
+        manifest = {
+            "format": _COMPACT_FORMAT,
+            "schema_version": _COMPACT_SCHEMA_VERSION,
+            "source": {
+                "path": resolved_source.name,
+                "sha256": source_sha256.hex(),
+                "size_bytes": int(resolved_source.stat().st_size),
+                "schema_version": int(metadata["schema_version"]),
+                "node_count": int(node_total),
+                "edge_count": int(edge_total),
+            },
+            "graph": {
+                "node_count": int(node_total),
+                "edge_count": int(edge_total),
+                "traversal_count": int(traversal_total),
+                "geodesic_bound_speed": {
+                    "all": float(geodesic_max_speed_all) if geodesic_valid_all else None,
+                    "avoid_highways": (
+                        float(geodesic_max_speed_avoid_highways)
+                        if geodesic_valid_avoid_highways
+                        else None
+                    ),
+                },
+            },
+            "geodesic_bound_speed": {
+                "all": float(geodesic_max_speed_all) if geodesic_valid_all else None,
+                "avoid_highways": (
+                    float(geodesic_max_speed_avoid_highways)
+                    if geodesic_valid_avoid_highways
+                    else None
+                ),
+            },
+            "bin_path": bin_path.name,
+            "bin_sha256": bin_digest.hexdigest(),
+            "bin_size_bytes": int(bin_offset),
+            "sections": section_descriptors,
+            "projection_index": projection_info,
+            "scenic_byway_road_type": _COMPACT_SCENIC_BYWAY_ROAD_TYPE,
+            "highway_road_types": ",".join(sorted(highway_types)),
+            "builder": {
+                "name": "write_compact_graph",
+                "row_order": "sqlite-rowid",
+            },
+            "score": {"present": False, "path": None},
+        }
+        manifest_payload = json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        _write_atomic_bytes(manifest_path, manifest_payload)
+        return {
+            "manifest_path": str(manifest_path),
+            "bin_path": str(bin_path),
+            "manifest_sha256": hashlib.sha256(manifest_payload).hexdigest(),
+            "bin_sha256": manifest["bin_sha256"],
+            "bin_size_bytes": int(bin_offset),
+            "node_count": int(node_total),
+            "edge_count": int(edge_total),
+            "traversal_count": int(traversal_total),
+            "source_sha256": manifest["source"]["sha256"],
+            "source_size_bytes": int(manifest["source"]["size_bytes"]),
+        }
+    finally:
+        connection.close()
+
+
+@dataclass(frozen=True)
+class _CompactCSRArrays:
+    """Persisted CSR topology plus lazy rank resolvers for one graph epoch."""
+
+    node_count: int
+    node_ids: Sequence[str]
+    node_index: Mapping[str, int]
+    indptr: np.ndarray
+    indices: np.ndarray
+    reverse_indptr: np.ndarray
+    reverse_indices: np.ndarray
+    reverse_positions: np.ndarray
+    edge_refs: Sequence[Tuple[str, bool]]
+    distance_km: np.ndarray
+    travel_time_minutes: np.ndarray
+    _scenic_score: Union[np.ndarray, Callable[[], np.ndarray]]
+    highway_mask: np.ndarray
+    scenic_byway_mask: np.ndarray
+
+    @property
+    def scenic_score(self) -> np.ndarray:
+        if callable(self._scenic_score):
+            value = self._scenic_score()
+            object.__setattr__(self, "_scenic_score", value)
+            return value
+        return self._scenic_score
+
+
+@dataclass(frozen=True)
+class _ScoreSidecar:
+    path: Path
+    manifest: Mapping[str, Any]
+    values: np.ndarray
+    _mmap: Optional[mmap.mmap] = None
+    _file: Optional[Any] = None
+
+    def close(self) -> None:
+        """Close backing memory-map and file handle if held."""
+        object.__setattr__(self, "values", np.empty(0, dtype=np.float64))
+        mm = getattr(self, "_mmap", None)
+        if mm is not None:
+            try:
+                mm.close()
+            except Exception:
+                pass
+            object.__setattr__(self, "_mmap", None)
+        f = getattr(self, "_file", None)
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+            object.__setattr__(self, "_file", None)
+
+    def __enter__(self) -> "_ScoreSidecar":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+class _CompactRankStringSequence(Sequence[str]):
+    """Lazy rank->id decoding from a compact string table."""
+
+    __slots__ = ("_graph", "_kind", "_cache", "_capacity")
+
+    def __init__(self, graph: "CompactRoadGraph", kind: str) -> None:
+        self._graph = graph
+        self._kind = kind
+        self._cache: "OrderedDict[int, str]" = OrderedDict()
+        self._capacity = _COMPACT_ID_CACHE_CAPACITY
+
+    def __len__(self) -> int:
+        graph = self._graph
+        return graph.node_count if self._kind == "node" else graph.edge_count
+
+    def __getitem__(self, index: int) -> str:
+        cached = self._cache.get(index)
+        if cached is not None:
+            return cached
+        graph = self._graph
+        value = (
+            graph._node_id_at_rank(index)
+            if self._kind == "node"
+            else graph._edge_id_at_rank(index)
+        )
+        if len(self._cache) >= self._capacity:
+            self._cache.popitem(last=False)
+        self._cache[index] = value
+        return value
+
+    def __iter__(self) -> Iterator[str]:
+        for index in range(len(self)):
+            yield self[index]
+
+
+class _CompactTraversalSequence(Sequence[Tuple[str, bool]]):
+    """Lazy traversal-position -> (edge id, reverse) decoding."""
+
+    __slots__ = ("_graph", "_cache", "_capacity")
+
+    def __init__(self, graph: "CompactRoadGraph") -> None:
+        self._graph = graph
+        self._cache: "OrderedDict[int, Tuple[str, bool]]" = OrderedDict()
+        self._capacity = _COMPACT_ID_CACHE_CAPACITY
+
+    def __len__(self) -> int:
+        return self._graph.traversal_count
+
+    def __getitem__(self, position: int) -> Tuple[str, bool]:
+        cached = self._cache.get(position)
+        if cached is not None:
+            return cached
+        value = self._graph._traversal_ref(position)
+        if len(self._cache) >= self._capacity:
+            self._cache.popitem(last=False)
+        self._cache[position] = value
+        return value
+
+    def __iter__(self) -> Iterator[Tuple[str, bool]]:
+        for position in range(len(self)):
+            yield self[position]
+
+
+class _CompactHashLookup(Mapping[str, int]):
+    """Read-only id->rank lookup over a persisted open-addressing table."""
+
+    __slots__ = ("_graph", "_kind")
+
+    def __init__(self, graph: "CompactRoadGraph", kind: str) -> None:
+        self._graph = graph
+        self._kind = kind
+
+    def __len__(self) -> int:
+        graph = self._graph
+        return graph.node_count if self._kind == "node" else graph.edge_count
+
+    def __getitem__(self, key: str) -> int:
+        rank = self._graph._rank_for_id(str(key), self._kind)
+        if rank is None:
+            raise KeyError(key)
+        return rank
+
+    def __contains__(self, key: object) -> bool:
+        return self._graph._rank_for_id(str(key), self._kind) is not None
+
+    def __iter__(self) -> Iterator[str]:
+        graph = self._graph
+        resolver = (
+            graph._node_id_at_rank if self._kind == "node" else graph._edge_id_at_rank
+        )
+        count = len(self)
+        for rank in range(count):
+            yield resolver(rank)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        rank = self._graph._rank_for_id(str(key), self._kind)
+        return rank if rank is not None else default
+
+
+class _CompactEdgeKeySequence(Sequence[str]):
+    """Lazy canonical edge keys used by the projection sidecar attachment."""
+
+    __slots__ = ("_graph",)
+
+    def __init__(self, graph: "CompactRoadGraph") -> None:
+        self._graph = graph
+
+    def __len__(self) -> int:
+        return self._graph.edge_count
+
+    def __getitem__(self, rank: int) -> str:
+        return self._graph._edge_id_at_rank(rank)
+
+
+class _RankProjectionIndex(EdgeProjectionIndex):
+    """Projection sidecar that binds to compact graphs without key tuples."""
+
+    __slots__ = ()
+
+    def attach(self, graph: Any) -> None:
+        owner = id(graph)
+        if self._canonical_keys is not None:
+            if self._canonical_keys_owner != owner:
+                raise ValueError("Edge projection index is attached to another graph")
+            return
+        self._canonical_keys = _CompactEdgeKeySequence(graph)
+        self._canonical_keys_owner = owner
+
+
+class _CompactNodeMapping(Mapping[str, Node]):
+    __slots__ = ("_graph",)
+
+    def __init__(self, graph: "CompactRoadGraph") -> None:
+        self._graph = graph
+
+    def __len__(self) -> int:
+        return self._graph.node_count
+
+    def __contains__(self, key: object) -> bool:
+        return self._graph._rank_for_id(str(key), "node") is not None
+
+    def __getitem__(self, key: str) -> Node:
+        rank = self._graph._rank_for_id(str(key), "node")
+        if rank is None:
+            raise KeyError(key)
+        return self._graph._node_at_rank(rank)
+
+    def __iter__(self) -> Iterator[str]:
+        graph = self._graph
+        for rank in range(graph.node_count):
+            yield graph._node_id_at_rank(rank)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        rank = self._graph._rank_for_id(str(key), "node")
+        return self._graph._node_at_rank(rank) if rank is not None else default
+
+
+class _CompactEdgeMapping(Mapping[str, Edge]):
+    __slots__ = ("_graph",)
+
+    def __init__(self, graph: "CompactRoadGraph") -> None:
+        self._graph = graph
+
+    def __len__(self) -> int:
+        return self._graph.edge_count
+
+    def __contains__(self, key: object) -> bool:
+        return self._graph._rank_for_id(str(key), "edge") is not None
+
+    def __getitem__(self, key: str) -> Edge:
+        rank = self._graph._rank_for_id(str(key), "edge")
+        if rank is None:
+            raise KeyError(key)
+        return self._graph._edge_at_rank(rank)
+
+    def __iter__(self) -> Iterator[str]:
+        graph = self._graph
+        for rank in range(graph.edge_count):
+            yield graph._edge_id_at_rank(rank)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        rank = self._graph._rank_for_id(str(key), "edge")
+        return self._graph._edge_at_rank(rank) if rank is not None else default
+
+
+class _CompactAdjacencyMapping(Mapping[str, List[Tuple[str, bool]]]):
+    """Lazy per-node traversal references in canonical edge order."""
+
+    __slots__ = ("_graph",)
+
+    def __init__(self, graph: "CompactRoadGraph") -> None:
+        self._graph = graph
+
+    def __len__(self) -> int:
+        return self._graph.node_count
+
+    def __contains__(self, key: object) -> bool:
+        return self._graph._rank_for_id(str(key), "node") is not None
+
+    def _row(self, key: str) -> List[Tuple[str, bool]]:
+        graph = self._graph
+        rank = graph._rank_for_id(str(key), "node")
+        if rank is None:
+            raise KeyError(key)
+        row_start = int(graph._sections["forward_indptr"][rank])
+        row_end = int(graph._sections["forward_indptr"][rank + 1])
+        refs: List[Tuple[str, bool]] = []
+        for position in range(row_start, row_end):
+            refs.append(graph._traversal_ref(position))
+        return refs
+
+    def __getitem__(self, key: str) -> List[Tuple[str, bool]]:
+        return self._row(key)
+
+    def __iter__(self) -> Iterator[str]:
+        graph = self._graph
+        for rank in range(graph.node_count):
+            yield graph._node_id_at_rank(rank)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        rank = self._graph._rank_for_id(str(key), "node")
+        if rank is None:
+            return default
+        return self._row(key)
+
+
+class CompactRoadGraph(RoadGraph):
+    """Immutable mmap-backed road graph loaded from a compact manifest.
+
+    Nodes, canonical edges, and directed traversals are stored as
+    little-endian numeric arrays and string tables.  Node/Edge objects are
+    materialized lazily only for path/endpoint records; no eager object graph
+    is ever constructed.  The runtime selects this backend only when an
+    explicit ``*.compact.json`` manifest path is supplied.
+    """
+
+    def __init__(
+        self,
+        manifest: Mapping[str, Any],
+        sections: Mapping[str, np.ndarray | memoryview],
+        bin_mmap: mmap.mmap,
+        bin_file: Any,
+        manifest_path: Path,
+        source_path: Path,
+    ) -> None:
+        self._heuristic_structure_epoch = 0
+        self._reverse_edge_views: Dict[str, _ReverseEdgeView] = {}
+        self._nearest_spatial_index: Optional[Tuple[object, ...]] = None
+        self._nearest_edge_projection_index: Optional[EdgeProjectionIndex] = None
+        self._edge_projection_index_status: str = "missing"
+        self._edge_projection_index_invalid_reason: str | None = None
+        self._edge_projection_index_stamp: Tuple[int, int, int] | None = None
+        self._edge_projection_index_path: str | None = None
+        self._edge_projection_index_payload_size: int | None = None
+        self.artifact_metadata: dict[str, Any] = dict(manifest)
+        self._manifest = manifest
+        self._manifest_path = Path(manifest_path)
+        self._source_path = Path(source_path)
+        self._bin_mmap = bin_mmap
+        self._bin_file = bin_file
+        self._sections = sections
+        self._geodesic_bound_speed = manifest.get("geodesic_bound_speed") or manifest.get("graph", {}).get("geodesic_bound_speed")
+        self._active_score_sidecar: Optional[_ScoreSidecar] = None
+        self._csr_arrays_cache: Optional[_CompactCSRArrays] = None
+        self._csr_arrays_cache_stamp: object = None
+        self._edge_highway_mask_cache: Optional[np.ndarray] = None
+        self.nodes = _CompactNodeMapping(self)  # type: ignore[assignment]
+        self.edges = _CompactEdgeMapping(self)  # type: ignore[assignment]
+        self.adjacency = _CompactAdjacencyMapping(self)  # type: ignore[assignment]
+
+    # -- counts ------------------------------------------------------------
+
+    @property
+    def node_count(self) -> int:
+        return int(self._manifest["graph"]["node_count"])
+
+    @property
+    def edge_count(self) -> int:
+        return int(self._manifest["graph"]["edge_count"])
+
+    @property
+    def traversal_count(self) -> int:
+        return int(self._manifest["graph"]["traversal_count"])
+
+    @property
+    def manifest_path(self) -> Path:
+        return self._manifest_path
+
+    @property
+    def source_path(self) -> Path:
+        return self._source_path
+
+    @property
+    def source_sha256(self) -> str:
+        return str(self._manifest["source"]["sha256"])
+
+    # -- sections ----------------------------------------------------------
+
+    def _section(self, name: str) -> np.ndarray | memoryview:
+        return self._sections[name]
+
+    def _string_at(
+        self,
+        strings: np.ndarray | memoryview,
+        offsets: np.ndarray,
+        index: int,
+    ) -> str:
+        start = int(offsets[index])
+        stop = int(offsets[index + 1])
+        return bytes(strings[start:stop]).decode("utf-8")
+
+    def _node_id_at_rank(self, rank: int) -> str:
+        return self._string_at(
+            self._sections["node_id_strings"],
+            self._sections["node_id_offsets"],
+            rank,
+        )
+
+    def _edge_id_at_rank(self, rank: int) -> str:
+        return self._string_at(
+            self._sections["edge_id_strings"],
+            self._sections["edge_id_offsets"],
+            rank,
+        )
+
+    def _road_name_at_rank(self, rank: int) -> Optional[str]:
+        start = int(self._sections["edge_road_name_offsets"][rank])
+        stop = int(self._sections["edge_road_name_offsets"][rank + 1])
+        if start == stop:
+            return None
+        return bytes(self._sections["edge_road_name_strings"][start:stop]).decode(
+            "utf-8"
+        )
+
+    def _road_type_at_rank(self, rank: int) -> str:
+        code = int(self._sections["edge_road_type_codes"][rank])
+        return self._string_at(
+            self._sections["road_type_strings"],
+            self._sections["road_type_offsets"],
+            code,
+        )
+
+    def _rank_for_id(self, key: str, kind: str) -> Optional[int]:
+        table_keys = self._sections[f"{kind}_hash_keys"]
+        table_values = self._sections[f"{kind}_hash_values"]
+        key_bytes = key.encode("utf-8")
+        hash_value = _compact_id_hash(key_bytes)
+        mask = len(table_keys) - 1
+        slot = (hash_value - 1) & mask
+        resolver = (
+            self._node_id_at_rank if kind == "node" else self._edge_id_at_rank
+        )
+        while True:
+            stored = int(table_keys[slot])
+            if stored == 0:
+                return None
+            if stored == hash_value:
+                rank = int(table_values[slot])
+                if rank >= 0 and resolver(rank) == key:
+                    return rank
+            slot = (slot + 1) & mask
+
+    # -- lazy object materialization ----------------------------------------
+
+    def _node_at_rank(self, rank: int) -> Node:
+        return Node(
+            id=self._node_id_at_rank(rank),
+            lat=float(self._sections["node_lat"][rank]),
+            lon=float(self._sections["node_lon"][rank]),
+        )
+
+    def _scenic_at_rank(self, rank: int) -> float:
+        sidecar = self._active_score_sidecar
+        if sidecar is not None:
+            return float(sidecar.values[rank])
+        return float(self._sections["edge_scenic_score"][rank])
+
+    def _edge_at_rank(self, rank: int) -> Edge:
+        return Edge(
+            id=self._edge_id_at_rank(rank),
+            start_node_id=self._node_id_at_rank(
+                int(self._sections["edge_start_rank"][rank])
+            ),
+            end_node_id=self._node_id_at_rank(
+                int(self._sections["edge_end_rank"][rank])
+            ),
+            distance_km=float(self._sections["edge_distance_km"][rank]),
+            scenic_score=self._scenic_at_rank(rank),
+            road_name=self._road_name_at_rank(rank),
+            road_type=self._road_type_at_rank(rank),
+            speed_limit_kmh=int(self._sections["edge_speed_limit_kmh"][rank]),
+            one_way=bool(self._sections["edge_one_way"][rank]),
+        )
+
+    def _traversal_ref(self, position: int) -> Tuple[str, bool]:
+        rank = int(self._sections["trav_edge_rank"][position])
+        return (
+            self._edge_id_at_rank(rank),
+            bool(self._sections["trav_reverse"][position]),
+        )
+
+    def _edge_projection_stamp(self) -> Tuple[int, int, int]:
+        # Compact graphs are structurally immutable and score sidecars never
+        # alter geometry, so the projection index stays valid for the graph
+        # lifetime.  The CSR heuristic stamp still changes with score
+        # sidecars, which is what drives weight/topology cache rebuilds.
+        return (
+            0,
+            Node._coordinate_mutation_epoch,
+            Edge._projection_epoch,
+        )
+
+    # -- immutability --------------------------------------------------------
+
+    def add_node(self, node: Node) -> None:
+        raise RuntimeError("compact road graphs are immutable")
+
+    def add_edge(self, edge: Edge) -> None:
+        raise RuntimeError("compact road graphs are immutable")
+
+    def _bulk_load(self, nodes: Any, edges: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("compact road graphs are immutable")
+    def close(self) -> None:
+        """Close backing mmap, file handles, and sidecar projection index."""
+        super().close()
+        if getattr(self, "_sections", None) is not None and hasattr(self._sections, "clear"):
+            self._sections.clear()
+        self._sections = {}
+        self._csr_arrays_cache = None
+        self._csr_arrays_cache_stamp = None
+        self._edge_highway_mask_cache = None
+        sidecar = getattr(self, "_active_score_sidecar", None)
+        if sidecar is not None:
+            if hasattr(sidecar, "close"):
+                try:
+                    sidecar.close()
+                except Exception:
+                    pass
+            self._active_score_sidecar = None
+        mm = getattr(self, "_bin_mmap", None)
+        if mm is not None:
+            try:
+                mm.close()
+            except Exception:
+                pass
+            self._bin_mmap = None
+        f = getattr(self, "_bin_file", None)
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+            self._bin_file = None
+
+
+    # -- compact planner arrays ----------------------------------------------
+
+    def _edge_highway_mask(self) -> np.ndarray:
+        cached = self._edge_highway_mask_cache
+        if cached is not None:
+            return cached
+        codes = self._sections["edge_road_type_codes"]
+        names = [
+            self._string_at(
+                self._sections["road_type_strings"],
+                self._sections["road_type_offsets"],
+                code,
+            )
+            for code in range(len(self._sections["road_type_offsets"]) - 1)
+        ]
+        highway_types = _compact_highway_road_types()
+        mask = np.zeros(len(codes), dtype=np.bool_)
+        for code, name in enumerate(names):
+            if name.lower() in highway_types:
+                mask[codes == code] = True
+        self._edge_highway_mask_cache = mask
+        return mask
+
+    def endpoint_geodesic_bound_speed(self, avoid_highways: bool) -> Optional[float]:
+        """Vectorized equivalent of the planner's graph-wide speed bound."""
+        if hasattr(self, "_geodesic_bound_speed") and isinstance(self._geodesic_bound_speed, dict):
+            key = "avoid_highways" if avoid_highways else "all"
+            if key in self._geodesic_bound_speed:
+                val = self._geodesic_bound_speed[key]
+                return float(val) if val is not None else None
+        distances = self._sections["edge_distance_km"]
+        speeds = self._sections["edge_speed_limit_kmh"]
+        start_ranks = self._sections["edge_start_rank"]
+        end_ranks = self._sections["edge_end_rank"]
+        node_lat = self._sections["node_lat"]
+        node_lon = self._sections["node_lon"]
+        start_lat = node_lat[start_ranks]
+        start_lon = node_lon[start_ranks]
+        end_lat = node_lat[end_ranks]
+        end_lon = node_lon[end_ranks]
+        dlat = np.radians(end_lat - start_lat)
+        dlon = np.radians(end_lon - start_lon)
+        a = np.sin(dlat / 2.0) ** 2
+        a += np.cos(np.radians(start_lat)) * np.cos(np.radians(end_lat)) * np.sin(
+            dlon / 2.0
+        ) ** 2
+        np.clip(a, 0.0, 1.0, out=a)
+        endpoint_km = 2.0 * 6371.0 * np.arcsin(np.sqrt(a))
+        eligible = (
+            ~self._edge_highway_mask() if avoid_highways else np.ones(len(distances), dtype=np.bool_)
+        )
+        valid_edges = eligible & (
+            np.isfinite(distances)
+            & (distances >= 0.0)
+            & np.isfinite(speeds)
+            & np.isfinite(endpoint_km)
+            & (endpoint_km >= 0.0)
+            & (distances >= endpoint_km)
+        )
+        if np.any(eligible & ~valid_edges):
+            return None
+        if not np.any(valid_edges):
+            return 1.0
+        return float(np.maximum(np.max(speeds[valid_edges]), 1.0))
+
+    def compact_csr_arrays(self) -> _CompactCSRArrays:
+        """Return the persisted CSR topology for the active graph epoch."""
+        stamp = self._heuristic_cache_stamp()
+        cached = self._csr_arrays_cache
+        if cached is not None and self._csr_arrays_cache_stamp == stamp:
+            return cached
+        trav_edge_rank = self._sections["trav_edge_rank"]
+        sidecar = self._active_score_sidecar
+        if sidecar is not None:
+            scenic_score = lambda: np.take(sidecar.values, trav_edge_rank)
+        else:
+            scenic_score = self._sections["trav_scenic_score"]
+        arrays = _CompactCSRArrays(
+            node_count=self.node_count,
+            node_ids=_CompactRankStringSequence(self, "node"),
+            node_index=_CompactHashLookup(self, "node"),
+            indptr=self._sections["forward_indptr"],
+            indices=self._sections["forward_indices"],
+            reverse_indptr=self._sections["reverse_indptr"],
+            reverse_indices=self._sections["reverse_indices"],
+            reverse_positions=self._sections["reverse_positions"],
+            edge_refs=_CompactTraversalSequence(self),
+            distance_km=self._sections["trav_distance_km"],
+            travel_time_minutes=self._sections["trav_travel_time_minutes"],
+            _scenic_score=scenic_score,
+            highway_mask=self._sections["trav_highway_mask"].view(np.bool_),
+            scenic_byway_mask=self._sections["trav_scenic_byway_mask"].view(np.bool_),
+        )
+        self._csr_arrays_cache = arrays
+        self._csr_arrays_cache_stamp = stamp
+        return arrays
+
+    # -- edge projection sidecar ---------------------------------------------
+
+    def _build_nearest_edge_projection_index(
+        self,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> EdgeProjectionIndex:
+        raise RuntimeError(
+            "compact road graphs require a persisted edge projection sidecar; "
+            "publish it from SQLite instead of materializing edge objects"
+        )
+
+    def _try_load_edge_projection_index(
+        self,
+        path: Path,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+        verify: bool = True,
+    ) -> str:
+        sidecar_path = EdgeProjectionIndex.sidecar_path(path)
+        self._edge_projection_index_path = str(sidecar_path)
+        try:
+            self._edge_projection_index_payload_size = sidecar_path.stat().st_size
+        except FileNotFoundError:
+            self._edge_projection_index_status = "missing"
+            self._edge_projection_index_invalid_reason = None
+            self._nearest_edge_projection_index = None
+            self._edge_projection_index_stamp = None
+            return self._edge_projection_index_status
+        except OSError as exc:
+            self._edge_projection_index_status = "corrupt"
+            self._edge_projection_index_invalid_reason = f"os_error: {exc}"
+            self._nearest_edge_projection_index = None
+            self._edge_projection_index_stamp = None
+            return self._edge_projection_index_status
+        try:
+            index = _RankProjectionIndex.load(
+                sidecar_path, path, check_cancelled=check_cancelled, verify=verify
+            )
+            index.attach(self)
+            self._nearest_edge_projection_index = index
+            self._edge_projection_index_stamp = self._edge_projection_stamp()
+            self._edge_projection_index_status = "loaded"
+            self._edge_projection_index_invalid_reason = None
+            self._edge_projection_index_payload_size = sidecar_path.stat().st_size
+        except _SidecarCancellation as exc:
+            raise exc.error
+        except _SidecarMissingError:
+            self._edge_projection_index_status = "missing"
+            self._edge_projection_index_invalid_reason = "missing"
+        except _SidecarVersionError:
+            self._edge_projection_index_status = "version_mismatch"
+            self._edge_projection_index_invalid_reason = "version_mismatch"
+        except _SidecarStaleError:
+            self._edge_projection_index_status = "stale"
+            self._edge_projection_index_invalid_reason = "stale"
+        except _SidecarTruncatedError:
+            self._edge_projection_index_status = "truncated"
+            self._edge_projection_index_invalid_reason = "truncated"
+        except _SidecarCorruptError:
+            self._edge_projection_index_status = "corrupt"
+            self._edge_projection_index_invalid_reason = "corrupt"
+        except ValueError as exc:
+            self._edge_projection_index_status = "corrupt"
+            self._edge_projection_index_invalid_reason = (
+                f"attachment_error: {exc}"
+            )
+        except OSError as exc:
+            self._edge_projection_index_status = "corrupt"
+            self._edge_projection_index_invalid_reason = f"os_error: {exc}"
+        if self._edge_projection_index_status != "loaded":
+            self._nearest_edge_projection_index = None
+            self._edge_projection_index_stamp = None
+        return self._edge_projection_index_status
+
+    # -- deterministic scenic-cost sidecar ------------------------------------
+
+    def _score_sidecar_paths(
+        self,
+        report_signature: str,
+        zoom: int,
+        fallback: float | None,
+        normalization: str,
+    ) -> tuple[Path, Path]:
+        base = self._manifest_path.name[: -len(_COMPACT_MANIFEST_SUFFIX)]
+        tag = (
+            f"score.{report_signature}.z{int(zoom)}."
+            f"fb{json.dumps(fallback, separators=(',', ':'))}."
+            f"n{normalization}"
+        )
+        json_path = self._manifest_path.with_name(f"{base}.{tag}.json")
+        bin_path = self._manifest_path.with_name(f"{base}.{tag}.bin")
+        return json_path, bin_path
+
+    def activate_report_scores(
+        self,
+        score_map: Mapping[tuple[int, int, int], float],
+        *,
+        zoom: int,
+        fallback: float | None,
+        report_signature: str,
+        normalization: str,
+        tile_scores_path: Path,
+        check_cancelled: Callable[[], None] | None = None,
+        verify: bool = True,
+    ) -> tuple[int, int]:
+        """Bind one deterministic per-report score sidecar to this graph.
+
+        The sidecar stores clamped scenic costs keyed by canonical edge rank
+        and is generated deterministically on first use.  Activating it bumps
+        the structure epoch so every planner cache rebuilds for the report.
+        """
+        json_path, bin_path = self._score_sidecar_paths(
+            report_signature, zoom, fallback, normalization
+        )
+        manifest = _ensure_compact_score_sidecar(
+            self,
+            score_map,
+            zoom=zoom,
+            fallback=fallback,
+            report_signature=report_signature,
+            normalization=normalization,
+            tile_scores_path=tile_scores_path,
+            json_path=json_path,
+            bin_path=bin_path,
+            check_cancelled=check_cancelled,
+            verify=verify,
+        )
+        file_size = bin_path.stat().st_size
+        if file_size != self.edge_count * 8:
+            raise ValueError(
+                f"Score sidecar size {file_size} does not match "
+                f"{self.edge_count} canonical edges"
+            )
+        file_obj = open(bin_path, "rb")
+        mm = None
+        try:
+            mm = mmap.mmap(file_obj.fileno(), 0, access=mmap.ACCESS_READ)
+            values = np.frombuffer(mm, dtype="<f8", count=self.edge_count)
+            values.flags.writeable = False
+            sidecar = _ScoreSidecar(
+                path=bin_path,
+                manifest=manifest,
+                values=values,
+                _mmap=mm,
+                _file=file_obj,
+            )
+        except Exception:
+            if mm is not None:
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+            try:
+                file_obj.close()
+            except Exception:
+                pass
+            raise
+
+        prev_sidecar = getattr(self, "_active_score_sidecar", None)
+        if prev_sidecar is not None:
+            if hasattr(prev_sidecar, "close"):
+                try:
+                    prev_sidecar.close()
+                except Exception:
+                    pass
+        self._active_score_sidecar = sidecar
+        self._heuristic_structure_epoch += 1
+        matched = int(manifest["counts"]["matched_edges"])
+        total = int(manifest["counts"]["total_edges"])
+        fallback_edges = int(manifest["counts"]["fallback_edges"])
+        object.__setattr__(
+            self,
+            "_route_service_score_mapping",
+            (matched, total, fallback_edges),
+        )
+        return matched, total
+
+    @classmethod
+    def load(
+        cls,
+        path: Path,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+        verify: bool = True,
+    ) -> "CompactRoadGraph":
+        """Load and structurally validate a compact manifest + binary payload."""
+        if check_cancelled is not None:
+            check_cancelled()
+        manifest_path = Path(path).expanduser().resolve()
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid compact graph manifest: {manifest_path}"
+            ) from exc
+        if manifest.get("format") != _COMPACT_FORMAT:
+            raise ValueError(
+                f"Unsupported compact graph format: {manifest.get('format')!r}"
+            )
+        schema_version = manifest.get("schema_version")
+        if isinstance(schema_version, bool) or schema_version != _COMPACT_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported compact graph schema version: {schema_version!r}"
+            )
+        graph_counts = manifest.get("graph")
+        if not isinstance(graph_counts, Mapping):
+            raise ValueError("Compact manifest is missing graph counts")
+        node_count = int(graph_counts.get("node_count", -1))
+        edge_count = int(graph_counts.get("edge_count", -1))
+        traversal_count = int(graph_counts.get("traversal_count", -1))
+        if node_count < 0 or edge_count < 0 or traversal_count < 0:
+            raise ValueError("Compact manifest has invalid graph counts")
+        source = manifest.get("source")
+        if not isinstance(source, Mapping):
+            raise ValueError("Compact manifest is missing source metadata")
+        source_name = str(source.get("path", ""))
+        if not source_name:
+            raise ValueError("Compact manifest is missing the source graph path")
+        source_path = (manifest_path.parent / source_name).resolve()
+        if not source_path.is_file():
+            raise ValueError(f"Compact source graph is missing: {source_path}")
+        source_schema = source.get("schema_version")
+        if (
+            isinstance(source_schema, bool)
+            or source_schema != _SQLITE_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"Unsupported compact source schema version: {source_schema!r}"
+            )
+        if int(source.get("node_count", -1)) != node_count:
+            raise ValueError("Compact source node count does not match graph")
+        if int(source.get("edge_count", -1)) != edge_count:
+            raise ValueError("Compact source edge count does not match graph")
+
+        bin_name = str(manifest.get("bin_path", ""))
+        if not bin_name:
+            raise ValueError("Compact manifest is missing the binary payload path")
+        bin_path = (manifest_path.parent / bin_name).resolve()
+        if not bin_path.is_file():
+            raise ValueError(f"Compact binary payload is missing: {bin_path}")
+
+        if verify:
+            if check_cancelled is not None:
+                check_cancelled()
+            actual_bin_sha = _sha256_file(
+                bin_path, check_cancelled=check_cancelled
+            ).hex()
+            if actual_bin_sha != str(manifest.get("bin_sha256", "")):
+                raise ValueError(
+                    "Compact binary payload SHA-256 does not match its manifest"
+                )
+            if check_cancelled is not None:
+                check_cancelled()
+            actual_source_sha = _sha256_file(
+                source_path, check_cancelled=check_cancelled
+            ).hex()
+            if actual_source_sha != str(source.get("sha256", "")):
+                raise ValueError(
+                    "Compact source graph SHA-256 does not match its manifest"
+                )
+
+        expected_sections = dict(manifest.get("sections") or {})
+        missing = _COMPACT_SECTION_NAMES.difference(expected_sections)
+        if missing:
+            raise ValueError(
+                f"Compact manifest is missing sections: {sorted(missing)}"
+            )
+        for name, descriptor in expected_sections.items():
+            if name not in _COMPACT_SECTION_NAMES:
+                raise ValueError(f"Compact manifest has unknown section: {name}")
+            if not isinstance(descriptor, Mapping):
+                raise ValueError(f"Compact section {name} has no descriptor")
+            dtype = descriptor.get("dtype")
+            if dtype not in _COMPACT_DTYPE_ITEMSIZE:
+                raise ValueError(f"Compact section {name} has unknown dtype")
+            offset = int(descriptor.get("offset", -1))
+            length = int(descriptor.get("length", -1))
+            count = int(descriptor.get("count", -1))
+            if offset < 0 or length < 0 or count < 0:
+                raise ValueError(f"Compact section {name} has invalid bounds")
+            if dtype == "raw":
+                if length != count:
+                    raise ValueError(
+                        f"Compact section {name} raw length/count mismatch"
+                    )
+            elif length != count * _COMPACT_DTYPE_ITEMSIZE[dtype]:
+                raise ValueError(f"Compact section {name} size/count mismatch")
+            if offset + length > int(manifest.get("bin_size_bytes", -1)):
+                raise ValueError(f"Compact section {name} extends past payload")
+        section_names = list(_COMPACT_SECTION_SPECS)
+        previous_end = 0
+        for name, _dtype in _COMPACT_SECTION_SPECS:
+            descriptor = expected_sections[name]
+            offset = int(descriptor["offset"])
+            if offset != previous_end:
+                raise ValueError(
+                    f"Compact section {name} offset is not contiguous"
+                )
+            previous_end = offset + int(descriptor["length"])
+        if previous_end != int(manifest.get("bin_size_bytes", -1)):
+            raise ValueError("Compact section payload has trailing bytes")
+
+        if (
+            str(manifest.get("scenic_byway_road_type"))
+            != _COMPACT_SCENIC_BYWAY_ROAD_TYPE
+        ):
+            raise ValueError("Compact manifest scenic byway marker mismatch")
+        if str(manifest.get("highway_road_types", "")) != ",".join(
+            sorted(_compact_highway_road_types())
+        ):
+            raise ValueError(
+                "Compact manifest highway road-type mask is stale; rebuild it"
+            )
+
+        if check_cancelled is not None:
+            check_cancelled()
+        file_size = bin_path.stat().st_size
+        if file_size != int(manifest.get("bin_size_bytes", -1)):
+            raise ValueError("Compact binary payload size mismatch")
+        bin_file = open(bin_path, "rb")
+        try:
+            mm = mmap.mmap(bin_file.fileno(), 0, access=mmap.ACCESS_READ)
+        except BaseException:
+            bin_file.close()
+            raise
+
+        graph: CompactRoadGraph | None = None
+        try:
+            sections: Dict[str, np.ndarray | memoryview] = {}
+            for name, dtype in _COMPACT_SECTION_SPECS:
+                descriptor = expected_sections[name]
+                offset = int(descriptor["offset"])
+                length = int(descriptor["length"])
+                count = int(descriptor["count"])
+                if dtype == "raw":
+                    sections[name] = memoryview(mm)[offset : offset + length]
+                else:
+                    arr = np.frombuffer(
+                        mm,
+                        dtype=np.dtype("<" + dtype),
+                        count=count,
+                        offset=offset,
+                    )
+                    arr.flags.writeable = False
+                    sections[name] = arr
+
+            graph = cls(
+                manifest,
+                sections,
+                mm,
+                bin_file,
+                manifest_path,
+                source_path,
+            )
+            if check_cancelled is not None:
+                check_cancelled()
+            try:
+                current_path_identity = _path_identity(manifest_path)
+            except OSError:
+                current_path_identity = None
+            if current_path_identity is not None:
+                graph._try_load_edge_projection_index(
+                    source_path,
+                    check_cancelled=check_cancelled,
+                    verify=verify,
+                )
+            else:
+                graph._edge_projection_index_path = str(
+                    EdgeProjectionIndex.sidecar_path(source_path)
+                )
+                graph._edge_projection_index_status = "stale"
+                graph._edge_projection_index_invalid_reason = (
+                    "graph_replaced_during_load"
+                )
+            if check_cancelled is not None:
+                check_cancelled()
+            return graph
+        except BaseException:
+            arr = None
+            sections.clear()
+            if graph is not None:
+                graph.close()
+            else:
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+                try:
+                    bin_file.close()
+                except Exception:
+                    pass
+            raise
+
+
+def _validate_compact_score_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    report_signature: str,
+    zoom: int,
+    fallback: float | None,
+    normalization: str,
+    source_sha256: str,
+    edge_count: int,
+) -> None:
+    if manifest.get("format") != _COMPACT_SCORE_FORMAT:
+        raise ValueError(
+            f"Unsupported score sidecar format: {manifest.get('format')!r}"
+        )
+    schema_version = manifest.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or schema_version != _COMPACT_SCORE_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            f"Unsupported score sidecar schema version: {schema_version!r}"
+        )
+    if str(manifest.get("report_signature")) != report_signature:
+        raise ValueError("Score sidecar report signature mismatch")
+    if int(manifest.get("zoom", -1)) != int(zoom):
+        raise ValueError("Score sidecar zoom mismatch")
+    expected_fallback = manifest.get("fallback")
+    if (
+        expected_fallback is None and fallback is not None
+    ) or (
+        expected_fallback is not None
+        and (fallback is None or float(expected_fallback) != float(fallback))
+    ):
+        raise ValueError("Score sidecar fallback mismatch")
+    if str(manifest.get("normalization")) != normalization:
+        raise ValueError("Score sidecar normalization version mismatch")
+    source = manifest.get("source")
+    if not isinstance(source, Mapping):
+        raise ValueError("Score sidecar is missing source metadata")
+    if str(source.get("sha256", "")) != source_sha256:
+        raise ValueError("Score sidecar source graph mismatch")
+    if int(source.get("edge_count", -1)) != edge_count:
+        raise ValueError("Score sidecar edge count mismatch")
+
+
+def _ensure_compact_score_sidecar(
+    graph: CompactRoadGraph,
+    score_map: Mapping[tuple[int, int, int], float],
+    *,
+    zoom: int,
+    fallback: float | None,
+    report_signature: str,
+    normalization: str,
+    tile_scores_path: Path,
+    json_path: Path,
+    bin_path: Path,
+    check_cancelled: Callable[[], None] | None = None,
+    verify: bool = True,
+) -> dict[str, Any]:
+    """Generate or validate one deterministic per-report score sidecar."""
+    if check_cancelled is not None:
+        check_cancelled()
+    if json_path.is_file() and bin_path.is_file():
+        try:
+            manifest = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise ValueError(f"Invalid score sidecar manifest: {json_path}") from exc
+        _validate_compact_score_manifest(
+            manifest,
+            report_signature=report_signature,
+            zoom=zoom,
+            fallback=fallback,
+            normalization=normalization,
+            source_sha256=graph.source_sha256,
+            edge_count=graph.edge_count,
+        )
+        if bin_path.stat().st_size != graph.edge_count * 8:
+            raise ValueError("Score sidecar payload size mismatch")
+        if verify and _sha256_file(
+            bin_path, check_cancelled=check_cancelled
+        ).hex() != str(manifest.get("bin_sha256", "")):
+            raise ValueError("Score sidecar payload SHA-256 mismatch")
+        return manifest
+
+    # Deterministic vectorized tile-score computation over canonical edges.
+    from src.data_pipeline.web_mercator import WEB_MERCATOR_MAX_LAT
+
+    if check_cancelled is not None:
+        check_cancelled()
+    start_ranks = graph._sections["edge_start_rank"]
+    end_ranks = graph._sections["edge_end_rank"]
+    node_lat = graph._sections["node_lat"]
+    node_lon = graph._sections["node_lon"]
+    mid_lat = 0.5 * (node_lat[start_ranks] + node_lat[end_ranks])
+    mid_lon = 0.5 * (node_lon[start_ranks] + node_lon[end_ranks])
+    clamped_lat = np.clip(
+        mid_lat, -float(WEB_MERCATOR_MAX_LAT), float(WEB_MERCATOR_MAX_LAT)
+    )
+    n = 1 << int(zoom)
+    tile_x = ((mid_lon + 180.0) / 360.0 * n).astype(np.int64)
+    tile_y = (
+        (1.0 - np.arcsinh(np.tan(np.radians(clamped_lat))) / np.pi)
+        / 2.0
+        * n
+    ).astype(np.int64)
+    tile_x = np.clip(tile_x, 0, n - 1)
+    tile_y = np.clip(tile_y, 0, n - 1)
+    tiles = np.stack((tile_x, tile_y), axis=1)
+    unique_tiles, inverse = np.unique(tiles, axis=0, return_inverse=True)
+    per_tile_score = np.full(len(unique_tiles), np.nan, dtype=np.float64)
+    for tile_index, (tx, ty) in enumerate(unique_tiles):
+        if check_cancelled is not None and tile_index & 1023 == 0:
+            check_cancelled()
+        value = score_map.get((int(zoom), int(tx), int(ty)))
+        if value is not None:
+            per_tile_score[tile_index] = float(value)
+    per_edge_tile = per_tile_score[inverse]
+    present = np.isfinite(per_edge_tile)
+    values = np.array(graph._sections["edge_scenic_score"], dtype=np.float64, copy=True)
+    values[present] = np.clip(per_edge_tile[present], 0.0, 10.0)
+    if fallback is not None:
+        values[~present] = float(min(max(float(fallback), 0.0), 10.0))
+    matched = int(np.count_nonzero(present))
+    total = graph.edge_count
+    fallback_edges = int(total - matched) if fallback is not None else 0
+    del per_edge_tile, per_tile_score
+    if check_cancelled is not None:
+        check_cancelled()
+    payload = values.astype("<f8", copy=False).tobytes()
+    bin_sha256 = hashlib.sha256(payload).hexdigest()
+    _write_atomic_bytes(bin_path, payload)
+    tile_sha256 = _sha256_file(
+        Path(tile_scores_path), check_cancelled=check_cancelled
+    ).hex()
+    manifest = {
+        "format": _COMPACT_SCORE_FORMAT,
+        "schema_version": _COMPACT_SCORE_SCHEMA_VERSION,
+        "report_signature": report_signature,
+        "tile_scores_source": str(tile_scores_path),
+        "tile_scores_sha256": tile_sha256,
+        "source": {
+            "path": graph.source_path.name,
+            "sha256": graph.source_sha256,
+            "size_bytes": int(graph.source_path.stat().st_size),
+            "edge_count": total,
+        },
+        "zoom": int(zoom),
+        "fallback": fallback,
+        "normalization": normalization,
+        "counts": {
+            "matched_edges": matched,
+            "fallback_edges": fallback_edges,
+            "total_edges": total,
+        },
+        "bin_path": bin_path.name,
+        "bin_sha256": bin_sha256,
+        "bin_size_bytes": len(payload),
+    }
+    _write_atomic_bytes(
+        json_path,
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+    )
+    return manifest
 
 
 

@@ -203,6 +203,42 @@ class EdgeProjectionIndex:
             raise ValueError("Graph edge count does not match sidecar total edge count")
         self._canonical_keys = canonical_keys
         self._canonical_keys_owner = owner
+    def close(self) -> None:
+        """Close backing memory-map and file handle if held."""
+        self.edge_ranks = np.empty(0, dtype=np.int64)
+        self.road_type_codes = np.empty(0, dtype=np.int32)
+        self.start_latitudes = np.empty(0, dtype=np.float64)
+        self.start_longitudes = np.empty(0, dtype=np.float64)
+        self.end_latitudes = np.empty(0, dtype=np.float64)
+        self.end_longitudes = np.empty(0, dtype=np.float64)
+        self.bvh_min_lat = np.empty(0, dtype=np.float64)
+        self.bvh_min_lon = np.empty(0, dtype=np.float64)
+        self.bvh_max_lat = np.empty(0, dtype=np.float64)
+        self.bvh_max_lon = np.empty(0, dtype=np.float64)
+        self.bvh_left = np.empty(0, dtype=np.int64)
+        self.bvh_right = np.empty(0, dtype=np.int64)
+        self.bvh_start = np.empty(0, dtype=np.int64)
+        self.bvh_stop = np.empty(0, dtype=np.int64)
+        mm = getattr(self, "_mmap", None)
+        if mm is not None:
+            try:
+                mm.close()
+            except Exception:
+                pass
+            self._mmap = None
+        f = getattr(self, "_file", None)
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+            self._file = None
+    def __enter__(self) -> "EdgeProjectionIndex":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
 
     @property
     def edge_count(self) -> int:
@@ -882,6 +918,7 @@ class EdgeProjectionIndex:
         graph_path: Path,
         *,
         check_cancelled: Callable[[], None] | None = None,
+        verify: bool = True,
     ) -> "EdgeProjectionIndex":
         """Load and validate a sidecar, raising on any inconsistency."""
         callback = check_cancelled
@@ -906,48 +943,50 @@ class EdgeProjectionIndex:
         if file_size < _EPI_HEADER_SIZE:
             raise _SidecarTruncatedError("Sidecar smaller than header")
 
-        with open(sidecar_path, "rb") as file_obj:
+        file_obj = open(sidecar_path, "rb")
+        mm: mmap.mmap | None = None
+        try:
             mm = mmap.mmap(file_obj.fileno(), 0, access=mmap.ACCESS_READ)
-            try:
-                header = mm[:_EPI_HEADER_SIZE]
-                (
-                    magic,
-                    version,
-                    header_size,
-                    bound_file_size,
-                    edge_count,
-                    total_edge_count,
-                    bvh_node_count,
-                    leaf_size,
-                    root_node,
-                    bound_sha256,
-                ) = struct.unpack("<8sIIQQQQIi32s", header)
+            header = mm[:_EPI_HEADER_SIZE]
+            (
+                magic,
+                version,
+                header_size,
+                bound_file_size,
+                edge_count,
+                total_edge_count,
+                bvh_node_count,
+                leaf_size,
+                root_node,
+                bound_sha256,
+            ) = struct.unpack("<8sIIQQQQIi32s", header)
 
-                if magic != _EPI_MAGIC:
-                    raise _SidecarCorruptError("Sidecar magic mismatch")
-                if version != _EPI_VERSION:
-                    raise _SidecarVersionError(
-                        f"Unsupported sidecar version: {version}"
-                    )
-
-                expected_header_size = cls._aligned_size(
-                    _EPI_HEADER_SIZE + _NUM_SECTIONS * _EPI_SECTION_DESCRIPTOR_SIZE
+            if magic != _EPI_MAGIC:
+                raise _SidecarCorruptError("Sidecar magic mismatch")
+            if version != _EPI_VERSION:
+                raise _SidecarVersionError(
+                    f"Unsupported sidecar version: {version}"
                 )
-                if header_size != expected_header_size:
-                    raise _SidecarCorruptError("Sidecar header size mismatch")
 
-                if file_size < header_size:
-                    raise _SidecarTruncatedError(
-                        f"Sidecar file size {file_size} is smaller than header directory {header_size}"
-                    )
+            expected_header_size = cls._aligned_size(
+                _EPI_HEADER_SIZE + _NUM_SECTIONS * _EPI_SECTION_DESCRIPTOR_SIZE
+            )
+            if header_size != expected_header_size:
+                raise _SidecarCorruptError("Sidecar header size mismatch")
 
-                if check_cancelled is not None:
-                    check_cancelled()
+            if file_size < header_size:
+                raise _SidecarTruncatedError(
+                    f"Sidecar file size {file_size} is smaller than header directory {header_size}"
+                )
 
-                # Validate graph binding.
-                graph_stat = graph_path.stat()
-                if graph_stat.st_size != bound_file_size:
-                    raise _SidecarStaleError("Graph file size mismatch")
+            if check_cancelled is not None:
+                check_cancelled()
+
+            # Validate graph binding.
+            graph_stat = graph_path.stat()
+            if graph_stat.st_size != bound_file_size:
+                raise _SidecarStaleError("Graph file size mismatch")
+            if verify:
                 digest = hashlib.sha256()
                 with open(graph_path, "rb") as gf:
                     while True:
@@ -960,331 +999,341 @@ class EdgeProjectionIndex:
                 if digest.digest() != bound_sha256:
                     raise _SidecarStaleError("Graph file SHA-256 mismatch")
 
-                if check_cancelled is not None:
-                    check_cancelled()
+            if check_cancelled is not None:
+                check_cancelled()
 
-                # Read section directory.
-                directory = []
-                for i in range(_NUM_SECTIONS):
-                    offset = _EPI_HEADER_SIZE + i * _EPI_SECTION_DESCRIPTOR_SIZE
-                    desc = mm[offset : offset + _EPI_SECTION_DESCRIPTOR_SIZE]
-                    section_offset, section_size, section_count, dtype_code, sha = (
-                        struct.unpack("<QQQB7x32s", desc)
-                    )
-                    directory.append(
-                        (section_offset, section_size, section_count, dtype_code, sha)
-                    )
-
-                expected_section_offset = header_size
-                for section_index, (
-                    section_offset,
-                    section_size,
-                    _section_count,
-                    dtype_code,
-                    _sha,
-                ) in enumerate(directory):
-                    if section_offset != expected_section_offset:
-                        raise _SidecarCorruptError(
-                            f"Section {section_index} offset mismatch"
-                        )
-                    if dtype_code not in _DTYPE_CODE_TO_NAME:
-                        raise _SidecarCorruptError(
-                            f"Section {section_index} dtype code is unknown"
-                        )
-                    expected_section_offset += cls._aligned_size(section_size)
-                if expected_section_offset > file_size:
-                    raise _SidecarTruncatedError("Sidecar payload is truncated")
-                if expected_section_offset != file_size:
-                    raise _SidecarCorruptError("Sidecar has trailing payload bytes")
-
-                if check_cancelled is not None:
-                    check_cancelled()
-
-                # Load numeric/string sections.
-                def load_numeric(
-                    idx: int, expected_dtype: str, expected_count: int | None = None
-                ) -> np.ndarray:
-                    offset, size, count, dtype_code, sha = directory[idx]
-                    if _DTYPE_CODE_TO_NAME[dtype_code] != expected_dtype:
-                        raise _SidecarCorruptError(f"Section {idx} dtype mismatch")
-                    if expected_count is not None and count != expected_count:
-                        raise _SidecarCorruptError(f"Section {idx} count mismatch")
-                    if size != count * np.dtype(expected_dtype).itemsize:
-                        raise _SidecarCorruptError(f"Section {idx} size mismatch")
-                    if offset + size > len(mm):
-                        raise _SidecarTruncatedError(f"Section {idx} extends past file")
-                    payload = memoryview(mm)[offset : offset + size]
-                    if _sha256_buffer(payload, check_cancelled) != sha:
-                        raise _SidecarCorruptError(f"Section {idx} SHA-256 mismatch")
-                    arr = np.frombuffer(
-                        mm, dtype=np.dtype(expected_dtype), count=count, offset=offset
-                    )
-                    arr.flags.writeable = False
-                    return arr
-
-                def load_bytes(idx: int) -> memoryview:
-                    offset, size, count, dtype_code, sha = directory[idx]
-                    if dtype_code != 0:
-                        raise _SidecarCorruptError(f"Section {idx} is not raw bytes")
-                    if count != size:
-                        raise _SidecarCorruptError(f"Section {idx} raw count mismatch")
-                    if offset + size > len(mm):
-                        raise _SidecarTruncatedError(f"Section {idx} extends past file")
-                    payload = memoryview(mm)[offset : offset + size]
-                    if _sha256_buffer(payload, check_cancelled) != sha:
-                        raise _SidecarCorruptError(f"Section {idx} SHA-256 mismatch")
-                    return payload
-
-                def validate_offsets(offsets: np.ndarray, data_size: int) -> None:
-                    if offsets.dtype.kind not in ("i", "u"):
-                        raise _SidecarCorruptError("Offsets dtype must be integer")
-                    if len(offsets) == 0:
-                        raise _SidecarCorruptError("Offsets array is empty")
-                    if offsets[0] != 0:
-                        raise _SidecarCorruptError("Offsets must start at zero")
-                    if len(offsets) == 1:
-                        if data_size != 0:
-                            raise _SidecarCorruptError(
-                                "Single offset must span empty data"
-                            )
-                        return
-                    if not all(
-                        offsets[i] <= offsets[i + 1] for i in range(len(offsets) - 1)
-                    ):
-                        raise _SidecarCorruptError("Offsets must be nondecreasing")
-                    if offsets[-1] > data_size:
-                        raise _SidecarCorruptError("Final offset exceeds data size")
-                    if offsets[-1] != data_size:
-                        raise _SidecarCorruptError("Final offset must match data size")
-
-                def decode_strings(
-                    data: memoryview, offsets: np.ndarray
-                ) -> tuple[str, ...]:
-                    validate_offsets(offsets, len(data))
-                    if len(offsets) == 1:
-                        return ()
-                    strings = []
-                    for i in range(len(offsets) - 1):
-                        start = int(offsets[i])
-                        stop = int(offsets[i + 1])
-                        try:
-                            strings.append(data[start:stop].tobytes().decode("utf-8"))
-                        except UnicodeDecodeError as exc:
-                            raise _SidecarCorruptError("UTF-8 decode error") from exc
-                    return tuple(strings)
-
-                edge_ranks = load_numeric(_SECTION_EDGE_RANKS, "<i8", edge_count)
-                type_data = load_bytes(_SECTION_TYPE_NAMES_DATA)
-                type_offsets = load_numeric(_SECTION_TYPE_NAMES_OFFSETS, "<i8")
-
-                road_type_codes = load_numeric(_SECTION_TYPE_CODES, "<i4", edge_count)
-                start_latitudes = load_numeric(_SECTION_START_LAT, "<f8", edge_count)
-                start_longitudes = load_numeric(_SECTION_START_LON, "<f8", edge_count)
-                end_latitudes = load_numeric(_SECTION_END_LAT, "<f8", edge_count)
-                end_longitudes = load_numeric(_SECTION_END_LON, "<f8", edge_count)
-
-                if bvh_node_count == 0 and edge_count > 0:
-                    raise _SidecarCorruptError("Missing BVH nodes")
-
-                bvh_min_lat = load_numeric(_SECTION_BVH_MIN_LAT, "<f8", bvh_node_count)
-                bvh_min_lon = load_numeric(_SECTION_BVH_MIN_LON, "<f8", bvh_node_count)
-                bvh_max_lat = load_numeric(_SECTION_BVH_MAX_LAT, "<f8", bvh_node_count)
-                bvh_max_lon = load_numeric(_SECTION_BVH_MAX_LON, "<f8", bvh_node_count)
-                bvh_left = load_numeric(_SECTION_BVH_LEFT, "<i8", bvh_node_count)
-                bvh_right = load_numeric(_SECTION_BVH_RIGHT, "<i8", bvh_node_count)
-                bvh_start = load_numeric(_SECTION_BVH_START, "<i8", bvh_node_count)
-                bvh_stop = load_numeric(_SECTION_BVH_STOP, "<i8", bvh_node_count)
-
-                if check_cancelled is not None:
-                    check_cancelled()
-
-                road_type_names = decode_strings(type_data, type_offsets)
-                type_count = len(road_type_names)
-                if type_count == 0 and edge_count > 0:
-                    raise _SidecarCorruptError("Missing road type names")
-                if edge_count > 0 and (
-                    road_type_codes.min() < 0 or road_type_codes.max() >= type_count
-                ):
-                    raise _SidecarCorruptError("Road type code out of range")
-
-                if not (
-                    np.all(np.isfinite(start_latitudes))
-                    and np.all(np.isfinite(start_longitudes))
-                    and np.all(np.isfinite(end_latitudes))
-                    and np.all(np.isfinite(end_longitudes))
-                ):
-                    raise _SidecarCorruptError(
-                        "Indexed segment coordinates must be finite"
-                    )
-                if edge_count > total_edge_count:
-                    raise _SidecarCorruptError(
-                        "Indexed edge count exceeds total graph edge count"
-                    )
-                if edge_count > 0:
-                    if edge_ranks.min() < 0 or edge_ranks.max() >= total_edge_count:
-                        raise _SidecarCorruptError("Edge rank out of bounds")
-                    if len(np.unique(edge_ranks)) != edge_count:
-                        raise _SidecarCorruptError("Edge ranks must be unique")
-
-                if edge_count == 0:
-                    if bvh_node_count != 0 or root_node != -1:
-                        raise _SidecarCorruptError(
-                            "Empty index has inconsistent BVH metadata"
-                        )
-                else:
-                    if leaf_size != _EDGE_PROJECTION_BVH_LEAF_SIZE:
-                        raise _SidecarVersionError(
-                            f"Unsupported BVH leaf size: {leaf_size}"
-                        )
-                    if root_node < 0 or root_node >= bvh_node_count:
-                        raise _SidecarCorruptError("Invalid BVH root node index")
-                    if not (
-                        np.all(np.isfinite(bvh_min_lat))
-                        and np.all(np.isfinite(bvh_min_lon))
-                        and np.all(np.isfinite(bvh_max_lat))
-                        and np.all(np.isfinite(bvh_max_lon))
-                        and np.all(bvh_min_lat <= bvh_max_lat)
-                        and np.all(bvh_min_lon <= bvh_max_lon)
-                    ):
-                        raise _SidecarCorruptError("Invalid BVH bounds")
-                    leaves = (bvh_left == -1) & (bvh_right == -1)
-                    internals = (
-                        (bvh_left >= 0)
-                        & (bvh_left < bvh_node_count)
-                        & (bvh_right >= 0)
-                        & (bvh_right < bvh_node_count)
-                    )
-                    if not np.all(leaves | internals):
-                        raise _SidecarCorruptError("Invalid BVH child indices")
-                    if not np.all(
-                        (bvh_start[leaves] >= 0)
-                        & (bvh_stop[leaves] > bvh_start[leaves])
-                        & (bvh_stop[leaves] <= edge_count)
-                    ):
-                        raise _SidecarCorruptError("Invalid BVH leaf range")
-                    if not np.all(
-                        (bvh_start[internals] == -1) & (bvh_stop[internals] == -1)
-                    ):
-                        raise _SidecarCorruptError(
-                            "Internal BVH nodes contain leaf ranges"
-                        )
-
-                    visit_state = np.zeros(bvh_node_count, dtype=np.uint8)
-                    stack = [(int(root_node), False)]
-                    visits = 0
-                    while stack:
-                        node, exiting = stack.pop()
-                        if exiting:
-                            visit_state[node] = 2
-                            continue
-                        if visit_state[node] != 0:
-                            raise _SidecarCorruptError(
-                                "BVH contains a cycle or shared child"
-                            )
-                        visit_state[node] = 1
-                        visits += 1
-                        if (
-                            check_cancelled is not None
-                            and visits
-                            & (_CANCELLATION_CHECK_INTERVAL - 1)
-                            == 0
-                        ):
-                            check_cancelled()
-                        stack.append((node, True))
-                        if internals[node]:
-                            stack.append((int(bvh_right[node]), False))
-                            stack.append((int(bvh_left[node]), False))
-                    if not np.all(visit_state == 2):
-                        raise _SidecarCorruptError(
-                            "BVH contains unreachable nodes"
-                        )
-
-                    leaf_starts = bvh_start[leaves]
-                    leaf_stops = bvh_stop[leaves]
-                    leaf_order = np.argsort(leaf_starts)
-                    sorted_starts = leaf_starts[leaf_order]
-                    sorted_stops = leaf_stops[leaf_order]
-                    if (
-                        sorted_starts[0] != 0
-                        or sorted_stops[-1] != edge_count
-                        or np.any(sorted_stops[:-1] != sorted_starts[1:])
-                    ):
-                        raise _SidecarCorruptError(
-                            "BVH leaves do not partition indexed edges"
-                        )
-
-                    internal_nodes = np.flatnonzero(internals)
-                    left_nodes = bvh_left[internal_nodes]
-                    right_nodes = bvh_right[internal_nodes]
-                    if not (
-                        np.all(
-                            bvh_min_lat[internal_nodes]
-                            <= bvh_min_lat[left_nodes]
-                        )
-                        and np.all(
-                            bvh_min_lat[internal_nodes]
-                            <= bvh_min_lat[right_nodes]
-                        )
-                        and np.all(
-                            bvh_min_lon[internal_nodes]
-                            <= bvh_min_lon[left_nodes]
-                        )
-                        and np.all(
-                            bvh_min_lon[internal_nodes]
-                            <= bvh_min_lon[right_nodes]
-                        )
-                        and np.all(
-                            bvh_max_lat[internal_nodes]
-                            >= bvh_max_lat[left_nodes]
-                        )
-                        and np.all(
-                            bvh_max_lat[internal_nodes]
-                            >= bvh_max_lat[right_nodes]
-                        )
-                        and np.all(
-                            bvh_max_lon[internal_nodes]
-                            >= bvh_max_lon[left_nodes]
-                        )
-                        and np.all(
-                            bvh_max_lon[internal_nodes]
-                            >= bvh_max_lon[right_nodes]
-                        )
-                    ):
-                        raise _SidecarCorruptError(
-                            "BVH parent bounds do not contain children"
-                        )
-                if check_cancelled is not None:
-                    check_cancelled()
-
-                return cls(
-                    edge_ranks=edge_ranks,
-                    total_edge_count=total_edge_count,
-                    road_type_names=road_type_names,
-                    road_type_codes=road_type_codes,
-                    start_latitudes=start_latitudes,
-                    start_longitudes=start_longitudes,
-                    end_latitudes=end_latitudes,
-                    end_longitudes=end_longitudes,
-                    bvh_min_lat=bvh_min_lat,
-                    bvh_min_lon=bvh_min_lon,
-                    bvh_max_lat=bvh_max_lat,
-                    bvh_max_lon=bvh_max_lon,
-                    bvh_left=bvh_left,
-                    bvh_right=bvh_right,
-                    bvh_start=bvh_start,
-                    bvh_stop=bvh_stop,
-                    leaf_size=leaf_size,
-                    root_node=root_node,
-                    mmap_ref=mm,
-                    file_ref=file_obj,
+            # Read section directory.
+            directory = []
+            for i in range(_NUM_SECTIONS):
+                offset = _EPI_HEADER_SIZE + i * _EPI_SECTION_DESCRIPTOR_SIZE
+                desc = mm[offset : offset + _EPI_SECTION_DESCRIPTOR_SIZE]
+                section_offset, section_size, section_count, dtype_code, sha = (
+                    struct.unpack("<QQQB7x32s", desc)
                 )
-            except _SidecarError:
+                directory.append(
+                    (section_offset, section_size, section_count, dtype_code, sha)
+                )
+
+            expected_section_offset = header_size
+            for section_index, (
+                section_offset,
+                section_size,
+                _section_count,
+                dtype_code,
+                _sha,
+            ) in enumerate(directory):
+                if section_offset != expected_section_offset:
+                    raise _SidecarCorruptError(
+                        f"Section {section_index} offset mismatch"
+                    )
+                if dtype_code not in _DTYPE_CODE_TO_NAME:
+                    raise _SidecarCorruptError(
+                        f"Section {section_index} dtype code is unknown"
+                    )
+                expected_section_offset += cls._aligned_size(section_size)
+            if expected_section_offset > file_size:
+                raise _SidecarTruncatedError("Sidecar payload is truncated")
+            if expected_section_offset != file_size:
+                raise _SidecarCorruptError("Sidecar has trailing payload bytes")
+
+            if check_cancelled is not None:
+                check_cancelled()
+
+            # Load numeric/string sections.
+            def load_numeric(
+                idx: int, expected_dtype: str, expected_count: int | None = None
+            ) -> np.ndarray:
+                offset, size, count, dtype_code, sha = directory[idx]
+                if _DTYPE_CODE_TO_NAME[dtype_code] != expected_dtype:
+                    raise _SidecarCorruptError(f"Section {idx} dtype mismatch")
+                if expected_count is not None and count != expected_count:
+                    raise _SidecarCorruptError(f"Section {idx} count mismatch")
+                if size != count * np.dtype(expected_dtype).itemsize:
+                    raise _SidecarCorruptError(f"Section {idx} size mismatch")
+                if offset + size > len(mm):
+                    raise _SidecarTruncatedError(f"Section {idx} extends past file")
+                payload = memoryview(mm)[offset : offset + size]
+                if verify and _sha256_buffer(payload, check_cancelled) != sha:
+                    raise _SidecarCorruptError(f"Section {idx} SHA-256 mismatch")
+                arr = np.frombuffer(
+                    mm, dtype=np.dtype(expected_dtype), count=count, offset=offset
+                )
+                arr.flags.writeable = False
+                return arr
+
+            def load_bytes(idx: int) -> memoryview:
+                offset, size, count, dtype_code, sha = directory[idx]
+                if dtype_code != 0:
+                    raise _SidecarCorruptError(f"Section {idx} is not raw bytes")
+                if count != size:
+                    raise _SidecarCorruptError(f"Section {idx} raw count mismatch")
+                if offset + size > len(mm):
+                    raise _SidecarTruncatedError(f"Section {idx} extends past file")
+                payload = memoryview(mm)[offset : offset + size]
+                if verify and _sha256_buffer(payload, check_cancelled) != sha:
+                    raise _SidecarCorruptError(f"Section {idx} SHA-256 mismatch")
+                return payload
+
+            def validate_offsets(offsets: np.ndarray, data_size: int) -> None:
+                if offsets.dtype.kind not in ("i", "u"):
+                    raise _SidecarCorruptError("Offsets dtype must be integer")
+                if len(offsets) == 0:
+                    raise _SidecarCorruptError("Offsets array is empty")
+                if offsets[0] != 0:
+                    raise _SidecarCorruptError("Offsets must start at zero")
+                if len(offsets) == 1:
+                    if data_size != 0:
+                        raise _SidecarCorruptError(
+                            "Single offset must span empty data"
+                        )
+                    return
+                if not all(
+                    offsets[i] <= offsets[i + 1] for i in range(len(offsets) - 1)
+                ):
+                    raise _SidecarCorruptError("Offsets must be nondecreasing")
+                if offsets[-1] > data_size:
+                    raise _SidecarCorruptError("Final offset exceeds data size")
+                if offsets[-1] != data_size:
+                    raise _SidecarCorruptError("Final offset must match data size")
+
+            def decode_strings(
+                data: memoryview, offsets: np.ndarray
+            ) -> tuple[str, ...]:
+                validate_offsets(offsets, len(data))
+                if len(offsets) == 1:
+                    return ()
+                strings = []
+                for i in range(len(offsets) - 1):
+                    start = int(offsets[i])
+                    stop = int(offsets[i + 1])
+                    try:
+                        strings.append(data[start:stop].tobytes().decode("utf-8"))
+                    except UnicodeDecodeError as exc:
+                        raise _SidecarCorruptError("UTF-8 decode error") from exc
+                return tuple(strings)
+
+            edge_ranks = load_numeric(_SECTION_EDGE_RANKS, "<i8", edge_count)
+            type_data = load_bytes(_SECTION_TYPE_NAMES_DATA)
+            type_offsets = load_numeric(_SECTION_TYPE_NAMES_OFFSETS, "<i8")
+
+            road_type_codes = load_numeric(_SECTION_TYPE_CODES, "<i4", edge_count)
+            start_latitudes = load_numeric(_SECTION_START_LAT, "<f8", edge_count)
+            start_longitudes = load_numeric(_SECTION_START_LON, "<f8", edge_count)
+            end_latitudes = load_numeric(_SECTION_END_LAT, "<f8", edge_count)
+            end_longitudes = load_numeric(_SECTION_END_LON, "<f8", edge_count)
+
+            if bvh_node_count == 0 and edge_count > 0:
+                raise _SidecarCorruptError("Missing BVH nodes")
+
+            bvh_min_lat = load_numeric(_SECTION_BVH_MIN_LAT, "<f8", bvh_node_count)
+            bvh_min_lon = load_numeric(_SECTION_BVH_MIN_LON, "<f8", bvh_node_count)
+            bvh_max_lat = load_numeric(_SECTION_BVH_MAX_LAT, "<f8", bvh_node_count)
+            bvh_max_lon = load_numeric(_SECTION_BVH_MAX_LON, "<f8", bvh_node_count)
+            bvh_left = load_numeric(_SECTION_BVH_LEFT, "<i8", bvh_node_count)
+            bvh_right = load_numeric(_SECTION_BVH_RIGHT, "<i8", bvh_node_count)
+            bvh_start = load_numeric(_SECTION_BVH_START, "<i8", bvh_node_count)
+            bvh_stop = load_numeric(_SECTION_BVH_STOP, "<i8", bvh_node_count)
+
+            if check_cancelled is not None:
+                check_cancelled()
+
+            road_type_names = decode_strings(type_data, type_offsets)
+            type_count = len(road_type_names)
+            if type_count == 0 and edge_count > 0:
+                raise _SidecarCorruptError("Missing road type names")
+            if edge_count > 0 and (
+                road_type_codes.min() < 0 or road_type_codes.max() >= type_count
+            ):
+                raise _SidecarCorruptError("Road type code out of range")
+
+            if not (
+                np.all(np.isfinite(start_latitudes))
+                and np.all(np.isfinite(start_longitudes))
+                and np.all(np.isfinite(end_latitudes))
+                and np.all(np.isfinite(end_longitudes))
+            ):
+                raise _SidecarCorruptError(
+                    "Indexed segment coordinates must be finite"
+                )
+            if edge_count > total_edge_count:
+                raise _SidecarCorruptError(
+                    "Indexed edge count exceeds total graph edge count"
+                )
+            if edge_count > 0:
+                if edge_ranks.min() < 0 or edge_ranks.max() >= total_edge_count:
+                    raise _SidecarCorruptError("Edge rank out of bounds")
+                if len(np.unique(edge_ranks)) != edge_count:
+                    raise _SidecarCorruptError("Edge ranks must be unique")
+
+            if edge_count == 0:
+                if bvh_node_count != 0 or root_node != -1:
+                    raise _SidecarCorruptError(
+                        "Empty index has inconsistent BVH metadata"
+                    )
+            else:
+                if leaf_size != _EDGE_PROJECTION_BVH_LEAF_SIZE:
+                    raise _SidecarVersionError(
+                        f"Unsupported BVH leaf size: {leaf_size}"
+                    )
+                if root_node < 0 or root_node >= bvh_node_count:
+                    raise _SidecarCorruptError("Invalid BVH root node index")
+                if not (
+                    np.all(np.isfinite(bvh_min_lat))
+                    and np.all(np.isfinite(bvh_min_lon))
+                    and np.all(np.isfinite(bvh_max_lat))
+                    and np.all(np.isfinite(bvh_max_lon))
+                    and np.all(bvh_min_lat <= bvh_max_lat)
+                    and np.all(bvh_min_lon <= bvh_max_lon)
+                ):
+                    raise _SidecarCorruptError("Invalid BVH bounds")
+                leaves = (bvh_left == -1) & (bvh_right == -1)
+                internals = (
+                    (bvh_left >= 0)
+                    & (bvh_left < bvh_node_count)
+                    & (bvh_right >= 0)
+                    & (bvh_right < bvh_node_count)
+                )
+                if not np.all(leaves | internals):
+                    raise _SidecarCorruptError("Invalid BVH child indices")
+                if not np.all(
+                    (bvh_start[leaves] >= 0)
+                    & (bvh_stop[leaves] > bvh_start[leaves])
+                    & (bvh_stop[leaves] <= edge_count)
+                ):
+                    raise _SidecarCorruptError("Invalid BVH leaf range")
+                if not np.all(
+                    (bvh_start[internals] == -1) & (bvh_stop[internals] == -1)
+                ):
+                    raise _SidecarCorruptError(
+                        "Internal BVH nodes contain leaf ranges"
+                    )
+
+                visit_state = np.zeros(bvh_node_count, dtype=np.uint8)
+                stack = [(int(root_node), False)]
+                visits = 0
+                while stack:
+                    node, exiting = stack.pop()
+                    if exiting:
+                        visit_state[node] = 2
+                        continue
+                    if visit_state[node] != 0:
+                        raise _SidecarCorruptError(
+                            "BVH contains a cycle or shared child"
+                        )
+                    visit_state[node] = 1
+                    visits += 1
+                    if (
+                        check_cancelled is not None
+                        and visits
+                        & (_CANCELLATION_CHECK_INTERVAL - 1)
+                        == 0
+                    ):
+                        check_cancelled()
+                    stack.append((node, True))
+                    if internals[node]:
+                        stack.append((int(bvh_right[node]), False))
+                        stack.append((int(bvh_left[node]), False))
+                if not np.all(visit_state == 2):
+                    raise _SidecarCorruptError(
+                        "BVH contains unreachable nodes"
+                    )
+
+                leaf_starts = bvh_start[leaves]
+                leaf_stops = bvh_stop[leaves]
+                leaf_order = np.argsort(leaf_starts)
+                sorted_starts = leaf_starts[leaf_order]
+                sorted_stops = leaf_stops[leaf_order]
+                if (
+                    sorted_starts[0] != 0
+                    or sorted_stops[-1] != edge_count
+                    or np.any(sorted_stops[:-1] != sorted_starts[1:])
+                ):
+                    raise _SidecarCorruptError(
+                        "BVH leaves do not partition indexed edges"
+                    )
+
+                internal_nodes = np.flatnonzero(internals)
+                left_nodes = bvh_left[internal_nodes]
+                right_nodes = bvh_right[internal_nodes]
+                if not (
+                    np.all(
+                        bvh_min_lat[internal_nodes]
+                        <= bvh_min_lat[left_nodes]
+                    )
+                    and np.all(
+                        bvh_min_lat[internal_nodes]
+                        <= bvh_min_lat[right_nodes]
+                    )
+                    and np.all(
+                        bvh_min_lon[internal_nodes]
+                        <= bvh_min_lon[left_nodes]
+                    )
+                    and np.all(
+                        bvh_min_lon[internal_nodes]
+                        <= bvh_min_lon[right_nodes]
+                    )
+                    and np.all(
+                        bvh_max_lat[internal_nodes]
+                        >= bvh_max_lat[left_nodes]
+                    )
+                    and np.all(
+                        bvh_max_lat[internal_nodes]
+                        >= bvh_max_lat[right_nodes]
+                    )
+                    and np.all(
+                        bvh_max_lon[internal_nodes]
+                        >= bvh_max_lon[left_nodes]
+                    )
+                    and np.all(
+                        bvh_max_lon[internal_nodes]
+                        >= bvh_max_lon[right_nodes]
+                    )
+                ):
+                    raise _SidecarCorruptError(
+                        "BVH parent bounds do not contain children"
+                    )
+            if check_cancelled is not None:
+                check_cancelled()
+
+            return cls(
+                edge_ranks=edge_ranks,
+                total_edge_count=total_edge_count,
+                road_type_names=road_type_names,
+                road_type_codes=road_type_codes,
+                start_latitudes=start_latitudes,
+                start_longitudes=start_longitudes,
+                end_latitudes=end_latitudes,
+                end_longitudes=end_longitudes,
+                bvh_min_lat=bvh_min_lat,
+                bvh_min_lon=bvh_min_lon,
+                bvh_max_lat=bvh_max_lat,
+                bvh_max_lon=bvh_max_lon,
+                bvh_left=bvh_left,
+                bvh_right=bvh_right,
+                bvh_start=bvh_start,
+                bvh_stop=bvh_stop,
+                leaf_size=leaf_size,
+                root_node=root_node,
+                mmap_ref=mm,
+                file_ref=file_obj,
+            )
+        except Exception as exc:
+            if mm is not None:
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+            try:
+                file_obj.close()
+            except Exception:
+                pass
+            if isinstance(exc, _SidecarError):
                 raise
-            except (struct.error, ValueError, TypeError, KeyError, OSError) as exc:
+            if isinstance(exc, (struct.error, ValueError, TypeError, KeyError, OSError)):
                 raise _SidecarCorruptError(
                     "Sidecar payload could not be parsed"
                 ) from exc
-
+            raise
     @staticmethod
     def sidecar_path(graph_path: Path) -> Path:
         return Path(f"{graph_path}.edge_projection_index")

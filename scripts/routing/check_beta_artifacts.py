@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -11,8 +12,21 @@ import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Mapping
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
+from src.route_planner._edge_projection import EdgeProjectionIndex, _SidecarError
+from src.route_planner.graph import (
+    _COMPACT_DTYPE_ITEMSIZE,
+    _COMPACT_FORMAT,
+    _COMPACT_SCENIC_BYWAY_ROAD_TYPE,
+    _COMPACT_SCHEMA_VERSION,
+    _COMPACT_SECTION_NAMES,
+    _COMPACT_SECTION_SPECS,
+    _compact_highway_road_types,
+)
 CONFIG_PATH = Path("config/app_regions.json")
 REGISTRY_PATH = Path("data/processed/regression/model_registry.json")
 DEFAULT_GRAPH_PATH = Path(
@@ -120,49 +134,179 @@ def _resolve_active_checkpoint(
     ]
 
 
-def _configured_region(root: Path) -> tuple[dict[str, Any] | None, list[str]]:
-    """Load the configured New England region without validating artifacts."""
+def _configured_route_regions(
+    root: Path, cli_graph: Path | None = None
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Resolve all configured route-enabled regions with graph paths.
 
+    Returns a list of dicts, each describing a route region:
+        - "region": region name (str)
+        - "graph_path": Path
+        - "run_name": run_name (str)
+        - "region_dict": raw region configuration dict
+        - "is_default": bool
+    and a list of issue strings.
+    """
     config_path = root / CONFIG_PATH
+    issues: list[str] = []
+
     if not config_path.is_file():
-        return None, []
+        default_graph = (
+            _project_path(root, cli_graph)
+            if cli_graph is not None
+            else root / DEFAULT_GRAPH_PATH
+        )
+        return [
+            {
+                "region": "new_england_north",
+                "graph_path": default_graph,
+                "run_name": DEFAULT_RUN_NAME,
+                "region_dict": None,
+                "is_default": True,
+            }
+        ], []
+
     try:
         payload: Any = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        return None, [f"invalid: {CONFIG_PATH} ({exc})"]
-    regions = payload.get("regions") if isinstance(payload, dict) else None
-    region = next(
-        (
-            item
-            for item in regions or []
-            if isinstance(item, dict) and item.get("region") == "new_england_north"
-        ),
-        None,
-    )
-    if not isinstance(region, dict):
-        return None, [f"invalid: {CONFIG_PATH} (new_england_north is not configured)"]
-    return region, []
+        default_graph = (
+            _project_path(root, cli_graph)
+            if cli_graph is not None
+            else root / DEFAULT_GRAPH_PATH
+        )
+        return [
+            {
+                "region": "new_england_north",
+                "graph_path": default_graph,
+                "run_name": DEFAULT_RUN_NAME,
+                "region_dict": None,
+                "is_default": True,
+            }
+        ], [f"invalid: {CONFIG_PATH} ({exc})"]
+
+    if not isinstance(payload, dict):
+        default_graph = (
+            _project_path(root, cli_graph)
+            if cli_graph is not None
+            else root / DEFAULT_GRAPH_PATH
+        )
+        return [
+            {
+                "region": "new_england_north",
+                "graph_path": default_graph,
+                "run_name": DEFAULT_RUN_NAME,
+                "region_dict": None,
+                "is_default": True,
+            }
+        ], [f"invalid: {CONFIG_PATH} (config payload is not a dict)"]
+
+    default_region_name = payload.get("default_region")
+    if not isinstance(default_region_name, str) or not default_region_name:
+        default_region_name = "new_england_north"
+
+    regions_raw = payload.get("regions")
+    if not isinstance(regions_raw, list):
+        default_graph = (
+            _project_path(root, cli_graph)
+            if cli_graph is not None
+            else root / DEFAULT_GRAPH_PATH
+        )
+        return [
+            {
+                "region": default_region_name,
+                "graph_path": default_graph,
+                "run_name": DEFAULT_RUN_NAME,
+                "region_dict": None,
+                "is_default": True,
+            }
+        ], [f"invalid: {CONFIG_PATH} (regions array is missing)"]
+
+    route_regions: list[dict[str, Any]] = []
+    found_default = False
+
+    for item in regions_raw:
+        if not isinstance(item, dict):
+            continue
+        region_name = item.get("region")
+        if not isinstance(region_name, str) or not region_name:
+            continue
+
+        is_default = region_name == default_region_name
+        if is_default:
+            found_default = True
+
+        if item.get("route_planning") is False:
+            continue
+
+        raw_graph = item.get("graph")
+        if raw_graph is None or not str(raw_graph).strip():
+            if is_default:
+                issues.append(
+                    f"invalid: {CONFIG_PATH} ({region_name} graph is missing)"
+                )
+            continue
+
+        if is_default and cli_graph is not None:
+            graph_path = _project_path(root, cli_graph)
+        else:
+            graph_path = _project_path(root, raw_graph)
+
+        run_name = item.get("run_name")
+        if not isinstance(run_name, str) or not run_name:
+            issues.append(f"invalid: {CONFIG_PATH} ({region_name} run_name is missing)")
+            run_name = DEFAULT_RUN_NAME if is_default else ""
+
+        route_regions.append(
+            {
+                "region": region_name,
+                "graph_path": graph_path,
+                "run_name": run_name,
+                "region_dict": item,
+                "is_default": is_default,
+            }
+        )
+
+    if not route_regions:
+        default_graph = (
+            _project_path(root, cli_graph)
+            if cli_graph is not None
+            else root / DEFAULT_GRAPH_PATH
+        )
+        route_regions.append(
+            {
+                "region": default_region_name,
+                "graph_path": default_graph,
+                "run_name": DEFAULT_RUN_NAME,
+                "region_dict": None,
+                "is_default": True,
+            }
+        )
+        if not found_default:
+            issues.append(
+                f"invalid: {CONFIG_PATH} ({default_region_name} is not configured)"
+            )
+
+    return route_regions, issues
+
+
+def _configured_region(root: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    """Load the default configured region without validating artifacts."""
+    regions, issues = _configured_route_regions(root)
+    for reg in regions:
+        if reg["is_default"]:
+            return reg["region_dict"], issues
+    return (regions[0]["region_dict"] if regions else None), issues
 
 
 def _configured_new_england(root: Path) -> tuple[Path, str, list[str]]:
-    """Read the New England graph/run settings, with canonical fallbacks."""
-
-    graph_path = root / DEFAULT_GRAPH_PATH
-    run_name = DEFAULT_RUN_NAME
-    region, issues = _configured_region(root)
-    if region is None:
-        return graph_path, run_name, issues
-    configured_graph = region.get("graph")
-    configured_run = region.get("run_name")
-    if isinstance(configured_graph, str) and configured_graph:
-        graph_path = _project_path(root, configured_graph)
-    else:
-        issues.append(f"invalid: {CONFIG_PATH} (new_england_north graph is missing)")
-    if isinstance(configured_run, str) and configured_run:
-        run_name = configured_run
-    else:
-        issues.append(f"invalid: {CONFIG_PATH} (new_england_north run_name is missing)")
-    return graph_path, run_name, issues
+    """Read the default graph/run settings, with canonical fallbacks."""
+    regions, issues = _configured_route_regions(root)
+    for reg in regions:
+        if reg["is_default"]:
+            return reg["graph_path"], reg["run_name"], issues
+    if regions:
+        return regions[0]["graph_path"], regions[0]["run_name"], issues
+    return root / DEFAULT_GRAPH_PATH, DEFAULT_RUN_NAME, issues
 
 
 def _metadata_bbox_matches(metadata_bbox: Any, configured_bbox: Any) -> bool:
@@ -257,7 +401,8 @@ def _validate_sqlite_graph(
         schema_version = metadata.get("schema_version")
         if isinstance(schema_version, bool) or schema_version != _SQLITE_SCHEMA_VERSION:
             return [f"invalid: {label} (unsupported schema_version {schema_version!r})"]
-        if not _metadata_bbox_matches(metadata.get("bbox"), region.get("bbox")):
+        configured_graph_bbox = region.get("graph_bbox", region.get("bbox"))
+        if not _metadata_bbox_matches(metadata.get("bbox"), configured_graph_bbox):
             return [f"invalid: {label} (bbox does not match configured region)"]
 
         for name, table in (("node_count", "nodes"), ("edge_count", "edges")):
@@ -285,30 +430,55 @@ def _validate_sqlite_graph(
         probes = metadata.get("coverage_probes")
         if not isinstance(probes, Mapping):
             return [f"invalid: {label} (coverage_probes metadata is missing)"]
-        for probe_name in _REQUIRED_PROBES:
+        configured_probes = region.get("coverage_probes")
+        if configured_probes is None:
+            expected_probes: Mapping[str, Any] = {
+                name: {"lat": coordinates[0], "lon": coordinates[1]}
+                for name, coordinates in _CANONICAL_PROBE_COORDINATES.items()
+            }
+        elif isinstance(configured_probes, Mapping) and configured_probes:
+            expected_probes = configured_probes
+        else:
+            return [f"invalid: {label} (configured coverage_probes are invalid)"]
+
+        for probe_name, expected_probe in expected_probes.items():
+            if not isinstance(probe_name, str) or not isinstance(
+                expected_probe, Mapping
+            ):
+                return [f"invalid: {label} (configured coverage_probes are invalid)"]
             probe = probes.get(probe_name)
             if not isinstance(probe, Mapping):
                 return [f"invalid: {label} (coverage probe {probe_name} is missing)"]
 
-            expected_lat, expected_lon = _CANONICAL_PROBE_COORDINATES[probe_name]
+            expected_lat = expected_probe.get("lat")
+            expected_lon = expected_probe.get("lon")
             latitude = probe.get("lat")
             longitude = probe.get("lon")
             if (
                 isinstance(latitude, bool)
                 or isinstance(longitude, bool)
+                or isinstance(expected_lat, bool)
+                or isinstance(expected_lon, bool)
                 or not isinstance(latitude, (int, float))
                 or not isinstance(longitude, (int, float))
+                or not isinstance(expected_lat, (int, float))
+                or not isinstance(expected_lon, (int, float))
                 or not math.isfinite(float(latitude))
                 or not math.isfinite(float(longitude))
+                or not math.isfinite(float(expected_lat))
+                or not math.isfinite(float(expected_lon))
             ):
                 return [
                     f"invalid: {label} (coverage probe {probe_name} "
                     "coordinates are invalid)"
                 ]
-            if float(latitude) != expected_lat or float(longitude) != expected_lon:
+            if (
+                float(latitude) != float(expected_lat)
+                or float(longitude) != float(expected_lon)
+            ):
                 return [
                     f"invalid: {label} (coverage probe {probe_name} "
-                    "coordinates do not match canonical values)"
+                    "coordinates do not match configured values)"
                 ]
 
             distance = probe.get("distance_km")
@@ -342,7 +512,250 @@ def _validate_sqlite_graph(
         if connection is not None:
             connection.close()
     return []
+def _sha256_file(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.digest()
 
+
+def _validate_compact_graph(
+    manifest_path: Path, region: Mapping[str, Any] | None
+) -> list[str]:
+    """Validate compact graph manifest, binary payload, source, and projection sidecar."""
+    label = str(manifest_path)
+    try:
+        manifest: Any = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return [f"invalid: {label} ({exc})"]
+
+    if not isinstance(manifest, dict):
+        return [f"invalid: {label} (manifest is not a dict)"]
+    if manifest.get("format") != _COMPACT_FORMAT:
+        return [
+            f"invalid: {label} (unsupported compact format {manifest.get('format')!r})"
+        ]
+
+    schema_version = manifest.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != _COMPACT_SCHEMA_VERSION:
+        return [
+            f"invalid: {label} (unsupported compact schema_version {schema_version!r})"
+        ]
+
+    graph_counts = manifest.get("graph")
+    if not isinstance(graph_counts, Mapping):
+        return [f"invalid: {label} (missing graph counts mapping)"]
+
+    node_count_val = graph_counts.get("node_count")
+    edge_count_val = graph_counts.get("edge_count")
+    traversal_count_val = graph_counts.get("traversal_count")
+    if (
+        isinstance(node_count_val, bool)
+        or not isinstance(node_count_val, int)
+        or node_count_val < 0
+        or isinstance(edge_count_val, bool)
+        or not isinstance(edge_count_val, int)
+        or edge_count_val < 0
+        or isinstance(traversal_count_val, bool)
+        or not isinstance(traversal_count_val, int)
+        or traversal_count_val < 0
+    ):
+        return [f"invalid: {label} (invalid compact graph counts)"]
+
+    node_count = node_count_val
+    edge_count = edge_count_val
+
+    bin_name = manifest.get("bin_path")
+    if not isinstance(bin_name, str) or not bin_name:
+        return [f"invalid: {label} (missing bin_path)"]
+    bin_path = (manifest_path.parent / bin_name).resolve()
+    if not bin_path.is_file():
+        return [f"invalid: {bin_path} (compact binary payload is missing)"]
+
+    bin_size_expected = manifest.get("bin_size_bytes")
+    if (
+        isinstance(bin_size_expected, bool)
+        or not isinstance(bin_size_expected, int)
+        or bin_size_expected <= 0
+    ):
+        return [f"invalid: {label} (invalid bin_size_bytes)"]
+    if bin_path.stat().st_size != bin_size_expected:
+        return [f"invalid: {bin_path} (compact binary size mismatch)"]
+
+    expected_bin_sha = manifest.get("bin_sha256")
+    if (
+        not isinstance(expected_bin_sha, str)
+        or not expected_bin_sha
+        or len(expected_bin_sha) != 64
+    ):
+        return [f"invalid: {label} (invalid or missing bin_sha256)"]
+    actual_bin_sha = _sha256_file(bin_path).hex()
+    if actual_bin_sha != expected_bin_sha:
+        return [f"invalid: {bin_path} (compact binary SHA-256 mismatch)"]
+
+    source_info = manifest.get("source")
+    if not isinstance(source_info, Mapping):
+        return [f"invalid: {label} (missing source metadata)"]
+    source_name = source_info.get("path")
+    if not isinstance(source_name, str) or not source_name:
+        return [f"invalid: {label} (missing source path)"]
+    source_path = (manifest_path.parent / source_name).resolve()
+    if not source_path.is_file():
+        return [f"invalid: {source_path} (compact source graph is missing)"]
+
+    source_schema = source_info.get("schema_version")
+    if (
+        isinstance(source_schema, bool)
+        or source_schema != _SQLITE_SCHEMA_VERSION
+    ):
+        return [
+            f"invalid: {label} (unsupported compact source schema_version {source_schema!r})"
+        ]
+
+    src_node_count = source_info.get("node_count")
+    src_edge_count = source_info.get("edge_count")
+    if isinstance(src_node_count, bool) or src_node_count != node_count:
+        return [f"invalid: {label} (compact source node count mismatch)"]
+    if isinstance(src_edge_count, bool) or src_edge_count != edge_count:
+        return [f"invalid: {label} (compact source edge count mismatch)"]
+
+    source_size_expected = source_info.get("size_bytes")
+    if (
+        isinstance(source_size_expected, bool)
+        or not isinstance(source_size_expected, int)
+        or source_size_expected <= 0
+    ):
+        return [f"invalid: {label} (invalid source size_bytes)"]
+    if source_path.stat().st_size != source_size_expected:
+        return [f"invalid: {source_path} (compact source graph size mismatch)"]
+
+    expected_source_sha = source_info.get("sha256")
+    if (
+        not isinstance(expected_source_sha, str)
+        or not expected_source_sha
+        or len(expected_source_sha) != 64
+    ):
+        return [f"invalid: {label} (invalid or missing source sha256)"]
+    actual_source_sha = _sha256_file(source_path).hex()
+    if actual_source_sha != expected_source_sha:
+        return [f"invalid: {source_path} (compact source graph SHA-256 mismatch)"]
+
+    sqlite_issues = _validate_sqlite_graph(source_path, region)
+    if sqlite_issues:
+        return sqlite_issues
+
+    expected_sections = manifest.get("sections")
+    if not isinstance(expected_sections, Mapping):
+        return [f"invalid: {label} (missing sections mapping)"]
+    missing_sections = _COMPACT_SECTION_NAMES.difference(expected_sections)
+    if missing_sections:
+        return [
+            f"invalid: {label} (compact manifest missing sections: {sorted(missing_sections)})"
+        ]
+    unknown_sections = set(expected_sections.keys()).difference(_COMPACT_SECTION_NAMES)
+    if unknown_sections:
+        return [
+            f"invalid: {label} (compact manifest has unknown section: {sorted(unknown_sections)})"
+        ]
+
+    for name, descriptor in expected_sections.items():
+        if not isinstance(descriptor, Mapping):
+            return [f"invalid: {label} (compact section {name} has no descriptor)"]
+        dtype = descriptor.get("dtype")
+        if dtype not in _COMPACT_DTYPE_ITEMSIZE:
+            return [f"invalid: {label} (compact section {name} has unknown dtype)"]
+        offset_val = descriptor.get("offset")
+        length_val = descriptor.get("length")
+        count_val = descriptor.get("count")
+        if (
+            isinstance(offset_val, bool)
+            or not isinstance(offset_val, int)
+            or offset_val < 0
+            or isinstance(length_val, bool)
+            or not isinstance(length_val, int)
+            or length_val < 0
+            or isinstance(count_val, bool)
+            or not isinstance(count_val, int)
+            or count_val < 0
+        ):
+            return [f"invalid: {label} (compact section {name} has invalid bounds)"]
+
+        offset = offset_val
+        length = length_val
+        count = count_val
+
+        if dtype == "raw":
+            if length != count:
+                return [f"invalid: {label} (compact section {name} size/count mismatch)"]
+        elif length != count * _COMPACT_DTYPE_ITEMSIZE[dtype]:
+            return [f"invalid: {label} (compact section {name} size/count mismatch)"]
+        if offset + length > bin_size_expected:
+            return [f"invalid: {label} (compact section {name} extends past payload)"]
+
+    previous_end = 0
+    for name, _dtype in _COMPACT_SECTION_SPECS:
+        descriptor = expected_sections[name]
+        offset = descriptor["offset"]
+        length = descriptor["length"]
+        if offset != previous_end:
+            return [
+                f"invalid: {label} (compact section {name} offset is not contiguous)"
+            ]
+        previous_end = offset + length
+    if previous_end != bin_size_expected:
+        return [f"invalid: {label} (compact section payload has trailing bytes)"]
+
+    if str(manifest.get("scenic_byway_road_type")) != _COMPACT_SCENIC_BYWAY_ROAD_TYPE:
+        return [f"invalid: {label} (compact manifest scenic byway marker mismatch)"]
+
+    expected_hw = ",".join(sorted(_compact_highway_road_types()))
+    if str(manifest.get("highway_road_types", "")) != expected_hw:
+        return [
+            f"invalid: {label} (compact manifest highway road-type mask is stale; rebuild it)"
+        ]
+
+    proj_info = manifest.get("projection_index")
+    if not isinstance(proj_info, Mapping):
+        return [f"invalid: {label} (missing projection_index metadata)"]
+
+    proj_name = proj_info.get("path")
+    if not isinstance(proj_name, str) or not proj_name:
+        return [f"invalid: {label} (missing projection sidecar path)"]
+    sidecar_path = (manifest_path.parent / proj_name).resolve()
+    if not sidecar_path.is_file():
+        return [f"invalid: {sidecar_path} (projection sidecar is missing)"]
+
+    proj_size_expected = proj_info.get("size_bytes")
+    if (
+        isinstance(proj_size_expected, bool)
+        or not isinstance(proj_size_expected, int)
+        or proj_size_expected <= 0
+    ):
+        return [f"invalid: {sidecar_path} (invalid projection sidecar size_bytes)"]
+    if sidecar_path.stat().st_size != proj_size_expected:
+        return [f"invalid: {sidecar_path} (projection sidecar size mismatch)"]
+
+    expected_proj_sha = proj_info.get("sha256")
+    if (
+        not isinstance(expected_proj_sha, str)
+        or not expected_proj_sha
+        or len(expected_proj_sha) != 64
+    ):
+        return [f"invalid: {sidecar_path} (invalid or missing projection sidecar sha256)"]
+    actual_proj_sha = _sha256_file(sidecar_path).hex()
+    if actual_proj_sha != expected_proj_sha:
+        return [f"invalid: {sidecar_path} (projection sidecar SHA-256 mismatch)"]
+
+    try:
+        EdgeProjectionIndex.load(sidecar_path, source_path, verify=True)
+    except (_SidecarError, ValueError, OSError) as exc:
+        return [f"invalid: {sidecar_path} ({exc})"]
+
+    return []
 
 def _active_checkpoint(root: Path) -> tuple[Path, list[str]]:
     """Resolve the checkpoint named by the active model-registry record."""
@@ -372,32 +785,56 @@ def _active_checkpoint(root: Path) -> tuple[Path, list[str]]:
         issues.append(f"invalid: {REGISTRY_PATH} (active checkpoint is missing)")
     return checkpoint_path, issues
 
-
 def check_artifacts(project_root: Path, graph: Path | None = None) -> int:
     root = project_root.resolve()
-    configured_graph, run_name, issues = _configured_new_england(root)
-    region, _ = _configured_region(root)
-    graph_path = _project_path(root, graph) if graph is not None else configured_graph
+    regions, issues = _configured_route_regions(root, cli_graph=graph)
     checkpoint_path, registry_issues = _active_checkpoint(root)
     issues.extend(registry_issues)
 
-    report_dir = root / "data/processed/heuristic_runs" / run_name / "report"
-    required_paths = [
-        graph_path,
-        report_dir / "report.json",
-        report_dir / "route.geojson",
-        report_dir / "route_metrics.json",
+    required_paths: list[Path] = [
         root / REGISTRY_PATH,
         checkpoint_path,
     ]
+
+    for reg in regions:
+        graph_path = reg["graph_path"]
+        run_name = reg["run_name"]
+        if graph_path and graph_path not in required_paths:
+            required_paths.append(graph_path)
+        if run_name:
+            report_dir = root / "data/processed/heuristic_runs" / run_name / "report"
+            for name in ("report.json", "route.geojson", "route_metrics.json"):
+                p = report_dir / name
+                if p not in required_paths:
+                    required_paths.append(p)
 
     missing: list[Path] = []
     for path in required_paths:
         if not path.is_file() and path not in missing:
             missing.append(path)
 
-    if graph_path.suffix.lower() == ".sqlite3" and graph_path not in missing:
-        issues.extend(_validate_sqlite_graph(graph_path, region))
+    for reg in regions:
+        graph_path = reg["graph_path"]
+        region_dict = reg["region_dict"]
+        if not graph_path or graph_path in missing:
+            continue
+
+        if graph_path.suffix.lower() == ".sqlite3":
+            issues.extend(_validate_sqlite_graph(graph_path, region_dict))
+            compact_manifest = graph_path.with_name(f"{graph_path.stem}.compact.json")
+            if compact_manifest.is_file():
+                issues.extend(_validate_compact_graph(compact_manifest, region_dict))
+            sidecar_path = EdgeProjectionIndex.sidecar_path(graph_path)
+            if sidecar_path.is_file() and not compact_manifest.is_file():
+                try:
+                    EdgeProjectionIndex.load(sidecar_path, graph_path, verify=True)
+                except (_SidecarError, ValueError, OSError) as exc:
+                    issues.append(f"invalid: {sidecar_path} ({exc})")
+        elif (
+            graph_path.name.endswith(".compact.json")
+            or graph_path.suffix.lower() == ".json"
+        ) and graph_path not in missing:
+            issues.extend(_validate_compact_graph(graph_path, region_dict))
 
     for path in missing:
         try:

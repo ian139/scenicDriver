@@ -19,6 +19,34 @@
       "size_bytes": 508427024
     },
     {
+      "name": "graph.compact.manifest",
+      "destination": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.compact.json",
+      "source_key": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.compact.json",
+      "sha256": "416dc9d7bf62d58b9d657b7c16e402274d4a36d1e56edaec0652d2208e2cb5ad",
+      "size_bytes": 6443
+    },
+    {
+      "name": "graph.compact.payload",
+      "destination": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.compact.bin",
+      "source_key": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.compact.bin",
+      "sha256": "6365746d804d50539dbac5416bcb8f4866386b0a2c40dc4d20081333c6c326dc",
+      "size_bytes": 3362413800
+    },
+    {
+      "name": "graph.compact.score.manifest",
+      "destination": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.score.7f7dc54cd1d8e1f6.z14.fbnull.nlinear-v1.json",
+      "source_key": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.score.7f7dc54cd1d8e1f6.z14.fbnull.nlinear-v1.json",
+      "sha256": "84ff0e9cbfa9a81f5239dd1474250edae9c0ee53fcc37bf7531098b66400f7e8",
+      "size_bytes": 825
+    },
+    {
+      "name": "graph.compact.score.payload",
+      "destination": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.score.7f7dc54cd1d8e1f6.z14.fbnull.nlinear-v1.bin",
+      "source_key": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.score.7f7dc54cd1d8e1f6.z14.fbnull.nlinear-v1.bin",
+      "sha256": "0465d2acf0326e3d541c2c12f90358068503a12edad5bc8b342fd91d40917758",
+      "size_bytes": 86340224
+    },
+    {
       "name": "report",
       "destination": "data/processed/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report/report.json",
       "source_key": "data/processed/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report/report.json.gz",
@@ -33,6 +61,64 @@
       "compression": "gzip",
       "sha256": "eb656ca4abf5e1cc1b9b53849ddf3f94a3e3d323b81cf0609a89a999dd0b51ff",
       "size_bytes": 126342647
+    },
+    {
+      "name": "expanded_route.geojson",
+      "destination": "data/processed/heuristic_runs/prompt_two_candidate_exp02_expanded_20260810/report/route.geojson",
+      "source_key": "data/processed/heuristic_runs/prompt_two_candidate_exp02_expanded_20260810/report/route.geojson.gz",
+      "compression": "gzip",
+      "sha256": "47fe0be633537b9c93a4867b4034f729b88922d502d2c4afc3013d1b687528f1",
+      "size_bytes": 19993557
+    },
+    {
+      "name": "expanded_route_metrics.json",
+      "destination": "data/processed/heuristic_runs/prompt_two_candidate_exp02_expanded_20260810/report/route_metrics.json",
+      "source_key": "data/processed/heuristic_runs/prompt_two_candidate_exp02_expanded_20260810/report/route_metrics.json.gz",
+      "compression": "gzip",
+      "sha256": "de530d417a32d6a17be51000d028f82384cac55361030229d03f159f310a829a",
+      "size_bytes": 16483525
+    },
+    {
+      "name": "expanded_graph.source",
+      "destination": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.sqlite3",
+      "source_key": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.sqlite3",
+      "sha256": "98795306baf933b67518b36daa9632c80394705477801405da2d967023615a04",
+      "size_bytes": 18680025088
+    },
+    {
+      "name": "expanded_graph.compact.manifest",
+      "destination": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.compact.json",
+      "source_key": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.compact.json",
+      "sha256": "26c5a61392a83056729848f3f12cf898e2a1f5a2e5cb71ecd909f588ff8b4195",
+      "size_bytes": 6508
+    },
+    {
+      "name": "expanded_graph.compact.payload",
+      "destination": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.compact.bin",
+      "source_key": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.compact.bin",
+      "sha256": "15531395c970f23573cff179457e2dfb7699b86d286cda2a15836e286ffc4c89",
+      "size_bytes": 18313525021
+    },
+    {
+      "name": "expanded_graph.edge_projection_index",
+      "destination": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.sqlite3.edge_projection_index",
+      "source_key": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.sqlite3.edge_projection_index",
+      "sha256": "441858642d9cf4b40136dffbc9200a9908c54c8a33a99121ad9e309f834334f6",
+      "size_bytes": 3068485448
+    },
+    {
+      "name": "expanded_graph.compact.score.manifest",
+      "destination": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.score.a9fff23e89860bfc.z14.fbnull.nlinear-v1.json",
+      "source_key": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.score.a9fff23e89860bfc.z14.fbnull.nlinear-v1.json",
+      "sha256": "12ac08f462b8cc086fd92c0478cff794a9778b02c76ede49d511691135a64d8a",
+      "size_bytes": 803
+    },
+    {
+      "name": "expanded_graph.compact.score.payload",
+      "destination": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.score.a9fff23e89860bfc.z14.fbnull.nlinear-v1.bin",
+      "source_key": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.score.a9fff23e89860bfc.z14.fbnull.nlinear-v1.bin",
+      "sha256": "381a14525d4f6561b345acf2315f3d88e6a7bad31e731428f61f566e1366e8e9",
+      "size_bytes": 533502928
     },
     {
       "name": "route.geojson",

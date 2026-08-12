@@ -130,7 +130,7 @@ def test_route_compare_missing_graph_does_not_leak_path(monkeypatch) -> None:
             "start": {"lat": 40.03, "lon": -75.22},
             "end": {"lat": 40.065, "lon": -75.19},
             "scenic_weight": 0.8,
-            "region": "philadelphia",
+            "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
             "include_baseline": True,
@@ -139,7 +139,7 @@ def test_route_compare_missing_graph_does_not_leak_path(monkeypatch) -> None:
     assert response.status_code == 404
     detail = response.json()["detail"]
     assert "/private/secret" not in detail
-    assert detail == "Route assets are unavailable for region 'philadelphia'"
+    assert detail == "Route assets are unavailable for region 'new_england_north'"
 
 
 def test_regions_list() -> None:
@@ -170,15 +170,27 @@ def test_northeast_expanded_region_configuration_and_discovery() -> None:
     )
     assert ne_region["is_default"] is False
     assert ne_region["source"] == "config"
-    assert ne_region["graph_exists"] is False
-    assert ne_region["route_planning_enabled"] is False
+    assert ne_region["graph_exists"] is (
+        app_api.PROJECT_ROOT
+        / "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.compact.json"
+    ).is_file()
+    assert ne_region["route_planning_enabled"] is True
 
-    # Counts and graph limits are explicit; this visualization is not route coverage.
     desc = ne_region["description"]
-    assert "369,822" in desc
-    assert "new_england_north (99,468)" in desc
-    assert "west_south_inland (270,354)" in desc
-    assert "Route planning is disabled for this view" in desc
+    assert (
+        desc
+        == "Expanded scenic coverage and cross-region routing across New England North and the western scored extent."
+    )
+
+    item = app_api._app_region("northeast_expanded")
+    assert item is not None
+    assert item["route_planning"] is True
+    assert item["route_deadline_seconds"] == 120
+    assert (
+        item["graph"]
+        == "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.compact.json"
+    )
+    assert item["run_name"] == "prompt_two_candidate_exp02_expanded_20260810"
 
     # The configured bounds match the full Stage One candidate-pool extent.
     assert ne_region["bbox"] == {
@@ -220,6 +232,43 @@ def test_northeast_expanded_report_availability_semantics() -> None:
         or "new_england_north" in diag["skipped_regions"]
     )
 
+
+def test_preload_configured_route_assets_skips_disabled_route_planning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_graph = tmp_path / "road_graph.json"
+    fake_graph.write_text("{}", encoding="utf-8")
+    fake_report = tmp_path / "report.json"
+    fake_report.write_text("{}", encoding="utf-8")
+
+    disabled_item = {
+        "region": "disabled_region",
+        "graph_path": str(fake_graph),
+        "tile_scores_path": str(fake_report),
+        "route_planning": False,
+    }
+
+    monkeypatch.setattr(app_api, "_configured_regions", lambda: [disabled_item])
+    monkeypatch.setattr(app_api, "_default_region_key", lambda: None)
+
+    preload_called = False
+
+    def _fail_preload(*args: Any, **kwargs: Any) -> Any:
+        nonlocal preload_called
+        preload_called = True
+        raise AssertionError("preload_route_assets should not be called for disabled region")
+
+    monkeypatch.setattr(app_api, "preload_route_assets", _fail_preload)
+
+    diag = app_api._preload_configured_route_assets(mode="best_effort")
+
+    assert preload_called is False
+    assert "disabled_region" in diag["skipped_regions"]
+    assert "disabled_region" not in diag["loaded_regions"]
+    region_diags = [r for r in diag["regions"] if r["region"] == "disabled_region"]
+    assert len(region_diags) == 1
+    assert region_diags[0]["status"] == "skipped"
+    assert region_diags[0]["reason"] == "route planning disabled"
 
 def test_region_graph_fallback_and_discovery_support_sqlite(
     tmp_path, monkeypatch
@@ -764,7 +813,7 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
             "start": {"lat": 40.03, "lon": -75.22},
             "end": {"lat": 40.065, "lon": -75.19},
             "scenic_weight": 0.8,
-            "region": "philadelphia",
+            "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": True,
             "include_baseline": True,
@@ -772,8 +821,8 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
     )
 
     assert response.status_code == 200
-    assert graph_calls == ["philadelphia"]
-    assert run_calls == ["philadelphia"]
+    assert graph_calls == ["new_england_north"]
+    assert run_calls == ["new_england_north"]
     assert len(plan_calls) == 1
     assert diagnosis_calls == []
 
@@ -1130,7 +1179,7 @@ def test_route_compare_rejects_incomplete_service_response(monkeypatch) -> None:
             "start": {"lat": 40.03, "lon": -75.22},
             "end": {"lat": 40.065, "lon": -75.19},
             "scenic_weight": 0.8,
-            "region": "philadelphia",
+            "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
             "include_baseline": False,
@@ -1233,7 +1282,7 @@ def test_route_compare_rejects_inconsistent_certified_bound(monkeypatch) -> None
             "start": {"lat": 40.03, "lon": -75.22},
             "end": {"lat": 40.065, "lon": -75.19},
             "scenic_weight": 0.8,
-            "region": "philadelphia",
+            "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
             "include_baseline": False,
@@ -1270,7 +1319,7 @@ def test_route_compare_rejects_per_route_weight_mismatch(monkeypatch) -> None:
             "start": {"lat": 40.03, "lon": -75.22},
             "end": {"lat": 40.065, "lon": -75.19},
             "scenic_weight": 0.8,
-            "region": "philadelphia",
+            "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
             "include_baseline": False,
@@ -1316,7 +1365,7 @@ def test_route_compare_redacts_private_asset_paths(monkeypatch) -> None:
             "start": {"lat": 40.03, "lon": -75.22},
             "end": {"lat": 40.065, "lon": -75.19},
             "scenic_weight": 0.8,
-            "region": "philadelphia",
+            "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
             "include_baseline": False,

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import heapq
 import math
 from threading import RLock
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
 
@@ -17,8 +17,8 @@ from scipy.sparse import csr_matrix as _scipy_csr_matrix
 from scipy.sparse.csgraph import dijkstra as _scipy_dijkstra
 from scipy.sparse.csgraph import shortest_path as _scipy_shortest_path
 
+from ._compact_search import run_compact_bidirectional_search
 from .cancellation import RoutingDeadline, RoutingTimeout
-
 from .cost import (
     CostWeights,
     HIGHWAY_ROAD_TYPES,
@@ -34,7 +34,14 @@ from .cost import (
     is_highway_road_type,
     resolve_routing_policy,
 )
-from .graph import Edge, EdgeProjection, EndpointRoadGraph, Node, RoadGraph
+from .graph import (
+    CompactRoadGraph,
+    Edge,
+    EdgeProjection,
+    EndpointRoadGraph,
+    Node,
+    RoadGraph,
+)
 
 _ORIGINAL_SCENIC_CALCULATE = ScenicCostFunction.calculate
 _ORIGINAL_SCENIC_ROAD_TYPE_ADJUSTMENT = (
@@ -67,6 +74,16 @@ def _check_active_deadline() -> None:
 def _check_active_deadline_at(counter: int) -> None:
     if counter & 1023 == 0:
         _check_active_deadline()
+
+def _active_deadline_remaining_seconds() -> Optional[float]:
+    """Return the active request's remaining wall-clock budget."""
+    deadline = _ACTIVE_ROUTING_DEADLINE.get()
+    if deadline is None:
+        return None
+    remaining = deadline.remaining_seconds()
+    if remaining is None:
+        return None
+    return max(0.0, remaining)
 
 
 @contextmanager
@@ -277,9 +294,17 @@ class _CSRTopology:
     edge_refs: Tuple[Tuple[str, bool], ...]
     distance_km: np.ndarray
     travel_time_minutes: np.ndarray
-    scenic_score: np.ndarray
+    _scenic_score: Union[np.ndarray, Callable[[], np.ndarray]]
     highway_mask: np.ndarray
     scenic_byway_mask: np.ndarray
+
+    @property
+    def scenic_score(self) -> np.ndarray:
+        if callable(self._scenic_score):
+            value = self._scenic_score()
+            object.__setattr__(self, "_scenic_score", value)
+            return value
+        return self._scenic_score
 
 @dataclass(frozen=True)
 class _CSRData:
@@ -498,6 +523,15 @@ class ScenicRoutePlanner:
                 "topology_built": False,
                 "fastest_variants": 0,
             }
+        if isinstance(self.graph, CompactRoadGraph):
+            self._endpoint_geodesic_bound_speed(self.graph, False)
+            return {
+                "available": True,
+                "topology_built": True,
+                "topology_traversals": len(topology.edge_refs),
+                "fastest_variants": 0,
+                "data_variants": 0,
+            }
         variants = 0
         for strict_highways in (False, True):
             cost = ScenicCostFunction(
@@ -514,7 +548,6 @@ class ScenicRoutePlanner:
             if signature is None or self._csr_data(cost, signature) is None:
                 continue
             variants += 1
-        self._endpoint_geodesic_bound_speed(self.graph, False)
         return {
             "available": True,
             "topology_built": True,
@@ -531,7 +564,43 @@ class ScenicRoutePlanner:
         graph = owner if owner is not None else self.graph
         if graph is None:
             return None
+        if isinstance(graph, EndpointRoadGraph):
+            graph = graph.base_graph
         stamp = graph._heuristic_cache_stamp()
+        if isinstance(graph, CompactRoadGraph):
+            try:
+                arrays = graph.compact_csr_arrays()
+            except (AttributeError, TypeError, ValueError):
+                return None
+            topology = _CSRTopology(
+                graph=graph,
+                stamp=stamp,
+                node_ids=arrays.node_ids,  # type: ignore[arg-type]
+                node_index=arrays.node_index,  # type: ignore[arg-type]
+                indptr=arrays.indptr,
+                indices=arrays.indices,
+                reverse_indptr=arrays.reverse_indptr,
+                reverse_indices=arrays.reverse_indices,
+                reverse_positions=arrays.reverse_positions,
+                edge_refs=arrays.edge_refs,  # type: ignore[arg-type]
+                distance_km=arrays.distance_km,
+                travel_time_minutes=arrays.travel_time_minutes,
+                _scenic_score=arrays._scenic_score,
+                highway_mask=arrays.highway_mask,
+                scenic_byway_mask=arrays.scenic_byway_mask,
+            )
+            _check_active_deadline()
+            active_graph = self.graph
+            owner_is_active = active_graph is graph or (
+                isinstance(active_graph, EndpointRoadGraph)
+                and active_graph.base_graph is graph
+            )
+            if (
+                not owner_is_active
+                or graph._heuristic_cache_stamp() != stamp
+            ):
+                return None
+            return topology
         try:
             node_ids = tuple(graph.nodes)
             node_index = {node_id: index for index, node_id in enumerate(node_ids)}
@@ -638,7 +707,7 @@ class ScenicRoutePlanner:
             edge_refs=tuple(edge_refs),
             distance_km=np.asarray(distances, dtype=np.float64),
             travel_time_minutes=np.asarray(durations, dtype=np.float64),
-            scenic_score=np.asarray(scenic_scores, dtype=np.float64),
+            _scenic_score=np.asarray(scenic_scores, dtype=np.float64),
             highway_mask=np.asarray(highway_mask, dtype=np.bool_),
             scenic_byway_mask=np.asarray(scenic_byway_mask, dtype=np.bool_),
         )
@@ -1607,8 +1676,18 @@ class ScenicRoutePlanner:
         reverse_seeds: List[Tuple[str, float, Tuple[object, ...], Optional[Edge]]],
         *,
         strict_mutation: bool = False,
+        base_weight_override: Optional[Callable[[int], float]] = None,
+        local_cost_override: Optional[Callable[[Edge], float]] = None,
+        cost_limit: Optional[float] = None,
+        lagrangian_multiplier: float = 0.0,
     ) -> Optional[Tuple[List[Edge], Tuple[object, ...]]]:
-        """Shared ranked bidirectional search over compact CSR and local edges."""
+        """Shared ranked bidirectional search over compact CSR and local edges.
+
+        ``base_weight_override`` supplies per-position base costs without an
+        E-sized temporary weight array; ``local_cost_override`` supplies
+        request-local (endpoint) edge costs; ``cost_limit`` prunes every label
+        whose partial cost already exceeds the bound (weights are nonnegative).
+        """
         graph = self.graph
         assert graph is not None
         active_stamp = graph._heuristic_cache_stamp()
@@ -1618,6 +1697,52 @@ class ScenicRoutePlanner:
         signature = self._built_in_cost_signature(cost_function)
         if signature is None:
             return None
+        is_compact_base = isinstance(topology.graph, CompactRoadGraph) or (
+            isinstance(topology.graph, EndpointRoadGraph)
+            and isinstance(topology.graph.base_graph, CompactRoadGraph)
+        )
+        if (
+            is_compact_base
+            and base_weight_override is None
+            and local_cost_override is None
+        ):
+            c_res = run_compact_bidirectional_search(
+                topology,
+                cost_function,
+                forward_seeds,
+                reverse_seeds,
+                lagrangian_multiplier=lagrangian_multiplier,
+                cost_limit=cost_limit,
+                deadline_seconds=_active_deadline_remaining_seconds(),
+            )
+            if c_res is not None:
+                positions, total_cost, fwd_idx, rev_idx = c_res
+                fwd_seed = forward_seeds[fwd_idx]
+                rev_seed = reverse_seeds[rev_idx]
+                path: List[Edge] = []
+                if fwd_seed[3] is not None:
+                    path.append(fwd_seed[3])
+                for pos in positions:
+                    edge_id, reverse = topology.edge_refs[pos]
+                    path.append(self._edge_from_reverse_index(edge_id, reverse))
+                if rev_seed[3] is not None:
+                    path.append(rev_seed[3])
+
+                forward_rank = fwd_seed[2]
+                reverse_rank = rev_seed[2]
+                middle_key = tuple(topology.edge_refs[pos][0] for pos in positions)
+                if forward_rank and reverse_rank:
+                    rank_key = (
+                        forward_rank[0],
+                        reverse_rank[0],
+                        forward_rank[1],
+                        reverse_rank[1],
+                        middle_key,
+                    )
+                else:
+                    rank_key = (middle_key,)
+                return path, rank_key
+
         data = self._csr_data(cost_function, signature)
         weights = (
             data.weights
@@ -1632,11 +1757,19 @@ class ScenicRoutePlanner:
             traversed = (
                 self._edge_from_reverse_index(edge_id, True) if reverse else edge
             )
+            if local_cost_override is not None:
+                return self._validated_nonnegative(
+                    local_cost_override(traversed), "edge calculated cost"
+                )
             return self._validated_nonnegative(
                 cost_function.calculate(traversed), "edge calculated cost"
             )
 
         def base_cost(position: int) -> float:
+            if base_weight_override is not None:
+                # Non-finite overrides (e.g. blocked edges) are skipped by the
+                # caller exactly like the cached weights-array path.
+                return float(base_weight_override(position))
             if weights is not None:
                 return float(weights[position])
             edge_id, reverse = topology.edge_refs[position]
@@ -1802,6 +1935,8 @@ class ScenicRoutePlanner:
         if compact_rank_keys:
             empty_path_key = None
         for node_id, cost, rank, seed_edge in forward_seeds:
+            if cost_limit is not None and cost > cost_limit:
+                continue
             add_label(
                 "f",
                 node_id,
@@ -1813,6 +1948,8 @@ class ScenicRoutePlanner:
                 rank,
             )
         for node_id, cost, rank, seed_edge in reverse_seeds:
+            if cost_limit is not None and cost > cost_limit:
+                continue
             add_label(
                 "r",
                 node_id,
@@ -1877,6 +2014,8 @@ class ScenicRoutePlanner:
                 or label["cost"] != current_cost
             ):
                 continue
+            if cost_limit is not None and current_cost > cost_limit:
+                continue
             other_id = best_at_node["r" if expand_side == "f" else "f"].get(
                 current_node
             )
@@ -1892,6 +2031,8 @@ class ScenicRoutePlanner:
                     raise ValueError(
                         "cumulative calculated cost must be finite and non-negative"
                     )
+                if cost_limit is not None and next_cost > cost_limit:
+                    continue
                 rank = tuple(label["rank"])
                 token_id = token_edge_id(token)
                 if compact_rank_keys:
@@ -4616,22 +4757,29 @@ class ScenicRoutePlanner:
         finally:
             self.graph = active_graph
 
-    def _multi_access_builtin_path(
+    def _endpoint_access_seeds(
         self,
         overlay: EndpointRoadGraph,
         starts: List[EdgeProjection],
         ends: List[EdgeProjection],
         cost_function: ScenicCostFunction,
-        direct_candidates: Tuple[Tuple[int, int, int, Edge], ...] = (),
-    ) -> Optional[Tuple[float, List[Edge], int, int, Tuple[object, ...]]]:
-        """Run one ranked search, including all direct endpoint candidates."""
+        *,
+        scalar_edge_cost: Optional[Callable[[Edge], float]] = None,
+    ) -> Tuple[
+        List[Tuple[str, float, Tuple[object, ...], Optional[Edge]]],
+        List[Tuple[str, float, Tuple[object, ...], Optional[Edge]]],
+    ]:
+        """Build ranked endpoint access seeds for one frozen overlay."""
+
         def access_cost(edge: Edge) -> float:
-            return self._validated_nonnegative(
-                cost_function.calculate(edge), "edge calculated cost"
+            value = (
+                scalar_edge_cost(edge)
+                if scalar_edge_cost is not None
+                else cost_function.calculate(edge)
             )
+            return self._validated_nonnegative(value, "edge calculated cost")
+
         endpoint_ids = getattr(overlay, "_route_endpoint_node_ids", None)
-
-
         forward_seeds: List[
             Tuple[str, float, Tuple[object, ...], Optional[Edge]]
         ] = []
@@ -4693,10 +4841,33 @@ class ScenicRoutePlanner:
                 reverse_seeds.append(
                     (str(endpoint_ids[1]), 0.0, (0, 0), None)
                 )
+        return forward_seeds, reverse_seeds
+
+    def _multi_access_builtin_path(
+        self,
+        overlay: EndpointRoadGraph,
+        starts: List[EdgeProjection],
+        ends: List[EdgeProjection],
+        cost_function: ScenicCostFunction,
+        direct_candidates: Tuple[Tuple[int, int, int, Edge], ...] = (),
+    ) -> Optional[Tuple[float, List[Edge], int, int, Tuple[object, ...]]]:
+        """Run one ranked search, including all direct endpoint candidates."""
+        def access_cost(edge: Edge) -> float:
+            return self._validated_nonnegative(
+                cost_function.calculate(edge), "edge calculated cost"
+            )
+        forward_seeds, reverse_seeds = self._endpoint_access_seeds(
+            overlay,
+            starts,
+            ends,
+            cost_function,
+        )
         large_graph_search = len(
             overlay.base_graph.edges
         ) > self._LARGE_GRAPH_EDGE_THRESHOLD
-        if large_graph_search:
+        if large_graph_search and not isinstance(
+            overlay.base_graph, CompactRoadGraph
+        ):
             result = self._large_graph_multi_access_path(
                 overlay,
                 starts,
@@ -4758,6 +4929,17 @@ class ScenicRoutePlanner:
         started_at = time.monotonic()
         search_scenic_weight = 1.0 if policy.scenic_priority else q
         base = request.overlay.base_graph
+        if isinstance(base, CompactRoadGraph):
+            return self._compact_lagrangian_scenic_search(
+                request,
+                q=q,
+                kappa=kappa,
+                fastest_duration_minutes=fastest_duration_minutes,
+                duration_cap_minutes=duration_cap_minutes,
+                policy=policy,
+                fastest_edges=fastest_edges,
+                fastest_evaluation=fastest_evaluation,
+            )
         scenic_cost = ScenicCostFunction(
             scenic_weight=search_scenic_weight,
             strict_highways=policy.strict_highways,
@@ -4872,6 +5054,166 @@ class ScenicRoutePlanner:
         return list(best_edges), best_evaluation, diagnostics
 
 
+
+    def _compact_lagrangian_scenic_search(
+        self,
+        request: _EndpointAccessRequest,
+        *,
+        q: float,
+        kappa: float,
+        fastest_duration_minutes: float,
+        duration_cap_minutes: float,
+        policy: RoutingPolicy,
+        fastest_edges: List[Edge],
+        fastest_evaluation: PathEvaluation,
+    ) -> Tuple[List[Edge], PathEvaluation, Dict[str, object]]:
+        """Ranked deadline-bounded scenic search over compact base CSR.
+
+        Lagrangian multipliers are applied per traversal position without an
+        E-sized weight copy, and every search is bounded by the fastest-path
+        scalar cost limit, so request memory stays proportional to the
+        explored labels rather than the full edge count.
+        """
+        started_at = time.monotonic()
+        search_scenic_weight = 1.0 if policy.scenic_priority else q
+        base = request.overlay.base_graph
+        scenic_cost = ScenicCostFunction(
+            scenic_weight=search_scenic_weight,
+            strict_highways=policy.strict_highways,
+            highway_preference=policy.highway_preference,
+            weights=self.cost_function.weights,
+        )
+        active_graph = self.graph
+        self.graph = base
+        try:
+            topology = self._csr_topology(owner=base)
+            signature = self._built_in_cost_signature(scenic_cost)
+            data = (
+                self._csr_data(scenic_cost, signature)
+                if signature is not None and not isinstance(base, CompactRoadGraph)
+                else None
+            )
+        finally:
+            self.graph = active_graph
+        if topology is None:
+            raise RuntimeError("compiled scenic routing is unavailable")
+        if not isinstance(base, CompactRoadGraph) and data is None:
+            raise RuntimeError("compiled scenic routing is unavailable")
+        if (
+            base._heuristic_cache_stamp() != request.graph_stamp
+            or topology.stamp != request.graph_stamp
+        ):
+            raise RuntimeError(
+                "road graph changed during compiled scenic search"
+            )
+
+        def check_graph() -> None:
+            _check_active_deadline()
+            if base._heuristic_cache_stamp() != request.graph_stamp:
+                raise RuntimeError(
+                    "road graph changed during compiled scenic search"
+                )
+
+        candidates: List[Tuple[List[Edge], PathEvaluation]] = [
+            (list(fastest_edges), fastest_evaluation)
+        ]
+        # Increasing duration multipliers trace a small, deterministic
+        # Lagrangian frontier without retaining a label for every base node.
+        multipliers = (0.0, 0.25, 0.75, 1.5)
+        weight_data = None if data is None else data.weights
+        travel_time = topology.travel_time_minutes
+        for multiplier in multipliers:
+            check_graph()
+
+            def base_weight(position: int, m: float = multiplier) -> float:
+                base_w = float(weight_data[position])
+                if not math.isfinite(base_w):
+                    return float("inf")
+                value = base_w + m * float(travel_time[position])
+                return value if value >= 0.0 else 0.0
+
+            def scalar_edge_cost(edge: Edge, m: float = multiplier) -> float:
+                return (
+                    scenic_cost.calculate(edge)
+                    + m * self._edge_duration_minutes(edge)
+                )
+
+            scalar_cost_limit = sum(
+                scalar_edge_cost(edge) for edge in fastest_edges
+            )
+            if not math.isfinite(scalar_cost_limit):
+                scalar_cost_limit = None
+            forward_seeds, reverse_seeds = self._endpoint_access_seeds(
+                request.overlay,
+                request.start_projections,
+                request.end_projections,
+                scenic_cost,
+                scalar_edge_cost=scalar_edge_cost,
+            )
+            result = self._bidirectional_search_core(
+                scenic_cost,
+                forward_seeds,
+                reverse_seeds,
+                strict_mutation=True,
+                base_weight_override=base_weight if not isinstance(base, CompactRoadGraph) else None,
+                local_cost_override=scalar_edge_cost if not isinstance(base, CompactRoadGraph) else None,
+                cost_limit=scalar_cost_limit,
+                lagrangian_multiplier=multiplier if isinstance(base, CompactRoadGraph) else 0.0,
+            )
+            check_graph()
+            if result is None:
+                continue
+            path, rank_key = result
+            best = (self._path_duration_minutes(path), path, rank_key)
+            best_metric = sum(scalar_edge_cost(edge) for edge in path)
+            for start_index, end_index, direction, edge in request.direct_candidates:
+                _check_active_deadline_at(start_index + end_index)
+                if self._avoids_highways(scenic_cost) and is_highway_road_type(
+                    edge.road_type
+                ):
+                    continue
+                duration = self._path_duration_minutes([edge])
+                metric = scalar_edge_cost(edge)
+                direct_rank_key = (start_index, end_index, 2, direction, ())
+                if (metric, direct_rank_key) < (best_metric, best[2]):
+                    best = (duration, [edge], direct_rank_key)
+                    best_metric = metric
+            duration, best_path, _rank_key = best
+            if not self._duration_within_cap(
+                duration, duration_cap_minutes
+            ):
+                continue
+            evaluation = evaluate_path(
+                best_path,
+                q=q,
+                kappa=kappa,
+                fastest_duration_minutes=fastest_duration_minutes,
+                policy=policy,
+                check_cancelled=_check_active_deadline,
+            )
+            candidates.append((best_path, evaluation))
+
+        check_graph()
+        best_edges, best_evaluation = candidates[0]
+        for candidate_edges, candidate_evaluation in candidates[1:]:
+            if is_better_path(candidate_evaluation, best_evaluation):
+                best_edges = candidate_edges
+                best_evaluation = candidate_evaluation
+        elapsed_ms = (time.monotonic() - started_at) * 1000.0
+        diagnostics = {
+            "time_limit_seconds": 0.0,
+            "labels_generated": len(multipliers),
+            "labels_expanded": len(candidates),
+            "labels_pruned": len(multipliers) - len(candidates) + 1,
+            "max_frontier_size": len(candidates),
+            "remaining_frontier_size": 0,
+            "deadline_reached": False,
+            "elapsed_ms": elapsed_ms,
+            "mode": "compiled-lagrangian",
+        }
+        return list(best_edges), best_evaluation, diagnostics
+
+
     def _large_graph_fastest_route(
         self,
         start: Tuple[float, float],
@@ -4887,6 +5229,7 @@ class ScenicRoutePlanner:
             end,
             avoid_highways=avoid_highways,
         )
+        setattr(request.overlay, "_route_access_request", request)
         self.graph = request.overlay
         try:
             policy = resolve_routing_policy(
@@ -4905,7 +5248,14 @@ class ScenicRoutePlanner:
             )
             if middle is None:
                 raise ValueError("No route found between the given coordinates.")
-            _, best_edges, start_index, end_index, _ = middle
+            _, best_edges, start_index, end_index, rank_key = middle
+            request.fastest_result = _EndpointRankedResult(
+                self._path_duration_minutes(best_edges),
+                tuple(best_edges),
+                start_index,
+                end_index,
+                rank_key,
+            )
             if base._heuristic_cache_stamp() != request.graph_stamp:
                 raise RuntimeError("road graph changed during fastest-path search")
             render_graph = RoadGraph()
@@ -5026,16 +5376,28 @@ class ScenicRoutePlanner:
             raise RuntimeError("Road graph not loaded")
         if not _endpoint_graph:
             base_graph = self.graph
-            request = self._build_endpoint_access_request(
-                start,
-                end,
-                avoid_highways=(
-                    bool(strict_highways)
-                    if strict_highways is not None
-                    else bool(avoid_highways)
-                ),
+            avoid_highways_value = (
+                bool(strict_highways)
+                if strict_highways is not None
+                else bool(avoid_highways)
             )
-            setattr(request.overlay, "_route_access_request", request)
+            cached_request = self._last_endpoint_access_request
+            request = cached_request
+            if not (
+                cached_request is not None
+                and cached_request.overlay.base_graph is base_graph
+                and cached_request.start == start
+                and cached_request.end == end
+                and cached_request.avoid_highways == avoid_highways_value
+                and cached_request.graph_stamp
+                == base_graph._heuristic_cache_stamp()
+            ):
+                request = self._build_endpoint_access_request(
+                    start,
+                    end,
+                    avoid_highways=avoid_highways_value,
+                )
+                setattr(request.overlay, "_route_access_request", request)
             self.graph = request.overlay
             try:
                 return self._find_scenic_route(
@@ -5088,24 +5450,27 @@ class ScenicRoutePlanner:
                 and len(endpoint_request.overlay.base_graph.nodes)
                 > self._ENDPOINT_OVERLAY_MAX_NODES
             ):
-                ranked = self._multi_access_builtin_path(
-                    endpoint_request.overlay,
-                    endpoint_request.start_projections,
-                    endpoint_request.end_projections,
-                    self._make_fastest_cost_function(),
-                    endpoint_request.direct_candidates,
-                )
-                if ranked is None:
-                    shortest_edges = None
-                else:
-                    endpoint_request.fastest_result = _EndpointRankedResult(
-                        ranked[0],
-                        tuple(ranked[1]),
-                        ranked[2],
-                        ranked[3],
-                        ranked[4],
-                    )
+                if endpoint_request.fastest_result is not None:
                     shortest_edges = list(endpoint_request.fastest_result.edges)
+                else:
+                    ranked = self._multi_access_builtin_path(
+                        endpoint_request.overlay,
+                        endpoint_request.start_projections,
+                        endpoint_request.end_projections,
+                        self._make_fastest_cost_function(),
+                        endpoint_request.direct_candidates,
+                    )
+                    if ranked is None:
+                        shortest_edges = None
+                    else:
+                        endpoint_request.fastest_result = _EndpointRankedResult(
+                            ranked[0],
+                            tuple(ranked[1]),
+                            ranked[2],
+                            ranked[3],
+                            ranked[4],
+                        )
+                        shortest_edges = list(endpoint_request.fastest_result.edges)
             else:
                 shortest_edges = self._cached_fastest_edges(
                     start_node,
@@ -5662,6 +6027,24 @@ class ScenicRoutePlanner:
             if graph._heuristic_cache_stamp() == stamp:
                 return cache[cache_key]
             del cache[cache_key]
+
+        if isinstance(graph, CompactRoadGraph):
+            result = graph.endpoint_geodesic_bound_speed(bool(avoid_highways))
+            final_stamp = graph._heuristic_cache_stamp()
+            if final_stamp != stamp:
+                return None
+            cache[cache_key] = result
+            cache.move_to_end(cache_key)
+            if not avoid_highways:
+                highway_key = (graph, stamp, True)
+                cache[highway_key] = result
+                cache.move_to_end(highway_key)
+            while (
+                len(cache)
+                > type(self)._ENDPOINT_GEODESIC_SPEED_CACHE_CAPACITY
+            ):
+                cache.popitem(last=False)
+            return result
 
         maximum_speed = 1.0
         valid = True
