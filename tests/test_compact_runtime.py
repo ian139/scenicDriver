@@ -594,14 +594,14 @@ def test_compact_scored_plan_routes_avoids_native_clone(
     route_service.clear_route_caches()
 
     cancel_event = Event()
-    real_deepcopy = route_service.deepcopy
+    real_dumps = route_service.pickle.dumps
 
-    def cancel_after_copy(value: object) -> object:
-        copied = real_deepcopy(value)
+    def cancel_after_serialize(value: object, *args: object, **kwargs: object) -> bytes:
+        serialized = real_dumps(value, *args, **kwargs)
         cancel_event.set()
-        return copied
+        return serialized
 
-    monkeypatch.setattr(route_service, "deepcopy", cancel_after_copy)
+    monkeypatch.setattr(route_service.pickle, "dumps", cancel_after_serialize)
     with pytest.raises(RoutingCancelled):
         route_service.plan_routes(
             request,

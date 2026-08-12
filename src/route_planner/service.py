@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import weakref
 from pathlib import Path
 from threading import RLock
@@ -291,9 +292,7 @@ _RouteResponseCacheKey = tuple[
     _FileSignature | None,
     str | None,
 ]
-_ROUTE_RESPONSE_CACHE: OrderedDict[_RouteResponseCacheKey, dict[str, Any]] = (
-    OrderedDict()
-)
+_ROUTE_RESPONSE_CACHE: OrderedDict[_RouteResponseCacheKey, bytes] = OrderedDict()
 _ROUTE_RESPONSE_CACHE_CAPACITY = 8
 _CACHE_LOCK = RLock()
 
@@ -1712,7 +1711,7 @@ def plan_routes(
         if cached_response is not None:
             _ROUTE_RESPONSE_CACHE.move_to_end(response_cache_key)
     if cached_response is not None:
-        response = deepcopy(cached_response)
+        response = pickle.loads(cached_response)
         if deadline is not None:
             deadline.check()
         response["diagnostics"]["route_response_cache_hit"] = True
@@ -2073,7 +2072,10 @@ def plan_routes(
         "geojson": {"type": "FeatureCollection", "features": features},
     }
     with _CACHE_LOCK:
-        _ROUTE_RESPONSE_CACHE[response_cache_key] = deepcopy(response)
+        _ROUTE_RESPONSE_CACHE[response_cache_key] = pickle.dumps(
+            response,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
         _ROUTE_RESPONSE_CACHE.move_to_end(response_cache_key)
         while len(_ROUTE_RESPONSE_CACHE) > _ROUTE_RESPONSE_CACHE_CAPACITY:
             _ROUTE_RESPONSE_CACHE.popitem(last=False)
