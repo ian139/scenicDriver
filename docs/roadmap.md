@@ -27,11 +27,12 @@ The promoted v6 learned regressor remains the baseline. Its metrics and provenan
 
 ## Routing
 
-The bounded scenic scalar traversal is the retained implementation. Its production benchmark and policy boundary are recorded in the [routing performance log](research/routing-performance-autoresearch.md).
+The bounded scenic scalar traversal, compact-search heap improvements, and bounded exact warm-response cache are retained. Their production evidence and policy boundaries are recorded in the [routing performance log](research/routing-performance-autoresearch.md).
 
 - Revalidate the fixed production workload after the corrected detour and best-effort highway policies.
+- Reduce exact Northeast Expanded cache-miss latency; the sub-50 ms result applies only to repeated identical warm requests.
 - Keep future routing optimization evidence-driven: profile first, preserve route identity and correctness invariants, then compare on a fixed workload.
-- Revisit a compact, mmap-backed graph artifact only if it improves cold load time and resident memory on the production graph while preserving IDs, adjacency order, nearest-node ties, overlays, and route output.
+- Consider exact precomputed indexes only with an approved graph/deployment artifact change and production preprocessing plan.
 
 ## Release
 

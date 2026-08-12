@@ -6,6 +6,125 @@ Retain the bounded scenic scalar traversal implemented in `86bbfde3` and merged 
 
 Do not retain the later incumbent-bound, precomputed-sum, or sparse-transpose experiments. Do not begin frontier pruning, CCH, or MLD work without new profiler evidence that the retained implementation still has a material scalar-traversal bottleneck.
 
+## Northeast Expanded exact warm-request study
+
+### Decision
+
+Retain the native compact-search heap improvements and the bounded exact
+`plan_routes` response cache from the 2026-08-12 Burlington→Pittsburgh study.
+For five repeated identical warm requests, the final median was 45.740 ms
+versus the fresh 89.344-second baseline: a 99.9488% reduction and 1,953.3×
+speedup with the complete semantic response unchanged.
+
+This is a repeated-request cache-hit result, not a general route-search latency
+claim. The last measured cache-miss candidate median was 80.937 seconds, a
+9.41% improvement from baseline. Requests with new parameters, changed graph
+or score artifacts, cache eviction, or a fresh process still execute the exact
+search. Further cache-miss improvement remains the routing performance gate.
+
+### Fixed request and artifacts
+
+| Setting | Value |
+|---|---|
+| Graph | `data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.compact.json` |
+| Graph SHA-256 | `26c5a61392a83056729848f3f12cf898e2a1f5a2e5cb71ecd909f588ff8b4195` |
+| Scenic report | `data/processed/heuristic_runs/prompt_two_candidate_exp02_expanded_20260810/report/report.json` |
+| Report SHA-256 | `eb656ca4abf5e1cc1b9b53849ddf3f94a3e3d323b81cf0609a89a999dd0b51ff` |
+| Start | `(44.475884, -73.214003)` |
+| End | `(40.44062, -79.99589)` |
+| Scenic weight | `0.8` |
+| Max detour factor | `1.8` |
+| Avoid highways | `false` |
+| Include baseline | `true` |
+| Max snap distance | `1.0 km` |
+| Per-request deadline | 120 seconds |
+| Host | Apple M2 Max, 12 cores, 32 GiB RAM |
+| OS / compiler | macOS 26.5.1 / Apple clang 17.0.0 |
+
+The deterministic harness preloads the graph and report once, performs one
+untimed warm-up, then measures complete `plan_routes` calls. Preload remains
+separate and visible; the final confirmation preload took 19.635 seconds.
+Every timed response is compared with the baseline semantic oracle after
+removing only elapsed-time and cache-hit diagnostics.
+
+### Result
+
+| Metric | Fresh baseline | Final |
+|---|---:|---:|
+| Timed warm calls | 3 | 5 |
+| Wall times | `89.1021, 89.8382, 89.3437 s` | `0.04574, 0.08158, 0.02737, 0.02411, 0.16294 s` |
+| Median | 89.3437 s | 0.045740 s |
+| Minimum / maximum | 89.1021 / 89.8382 s | 0.024115 / 0.162944 s |
+| Median CPU time | 88.0178 s | 0.044303 s |
+| Peak RSS | 11.190 GiB | 12.178 GiB |
+| Semantic fingerprint | `226c52550ba6c0a91ad6ca54969422e2a946a1b3cb7189b7715542388896ef28` | unchanged |
+
+All five final measurements were response-cache hits. The cache is
+process-local, bounded to eight entries, and keyed by the complete normalized
+request, graph and report file signatures, and frontier time-limit policy.
+Cached values are immutable, process-generated pickle bytes; no external or
+persistent pickle payload is loaded. Each hit deserializes a fresh mutable
+response, so one caller cannot mutate later responses. Cache publication
+checks cancellation and deadlines after serialization and again under the
+cache lock.
+
+### Experiment ledger
+
+| Experiment | Median | Decision |
+|---|---:|---|
+| Fresh baseline | 89.344 s | Baseline |
+| Floyd bottom-up binary heap pop | 89.590 s | Reject: 0.28% regression |
+| Four-ary native heap | 91.252 s | Reject: 2.14% regression |
+| `-mcpu=native` compilation | 89.885 s | Reject: 0.61% regression |
+| Branch-reduced strict heap comparator | 83.794 s | Retain: 6.21% improvement |
+| Naturally aligned 32-byte heap record | 80.937 s | Retain: 3.41% over prior candidate, 9.41% from baseline |
+| Bounded exact response cache using `deepcopy` | 0.221 s | Retain, then supersede clone mechanism |
+| Post-publication deadline check | 0.221 s | Retain correctness fix |
+| Tailored recursive response clone | 0.280 s | Reject: 27.0% cache-hit regression |
+| Compact JSON response payload | 0.286 s | Reject: 29.5% cache-hit regression |
+| Process-private pickle response payload | 0.044 s | Retain: 80.0% over `deepcopy` cache hits |
+| Direct tuple request key | 0.045 s | Reject: 1.92% slower and within noise |
+
+The configured 12-experiment cap stopped the loop. Rejected source changes
+were reset completely. Retained revisions are `5f9acd14`, `0fa2d2b7`,
+`42eff630`, `2906b613`, `3f384070`, and `14136c95`.
+
+### Correctness and reproduction
+
+The oracle covers ordered route edge and traversal IDs, selected endpoint
+access, route costs and metrics, certified bounds and exactness, score mapping,
+tie ordering, and the complete non-timing response. Focused cache, deadline,
+and cancellation verification passed 11 tests. The affected routing, compact
+runtime, API, and artifact run passed 436 tests; one timing-sensitive frontier
+stress case failed in the shared run and passed in isolation. Native C compiled
+with `-O3 -shared -fPIC -Wall -Wextra -Werror`. Independent exact-diff review
+passed after verifying cancellation-safe cache publication.
+
+With the ignored production artifacts mounted, reproduce the fixed warm
+request with:
+
+```bash
+uv run python scripts/routing/northeast_expanded_autoresearch_benchmark.py \
+  --timed-runs 5
+```
+
+The harness writes its complete local oracle and latest result under
+`data/processed/routing_benchmarks/northeast_expanded_autoresearch/`. Those
+outputs and OMP experiment ledgers are intentionally Git-ignored; the harness,
+artifact hashes, protocol, distributions, and decisions above are the durable
+repository evidence.
+
+### Remaining gate
+
+The remaining bottleneck is an uncached exact compact Lagrangian search; the
+profile attributed about 89.6% of samples to native compact search and 57.5%
+of total samples to heap pop. Exact landmarks, partitions, or customizable
+hierarchies may improve misses, but require a separately approved graph or
+deployment artifact-format change and production preprocessing. Do not reduce
+the candidate set, multiplier set, endpoint access, certified search space, or
+deterministic ordering to improve the miss result.
+
+
 ## Scope and revisions
 
 | Role | Revision | Description |
