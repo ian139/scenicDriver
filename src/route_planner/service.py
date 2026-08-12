@@ -4,10 +4,12 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from copy import copy
 from dataclasses import dataclass
+import gc
 import hashlib
 import json
 import math
 import os
+import weakref
 from pathlib import Path
 from threading import RLock
 from time import perf_counter
@@ -25,7 +27,7 @@ from .cancellation import (
     RoutingDeadline,
     RoutingTimeout,
 )
-from .graph import RoadGraph
+from .graph import CompactRoadGraph, RoadGraph
 from .planner import (
     Route,
     ScenicRoutePlanner,
@@ -269,19 +271,220 @@ def _signature_digest(path_key: str, signature: _FileSignature) -> str:
 
 
 # ``_GRAPH_CACHE`` retains either the canonical raw graph or the active
-# scored variant, never both.  A scored miss briefly holds the raw graph,
-# its private native-edge clone, and (while replacing it) the previous
-# scored variant.  Only one graph variant is retained after publication;
-# requests already using an evicted variant keep their own reference.
+# scored variant per graph key, never both.  Up to two distinct graph paths can
+# coexist concurrently.  A scored miss briefly holds the raw graph, its
+# private native-edge clone, and (while replacing it) the previous scored
+# variant for that graph key.  Only one active scored variant per graph key is retained
+# after publication; requests already using an evicted variant keep their own reference.
 _GRAPH_CACHE: OrderedDict[_GraphCacheKey, RoadGraph] = OrderedDict()
 _TILE_SCORE_CACHE: OrderedDict[_GraphCacheKey, _TileCacheValue] = OrderedDict()
 _ScoredGraphCacheKey = tuple[_GraphCacheKey, _GraphCacheKey, int, float | None, str]
 _SCORED_GRAPH_CACHE: OrderedDict[_ScoredGraphCacheKey, RoadGraph] = OrderedDict()
-_ACTIVE_GRAPH_VARIANT_KEY: _ScoredGraphCacheKey | None = None
-_CACHE_CAPACITY = 1
-_TILE_CACHE_CAPACITY = 1
-_SCORED_GRAPH_CACHE_CAPACITY = 1
+_ACTIVE_GRAPH_VARIANT_KEYS: OrderedDict[_GraphCacheKey, _ScoredGraphCacheKey] = OrderedDict()
+_CACHE_CAPACITY = 2
+_TILE_CACHE_CAPACITY = 2
+_SCORED_GRAPH_CACHE_CAPACITY = 2
 _CACHE_LOCK = RLock()
+
+# Compact graphs own mmap-backed binary payloads, projection indexes, and
+# per-report score sidecars that must be released deterministically when the
+# final retained cache reference/variant is dropped.  A compact graph also
+# participates in internal graph<->mapping reference cycles, so dropping the
+# last cache reference does not destroy it by itself: the cache runs a full
+# ``gc.collect`` at last-owner drop, which collects only unreachable webs and
+# therefore never invalidates a graph still retained or borrowed by an
+# in-flight request.  Each compact graph admitted to the shared caches is
+# registered once with a close-on-final-release finalizer whose captured
+# handles never reference the graph itself (the projection index is captured
+# through its mmap/file, since the index's canonical-key sequences reference
+# the graph and would otherwise pin the whole reference web alive).  The
+# finalizer runs while the graph's arrays still export the mappings, so it
+# closes every order-safe resource and a post-collection pass finishes the
+# mmap/file handles once the exporters are gone.
+# Registry values: (finalizer, (bin_mmap, bin_file, projection_mmap,
+# projection_file)) -- the handles let the cache finish the close after the
+# graph's web is collected.
+_COMPACT_GRAPH_FINALIZERS: dict[
+    int, tuple[weakref.finalize, tuple[Any, Any, Any, Any]]
+] = {}
+# Set when a compact graph's final cache reference was dropped; flushed (via
+# ``gc.collect``) at the end of each top-level cache-lock region, when no
+# in-progress frame can still reference the released graph.
+_PENDING_COMPACT_RELEASE = False
+# One-shot guard so the post-collection finish hook is registered once.
+_GC_FINISH_HOOK_REGISTERED = False
+
+
+def _register_compact_graph_finalizer(graph: RoadGraph) -> None:
+    """Register exactly one close-on-final-release finalizer per compact graph."""
+    global _GC_FINISH_HOOK_REGISTERED
+    if not isinstance(graph, CompactRoadGraph):
+        return
+    if not _GC_FINISH_HOOK_REGISTERED:
+        gc.callbacks.append(_finish_compact_graphs_after_collect)
+        _GC_FINISH_HOOK_REGISTERED = True
+    graph_id = id(graph)
+    existing = _COMPACT_GRAPH_FINALIZERS.get(graph_id)
+    if existing is not None:
+        peeked = existing[0].peek()
+        if peeked is not None and peeked[0] is graph:
+            return
+    if len(_COMPACT_GRAPH_FINALIZERS) >= 128:
+        for stale_id, stale in tuple(_COMPACT_GRAPH_FINALIZERS.items()):
+            if not stale[0].alive:
+                _COMPACT_GRAPH_FINALIZERS.pop(stale_id, None)
+    projection_index = graph._nearest_edge_projection_index
+    projection_mmap = (
+        getattr(projection_index, "_mmap", None)
+        if projection_index is not None
+        else None
+    )
+    projection_file = (
+        getattr(projection_index, "_file", None)
+        if projection_index is not None
+        else None
+    )
+    bin_mmap = graph._bin_mmap
+    bin_file = graph._bin_file
+    finalizer = weakref.finalize(
+        graph,
+        _close_compact_graph_resources,
+        graph._sections,
+        bin_mmap,
+        bin_file,
+        graph._active_score_sidecar,
+        projection_mmap,
+        projection_file,
+    )
+    _COMPACT_GRAPH_FINALIZERS[graph_id] = (
+        finalizer,
+        (bin_mmap, bin_file, projection_mmap, projection_file),
+    )
+
+
+def _close_compact_graph_resources(
+    sections: Mapping[str, Any],
+    bin_mmap: Any,
+    bin_file: Any,
+    score_sidecar: Any,
+    projection_mmap: Any,
+    projection_file: Any,
+) -> None:
+    """Deterministically close one compact graph's owned resources.
+
+    Mirrors ``CompactRoadGraph.close`` for the captured handles.  Runs from a
+    finalize callback when the graph's reference web is collected at
+    last-owner drop, so a graph still retained or borrowed by an in-flight
+    request keeps every resource open.  Mmap closes can raise ``BufferError``
+    while the graph's arrays still export the mapping; those handles are
+    finished by ``_finish_released_compact_graphs_locked`` once the web is
+    gone.  Finalization never propagates exceptions into the code releasing
+    the last reference.
+    """
+    if score_sidecar is not None and hasattr(score_sidecar, "close"):
+        try:
+            score_sidecar.close()
+        except Exception:
+            pass
+    if projection_mmap is not None:
+        try:
+            projection_mmap.close()
+        except Exception:
+            pass
+    if projection_file is not None:
+        try:
+            projection_file.close()
+        except Exception:
+            pass
+    if sections is not None and hasattr(sections, "clear"):
+        sections.clear()
+    if bin_mmap is not None:
+        try:
+            bin_mmap.close()
+        except Exception:
+            pass
+    if bin_file is not None:
+        try:
+            bin_file.close()
+        except Exception:
+            pass
+
+
+def _finish_compact_graph_close(
+    bin_mmap: Any, bin_file: Any, projection_mmap: Any, projection_file: Any
+) -> None:
+    """Close mmap/file handles a mid-collection finalizer could not release.
+
+    Runs after the graph's reference web has been collected, when its arrays
+    no longer export the backing mappings.  Idempotent: resources the
+    finalizer already closed are skipped.
+    """
+    for resource in (projection_mmap, projection_file, bin_mmap, bin_file):
+        if resource is not None and not getattr(resource, "closed", False):
+            try:
+                resource.close()
+            except Exception:
+                pass
+
+
+def _finish_released_compact_graphs_locked() -> None:
+    """Finish closes for every compact graph whose web was already collected."""
+    for _graph_id, (finalizer, handles) in tuple(
+        _COMPACT_GRAPH_FINALIZERS.items()
+    ):
+        if not finalizer.alive:
+            _finish_compact_graph_close(*handles)
+
+
+def _finish_compact_graphs_after_collect(phase: str, _info: object) -> None:
+    """Finish mmap/file closes after every collection, whatever triggered it.
+
+    The finalizer runs mid-collection while the graph's arrays still export
+    the backing mappings, so a release can also be collected by a natural GC
+    pass or an explicit test-side collect; this hook guarantees the remaining
+    handles are closed once the collection completes.
+    """
+    if phase != "stop":
+        return
+    _finish_released_compact_graphs_locked()
+
+
+def _release_compact_graph_locked(graph: RoadGraph | None) -> None:
+    """Mark one compact graph for deterministic resource release once the
+    cache drops its final retained reference/variant.
+
+    The graph's reference web is only collectable when no cache variant and
+    no in-flight request still holds it; the actual collection is deferred to
+    ``_flush_compact_releases_locked`` so that no in-progress cache frame
+    still references the graph.  A full ``gc.collect`` collects exclusively
+    unreachable webs, firing each graph's close-on-final-release finalizer at
+    a deterministic point.
+    """
+    global _PENDING_COMPACT_RELEASE
+    if not isinstance(graph, CompactRoadGraph):
+        return
+    if graph in _GRAPH_CACHE.values() or graph in _SCORED_GRAPH_CACHE.values():
+        return
+    _PENDING_COMPACT_RELEASE = True
+
+
+def _flush_compact_releases_locked() -> None:
+    """Collect and finish every compact graph released since the last flush.
+
+    The planner's shared caches key on graph objects, so they are dropped
+    first; otherwise a released graph stays reachable and its resources stay
+    open.  The flush runs only at the end of a cache-lock region after a
+    compact graph lost its final retained reference/variant (eviction,
+    invalidation, replacement, or clear), so the current request rebuilds any
+    caches it still needs.
+    """
+    global _PENDING_COMPACT_RELEASE
+    if not _PENDING_COMPACT_RELEASE:
+        return
+    _PENDING_COMPACT_RELEASE = False
+    ScenicRoutePlanner.clear_shared_caches()
+    gc.collect()
+    _finish_released_compact_graphs_locked()
 
 
 def _resolved_path_key(path: Path) -> str:
@@ -306,15 +509,22 @@ def clear_route_caches() -> None:
     explicit hook keeps tests and long-lived workers able to release retained
     graph memory between independent jobs.
     """
+    global _PENDING_COMPACT_RELEASE
 
-    global _ACTIVE_GRAPH_VARIANT_KEY
     with _CACHE_LOCK:
+        had_compact = any(
+            isinstance(graph, CompactRoadGraph)
+            for graph in tuple(_GRAPH_CACHE.values())
+            + tuple(_SCORED_GRAPH_CACHE.values())
+        )
         _GRAPH_CACHE.clear()
         _TILE_SCORE_CACHE.clear()
         _SCORED_GRAPH_CACHE.clear()
+        _ACTIVE_GRAPH_VARIANT_KEYS.clear()
         ScenicRoutePlanner.clear_shared_caches()
-        _ACTIVE_GRAPH_VARIANT_KEY = None
-
+        if had_compact:
+            _PENDING_COMPACT_RELEASE = True
+        _flush_compact_releases_locked()
 
 def _apply_tile_scores_to_graph_native(
     graph: RoadGraph,
@@ -398,14 +608,45 @@ def _clone_graph_for_scoring(
     return variant
 
 
-def _clear_scored_variant_locked() -> None:
-    """Drop the sole scored variant while retaining no stale graph alias."""
+def _clear_scored_variant_for_graph_locked(graph_key: _GraphCacheKey) -> None:
+    """Drop the active scored variant for one graph key while retaining no stale alias."""
 
-    global _ACTIVE_GRAPH_VARIANT_KEY
-    if _ACTIVE_GRAPH_VARIANT_KEY is not None:
-        _GRAPH_CACHE.pop(_ACTIVE_GRAPH_VARIANT_KEY[0], None)
-    _SCORED_GRAPH_CACHE.clear()
-    _ACTIVE_GRAPH_VARIANT_KEY = None
+    active_key = _ACTIVE_GRAPH_VARIANT_KEYS.pop(graph_key, None)
+    if active_key is not None:
+        evicted = _SCORED_GRAPH_CACHE.pop(active_key, None)
+        _GRAPH_CACHE.pop(graph_key, None)
+        _release_compact_graph_locked(evicted)
+
+
+def _enforce_cache_capacities_locked() -> None:
+    """Enforce capacity limits on graph, tile score, and scored graph caches coherently."""
+
+    while len(_GRAPH_CACHE) > _CACHE_CAPACITY:
+        evicted_gkey, evicted_graph = _GRAPH_CACHE.popitem(last=False)
+        active_skey = _ACTIVE_GRAPH_VARIANT_KEYS.pop(evicted_gkey, None)
+        if active_skey is not None:
+            _SCORED_GRAPH_CACHE.pop(active_skey, None)
+        _release_compact_graph_locked(evicted_graph)
+
+    while len(_SCORED_GRAPH_CACHE) > _SCORED_GRAPH_CACHE_CAPACITY:
+        evicted_skey, evicted_sgraph = _SCORED_GRAPH_CACHE.popitem(last=False)
+        gkey = evicted_skey[0]
+        if _ACTIVE_GRAPH_VARIANT_KEYS.get(gkey) == evicted_skey:
+            _ACTIVE_GRAPH_VARIANT_KEYS.pop(gkey, None)
+            if _GRAPH_CACHE.get(gkey) is evicted_sgraph:
+                _GRAPH_CACHE.pop(gkey, None)
+        _release_compact_graph_locked(evicted_sgraph)
+
+    while len(_TILE_SCORE_CACHE) > _TILE_CACHE_CAPACITY:
+        evicted_tkey, _ = _TILE_SCORE_CACHE.popitem(last=False)
+        for skey in tuple(_SCORED_GRAPH_CACHE):
+            if skey[1] == evicted_tkey:
+                gkey = skey[0]
+                evicted_sgraph = _SCORED_GRAPH_CACHE.pop(skey, None)
+                if _ACTIVE_GRAPH_VARIANT_KEYS.get(gkey) == skey:
+                    _ACTIVE_GRAPH_VARIANT_KEYS.pop(gkey, None)
+                    _GRAPH_CACHE.pop(gkey, None)
+                _release_compact_graph_locked(evicted_sgraph)
 
 
 def _load_cached_graph(
@@ -414,8 +655,6 @@ def _load_cached_graph(
     scored_cache_key: _ScoredGraphCacheKey | None = None,
     deadline: RoutingDeadline | None = None,
 ) -> tuple[RoadGraph, str, _FileSignature, bool]:
-    global _ACTIVE_GRAPH_VARIANT_KEY
-
     if deadline is not None:
         deadline.check()
 
@@ -429,26 +668,36 @@ def _load_cached_graph(
                 _GRAPH_CACHE[cache_key] = scored
                 _GRAPH_CACHE.move_to_end(cache_key)
                 _SCORED_GRAPH_CACHE.move_to_end(scored_cache_key)
-                while len(_GRAPH_CACHE) > _CACHE_CAPACITY:
-                    _GRAPH_CACHE.popitem(last=False)
-                _ACTIVE_GRAPH_VARIANT_KEY = scored_cache_key
+                _ACTIVE_GRAPH_VARIANT_KEYS[cache_key] = scored_cache_key
+                _ACTIVE_GRAPH_VARIANT_KEYS.move_to_end(cache_key)
+                _enforce_cache_capacities_locked()
+                _flush_compact_releases_locked()
                 return scored, path_key, signature, True
 
         cached = _GRAPH_CACHE.get(cache_key)
-        if cached is not None and _ACTIVE_GRAPH_VARIANT_KEY is None:
+        if cached is not None and cache_key not in _ACTIVE_GRAPH_VARIANT_KEYS:
             _GRAPH_CACHE.move_to_end(cache_key)
+            _flush_compact_releases_locked()
             return cached, path_key, signature, True
 
         # A native scored variant cannot satisfy an unscored request or a
-        # different tile/signature variant.  Release it before reparsing.
-        if cached is not None or _ACTIVE_GRAPH_VARIANT_KEY is not None:
-            _clear_scored_variant_locked()
+        # different tile/signature variant.  Release it for this graph key before reparsing.
+        if cached is not None or cache_key in _ACTIVE_GRAPH_VARIANT_KEYS:
+            _clear_scored_variant_for_graph_locked(cache_key)
 
         # A changed file supersedes all prior graph objects for this path.
         for stale_key in tuple(_GRAPH_CACHE):
             if stale_key[0] == path_key:
+                stale_graph = _GRAPH_CACHE.get(stale_key)
+                _clear_scored_variant_for_graph_locked(stale_key)
                 _GRAPH_CACHE.pop(stale_key, None)
-        _clear_scored_variant_locked()
+                _release_compact_graph_locked(stale_graph)
+        for skey in tuple(_SCORED_GRAPH_CACHE):
+            if skey[0][0] == path_key:
+                stale_sgraph = _SCORED_GRAPH_CACHE.pop(skey, None)
+                _ACTIVE_GRAPH_VARIANT_KEYS.pop(skey[0], None)
+                _release_compact_graph_locked(stale_sgraph)
+
         graph = _load_graph(
             path,
             check_cancelled=deadline.check if deadline is not None else None,
@@ -461,8 +710,9 @@ def _load_cached_graph(
             deadline.check()
         _GRAPH_CACHE[final_key] = graph
         _GRAPH_CACHE.move_to_end(final_key)
-        while len(_GRAPH_CACHE) > _CACHE_CAPACITY:
-            _GRAPH_CACHE.popitem(last=False)
+        _register_compact_graph_finalizer(graph)
+        _enforce_cache_capacities_locked()
+        _flush_compact_releases_locked()
         return graph, path_key, final_signature, False
 
 
@@ -510,20 +760,28 @@ def _load_cached_tile_scores(
         if cached is not None:
             _TILE_SCORE_CACHE.move_to_end(cache_key)
             score_map, inferred_zoom = cached
+            _flush_compact_releases_locked()
             return score_map, inferred_zoom, path_key, signature, True
 
         for stale_key in tuple(_TILE_SCORE_CACHE):
             if stale_key[0] == path_key:
                 _TILE_SCORE_CACHE.pop(stale_key, None)
-        _clear_scored_variant_locked()
+        for skey in tuple(_SCORED_GRAPH_CACHE):
+            if skey[1][0] == path_key:
+                gkey = skey[0]
+                stale_sgraph = _SCORED_GRAPH_CACHE.get(skey)
+                _clear_scored_variant_for_graph_locked(gkey)
+                _SCORED_GRAPH_CACHE.pop(skey, None)
+                _release_compact_graph_locked(stale_sgraph)
+
         score_map, inferred_zoom = load_tile_scores(path, deadline=deadline)
         immutable_map = MappingProxyType(dict(score_map))
         final_signature = _file_signature(path)
         final_key = (path_key, final_signature)
         _TILE_SCORE_CACHE[final_key] = (immutable_map, inferred_zoom)
         _TILE_SCORE_CACHE.move_to_end(final_key)
-        while len(_TILE_SCORE_CACHE) > _TILE_CACHE_CAPACITY:
-            _TILE_SCORE_CACHE.popitem(last=False)
+        _enforce_cache_capacities_locked()
+        _flush_compact_releases_locked()
         return immutable_map, inferred_zoom, path_key, final_signature, False
 
 
@@ -547,7 +805,6 @@ def _get_scored_graph(
     a second full graph during preload.
     """
 
-    global _ACTIVE_GRAPH_VARIANT_KEY
     if deadline is not None:
         deadline.check()
 
@@ -564,6 +821,9 @@ def _get_scored_graph(
             _SCORED_GRAPH_CACHE.move_to_end(cache_key)
             _GRAPH_CACHE[graph_key] = cached
             _GRAPH_CACHE.move_to_end(graph_key)
+            _ACTIVE_GRAPH_VARIANT_KEYS[graph_key] = cache_key
+            _ACTIVE_GRAPH_VARIANT_KEYS.move_to_end(graph_key)
+            _enforce_cache_capacities_locked()
             matched, total, fallback_edges = getattr(
                 cached,
                 "_route_service_score_mapping",
@@ -574,13 +834,53 @@ def _get_scored_graph(
                 "_route_service_score_mapping",
                 (int(matched), int(total), int(fallback_edges)),
             )
+            _flush_compact_releases_locked()
             return cached, int(matched), int(total), True
 
-        if (
-            _ACTIVE_GRAPH_VARIANT_KEY is not None
-            and _ACTIVE_GRAPH_VARIANT_KEY != cache_key
-        ):
-            _clear_scored_variant_locked()
+        active_key = _ACTIVE_GRAPH_VARIANT_KEYS.get(graph_key)
+        if active_key is not None and active_key != cache_key:
+            _clear_scored_variant_for_graph_locked(graph_key)
+
+        if isinstance(graph, CompactRoadGraph):
+            # Compact graphs are immutable; a report variant is a fresh mmap
+            # load with a deterministic per-report scenic-cost sidecar, never
+            # an O(E) native-edge clone or mutation pass.
+            scored_graph = CompactRoadGraph.load(
+                graph.manifest_path,
+                check_cancelled=deadline.check if deadline is not None else None,
+                verify=False,
+            )
+            if deadline is not None:
+                deadline.check()
+            report_signature = _signature_digest(tile_key[0], tile_key[1])
+            matched, total = scored_graph.activate_report_scores(
+                score_map,
+                zoom=int(zoom),
+                fallback=fallback,
+                report_signature=report_signature,
+                normalization=_NORMALIZATION_VERSION,
+                tile_scores_path=Path(tile_key[0]),
+                check_cancelled=deadline.check if deadline is not None else None,
+                verify=False,
+            )
+            fallback_edges = int(total - matched) if fallback is not None else 0
+            object.__setattr__(
+                scored_graph,
+                "_route_service_score_mapping",
+                (int(matched), int(total), fallback_edges),
+            )
+            previous = _GRAPH_CACHE.get(graph_key)
+            _GRAPH_CACHE[graph_key] = scored_graph
+            _GRAPH_CACHE.move_to_end(graph_key)
+            _SCORED_GRAPH_CACHE[cache_key] = scored_graph
+            _SCORED_GRAPH_CACHE.move_to_end(cache_key)
+            _ACTIVE_GRAPH_VARIANT_KEYS[graph_key] = cache_key
+            _ACTIVE_GRAPH_VARIANT_KEYS.move_to_end(graph_key)
+            _register_compact_graph_finalizer(scored_graph)
+            _enforce_cache_capacities_locked()
+            _release_compact_graph_locked(previous)
+            _flush_compact_releases_locked()
+            return scored_graph, int(matched), int(total), False
 
         # ``graph`` is the canonical raw graph (or a private raw reference
         # fetched before this lock).  Normal requests always score a clone;
@@ -607,11 +907,10 @@ def _get_scored_graph(
         _GRAPH_CACHE.move_to_end(graph_key)
         _SCORED_GRAPH_CACHE[cache_key] = scored_graph
         _SCORED_GRAPH_CACHE.move_to_end(cache_key)
-        while len(_GRAPH_CACHE) > _CACHE_CAPACITY:
-            _GRAPH_CACHE.popitem(last=False)
-        while len(_SCORED_GRAPH_CACHE) > _SCORED_GRAPH_CACHE_CAPACITY:
-            _SCORED_GRAPH_CACHE.popitem(last=False)
-        _ACTIVE_GRAPH_VARIANT_KEY = cache_key
+        _ACTIVE_GRAPH_VARIANT_KEYS[graph_key] = cache_key
+        _ACTIVE_GRAPH_VARIANT_KEYS.move_to_end(graph_key)
+        _enforce_cache_capacities_locked()
+        _flush_compact_releases_locked()
         return scored_graph, matched, total, False
 
 
@@ -712,6 +1011,13 @@ def preload_route_assets(
     )
     if not graph.nodes or not graph.edges:
         raise ValueError(f"Graph asset has no usable nodes/edges: {graph_file}")
+    if isinstance(graph, CompactRoadGraph):
+        projection_status = dict(graph.edge_projection_index_status)
+        if projection_status.get("state") != "loaded":
+            raise RuntimeError(
+                "compact graph requires a compatible mmap-loaded edge "
+                f"projection index; observed {projection_status}"
+            )
 
     matched = 0
     total = len(graph.edges)
