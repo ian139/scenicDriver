@@ -62,15 +62,15 @@ static bool checked_size_mul(size_t count, size_t element_size, size_t* out_byte
 }
 
 static int heap_item_compare(const HeapItem* a, const HeapItem* b) {
-    if (a->dist < b->dist) return -1;
-    if (a->dist > b->dist) return 1;
-    if (a->rank_primary < b->rank_primary) return -1;
-    if (a->rank_primary > b->rank_primary) return 1;
-    if (a->rank_secondary < b->rank_secondary) return -1;
-    if (a->rank_secondary > b->rank_secondary) return 1;
-    if (a->sequence < b->sequence) return -1;
-    if (a->sequence > b->sequence) return 1;
-    return 0;
+    int order = (a->dist > b->dist) - (a->dist < b->dist);
+    if (order != 0) return order;
+    order = (a->rank_primary > b->rank_primary)
+        - (a->rank_primary < b->rank_primary);
+    if (order != 0) return order;
+    order = (a->rank_secondary > b->rank_secondary)
+        - (a->rank_secondary < b->rank_secondary);
+    if (order != 0) return order;
+    return (a->sequence > b->sequence) - (a->sequence < b->sequence);
 }
 
 static MinHeap* heap_create(int32_t capacity) {
