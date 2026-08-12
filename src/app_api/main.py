@@ -369,6 +369,16 @@ def _preload_configured_route_assets(
             "graph_path": str(graph_path) if graph_path else None,
             "tile_scores_path": str(tile_path) if tile_path else None,
         }
+        if item.get("route_planning") is False:
+            reason = "route planning disabled"
+            if is_default and mode == "required":
+                raise RuntimeError(
+                    f"Configured default region '{region}' {reason}"
+                )
+            region_diag.update({"status": "skipped", "reason": reason})
+            diagnostics["regions"].append(region_diag)
+            _LOGGER.warning("Skipping route preload for %s: %s", region, reason)
+            continue
         missing: list[str] = []
         if graph_path is None or not graph_path.exists():
             missing.append("graph")
