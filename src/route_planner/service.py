@@ -25,7 +25,7 @@ from .cancellation import (
     RoutingDeadline,
     RoutingTimeout,
 )
-from .graph import RoadGraph
+from .graph import CompactRoadGraph, RoadGraph
 from .planner import (
     Route,
     ScenicRoutePlanner,
@@ -269,18 +269,19 @@ def _signature_digest(path_key: str, signature: _FileSignature) -> str:
 
 
 # ``_GRAPH_CACHE`` retains either the canonical raw graph or the active
-# scored variant, never both.  A scored miss briefly holds the raw graph,
-# its private native-edge clone, and (while replacing it) the previous
-# scored variant.  Only one graph variant is retained after publication;
-# requests already using an evicted variant keep their own reference.
+# scored variant per graph key, never both.  Up to two distinct graph paths can
+# coexist concurrently.  A scored miss briefly holds the raw graph, its
+# private native-edge clone, and (while replacing it) the previous scored
+# variant for that graph key.  Only one active scored variant per graph key is retained
+# after publication; requests already using an evicted variant keep their own reference.
 _GRAPH_CACHE: OrderedDict[_GraphCacheKey, RoadGraph] = OrderedDict()
 _TILE_SCORE_CACHE: OrderedDict[_GraphCacheKey, _TileCacheValue] = OrderedDict()
 _ScoredGraphCacheKey = tuple[_GraphCacheKey, _GraphCacheKey, int, float | None, str]
 _SCORED_GRAPH_CACHE: OrderedDict[_ScoredGraphCacheKey, RoadGraph] = OrderedDict()
-_ACTIVE_GRAPH_VARIANT_KEY: _ScoredGraphCacheKey | None = None
-_CACHE_CAPACITY = 1
-_TILE_CACHE_CAPACITY = 1
-_SCORED_GRAPH_CACHE_CAPACITY = 1
+_ACTIVE_GRAPH_VARIANT_KEYS: OrderedDict[_GraphCacheKey, _ScoredGraphCacheKey] = OrderedDict()
+_CACHE_CAPACITY = 2
+_TILE_CACHE_CAPACITY = 2
+_SCORED_GRAPH_CACHE_CAPACITY = 2
 _CACHE_LOCK = RLock()
 
 
@@ -307,14 +308,12 @@ def clear_route_caches() -> None:
     graph memory between independent jobs.
     """
 
-    global _ACTIVE_GRAPH_VARIANT_KEY
     with _CACHE_LOCK:
         _GRAPH_CACHE.clear()
         _TILE_SCORE_CACHE.clear()
         _SCORED_GRAPH_CACHE.clear()
+        _ACTIVE_GRAPH_VARIANT_KEYS.clear()
         ScenicRoutePlanner.clear_shared_caches()
-        _ACTIVE_GRAPH_VARIANT_KEY = None
-
 
 def _apply_tile_scores_to_graph_native(
     graph: RoadGraph,
@@ -398,14 +397,41 @@ def _clone_graph_for_scoring(
     return variant
 
 
-def _clear_scored_variant_locked() -> None:
-    """Drop the sole scored variant while retaining no stale graph alias."""
+def _clear_scored_variant_for_graph_locked(graph_key: _GraphCacheKey) -> None:
+    """Drop the active scored variant for one graph key while retaining no stale alias."""
 
-    global _ACTIVE_GRAPH_VARIANT_KEY
-    if _ACTIVE_GRAPH_VARIANT_KEY is not None:
-        _GRAPH_CACHE.pop(_ACTIVE_GRAPH_VARIANT_KEY[0], None)
-    _SCORED_GRAPH_CACHE.clear()
-    _ACTIVE_GRAPH_VARIANT_KEY = None
+    active_key = _ACTIVE_GRAPH_VARIANT_KEYS.pop(graph_key, None)
+    if active_key is not None:
+        _SCORED_GRAPH_CACHE.pop(active_key, None)
+        _GRAPH_CACHE.pop(graph_key, None)
+
+
+def _enforce_cache_capacities_locked() -> None:
+    """Enforce capacity limits on graph, tile score, and scored graph caches coherently."""
+
+    while len(_GRAPH_CACHE) > _CACHE_CAPACITY:
+        evicted_gkey, evicted_graph = _GRAPH_CACHE.popitem(last=False)
+        active_skey = _ACTIVE_GRAPH_VARIANT_KEYS.pop(evicted_gkey, None)
+        if active_skey is not None:
+            _SCORED_GRAPH_CACHE.pop(active_skey, None)
+
+    while len(_SCORED_GRAPH_CACHE) > _SCORED_GRAPH_CACHE_CAPACITY:
+        evicted_skey, evicted_sgraph = _SCORED_GRAPH_CACHE.popitem(last=False)
+        gkey = evicted_skey[0]
+        if _ACTIVE_GRAPH_VARIANT_KEYS.get(gkey) == evicted_skey:
+            _ACTIVE_GRAPH_VARIANT_KEYS.pop(gkey, None)
+            if _GRAPH_CACHE.get(gkey) is evicted_sgraph:
+                _GRAPH_CACHE.pop(gkey, None)
+
+    while len(_TILE_SCORE_CACHE) > _TILE_CACHE_CAPACITY:
+        evicted_tkey, _ = _TILE_SCORE_CACHE.popitem(last=False)
+        for skey in tuple(_SCORED_GRAPH_CACHE):
+            if skey[1] == evicted_tkey:
+                gkey = skey[0]
+                _SCORED_GRAPH_CACHE.pop(skey, None)
+                if _ACTIVE_GRAPH_VARIANT_KEYS.get(gkey) == skey:
+                    _ACTIVE_GRAPH_VARIANT_KEYS.pop(gkey, None)
+                    _GRAPH_CACHE.pop(gkey, None)
 
 
 def _load_cached_graph(
@@ -414,8 +440,6 @@ def _load_cached_graph(
     scored_cache_key: _ScoredGraphCacheKey | None = None,
     deadline: RoutingDeadline | None = None,
 ) -> tuple[RoadGraph, str, _FileSignature, bool]:
-    global _ACTIVE_GRAPH_VARIANT_KEY
-
     if deadline is not None:
         deadline.check()
 
@@ -429,26 +453,31 @@ def _load_cached_graph(
                 _GRAPH_CACHE[cache_key] = scored
                 _GRAPH_CACHE.move_to_end(cache_key)
                 _SCORED_GRAPH_CACHE.move_to_end(scored_cache_key)
-                while len(_GRAPH_CACHE) > _CACHE_CAPACITY:
-                    _GRAPH_CACHE.popitem(last=False)
-                _ACTIVE_GRAPH_VARIANT_KEY = scored_cache_key
+                _ACTIVE_GRAPH_VARIANT_KEYS[cache_key] = scored_cache_key
+                _ACTIVE_GRAPH_VARIANT_KEYS.move_to_end(cache_key)
+                _enforce_cache_capacities_locked()
                 return scored, path_key, signature, True
 
         cached = _GRAPH_CACHE.get(cache_key)
-        if cached is not None and _ACTIVE_GRAPH_VARIANT_KEY is None:
+        if cached is not None and cache_key not in _ACTIVE_GRAPH_VARIANT_KEYS:
             _GRAPH_CACHE.move_to_end(cache_key)
             return cached, path_key, signature, True
 
         # A native scored variant cannot satisfy an unscored request or a
-        # different tile/signature variant.  Release it before reparsing.
-        if cached is not None or _ACTIVE_GRAPH_VARIANT_KEY is not None:
-            _clear_scored_variant_locked()
+        # different tile/signature variant.  Release it for this graph key before reparsing.
+        if cached is not None or cache_key in _ACTIVE_GRAPH_VARIANT_KEYS:
+            _clear_scored_variant_for_graph_locked(cache_key)
 
         # A changed file supersedes all prior graph objects for this path.
         for stale_key in tuple(_GRAPH_CACHE):
             if stale_key[0] == path_key:
+                _clear_scored_variant_for_graph_locked(stale_key)
                 _GRAPH_CACHE.pop(stale_key, None)
-        _clear_scored_variant_locked()
+        for skey in tuple(_SCORED_GRAPH_CACHE):
+            if skey[0][0] == path_key:
+                _SCORED_GRAPH_CACHE.pop(skey, None)
+                _ACTIVE_GRAPH_VARIANT_KEYS.pop(skey[0], None)
+
         graph = _load_graph(
             path,
             check_cancelled=deadline.check if deadline is not None else None,
@@ -461,8 +490,7 @@ def _load_cached_graph(
             deadline.check()
         _GRAPH_CACHE[final_key] = graph
         _GRAPH_CACHE.move_to_end(final_key)
-        while len(_GRAPH_CACHE) > _CACHE_CAPACITY:
-            _GRAPH_CACHE.popitem(last=False)
+        _enforce_cache_capacities_locked()
         return graph, path_key, final_signature, False
 
 
@@ -515,15 +543,19 @@ def _load_cached_tile_scores(
         for stale_key in tuple(_TILE_SCORE_CACHE):
             if stale_key[0] == path_key:
                 _TILE_SCORE_CACHE.pop(stale_key, None)
-        _clear_scored_variant_locked()
+        for skey in tuple(_SCORED_GRAPH_CACHE):
+            if skey[1][0] == path_key:
+                gkey = skey[0]
+                _clear_scored_variant_for_graph_locked(gkey)
+                _SCORED_GRAPH_CACHE.pop(skey, None)
+
         score_map, inferred_zoom = load_tile_scores(path, deadline=deadline)
         immutable_map = MappingProxyType(dict(score_map))
         final_signature = _file_signature(path)
         final_key = (path_key, final_signature)
         _TILE_SCORE_CACHE[final_key] = (immutable_map, inferred_zoom)
         _TILE_SCORE_CACHE.move_to_end(final_key)
-        while len(_TILE_SCORE_CACHE) > _TILE_CACHE_CAPACITY:
-            _TILE_SCORE_CACHE.popitem(last=False)
+        _enforce_cache_capacities_locked()
         return immutable_map, inferred_zoom, path_key, final_signature, False
 
 
@@ -547,7 +579,6 @@ def _get_scored_graph(
     a second full graph during preload.
     """
 
-    global _ACTIVE_GRAPH_VARIANT_KEY
     if deadline is not None:
         deadline.check()
 
@@ -564,6 +595,9 @@ def _get_scored_graph(
             _SCORED_GRAPH_CACHE.move_to_end(cache_key)
             _GRAPH_CACHE[graph_key] = cached
             _GRAPH_CACHE.move_to_end(graph_key)
+            _ACTIVE_GRAPH_VARIANT_KEYS[graph_key] = cache_key
+            _ACTIVE_GRAPH_VARIANT_KEYS.move_to_end(graph_key)
+            _enforce_cache_capacities_locked()
             matched, total, fallback_edges = getattr(
                 cached,
                 "_route_service_score_mapping",
@@ -576,11 +610,46 @@ def _get_scored_graph(
             )
             return cached, int(matched), int(total), True
 
-        if (
-            _ACTIVE_GRAPH_VARIANT_KEY is not None
-            and _ACTIVE_GRAPH_VARIANT_KEY != cache_key
-        ):
-            _clear_scored_variant_locked()
+        active_key = _ACTIVE_GRAPH_VARIANT_KEYS.get(graph_key)
+        if active_key is not None and active_key != cache_key:
+            _clear_scored_variant_for_graph_locked(graph_key)
+
+        if isinstance(graph, CompactRoadGraph):
+            # Compact graphs are immutable; a report variant is a fresh mmap
+            # load with a deterministic per-report scenic-cost sidecar, never
+            # an O(E) native-edge clone or mutation pass.
+            scored_graph = CompactRoadGraph.load(
+                graph.manifest_path,
+                check_cancelled=deadline.check if deadline is not None else None,
+                verify=False,
+            )
+            if deadline is not None:
+                deadline.check()
+            report_signature = _signature_digest(tile_key[0], tile_key[1])
+            matched, total = scored_graph.activate_report_scores(
+                score_map,
+                zoom=int(zoom),
+                fallback=fallback,
+                report_signature=report_signature,
+                normalization=_NORMALIZATION_VERSION,
+                tile_scores_path=Path(tile_key[0]),
+                check_cancelled=deadline.check if deadline is not None else None,
+                verify=False,
+            )
+            fallback_edges = int(total - matched) if fallback is not None else 0
+            object.__setattr__(
+                scored_graph,
+                "_route_service_score_mapping",
+                (int(matched), int(total), fallback_edges),
+            )
+            _GRAPH_CACHE[graph_key] = scored_graph
+            _GRAPH_CACHE.move_to_end(graph_key)
+            _SCORED_GRAPH_CACHE[cache_key] = scored_graph
+            _SCORED_GRAPH_CACHE.move_to_end(cache_key)
+            _ACTIVE_GRAPH_VARIANT_KEYS[graph_key] = cache_key
+            _ACTIVE_GRAPH_VARIANT_KEYS.move_to_end(graph_key)
+            _enforce_cache_capacities_locked()
+            return scored_graph, int(matched), int(total), False
 
         # ``graph`` is the canonical raw graph (or a private raw reference
         # fetched before this lock).  Normal requests always score a clone;
@@ -607,11 +676,9 @@ def _get_scored_graph(
         _GRAPH_CACHE.move_to_end(graph_key)
         _SCORED_GRAPH_CACHE[cache_key] = scored_graph
         _SCORED_GRAPH_CACHE.move_to_end(cache_key)
-        while len(_GRAPH_CACHE) > _CACHE_CAPACITY:
-            _GRAPH_CACHE.popitem(last=False)
-        while len(_SCORED_GRAPH_CACHE) > _SCORED_GRAPH_CACHE_CAPACITY:
-            _SCORED_GRAPH_CACHE.popitem(last=False)
-        _ACTIVE_GRAPH_VARIANT_KEY = cache_key
+        _ACTIVE_GRAPH_VARIANT_KEYS[graph_key] = cache_key
+        _ACTIVE_GRAPH_VARIANT_KEYS.move_to_end(graph_key)
+        _enforce_cache_capacities_locked()
         return scored_graph, matched, total, False
 
 
@@ -712,6 +779,13 @@ def preload_route_assets(
     )
     if not graph.nodes or not graph.edges:
         raise ValueError(f"Graph asset has no usable nodes/edges: {graph_file}")
+    if isinstance(graph, CompactRoadGraph):
+        projection_status = dict(graph.edge_projection_index_status)
+        if projection_status.get("state") != "loaded":
+            raise RuntimeError(
+                "compact graph requires a compatible mmap-loaded edge "
+                f"projection index; observed {projection_status}"
+            )
 
     matched = 0
     total = len(graph.edges)
