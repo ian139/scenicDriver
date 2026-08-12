@@ -4,6 +4,7 @@ import gc
 import json
 import sys
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -575,7 +576,10 @@ def test_compact_scored_plan_routes_avoids_native_clone(
     second["routes"][0]["metrics"]["edge_ids"].append("mutated")
     third = route_service.plan_routes(request)
     assert third["diagnostics"]["route_response_cache_hit"] is True
-    assert third["routes"][0]["metrics"]["edge_ids"] == result["routes"][0]["metrics"]["edge_ids"]
+    assert (
+        third["routes"][0]["metrics"]["edge_ids"]
+        == result["routes"][0]["metrics"]["edge_ids"]
+    )
 
     class Cancelled:
         def is_set(self) -> bool:
@@ -585,6 +589,23 @@ def test_compact_scored_plan_routes_avoids_native_clone(
         route_service.plan_routes(
             request,
             deadline=RoutingDeadline(cancel_event=Cancelled()),
+        )
+
+    route_service.clear_route_caches()
+
+    cancel_event = Event()
+    real_deepcopy = route_service.deepcopy
+
+    def cancel_after_copy(value: object) -> object:
+        copied = real_deepcopy(value)
+        cancel_event.set()
+        return copied
+
+    monkeypatch.setattr(route_service, "deepcopy", cancel_after_copy)
+    with pytest.raises(RoutingCancelled):
+        route_service.plan_routes(
+            request,
+            deadline=RoutingDeadline(cancel_event=cancel_event),
         )
 
 

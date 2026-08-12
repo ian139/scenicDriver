@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 import gc
 import hashlib
@@ -537,6 +537,7 @@ def clear_route_caches() -> None:
         if had_compact:
             _PENDING_COMPACT_RELEASE = True
         _flush_compact_releases_locked()
+
 
 def _apply_tile_scores_to_graph_native(
     graph: RoadGraph,
@@ -1670,7 +1671,6 @@ def _route_response_cache_key(
     request: RouteRequest,
     graph_path: Path,
 ) -> _RouteResponseCacheKey:
-    graph_path_key = _resolved_path_key(graph_path)
     graph_signature = _file_signature(graph_path)
     if request.tile_scores_json is None:
         score_path_key = None
@@ -1711,8 +1711,8 @@ def plan_routes(
         cached_response = _ROUTE_RESPONSE_CACHE.get(response_cache_key)
         if cached_response is not None:
             _ROUTE_RESPONSE_CACHE.move_to_end(response_cache_key)
-            response = deepcopy(cached_response)
     if cached_response is not None:
+        response = deepcopy(cached_response)
         if deadline is not None:
             deadline.check()
         response["diagnostics"]["route_response_cache_hit"] = True
@@ -2077,4 +2077,6 @@ def plan_routes(
         _ROUTE_RESPONSE_CACHE.move_to_end(response_cache_key)
         while len(_ROUTE_RESPONSE_CACHE) > _ROUTE_RESPONSE_CACHE_CAPACITY:
             _ROUTE_RESPONSE_CACHE.popitem(last=False)
+    if deadline is not None:
+        deadline.check()
     return response
