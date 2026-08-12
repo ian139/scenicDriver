@@ -562,14 +562,30 @@ def test_compact_scored_plan_routes_avoids_native_clone(
     assert result["score_mapping"]["report_signature"] is not None
     assert result["score_mapping"]["graph_signature"] is not None
     assert result["diagnostics"]["scored_graph_cache_hit"] is False
+    assert result["diagnostics"]["route_response_cache_hit"] is False
 
     second = route_service.plan_routes(request)
     assert second["diagnostics"]["scored_graph_cache_hit"] is True
+    assert second["diagnostics"]["route_response_cache_hit"] is True
     assert second["score_mapping"] == result["score_mapping"]
     assert (
         second["routes"][0]["metrics"]["edge_ids"]
         == result["routes"][0]["metrics"]["edge_ids"]
     )
+    second["routes"][0]["metrics"]["edge_ids"].append("mutated")
+    third = route_service.plan_routes(request)
+    assert third["diagnostics"]["route_response_cache_hit"] is True
+    assert third["routes"][0]["metrics"]["edge_ids"] == result["routes"][0]["metrics"]["edge_ids"]
+
+    class Cancelled:
+        def is_set(self) -> bool:
+            return True
+
+    with pytest.raises(RoutingCancelled):
+        route_service.plan_routes(
+            request,
+            deadline=RoutingDeadline(cancel_event=Cancelled()),
+        )
 
 
 def test_compact_load_honours_cancellation(tmp_path: Path) -> None:

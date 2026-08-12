@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from copy import copy
+from copy import deepcopy
 from dataclasses import dataclass
 import gc
 import hashlib
@@ -284,6 +284,17 @@ _ACTIVE_GRAPH_VARIANT_KEYS: OrderedDict[_GraphCacheKey, _ScoredGraphCacheKey] = 
 _CACHE_CAPACITY = 2
 _TILE_CACHE_CAPACITY = 2
 _SCORED_GRAPH_CACHE_CAPACITY = 2
+_RouteResponseCacheKey = tuple[
+    str,
+    _FileSignature,
+    str | None,
+    _FileSignature | None,
+    str | None,
+]
+_ROUTE_RESPONSE_CACHE: OrderedDict[_RouteResponseCacheKey, dict[str, Any]] = (
+    OrderedDict()
+)
+_ROUTE_RESPONSE_CACHE_CAPACITY = 8
 _CACHE_LOCK = RLock()
 
 # Compact graphs own mmap-backed binary payloads, projection indexes, and
@@ -520,6 +531,7 @@ def clear_route_caches() -> None:
         _GRAPH_CACHE.clear()
         _TILE_SCORE_CACHE.clear()
         _SCORED_GRAPH_CACHE.clear()
+        _ROUTE_RESPONSE_CACHE.clear()
         _ACTIVE_GRAPH_VARIANT_KEYS.clear()
         ScenicRoutePlanner.clear_shared_caches()
         if had_compact:
@@ -1654,6 +1666,34 @@ def _find_scenic_route_with_best_effort_avoidance(
     return route, False, fallback_reason
 
 
+def _route_response_cache_key(
+    request: RouteRequest,
+    graph_path: Path,
+) -> _RouteResponseCacheKey:
+    graph_path_key = _resolved_path_key(graph_path)
+    graph_signature = _file_signature(graph_path)
+    if request.tile_scores_json is None:
+        score_path_key = None
+        score_signature = None
+    else:
+        score_path = Path(request.tile_scores_json)
+        score_path_key = _resolved_path_key(score_path)
+        score_signature = _file_signature(score_path) if score_path.exists() else None
+    request_key = json.dumps(
+        request.to_dict(),
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (
+        request_key,
+        graph_signature,
+        score_path_key,
+        score_signature,
+        os.environ.get("SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS"),
+    )
+
+
 def plan_routes(
     request: RouteRequest,
     *,
@@ -1666,6 +1706,24 @@ def plan_routes(
     graph_path = Path(request.graph_geojson)
     if not graph_path.exists():
         raise FileNotFoundError(f"Graph GeoJSON not found: {graph_path}")
+    response_cache_key = _route_response_cache_key(request, graph_path)
+    with _CACHE_LOCK:
+        cached_response = _ROUTE_RESPONSE_CACHE.get(response_cache_key)
+        if cached_response is not None:
+            _ROUTE_RESPONSE_CACHE.move_to_end(response_cache_key)
+            response = deepcopy(cached_response)
+    if cached_response is not None:
+        if deadline is not None:
+            deadline.check()
+        response["diagnostics"]["route_response_cache_hit"] = True
+        response["diagnostics"]["graph_cache_hit"] = True
+        if request.tile_scores_json is not None:
+            response["diagnostics"]["tile_score_cache_hit"] = True
+            response["diagnostics"]["scored_graph_cache_hit"] = True
+        response["diagnostics"]["planning_elapsed_ms"] = (
+            perf_counter() - started_at
+        ) * 1000.0
+        return response
 
     tile_score_cache_hit = False
     scored_graph_cache_hit = False
@@ -2003,13 +2061,20 @@ def plan_routes(
     diagnostics["search_diagnostics"] = _normalize_search_diagnostics(
         scenic_route.search_diagnostics
     )
+    diagnostics["route_response_cache_hit"] = False
     diagnostics["planning_elapsed_ms"] = (perf_counter() - started_at) * 1000.0
     if deadline is not None:
         deadline.check()
-    return {
+    response = {
         "request": request.to_dict(),
         "diagnostics": diagnostics,
         "score_mapping": score_mapping,
         "routes": routes,
         "geojson": {"type": "FeatureCollection", "features": features},
     }
+    with _CACHE_LOCK:
+        _ROUTE_RESPONSE_CACHE[response_cache_key] = deepcopy(response)
+        _ROUTE_RESPONSE_CACHE.move_to_end(response_cache_key)
+        while len(_ROUTE_RESPONSE_CACHE) > _ROUTE_RESPONSE_CACHE_CAPACITY:
+            _ROUTE_RESPONSE_CACHE.popitem(last=False)
+    return response

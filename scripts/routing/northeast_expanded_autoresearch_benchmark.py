@@ -45,6 +45,7 @@ _VOLATILE_DIAGNOSTIC_KEYS = {
     "graph_cache_hit",
     "graph_load_elapsed_ms",
     "planning_elapsed_ms",
+    "route_response_cache_hit",
     "score_application_elapsed_ms",
     "scored_graph_cache_hit",
     "tile_score_cache_hit",
