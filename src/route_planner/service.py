@@ -1715,10 +1715,9 @@ def plan_routes(
         if deadline is not None:
             deadline.check()
         response["diagnostics"]["route_response_cache_hit"] = True
-        response["diagnostics"]["graph_cache_hit"] = True
-        if request.tile_scores_json is not None:
-            response["diagnostics"]["tile_score_cache_hit"] = True
-            response["diagnostics"]["scored_graph_cache_hit"] = True
+        response["diagnostics"]["graph_cache_hit"] = False
+        response["diagnostics"]["tile_score_cache_hit"] = False
+        response["diagnostics"]["scored_graph_cache_hit"] = False
         response["diagnostics"]["planning_elapsed_ms"] = (
             perf_counter() - started_at
         ) * 1000.0

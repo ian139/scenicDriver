@@ -566,7 +566,9 @@ def test_compact_scored_plan_routes_avoids_native_clone(
     assert result["diagnostics"]["route_response_cache_hit"] is False
 
     second = route_service.plan_routes(request)
-    assert second["diagnostics"]["scored_graph_cache_hit"] is True
+    assert second["diagnostics"]["graph_cache_hit"] is False
+    assert second["diagnostics"]["tile_score_cache_hit"] is False
+    assert second["diagnostics"]["scored_graph_cache_hit"] is False
     assert second["diagnostics"]["route_response_cache_hit"] is True
     assert second["score_mapping"] == result["score_mapping"]
     assert (

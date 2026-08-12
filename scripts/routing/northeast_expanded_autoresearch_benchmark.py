@@ -40,6 +40,15 @@ ORACLE_PATH = OUTPUT_DIR / "baseline_oracle.json"
 LATEST_PATH = OUTPUT_DIR / "latest_result.json"
 DEADLINE_SECONDS = 120.0
 MAX_RSS_BYTES = 24 * 1024**3
+EXPECTED_GRAPH_SHA256 = (
+    "26c5a61392a83056729848f3f12cf898e2a1f5a2e5cb71ecd909f588ff8b4195"
+)
+EXPECTED_REPORT_SHA256 = (
+    "eb656ca4abf5e1cc1b9b53849ddf3f94a3e3d323b81cf0609a89a999dd0b51ff"
+)
+EXPECTED_SEMANTIC_FINGERPRINT_SHA256 = (
+    "226c52550ba6c0a91ad6ca54969422e2a946a1b3cb7189b7715542388896ef28"
+)
 _VOLATILE_DIAGNOSTIC_KEYS = {
     "elapsed_ms",
     "graph_cache_hit",
@@ -170,6 +179,22 @@ def run_benchmark(*, timed_runs: int) -> dict[str, Any]:
     for path in (GRAPH_PATH, REPORT_PATH):
         if not path.is_file():
             raise FileNotFoundError(path)
+    artifact_hashes = {
+        GRAPH_PATH: _sha256_file(GRAPH_PATH),
+        REPORT_PATH: _sha256_file(REPORT_PATH),
+    }
+    expected_hashes = {
+        GRAPH_PATH: EXPECTED_GRAPH_SHA256,
+        REPORT_PATH: EXPECTED_REPORT_SHA256,
+    }
+    for path, expected in expected_hashes.items():
+        observed = artifact_hashes[path]
+        if observed != expected:
+            raise RuntimeError(
+                f"artifact SHA-256 mismatch for {path}: "
+                f"expected {expected}, observed {observed}"
+            )
+
 
     clear_route_caches()
     preload_started = time.perf_counter()
@@ -201,6 +226,12 @@ def run_benchmark(*, timed_runs: int) -> dict[str, Any]:
 
     semantic_response = _semantic_response(responses[0])
     fingerprint = fingerprints[0]
+    if fingerprint != EXPECTED_SEMANTIC_FINGERPRINT_SHA256:
+        raise RuntimeError(
+            "route semantics differ from the pinned baseline: "
+            f"expected {EXPECTED_SEMANTIC_FINGERPRINT_SHA256}, "
+            f"observed {fingerprint}"
+        )
     if ORACLE_PATH.exists():
         oracle = json.loads(ORACLE_PATH.read_text(encoding="utf-8"))
         expected = oracle.get("semantic_fingerprint_sha256")
@@ -244,12 +275,12 @@ def run_benchmark(*, timed_runs: int) -> dict[str, Any]:
         "artifact_identity": {
             "graph": {
                 "path": str(GRAPH_PATH),
-                "sha256": _sha256_file(GRAPH_PATH),
+                "sha256": artifact_hashes[GRAPH_PATH],
                 "size_bytes": GRAPH_PATH.stat().st_size,
             },
             "report": {
                 "path": str(REPORT_PATH),
-                "sha256": _sha256_file(REPORT_PATH),
+                "sha256": artifact_hashes[REPORT_PATH],
                 "size_bytes": REPORT_PATH.stat().st_size,
             },
         },
