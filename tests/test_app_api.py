@@ -1890,3 +1890,120 @@ def test_route_compare_supervisor_error_maps_to_structured_503(monkeypatch) -> N
         "error": "routing_supervisor_unavailable",
         "message": "The routing service is temporarily unavailable.",
     }
+
+
+def test_resolve_route_deadline_seconds_validates_and_resolves(monkeypatch) -> None:
+    assert app_api._resolve_route_deadline_seconds({"route_deadline_seconds": 60}) == 60.0
+    assert app_api._resolve_route_deadline_seconds({"route_deadline_seconds": "60.0"}) == 60.0
+
+    monkeypatch.setenv("SCENIC_ROUTE_DEADLINE_SECONDS", "25.0")
+    assert app_api._resolve_route_deadline_seconds(None) == 25.0
+    assert app_api._resolve_route_deadline_seconds({}) == 25.0
+    assert app_api._resolve_route_deadline_seconds({"route_deadline_seconds": None}) == 25.0
+
+    for bad in [True, False, "invalid", -1.0, float("nan"), float("inf"), [60]]:
+        with pytest.raises(app_api.RouteConfigurationError):
+            app_api._resolve_route_deadline_seconds({"route_deadline_seconds": bad})
+
+
+def test_route_compare_configured_deadline_override_reaches_supervisor(
+    monkeypatch,
+) -> None:
+    _stub_route_compare_assets(monkeypatch)
+    monkeypatch.setattr(
+        app_api,
+        "_app_region",
+        lambda region: {"region": region, "route_deadline_seconds": 60.0},
+    )
+    run_calls: list[tuple[object, object, RoutingDeadline]] = []
+
+    def fake_validate(result, *, request, deadline):
+        return (
+            {"scenic_score_delta_absolute": 0.0, "scenic_score_delta_relative": 0.0},
+            {
+                "scenic": {
+                    "total_distance_km": 1.0,
+                    "estimated_duration_minutes": 2.0,
+                    "normalized_scenic_score": 0.5,
+                }
+            },
+        )
+
+    class FakeSupervisor:
+        def run_job(self, func, route_request, *, deadline):
+            run_calls.append((func, route_request, deadline))
+            return {"score_mapping": {}, "geojson": {}}
+
+    monkeypatch.setattr(app_api, "_validate_route_contract", fake_validate)
+    app = create_app()
+    app.state.route_supervisor = FakeSupervisor()
+    response = TestClient(app).post("/v1/route/compare", json=_route_compare_payload())
+
+    assert response.status_code == 200
+    assert len(run_calls) == 1
+    _, _, deadline = run_calls[0]
+    assert isinstance(deadline, RoutingDeadline)
+    remaining = deadline.remaining_seconds()
+    assert remaining is not None and 58.0 <= remaining <= 61.0
+
+
+def test_route_compare_missing_deadline_override_preserves_env_default(
+    monkeypatch,
+) -> None:
+    _stub_route_compare_assets(monkeypatch)
+    monkeypatch.setattr(
+        app_api,
+        "_app_region",
+        lambda region: {"region": region},
+    )
+    monkeypatch.setenv("SCENIC_ROUTE_DEADLINE_SECONDS", "20.0")
+    run_calls: list[tuple[object, object, RoutingDeadline]] = []
+
+    def fake_validate(result, *, request, deadline):
+        return (
+            {"scenic_score_delta_absolute": 0.0, "scenic_score_delta_relative": 0.0},
+            {
+                "scenic": {
+                    "total_distance_km": 1.0,
+                    "estimated_duration_minutes": 2.0,
+                    "normalized_scenic_score": 0.5,
+                }
+            },
+        )
+
+    class FakeSupervisor:
+        def run_job(self, func, route_request, *, deadline):
+            run_calls.append((func, route_request, deadline))
+            return {"score_mapping": {}, "geojson": {}}
+
+    monkeypatch.setattr(app_api, "_validate_route_contract", fake_validate)
+    app = create_app()
+    app.state.route_supervisor = FakeSupervisor()
+    response = TestClient(app).post("/v1/route/compare", json=_route_compare_payload())
+
+    assert response.status_code == 200
+    assert len(run_calls) == 1
+    _, _, deadline = run_calls[0]
+    assert isinstance(deadline, RoutingDeadline)
+    remaining = deadline.remaining_seconds()
+    assert remaining is not None and 18.0 <= remaining <= 21.0
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [True, False, "invalid", -10, float("nan"), float("inf")],
+)
+def test_route_compare_invalid_deadline_config_fails_closed(
+    monkeypatch, bad_value
+) -> None:
+    _stub_route_compare_assets(monkeypatch)
+    monkeypatch.setattr(
+        app_api,
+        "_app_region",
+        lambda region: {"region": region, "route_deadline_seconds": bad_value},
+    )
+    app = create_app()
+    response = TestClient(app).post("/v1/route/compare", json=_route_compare_payload())
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["error"] == "route_configuration_invalid"

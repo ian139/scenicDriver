@@ -225,6 +225,29 @@ def _app_region(region: str) -> dict[str, Any] | None:
         if str(item.get("region", "")).strip().lower() == key:
             return item
     return None
+def _resolve_route_deadline_seconds(configured: dict[str, Any] | None) -> float:
+    if configured is None or "route_deadline_seconds" not in configured:
+        return _deadline_seconds_from_env()
+    val = configured["route_deadline_seconds"]
+    if val is None:
+        return _deadline_seconds_from_env()
+    if isinstance(val, bool):
+        raise RouteConfigurationError(
+            "Configured route_deadline_seconds must be a finite non-negative number"
+        )
+    try:
+        if not isinstance(val, (int, float, str)):
+            raise TypeError("Not a number or string")
+        value = float(val)
+    except (ValueError, TypeError) as exc:
+        raise RouteConfigurationError(
+            "Configured route_deadline_seconds must be a finite non-negative number"
+        ) from exc
+    if not math.isfinite(value) or value < 0.0:
+        raise RouteConfigurationError(
+            "Configured route_deadline_seconds must be finite and non-negative"
+        )
+    return value
 
 
 def _default_region_key() -> str | None:
@@ -1607,8 +1630,8 @@ def create_app() -> FastAPI:
                 configured.get("max_route_snap_km") if configured is not None else None
             ),
         )
-        deadline = RoutingDeadline.after(_deadline_seconds_from_env())
         try:
+            deadline = RoutingDeadline.after(_resolve_route_deadline_seconds(configured))
             supervisor = getattr(request.app.state, "route_supervisor", None)
             if supervisor is not None:
                 result = supervisor.run_job(_plan_routes_worker, req, deadline=deadline)
