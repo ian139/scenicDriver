@@ -25,7 +25,7 @@ from .cancellation import (
     RoutingDeadline,
     RoutingTimeout,
 )
-from .graph import RoadGraph
+from .graph import CompactRoadGraph, RoadGraph
 from .planner import (
     Route,
     ScenicRoutePlanner,
@@ -582,6 +582,43 @@ def _get_scored_graph(
         ):
             _clear_scored_variant_locked()
 
+        if isinstance(graph, CompactRoadGraph):
+            # Compact graphs are immutable; a report variant is a fresh mmap
+            # load with a deterministic per-report scenic-cost sidecar, never
+            # an O(E) native-edge clone or mutation pass.
+            scored_graph = CompactRoadGraph.load(
+                graph.manifest_path,
+                check_cancelled=deadline.check if deadline is not None else None,
+            )
+            if deadline is not None:
+                deadline.check()
+            report_signature = _signature_digest(tile_key[0], tile_key[1])
+            matched, total = scored_graph.activate_report_scores(
+                score_map,
+                zoom=int(zoom),
+                fallback=fallback,
+                report_signature=report_signature,
+                normalization=_NORMALIZATION_VERSION,
+                tile_scores_path=Path(tile_key[0]),
+                check_cancelled=deadline.check if deadline is not None else None,
+            )
+            fallback_edges = int(total - matched) if fallback is not None else 0
+            object.__setattr__(
+                scored_graph,
+                "_route_service_score_mapping",
+                (int(matched), int(total), fallback_edges),
+            )
+            _GRAPH_CACHE[graph_key] = scored_graph
+            _GRAPH_CACHE.move_to_end(graph_key)
+            _SCORED_GRAPH_CACHE[cache_key] = scored_graph
+            _SCORED_GRAPH_CACHE.move_to_end(cache_key)
+            while len(_GRAPH_CACHE) > _CACHE_CAPACITY:
+                _GRAPH_CACHE.popitem(last=False)
+            while len(_SCORED_GRAPH_CACHE) > _SCORED_GRAPH_CACHE_CAPACITY:
+                _SCORED_GRAPH_CACHE.popitem(last=False)
+            _ACTIVE_GRAPH_VARIANT_KEY = cache_key
+            return scored_graph, int(matched), int(total), False
+
         # ``graph`` is the canonical raw graph (or a private raw reference
         # fetched before this lock).  Normal requests always score a clone;
         # startup may explicitly score this source graph in place.
@@ -712,6 +749,13 @@ def preload_route_assets(
     )
     if not graph.nodes or not graph.edges:
         raise ValueError(f"Graph asset has no usable nodes/edges: {graph_file}")
+    if isinstance(graph, CompactRoadGraph):
+        projection_status = dict(graph.edge_projection_index_status)
+        if projection_status.get("state") != "loaded":
+            raise RuntimeError(
+                "compact graph requires a compatible mmap-loaded edge "
+                f"projection index; observed {projection_status}"
+            )
 
     matched = 0
     total = len(graph.edges)
