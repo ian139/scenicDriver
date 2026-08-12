@@ -203,6 +203,42 @@ class EdgeProjectionIndex:
             raise ValueError("Graph edge count does not match sidecar total edge count")
         self._canonical_keys = canonical_keys
         self._canonical_keys_owner = owner
+    def close(self) -> None:
+        """Close backing memory-map and file handle if held."""
+        self.edge_ranks = np.empty(0, dtype=np.int64)
+        self.start_latitudes = np.empty(0, dtype=np.float64)
+        self.start_longitudes = np.empty(0, dtype=np.float64)
+        self.end_latitudes = np.empty(0, dtype=np.float64)
+        self.end_longitudes = np.empty(0, dtype=np.float64)
+        self.bvh_min_lat = np.empty(0, dtype=np.float64)
+        self.bvh_min_lon = np.empty(0, dtype=np.float64)
+        self.bvh_max_lat = np.empty(0, dtype=np.float64)
+        self.bvh_max_lon = np.empty(0, dtype=np.float64)
+        self.bvh_left = np.empty(0, dtype=np.int64)
+        self.bvh_right = np.empty(0, dtype=np.int64)
+        self.bvh_start = np.empty(0, dtype=np.int64)
+        self.bvh_stop = np.empty(0, dtype=np.int64)
+        mm = getattr(self, "_mmap", None)
+        if mm is not None:
+            try:
+                mm.close()
+            except Exception:
+                pass
+            self._mmap = None
+        f = getattr(self, "_file", None)
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+            self._file = None
+
+    def __enter__(self) -> "EdgeProjectionIndex":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
 
     @property
     def edge_count(self) -> int:
@@ -882,6 +918,7 @@ class EdgeProjectionIndex:
         graph_path: Path,
         *,
         check_cancelled: Callable[[], None] | None = None,
+        verify: bool = True,
     ) -> "EdgeProjectionIndex":
         """Load and validate a sidecar, raising on any inconsistency."""
         callback = check_cancelled
@@ -948,17 +985,18 @@ class EdgeProjectionIndex:
                 graph_stat = graph_path.stat()
                 if graph_stat.st_size != bound_file_size:
                     raise _SidecarStaleError("Graph file size mismatch")
-                digest = hashlib.sha256()
-                with open(graph_path, "rb") as gf:
-                    while True:
-                        if check_cancelled is not None:
-                            check_cancelled()
-                        chunk = gf.read(8 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        digest.update(chunk)
-                if digest.digest() != bound_sha256:
-                    raise _SidecarStaleError("Graph file SHA-256 mismatch")
+                if verify:
+                    digest = hashlib.sha256()
+                    with open(graph_path, "rb") as gf:
+                        while True:
+                            if check_cancelled is not None:
+                                check_cancelled()
+                            chunk = gf.read(8 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                    if digest.digest() != bound_sha256:
+                        raise _SidecarStaleError("Graph file SHA-256 mismatch")
 
                 if check_cancelled is not None:
                     check_cancelled()
@@ -1014,7 +1052,7 @@ class EdgeProjectionIndex:
                     if offset + size > len(mm):
                         raise _SidecarTruncatedError(f"Section {idx} extends past file")
                     payload = memoryview(mm)[offset : offset + size]
-                    if _sha256_buffer(payload, check_cancelled) != sha:
+                    if verify and _sha256_buffer(payload, check_cancelled) != sha:
                         raise _SidecarCorruptError(f"Section {idx} SHA-256 mismatch")
                     arr = np.frombuffer(
                         mm, dtype=np.dtype(expected_dtype), count=count, offset=offset
@@ -1031,7 +1069,7 @@ class EdgeProjectionIndex:
                     if offset + size > len(mm):
                         raise _SidecarTruncatedError(f"Section {idx} extends past file")
                     payload = memoryview(mm)[offset : offset + size]
-                    if _sha256_buffer(payload, check_cancelled) != sha:
+                    if verify and _sha256_buffer(payload, check_cancelled) != sha:
                         raise _SidecarCorruptError(f"Section {idx} SHA-256 mismatch")
                     return payload
 
