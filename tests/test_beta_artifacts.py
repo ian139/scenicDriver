@@ -7,9 +7,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from scripts.routing import check_beta_artifacts as checker
-
+from src.route_planner.graph import RoadGraph, write_compact_graph
 
 BBOX = {
     "min_lat": 42.488301979602255,
@@ -374,3 +373,62 @@ def test_active_checkpoint_prefers_existing_and_reports_missing_paths(
     assert "tried:" in issues[0]
     assert str(registry.parent / "checkpoints" / f"{missing_sha}.pt") in issues[0]
     assert str(root / "checkpoints" / f"{missing_sha}.pt") in issues[0]
+def test_valid_compact_graph_artifacts_pass(tmp_path: Path) -> None:
+    relative_sqlite = "data/processed/road_graphs/candidate/road_graph.sqlite3"
+    _write_project(tmp_path, graph=relative_sqlite)
+    sqlite_path = tmp_path / relative_sqlite
+    _write_sqlite_graph(sqlite_path)
+
+    graph = RoadGraph.load(sqlite_path)
+    graph.persist_edge_projection_index(sqlite_path)
+    manifest_path = sqlite_path.with_name("road_graph.compact.json")
+    write_compact_graph(sqlite_path, manifest_path)
+
+    assert checker.check_artifacts(tmp_path, graph=manifest_path) == 0
+
+
+def test_corrupt_compact_payload_sha_rejected_by_checker(
+    tmp_path: Path, capsys
+) -> None:
+    relative_sqlite = "data/processed/road_graphs/candidate/road_graph.sqlite3"
+    _write_project(tmp_path, graph=relative_sqlite)
+    sqlite_path = tmp_path / relative_sqlite
+    _write_sqlite_graph(sqlite_path)
+
+    graph = RoadGraph.load(sqlite_path)
+    graph.persist_edge_projection_index(sqlite_path)
+    manifest_path = sqlite_path.with_name("road_graph.compact.json")
+    write_compact_graph(sqlite_path, manifest_path)
+
+    bin_path = sqlite_path.with_name("road_graph.compact.bin")
+    bin_bytes = bytearray(bin_path.read_bytes())
+    bin_bytes[0] ^= 0xFF
+    bin_path.write_bytes(bytes(bin_bytes))
+
+    assert checker.check_artifacts(tmp_path, graph=manifest_path) == 1
+    output = capsys.readouterr().out
+    assert "compact binary SHA-256 mismatch" in output
+
+
+def test_corrupt_projection_sidecar_rejected_by_checker(
+    tmp_path: Path, capsys
+) -> None:
+    relative_sqlite = "data/processed/road_graphs/candidate/road_graph.sqlite3"
+    _write_project(tmp_path, graph=relative_sqlite)
+    sqlite_path = tmp_path / relative_sqlite
+    _write_sqlite_graph(sqlite_path)
+
+    graph = RoadGraph.load(sqlite_path)
+    graph.persist_edge_projection_index(sqlite_path)
+    manifest_path = sqlite_path.with_name("road_graph.compact.json")
+    write_compact_graph(sqlite_path, manifest_path)
+
+    sidecar_path = sqlite_path.with_name("road_graph.sqlite3.edge_projection_index")
+    sidecar_bytes = bytearray(sidecar_path.read_bytes())
+    sidecar_bytes[-1] ^= 0xFF
+    sidecar_path.write_bytes(bytes(sidecar_bytes))
+
+    assert checker.check_artifacts(tmp_path, graph=manifest_path) == 1
+    output = capsys.readouterr().out
+    assert "invalid:" in output
+    assert "projection_index" in output or "edge_projection_index" in output

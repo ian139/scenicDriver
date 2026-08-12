@@ -882,6 +882,7 @@ class EdgeProjectionIndex:
         graph_path: Path,
         *,
         check_cancelled: Callable[[], None] | None = None,
+        verify: bool = True,
     ) -> "EdgeProjectionIndex":
         """Load and validate a sidecar, raising on any inconsistency."""
         callback = check_cancelled
@@ -948,17 +949,18 @@ class EdgeProjectionIndex:
                 graph_stat = graph_path.stat()
                 if graph_stat.st_size != bound_file_size:
                     raise _SidecarStaleError("Graph file size mismatch")
-                digest = hashlib.sha256()
-                with open(graph_path, "rb") as gf:
-                    while True:
-                        if check_cancelled is not None:
-                            check_cancelled()
-                        chunk = gf.read(8 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        digest.update(chunk)
-                if digest.digest() != bound_sha256:
-                    raise _SidecarStaleError("Graph file SHA-256 mismatch")
+                if verify:
+                    digest = hashlib.sha256()
+                    with open(graph_path, "rb") as gf:
+                        while True:
+                            if check_cancelled is not None:
+                                check_cancelled()
+                            chunk = gf.read(8 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                    if digest.digest() != bound_sha256:
+                        raise _SidecarStaleError("Graph file SHA-256 mismatch")
 
                 if check_cancelled is not None:
                     check_cancelled()
@@ -1014,7 +1016,7 @@ class EdgeProjectionIndex:
                     if offset + size > len(mm):
                         raise _SidecarTruncatedError(f"Section {idx} extends past file")
                     payload = memoryview(mm)[offset : offset + size]
-                    if _sha256_buffer(payload, check_cancelled) != sha:
+                    if verify and _sha256_buffer(payload, check_cancelled) != sha:
                         raise _SidecarCorruptError(f"Section {idx} SHA-256 mismatch")
                     arr = np.frombuffer(
                         mm, dtype=np.dtype(expected_dtype), count=count, offset=offset
@@ -1031,7 +1033,7 @@ class EdgeProjectionIndex:
                     if offset + size > len(mm):
                         raise _SidecarTruncatedError(f"Section {idx} extends past file")
                     payload = memoryview(mm)[offset : offset + size]
-                    if _sha256_buffer(payload, check_cancelled) != sha:
+                    if verify and _sha256_buffer(payload, check_cancelled) != sha:
                         raise _SidecarCorruptError(f"Section {idx} SHA-256 mismatch")
                     return payload
 

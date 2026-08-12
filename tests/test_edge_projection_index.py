@@ -723,3 +723,35 @@ def test_longitude_bound_prunes_same_latitude_distractors() -> None:
         f"edge-{expected_index}"
     ]
     assert stats["scanned_edges"] < 200
+def test_load_with_verify_false_bypasses_digest_computation_but_enforces_structure(
+    tmp_path: Path,
+) -> None:
+    graph = _basic_graph()
+    path = tmp_path / "g.sqlite3"
+    graph.save(path)
+    graph.persist_edge_projection_index(path)
+    sidecar = _sidecar_path(path)
+    data = sidecar.read_bytes()
+    # Flip a byte in bound_sha256 (bytes 60..92)
+    header = bytearray(data[:_EPI_HEADER_SIZE])
+    header[60] ^= 0xFF
+    sidecar.write_bytes(bytes(header + data[_EPI_HEADER_SIZE:]))
+
+    with pytest.raises(edge_projection_module._SidecarStaleError, match="SHA-256"):
+        EdgeProjectionIndex.load(sidecar, path, verify=True)
+
+    loaded_index = EdgeProjectionIndex.load(sidecar, path, verify=False)
+    assert loaded_index.total_edge_count == len(graph.edges)
+
+    # 2. Structural invariants retained even with verify=False
+    # Magic mismatch
+    bad_magic = bytearray(bytes(data))
+    bad_magic[:8] = b"BADMAGIC"
+    sidecar.write_bytes(bytes(bad_magic))
+    with pytest.raises(edge_projection_module._SidecarCorruptError, match="magic"):
+        EdgeProjectionIndex.load(sidecar, path, verify=False)
+
+    # Truncation
+    sidecar.write_bytes(bytes(data[:40]))
+    with pytest.raises(edge_projection_module._SidecarTruncatedError):
+        EdgeProjectionIndex.load(sidecar, path, verify=False)

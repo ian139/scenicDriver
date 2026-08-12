@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -12,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping
 
+from src.route_planner._edge_projection import EdgeProjectionIndex, _SidecarError
 
 CONFIG_PATH = Path("config/app_regions.json")
 REGISTRY_PATH = Path("data/processed/regression/model_registry.json")
@@ -342,7 +344,111 @@ def _validate_sqlite_graph(
         if connection is not None:
             connection.close()
     return []
+def _sha256_file(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.digest()
 
+
+def _validate_compact_graph(
+    manifest_path: Path, region: Mapping[str, Any] | None
+) -> list[str]:
+    """Validate compact graph manifest, binary payload, source, and projection sidecar."""
+    label = str(manifest_path)
+    try:
+        manifest: Any = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return [f"invalid: {label} ({exc})"]
+
+    if not isinstance(manifest, dict):
+        return [f"invalid: {label} (manifest is not a dict)"]
+    if manifest.get("format") != "scenic-roadgraph-compact":
+        return [
+            f"invalid: {label} (unsupported compact format {manifest.get('format')!r})"
+        ]
+    if manifest.get("schema_version") != 1:
+        return [
+            f"invalid: {label} (unsupported compact schema_version {manifest.get('schema_version')!r})"
+        ]
+
+    bin_name = manifest.get("bin_path")
+    if not isinstance(bin_name, str) or not bin_name:
+        return [f"invalid: {label} (missing bin_path)"]
+    bin_path = (manifest_path.parent / bin_name).resolve()
+    if not bin_path.is_file():
+        return [f"invalid: {bin_path} (compact binary payload is missing)"]
+
+    bin_size_expected = manifest.get("bin_size_bytes")
+    if isinstance(bin_size_expected, int) and bin_path.stat().st_size != bin_size_expected:
+        return [f"invalid: {bin_path} (compact binary size mismatch)"]
+
+    expected_bin_sha = manifest.get("bin_sha256")
+    if isinstance(expected_bin_sha, str) and expected_bin_sha:
+        actual_bin_sha = _sha256_file(bin_path).hex()
+        if actual_bin_sha != expected_bin_sha:
+            return [f"invalid: {bin_path} (compact binary SHA-256 mismatch)"]
+
+    source_info = manifest.get("source")
+    if not isinstance(source_info, Mapping):
+        return [f"invalid: {label} (missing source metadata)"]
+    source_name = source_info.get("path")
+    if not isinstance(source_name, str) or not source_name:
+        return [f"invalid: {label} (missing source path)"]
+    source_path = (manifest_path.parent / source_name).resolve()
+    if not source_path.is_file():
+        return [f"invalid: {source_path} (compact source graph is missing)"]
+
+    source_size_expected = source_info.get("size_bytes")
+    if (
+        isinstance(source_size_expected, int)
+        and source_path.stat().st_size != source_size_expected
+    ):
+        return [f"invalid: {source_path} (compact source graph size mismatch)"]
+
+    expected_source_sha = source_info.get("sha256")
+    if isinstance(expected_source_sha, str) and expected_source_sha:
+        actual_source_sha = _sha256_file(source_path).hex()
+        if actual_source_sha != expected_source_sha:
+            return [f"invalid: {source_path} (compact source graph SHA-256 mismatch)"]
+
+    sqlite_issues = _validate_sqlite_graph(source_path, region)
+    if sqlite_issues:
+        return sqlite_issues
+
+    proj_info = manifest.get("projection_index")
+    proj_name = proj_info.get("path") if isinstance(proj_info, Mapping) else None
+    if isinstance(proj_name, str) and proj_name:
+        sidecar_path = (manifest_path.parent / proj_name).resolve()
+    else:
+        sidecar_path = EdgeProjectionIndex.sidecar_path(source_path)
+
+    if not sidecar_path.is_file():
+        return [f"invalid: {sidecar_path} (projection sidecar is missing)"]
+
+    if isinstance(proj_info, Mapping):
+        expected_proj_sha = proj_info.get("sha256")
+        if isinstance(expected_proj_sha, str) and expected_proj_sha:
+            actual_proj_sha = _sha256_file(sidecar_path).hex()
+            if actual_proj_sha != expected_proj_sha:
+                return [f"invalid: {sidecar_path} (projection sidecar SHA-256 mismatch)"]
+        expected_proj_size = proj_info.get("size_bytes")
+        if (
+            isinstance(expected_proj_size, int)
+            and sidecar_path.stat().st_size != expected_proj_size
+        ):
+            return [f"invalid: {sidecar_path} (projection sidecar size mismatch)"]
+
+    try:
+        EdgeProjectionIndex.load(sidecar_path, source_path, verify=True)
+    except (_SidecarError, ValueError, OSError) as exc:
+        return [f"invalid: {sidecar_path} ({exc})"]
+
+    return []
 
 def _active_checkpoint(root: Path) -> tuple[Path, list[str]]:
     """Resolve the checkpoint named by the active model-registry record."""
@@ -398,6 +504,20 @@ def check_artifacts(project_root: Path, graph: Path | None = None) -> int:
 
     if graph_path.suffix.lower() == ".sqlite3" and graph_path not in missing:
         issues.extend(_validate_sqlite_graph(graph_path, region))
+        compact_manifest = graph_path.with_name(f"{graph_path.stem}.compact.json")
+        if compact_manifest.is_file():
+            issues.extend(_validate_compact_graph(compact_manifest, region))
+        sidecar_path = EdgeProjectionIndex.sidecar_path(graph_path)
+        if sidecar_path.is_file() and not compact_manifest.is_file():
+            try:
+                EdgeProjectionIndex.load(sidecar_path, graph_path, verify=True)
+            except (_SidecarError, ValueError, OSError) as exc:
+                issues.append(f"invalid: {sidecar_path} ({exc})")
+    elif (
+        graph_path.name.endswith(".compact.json")
+        or graph_path.suffix.lower() == ".json"
+    ) and graph_path not in missing:
+        issues.extend(_validate_compact_graph(graph_path, region))
 
     for path in missing:
         try:
