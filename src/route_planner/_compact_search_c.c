@@ -41,11 +41,11 @@ typedef struct {
 } CostSpec;
 
 typedef struct {
-    int32_t node_rank;
     double dist;
+    uint64_t sequence;
+    int32_t node_rank;
     int32_t rank_primary;
     int32_t rank_secondary;
-    uint64_t sequence;
     int32_t label_id;
 } HeapItem;
 
@@ -121,12 +121,12 @@ static bool heap_push(
         h->capacity = next_capacity;
     }
     HeapItem item = {
-        node_rank,
-        dist,
-        rank_primary,
-        rank_secondary,
-        sequence,
-        label_id,
+        .dist = dist,
+        .sequence = sequence,
+        .node_rank = node_rank,
+        .rank_primary = rank_primary,
+        .rank_secondary = rank_secondary,
+        .label_id = label_id,
     };
     int32_t i = h->size++;
     while (i > 0) {
