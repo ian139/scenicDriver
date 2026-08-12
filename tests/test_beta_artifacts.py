@@ -7,9 +7,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from scripts.routing import check_beta_artifacts as checker
-
+from src.route_planner.graph import RoadGraph, write_compact_graph
 
 BBOX = {
     "min_lat": 42.488301979602255,
@@ -374,3 +373,273 @@ def test_active_checkpoint_prefers_existing_and_reports_missing_paths(
     assert "tried:" in issues[0]
     assert str(registry.parent / "checkpoints" / f"{missing_sha}.pt") in issues[0]
     assert str(root / "checkpoints" / f"{missing_sha}.pt") in issues[0]
+def test_valid_compact_graph_artifacts_pass(tmp_path: Path) -> None:
+    relative_sqlite = "data/processed/road_graphs/candidate/road_graph.sqlite3"
+    _write_project(tmp_path, graph=relative_sqlite)
+    sqlite_path = tmp_path / relative_sqlite
+    _write_sqlite_graph(sqlite_path)
+
+    graph = RoadGraph.load(sqlite_path)
+    graph.persist_edge_projection_index(sqlite_path)
+    manifest_path = sqlite_path.with_name("road_graph.compact.json")
+    write_compact_graph(sqlite_path, manifest_path)
+
+    assert checker.check_artifacts(tmp_path, graph=manifest_path) == 0
+
+
+def test_corrupt_compact_payload_sha_rejected_by_checker(
+    tmp_path: Path, capsys
+) -> None:
+    relative_sqlite = "data/processed/road_graphs/candidate/road_graph.sqlite3"
+    _write_project(tmp_path, graph=relative_sqlite)
+    sqlite_path = tmp_path / relative_sqlite
+    _write_sqlite_graph(sqlite_path)
+
+    graph = RoadGraph.load(sqlite_path)
+    graph.persist_edge_projection_index(sqlite_path)
+    manifest_path = sqlite_path.with_name("road_graph.compact.json")
+    write_compact_graph(sqlite_path, manifest_path)
+
+    bin_path = sqlite_path.with_name("road_graph.compact.bin")
+    bin_bytes = bytearray(bin_path.read_bytes())
+    bin_bytes[0] ^= 0xFF
+    bin_path.write_bytes(bytes(bin_bytes))
+
+    assert checker.check_artifacts(tmp_path, graph=manifest_path) == 1
+    output = capsys.readouterr().out
+    assert "compact binary SHA-256 mismatch" in output
+
+
+def test_corrupt_projection_sidecar_rejected_by_checker(
+    tmp_path: Path, capsys
+) -> None:
+    relative_sqlite = "data/processed/road_graphs/candidate/road_graph.sqlite3"
+    _write_project(tmp_path, graph=relative_sqlite)
+    sqlite_path = tmp_path / relative_sqlite
+    _write_sqlite_graph(sqlite_path)
+
+    graph = RoadGraph.load(sqlite_path)
+    graph.persist_edge_projection_index(sqlite_path)
+    manifest_path = sqlite_path.with_name("road_graph.compact.json")
+    write_compact_graph(sqlite_path, manifest_path)
+
+    sidecar_path = sqlite_path.with_name("road_graph.sqlite3.edge_projection_index")
+    sidecar_bytes = bytearray(sidecar_path.read_bytes())
+    sidecar_bytes[-1] ^= 0xFF
+    sidecar_path.write_bytes(bytes(sidecar_bytes))
+
+    assert checker.check_artifacts(tmp_path, graph=manifest_path) == 1
+    output = capsys.readouterr().out
+    assert "invalid:" in output
+    assert "projection_index" in output or "edge_projection_index" in output
+
+
+def test_multiple_enabled_regions_pass(tmp_path: Path) -> None:
+    ne_graph = "data/processed/road_graphs/ne/road_graph.sqlite3"
+    mw_graph = "data/processed/road_graphs/mw/road_graph.sqlite3"
+    (tmp_path / "config").mkdir(parents=True)
+    (tmp_path / "config/app_regions.json").write_text(
+        json.dumps(
+            {
+                "default_region": "new_england_north",
+                "regions": [
+                    {
+                        "region": "new_england_north",
+                        "graph": ne_graph,
+                        "run_name": "run_ne",
+                        "max_route_snap_km": 1.0,
+                        "bbox": BBOX,
+                    },
+                    {
+                        "region": "masswhites",
+                        "graph": mw_graph,
+                        "run_name": "run_mw",
+                        "max_route_snap_km": 1.0,
+                        "bbox": BBOX,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_sqlite_graph(tmp_path / ne_graph)
+    _write_sqlite_graph(tmp_path / mw_graph)
+    for run in ("run_ne", "run_mw"):
+        rep = tmp_path / "data/processed/heuristic_runs" / run / "report"
+        rep.mkdir(parents=True)
+        for name in ("report.json", "route.geojson", "route_metrics.json"):
+            (rep / name).write_text("{}", encoding="utf-8")
+
+    registry = tmp_path / checker.REGISTRY_PATH
+    registry.parent.mkdir(parents=True)
+    registry.write_text(
+        json.dumps({"active": {"checkpoint": str(checker.DEFAULT_CHECKPOINT_PATH)}}),
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / checker.DEFAULT_CHECKPOINT_PATH
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+
+    assert checker.check_artifacts(tmp_path) == 0
+
+
+def test_disabled_region_skipped(tmp_path: Path) -> None:
+    ne_graph = "data/processed/road_graphs/ne/road_graph.sqlite3"
+    (tmp_path / "config").mkdir(parents=True)
+    (tmp_path / "config/app_regions.json").write_text(
+        json.dumps(
+            {
+                "default_region": "new_england_north",
+                "regions": [
+                    {
+                        "region": "new_england_north",
+                        "graph": ne_graph,
+                        "run_name": "run_ne",
+                        "max_route_snap_km": 1.0,
+                        "bbox": BBOX,
+                    },
+                    {
+                        "region": "northeast_expanded",
+                        "graph": None,
+                        "route_planning": False,
+                        "run_name": "run_expanded",
+                        "bbox": BBOX,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_sqlite_graph(tmp_path / ne_graph)
+    rep = tmp_path / "data/processed/heuristic_runs" / "run_ne" / "report"
+    rep.mkdir(parents=True)
+    for name in ("report.json", "route.geojson", "route_metrics.json"):
+        (rep / name).write_text("{}", encoding="utf-8")
+
+    registry = tmp_path / checker.REGISTRY_PATH
+    registry.parent.mkdir(parents=True)
+    registry.write_text(
+        json.dumps({"active": {"checkpoint": str(checker.DEFAULT_CHECKPOINT_PATH)}}),
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / checker.DEFAULT_CHECKPOINT_PATH
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+
+    assert checker.check_artifacts(tmp_path) == 0
+
+
+def test_missing_second_region_artifact_rejected(
+    tmp_path: Path, capsys
+) -> None:
+    ne_graph = "data/processed/road_graphs/ne/road_graph.sqlite3"
+    mw_graph = "data/processed/road_graphs/mw/road_graph.sqlite3"
+    (tmp_path / "config").mkdir(parents=True)
+    (tmp_path / "config/app_regions.json").write_text(
+        json.dumps(
+            {
+                "default_region": "new_england_north",
+                "regions": [
+                    {
+                        "region": "new_england_north",
+                        "graph": ne_graph,
+                        "run_name": "run_ne",
+                        "max_route_snap_km": 1.0,
+                        "bbox": BBOX,
+                    },
+                    {
+                        "region": "masswhites",
+                        "graph": mw_graph,
+                        "run_name": "run_mw",
+                        "max_route_snap_km": 1.0,
+                        "bbox": BBOX,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_sqlite_graph(tmp_path / ne_graph)
+    _write_sqlite_graph(tmp_path / mw_graph)
+    rep_ne = tmp_path / "data/processed/heuristic_runs" / "run_ne" / "report"
+    rep_ne.mkdir(parents=True)
+    for name in ("report.json", "route.geojson", "route_metrics.json"):
+        (rep_ne / name).write_text("{}", encoding="utf-8")
+
+    # Second region missing route_metrics.json
+    rep_mw = tmp_path / "data/processed/heuristic_runs" / "run_mw" / "report"
+    rep_mw.mkdir(parents=True)
+    (rep_mw / "report.json").write_text("{}", encoding="utf-8")
+    (rep_mw / "route.geojson").write_text("{}", encoding="utf-8")
+
+    registry = tmp_path / checker.REGISTRY_PATH
+    registry.parent.mkdir(parents=True)
+    registry.write_text(
+        json.dumps({"active": {"checkpoint": str(checker.DEFAULT_CHECKPOINT_PATH)}}),
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / checker.DEFAULT_CHECKPOINT_PATH
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+
+    assert checker.check_artifacts(tmp_path) == 1
+    output = capsys.readouterr().out
+    assert "missing:" in output
+    assert "run_mw/report/route_metrics.json" in output
+
+
+def test_per_region_compact_validation_selection(tmp_path: Path) -> None:
+    ne_graph = "data/processed/road_graphs/ne/road_graph.sqlite3"
+    mw_sqlite = "data/processed/road_graphs/mw/road_graph.sqlite3"
+    mw_compact = "data/processed/road_graphs/mw/road_graph.compact.json"
+    (tmp_path / "config").mkdir(parents=True)
+    (tmp_path / "config/app_regions.json").write_text(
+        json.dumps(
+            {
+                "default_region": "new_england_north",
+                "regions": [
+                    {
+                        "region": "new_england_north",
+                        "graph": ne_graph,
+                        "run_name": "run_ne",
+                        "max_route_snap_km": 1.0,
+                        "bbox": BBOX,
+                    },
+                    {
+                        "region": "masswhites",
+                        "graph": mw_compact,
+                        "run_name": "run_mw",
+                        "max_route_snap_km": 1.0,
+                        "bbox": BBOX,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_sqlite_graph(tmp_path / ne_graph)
+
+    sqlite_path = tmp_path / mw_sqlite
+    _write_sqlite_graph(sqlite_path)
+    graph = RoadGraph.load(sqlite_path)
+    graph.persist_edge_projection_index(sqlite_path)
+    manifest_path = tmp_path / mw_compact
+    write_compact_graph(sqlite_path, manifest_path)
+
+    for run in ("run_ne", "run_mw"):
+        rep = tmp_path / "data/processed/heuristic_runs" / run / "report"
+        rep.mkdir(parents=True)
+        for name in ("report.json", "route.geojson", "route_metrics.json"):
+            (rep / name).write_text("{}", encoding="utf-8")
+
+    registry = tmp_path / checker.REGISTRY_PATH
+    registry.parent.mkdir(parents=True)
+    registry.write_text(
+        json.dumps({"active": {"checkpoint": str(checker.DEFAULT_CHECKPOINT_PATH)}}),
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / checker.DEFAULT_CHECKPOINT_PATH
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+
+    assert checker.check_artifacts(tmp_path) == 0

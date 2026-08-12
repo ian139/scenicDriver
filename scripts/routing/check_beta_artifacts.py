@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -12,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping
 
+from src.route_planner._edge_projection import EdgeProjectionIndex, _SidecarError
 
 CONFIG_PATH = Path("config/app_regions.json")
 REGISTRY_PATH = Path("data/processed/regression/model_registry.json")
@@ -120,49 +122,179 @@ def _resolve_active_checkpoint(
     ]
 
 
-def _configured_region(root: Path) -> tuple[dict[str, Any] | None, list[str]]:
-    """Load the configured New England region without validating artifacts."""
+def _configured_route_regions(
+    root: Path, cli_graph: Path | None = None
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Resolve all configured route-enabled regions with graph paths.
 
+    Returns a list of dicts, each describing a route region:
+        - "region": region name (str)
+        - "graph_path": Path
+        - "run_name": run_name (str)
+        - "region_dict": raw region configuration dict
+        - "is_default": bool
+    and a list of issue strings.
+    """
     config_path = root / CONFIG_PATH
+    issues: list[str] = []
+
     if not config_path.is_file():
-        return None, []
+        default_graph = (
+            _project_path(root, cli_graph)
+            if cli_graph is not None
+            else root / DEFAULT_GRAPH_PATH
+        )
+        return [
+            {
+                "region": "new_england_north",
+                "graph_path": default_graph,
+                "run_name": DEFAULT_RUN_NAME,
+                "region_dict": None,
+                "is_default": True,
+            }
+        ], []
+
     try:
         payload: Any = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        return None, [f"invalid: {CONFIG_PATH} ({exc})"]
-    regions = payload.get("regions") if isinstance(payload, dict) else None
-    region = next(
-        (
-            item
-            for item in regions or []
-            if isinstance(item, dict) and item.get("region") == "new_england_north"
-        ),
-        None,
-    )
-    if not isinstance(region, dict):
-        return None, [f"invalid: {CONFIG_PATH} (new_england_north is not configured)"]
-    return region, []
+        default_graph = (
+            _project_path(root, cli_graph)
+            if cli_graph is not None
+            else root / DEFAULT_GRAPH_PATH
+        )
+        return [
+            {
+                "region": "new_england_north",
+                "graph_path": default_graph,
+                "run_name": DEFAULT_RUN_NAME,
+                "region_dict": None,
+                "is_default": True,
+            }
+        ], [f"invalid: {CONFIG_PATH} ({exc})"]
+
+    if not isinstance(payload, dict):
+        default_graph = (
+            _project_path(root, cli_graph)
+            if cli_graph is not None
+            else root / DEFAULT_GRAPH_PATH
+        )
+        return [
+            {
+                "region": "new_england_north",
+                "graph_path": default_graph,
+                "run_name": DEFAULT_RUN_NAME,
+                "region_dict": None,
+                "is_default": True,
+            }
+        ], [f"invalid: {CONFIG_PATH} (config payload is not a dict)"]
+
+    default_region_name = payload.get("default_region")
+    if not isinstance(default_region_name, str) or not default_region_name:
+        default_region_name = "new_england_north"
+
+    regions_raw = payload.get("regions")
+    if not isinstance(regions_raw, list):
+        default_graph = (
+            _project_path(root, cli_graph)
+            if cli_graph is not None
+            else root / DEFAULT_GRAPH_PATH
+        )
+        return [
+            {
+                "region": default_region_name,
+                "graph_path": default_graph,
+                "run_name": DEFAULT_RUN_NAME,
+                "region_dict": None,
+                "is_default": True,
+            }
+        ], [f"invalid: {CONFIG_PATH} (regions array is missing)"]
+
+    route_regions: list[dict[str, Any]] = []
+    found_default = False
+
+    for item in regions_raw:
+        if not isinstance(item, dict):
+            continue
+        region_name = item.get("region")
+        if not isinstance(region_name, str) or not region_name:
+            continue
+
+        is_default = region_name == default_region_name
+        if is_default:
+            found_default = True
+
+        if item.get("route_planning") is False:
+            continue
+
+        raw_graph = item.get("graph")
+        if raw_graph is None or not str(raw_graph).strip():
+            if is_default:
+                issues.append(
+                    f"invalid: {CONFIG_PATH} ({region_name} graph is missing)"
+                )
+            continue
+
+        if is_default and cli_graph is not None:
+            graph_path = _project_path(root, cli_graph)
+        else:
+            graph_path = _project_path(root, raw_graph)
+
+        run_name = item.get("run_name")
+        if not isinstance(run_name, str) or not run_name:
+            issues.append(f"invalid: {CONFIG_PATH} ({region_name} run_name is missing)")
+            run_name = DEFAULT_RUN_NAME if is_default else ""
+
+        route_regions.append(
+            {
+                "region": region_name,
+                "graph_path": graph_path,
+                "run_name": run_name,
+                "region_dict": item,
+                "is_default": is_default,
+            }
+        )
+
+    if not route_regions:
+        default_graph = (
+            _project_path(root, cli_graph)
+            if cli_graph is not None
+            else root / DEFAULT_GRAPH_PATH
+        )
+        route_regions.append(
+            {
+                "region": default_region_name,
+                "graph_path": default_graph,
+                "run_name": DEFAULT_RUN_NAME,
+                "region_dict": None,
+                "is_default": True,
+            }
+        )
+        if not found_default:
+            issues.append(
+                f"invalid: {CONFIG_PATH} ({default_region_name} is not configured)"
+            )
+
+    return route_regions, issues
+
+
+def _configured_region(root: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    """Load the default configured region without validating artifacts."""
+    regions, issues = _configured_route_regions(root)
+    for reg in regions:
+        if reg["is_default"]:
+            return reg["region_dict"], issues
+    return (regions[0]["region_dict"] if regions else None), issues
 
 
 def _configured_new_england(root: Path) -> tuple[Path, str, list[str]]:
-    """Read the New England graph/run settings, with canonical fallbacks."""
-
-    graph_path = root / DEFAULT_GRAPH_PATH
-    run_name = DEFAULT_RUN_NAME
-    region, issues = _configured_region(root)
-    if region is None:
-        return graph_path, run_name, issues
-    configured_graph = region.get("graph")
-    configured_run = region.get("run_name")
-    if isinstance(configured_graph, str) and configured_graph:
-        graph_path = _project_path(root, configured_graph)
-    else:
-        issues.append(f"invalid: {CONFIG_PATH} (new_england_north graph is missing)")
-    if isinstance(configured_run, str) and configured_run:
-        run_name = configured_run
-    else:
-        issues.append(f"invalid: {CONFIG_PATH} (new_england_north run_name is missing)")
-    return graph_path, run_name, issues
+    """Read the default graph/run settings, with canonical fallbacks."""
+    regions, issues = _configured_route_regions(root)
+    for reg in regions:
+        if reg["is_default"]:
+            return reg["graph_path"], reg["run_name"], issues
+    if regions:
+        return regions[0]["graph_path"], regions[0]["run_name"], issues
+    return root / DEFAULT_GRAPH_PATH, DEFAULT_RUN_NAME, issues
 
 
 def _metadata_bbox_matches(metadata_bbox: Any, configured_bbox: Any) -> bool:
@@ -342,7 +474,111 @@ def _validate_sqlite_graph(
         if connection is not None:
             connection.close()
     return []
+def _sha256_file(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.digest()
 
+
+def _validate_compact_graph(
+    manifest_path: Path, region: Mapping[str, Any] | None
+) -> list[str]:
+    """Validate compact graph manifest, binary payload, source, and projection sidecar."""
+    label = str(manifest_path)
+    try:
+        manifest: Any = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return [f"invalid: {label} ({exc})"]
+
+    if not isinstance(manifest, dict):
+        return [f"invalid: {label} (manifest is not a dict)"]
+    if manifest.get("format") != "scenic-roadgraph-compact":
+        return [
+            f"invalid: {label} (unsupported compact format {manifest.get('format')!r})"
+        ]
+    if manifest.get("schema_version") != 1:
+        return [
+            f"invalid: {label} (unsupported compact schema_version {manifest.get('schema_version')!r})"
+        ]
+
+    bin_name = manifest.get("bin_path")
+    if not isinstance(bin_name, str) or not bin_name:
+        return [f"invalid: {label} (missing bin_path)"]
+    bin_path = (manifest_path.parent / bin_name).resolve()
+    if not bin_path.is_file():
+        return [f"invalid: {bin_path} (compact binary payload is missing)"]
+
+    bin_size_expected = manifest.get("bin_size_bytes")
+    if isinstance(bin_size_expected, int) and bin_path.stat().st_size != bin_size_expected:
+        return [f"invalid: {bin_path} (compact binary size mismatch)"]
+
+    expected_bin_sha = manifest.get("bin_sha256")
+    if isinstance(expected_bin_sha, str) and expected_bin_sha:
+        actual_bin_sha = _sha256_file(bin_path).hex()
+        if actual_bin_sha != expected_bin_sha:
+            return [f"invalid: {bin_path} (compact binary SHA-256 mismatch)"]
+
+    source_info = manifest.get("source")
+    if not isinstance(source_info, Mapping):
+        return [f"invalid: {label} (missing source metadata)"]
+    source_name = source_info.get("path")
+    if not isinstance(source_name, str) or not source_name:
+        return [f"invalid: {label} (missing source path)"]
+    source_path = (manifest_path.parent / source_name).resolve()
+    if not source_path.is_file():
+        return [f"invalid: {source_path} (compact source graph is missing)"]
+
+    source_size_expected = source_info.get("size_bytes")
+    if (
+        isinstance(source_size_expected, int)
+        and source_path.stat().st_size != source_size_expected
+    ):
+        return [f"invalid: {source_path} (compact source graph size mismatch)"]
+
+    expected_source_sha = source_info.get("sha256")
+    if isinstance(expected_source_sha, str) and expected_source_sha:
+        actual_source_sha = _sha256_file(source_path).hex()
+        if actual_source_sha != expected_source_sha:
+            return [f"invalid: {source_path} (compact source graph SHA-256 mismatch)"]
+
+    sqlite_issues = _validate_sqlite_graph(source_path, region)
+    if sqlite_issues:
+        return sqlite_issues
+
+    proj_info = manifest.get("projection_index")
+    proj_name = proj_info.get("path") if isinstance(proj_info, Mapping) else None
+    if isinstance(proj_name, str) and proj_name:
+        sidecar_path = (manifest_path.parent / proj_name).resolve()
+    else:
+        sidecar_path = EdgeProjectionIndex.sidecar_path(source_path)
+
+    if not sidecar_path.is_file():
+        return [f"invalid: {sidecar_path} (projection sidecar is missing)"]
+
+    if isinstance(proj_info, Mapping):
+        expected_proj_sha = proj_info.get("sha256")
+        if isinstance(expected_proj_sha, str) and expected_proj_sha:
+            actual_proj_sha = _sha256_file(sidecar_path).hex()
+            if actual_proj_sha != expected_proj_sha:
+                return [f"invalid: {sidecar_path} (projection sidecar SHA-256 mismatch)"]
+        expected_proj_size = proj_info.get("size_bytes")
+        if (
+            isinstance(expected_proj_size, int)
+            and sidecar_path.stat().st_size != expected_proj_size
+        ):
+            return [f"invalid: {sidecar_path} (projection sidecar size mismatch)"]
+
+    try:
+        EdgeProjectionIndex.load(sidecar_path, source_path, verify=True)
+    except (_SidecarError, ValueError, OSError) as exc:
+        return [f"invalid: {sidecar_path} ({exc})"]
+
+    return []
 
 def _active_checkpoint(root: Path) -> tuple[Path, list[str]]:
     """Resolve the checkpoint named by the active model-registry record."""
@@ -372,32 +608,56 @@ def _active_checkpoint(root: Path) -> tuple[Path, list[str]]:
         issues.append(f"invalid: {REGISTRY_PATH} (active checkpoint is missing)")
     return checkpoint_path, issues
 
-
 def check_artifacts(project_root: Path, graph: Path | None = None) -> int:
     root = project_root.resolve()
-    configured_graph, run_name, issues = _configured_new_england(root)
-    region, _ = _configured_region(root)
-    graph_path = _project_path(root, graph) if graph is not None else configured_graph
+    regions, issues = _configured_route_regions(root, cli_graph=graph)
     checkpoint_path, registry_issues = _active_checkpoint(root)
     issues.extend(registry_issues)
 
-    report_dir = root / "data/processed/heuristic_runs" / run_name / "report"
-    required_paths = [
-        graph_path,
-        report_dir / "report.json",
-        report_dir / "route.geojson",
-        report_dir / "route_metrics.json",
+    required_paths: list[Path] = [
         root / REGISTRY_PATH,
         checkpoint_path,
     ]
+
+    for reg in regions:
+        graph_path = reg["graph_path"]
+        run_name = reg["run_name"]
+        if graph_path and graph_path not in required_paths:
+            required_paths.append(graph_path)
+        if run_name:
+            report_dir = root / "data/processed/heuristic_runs" / run_name / "report"
+            for name in ("report.json", "route.geojson", "route_metrics.json"):
+                p = report_dir / name
+                if p not in required_paths:
+                    required_paths.append(p)
 
     missing: list[Path] = []
     for path in required_paths:
         if not path.is_file() and path not in missing:
             missing.append(path)
 
-    if graph_path.suffix.lower() == ".sqlite3" and graph_path not in missing:
-        issues.extend(_validate_sqlite_graph(graph_path, region))
+    for reg in regions:
+        graph_path = reg["graph_path"]
+        region_dict = reg["region_dict"]
+        if not graph_path or graph_path in missing:
+            continue
+
+        if graph_path.suffix.lower() == ".sqlite3":
+            issues.extend(_validate_sqlite_graph(graph_path, region_dict))
+            compact_manifest = graph_path.with_name(f"{graph_path.stem}.compact.json")
+            if compact_manifest.is_file():
+                issues.extend(_validate_compact_graph(compact_manifest, region_dict))
+            sidecar_path = EdgeProjectionIndex.sidecar_path(graph_path)
+            if sidecar_path.is_file() and not compact_manifest.is_file():
+                try:
+                    EdgeProjectionIndex.load(sidecar_path, graph_path, verify=True)
+                except (_SidecarError, ValueError, OSError) as exc:
+                    issues.append(f"invalid: {sidecar_path} ({exc})")
+        elif (
+            graph_path.name.endswith(".compact.json")
+            or graph_path.suffix.lower() == ".json"
+        ) and graph_path not in missing:
+            issues.extend(_validate_compact_graph(graph_path, region_dict))
 
     for path in missing:
         try:
