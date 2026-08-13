@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="autoresearch-loop-title autoresearch-loop-desc">
+<title id="autoresearch-loop-title">Bounded autoresearch loop</title>
+<desc id="autoresearch-loop-desc">An immutable cache-empty baseline is followed by one-hypothesis candidates, semantic-oracle checks, measured acceptance, rollback of rejects, and a fixed experiment cap.</desc>
+<defs><pattern id="diagonal-hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="8" stroke="#1f2933" stroke-width="2"/></pattern><marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#1f2933"/></marker></defs>
+<rect x="0.0" y="0.0" width="1200.0" height="720.0" rx="0.0" fill="#fffdf8" stroke="none" />
+<g aria-label="Research figure">
+<text x="64.0" y="66.0" text-anchor="start" style="font-family:Georgia, 'Times New Roman', serif;font-size:29px;font-weight:bold;fill:#1f2933;">Bounded autoresearch loop</text>
+<text x="64.0" y="96.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:15px;font-weight:normal;fill:#52616b;">One immutable baseline, eleven measured candidates, and a fixed stop condition.</text>
+<line x1="64.0" y1="116.0" x2="1136.0" y2="116.0" stroke="#c8c4ba" stroke-width="1.5"/>
+<circle cx="156.0" cy="260.0" r="50.0" fill="#f7f5ef" stroke="#315b7d" stroke-width="4"/>
+<text x="156.0" y="253.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:21px;font-weight:bold;fill:#315b7d;">1</text>
+<text x="156.0" y="335.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:16px;font-weight:bold;fill:#1f2933;">Immutable baseline</text>
+<text x="156.0" y="357.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">cache-empty</text>
+<line x1="210.0" y1="260.0" x2="247.0" y2="260.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
+<circle cx="374.0" cy="260.0" r="50.0" fill="#f7f5ef" stroke="#b85c38" stroke-width="4"/>
+<text x="374.0" y="253.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:21px;font-weight:bold;fill:#b85c38;">2</text>
+<text x="374.0" y="335.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:16px;font-weight:bold;fill:#1f2933;">One hypothesis</text>
+<text x="374.0" y="357.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">one candidate</text>
+<line x1="428.0" y1="260.0" x2="465.0" y2="260.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
+<circle cx="592.0" cy="260.0" r="50.0" fill="#f7f5ef" stroke="#287271" stroke-width="4"/>
+<text x="592.0" y="253.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:21px;font-weight:bold;fill:#287271;">3</text>
+<text x="592.0" y="335.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:16px;font-weight:bold;fill:#1f2933;">Semantic oracle</text>
+<text x="592.0" y="357.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">complete response</text>
+<line x1="646.0" y1="260.0" x2="683.0" y2="260.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
+<circle cx="810.0" cy="260.0" r="50.0" fill="#f7f5ef" stroke="#9b6c16" stroke-width="4"/>
+<text x="810.0" y="253.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:21px;font-weight:bold;fill:#9b6c16;">4</text>
+<text x="810.0" y="335.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:16px;font-weight:bold;fill:#1f2933;">Measured decision</text>
+<text x="810.0" y="357.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">retain or reject</text>
+<line x1="864.0" y1="260.0" x2="901.0" y2="260.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
+<circle cx="1028.0" cy="260.0" r="50.0" fill="#f7f5ef" stroke="#71808c" stroke-width="4"/>
+<text x="1028.0" y="253.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:21px;font-weight:bold;fill:#71808c;">5</text>
+<text x="1028.0" y="335.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:16px;font-weight:bold;fill:#1f2933;">Cap reached</text>
+<text x="1028.0" y="357.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">stop and document</text>
+<rect x="150.0" y="440.0" width="900.0" height="120.0" rx="6.0" fill="#f7f5ef" stroke="#c8c4ba" />
+<text x="180.0" y="476.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:15px;font-weight:bold;fill:#287271;">Acceptance record</text>
+<text x="180.0" y="506.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:18px;font-weight:normal;fill:#1f2933;">Two native workers: 62.682 s isolated median; 18.03% below the fresh 76.470 s baseline.</text>
+<text x="180.0" y="534.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:14px;font-weight:normal;fill:#52616b;">All rejected candidates were removed. Timeouts are deadline outcomes, not 120-second measurements.</text>
+<text x="1020.0" y="476.0" text-anchor="end" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:bold;fill:#b85c38;">STOP CONDITION</text>
+<text x="1020.0" y="506.0" text-anchor="end" style="font-family:Arial, Helvetica, sans-serif;font-size:17px;font-weight:bold;fill:#1f2933;">1 baseline + 11 candidates</text>
+<text x="1020.0" y="534.0" text-anchor="end" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">uncached median target &lt; 20 s not met</text>
+<rect x="64.0" y="650.0" width="1072.0" height="42.0" rx="4.0" fill="#f7f5ef" stroke="#c8c4ba" />
+<text x="80.0" y="675.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:12px;font-weight:normal;fill:#52616b;">Source: docs/research/routing-performance-autoresearch.md (uncached_decision).</text>
+<text x="1120.0" y="675.0" text-anchor="end" style="font-family:Arial, Helvetica, sans-serif;font-size:12px;font-weight:normal;fill:#52616b;">Apple M2 Max; 12 logical CPUs; 32 GiB RAM</text>
+</g>
+</svg>

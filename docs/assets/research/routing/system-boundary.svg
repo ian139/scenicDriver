@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="system-boundary-title system-boundary-desc">
+<title id="system-boundary-title">Benchmark boundary: what the timing includes</title>
+<desc id="system-boundary-desc">The timed complete request includes service planning and four native multiplier searches; preload and response-cache hits remain outside the uncached-search claim.</desc>
+<defs><pattern id="diagonal-hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="8" stroke="#1f2933" stroke-width="2"/></pattern><marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#1f2933"/></marker></defs>
+<rect x="0.0" y="0.0" width="1200.0" height="720.0" rx="0.0" fill="#fffdf8" stroke="none" />
+<g aria-label="Research figure">
+<text x="64.0" y="66.0" text-anchor="start" style="font-family:Georgia, 'Times New Roman', serif;font-size:29px;font-weight:bold;fill:#1f2933;">Benchmark boundary: what the timing includes</text>
+<text x="64.0" y="96.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:15px;font-weight:normal;fill:#52616b;">A complete request is the unit of the uncached research claim.</text>
+<line x1="64.0" y1="116.0" x2="1136.0" y2="116.0" stroke="#c8c4ba" stroke-width="1.5"/>
+<rect x="80.0" y="180.0" width="212.0" height="120.0" rx="6.0" fill="#f7f5ef" stroke="#315b7d" />
+<rect x="80.0" y="180.0" width="9.0" height="120.0" rx="0.0" fill="#315b7d" stroke="none" />
+<text x="106.0" y="228.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:18px;font-weight:bold;fill:#1f2933;">Request</text>
+<text x="106.0" y="257.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">Burlington → Pittsburgh</text>
+<rect x="336.0" y="180.0" width="212.0" height="120.0" rx="6.0" fill="#f7f5ef" stroke="#287271" />
+<rect x="336.0" y="180.0" width="9.0" height="120.0" rx="0.0" fill="#287271" stroke="none" />
+<text x="362.0" y="228.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:18px;font-weight:bold;fill:#1f2933;">Service planner</text>
+<text x="362.0" y="257.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">normal scenic + baseline path</text>
+<rect x="592.0" y="180.0" width="212.0" height="120.0" rx="6.0" fill="#f7f5ef" stroke="#b85c38" />
+<rect x="592.0" y="180.0" width="9.0" height="120.0" rx="0.0" fill="#b85c38" stroke="none" />
+<text x="618.0" y="228.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:18px;font-weight:bold;fill:#1f2933;">Native search</text>
+<text x="618.0" y="257.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">four multiplier searches</text>
+<rect x="848.0" y="180.0" width="212.0" height="120.0" rx="6.0" fill="#f7f5ef" stroke="#9b6c16" />
+<rect x="848.0" y="180.0" width="9.0" height="120.0" rx="0.0" fill="#9b6c16" stroke="none" />
+<text x="874.0" y="228.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:18px;font-weight:bold;fill:#1f2933;">Semantic oracle</text>
+<text x="874.0" y="257.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">complete response comparison</text>
+<line x1="300.0" y1="240.0" x2="328.0" y2="240.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
+<line x1="556.0" y1="240.0" x2="584.0" y2="240.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
+<line x1="812.0" y1="240.0" x2="840.0" y2="240.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
+<rect x="80.0" y="356.0" width="700.0" height="156.0" rx="6.0" fill="#eef4f2" stroke="#287271" />
+<text x="104.0" y="392.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:14px;font-weight:bold;fill:#287271;">UNCACHED SEARCH EVIDENCE</text>
+<text x="104.0" y="425.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:21px;font-weight:bold;fill:#1f2933;">Complete response cache cleared before every run</text>
+<text x="104.0" y="455.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:16px;font-weight:normal;fill:#b85c38;">Target: median complete plan_routes request &lt; 20 s — not met</text>
+<text x="104.0" y="485.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:14px;font-weight:normal;fill:#52616b;">Deadline: 120 s; preload is measured separately</text>
+<rect x="816.0" y="356.0" width="244.0" height="156.0" rx="6.0" fill="#f7f5ef" stroke="#71808c" />
+<text x="840.0" y="392.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:14px;font-weight:bold;fill:#71808c;">EXCLUDED FROM CLAIM</text>
+<circle cx="848.0" cy="431.0" r="8.0" fill="#71808c" stroke="none" />
+<text x="868.0" y="436.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:16px;font-weight:normal;fill:#1f2933;">Preload</text>
+<circle cx="848.0" cy="470.0" r="8.0" fill="#71808c" stroke="none" stroke-dasharray="2 2"/>
+<text x="868.0" y="475.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:16px;font-weight:normal;fill:#1f2933;">Response-cache hit</text>
+<text x="840.0" y="499.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:12px;font-weight:normal;fill:#52616b;font-style:italic;">operational evidence only</text>
+<rect x="64.0" y="650.0" width="1072.0" height="42.0" rx="4.0" fill="#f7f5ef" stroke="#c8c4ba" />
+<text x="80.0" y="675.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:12px;font-weight:normal;fill:#52616b;">Source: docs/research/routing-performance-autoresearch.md (uncached_distributions).</text>
+<text x="1120.0" y="675.0" text-anchor="end" style="font-family:Arial, Helvetica, sans-serif;font-size:12px;font-weight:normal;fill:#52616b;">Apple M2 Max; 12 logical CPUs; 32 GiB RAM</text>
+</g>
+</svg>

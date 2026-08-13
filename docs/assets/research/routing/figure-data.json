@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "source": {
+    "document": "docs/research/routing-performance-autoresearch.md",
+    "revision": "a12af830",
+    "evidence": {
+      "uncached_decision": "lines 9-35",
+      "fixed_request": "lines 37-55",
+      "uncached_distributions": "lines 57-71",
+      "experiment_ledger": "lines 101-120",
+      "profile": "lines 145-168",
+      "production_workload": "lines 315-340",
+      "production_results": "lines 359-374"
+    }
+  },
+  "study": {
+    "target": {
+      "metric": "median uncached complete plan_routes request",
+      "threshold_seconds": 20,
+      "met": false,
+      "evidence": "uncached_decision"
+    },
+    "request": {
+      "start": "Burlington (44.475884, -73.214003)",
+      "end": "Pittsburgh (40.44062, -79.99589)",
+      "q": 0.8,
+      "kappa": 1.8,
+      "highways_allowed": true,
+      "baseline_included": true,
+      "snap_limit_km": 1.0,
+      "deadline_seconds": 120,
+      "evidence": "fixed_request"
+    },
+    "cache_policy": {
+      "uncached": "complete response cache cleared before every run",
+      "isolated_candidate": "cache-empty isolated three-run timing",
+      "final_confirmation": "sequential and cache-empty; noisy host",
+      "response_hit": "repeated identical request; operational evidence only",
+      "evidence": "uncached_decision"
+    },
+    "host": {
+      "label": "Apple M2 Max; 12 logical CPUs; 32 GiB RAM",
+      "final_load_averages": [16.95, 31.52, 30.53],
+      "caveat": "Wide final-confirmation distribution retained under high same-host load; do not replace it with the best isolated result.",
+      "evidence": "uncached_decision"
+    }
+  },
+  "figures": {
+    "system-boundary": {
+      "title": "Benchmark boundary: what the timing includes",
+      "description": "The timed complete request includes service planning and four native multiplier searches; preload and response-cache hits remain outside the uncached-search claim.",
+      "search_count": 4,
+      "evidence": "uncached_distributions"
+    },
+    "autoresearch-loop": {
+      "title": "Bounded autoresearch loop",
+      "description": "An immutable cache-empty baseline is followed by one-hypothesis candidates, semantic-oracle checks, measured acceptance, rollback of rejects, and a fixed experiment cap.",
+      "baseline_count": 1,
+      "candidate_cap": 11,
+      "acceptance_improvement_percent": 18.03,
+      "evidence": "uncached_decision"
+    },
+    "experiment-outcomes": {
+      "title": "Measured experiment outcomes",
+      "description": "Candidate medians are shown as measured values; warm-up deadline timeouts are categorical and are not plotted as 120-second successes.",
+      "unit": "seconds, median wall time",
+      "experiments": [
+        {"run": 111, "label": "Immutable baseline", "status": "baseline", "median_seconds": 76.470},
+        {"run": 112, "label": "Packed heap rank", "status": "timeout"},
+        {"run": 113, "label": "Finite-incumbent skip", "status": "reject", "median_seconds": 97.403},
+        {"run": 114, "label": "Geodesic completion bound", "status": "reject", "median_seconds": 113.276},
+        {"run": 115, "label": "Two native workers", "status": "retain", "median_seconds": 62.682},
+        {"run": 116, "label": "Four native workers", "status": "reject", "median_seconds": 59.673},
+        {"run": 117, "label": "Concurrent payload hash", "status": "reject", "median_seconds": 76.426},
+        {"run": 118, "label": "Early dominated-label reject", "status": "reject", "median_seconds": 64.142},
+        {"run": 119, "label": "Three native workers", "status": "timeout"},
+        {"run": 120, "label": "Remove rank checks", "status": "reject", "median_seconds": 62.377},
+        {"run": 121, "label": "Comparator scratch reuse", "status": "reject", "median_seconds": 76.570},
+        {"run": 122, "label": "Reusable native workspaces", "status": "timeout"}
+      ],
+      "evidence": "experiment_ledger"
+    },
+    "latency-distributions": {
+      "title": "Latency evidence, kept in its measurement context",
+      "description": "Three cache-empty distributions and one operational response-cache hit are separated; the 20-second research target is shown without conflating cache hits with search improvements.",
+      "unit": "seconds, wall time",
+      "series": [
+        {"label": "Fresh uncached baseline", "class": "uncached", "values": [76.4699, 78.9445, 74.2697], "n": 3},
+        {"label": "Retained candidate — isolated", "class": "accepted_candidate", "values": [60.8398, 62.6824, 65.7794], "n": 3},
+        {"label": "Final confirmation — noisy host", "class": "final_confirmation", "values": [82.3048, 114.4851, 92.0760, 70.9841, 61.6257], "n": 5},
+        {"label": "Response-cache hit — operational only", "class": "response_cache_hit", "values": [0.2663], "n": 1}
+      ],
+      "evidence": "uncached_distributions"
+    },
+    "profile-bottlenecks": {
+      "title": "Observed bottleneck attribution",
+      "description": "Sampling attributed most request samples to native compact search, with heap pop accounting for over half of total samples; these are observed sample shares, not a complete additive decomposition.",
+      "unit": "percent of total request samples",
+      "observations": [
+        {"label": "Native compact search", "percent": 89.6},
+        {"label": "Heap pop", "percent": 57.5}
+      ],
+      "evidence": "profile"
+    },
+    "two-worker-execution": {
+      "title": "Retained bounded two-worker execution",
+      "description": "Four independent native multiplier searches run at most two at a time, propagate request context, join on success or failure, and restore the original multiplier order.",
+      "multiplier_searches": 4,
+      "max_workers": 2,
+      "isolated_baseline_median_seconds": 76.470,
+      "isolated_candidate_median_seconds": 62.682,
+      "isolated_improvement_percent": 18.03,
+      "evidence": "uncached_distributions"
+    }
+  },
+  "production_context": {
+    "cases": 2256,
+    "workers": 2,
+    "case_timeout_seconds": 10,
+    "baseline_median_ms": 6449.169,
+    "candidate_median_ms": 1238.558,
+    "baseline_p95_ms": 12274.275,
+    "candidate_p95_ms": 4473.816,
+    "baseline_timeouts": 492,
+    "candidate_timeouts": 2,
+    "policy_caveat": "Historical evidence predates the avoid-highways detour-policy correction; current fixed-denominator revalidation remains open.",
+    "evidence": "production_results"
+  }
+}
