@@ -589,90 +589,40 @@ static bool path_record_length(
     return true;
 }
 
-/* Search-scoped reusable scratch buffers for path-key and middle-key
- * comparisons, avoiding repeated malloc/free on hot comparison paths. */
-typedef struct {
-    int32_t* buf_a;
-    int32_t capacity_a;
-    int32_t* buf_b;
-    int32_t capacity_b;
-} PathScratch;
-
-static void path_scratch_init(PathScratch* scratch) {
-    scratch->buf_a = NULL;
-    scratch->capacity_a = 0;
-    scratch->buf_b = NULL;
-    scratch->capacity_b = 0;
-}
-
-static void path_scratch_free(PathScratch* scratch) {
-    if (scratch) {
-        free(scratch->buf_a);
-        free(scratch->buf_b);
-        scratch->buf_a = NULL;
-        scratch->capacity_a = 0;
-        scratch->buf_b = NULL;
-        scratch->capacity_b = 0;
-    }
-}
-
-static __attribute__((noinline)) bool path_scratch_ensure_capacity(
-    int32_t** buf,
-    int32_t* capacity,
-    int32_t required
-) {
-    if (required <= 0) return true;
-    if (*capacity >= required) return true;
-
-    int32_t new_cap = *capacity > 0 ? *capacity : 16;
-    while (new_cap < required) {
-        if (new_cap > INT32_MAX / 2) {
-            new_cap = required;
-            break;
-        }
-        new_cap *= 2;
-    }
-    if (new_cap < required) new_cap = required;
-
-    size_t bytes = 0;
-    if (!checked_size_mul((size_t)new_cap, sizeof(int32_t), &bytes)) {
-        return false;
-    }
-    int32_t* ptr = (int32_t*)realloc(*buf, bytes);
-    if (!ptr) return false;
-
-    *buf = ptr;
-    *capacity = new_cap;
-    return true;
-}
-
 /* Materialize one parent-linked chain in chronological order without using
- * recursion into search-scoped reusable scratch space. */
-static __attribute__((noinline)) bool path_record_materialize_forward(
+ * recursion.  The array is deliberately transient: path records remain the
+ * only persistent per-label storage, and callers free this scratch before
+ * every return (including allocation and malformed-chain failures). */
+static bool path_record_materialize_forward(
     const PathRecord* records,
     int32_t record_count,
     int32_t id,
     int32_t length,
-    int32_t** buf_ptr,
-    int32_t* cap_ptr
+    int32_t** out_edges
 ) {
-    if (!buf_ptr || !cap_ptr || length < 0) return false;
+    if (!out_edges || length < 0) return false;
+    *out_edges = NULL;
     if (length == 0) return true;
-    if (!path_scratch_ensure_capacity(buf_ptr, cap_ptr, length)) {
+    size_t bytes = 0;
+    if (!checked_size_mul((size_t)length, sizeof(int32_t), &bytes)) {
         return false;
     }
-    int32_t* edges = *buf_ptr;
+    int32_t* edges = (int32_t*)malloc(bytes);
+    if (!edges) return false;
     int32_t current = id;
     for (int32_t i = length; i > 0; --i) {
         if (!records || current < 0 || current >= record_count) {
+            free(edges);
             return false;
         }
         edges[i - 1] = records[current].edge_rank;
         current = records[current].parent;
     }
     if (current != -1) {
+        free(edges);
         return false;
     }
+    *out_edges = edges;
     return true;
 }
 
@@ -680,8 +630,8 @@ static __attribute__((noinline)) bool path_record_materialize_forward(
  * orientation: forward labels store chronological edge order (oldest record
  * first), reverse labels store the reversed order (newest record first, i.e.
  * the meeting-side edge first).  The forward path is materialized in
- * search-scoped reusable scratch so this comparison is iterative and has
- * bounded C stack use even for very deep equal-cost prefixes. */
+ * transient heap scratch so this comparison is iterative and has bounded C
+ * stack use even for very deep equal-cost prefixes. */
 static int path_record_compare(
     const CompactGraphSpec* graph,
     int32_t left_id,
@@ -689,7 +639,6 @@ static int path_record_compare(
     const PathRecord* records,
     int32_t record_count,
     bool newest_first,
-    PathScratch* scratch,
     bool* compare_ok
 ) {
     if (!compare_ok) return 0;
@@ -721,21 +670,19 @@ static int path_record_compare(
         return l == -1 ? -1 : 1; /* shorter prefix is smaller */
     }
 
-    if (!scratch ||
-        !path_record_materialize_forward(
-            records, record_count, left_id, left_length,
-            &scratch->buf_a, &scratch->capacity_a
+    int32_t* left_edges = NULL;
+    int32_t* right_edges = NULL;
+    if (!path_record_materialize_forward(
+            records, record_count, left_id, left_length, &left_edges
         ) ||
         !path_record_materialize_forward(
-            records, record_count, right_id, right_length,
-            &scratch->buf_b, &scratch->capacity_b
+            records, record_count, right_id, right_length, &right_edges
         )) {
+        free(left_edges);
+        free(right_edges);
         *compare_ok = false;
         return 0;
     }
-
-    int32_t* left_edges = scratch->buf_a;
-    int32_t* right_edges = scratch->buf_b;
 
     int32_t common = left_length < right_length ? left_length : right_length;
     int result = 0;
@@ -743,6 +690,8 @@ static int path_record_compare(
         result = edge_key_compare(graph, left_edges[i], right_edges[i]);
         if (result != 0) break;
     }
+    free(left_edges);
+    free(right_edges);
     if (result != 0) return result;
     if (left_length == right_length) return 0;
     return left_length < right_length ? -1 : 1; /* shorter prefix is smaller */
@@ -761,7 +710,6 @@ static int middle_key_compare(
     int32_t rev_b,
     const PathRecord* records,
     int32_t record_count,
-    PathScratch* scratch,
     bool* compare_ok
 ) {
     if (!compare_ok) return 0;
@@ -786,21 +734,19 @@ static int middle_key_compare(
         return 0;
     }
 
-    if (!scratch ||
-        !path_record_materialize_forward(
-            records, record_count, fwd_a, fwd_length_a,
-            &scratch->buf_a, &scratch->capacity_a
+    int32_t* fwd_edges_a = NULL;
+    int32_t* fwd_edges_b = NULL;
+    if (!path_record_materialize_forward(
+            records, record_count, fwd_a, fwd_length_a, &fwd_edges_a
         ) ||
         !path_record_materialize_forward(
-            records, record_count, fwd_b, fwd_length_b,
-            &scratch->buf_b, &scratch->capacity_b
+            records, record_count, fwd_b, fwd_length_b, &fwd_edges_b
         )) {
+        free(fwd_edges_a);
+        free(fwd_edges_b);
         *compare_ok = false;
         return 0;
     }
-
-    int32_t* fwd_edges_a = scratch->buf_a;
-    int32_t* fwd_edges_b = scratch->buf_b;
 
     int32_t fwd_index_a = 0;
     int32_t fwd_index_b = 0;
@@ -861,6 +807,8 @@ static int middle_key_compare(
         result = edge_key_compare(graph, edge_a, edge_b);
         if (result != 0) break;
     }
+    free(fwd_edges_a);
+    free(fwd_edges_b);
     return result;
 }
 
@@ -884,7 +832,6 @@ static bool label_candidate_better(
     const PathRecord* records,
     int32_t record_count,
     bool newest_first,
-    PathScratch* scratch,
     bool* compare_ok
 ) {
     if (!compare_ok) return false;
@@ -900,7 +847,7 @@ static bool label_candidate_better(
     }
     int cmp = path_record_compare(
         graph, new_path_id, ds->path_id[rank], records, record_count,
-        newest_first, scratch, compare_ok
+        newest_first, compare_ok
     );
     if (!*compare_ok) return false;
     return cmp < 0;
@@ -927,8 +874,7 @@ static bool consider_meeting(
     int32_t* best_f_secondary,
     int32_t* best_r_secondary,
     int32_t* best_f_path,
-    int32_t* best_r_path,
-    PathScratch* scratch
+    int32_t* best_r_path
 ) {
     double total = ds_f->dist[node] + ds_r->dist[node];
     if (*best_node != -1 && total > *best_cost) return true;
@@ -951,7 +897,6 @@ static bool consider_meeting(
                 *best_r_path,
                 records,
                 record_count,
-                scratch,
                 &compare_ok
             );
             if (!compare_ok) return false;
@@ -1092,12 +1037,11 @@ static int32_t compact_search_impl(
     PathRecord* path_records = NULL;
     int32_t path_capacity = 0;
     int32_t path_count = 0;
-    PathScratch scratch;
-    path_scratch_init(&scratch);
     bool compare_ok = true; /* path-key comparison scratch failures */
     uint64_t next_sequence = 0; /* shared across both sides, like Python */
     int32_t next_label_f = 0;
     int32_t next_label_r = 0;
+
     for (int32_t i = 0; i < fwd_seed_count; i++) {
         int32_t node = fwd_seed_nodes[i];
         double cost = fwd_seed_costs[i];
@@ -1107,7 +1051,7 @@ static int32_t compact_search_impl(
         int32_t rank_secondary = ranked ? fwd_seed_rank_secondary[i] : 0;
         if (!label_candidate_better(
                 graph, &ds_f, node, cost, rank_primary, rank_secondary, -1,
-                path_records, path_count, false, &scratch, &compare_ok
+                path_records, path_count, false, &compare_ok
             )) {
             if (!compare_ok) goto cleanup;
             continue;
@@ -1132,7 +1076,7 @@ static int32_t compact_search_impl(
         int32_t rank_secondary = ranked ? rev_seed_rank_secondary[i] : 0;
         if (!label_candidate_better(
                 graph, &ds_r, node, cost, rank_primary, rank_secondary, -1,
-                path_records, path_count, true, &scratch, &compare_ok
+                path_records, path_count, true, &compare_ok
             )) {
             if (!compare_ok) goto cleanup;
             continue;
@@ -1192,7 +1136,7 @@ static int32_t compact_search_impl(
                         graph, &ds_f, &ds_r, u, path_records, path_count,
                         &best_cost, &best_meeting_node, &best_f_primary,
                         &best_r_primary, &best_f_secondary, &best_r_secondary,
-                        &best_f_path, &best_r_path, &scratch
+                        &best_f_path, &best_r_path
                     )) {
                     goto cleanup;
                 }
@@ -1223,7 +1167,7 @@ static int32_t compact_search_impl(
                 if (!label_candidate_better(
                         graph, &ds_f, v, next_cost, ds_f.rank_primary[u],
                         ds_f.rank_secondary[u], new_path_id, path_records,
-                        path_count, false, &scratch, &compare_ok
+                        path_count, false, &compare_ok
                     )) {
                     if (!compare_ok) goto cleanup;
                     continue;
@@ -1245,8 +1189,7 @@ static int32_t compact_search_impl(
                             graph, &ds_f, &ds_r, v, path_records, path_count,
                             &best_cost, &best_meeting_node, &best_f_primary,
                             &best_r_primary, &best_f_secondary,
-                            &best_r_secondary, &best_f_path, &best_r_path,
-                            &scratch
+                            &best_r_secondary, &best_f_path, &best_r_path
                         )) {
                         goto cleanup;
                     }
@@ -1266,7 +1209,7 @@ static int32_t compact_search_impl(
                         graph, &ds_f, &ds_r, u, path_records, path_count,
                         &best_cost, &best_meeting_node, &best_f_primary,
                         &best_r_primary, &best_f_secondary, &best_r_secondary,
-                        &best_f_path, &best_r_path, &scratch
+                        &best_f_path, &best_r_path
                     )) {
                     goto cleanup;
                 }
@@ -1298,7 +1241,7 @@ static int32_t compact_search_impl(
                 if (!label_candidate_better(
                         graph, &ds_r, v, next_cost, ds_r.rank_primary[u],
                         ds_r.rank_secondary[u], new_path_id, path_records,
-                        path_count, true, &scratch, &compare_ok
+                        path_count, true, &compare_ok
                     )) {
                     if (!compare_ok) goto cleanup;
                     continue;
@@ -1320,8 +1263,7 @@ static int32_t compact_search_impl(
                             graph, &ds_f, &ds_r, v, path_records, path_count,
                             &best_cost, &best_meeting_node, &best_f_primary,
                             &best_r_primary, &best_f_secondary,
-                            &best_r_secondary, &best_f_path, &best_r_path,
-                            &scratch
+                            &best_r_secondary, &best_f_path, &best_r_path
                         )) {
                         goto cleanup;
                     }
@@ -1453,7 +1395,6 @@ static int32_t compact_search_impl(
     }
 
 cleanup:
-    path_scratch_free(&scratch);
     heap_free(heap_f);
     heap_free(heap_r);
     direction_state_free(&ds_f);
