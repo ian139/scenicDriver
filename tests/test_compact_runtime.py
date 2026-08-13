@@ -3727,3 +3727,452 @@ def test_compact_lagrangian_sequential_fallback(
 
     assert route is not None
     assert executed_threads == {threading.get_ident()}
+
+
+# ---------------------------------------------------------------------------
+# Request-local native workspace reuse across the four multiplier searches
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _clear_workspace_registry() -> None:
+    """Free any lingering per-thread workspace before and after every test.
+
+    The workspace registry is module-level bookkeeping (one bounded slot per
+    thread); tests that assert on create/free counts need it pristine, and
+    freeing at teardown keeps native buffers from accumulating across the
+    run."""
+    import src.route_planner._compact_search as compact_search_module
+
+    def clear() -> None:
+        lib = compact_search_module._ensure_compiled_library()
+        if lib is None:
+            return
+        with compact_search_module._WORKSPACE_LOCK:
+            for _deadline, handle in compact_search_module._THREAD_WORKSPACES.values():
+                if handle is not None:
+                    lib.compact_workspace_free(handle)
+            compact_search_module._THREAD_WORKSPACES.clear()
+
+    clear()
+    yield
+    clear()
+
+
+def _compact_native_gates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the tiny fixture graphs onto the compact native path (the same
+    gates the lagrangian tests above use)."""
+    monkeypatch.setattr(ScenicRoutePlanner, "_ENDPOINT_OVERLAY_MAX_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_LARGE_GRAPH_EDGE_THRESHOLD", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_COMPILED_SCENIC_MIN_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_NODES", 0)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_EDGES", 0)
+
+
+def _workspace_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[object], list[object]]:
+    """Hook the module's workspace create/free points and record handles."""
+    import src.route_planner._compact_search as compact_search_module
+
+    created: list[object] = []
+    freed: list[object] = []
+
+    def counting_create(lib: object) -> object:
+        handle = lib.compact_workspace_create()
+        created.append(handle)
+        return handle
+
+    def counting_free(lib: object, handle: object) -> None:
+        freed.append(handle)
+        lib.compact_workspace_free(handle)
+
+    monkeypatch.setattr(compact_search_module, "_workspace_create", counting_create)
+    monkeypatch.setattr(compact_search_module, "_workspace_free", counting_free)
+    return created, freed
+
+
+class _InlineExecutor:
+    """Runs submitted jobs synchronously on the caller thread with real
+    ``concurrent.futures.Future`` results, so the planner's four multiplier
+    searches execute sequentially while the native path stays enabled."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def submit(self, fn: object, *args: object, **kwargs: object) -> object:
+        import concurrent.futures as cf
+
+        future = cf.Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 - propagated by result()
+            future.set_exception(exc)
+        return future
+
+    def __enter__(self) -> "_InlineExecutor":
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+
+def _route_segments(route: object) -> list[str]:
+    return [segment.edge_id for segment in route.segments]
+
+
+def test_compact_workspace_reused_across_sequential_multiplier_searches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The four multiplier searches of one request must share exactly one
+    native workspace per thread; a different request on the same thread must
+    free the previous workspace before allocating a fresh one, and every
+    route must stay byte-identical to the per-call baseline."""
+    import src.route_planner.planner as planner_module
+
+    _compact_native_gates(monkeypatch)
+    created, freed = _workspace_counters(monkeypatch)
+
+    graph = _fixture_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    planner = ScenicRoutePlanner(graph=compact)
+    start = (42.0, -72.0)
+    end = (42.1, -72.1)
+
+    # No deadline scope: the per-call path, so no workspace is ever created.
+    baseline = planner.find_scenic_route(start, end, scenic_weight=0.8)
+    assert baseline is not None
+    assert created == []
+    baseline_segments = _route_segments(baseline)
+
+    orig_executor = planner_module.ThreadPoolExecutor
+
+    def run_scenic_with_deadline(deadline: object) -> object:
+        planner_module.ThreadPoolExecutor = _InlineExecutor
+        try:
+            with planner_module._routing_deadline_scope(deadline):
+                return planner.find_scenic_route(start, end, scenic_weight=0.8)
+        finally:
+            planner_module.ThreadPoolExecutor = orig_executor
+
+    # Request 1: all four multiplier searches run on this thread and must
+    # share the single workspace created on the first search.
+    route_1 = run_scenic_with_deadline(RoutingDeadline.after(30.0))
+    assert route_1 is not None
+    assert len(created) == 1
+    assert freed == []
+    assert _route_segments(route_1) == baseline_segments
+
+    # Request 2 with a different deadline on the same thread: the previous
+    # request's workspace is retired before the fresh one is returned.
+    held_deadline = RoutingDeadline.after(30.0)
+    route_2 = run_scenic_with_deadline(held_deadline)
+    assert route_2 is not None
+    assert len(created) == 2
+    assert freed == [created[0]]
+    assert _route_segments(route_2) == baseline_segments
+
+    # A third request reusing the same deadline object reuses the workspace:
+    # no new create, nothing freed.
+    route_3 = run_scenic_with_deadline(held_deadline)
+    assert route_3 is not None
+    assert len(created) == 2
+    assert len(freed) == 1
+    assert _route_segments(route_3) == baseline_segments
+
+
+def test_compact_workspace_two_worker_overlap_uses_distinct_workspaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under the production two-worker concurrency, the searches of one
+    request run on two pool threads with one workspace each; both concurrent
+    searches must return the exact baseline route and the workspaces must be
+    distinct, so no native buffer is ever shared across threads."""
+    import time
+    import src.route_planner.planner as planner_module
+
+    _compact_native_gates(monkeypatch)
+    created, freed = _workspace_counters(monkeypatch)
+
+    graph = _fixture_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    planner = ScenicRoutePlanner(graph=compact)
+    start = (42.0, -72.0)
+    end = (42.1, -72.1)
+
+    baseline = planner.find_scenic_route(start, end, scenic_weight=0.8)
+    assert baseline is not None
+    baseline_segments = _route_segments(baseline)
+
+    # Slow each native search so both executor workers demonstrably run (the
+    # same hook the two-worker-overlap test above uses).
+    orig_search = planner_module.run_compact_bidirectional_search
+
+    def slow_search(*args: object, **kwargs: object) -> object:
+        time.sleep(0.02)
+        return orig_search(*args, **kwargs)
+
+    monkeypatch.setattr(planner_module, "run_compact_bidirectional_search", slow_search)
+
+    with planner_module._routing_deadline_scope(RoutingDeadline.after(30.0)):
+        route = planner.find_scenic_route(start, end, scenic_weight=0.8)
+    assert route is not None
+    assert len(created) == 2, created
+    assert created[0] != created[1]
+    assert freed == []
+    assert _route_segments(route) == baseline_segments
+
+    # A second request on the same pool threads (ident reuse is common but
+    # not guaranteed) must still return the identical route; any retired
+    # workspace must be freed at the replacement point.
+    with planner_module._routing_deadline_scope(RoutingDeadline.after(30.0)):
+        route_2 = planner.find_scenic_route(start, end, scenic_weight=0.8)
+    assert route_2 is not None
+    assert _route_segments(route_2) == baseline_segments
+    # Every handle freed so far belongs to a created workspace (the second
+    # request retires the first one's handles when its pool threads reuse
+    # the ident; ident reuse is common but not contractual, so no count
+    # equality is asserted here).
+    assert set(freed) <= set(created)
+
+
+def test_compact_workspace_failure_retired_on_next_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mid-request exception (a worker raising) must not strand native
+    buffers in the per-thread slot: the next request on the same thread
+    retires the aborted request's workspace before creating its own."""
+    import src.route_planner.planner as planner_module
+
+    _compact_native_gates(monkeypatch)
+    created, freed = _workspace_counters(monkeypatch)
+
+    graph = _fixture_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    planner = ScenicRoutePlanner(graph=compact)
+    start = (42.0, -72.0)
+    end = (42.1, -72.1)
+
+    baseline = planner.find_scenic_route(start, end, scenic_weight=0.8)
+    assert baseline is not None
+    baseline_segments = _route_segments(baseline)
+
+    orig_search = planner_module.run_compact_bidirectional_search
+    orig_executor = planner_module.ThreadPoolExecutor
+
+    def failing_search(*args: object, **kwargs: object) -> object:
+        if kwargs.get("lagrangian_multiplier") == 0.25:
+            raise RuntimeError("Lagrangian worker artificial failure")
+        return orig_search(*args, **kwargs)
+
+    planner_module.run_compact_bidirectional_search = failing_search
+    planner_module.ThreadPoolExecutor = _InlineExecutor
+    try:
+        with pytest.raises(RuntimeError, match="Lagrangian worker artificial failure"):
+            with planner_module._routing_deadline_scope(RoutingDeadline.after(30.0)):
+                planner.find_scenic_route(start, end, scenic_weight=0.8)
+    finally:
+        planner_module.run_compact_bidirectional_search = orig_search
+        planner_module.ThreadPoolExecutor = orig_executor
+
+    # The request created its workspace before the worker raised.
+    assert len(created) == 1
+
+    # Next request (fresh deadline, same thread): aborted workspace retired.
+    planner_module.ThreadPoolExecutor = _InlineExecutor
+    try:
+        with planner_module._routing_deadline_scope(RoutingDeadline.after(30.0)):
+            route = planner.find_scenic_route(start, end, scenic_weight=0.8)
+    finally:
+        planner_module.ThreadPoolExecutor = orig_executor
+    assert route is not None
+    assert len(created) == 2
+    assert freed == [created[0]]
+    assert _route_segments(route) == baseline_segments
+
+
+def test_compact_workspace_native_timeout_propagates_and_retires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A native deadline hit inside a workspace search must still surface as
+    RoutingTimeout, and the next request must retire the timed-out request's
+    workspace.  Uses the long chain so the native loop reliably exceeds a
+    tiny budget."""
+    import src.route_planner.planner as planner_module
+    from src.route_planner._compact_search import run_compact_bidirectional_search
+
+    _compact_native_gates(monkeypatch)
+    created, freed = _workspace_counters(monkeypatch)
+
+    edge_count = 100_000
+    graph = _long_chain_graph(edge_count)
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    planner = ScenicRoutePlanner(graph=compact)
+    topology = planner._csr_topology()
+    assert topology is not None
+    cost_function = planner._make_fastest_cost_function()
+    forward_seeds = [("c0", 0.0, (), None)]
+    reverse_seeds = [(f"c{edge_count}", 0.0, (), None)]
+
+    with planner_module._routing_deadline_scope(RoutingDeadline.after(30.0)):
+        with pytest.raises(RoutingTimeout, match="deadline"):
+            run_compact_bidirectional_search(
+                topology,
+                cost_function,
+                forward_seeds,
+                reverse_seeds,
+                deadline_seconds=0.0005,
+            )
+    assert len(created) == 1
+
+    # Follow-up request with a fresh deadline: the timed-out workspace is
+    # retired and the unbounded search still returns the exact full chain.
+    with planner_module._routing_deadline_scope(RoutingDeadline.after(30.0)):
+        positions, total_cost, fwd_index, rev_index = (
+            run_compact_bidirectional_search(
+                topology, cost_function, forward_seeds, reverse_seeds
+            )
+        )
+    assert len(created) == 2
+    assert freed == [created[0]]
+    assert positions == list(range(edge_count))
+    assert (fwd_index, rev_index) == (0, 0)
+    assert total_cost == pytest.approx(float(sum(topology.travel_time_minutes)))
+
+
+def test_compact_workspace_held_deadline_reuses_buffers_across_graphs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller-held deadline (same request identity across two graphs) must
+    keep using one workspace: buffers grow to fit a larger graph and shrink
+    back safely to a smaller one, with every route byte-identical to the
+    per-call baseline and no state crossing graph identities."""
+    import src.route_planner.planner as planner_module
+    from src.route_planner._compact_search import run_compact_bidirectional_search
+
+    _compact_native_gates(monkeypatch)
+    created, freed = _workspace_counters(monkeypatch)
+
+    small_graph = _fixture_graph()
+    _sqlite_path, small_manifest, _record = _publish_compact(tmp_path, small_graph)
+    small_compact = CompactRoadGraph.load(small_manifest)
+    small_planner = ScenicRoutePlanner(graph=small_compact)
+    small_start = (42.0, -72.0)
+    small_end = (42.1, -72.1)
+
+    big_graph = _long_chain_graph(8192)
+    _sqlite_path, big_manifest, _record = _publish_compact(
+        tmp_path, big_graph
+    )
+    big_compact = CompactRoadGraph.load(big_manifest)
+    big_planner = ScenicRoutePlanner(graph=big_compact)
+
+    small_baseline = small_planner.find_scenic_route(
+        small_start, small_end, scenic_weight=0.8
+    )
+    assert small_baseline is not None
+    small_baseline_segments = _route_segments(small_baseline)
+
+    # Big chain reference: the direct search with explicit chain-end seeds
+    # returns the full directed chain.
+    big_topology = big_planner._csr_topology()
+    assert big_topology is not None
+    big_cost_function = big_planner._make_fastest_cost_function()
+    big_forward = [("c0", 0.0, (), None)]
+    big_reverse = [("c8192", 0.0, (), None)]
+
+    held_deadline = RoutingDeadline.after(60.0)
+    monkeypatch.setattr(planner_module, "ThreadPoolExecutor", _InlineExecutor)
+    try:
+        with planner_module._routing_deadline_scope(held_deadline):
+            small_route = small_planner.find_scenic_route(
+                small_start, small_end, scenic_weight=0.8
+            )
+        with planner_module._routing_deadline_scope(held_deadline):
+            big_positions, big_cost, big_fwd, big_rev = (
+                run_compact_bidirectional_search(
+                    big_topology,
+                    big_cost_function,
+                    big_forward,
+                    big_reverse,
+                )
+            )
+        with planner_module._routing_deadline_scope(held_deadline):
+            small_route_2 = small_planner.find_scenic_route(
+                small_start, small_end, scenic_weight=0.8
+            )
+    finally:
+        monkeypatch.undo()
+        _compact_native_gates(monkeypatch)
+
+    # One workspace served every search across both graphs (the small search
+    # allocates node_count=4 buffers first; the big search grows them to
+    # node_count=8193; the second small search shrinks back safely).
+    assert len(created) == 1
+    assert freed == []
+    assert _route_segments(small_route) == small_baseline_segments
+    assert _route_segments(small_route_2) == small_baseline_segments
+    assert big_positions == list(range(8192))
+    assert (big_fwd, big_rev) == (0, 0)
+    assert big_cost == pytest.approx(float(sum(big_topology.travel_time_minutes)))
+
+
+def test_compact_workspace_concurrent_requests_are_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simultaneous API calls (two threads, two planners, two deadlines)
+    must each get the exact baseline route; per-thread workspace slots never
+    cross requests."""
+    import threading
+    import src.route_planner.planner as planner_module
+
+    _compact_native_gates(monkeypatch)
+    created, freed = _workspace_counters(monkeypatch)
+
+    graph = _fixture_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    start = (42.0, -72.0)
+    end = (42.1, -72.1)
+
+    baseline = ScenicRoutePlanner(graph=compact).find_scenic_route(
+        start, end, scenic_weight=0.8
+    )
+    assert baseline is not None
+    baseline_segments = _route_segments(baseline)
+
+    results: list[object] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def run_request(planner: ScenicRoutePlanner) -> None:
+        try:
+            barrier.wait(timeout=30)
+            with planner_module._routing_deadline_scope(RoutingDeadline.after(30.0)):
+                results.append(planner.find_scenic_route(start, end, scenic_weight=0.8))
+        except BaseException as exc:  # noqa: BLE001 - collected below
+            errors.append(exc)
+
+    thread_a = threading.Thread(
+        target=run_request, args=(ScenicRoutePlanner(graph=compact),)
+    )
+    thread_b = threading.Thread(
+        target=run_request, args=(ScenicRoutePlanner(graph=compact),)
+    )
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=120)
+    thread_b.join(timeout=120)
+    assert not thread_a.is_alive() and not thread_b.is_alive()
+    assert errors == []
+    assert len(results) == 2
+    assert _route_segments(results[0]) == baseline_segments
+    assert _route_segments(results[1]) == baseline_segments
+    # Both concurrent requests ran with workspaces; nothing was shared or
+    # freed spuriously (handles may repeat only via allocator address reuse
+    # after a retire, so uniqueness is not asserted).
+    assert len(created) >= 2
+    assert set(freed) <= set(created)
