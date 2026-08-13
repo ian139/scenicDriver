@@ -180,7 +180,12 @@ static bool heap_pop(MinHeap* h, HeapItem* out_item) {
  *
  * The sentinel is a per-call constant: 0 (from calloc) never equals it,
  * and written slots always do.  No global generation counter is needed,
- * so the state is thread-safe and there is nothing to reset.
+ * so the state is thread-safe and there is nothing to reset.  Reused
+ * workspaces keep the buffers across searches and instead stamp every
+ * write with the current per-search generation; any slot whose stamp does
+ * not match it reads as unseen, which is equivalent because a generation
+ * is only ever handed out once per workspace.  ``capacity`` tracks the
+ * buffer length so growth can preserve earlier searches' slots.
  *
  * Three more per-rank arrays carry the ranked-search metadata that the
  * Python `_bidirectional_search_core` keeps on each label:
@@ -203,6 +208,7 @@ static bool heap_pop(MinHeap* h, HeapItem* out_item) {
  */
 typedef struct {
     int64_t node_count;
+    int64_t capacity;
     uint32_t* stamp;
     double* dist;
     int32_t* parent;
@@ -228,6 +234,26 @@ typedef struct {
     int32_t parent;
     int32_t edge_rank;
 } PathRecord;
+
+/* Request-local reuse workspace.  One workspace is owned by one thread for
+ * the duration of one request (identified by the routing deadline object):
+ * the four multiplier searches of that request share its DirectionState
+ * buffers, heap storage, and path arena.  Buffers are grown to fit the
+ * largest graph seen and never cleared between searches; a per-search
+ * generation stamp makes every stale slot read as unseen, so nothing from
+ * an earlier search, graph, or request can be observed.  Workspaces are
+ * never shared between threads and are freed when the owning thread starts
+ * a different request or exits, keeping memory bounded per thread. */
+typedef struct {
+    MinHeap* heap_f;
+    MinHeap* heap_r;
+    DirectionState ds_f;
+    DirectionState ds_r;
+    PathRecord* path_records;
+    int32_t path_capacity;
+    int32_t path_count;
+    uint32_t generation;
+} CompactWorkspace;
 
 /* Any non-zero sentinel works (see above); 1 is used for clarity. */
 static const uint32_t k_search_gen = 1u;
@@ -378,6 +404,7 @@ static bool direction_state_alloc(DirectionState* ds, int64_t node_count) {
         ds->rank_secondary = NULL;
         return false;
     }
+    ds->capacity = node_count;
     return true;
 }
 
@@ -393,6 +420,59 @@ static void direction_state_free(DirectionState* ds) {
     free(ds->rank_secondary);
     free(ds->path_id);
     memset(ds, 0, sizeof(*ds));
+}
+
+/* Grow a DirectionState so it can serve at least ``node_count`` ranks,
+ * preserving any previously written entries.  The stamp array is kept
+ * zero-filled beyond the previous capacity so unvisited ranks always read
+ * as unseen when a fresh generation is introduced.  On failure the state
+ * is fully released (never left half-sized), so the next attempt restarts
+ * from an empty state and the owning search reports generic -1. */
+static bool direction_state_reserve(DirectionState* ds, int64_t node_count) {
+    if (ds->capacity >= node_count) {
+        ds->node_count = node_count;
+        return true;
+    }
+    DirectionState fresh;
+    if (!direction_state_alloc(&fresh, node_count)) return false;
+    size_t keep = (size_t)(ds->capacity < node_count ? ds->capacity : node_count);
+    if (keep > 0) {
+        memcpy(fresh.stamp, ds->stamp, sizeof(uint32_t) * keep);
+        memcpy(fresh.dist, ds->dist, sizeof(double) * keep);
+        memcpy(fresh.parent, ds->parent, sizeof(int32_t) * keep);
+        memcpy(fresh.trav_pos, ds->trav_pos, sizeof(int64_t) * keep);
+        memcpy(fresh.label_id, ds->label_id, sizeof(int32_t) * keep);
+        memcpy(fresh.seed_idx, ds->seed_idx, sizeof(int32_t) * keep);
+        memcpy(fresh.rank_primary, ds->rank_primary, sizeof(int32_t) * keep);
+        memcpy(fresh.rank_secondary, ds->rank_secondary, sizeof(int32_t) * keep);
+        memcpy(fresh.path_id, ds->path_id, sizeof(int32_t) * keep);
+    }
+    direction_state_free(ds);
+    *ds = fresh;
+    return true;
+}
+
+/* Bump the workspace generation.  A search never clears its state arrays:
+ * every slot written in an earlier search carries that search's generation,
+ * so a fresh generation makes all old stamps read as unseen.  When the
+ * counter would wrap back toward the initial generation, every stamp could
+ * spuriously match again, so both stamp arrays are re-zeroed first (bounded
+ * by the buffer capacity, which always covers the current node count). */
+static uint32_t workspace_next_generation(CompactWorkspace* ws) {
+    uint32_t gen = ws->generation + 1u;
+    if (gen == 0u) {
+        size_t n = (size_t)ws->ds_f.capacity;
+        if (n > 0 && ws->ds_f.stamp != NULL) {
+            memset(ws->ds_f.stamp, 0, sizeof(uint32_t) * n);
+        }
+        n = (size_t)ws->ds_r.capacity;
+        if (n > 0 && ws->ds_r.stamp != NULL) {
+            memset(ws->ds_r.stamp, 0, sizeof(uint32_t) * n);
+        }
+        gen = 1u;
+    }
+    ws->generation = gen;
+    return gen;
 }
 
 /* Explicit seen-state check with a bounds guard; the only gate before any
@@ -832,11 +912,12 @@ static bool label_candidate_better(
     const PathRecord* records,
     int32_t record_count,
     bool newest_first,
+    uint32_t gen,
     bool* compare_ok
 ) {
     if (!compare_ok) return false;
     *compare_ok = true;
-    if (!state_seen(ds, rank, k_search_gen)) return true;
+    if (!state_seen(ds, rank, gen)) return true;
     if (cost < ds->dist[rank]) return true;
     if (cost > ds->dist[rank]) return false;
     if (rank_primary != ds->rank_primary[rank]) {
@@ -959,6 +1040,14 @@ static bool path_arena_push(
  * sidecar can never be silently misread.  NULL keeps the legacy traversal-
  * indexed scoring (or the 5.0 default when ``trav_scenic_score`` is NULL).
  *
+ * ``workspace`` selects the reusable request-local buffers: when non-NULL,
+ * the two DirectionStates are grown to fit the graph (never shrunk), the
+ * heap capacity and path arena are retained across searches, and a fresh
+ * per-search generation marks the state instead of clearing it.  All
+ * value reads stay gated by the seen stamp, so stale bytes from earlier
+ * searches, graphs, or requests are never observed.  NULL keeps the exact
+ * per-call allocate/run/free behavior.
+ *
  * Negative returns: -1 generic failure, -2 deadline exceeded. */
 static int32_t compact_search_impl(
     const CompactGraphSpec* graph,
@@ -978,7 +1067,8 @@ static int32_t compact_search_impl(
     double* out_total_cost,
     int32_t* out_fwd_seed_index,
     int32_t* out_rev_seed_index,
-    double deadline_seconds
+    double deadline_seconds,
+    CompactWorkspace* workspace
 ) {
     *out_trav_positions = NULL;
     int32_t total_positions = -1;
@@ -1014,29 +1104,53 @@ static int32_t compact_search_impl(
         started_clock.tv_sec = 0;
         started_clock.tv_nsec = 0;
     }
-    MinHeap* heap_f = heap_create(128);
-    MinHeap* heap_r = heap_create(128);
+    MinHeap* heap_f;
+    MinHeap* heap_r;
     DirectionState ds_f;
     DirectionState ds_r;
-    bool ds_f_ok = false;
-    bool ds_r_ok = false;
-    if (heap_f && heap_r) {
-        ds_f_ok = direction_state_alloc(&ds_f, node_count);
-    }
-    if (heap_f && heap_r && ds_f_ok) {
-        ds_r_ok = direction_state_alloc(&ds_r, node_count);
-    }
-    if (!heap_f || !heap_r || !ds_f_ok || !ds_r_ok) {
-        heap_free(heap_f);
-        heap_free(heap_r);
-        if (ds_f_ok) direction_state_free(&ds_f);
-        if (ds_r_ok) direction_state_free(&ds_r);
-        return -1;
-    }
-
     PathRecord* path_records = NULL;
     int32_t path_capacity = 0;
     int32_t path_count = 0;
+    bool owns_storage;
+    if (workspace != NULL) {
+        /* Reuse the request-local buffers: grow the direction states to fit
+         * this graph, empty both heaps, and restart the path arena at 0.
+         * The old stamps/values are deliberately NOT cleared; the fresh
+         * generation below makes every stale slot read as unseen. */
+        if (!direction_state_reserve(&workspace->ds_f, node_count)) return -1;
+        if (!direction_state_reserve(&workspace->ds_r, node_count)) return -1;
+        workspace->heap_f->size = 0;
+        workspace->heap_r->size = 0;
+        workspace->path_count = 0;
+        heap_f = workspace->heap_f;
+        heap_r = workspace->heap_r;
+        ds_f = workspace->ds_f;
+        ds_r = workspace->ds_r;
+        path_records = workspace->path_records;
+        path_capacity = workspace->path_capacity;
+        path_count = workspace->path_count;
+        owns_storage = false;
+    } else {
+        heap_f = heap_create(128);
+        heap_r = heap_create(128);
+        bool ds_f_ok = false;
+        bool ds_r_ok = false;
+        if (heap_f && heap_r) {
+            ds_f_ok = direction_state_alloc(&ds_f, node_count);
+        }
+        if (heap_f && heap_r && ds_f_ok) {
+            ds_r_ok = direction_state_alloc(&ds_r, node_count);
+        }
+        if (!heap_f || !heap_r || !ds_f_ok || !ds_r_ok) {
+            heap_free(heap_f);
+            heap_free(heap_r);
+            if (ds_f_ok) direction_state_free(&ds_f);
+            if (ds_r_ok) direction_state_free(&ds_r);
+            return -1;
+        }
+        owns_storage = true;
+    }
+    uint32_t gen = workspace != NULL ? workspace_next_generation(workspace) : k_search_gen;
     bool compare_ok = true; /* path-key comparison scratch failures */
     uint64_t next_sequence = 0; /* shared across both sides, like Python */
     int32_t next_label_f = 0;
@@ -1051,14 +1165,14 @@ static int32_t compact_search_impl(
         int32_t rank_secondary = ranked ? fwd_seed_rank_secondary[i] : 0;
         if (!label_candidate_better(
                 graph, &ds_f, node, cost, rank_primary, rank_secondary, -1,
-                path_records, path_count, false, &compare_ok
+                path_records, path_count, false, gen, &compare_ok
             )) {
             if (!compare_ok) goto cleanup;
             continue;
         }
         state_set(
             &ds_f, node, -1, -1, cost, next_label_f++, i, rank_primary,
-            rank_secondary, -1, k_search_gen
+            rank_secondary, -1, gen
         );
         if (!heap_push(
                 heap_f, node, cost, rank_primary, rank_secondary,
@@ -1076,14 +1190,14 @@ static int32_t compact_search_impl(
         int32_t rank_secondary = ranked ? rev_seed_rank_secondary[i] : 0;
         if (!label_candidate_better(
                 graph, &ds_r, node, cost, rank_primary, rank_secondary, -1,
-                path_records, path_count, true, &compare_ok
+                path_records, path_count, true, gen, &compare_ok
             )) {
             if (!compare_ok) goto cleanup;
             continue;
         }
         state_set(
             &ds_r, node, -1, -1, cost, next_label_r++, i, rank_primary,
-            rank_secondary, -1, k_search_gen
+            rank_secondary, -1, gen
         );
         if (!heap_push(
                 heap_r, node, cost, rank_primary, rank_secondary,
@@ -1125,13 +1239,13 @@ static int32_t compact_search_impl(
             /* Stale heap entries: a cheaper or better-key label replaced the
              * one that was pushed.  The label_id identifies the exact label,
              * mirroring Python's best_at_node/label cost checks. */
-            if (!state_seen(&ds_f, u, k_search_gen) ||
+            if (!state_seen(&ds_f, u, gen) ||
                 ds_f.label_id[u] != item.label_id ||
                 ds_f.dist[u] != item.dist) {
                 continue;
             }
 
-            if (state_seen(&ds_r, u, k_search_gen)) {
+            if (state_seen(&ds_r, u, gen)) {
                 if (!consider_meeting(
                         graph, &ds_f, &ds_r, u, path_records, path_count,
                         &best_cost, &best_meeting_node, &best_f_primary,
@@ -1167,7 +1281,7 @@ static int32_t compact_search_impl(
                 if (!label_candidate_better(
                         graph, &ds_f, v, next_cost, ds_f.rank_primary[u],
                         ds_f.rank_secondary[u], new_path_id, path_records,
-                        path_count, false, &compare_ok
+                        path_count, false, gen, &compare_ok
                     )) {
                     if (!compare_ok) goto cleanup;
                     continue;
@@ -1175,7 +1289,7 @@ static int32_t compact_search_impl(
                 state_set(
                     &ds_f, v, u, pos, next_cost, next_label_f++,
                     ds_f.seed_idx[u], ds_f.rank_primary[u],
-                    ds_f.rank_secondary[u], new_path_id, k_search_gen
+                    ds_f.rank_secondary[u], new_path_id, gen
                 );
                 if (!heap_push(
                         heap_f, v, next_cost, ds_f.rank_primary[v],
@@ -1184,7 +1298,7 @@ static int32_t compact_search_impl(
                     )) {
                     goto cleanup;
                 }
-                if (state_seen(&ds_r, v, k_search_gen)) {
+                if (state_seen(&ds_r, v, gen)) {
                     if (!consider_meeting(
                             graph, &ds_f, &ds_r, v, path_records, path_count,
                             &best_cost, &best_meeting_node, &best_f_primary,
@@ -1198,13 +1312,13 @@ static int32_t compact_search_impl(
         } else {
             if (!heap_pop(heap_r, &item)) break;
             int32_t u = item.node_rank;
-            if (!state_seen(&ds_r, u, k_search_gen) ||
+            if (!state_seen(&ds_r, u, gen) ||
                 ds_r.label_id[u] != item.label_id ||
                 ds_r.dist[u] != item.dist) {
                 continue;
             }
 
-            if (state_seen(&ds_f, u, k_search_gen)) {
+            if (state_seen(&ds_f, u, gen)) {
                 if (!consider_meeting(
                         graph, &ds_f, &ds_r, u, path_records, path_count,
                         &best_cost, &best_meeting_node, &best_f_primary,
@@ -1241,7 +1355,7 @@ static int32_t compact_search_impl(
                 if (!label_candidate_better(
                         graph, &ds_r, v, next_cost, ds_r.rank_primary[u],
                         ds_r.rank_secondary[u], new_path_id, path_records,
-                        path_count, true, &compare_ok
+                        path_count, true, gen, &compare_ok
                     )) {
                     if (!compare_ok) goto cleanup;
                     continue;
@@ -1249,7 +1363,7 @@ static int32_t compact_search_impl(
                 state_set(
                     &ds_r, v, u, pos, next_cost, next_label_r++,
                     ds_r.seed_idx[u], ds_r.rank_primary[u],
-                    ds_r.rank_secondary[u], new_path_id, k_search_gen
+                    ds_r.rank_secondary[u], new_path_id, gen
                 );
                 if (!heap_push(
                         heap_r, v, next_cost, ds_r.rank_primary[v],
@@ -1258,7 +1372,7 @@ static int32_t compact_search_impl(
                     )) {
                     goto cleanup;
                 }
-                if (state_seen(&ds_f, v, k_search_gen)) {
+                if (state_seen(&ds_f, v, gen)) {
                     if (!consider_meeting(
                             graph, &ds_f, &ds_r, v, path_records, path_count,
                             &best_cost, &best_meeting_node, &best_f_primary,
@@ -1290,7 +1404,7 @@ static int32_t compact_search_impl(
                 reconstruction_failed = true;
                 break;
             }
-            if (!state_seen(&ds_f, curr, k_search_gen)) break;
+            if (!state_seen(&ds_f, curr, gen)) break;
             if (ds_f.parent[curr] == -1) {
                 /* The seed label at this rank records the actual winning
                  * compact seed index (duplicate-node seeds resolve by
@@ -1333,7 +1447,7 @@ static int32_t compact_search_impl(
                 reconstruction_failed = true;
                 break;
             }
-            if (!state_seen(&ds_r, curr, k_search_gen)) break;
+            if (!state_seen(&ds_r, curr, gen)) break;
             if (ds_r.parent[curr] == -1) {
                 rev_start_seed_idx = ds_r.seed_idx[curr];
                 break;
@@ -1395,11 +1509,22 @@ static int32_t compact_search_impl(
     }
 
 cleanup:
-    heap_free(heap_f);
-    heap_free(heap_r);
-    direction_state_free(&ds_f);
-    direction_state_free(&ds_r);
-    free(path_records);
+    if (owns_storage) {
+        heap_free(heap_f);
+        heap_free(heap_r);
+        direction_state_free(&ds_f);
+        direction_state_free(&ds_r);
+        free(path_records);
+    } else if (workspace != NULL) {
+        /* The direction states and heaps already live inside the workspace
+         * (the search wrote through their shared pointers); only the path
+         * arena may have been realloc'd during the search, so hand it back.
+         * The next search on this workspace restarts heap sizes and the
+         * arena count at zero under a fresh generation. */
+        workspace->path_records = path_records;
+        workspace->path_capacity = path_capacity;
+        workspace->path_count = path_count;
+    }
     return total_positions;
 }
 
@@ -1443,7 +1568,8 @@ int32_t compact_bidirectional_search_alloc(
         out_total_cost,
         out_fwd_seed_index,
         out_rev_seed_index,
-        deadline_seconds
+        deadline_seconds,
+        NULL
     );
 }
 
@@ -1490,7 +1616,8 @@ int32_t compact_bidirectional_search_alloc_ranked(
         out_total_cost,
         out_fwd_seed_index,
         out_rev_seed_index,
-        deadline_seconds
+        deadline_seconds,
+        NULL
     );
 }
 
@@ -1543,10 +1670,140 @@ int32_t compact_bidirectional_search_alloc_ranked_edge_scores(
         out_total_cost,
         out_fwd_seed_index,
         out_rev_seed_index,
-        deadline_seconds
+        deadline_seconds,
+        NULL
     );
 }
 
 void compact_free_positions(int64_t* positions) {
     free(positions);
+}
+
+/* Request-local workspace lifecycle.  ``compact_workspace_create`` returns
+ * an empty workspace (heap structs allocated, all big arrays lazy) or NULL
+ * on allocation failure; the Python layer owns it, hands it to the ``_ws``
+ * search entries below, and frees it when the request identity is replaced.
+ * A workspace is never shared across threads: each worker thread that runs
+ * a request's searches owns its own. */
+CompactWorkspace* compact_workspace_create(void) {
+    CompactWorkspace* ws = (CompactWorkspace*)malloc(sizeof(CompactWorkspace));
+    if (!ws) return NULL;
+    memset(ws, 0, sizeof(*ws));
+    ws->heap_f = heap_create(16);
+    ws->heap_r = heap_create(16);
+    if (!ws->heap_f || !ws->heap_r) {
+        heap_free(ws->heap_f);
+        heap_free(ws->heap_r);
+        free(ws);
+        return NULL;
+    }
+    ws->generation = 1u;
+    return ws;
+}
+
+void compact_workspace_free(CompactWorkspace* ws) {
+    if (!ws) return;
+    heap_free(ws->heap_f);
+    heap_free(ws->heap_r);
+    direction_state_free(&ws->ds_f);
+    direction_state_free(&ws->ds_r);
+    free(ws->path_records);
+    free(ws);
+}
+
+/* Workspace-aware ranked ABI entry: identical to
+ * compact_bidirectional_search_alloc_ranked plus a request-local
+ * ``workspace`` whose DirectionState/path/heap buffers are reused across
+ * the searches of one request.  NULL workspaces keep the per-call
+ * behavior.  Returns -1 on generic failure, -2 on deadline exceeded. */
+int32_t compact_bidirectional_search_alloc_ranked_ws(
+    const CompactGraphSpec* graph,
+    const CostSpec* cost_spec,
+    const int32_t* fwd_seed_nodes,
+    const double* fwd_seed_costs,
+    const int32_t* fwd_seed_rank_primary,
+    const int32_t* fwd_seed_rank_secondary,
+    int32_t fwd_seed_count,
+    const int32_t* rev_seed_nodes,
+    const double* rev_seed_costs,
+    const int32_t* rev_seed_rank_primary,
+    const int32_t* rev_seed_rank_secondary,
+    int32_t rev_seed_count,
+    int64_t** out_trav_positions,
+    double* out_total_cost,
+    int32_t* out_fwd_seed_index,
+    int32_t* out_rev_seed_index,
+    double deadline_seconds,
+    CompactWorkspace* workspace
+) {
+    return compact_search_impl(
+        graph,
+        cost_spec,
+        NULL,
+        fwd_seed_nodes,
+        fwd_seed_costs,
+        fwd_seed_rank_primary,
+        fwd_seed_rank_secondary,
+        fwd_seed_count,
+        rev_seed_nodes,
+        rev_seed_costs,
+        rev_seed_rank_primary,
+        rev_seed_rank_secondary,
+        rev_seed_count,
+        out_trav_positions,
+        out_total_cost,
+        out_fwd_seed_index,
+        out_rev_seed_index,
+        deadline_seconds,
+        workspace
+    );
+}
+
+/* Workspace-aware edge-score sidecar ABI entry: identical to
+ * compact_bidirectional_search_alloc_ranked_edge_scores plus the trailing
+ * request-local ``workspace``.  NULL workspaces keep the per-call
+ * behavior.  Returns -1 on generic failure (including malformed ranks),
+ * -2 on deadline exceeded. */
+int32_t compact_bidirectional_search_alloc_ranked_edge_scores_ws(
+    const CompactGraphSpec* graph,
+    const CostSpec* cost_spec,
+    const double* edge_scenic_score_by_rank,
+    const int32_t* fwd_seed_nodes,
+    const double* fwd_seed_costs,
+    const int32_t* fwd_seed_rank_primary,
+    const int32_t* fwd_seed_rank_secondary,
+    int32_t fwd_seed_count,
+    const int32_t* rev_seed_nodes,
+    const double* rev_seed_costs,
+    const int32_t* rev_seed_rank_primary,
+    const int32_t* rev_seed_rank_secondary,
+    int32_t rev_seed_count,
+    int64_t** out_trav_positions,
+    double* out_total_cost,
+    int32_t* out_fwd_seed_index,
+    int32_t* out_rev_seed_index,
+    double deadline_seconds,
+    CompactWorkspace* workspace
+) {
+    return compact_search_impl(
+        graph,
+        cost_spec,
+        edge_scenic_score_by_rank,
+        fwd_seed_nodes,
+        fwd_seed_costs,
+        fwd_seed_rank_primary,
+        fwd_seed_rank_secondary,
+        fwd_seed_count,
+        rev_seed_nodes,
+        rev_seed_costs,
+        rev_seed_rank_primary,
+        rev_seed_rank_secondary,
+        rev_seed_count,
+        out_trav_positions,
+        out_total_cost,
+        out_fwd_seed_index,
+        out_rev_seed_index,
+        deadline_seconds,
+        workspace
+    );
 }

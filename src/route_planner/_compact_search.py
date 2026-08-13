@@ -5,6 +5,7 @@ import sys
 import ctypes
 import math
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -15,6 +16,18 @@ _C_SOURCE = Path(__file__).with_name("_compact_search_c.c")
 _C_LIB_PATH = Path(__file__).with_name("_compact_search_c.so")
 
 _LIB: Optional[ctypes.CDLL] = None
+
+# Request-scoped native workspace registry.  Keyed by the calling thread,
+# each entry is ``(routing deadline object, native workspace handle)``: the
+# four multiplier searches of one request share one workspace per worker
+# thread (native buffers are re-stamped by a generation counter instead of
+# cleared).  When a different request starts on the same thread the old
+# workspace is freed and a fresh one is created, so buffers never carry
+# state across requests; with no active deadline the wrapper uses the plain
+# per-call entries and no workspace is created at all.  The registry holds
+# at most one workspace per live thread, so memory stays bounded.
+_WORKSPACE_LOCK = threading.Lock()
+_THREAD_WORKSPACES: dict[int, Tuple[Any, Any]] = {}
 
 
 class _CompactGraphSpec(ctypes.Structure):
@@ -128,6 +141,27 @@ def _ensure_compiled_library() -> Optional[ctypes.CDLL]:
         lib.compact_bidirectional_search_alloc.restype = ctypes.c_int32
         lib.compact_bidirectional_search_alloc_ranked.argtypes = ranked_argtypes
         lib.compact_bidirectional_search_alloc_ranked.restype = ctypes.c_int32
+        # Workspace-aware variants: identical signatures plus a trailing
+        # request-local workspace handle (NULL selects the per-call path).
+        # The workspace is owned by this module's per-thread registry and is
+        # never shared across threads.
+        lib.compact_bidirectional_search_alloc_ranked_ws.argtypes = (
+            ranked_argtypes + [ctypes.c_void_p]
+        )
+        lib.compact_bidirectional_search_alloc_ranked_ws.restype = ctypes.c_int32
+        lib.compact_bidirectional_search_alloc_ranked_edge_scores_ws.argtypes = (
+            [ctypes.POINTER(_CompactGraphSpec), ctypes.POINTER(_CostSpec)]
+            + [ctypes.POINTER(ctypes.c_double)]
+            + ranked_argtypes[2:]
+            + [ctypes.c_void_p]
+        )
+        lib.compact_bidirectional_search_alloc_ranked_edge_scores_ws.restype = (
+            ctypes.c_int32
+        )
+        lib.compact_workspace_create.argtypes = []
+        lib.compact_workspace_create.restype = ctypes.c_void_p
+        lib.compact_workspace_free.argtypes = [ctypes.c_void_p]
+        lib.compact_workspace_free.restype = None
         lib.compact_free_positions.argtypes = [ctypes.POINTER(ctypes.c_int64)]
         lib.compact_free_positions.restype = None
         _LIB = lib
@@ -138,6 +172,56 @@ def _ensure_compiled_library() -> Optional[ctypes.CDLL]:
 
 def compact_search_available() -> bool:
     return _ensure_compiled_library() is not None
+
+
+def _workspace_create(lib: Any) -> Any:
+    """Create one native workspace handle (module-level so tests can hook)."""
+    return lib.compact_workspace_create()
+
+
+def _workspace_free(lib: Any, handle: Any) -> None:
+    """Free one native workspace handle (module-level so tests can hook)."""
+    lib.compact_workspace_free(handle)
+
+
+def _request_workspace(lib: Any) -> Any:
+    """Return this thread's workspace handle for the active request, or None.
+
+    The request identity is the routing-deadline object currently bound to
+    the ``_ACTIVE_ROUTING_DEADLINE`` context variable (the planner's
+    ``_routing_deadline_scope`` wraps one whole ``find_*_route`` call, so
+    all of its multiplier searches share the identity; worker threads see
+    the same object through ``copy_context``).  The first search on a
+    thread creates the workspace; later searches of the same request reuse
+    it.  When a different request starts on the same thread, the previous
+    workspace is freed before the fresh one is returned, so buffers never
+    outlive their request's identity on a thread.
+
+    Returns None when no request identity is active or when the native
+    workspace cannot be allocated; callers then use the plain per-call
+    entries, preserving the exact baseline behavior.
+    """
+    try:
+        from .planner import _ACTIVE_ROUTING_DEADLINE  # lazy: breaks import cycle
+    except Exception:
+        return None
+    deadline = _ACTIVE_ROUTING_DEADLINE.get()
+    if deadline is None:
+        return None
+    thread_id = threading.get_ident()
+    with _WORKSPACE_LOCK:
+        entry = _THREAD_WORKSPACES.get(thread_id)
+        if entry is not None and entry[0] is deadline:
+            return entry[1]
+        handle = _workspace_create(lib)
+        if handle is None:
+            return None
+        _THREAD_WORKSPACES[thread_id] = (deadline, handle)
+        if entry is not None and entry[1] is not None:
+            # Previous request's workspace: no search can still be using it
+            # (this thread's searches are sequential), so retire it now.
+            _workspace_free(lib, entry[1])
+        return handle
 
 
 def run_compact_bidirectional_search(
@@ -327,7 +411,10 @@ def run_compact_bidirectional_search(
     out_rev_idx = ctypes.c_int32(-1)
 
     if edge_scenic_score_by_rank is not None:
-        res = lib.compact_bidirectional_search_alloc_ranked_edge_scores(
+        ws_entry = getattr(
+            lib, "compact_bidirectional_search_alloc_ranked_edge_scores_ws", None
+        )
+        args = (
             ctypes.byref(spec),
             ctypes.byref(cost_spec),
             edge_scenic_score_by_rank,
@@ -347,8 +434,17 @@ def run_compact_bidirectional_search(
             ctypes.byref(out_rev_idx),
             native_deadline_seconds,
         )
+        if ws_entry is not None:
+            # The ws entry always takes the trailing workspace slot; None
+            # maps to the native NULL (per-call) path when no request
+            # identity is active.
+            res = ws_entry(*args, _request_workspace(lib))
+        else:
+            # Stale library without the workspace-aware entry: per-call path.
+            res = lib.compact_bidirectional_search_alloc_ranked_edge_scores(*args)
     else:
-        res = lib.compact_bidirectional_search_alloc_ranked(
+        ws_entry = getattr(lib, "compact_bidirectional_search_alloc_ranked_ws", None)
+        args = (
             ctypes.byref(spec),
             ctypes.byref(cost_spec),
             fwd_nodes,
@@ -367,6 +463,10 @@ def run_compact_bidirectional_search(
             ctypes.byref(out_rev_idx),
             native_deadline_seconds,
         )
+        if ws_entry is not None:
+            res = ws_entry(*args, _request_workspace(lib))
+        else:
+            res = lib.compact_bidirectional_search_alloc_ranked(*args)
 
     if res == -2:
         raise RoutingTimeout("compiled compact search deadline exceeded")
