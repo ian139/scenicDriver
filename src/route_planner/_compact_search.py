@@ -16,6 +16,45 @@ _C_LIB_PATH = Path(__file__).with_name("_compact_search_c.so")
 
 _LIB: Optional[ctypes.CDLL] = None
 
+# Downward safety factor shared by every scalar completion bound: the
+# per-minute floor is shrunk slightly so accumulated floating-point error can
+# never make the native strict ``>`` prune overestimate admissible remaining
+# cost.  Must stay in sync with ``graph._COMPACT_BOUND_SAFETY_FACTOR``.
+_COMPACT_BOUND_SAFETY_FACTOR = 1.0 - 1e-12
+
+
+def _scalar_cost_bound_per_minute(
+    cost_function: Any, lagrangian_multiplier: float
+) -> float:
+    """Return the conservative nonnegative scalar-cost-per-duration floor.
+
+    Derivation (mirrors ``ScenicCostFunction.calculate`` and the native
+    ``compute_edge_cost`` exactly): for any edge of duration ``d``,
+
+    - the weighted scenic/travel base is clamped to at least ``1e-6 * d``;
+    - a scenic byway multiplies that base by ``(1 - bonus)`` with the bonus
+      capped at 0.5, leaving at least ``0.5e-6 * d``;
+    - highway adjustments and the Lagrangian term ``lambda * d`` are
+      duration-scaled and nonnegative.
+
+    So every edge cost satisfies ``cost(edge) >= (0.5e-6 + lambda) *
+    duration(edge)`` and the multiplier-scaled scalar edge cost is bounded
+    below by the same floor; the result is scaled by a downward safety
+    factor so accumulated floating-point error can never turn it into an
+    overestimate.  ``0.0`` disables completion-bound pruning in the native
+    search.
+    """
+    try:
+        lambda_value = float(lagrangian_multiplier)
+    except (TypeError, ValueError, OverflowError):
+        lambda_value = 0.0
+    if not math.isfinite(lambda_value) or lambda_value < 0.0:
+        lambda_value = 0.0
+    bound_per_minute = (0.5e-6 + lambda_value) * _COMPACT_BOUND_SAFETY_FACTOR
+    if not math.isfinite(bound_per_minute) or bound_per_minute < 0.0:
+        return 0.0
+    return bound_per_minute
+
 
 class _CompactGraphSpec(ctypes.Structure):
     _fields_ = [
@@ -35,6 +74,11 @@ class _CompactGraphSpec(ctypes.Structure):
         ("trav_reverse", ctypes.POINTER(ctypes.c_uint8)),
         ("edge_id_strings", ctypes.POINTER(ctypes.c_uint8)),
         ("edge_id_offsets", ctypes.POINTER(ctypes.c_int64)),
+        # Node-rank-indexed admissible scalar-cost completion bounds
+        # (toward the reverse seed side and the forward seed side).  Both
+        # may be NULL, which disables the native completion prune.
+        ("node_bound_forward", ctypes.POINTER(ctypes.c_double)),
+        ("node_bound_reverse", ctypes.POINTER(ctypes.c_double)),
     ]
 
 
@@ -49,6 +93,7 @@ class _CostSpec(ctypes.Structure):
         ("scenic_byway_bonus", ctypes.c_double),
         ("lagrangian_multiplier", ctypes.c_double),
         ("cost_limit", ctypes.c_double),
+        ("bound_per_minute", ctypes.c_double),
     ]
 
 
@@ -103,7 +148,9 @@ def _ensure_compiled_library() -> Optional[ctypes.CDLL]:
         # The edge-score sidecar entry adds one argument after the cost spec:
         # the canonical-edge-rank-indexed scenic score array.  It is selected
         # only for active CompactRoadGraph score sidecars; the ranked and
-        # legacy entries below keep their traversal-indexed contract.
+        # legacy entries below keep their traversal-indexed contract.  The
+        # node-bound arrays travel inside the graph spec, so no ABI function
+        # signature changes.
         lib.compact_bidirectional_search_alloc_ranked_edge_scores.argtypes = (
             [ctypes.POINTER(_CompactGraphSpec), ctypes.POINTER(_CostSpec)]
             + [ctypes.POINTER(ctypes.c_double)]
@@ -149,6 +196,8 @@ def run_compact_bidirectional_search(
     lagrangian_multiplier: float = 0.0,
     cost_limit: Optional[float] = None,
     deadline_seconds: Optional[float] = None,
+    bound_forward: Optional[Any] = None,
+    bound_reverse: Optional[Any] = None,
 ) -> Optional[Tuple[List[int], float, int, int]]:
     lib = _ensure_compiled_library()
     if lib is None:
@@ -208,6 +257,31 @@ def run_compact_bidirectional_search(
     ):
         return None
 
+    # Node-rank-indexed admissible scalar-cost completion bounds.  Both must
+    # be supplied together (partial bounds are never substituted): each
+    # array covers every node rank in [0, node_count) and the native search
+    # prunes a relaxed label only when
+    # ``next_cost + bound[neighbor] > cost_limit`` (strict, so equal-cost
+    # ties and the fastest path itself survive).
+    bound_fwd_ptr = None
+    bound_rev_ptr = None
+    if bound_forward is not None or bound_reverse is not None:
+        if bound_forward is None or bound_reverse is None:
+            return None
+        if (
+            not hasattr(bound_forward, "ctypes")
+            or not hasattr(bound_reverse, "ctypes")
+            or bound_forward.shape[0] < graph.node_count
+            or bound_reverse.shape[0] < graph.node_count
+        ):
+            return None
+        bound_fwd_ptr = bound_forward.ctypes.data_as(
+            ctypes.POINTER(ctypes.c_double)
+        )
+        bound_rev_ptr = bound_reverse.ctypes.data_as(
+            ctypes.POINTER(ctypes.c_double)
+        )
+
     # The compact score sidecar is indexed by canonical edge rank, not by
     # traversal position, so the sidecar-aware native entry receives the raw
     # sidecar array and indexes it via trav_edge_rank[position].  The legacy
@@ -254,6 +328,8 @@ def run_compact_bidirectional_search(
         trav_reverse=trav_reverse,
         edge_id_strings=edge_id_strings,
         edge_id_offsets=edge_id_offsets,
+        node_bound_forward=bound_fwd_ptr,
+        node_bound_reverse=bound_rev_ptr,
     )
 
     weights = getattr(cost_function, "weights", None)
@@ -275,6 +351,9 @@ def run_compact_bidirectional_search(
         scenic_byway_bonus=float(getattr(weights, "scenic_byway_bonus", 0.0) if weights else 0.0),
         lagrangian_multiplier=float(lagrangian_multiplier),
         cost_limit=float(cost_limit) if cost_limit is not None else 0.0,
+        bound_per_minute=_scalar_cost_bound_per_minute(
+            cost_function, lagrangian_multiplier
+        ),
     )
 
     node_index = topology.node_index
