@@ -3386,14 +3386,23 @@ static int fail_enabled(void) {
 }
 
 static int is_compare_scratch_alloc(void) {
-    Dl_info info;
-    if (dladdr(__builtin_return_address(0), &info) == 0 ||
-        info.dli_sname == NULL) {
-        return 0;
+    Dl_info info0, info1;
+    const char *s0 = (dladdr(__builtin_return_address(0), &info0) != 0) ? info0.dli_sname : NULL;
+    const char *s1 = (dladdr(__builtin_return_address(1), &info1) != 0) ? info1.dli_sname : NULL;
+
+    if (s0 && (strstr(s0, "path_scratch_ensure_capacity") ||
+               strstr(s0, "path_record_materialize_forward") ||
+               strstr(s0, "path_record_compare") ||
+               strstr(s0, "middle_key_compare"))) {
+        return 1;
     }
-    return strstr(info.dli_sname, "path_record_materialize_forward") != NULL ||
-           strstr(info.dli_sname, "path_record_compare") != NULL ||
-           strstr(info.dli_sname, "middle_key_compare") != NULL;
+    if (s1 && (strstr(s1, "path_scratch_ensure_capacity") ||
+               strstr(s1, "path_record_materialize_forward") ||
+               strstr(s1, "path_record_compare") ||
+               strstr(s1, "middle_key_compare"))) {
+        return 1;
+    }
+    return 0;
 }
 
 static void *my_malloc(size_t size) {
@@ -3406,12 +3415,30 @@ static void *my_malloc(size_t size) {
     return malloc_zone_malloc(malloc_default_zone(), size);
 }
 
+static void *my_realloc(void *ptr, size_t size) {
+    if (is_compare_scratch_alloc() && fail_enabled()) {
+        static unsigned long compare_alloc_count = 0;
+        if ((++compare_alloc_count % 2) == 0) {
+            return NULL;
+        }
+    }
+    return malloc_zone_realloc(malloc_default_zone(), ptr, size);
+}
+
 __attribute__((used)) static struct {
     const void *replacement;
     const void *replacee;
 } _interpose_malloc __attribute__((section("__DATA,__interpose"))) = {
     (const void *)my_malloc,
     (const void *)malloc,
+};
+
+__attribute__((used)) static struct {
+    const void *replacement;
+    const void *replacee;
+} _interpose_realloc __attribute__((section("__DATA,__interpose"))) = {
+    (const void *)my_realloc,
+    (const void *)realloc,
 };
 """
 
@@ -3727,3 +3754,90 @@ def test_compact_lagrangian_sequential_fallback(
 
     assert route is not None
     assert executed_threads == {threading.get_ident()}
+
+
+def test_compact_scratch_growth_and_repeated_calls(tmp_path: Path) -> None:
+    """Reusable scratch buffers must grow geometrically for long paths and reset
+    cleanly between repeated search calls without stale state or corruption."""
+    edge_count = 256
+    graph = _deep_prefix_parallel_end_graph(edge_count)
+    _sqlite, manifest, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest)
+    planner = ScenicRoutePlanner(graph=compact)
+    cost_spec = _native_cost_spec(planner)
+    arrays = dict(compact._sections)
+    spec = _native_graph_spec(compact, arrays)
+    lib = _native_library()
+
+    for _ in range(5):
+        rc, positions, cost, fwd, rev = _call_native_search_ranked(
+            lib,
+            spec,
+            cost_spec,
+            [(0, 0.0, 0, 0)],
+            [(edge_count + 1, 0.0, 0, 0)],
+        )
+        assert rc == edge_count + 1, f"Expected {edge_count + 1} positions, got {rc}"
+        assert positions is not None
+        assert len(positions) == edge_count + 1
+        assert fwd == 0
+        assert rev == 0
+
+
+def test_compact_scratch_equal_prefix_long_path_ordering(tmp_path: Path) -> None:
+    """Exact lexicographic tie-breaking on deep paths with shared equal-cost
+    prefixes must be preserved under reusable scratch geometric growth."""
+    edge_count = 1024
+    graph = _deep_prefix_parallel_end_graph(edge_count)
+    _sqlite, manifest, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest)
+    planner = ScenicRoutePlanner(graph=compact)
+    cost_spec = _native_cost_spec(planner)
+    arrays = dict(compact._sections)
+    spec = _native_graph_spec(compact, arrays)
+    lib = _native_library()
+
+    rc, positions, cost, fwd, rev = _call_native_search_ranked(
+        lib,
+        spec,
+        cost_spec,
+        [(0, 0.0, 0, 0)],
+        [(edge_count + 1, 0.0, 0, 0)],
+    )
+    assert rc == edge_count + 1
+    assert positions is not None
+    assert positions[0] == 0
+    assert positions[-1] == edge_count + 1
+
+
+def test_compact_scratch_multithreaded_concurrency(tmp_path: Path) -> None:
+    """Search-scoped scratch buffers must be reentrant and thread-safe when
+    multiple search threads execute concurrently."""
+    import concurrent.futures
+
+    edge_count = 512
+    graph = _deep_prefix_parallel_end_graph(edge_count)
+    _sqlite, manifest, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest)
+    planner = ScenicRoutePlanner(graph=compact)
+    cost_spec = _native_cost_spec(planner)
+    arrays = dict(compact._sections)
+    spec = _native_graph_spec(compact, arrays)
+    lib = _native_library()
+
+    def worker_run(thread_id: int) -> int:
+        rc, positions, _cost, _fwd, _rev = _call_native_search_ranked(
+            lib,
+            spec,
+            cost_spec,
+            [(0, 0.0, 0, 0)],
+            [(edge_count + 1, 0.0, 0, 0)],
+        )
+        return rc
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(worker_run, i) for i in range(16)]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    assert len(results) == 16
+    assert all(r == edge_count + 1 for r in results)
