@@ -3727,3 +3727,36 @@ def test_compact_lagrangian_sequential_fallback(
 
     assert route is not None
     assert executed_threads == {threading.get_ident()}
+def test_compact_search_early_rejection_parity_and_ties(tmp_path: Path) -> None:
+    """Verify native relaxation early-rejection optimization preserves route identity,
+    equal-cost path key ties, rank ties, and deadline behavior."""
+    lib = _native_library()
+    assert lib is not None
+    graph = _diamond_graph()
+    sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    planner = ScenicRoutePlanner(graph=compact)
+    cost_spec = _native_cost_spec(planner)
+    arrays = dict(compact._sections)
+    spec = _native_graph_spec(compact, arrays)
+    topology = planner._csr_topology()
+    assert topology is not None
+
+    # 1. Equal cost alternatives with rank ties and strictly worse candidates
+    seeds_f = [(0, 0.0, 0, 0)]
+    seeds_r = [(3, 0.0, 0, 0)]
+    rc, positions, cost, fwd_idx, rev_idx = _call_native_search_ranked(
+        lib, spec, cost_spec, seeds_f, seeds_r
+    )
+    assert rc >= 0
+    assert positions is not None
+    assert cost == pytest.approx(2.0)
+    assert [topology.edge_refs[p][0] for p in positions] == ["e0", "e1"]
+    assert (fwd_idx, rev_idx) == (0, 0)
+
+    # 2. Deadline failure mode returns -2
+    rc_dl, pos_dl, _, _, _ = _call_native_search_ranked(
+        lib, spec, cost_spec, seeds_f, seeds_r, deadline_seconds=0.0
+    )
+    assert rc_dl == -2
+    assert pos_dl is None

@@ -821,6 +821,24 @@ static int middle_key_compare(
  * completed (transient scratch allocation failed or a malformed chain was
  * detected); callers must then abort the search with a generic failure
  * instead of trusting the boolean result. */
+/* Quickly test if a candidate label at ``rank`` is guaranteed to lose to the
+ * current best label there by cost or rank pair alone, avoiding unnecessary
+ * path arena allocation for labels that cannot win or tie. */
+static inline bool label_candidate_loses_by_cost_or_rank(
+    const DirectionState* ds,
+    int32_t rank,
+    double cost,
+    int32_t rank_primary,
+    int32_t rank_secondary
+) {
+    if (!state_seen(ds, rank, k_search_gen)) return false;
+    if (cost > ds->dist[rank]) return true;
+    if (cost < ds->dist[rank]) return false;
+    if (rank_primary > ds->rank_primary[rank]) return true;
+    if (rank_primary < ds->rank_primary[rank]) return false;
+    return rank_secondary > ds->rank_secondary[rank];
+}
+
 static bool label_candidate_better(
     const CompactGraphSpec* graph,
     const DirectionState* ds,
@@ -1157,6 +1175,12 @@ static int32_t compact_search_impl(
                 int32_t v = graph->forward_indices[pos];
                 if (v < 0 || (int64_t)v >= node_count) continue; /* reject invalid neighbor ranks */
                 int32_t edge_rank = graph->trav_edge_rank ? graph->trav_edge_rank[pos] : (int32_t)pos;
+                if (label_candidate_loses_by_cost_or_rank(
+                        &ds_f, v, next_cost, ds_f.rank_primary[u],
+                        ds_f.rank_secondary[u]
+                    )) {
+                    continue;
+                }
                 int32_t new_path_id = -1;
                 if (!path_arena_push(
                         &path_records, &path_capacity, &path_count,
@@ -1231,6 +1255,12 @@ static int32_t compact_search_impl(
                 int32_t v = graph->reverse_indices[rev_pos];
                 if (v < 0 || (int64_t)v >= node_count) continue; /* reject invalid neighbor ranks */
                 int32_t edge_rank = graph->trav_edge_rank ? graph->trav_edge_rank[pos] : (int32_t)pos;
+                if (label_candidate_loses_by_cost_or_rank(
+                        &ds_r, v, next_cost, ds_r.rank_primary[u],
+                        ds_r.rank_secondary[u]
+                    )) {
+                    continue;
+                }
                 int32_t new_path_id = -1;
                 if (!path_arena_push(
                         &path_records, &path_capacity, &path_count,
