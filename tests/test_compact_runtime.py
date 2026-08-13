@@ -3540,3 +3540,183 @@ def test_compact_comparator_alloc_failure_preserves_minus_one_and_frees_scratch(
         control_rss,
     )
 
+def test_compact_lagrangian_two_worker_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+    import threading
+    import src.route_planner.planner as planner_module
+
+    graph = _fixture_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+
+    monkeypatch.setattr(ScenicRoutePlanner, "_ENDPOINT_OVERLAY_MAX_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_LARGE_GRAPH_EDGE_THRESHOLD", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_COMPILED_SCENIC_MIN_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_NODES", 0)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_EDGES", 0)
+
+    lock = threading.Lock()
+    active_workers = 0
+    max_active_workers = 0
+
+    orig_native_search = planner_module.run_compact_bidirectional_search
+
+    def hooked_search(*args: object, **kwargs: object) -> object:
+        nonlocal active_workers, max_active_workers
+        with lock:
+            active_workers += 1
+            if active_workers > max_active_workers:
+                max_active_workers = active_workers
+        try:
+            time.sleep(0.02)
+            return orig_native_search(*args, **kwargs)
+        finally:
+            with lock:
+                active_workers -= 1
+
+    monkeypatch.setattr(
+        planner_module, "run_compact_bidirectional_search", hooked_search
+    )
+
+    planner = ScenicRoutePlanner(graph=compact)
+    start = (42.0, -72.0)
+    end = (42.1, -72.1)
+    route = planner.find_scenic_route(start, end, scenic_weight=0.8)
+
+    assert route is not None
+    assert max_active_workers == 2
+
+
+def test_compact_lagrangian_result_ordering_and_identical_evaluation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.route_planner.planner as planner_module
+
+    graph = _fixture_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+
+    monkeypatch.setattr(ScenicRoutePlanner, "_ENDPOINT_OVERLAY_MAX_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_LARGE_GRAPH_EDGE_THRESHOLD", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_COMPILED_SCENIC_MIN_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_NODES", 0)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_EDGES", 0)
+
+    planner_parallel = ScenicRoutePlanner(graph=compact)
+    start = (42.0, -72.0)
+    end = (42.1, -72.1)
+    route_parallel = planner_parallel.find_scenic_route(
+        start, end, scenic_weight=0.8
+    )
+
+    monkeypatch.setattr(
+        planner_module, "compact_search_available", lambda: False
+    )
+    planner_seq = ScenicRoutePlanner(graph=compact)
+    route_seq = planner_seq.find_scenic_route(start, end, scenic_weight=0.8)
+
+    assert route_parallel is not None
+    assert route_seq is not None
+    assert route_parallel.total_distance_km == pytest.approx(
+        route_seq.total_distance_km
+    )
+    assert route_parallel.estimated_duration_minutes == pytest.approx(
+        route_seq.estimated_duration_minutes
+    )
+    assert route_parallel.average_scenic_score == pytest.approx(
+        route_seq.average_scenic_score
+    )
+    assert [s.edge_id for s in route_parallel.segments] == [
+        s.edge_id for s in route_seq.segments
+    ]
+
+
+def test_compact_lagrangian_exception_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+    import src.route_planner.planner as planner_module
+
+    graph = _fixture_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+
+    monkeypatch.setattr(ScenicRoutePlanner, "_ENDPOINT_OVERLAY_MAX_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_LARGE_GRAPH_EDGE_THRESHOLD", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_COMPILED_SCENIC_MIN_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_NODES", 0)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_EDGES", 0)
+
+    orig_search = planner_module.run_compact_bidirectional_search
+
+    def failing_search(*args: object, **kwargs: object) -> object:
+        if kwargs.get("lagrangian_multiplier") == 0.25:
+            raise RuntimeError("Lagrangian worker artificial failure")
+        return orig_search(*args, **kwargs)
+
+    monkeypatch.setattr(
+        planner_module, "run_compact_bidirectional_search", failing_search
+    )
+
+    planner = ScenicRoutePlanner(graph=compact)
+    start = (42.0, -72.0)
+    end = (42.1, -72.1)
+    with pytest.raises(
+        RuntimeError, match="Lagrangian worker artificial failure"
+    ):
+        planner.find_scenic_route(start, end, scenic_weight=0.8)
+
+    monkeypatch.undo()
+    monkeypatch.setattr(ScenicRoutePlanner, "_ENDPOINT_OVERLAY_MAX_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_LARGE_GRAPH_EDGE_THRESHOLD", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_COMPILED_SCENIC_MIN_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_NODES", 0)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_EDGES", 0)
+    deadline = RoutingDeadline(expires_at=time.monotonic() - 0.01)
+    with pytest.raises(RoutingTimeout):
+        with planner_module._routing_deadline_scope(deadline):
+            planner.find_scenic_route(start, end, scenic_weight=0.8)
+
+
+def test_compact_lagrangian_sequential_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    import src.route_planner.planner as planner_module
+
+    graph = _fixture_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+
+    monkeypatch.setattr(ScenicRoutePlanner, "_ENDPOINT_OVERLAY_MAX_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_LARGE_GRAPH_EDGE_THRESHOLD", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_COMPILED_SCENIC_MIN_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_NODES", 0)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_EDGES", 0)
+
+    monkeypatch.setattr(
+        planner_module, "compact_search_available", lambda: False
+    )
+
+    executed_threads: set[int] = set()
+    orig_bidirectional = ScenicRoutePlanner._bidirectional_search_core
+
+    def tracked_bidirectional(
+        self: ScenicRoutePlanner, *args: object, **kwargs: object
+    ) -> object:
+        executed_threads.add(threading.get_ident())
+        return orig_bidirectional(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        ScenicRoutePlanner, "_bidirectional_search_core", tracked_bidirectional
+    )
+
+    planner = ScenicRoutePlanner(graph=compact)
+    start = (42.0, -72.0)
+    end = (42.1, -72.1)
+    route = planner.find_scenic_route(start, end, scenic_weight=0.8)
+
+    assert route is not None
+    assert executed_threads == {threading.get_ident()}
