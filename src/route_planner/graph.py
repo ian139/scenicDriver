@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from array import array
 from collections import OrderedDict
@@ -3473,22 +3474,25 @@ class CompactRoadGraph(RoadGraph):
         if verify:
             if check_cancelled is not None:
                 check_cancelled()
-            actual_bin_sha = _sha256_file(
-                bin_path, check_cancelled=check_cancelled
-            ).hex()
-            if actual_bin_sha != str(manifest.get("bin_sha256", "")):
-                raise ValueError(
-                    "Compact binary payload SHA-256 does not match its manifest"
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_bin = executor.submit(
+                    _sha256_file, bin_path, check_cancelled=check_cancelled
                 )
-            if check_cancelled is not None:
-                check_cancelled()
-            actual_source_sha = _sha256_file(
-                source_path, check_cancelled=check_cancelled
-            ).hex()
-            if actual_source_sha != str(source.get("sha256", "")):
-                raise ValueError(
-                    "Compact source graph SHA-256 does not match its manifest"
+                future_source = executor.submit(
+                    _sha256_file, source_path, check_cancelled=check_cancelled
                 )
+                actual_bin_sha = future_bin.result().hex()
+                if actual_bin_sha != str(manifest.get("bin_sha256", "")):
+                    raise ValueError(
+                        "Compact binary payload SHA-256 does not match its manifest"
+                    )
+                if check_cancelled is not None:
+                    check_cancelled()
+                actual_source_sha = future_source.result().hex()
+                if actual_source_sha != str(source.get("sha256", "")):
+                    raise ValueError(
+                        "Compact source graph SHA-256 does not match its manifest"
+                    )
 
         expected_sections = dict(manifest.get("sections") or {})
         missing = _COMPACT_SECTION_NAMES.difference(expected_sections)
