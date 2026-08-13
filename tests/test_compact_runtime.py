@@ -3362,6 +3362,78 @@ def test_compact_native_edge_score_entry_rejects_malformed_ranks(
     assert rc == 2
 
 
+def test_compact_native_edge_score_sidecar_preflight_and_bidirectional_parity(
+    tmp_path: Path,
+) -> None:
+    """Preflight fails closed (-1) for negative edge or traversal counts before
+    allocation. Forward, reverse, and meeting bidirectional relaxations with
+    sidecar scores match eager/Python expectations with exact cost/route parity."""
+    import ctypes as _ctypes
+
+    import numpy as np
+
+    lib = _native_library()
+    graph = _rank_permutation_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    arrays = dict(compact._sections)
+    scenic_spec = _scenic_cost_spec()
+
+    edge_scores = np.array([10.0, 2.0, 8.0, 2.0], dtype=np.float64)
+    edge_scores_ptr = edge_scores.ctypes.data_as(
+        _ctypes.POINTER(_ctypes.c_double)
+    )
+
+    # 1. Malformed table preflight: negative edge_count or traversal_count.
+    spec_neg_edges = _native_graph_spec(compact, arrays)
+    spec_neg_edges.edge_count = -1
+    rc, pos, _c, _f, _r = _call_native_search_edge_scores(
+        lib, spec_neg_edges, scenic_spec, edge_scores_ptr,
+        [(0, 0.0, 0, 0)], [(1, 0.0, 0, 0)]
+    )
+    assert rc == -1
+    assert pos is None
+
+    spec_neg_trav = _native_graph_spec(compact, arrays)
+    spec_neg_trav.traversal_count = -1
+    rc, pos, _c, _f, _r = _call_native_search_edge_scores(
+        lib, spec_neg_trav, scenic_spec, edge_scores_ptr,
+        [(0, 0.0, 0, 0)], [(1, 0.0, 0, 0)]
+    )
+    assert rc == -1
+    assert pos is None
+
+    # Expected route B (e3, e0) cost calculation with scores [10.0, 2.0, 8.0, 2.0]:
+    # e3 (rank 3, score 2.0), e0 (rank 0, score 10.0) -> cost = 1.04
+    spec_ok = _native_graph_spec(compact, arrays)
+    expected_cost = 1.04
+    compact_planner = ScenicRoutePlanner(graph=compact)
+    topology = compact_planner._csr_topology()
+    # 2. Forward-dominated expansion: fwd seed cost 0.0, rev seed cost 50.0.
+    rc_fwd, pos_fwd, cost_fwd, _fi, _ri = _call_native_search_edge_scores(
+        lib, spec_ok, scenic_spec, edge_scores_ptr,
+        [(0, 0.0, 0, 0)], [(1, 50.0, 0, 0)]
+    )
+    assert rc_fwd == 2
+    assert cost_fwd == pytest.approx(expected_cost + 50.0)
+
+    # 3. Reverse-dominated expansion: fwd seed cost 50.0, rev seed cost 0.0.
+    rc_rev, pos_rev, cost_rev, _fi, _ri = _call_native_search_edge_scores(
+        lib, spec_ok, scenic_spec, edge_scores_ptr,
+        [(0, 50.0, 0, 0)], [(1, 0.0, 0, 0)]
+    )
+    assert rc_rev == 2
+    assert [topology.edge_refs[p][0] for p in pos_rev] == ["e3", "e0"]
+    assert cost_rev == pytest.approx(expected_cost + 50.0)
+    # 4. Balanced bidirectional meeting expansion: fwd seed cost 0.0, rev seed cost 0.0.
+    rc_bi, pos_bi, cost_bi, _fi, _ri = _call_native_search_edge_scores(
+        lib, spec_ok, scenic_spec, edge_scores_ptr,
+        [(0, 0.0, 0, 0)], [(1, 0.0, 0, 0)]
+    )
+    assert rc_bi == 2
+    assert [topology.edge_refs[p][0] for p in pos_bi] == ["e3", "e0"]
+    assert cost_bi == pytest.approx(expected_cost)
+
 # ---------------------------------------------------------------------------
 # Comparator transient-scratch allocation failure
 # ---------------------------------------------------------------------------
