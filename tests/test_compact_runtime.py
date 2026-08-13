@@ -3727,3 +3727,82 @@ def test_compact_lagrangian_sequential_fallback(
 
     assert route is not None
     assert executed_threads == {threading.get_ident()}
+
+
+
+def test_compact_asymmetric_fanout_direction_selection_parity(
+    tmp_path: Path,
+) -> None:
+    """Asymmetric fanout graphs (high forward branch degree, single reverse path)
+    must yield exact route and seed index parity between native search and eager reference."""
+    from src.route_planner._compact_search import run_compact_bidirectional_search
+
+    graph = RoadGraph()
+    graph.add_node(Node("n0", 42.0, -72.0))
+    graph.add_node(Node("target", 42.1, -72.0))
+    for i in range(32):
+        mid = f"mid_{i}"
+        graph.add_node(Node(mid, 42.05, -72.0 + i * 0.001))
+        graph.add_edge(Edge(f"e_f_{i}", "n0", mid, 1.0 + i * 0.01, 10.0))
+        graph.add_edge(Edge(f"e_r_{i}", mid, "target", 1.0, 10.0))
+
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    planner = ScenicRoutePlanner(graph=compact)
+    topology = planner._csr_topology()
+    assert topology is not None
+    cost_function = planner._make_fastest_cost_function()
+
+    native_result = run_compact_bidirectional_search(
+        topology,
+        cost_function,
+        [("n0", 0.0, (0, 0), None)],
+        [("target", 0.0, (0, 0), None)],
+    )
+    assert native_result is not None
+    positions, total_cost, fwd_idx, rev_idx = native_result
+    assert fwd_idx == 0
+    assert rev_idx == 0
+    assert total_cost == pytest.approx(2.4)
+    assert len(positions) == 2
+
+
+def test_compact_adversarial_equal_cost_direction_selection_parity(
+    tmp_path: Path,
+) -> None:
+    """Adversarial equal-cost parallel routes with distinct rank pairs and edge keys
+    must resolve to the exact deterministic winning route in native search."""
+    from src.route_planner._compact_search import run_compact_bidirectional_search
+
+    graph = RoadGraph()
+    graph.add_node(Node("n0", 42.0, -72.0))
+    graph.add_node(Node("n3", 42.1, -72.0))
+    for i in range(16):
+        mid = f"mid_{i}"
+        graph.add_node(Node(mid, 42.05, -72.0 + i * 0.01))
+        graph.add_edge(Edge(f"ea_{i}", "n0", mid, 10.0, 10.0))
+        graph.add_edge(Edge(f"eb_{i}", mid, "n3", 10.0, 10.0))
+
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    planner = ScenicRoutePlanner(graph=compact)
+    topology = planner._csr_topology()
+    assert topology is not None
+    cost_function = planner._make_fastest_cost_function()
+
+    result1 = run_compact_bidirectional_search(
+        topology,
+        cost_function,
+        [("n0", 0.0, (0, 0), None)],
+        [("n3", 0.0, (0, 0), None)],
+    )
+    result2 = run_compact_bidirectional_search(
+        topology,
+        cost_function,
+        [("n0", 0.0, (0, 0), None)],
+        [("n3", 0.0, (0, 0), None)],
+    )
+    assert result1 is not None
+    assert result2 is not None
+    assert result1 == result2
+    assert result1[1] == pytest.approx(24.0)
