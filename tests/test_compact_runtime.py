@@ -3727,3 +3727,740 @@ def test_compact_lagrangian_sequential_fallback(
 
     assert route is not None
     assert executed_threads == {threading.get_ident()}
+
+
+# ---------------------------------------------------------------------------
+# Shared multiplier-invariant base-cost sidecar
+# ---------------------------------------------------------------------------
+
+_BASE_COST_BITWISE_PROBE_C = r"""
+/* Test-only probe.  It includes the production compact source verbatim so
+ * the fill and the historical cost formula compile in this TU with the same
+ * -O3 codegen as the shipped library, then asserts bitwise per-traversal
+ * equivalence between the historical inline computation and the shared
+ * base-cost sidecar path across cost modes (scores, byway bonus, highway
+ * preference/penalty, strict highways), sidecar modes, and multipliers. */
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "__SOURCE_PATH__"
+
+#define T 8
+
+int main(void) {
+    static double travel_time[T] = {
+        0.1, 0.7, 1e6, -1.0, NAN, INFINITY, 0.0, 3.5
+    };
+    static const uint8_t highway_mask[T] = {0, 1, 0, 0, 1, 0, 1, 0};
+    static const uint8_t byway_mask[T] = {1, 0, 0, 1, 0, 1, 0, 0};
+    static const double scenic_score[T] = {
+        5.0, 2.0, 8.0, 15.0, -3.0, NAN, 10.0, 0.0
+    };
+    /* Canonical ranks permute the traversal order so the rank-indexed
+     * sidecar scoring is exercised on every traversal. */
+    static const int32_t edge_rank[T] = {1, 3, 2, 0, 1, 0, 3, 2};
+    static const double edge_scores[4] = {10.0, 2.0, 8.0, 2.0};
+    static const int64_t fwd_indptr[3] = {0, T, T};
+    static const int32_t fwd_indices[2] = {1, 1};
+    static const int64_t rev_indptr[3] = {0, T, T};
+    static const int32_t rev_indices[2] = {0, 0};
+    static const int64_t rev_positions[T] = {0, 1, 2, 3, 4, 5, 6, 7};
+    static const uint8_t trav_reverse[T] = {0};
+
+    const CompactGraphSpec g = {
+        .node_count = 2,
+        .edge_count = 4,
+        .traversal_count = T,
+        .forward_indptr = fwd_indptr,
+        .forward_indices = fwd_indices,
+        .reverse_indptr = rev_indptr,
+        .reverse_indices = rev_indices,
+        .reverse_positions = rev_positions,
+        .trav_travel_time = travel_time,
+        .trav_highway_mask = highway_mask,
+        .trav_scenic_score = scenic_score,
+        .trav_scenic_byway_mask = byway_mask,
+        .trav_edge_rank = edge_rank,
+        .trav_reverse = trav_reverse,
+        .edge_id_strings = NULL,
+        .edge_id_offsets = NULL,
+    };
+
+    static const double multipliers[] = {0.0, 0.25, 0.75, 1.5, -1.0};
+    static const double* sidecar_variants[2] = {NULL, edge_scores};
+
+    typedef struct {
+        double scenic_weight;
+        int strict_highways;
+        double highway_preference;
+        double travel_weight;
+        double scenic_reward;
+        double highway_penalty;
+        double scenic_byway_bonus;
+    } Mode;
+    static const Mode modes[] = {
+        /* identity fast path */
+        {0.0, 0, 0.0, 1.0, 0.0, 0.0, 0.0},
+        /* default scenic weights + byway bonus */
+        {0.8, 0, 0.0, 1.0, 1.0, 2.0, 1.0},
+        /* highway preference */
+        {0.5, 0, 0.5, 1.0, 1.0, 0.0, 0.0},
+        /* strict highways */
+        {0.8, 1, 0.0, 1.0, 1.0, 2.0, 1.0},
+        /* pure scenic (travel_weight 0.5) */
+        {1.0, 0, 0.0, 0.5, 0.5, 0.0, 0.0},
+        /* zero weights (1e-6 floor path) */
+        {0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    };
+
+    double buf[T];
+    unsigned checks = 0;
+    for (size_t mi = 0; mi < sizeof(modes) / sizeof(modes[0]); mi++) {
+        for (size_t si = 0; si < 2; si++) {
+            for (size_t xi = 0;
+                 xi < sizeof(multipliers) / sizeof(multipliers[0]);
+                 xi++) {
+                const CostSpec c = {
+                    .scenic_weight = modes[mi].scenic_weight,
+                    .strict_highways = modes[mi].strict_highways,
+                    .highway_preference = modes[mi].highway_preference,
+                    .travel_weight = modes[mi].travel_weight,
+                    .scenic_reward = modes[mi].scenic_reward,
+                    .highway_penalty = modes[mi].highway_penalty,
+                    .scenic_byway_bonus = modes[mi].scenic_byway_bonus,
+                    .lagrangian_multiplier = multipliers[xi],
+                    .cost_limit = 0.0,
+                };
+                const double* sidecar = sidecar_variants[si];
+                assert(
+                    compact_fill_base_costs(&g, &c, sidecar, buf, -1.0) == 0
+                );
+                for (int64_t pos = 0; pos < T; pos++) {
+                    bool inv_full = false;
+                    bool inv_side = false;
+                    bool inv_base = false;
+                    double full = compute_edge_cost(
+                        &g, &c, pos, sidecar, NULL, &inv_full
+                    );
+                    double side = compute_edge_cost(
+                        &g, &c, pos, NULL, buf, &inv_side
+                    );
+                    double base = compute_edge_base_cost(
+                        &g, &c, pos, sidecar, &inv_base
+                    );
+                    assert(inv_full == inv_side && inv_side == inv_base);
+                    assert(memcmp(&full, &side, sizeof(double)) == 0);
+                    assert(memcmp(&buf[pos], &base, sizeof(double)) == 0);
+                    checks++;
+                }
+            }
+        }
+    }
+    printf("BITWISE_OK checks=%u\n", checks);
+    return 0;
+}
+"""
+
+
+def test_compact_base_cost_fill_bitwise_matches_inline_native(
+    tmp_path: Path,
+) -> None:
+    """The multiplier-invariant fill must reproduce the historical cost
+    formula bitwise: for every cost mode (scores, byway, highway, strict),
+    sidecar mode, and multiplier, ``fill(base) + multiplier * duration`` is
+    byte-identical to the inline per-search computation, and the stored base
+    is byte-identical to the invariant formula computed inline.  The probe
+    compiles the production source with the same -O3 flags so FP codegen
+    cannot differ between the two paths."""
+    import subprocess
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "route_planner"
+        / "_compact_search_c.c"
+    )
+    assert source.exists()
+    probe_src = tmp_path / "base_cost_bitwise_probe.c"
+    probe_src.write_text(
+        _BASE_COST_BITWISE_PROBE_C.replace("__SOURCE_PATH__", str(source))
+    )
+    binary = tmp_path / "base_cost_bitwise_probe"
+    subprocess.run(
+        [
+            "clang",
+            "-O3",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-o",
+            str(binary),
+            str(probe_src),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    out = subprocess.run(
+        [str(binary)], check=True, capture_output=True, text=True
+    )
+    assert "BITWISE_OK checks=480" in out.stdout  # 6 modes x 2 x 5 x 8
+
+
+def _call_native_search_ranked_base_costs(
+    lib,
+    spec,
+    cost_spec,
+    base_costs,
+    fwd_seeds,
+    rev_seeds,
+    deadline_seconds: float = -1.0,
+):
+    """Direct ranked-base-costs entry call with (rank, cost, rank_primary,
+    rank_secondary) seed tuples plus the traversal-indexed base-cost array;
+    returns (rc, positions, out_cost, out_fwd_idx, out_rev_idx)."""
+    import ctypes as _ctypes
+
+    fwd_nodes = (_ctypes.c_int32 * len(fwd_seeds))()
+    fwd_costs = (_ctypes.c_double * len(fwd_seeds))()
+    fwd_primary = (_ctypes.c_int32 * len(fwd_seeds))()
+    fwd_secondary = (_ctypes.c_int32 * len(fwd_seeds))()
+    for i, (rank, cost, primary, secondary) in enumerate(fwd_seeds):
+        fwd_nodes[i] = int(rank)
+        fwd_costs[i] = float(cost)
+        fwd_primary[i] = int(primary)
+        fwd_secondary[i] = int(secondary)
+    rev_nodes = (_ctypes.c_int32 * len(rev_seeds))()
+    rev_costs = (_ctypes.c_double * len(rev_seeds))()
+    rev_primary = (_ctypes.c_int32 * len(rev_seeds))()
+    rev_secondary = (_ctypes.c_int32 * len(rev_seeds))()
+    for i, (rank, cost, primary, secondary) in enumerate(rev_seeds):
+        rev_nodes[i] = int(rank)
+        rev_costs[i] = float(cost)
+        rev_primary[i] = int(primary)
+        rev_secondary[i] = int(secondary)
+
+    out_pos_ptr = _ctypes.POINTER(_ctypes.c_int64)()
+    out_cost = _ctypes.c_double(0.0)
+    out_fwd = _ctypes.c_int32(-1)
+    out_rev = _ctypes.c_int32(-1)
+    rc = lib.compact_bidirectional_search_alloc_ranked_base_costs(
+        _ctypes.byref(spec),
+        _ctypes.byref(cost_spec),
+        base_costs,
+        fwd_nodes,
+        fwd_costs,
+        fwd_primary,
+        fwd_secondary,
+        len(fwd_seeds),
+        rev_nodes,
+        rev_costs,
+        rev_primary,
+        rev_secondary,
+        len(rev_seeds),
+        _ctypes.byref(out_pos_ptr),
+        _ctypes.byref(out_cost),
+        _ctypes.byref(out_fwd),
+        _ctypes.byref(out_rev),
+        float(deadline_seconds),
+    )
+    positions = None
+    if rc >= 0:
+        positions = [int(out_pos_ptr[i]) for i in range(rc)]
+        lib.compact_free_positions(out_pos_ptr)
+    return rc, positions, float(out_cost.value), int(out_fwd.value), int(
+        out_rev.value
+    )
+
+
+def test_compact_base_costs_search_parity_across_multipliers(
+    tmp_path: Path,
+) -> None:
+    """Searches fed the shared base-cost sidecar must return byte-identical
+    routes, total costs, and seed indices to the historical per-search
+    computation for every Lagrangian multiplier, including equal-cost tie
+    graphs where any per-edge difference would flip the route."""
+    from src.route_planner._compact_search import (
+        fill_compact_base_costs,
+        run_compact_bidirectional_search,
+    )
+
+    _native_library()  # skips when the compiled search is unavailable
+    for graph, start_node, end_node in (
+        (_diamond_graph(), "n0", "n3"),  # equal-cost tie
+        (_fixture_graph(), "n0", "n3"),
+    ):
+        _sqlite_path, manifest_path, _record = _publish_compact(
+            tmp_path, graph
+        )
+        compact = CompactRoadGraph.load(manifest_path)
+        planner = ScenicRoutePlanner(graph=compact)
+        topology = planner._csr_topology()
+        assert topology is not None
+        cost_function = planner._make_cost_function(0.8)
+        base = fill_compact_base_costs(topology, cost_function)
+        assert base is not None
+        assert len(base) == int(compact.traversal_count)
+        fwd = [(start_node, 0.0, (0, 0), None)]
+        rev = [(end_node, 0.0, (0, 0), None)]
+        for multiplier in (0.0, 0.25, 0.75, 1.5):
+            plain = run_compact_bidirectional_search(
+                topology,
+                cost_function,
+                fwd,
+                rev,
+                lagrangian_multiplier=multiplier,
+            )
+            shared = run_compact_bidirectional_search(
+                topology,
+                cost_function,
+                fwd,
+                rev,
+                lagrangian_multiplier=multiplier,
+                base_costs=base,
+            )
+            assert plain is not None and shared is not None
+            assert shared[0] == plain[0]  # positions, tie order included
+            assert shared[1] == plain[1]  # bitwise total-cost equality
+            assert (shared[2], shared[3]) == (plain[2], plain[3])
+
+
+def test_compact_base_costs_sidecar_active_search_parity(
+    tmp_path: Path,
+) -> None:
+    """With an active edge-score sidecar the fill merges the rank-indexed
+    scores into the base array, and the shared sidecar search must still pick
+    the same route and cost as the historical sidecar search at every
+    multiplier."""
+    import ctypes as _ctypes
+
+    import numpy as np
+
+    from src.route_planner._compact_search import (
+        fill_compact_base_costs,
+        run_compact_bidirectional_search,
+    )
+
+    _native_library()
+    graph = _rank_permutation_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    scores = {"e0": 10.0, "e1": 2.0, "e2": 8.0, "e3": 2.0}
+    report_path, _tiles = _tile_report(tmp_path, graph, scores)
+    score_map, _zoom = load_tile_scores(report_path)
+    compact = CompactRoadGraph.load(manifest_path)
+    report_signature = _signature_digest(
+        _resolved_path_key(report_path), _file_signature(report_path)
+    )
+    matched, total = compact.activate_report_scores(
+        score_map,
+        zoom=14,
+        fallback=None,
+        report_signature=report_signature,
+        normalization="linear-v1",
+        tile_scores_path=report_path,
+    )
+    assert (matched, total) == (4, 4)
+    sidecar = compact._active_score_sidecar
+    assert sidecar is not None
+    assert list(np.asarray(sidecar.values)) == pytest.approx(
+        [10.0, 2.0, 8.0, 2.0]
+    )
+
+    planner = ScenicRoutePlanner(graph=compact)
+    topology = planner._csr_topology()
+    assert topology is not None
+    cost_function = planner._make_cost_function(0.8)
+    base = fill_compact_base_costs(topology, cost_function)
+    assert base is not None
+    fwd = [("n0", 0.0, (0, 0), None)]
+    rev = [("n1", 0.0, (0, 0), None)]
+
+    plain = run_compact_bidirectional_search(
+        topology, cost_function, fwd, rev
+    )
+    shared = run_compact_bidirectional_search(
+        topology, cost_function, fwd, rev, base_costs=base
+    )
+    assert plain is not None and shared is not None
+    assert [topology.edge_refs[p][0] for p in shared[0]] == ["e3", "e0"]
+    assert shared[0] == plain[0]
+    assert shared[1] == plain[1] == pytest.approx(1.04)
+    for multiplier in (0.25, 0.75, 1.5):
+        plain_m = run_compact_bidirectional_search(
+            topology,
+            cost_function,
+            fwd,
+            rev,
+            lagrangian_multiplier=multiplier,
+        )
+        shared_m = run_compact_bidirectional_search(
+            topology,
+            cost_function,
+            fwd,
+            rev,
+            lagrangian_multiplier=multiplier,
+            base_costs=base,
+        )
+        assert plain_m is not None and shared_m is not None
+        assert shared_m[0] == plain_m[0]
+        assert shared_m[1] == plain_m[1]
+
+
+def test_compact_lagrangian_shares_one_fill_and_readonly_buffer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The four Lagrangian workers must share one request-local base-cost
+    buffer computed exactly once before submission, and none of the workers
+    may mutate it."""
+    import gc
+    import weakref
+
+    import numpy as np
+
+    import src.route_planner.planner as planner_module
+
+    graph = _fixture_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+
+    monkeypatch.setattr(ScenicRoutePlanner, "_ENDPOINT_OVERLAY_MAX_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_LARGE_GRAPH_EDGE_THRESHOLD", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_COMPILED_SCENIC_MIN_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_NODES", 0)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_EDGES", 0)
+
+    fill_results: list[object] = []
+    search_base_costs: list[object] = []
+    orig_fill = planner_module.fill_compact_base_costs
+    orig_search = planner_module.run_compact_bidirectional_search
+
+    def counting_fill(*args: object, **kwargs: object) -> object:
+        buf = orig_fill(*args, **kwargs)
+        fill_results.append(buf)
+        return buf
+
+    def recording_search(*args: object, **kwargs: object) -> object:
+        search_base_costs.append(kwargs.get("base_costs"))
+        return orig_search(*args, **kwargs)
+
+    monkeypatch.setattr(
+        planner_module, "fill_compact_base_costs", counting_fill
+    )
+    monkeypatch.setattr(
+        planner_module, "run_compact_bidirectional_search", recording_search
+    )
+
+    planner = ScenicRoutePlanner(graph=compact)
+    route = planner.find_scenic_route(
+        (42.0, -72.0), (42.1, -72.1), scenic_weight=0.8
+    )
+    assert route is not None
+
+    assert len(fill_results) == 1
+    buf = fill_results[0]
+    assert buf is not None
+    assert len(buf) == int(compact.traversal_count)
+    assert not buf.flags.writeable  # workers must never mutate the shared buf
+    snapshot = np.array(buf, copy=True)
+    shared = [bc for bc in search_base_costs if bc is not None]
+    assert len(shared) == 4  # exactly the four Lagrangian searches
+    assert all(bc is buf for bc in shared)
+    assert np.array_equal(buf, snapshot)
+
+    # The request-local buffer is released once the search scope ends.
+    ref = weakref.ref(buf)
+    del buf, snapshot, shared, fill_results, search_base_costs
+    gc.collect()
+    assert ref() is None
+
+
+def test_compact_lagrangian_falls_back_when_fill_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed fill (allocation/generic) must fall back to the historical
+    per-multiplier native computation instead of searching partial values."""
+    import src.route_planner.planner as planner_module
+
+    graph = _fixture_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+
+    monkeypatch.setattr(ScenicRoutePlanner, "_ENDPOINT_OVERLAY_MAX_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_LARGE_GRAPH_EDGE_THRESHOLD", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_COMPILED_SCENIC_MIN_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_NODES", 0)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_EDGES", 0)
+
+    calls: list[tuple[float, object]] = []
+    orig_search = planner_module.run_compact_bidirectional_search
+
+    def recording_search(*args: object, **kwargs: object) -> object:
+        calls.append(
+            (
+                float(kwargs.get("lagrangian_multiplier", 0.0)),
+                kwargs.get("base_costs"),
+            )
+        )
+        return orig_search(*args, **kwargs)
+
+    monkeypatch.setattr(
+        planner_module,
+        "fill_compact_base_costs",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        planner_module, "run_compact_bidirectional_search", recording_search
+    )
+
+    planner = ScenicRoutePlanner(graph=compact)
+    route = planner.find_scenic_route(
+        (42.0, -72.0), (42.1, -72.1), scenic_weight=0.8
+    )
+    assert route is not None
+    # One baseline fastest search plus the four Lagrangian searches, all
+    # running the historical per-search computation without the sidecar.
+    assert len(calls) == 5
+    assert all(bc is None for _m, bc in calls)
+
+
+def test_compact_native_base_cost_fill_fails_closed(tmp_path: Path) -> None:
+    """Malformed canonical ranks, NULL inputs, and an exhausted deadline must
+    fail closed with -1/-2 before the buffer is ever searchable; a short or
+    wrong-typed Python buffer is rejected by the wrapper."""
+    import ctypes as _ctypes
+
+    import numpy as np
+
+    lib = _native_library()
+    graph = _rank_permutation_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    arrays = dict(compact._sections)
+    edge_count = int(compact.edge_count)
+    spec = _native_graph_spec(compact, arrays)
+    cost_spec = _scenic_cost_spec()
+    buf = np.zeros(int(compact.traversal_count), dtype=np.float64)
+    buf_ptr = buf.ctypes.data_as(_ctypes.POINTER(_ctypes.c_double))
+
+    rc = lib.compact_fill_base_costs(
+        _ctypes.byref(spec), _ctypes.byref(cost_spec), None, buf_ptr, -1.0
+    )
+    assert rc == 0
+
+    # Rank at or above edge_count: fail closed, nothing to search.
+    bad_upper = np.array(
+        arrays["trav_edge_rank"], dtype=np.int32, copy=True
+    )
+    bad_upper[0] = edge_count
+    arrays_upper = dict(arrays)
+    arrays_upper["trav_edge_rank"] = bad_upper
+    rc = lib.compact_fill_base_costs(
+        _ctypes.byref(_native_graph_spec(compact, arrays_upper)),
+        _ctypes.byref(cost_spec),
+        None,
+        buf_ptr,
+        -1.0,
+    )
+    assert rc == -1
+
+    # Negative rank: fail closed.
+    bad_neg = np.array(arrays["trav_edge_rank"], dtype=np.int32, copy=True)
+    bad_neg[1] = -1
+    arrays_neg = dict(arrays)
+    arrays_neg["trav_edge_rank"] = bad_neg
+    rc = lib.compact_fill_base_costs(
+        _ctypes.byref(_native_graph_spec(compact, arrays_neg)),
+        _ctypes.byref(cost_spec),
+        None,
+        buf_ptr,
+        -1.0,
+    )
+    assert rc == -1
+
+    # Missing rank table cannot be indexed.
+    arrays_no_rank = {
+        name: value
+        for name, value in arrays.items()
+        if name != "trav_edge_rank"
+    }
+    rc = lib.compact_fill_base_costs(
+        _ctypes.byref(_native_graph_spec(compact, arrays_no_rank)),
+        _ctypes.byref(cost_spec),
+        None,
+        buf_ptr,
+        -1.0,
+    )
+    assert rc == -1
+
+    # NULL spec / NULL buffer fail closed.
+    rc = lib.compact_fill_base_costs(
+        None, _ctypes.byref(cost_spec), None, buf_ptr, -1.0
+    )
+    assert rc == -1
+    rc = lib.compact_fill_base_costs(
+        _ctypes.byref(spec), _ctypes.byref(cost_spec), None, None, -1.0
+    )
+    assert rc == -1
+
+    # An exhausted deadline surfaces as -2, never partial output.
+    rc = lib.compact_fill_base_costs(
+        _ctypes.byref(spec), _ctypes.byref(cost_spec), None, buf_ptr, 0.0
+    )
+    assert rc == -2
+
+    # The base-costs search entry routes a valid sidecar to a real route and
+    # rejects a sidecar with malformed ranks up front.
+    fwd = [(0, 0.0, 0, 0)]
+    rev = [(1, 0.0, 0, 0)]
+    rc, positions, _cost, _fi, _ri = _call_native_search_ranked_base_costs(
+        lib, spec, cost_spec, buf_ptr, fwd, rev
+    )
+    assert rc >= 0 and positions is not None
+    rc, positions, _cost, _fi, _ri = _call_native_search_ranked_base_costs(
+        lib,
+        _native_graph_spec(compact, arrays_upper),
+        cost_spec,
+        buf_ptr,
+        fwd,
+        rev,
+    )
+    assert rc == -1 and positions is None
+
+    # Wrapper-level fail-closed buffer validation: short or non-f64 buffers
+    # are never handed to the native search.
+    from src.route_planner._compact_search import (
+        run_compact_bidirectional_search,
+    )
+
+    planner = ScenicRoutePlanner(graph=compact)
+    topology = planner._csr_topology()
+    assert topology is not None
+    cost_function = planner._make_cost_function(0.8)
+    fwd_py = [("n0", 0.0, (0, 0), None)]
+    rev_py = [("n1", 0.0, (0, 0), None)]
+    short = np.zeros(int(compact.traversal_count) - 1, dtype=np.float64)
+    assert (
+        run_compact_bidirectional_search(
+            topology,
+            cost_function,
+            fwd_py,
+            rev_py,
+            base_costs=short,
+        )
+        is None
+    )
+    wrong = np.zeros(int(compact.traversal_count), dtype=np.float32)
+    assert (
+        run_compact_bidirectional_search(
+            topology,
+            cost_function,
+            fwd_py,
+            rev_py,
+            base_costs=wrong,
+        )
+        is None
+    )
+
+
+def test_compact_base_cost_fill_deadline_memory_and_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exhausted deadline during the fill raises RoutingTimeout (matching
+    the per-search deadline contract), an allocation failure returns None for
+    the sequential fallback, and a successful buffer is released by GC."""
+    import gc
+    import weakref
+
+    import numpy as np
+
+    from src.route_planner._compact_search import (
+        fill_compact_base_costs,
+    )
+
+    _native_library()
+    graph = _fixture_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    planner = ScenicRoutePlanner(graph=compact)
+    topology = planner._csr_topology()
+    assert topology is not None
+    cost_function = planner._make_cost_function(0.8)
+
+    with pytest.raises(RoutingTimeout):
+        fill_compact_base_costs(
+            topology, cost_function, deadline_seconds=0.0
+        )
+
+    real_empty = np.empty
+
+    def failing_empty(*args: object, **kwargs: object) -> object:
+        raise MemoryError("simulated allocation failure")
+
+    monkeypatch.setattr(np, "empty", failing_empty)
+    assert fill_compact_base_costs(topology, cost_function) is None
+    monkeypatch.setattr(np, "empty", real_empty)
+
+    buf = fill_compact_base_costs(topology, cost_function)
+    assert buf is not None
+    ref = weakref.ref(buf)
+    del buf
+    gc.collect()
+    assert ref() is None
+
+
+def test_compact_base_costs_two_worker_sharing_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """Two concurrent searches sharing one read-only buffer must return the
+    same routes as the serial searches and leave the buffer byte-identical."""
+    import concurrent.futures
+
+    import numpy as np
+
+    from src.route_planner._compact_search import (
+        fill_compact_base_costs,
+        run_compact_bidirectional_search,
+    )
+
+    _native_library()
+    graph = _diamond_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    planner = ScenicRoutePlanner(graph=compact)
+    topology = planner._csr_topology()
+    assert topology is not None
+    cost_function = planner._make_cost_function(0.8)
+    base = fill_compact_base_costs(topology, cost_function)
+    assert base is not None
+    snapshot = np.array(base, copy=True)
+    fwd = [("n0", 0.0, (0, 0), None)]
+    rev = [("n3", 0.0, (0, 0), None)]
+
+    def run(multiplier: float):
+        return run_compact_bidirectional_search(
+            topology,
+            cost_function,
+            fwd,
+            rev,
+            lagrangian_multiplier=multiplier,
+            base_costs=base,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(run, m) for m in (0.25, 0.75)]
+        results = [future.result() for future in futures]
+    assert all(result is not None for result in results)
+    for multiplier, result in zip((0.25, 0.75), results):
+        serial = run_compact_bidirectional_search(
+            topology,
+            cost_function,
+            fwd,
+            rev,
+            lagrangian_multiplier=multiplier,
+        )
+        assert serial is not None
+        assert result[0] == serial[0]
+        assert result[1] == serial[1]
+    assert np.array_equal(base, snapshot)

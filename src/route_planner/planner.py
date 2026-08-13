@@ -18,7 +18,11 @@ from scipy.sparse import csr_matrix as _scipy_csr_matrix
 from scipy.sparse.csgraph import dijkstra as _scipy_dijkstra
 from scipy.sparse.csgraph import shortest_path as _scipy_shortest_path
 
-from ._compact_search import compact_search_available, run_compact_bidirectional_search
+from ._compact_search import (
+    compact_search_available,
+    fill_compact_base_costs,
+    run_compact_bidirectional_search,
+)
 from .cancellation import RoutingDeadline, RoutingTimeout
 from .cost import (
     CostWeights,
@@ -1681,6 +1685,7 @@ class ScenicRoutePlanner:
         local_cost_override: Optional[Callable[[Edge], float]] = None,
         cost_limit: Optional[float] = None,
         lagrangian_multiplier: float = 0.0,
+        base_costs: Optional[Any] = None,
     ) -> Optional[Tuple[List[Edge], Tuple[object, ...]]]:
         """Shared ranked bidirectional search over compact CSR and local edges.
 
@@ -1688,6 +1693,10 @@ class ScenicRoutePlanner:
         E-sized temporary weight array; ``local_cost_override`` supplies
         request-local (endpoint) edge costs; ``cost_limit`` prunes every label
         whose partial cost already exceeds the bound (weights are nonnegative).
+        ``base_costs`` is the request-local multiplier-invariant traversal
+        base-cost sidecar precomputed by ``fill_compact_base_costs`` before
+        the four Lagrangian workers are submitted; it is read-only and shared
+        across the workers, and is only honored on the compact native path.
         """
         graph = self.graph
         assert graph is not None
@@ -1715,6 +1724,7 @@ class ScenicRoutePlanner:
                 lagrangian_multiplier=lagrangian_multiplier,
                 cost_limit=cost_limit,
                 deadline_seconds=_active_deadline_remaining_seconds(),
+                base_costs=base_costs,
             )
             if c_res is not None:
                 positions, total_cost, fwd_idx, rev_idx = c_res
@@ -5073,7 +5083,11 @@ class ScenicRoutePlanner:
         Lagrangian multipliers are applied per traversal position without an
         E-sized weight copy, and every search is bounded by the fastest-path
         scalar cost limit, so request memory stays proportional to the
-        explored labels rather than the full edge count.
+        explored labels rather than the full edge count.  On the native path
+        the multiplier-invariant traversal base cost is computed once by
+        ``fill_compact_base_costs`` and shared read-only by the four workers;
+        the single request-local f64 buffer (~8 bytes per traversal) is
+        released with this method's scope.
         """
         started_at = time.monotonic()
         search_scenic_weight = 1.0 if policy.scenic_priority else q
@@ -5126,6 +5140,7 @@ class ScenicRoutePlanner:
 
         def _search_multiplier(
             multiplier: float,
+            base_costs: Optional[Any] = None,
         ) -> Optional[Tuple[List[Edge], PathEvaluation]]:
             check_graph()
 
@@ -5163,6 +5178,7 @@ class ScenicRoutePlanner:
                 local_cost_override=scalar_edge_cost if not isinstance(base, CompactRoadGraph) else None,
                 cost_limit=scalar_cost_limit,
                 lagrangian_multiplier=multiplier if isinstance(base, CompactRoadGraph) else 0.0,
+                base_costs=base_costs if isinstance(base, CompactRoadGraph) else None,
             )
             check_graph()
             if result is None:
@@ -5203,6 +5219,25 @@ class ScenicRoutePlanner:
             and compact_search_available()
         )
 
+        # The four multiplier searches share one scenic CostSpec that differs
+        # only in ``lagrangian_multiplier``, so the multiplier-invariant
+        # traversal base cost is computed once here, before any worker is
+        # submitted, and shared read-only.  The request-local buffer lives for
+        # the whole method (closure of the workers) and is released on
+        # success, error, and deadline alike; on fill failure (allocation or
+        # generic) the search falls back to the historical per-multiplier
+        # native computation, and an exhausted deadline during the fill
+        # surfaces as RoutingTimeout like any exhausted native deadline.
+        base_costs = None
+        if is_native_eligible:
+            base_costs = fill_compact_base_costs(
+                topology,
+                scenic_cost,
+                deadline_seconds=_active_deadline_remaining_seconds(),
+            )
+            if base_costs is None:
+                is_native_eligible = False
+
         if is_native_eligible:
             results: List[Optional[Tuple[List[Edge], PathEvaluation]]] = [
                 None
@@ -5211,7 +5246,7 @@ class ScenicRoutePlanner:
             def _worker(
                 idx: int, m: float
             ) -> Tuple[int, Optional[Tuple[List[Edge], PathEvaluation]]]:
-                return idx, _search_multiplier(m)
+                return idx, _search_multiplier(m, base_costs)
 
             with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [

@@ -427,12 +427,10 @@ static inline void state_set(
     ds->path_id[rank] = path_id;
 }
 
-static bool validate_edge_score_sidecar(
-    const CompactGraphSpec* graph,
-    const double* edge_scenic_score_by_rank
-) {
-    if (!graph || !edge_scenic_score_by_rank) return false;
-    if (graph->edge_count < 0 || graph->traversal_count < 0) return false;
+static bool validate_traversal_ranks(const CompactGraphSpec* graph) {
+    if (!graph || graph->edge_count < 0 || graph->traversal_count < 0) {
+        return false;
+    }
     if (graph->traversal_count > 0 && !graph->trav_edge_rank) return false;
     for (int64_t pos = 0; pos < graph->traversal_count; pos++) {
         int32_t edge_rank = graph->trav_edge_rank[pos];
@@ -443,7 +441,18 @@ static bool validate_edge_score_sidecar(
     return true;
 }
 
-static inline double compute_edge_cost(
+static bool validate_edge_score_sidecar(
+    const CompactGraphSpec* graph,
+    const double* edge_scenic_score_by_rank
+) {
+    if (!graph || !edge_scenic_score_by_rank) return false;
+    return validate_traversal_ranks(graph);
+}
+
+/* Compute the multiplier-invariant portion of one traversal cost.  Keep the
+ * arithmetic and branch order identical to the historical compute_edge_cost:
+ * the only operation removed is the final multiplier addition. */
+static inline double compute_edge_base_cost(
     const CompactGraphSpec* g,
     const CostSpec* c,
     int64_t pos,
@@ -472,11 +481,7 @@ static inline double compute_edge_cost(
     if (c->scenic_weight == 0.0 && c->highway_preference == 0.0 &&
         c->travel_weight == 1.0 && c->scenic_reward == 0.0 &&
         c->highway_penalty == 0.0 && c->scenic_byway_bonus == 0.0) {
-        double cost = duration;
-        if (c->lagrangian_multiplier > 0.0) {
-            cost += c->lagrangian_multiplier * duration;
-        }
-        return cost;
+        return duration;
     }
 
     double raw_score = edge_scenic_score_by_rank
@@ -506,7 +511,37 @@ static inline double compute_edge_cost(
     double cost = base + adjustment;
     if (cost < 1e-6) cost = 1e-6;
     if (!isfinite(cost)) cost = 1e-6;
+    return cost;
+}
 
+static inline double compute_edge_cost(
+    const CompactGraphSpec* g,
+    const CostSpec* c,
+    int64_t pos,
+    const double* edge_scenic_score_by_rank,
+    const double* base_cost_by_traversal,
+    bool* invalid_edge_rank
+) {
+    *invalid_edge_rank = false;
+    double base;
+    if (base_cost_by_traversal) {
+        if (!g->trav_edge_rank ||
+            g->trav_edge_rank[pos] < 0 ||
+            (int64_t)g->trav_edge_rank[pos] >= g->edge_count) {
+            *invalid_edge_rank = true;
+            return INFINITY;
+        }
+        base = base_cost_by_traversal[pos];
+        if (!isfinite(base)) return INFINITY;
+    } else {
+        base = compute_edge_base_cost(
+            g, c, pos, edge_scenic_score_by_rank, invalid_edge_rank
+        );
+        if (*invalid_edge_rank || !isfinite(base)) return base;
+    }
+    double duration = g->trav_travel_time[pos];
+    if (duration < 0.0 || !isfinite(duration)) return INFINITY;
+    double cost = base;
     if (c->lagrangian_multiplier > 0.0) {
         cost += c->lagrangian_multiplier * duration;
     }
@@ -530,6 +565,53 @@ static inline bool deadline_exceeded(double deadline_seconds, struct timespec st
     double elapsed = (double)(now.tv_sec - started.tv_sec)
         + (double)(now.tv_nsec - started.tv_nsec) / 1000000000.0;
     return elapsed >= deadline_seconds;
+}
+
+/* Fill one request-local traversal sidecar before worker submission.  Rank
+ * validation is deliberately before the first output write so malformed
+ * canonical metadata cannot lead to a partial sidecar being searched.  The
+ * fill computes the exact multiplier-invariant cost formula (the same C
+ * expression as compute_edge_cost with the final multiplier addition
+ * removed); each search then performs only the original conditional
+ * ``base + multiplier * duration``.  The buffer is caller-owned and only
+ * written when validation and the deadline check pass, so a failure never
+ * leaves a partially filled array that could be searched. */
+int32_t compact_fill_base_costs(
+    const CompactGraphSpec* graph,
+    const CostSpec* cost_spec,
+    const double* edge_scenic_score_by_rank,
+    double* out_base_costs,
+    double deadline_seconds
+) {
+    if (!graph || !cost_spec || !out_base_costs ||
+        graph->traversal_count < 0 ||
+        graph->edge_count < 0 ||
+        !validate_traversal_ranks(graph)) {
+        return -1;
+    }
+    if (edge_scenic_score_by_rank &&
+        !validate_edge_score_sidecar(graph, edge_scenic_score_by_rank)) {
+        return -1;
+    }
+    struct timespec started_clock;
+    if (clock_gettime(CLOCK_MONOTONIC, &started_clock) != 0) {
+        started_clock.tv_sec = 0;
+        started_clock.tv_nsec = 0;
+    }
+    for (int64_t pos = 0; pos < graph->traversal_count; pos++) {
+        if ((pos & 1023) == 0 &&
+            deadline_exceeded(deadline_seconds, started_clock)) {
+            return -2;
+        }
+        bool invalid_edge_rank = false;
+        double base = compute_edge_base_cost(
+            graph, cost_spec, pos, edge_scenic_score_by_rank,
+            &invalid_edge_rank
+        );
+        if (invalid_edge_rank) return -1;
+        out_base_costs[pos] = base;
+    }
+    return 0;
 }
 
 /* ---- ranked-search ordering helpers ------------------------------------ */
@@ -964,6 +1046,7 @@ static int32_t compact_search_impl(
     const CompactGraphSpec* graph,
     const CostSpec* cost_spec,
     const double* edge_scenic_score_by_rank,
+    const double* base_cost_by_traversal,
     const int32_t* fwd_seed_nodes,
     const double* fwd_seed_costs,
     const int32_t* fwd_seed_rank_primary,
@@ -989,8 +1072,17 @@ static int32_t compact_search_impl(
     if (graph->node_count <= 0 || graph->node_count > (int64_t)INT32_MAX) {
         return -1;
     }
+    /* The multiplier-invariant base-cost sidecar and the per-rank scenic
+     * sidecar are mutually exclusive inputs: the fill merges scenic scores
+     * into the base array, so a caller must never supply both. */
+    if (edge_scenic_score_by_rank && base_cost_by_traversal) {
+        return -1;
+    }
     if (edge_scenic_score_by_rank &&
         !validate_edge_score_sidecar(graph, edge_scenic_score_by_rank)) {
+        return -1;
+    }
+    if (base_cost_by_traversal && !validate_traversal_ranks(graph)) {
         return -1;
     }
     if (fwd_seed_count < 0 || rev_seed_count < 0) return -1;
@@ -1148,7 +1240,7 @@ static int32_t compact_search_impl(
                 bool invalid_edge_rank = false;
                 double w = compute_edge_cost(
                     graph, cost_spec, pos, edge_scenic_score_by_rank,
-                    &invalid_edge_rank
+                    base_cost_by_traversal, &invalid_edge_rank
                 );
                 if (invalid_edge_rank) goto cleanup;
                 if (!isfinite(w)) continue;
@@ -1222,7 +1314,7 @@ static int32_t compact_search_impl(
                 bool invalid_edge_rank = false;
                 double w = compute_edge_cost(
                     graph, cost_spec, pos, edge_scenic_score_by_rank,
-                    &invalid_edge_rank
+                    base_cost_by_traversal, &invalid_edge_rank
                 );
                 if (invalid_edge_rank) goto cleanup;
                 if (!isfinite(w)) continue;
@@ -1429,6 +1521,7 @@ int32_t compact_bidirectional_search_alloc(
         graph,
         cost_spec,
         NULL,
+        NULL,
         fwd_seed_nodes,
         fwd_seed_costs,
         NULL,
@@ -1475,6 +1568,7 @@ int32_t compact_bidirectional_search_alloc_ranked(
     return compact_search_impl(
         graph,
         cost_spec,
+        NULL,
         NULL,
         fwd_seed_nodes,
         fwd_seed_costs,
@@ -1529,6 +1623,64 @@ int32_t compact_bidirectional_search_alloc_ranked_edge_scores(
         graph,
         cost_spec,
         edge_scenic_score_by_rank,
+        NULL,
+        fwd_seed_nodes,
+        fwd_seed_costs,
+        fwd_seed_rank_primary,
+        fwd_seed_rank_secondary,
+        fwd_seed_count,
+        rev_seed_nodes,
+        rev_seed_costs,
+        rev_seed_rank_primary,
+        rev_seed_rank_secondary,
+        rev_seed_count,
+        out_trav_positions,
+        out_total_cost,
+        out_fwd_seed_index,
+        out_rev_seed_index,
+        deadline_seconds
+    );
+}
+
+/* Multiplier-invariant base-cost sidecar ABI entry: identical to
+ * compact_bidirectional_search_alloc_ranked plus the traversal-indexed
+ * ``base_cost_by_traversal`` array produced by compact_fill_base_costs.
+ * The sidecar is request-local and read-only; every search adds only the
+ * original conditional ``base + lagrangian_multiplier * duration`` so the
+ * FP operation order matches the historical per-search computation exactly
+ * (the base bits were computed by the identical formula, minus the final
+ * multiplier addition).  Passing both this sidecar and the per-rank scenic
+ * score array fails with -1.  All traversal ranks are validated up front
+ * (fail-closed before search allocation) and again at every cost
+ * evaluation.
+ *
+ * Negative returns: -1 generic failure (including malformed ranks),
+ * -2 deadline exceeded. */
+int32_t compact_bidirectional_search_alloc_ranked_base_costs(
+    const CompactGraphSpec* graph,
+    const CostSpec* cost_spec,
+    const double* base_cost_by_traversal,
+    const int32_t* fwd_seed_nodes,
+    const double* fwd_seed_costs,
+    const int32_t* fwd_seed_rank_primary,
+    const int32_t* fwd_seed_rank_secondary,
+    int32_t fwd_seed_count,
+    const int32_t* rev_seed_nodes,
+    const double* rev_seed_costs,
+    const int32_t* rev_seed_rank_primary,
+    const int32_t* rev_seed_rank_secondary,
+    int32_t rev_seed_count,
+    int64_t** out_trav_positions,
+    double* out_total_cost,
+    int32_t* out_fwd_seed_index,
+    int32_t* out_rev_seed_index,
+    double deadline_seconds
+) {
+    return compact_search_impl(
+        graph,
+        cost_spec,
+        NULL,
+        base_cost_by_traversal,
         fwd_seed_nodes,
         fwd_seed_costs,
         fwd_seed_rank_primary,

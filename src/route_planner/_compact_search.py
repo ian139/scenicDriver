@@ -110,6 +110,26 @@ def _ensure_compiled_library() -> Optional[ctypes.CDLL]:
             + ranked_argtypes[2:]
         )
         lib.compact_bidirectional_search_alloc_ranked_edge_scores.restype = ctypes.c_int32
+        # The multiplier-invariant base-cost sidecar entry adds the
+        # traversal-indexed base array right after the cost spec, exactly
+        # like the edge-score sidecar entry.  It is selected only when the
+        # planner precomputes the invariant base costs before worker
+        # submission; the ranked and legacy entries keep their historical
+        # contract.
+        lib.compact_bidirectional_search_alloc_ranked_base_costs.argtypes = (
+            [ctypes.POINTER(_CompactGraphSpec), ctypes.POINTER(_CostSpec)]
+            + [ctypes.POINTER(ctypes.c_double)]
+            + ranked_argtypes[2:]
+        )
+        lib.compact_bidirectional_search_alloc_ranked_base_costs.restype = ctypes.c_int32
+        lib.compact_fill_base_costs.argtypes = [
+            ctypes.POINTER(_CompactGraphSpec),
+            ctypes.POINTER(_CostSpec),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_double,
+        ]
+        lib.compact_fill_base_costs.restype = ctypes.c_int32
         lib.compact_bidirectional_search_alloc.argtypes = [
             ctypes.POINTER(_CompactGraphSpec),
             ctypes.POINTER(_CostSpec),
@@ -140,16 +160,24 @@ def compact_search_available() -> bool:
     return _ensure_compiled_library() is not None
 
 
-def run_compact_bidirectional_search(
+def _compact_request(
     topology: Any,
     cost_function: Any,
-    forward_seeds: List[Tuple[str, float, Tuple[object, ...], Any]],
-    reverse_seeds: List[Tuple[str, float, Tuple[object, ...], Any]],
-    *,
-    lagrangian_multiplier: float = 0.0,
-    cost_limit: Optional[float] = None,
-    deadline_seconds: Optional[float] = None,
-) -> Optional[Tuple[List[int], float, int, int]]:
+    lagrangian_multiplier: float,
+    cost_limit: Optional[float],
+    deadline_seconds: Optional[float],
+) -> Optional[
+    Tuple[ctypes.CDLL, _CompactGraphSpec, _CostSpec, Any, float]
+]:
+    """Build the graph/cost specs shared by every compiled entry.
+
+    Returns ``(lib, spec, cost_spec, edge_scenic_score_by_rank,
+    native_deadline_seconds)`` or None when the graph cannot be served by
+    the compiled search.  The edge-score sidecar pointer is canonical-edge-
+    rank-indexed and is only produced when the active CompactRoadGraph
+    carries a score sidecar; both the fill and the per-search entries read
+    it through ``trav_edge_rank`` without any remap or E-sized copy.
+    """
     lib = _ensure_compiled_library()
     if lib is None:
         return None
@@ -276,6 +304,91 @@ def run_compact_bidirectional_search(
         lagrangian_multiplier=float(lagrangian_multiplier),
         cost_limit=float(cost_limit) if cost_limit is not None else 0.0,
     )
+    return lib, spec, cost_spec, edge_scenic_score_by_rank, native_deadline_seconds
+
+
+def fill_compact_base_costs(
+    topology: Any,
+    cost_function: Any,
+    *,
+    deadline_seconds: Optional[float] = None,
+) -> Optional[Any]:
+    """Compute the multiplier-invariant traversal base costs exactly once.
+
+    The four compact Lagrangian searches share one scenic CostSpec that
+    differs only in ``lagrangian_multiplier``; this fill runs before worker
+    submission and returns a request-local, read-only numpy f64 array of the
+    invariant base costs, so each search performs only the original
+    conditional ``base + multiplier * duration``.  The native fill uses the
+    exact same C formula and FP operation order as the historical
+    per-search cost evaluation (minus the final multiplier addition), and
+    validates canonical edge ranks fail-closed before writing.
+
+    Returns the array, or None when the compiled fill is unavailable or the
+    graph cannot be served (callers then fall back to per-search
+    computation); raises RoutingTimeout when the active deadline is
+    exhausted inside the fill.  On any failure the array is never partially
+    exposed: a failing native call leaves the buffer unwritten and it is
+    released with the caller's scope.
+    """
+    lib = _ensure_compiled_library()
+    if lib is None or not hasattr(lib, "compact_fill_base_costs"):
+        return None
+    built = _compact_request(
+        topology, cost_function, 0.0, None, deadline_seconds
+    )
+    if built is None:
+        return None
+    lib, spec, cost_spec, edge_scenic_score_by_rank, native_deadline = built
+    traversal_count = int(spec.traversal_count)
+    if traversal_count <= 0:
+        return None
+    try:
+        import numpy as _np
+
+        buf = _np.empty(traversal_count, dtype=_np.float64)
+    except (ImportError, MemoryError):
+        return None
+    rc = lib.compact_fill_base_costs(
+        ctypes.byref(spec),
+        ctypes.byref(cost_spec),
+        edge_scenic_score_by_rank,
+        buf.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        native_deadline,
+    )
+    if rc == -2:
+        raise RoutingTimeout(
+            "compiled compact base-cost fill deadline exceeded"
+        )
+    if rc != 0:
+        return None
+    buf.setflags(write=False)
+    return buf
+
+
+def run_compact_bidirectional_search(
+    topology: Any,
+    cost_function: Any,
+    forward_seeds: List[Tuple[str, float, Tuple[object, ...], Any]],
+    reverse_seeds: List[Tuple[str, float, Tuple[object, ...], Any]],
+    *,
+    lagrangian_multiplier: float = 0.0,
+    cost_limit: Optional[float] = None,
+    deadline_seconds: Optional[float] = None,
+    base_costs: Optional[Any] = None,
+) -> Optional[Tuple[List[int], float, int, int]]:
+    built = _compact_request(
+        topology,
+        cost_function,
+        lagrangian_multiplier,
+        cost_limit,
+        deadline_seconds,
+    )
+    if built is None:
+        return None
+    lib, spec, cost_spec, edge_scenic_score_by_rank, native_deadline_seconds = (
+        built
+    )
 
     node_index = topology.node_index
     fwd_seed_indices: list[int] = []
@@ -326,7 +439,50 @@ def run_compact_bidirectional_search(
     out_fwd_idx = ctypes.c_int32(-1)
     out_rev_idx = ctypes.c_int32(-1)
 
-    if edge_scenic_score_by_rank is not None:
+    base_costs_ptr = None
+    if base_costs is not None:
+        # The base-cost sidecar is request-local and read-only; validate the
+        # caller's buffer shape fail-closed so a short array can never be
+        # indexed out of bounds by the native search.
+        entry = getattr(
+            lib, "compact_bidirectional_search_alloc_ranked_base_costs", None
+        )
+        if entry is None:
+            return None
+        dtype = getattr(base_costs, "dtype", None)
+        if (
+            not hasattr(base_costs, "ctypes")
+            or getattr(base_costs, "ndim", None) != 1
+            or getattr(dtype, "itemsize", 0) != 8
+            or int(len(base_costs)) != int(spec.traversal_count)
+        ):
+            return None
+        base_costs_ptr = base_costs.ctypes.data_as(
+            ctypes.POINTER(ctypes.c_double)
+        )
+
+    if base_costs_ptr is not None:
+        res = entry(
+            ctypes.byref(spec),
+            ctypes.byref(cost_spec),
+            base_costs_ptr,
+            fwd_nodes,
+            fwd_costs,
+            fwd_rank_primary,
+            fwd_rank_secondary,
+            len(fwd_seed_indices),
+            rev_nodes,
+            rev_costs,
+            rev_rank_primary,
+            rev_rank_secondary,
+            len(rev_seed_indices),
+            ctypes.byref(out_pos_ptr),
+            ctypes.byref(out_cost),
+            ctypes.byref(out_fwd_idx),
+            ctypes.byref(out_rev_idx),
+            native_deadline_seconds,
+        )
+    elif edge_scenic_score_by_rank is not None:
         res = lib.compact_bidirectional_search_alloc_ranked_edge_scores(
             ctypes.byref(spec),
             ctypes.byref(cost_spec),
