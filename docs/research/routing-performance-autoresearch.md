@@ -1,10 +1,112 @@
 # Routing Performance Autoresearch Log
 
-## Decision
+## Abstract and current conclusions
 
-Retain the bounded scenic scalar traversal implemented in `86bbfde3` and merged to `main` by `ba5cf73b`. On the fixed 2,256-case production workload it reduced all-case median latency by 80.80%, reduced p95 by 63.55%, and raised the under-10-second rate from 68.22% to 99.91% without changing any route completed by both revisions.
+Scenic Drive's current routing-performance gate is a complete, **uncached**
+Northeast Expanded `plan_routes` request. The 2026-08-12 bounded campaign did
+not meet its target of a median below 20 seconds: its five-run confirmation
+median was 82.3048 seconds. The retained two-worker Lagrangian implementation
+did show an 18.03% lower isolated median than the fresh baseline, but its
+confirmation distribution regressed 7.63% under high and variable host load.
+That distinction is intentional: the implementation is retained; the
+performance target is not claimed as met.
 
-Do not retain the later incumbent-bound, precomputed-sum, or sparse-transpose experiments. Do not begin frontier pruning, CCH, or MLD work without new profiler evidence that the retained implementation still has a material scalar-traversal bottleneck.
+Repeated identical warm requests are a separate operational case. The bounded
+response cache reduced their five-run median to 45.740 ms, but a cache miss
+still executes the exact search and the last measured miss median was 80.937
+seconds. Cache-hit latency is never evidence of faster uncached traversal.
+
+The older 2,256-case New England North Vast study remains useful historical
+evidence for the scalar incumbent bound: it reduced all-case median latency by
+80.80% under the then-current route policy. Half of that workload used
+pre-correction highway-avoidance semantics, so those measurements are not
+current-policy production claims. The corrected fixed-denominator revalidation
+remains open.
+
+### Research question and success criteria
+
+The active question is whether an exact, semantics-preserving method can make
+uncached Northeast Expanded routing materially faster. A result is accepted
+only when it preserves the complete route oracle, beats a predefined threshold
+on same-host repeated measurements, and survives focused correctness,
+deadline, cancellation, native-parity, and artifact checks. Approximation,
+reduced candidates or seeds, cost changes, and tie-order changes are outside
+that contract.
+
+### Evidence boundaries
+
+- **Uncached Northeast Expanded:** complete cache-empty service calls; primary
+  evidence for the current gate.
+- **Repeated-request cache hits:** complete service calls served by the bounded
+  process-local response cache; operational evidence only.
+- **Historical New England North:** a fixed 2,256-case Vast benchmark under the
+  prior highway-avoidance policy; retained as provenance, not current policy
+  validation.
+- **Machine-local records:** ignored profiles and ledgers support the logged
+  decisions but are not portable repository evidence. Tracked hashes,
+  protocols, distributions, and durable S3 identities keep the claims
+  auditable.
+
+## Figure guide
+
+The figures below are generated from the auditable
+[`figure-data.json`](../assets/research/routing/figure-data.json) source with
+[`generate_routing_research_figures.py`](../../scripts/reports/generate_routing_research_figures.py):
+
+```bash
+uv run python scripts/reports/generate_routing_research_figures.py
+```
+
+The source data identifies repository revision `a12af830` and the exact
+evidence ranges used for every quantitative value. SVG titles, descriptions,
+direct labels, shapes, and hatching keep each figure interpretable without
+color alone.
+
+### System and benchmark boundary
+
+![Complete uncached request boundary from request through service planner, four native searches, and semantic-oracle comparison](../assets/research/routing/system-boundary.svg)
+
+*Figure 1. The uncached claim times the complete normal service request.
+Preload is measured separately; response-cache hits are explicitly excluded.*
+
+### Bounded decision process
+
+![Five-stage bounded autoresearch loop from immutable baseline through one-hypothesis candidates, semantic checks, measured decisions, and experiment-cap stop](../assets/research/routing/autoresearch-loop.svg)
+
+*Figure 2. One immutable baseline and eleven candidates exhaust the fixed cap.
+A candidate must pass the complete semantic oracle before timing can support a
+retain decision; timeouts are outcomes, not synthetic 120-second samples.*
+
+### Candidate outcomes
+
+![Median wall time for baseline and measured candidates, with retained, rejected, and timeout outcomes distinguished by shape and hatching](../assets/research/routing/experiment-outcomes.svg)
+
+*Figure 3. Run 115 is the only retained uncached candidate. Runs 112, 119, and
+122 timed out during warm-up and therefore have no plotted median.*
+
+### Latency distributions
+
+![Fresh baseline, isolated retained candidate, noisy final confirmation, and separate operational response-cache-hit distributions on a zero-based seconds axis](../assets/research/routing/latency-distributions.svg)
+
+*Figure 4. Raw samples remain in their measurement contexts. The isolated
+candidate beat baseline, but the five-run confirmation did not meet the
+20-second target; the single cache hit is not uncached-search evidence.*
+
+### Profile attribution
+
+![Observed request-sample shares for native compact search and its heap-pop component](../assets/research/routing/profile-bottlenecks.svg)
+
+*Figure 5. Native compact search accounts for about 89.6% of observed request
+samples; heap pop is a nested 57.5% component, so the bars must not be added.*
+
+### Retained two-worker execution
+
+![Four deterministic multiplier searches scheduled at most two at a time, then restored to original order before response or failure](../assets/research/routing/two-worker-execution.svg)
+
+*Figure 6. The retained executor propagates request context, limits concurrency
+to two native searches, joins all work on success or failure, and restores
+multiplier order. The 18.03% reduction is the isolated three-run result, not
+the noisy final confirmation.*
 
 ## Northeast Expanded uncached exact-search campaign
 
@@ -167,7 +269,7 @@ precomputed index design and production artifact generation; approximation,
 reduced multipliers/seeds, cost changes, tie changes, dependency additions,
 deployment changes, and remote compute were not attempted.
 
-## Northeast Expanded exact warm-request study
+## Repeated identical warm-request cache study
 
 ### Decision
 
@@ -286,7 +388,7 @@ the candidate set, multiplier set, endpoint access, certified search space, or
 deterministic ordering to improve the miss result.
 
 
-## Scope and revisions
+## Historical New England North production study
 
 | Role | Revision | Description |
 |---|---|---|
@@ -312,7 +414,7 @@ The retained implementation:
 - falls back to the previous unbounded traversal if the aggregate scalar bound is non-finite; and
 - leaves endpoint rank, direction, reconstruction, highway filtering, deadline, and cancellation behavior unchanged.
 
-## Fixed workload
+## Historical fixed workload
 
 | Setting | Value |
 |---|---|
@@ -339,9 +441,18 @@ The denominator is $23 \times 7 \times 7 \times 2 + 2 = 2{,}256$: the full pair/
 
 Both measurements used the same host, graph, report, projection sidecar, corpus, denominator, timeout, worker configuration, and application cache boundary.
 
-## Reproduction command
+The tracked corpus at this path has since changed: its current SHA-256 is
+`dc96be4f191bfdc1c660c6389b11000083e01cfd3770fd21a003484c532e82d6`,
+not the pinned `b92cfcbe...` workload above. The exact 23-pair historical
+corpus remains recoverable from Git revision `b717f883`.
 
-Use Vast for this graph-scale benchmark; do not run the full workload locally.
+## Historical reproduction command
+
+The command below records the original Vast invocation. Before rerunning,
+restore `scripts/routing/production_benchmark_pairs.json` from `b717f883` and
+verify its pinned SHA-256; do not substitute the current corpus. The ignored
+graph and report artifacts are also required. Do not run the full graph-scale
+workload locally.
 
 ```bash
 uv run --offline --frozen python scripts/routing/production_benchmark.py \
@@ -356,7 +467,7 @@ uv run --offline --frozen python scripts/routing/production_benchmark.py \
 
 The benchmark validates the fixed matrix, unique case IDs, checkpoint fingerprint consistency, all-case persistence, route invariants, cache boundaries, and strict-service/direct-planner parity before publishing a final artifact.
 
-## Production benchmark result
+## Historical production benchmark result
 
 | Metric | Baseline `0d8c4949fc41` | Integrated candidate `86bbfde3` | Change |
 |---|---:|---:|---:|
@@ -451,7 +562,10 @@ These records are saved but intentionally Git-ignored and are not portable repos
 - other local benchmark checkpoints and outputs under `data/processed/routing_benchmarks/`; and
 - raw files on a Vast instance, which are not durable after teardown unless uploaded.
 
-The scripts, fixed corpus, validation logic, and this summary are tracked in Git. The large canonical results are durable in S3, not Git.
+The harness and validation logic are tracked in Git. The exact historical
+corpus is recoverable from revision `b717f883` and pinned by the hash above;
+the current path contains a newer corpus. The large canonical results are
+durable in S3, not Git.
 
 ## Detour-policy boundary
 

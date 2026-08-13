@@ -218,13 +218,16 @@ def render_autoresearch_loop(data: dict[str, Any]) -> str:
         if index < len(steps) - 1:
             body.append(_line(x + 126, 260, x + 163, 260, stroke=COLORS["ink"], width=2, marker="arrow"))
     body.extend([
-        _rect(150, 440, 900, 120, fill=COLORS["paper"], stroke=COLORS["line"], radius=6),
-        _text(180, 476, "Acceptance record", size=15, weight="bold", fill=COLORS["teal"]),
-        _text(180, 506, "Two native workers: 62.682 s isolated median; 18.03% below the fresh 76.470 s baseline.", size=18),
-        _text(180, 534, "All rejected candidates were removed. Timeouts are deadline outcomes, not 120-second measurements.", size=14, fill=COLORS["muted"]),
-        _text(1020, 476, "STOP CONDITION", size=13, weight="bold", fill=COLORS["orange"], anchor="end"),
-        _text(1020, 506, "1 baseline + 11 candidates", size=17, weight="bold", anchor="end"),
-        _text(1020, 534, "uncached median target < 20 s not met", size=13, fill=COLORS["muted"], anchor="end"),
+        _rect(150, 430, 900, 150, fill=COLORS["paper"], stroke=COLORS["line"], radius=6),
+        _line(730, 448, 730, 562, stroke=COLORS["line"]),
+        _text(180, 463, "ACCEPTANCE RECORD", size=13, weight="bold", fill=COLORS["teal"]),
+        _text(180, 496, "Retained: two native workers, 62.682 s isolated median", size=17, weight="bold"),
+        _text(180, 524, "18.03% below the fresh 76.470 s baseline", size=15),
+        _text(180, 552, "Timeouts are deadline outcomes; rejected source was removed.", size=13, fill=COLORS["muted"]),
+        _text(1020, 463, "STOP CONDITION", size=13, weight="bold", fill=COLORS["orange"], anchor="end"),
+        _text(1020, 496, "1 baseline + 11 candidates", size=17, weight="bold", anchor="end"),
+        _text(1020, 524, "uncached median target < 20 s", size=13, fill=COLORS["muted"], anchor="end"),
+        _text(1020, 550, "not met", size=15, fill=COLORS["orange"], weight="bold", anchor="end"),
     ])
     return _svg("autoresearch-loop", figure, body, data)
 
@@ -339,12 +342,29 @@ def render_two_worker_execution(data: dict[str, Any]) -> str:
     searches = [(190, 195, "λ1"), (450, 195, "λ2"), (190, 330, "λ3"), (450, 330, "λ4")]
     for x, y, label in searches:
         body.extend([_rect(x, y, 120, 68, fill=COLORS["paper"], stroke=COLORS["teal"], radius=5), _text(x + 60, y + 42, label + " native search", size=14, weight="bold", anchor="middle")])
-    body.extend([_rect(64, 220, 76, 92, fill=COLORS["navy"], radius=5), _text(102, 258, "request", size=14, fill=COLORS["white"], weight="bold", anchor="middle"), _text(102, 280, "context", size=14, fill=COLORS["white"], anchor="middle"),
-                 _line(140, 245, 186, 225, stroke=COLORS["ink"], width=2, marker="arrow"), _line(140, 285, 186, 355, stroke=COLORS["ink"], width=2, marker="arrow"),
-                 _line(310, 229, 704, 258, stroke=COLORS["ink"], width=2, marker="arrow"), _line(570, 229, 704, 258, stroke=COLORS["ink"], width=2, marker="arrow"),
-                 _line(310, 364, 704, 292, stroke=COLORS["ink"], width=2, marker="arrow"), _line(570, 364, 704, 292, stroke=COLORS["ink"], width=2, marker="arrow"),
-                 _rect(704, 220, 172, 92, fill=COLORS["gold"], radius=5), _text(790, 258, "restore original", size=14, fill=COLORS["white"], weight="bold", anchor="middle"), _text(790, 280, "multiplier order", size=14, fill=COLORS["white"], anchor="middle"),
-                 _line(876, 266, 966, 266, stroke=COLORS["ink"], width=2, marker="arrow"), _rect(966, 220, 120, 92, fill=COLORS["orange"], radius=5), _text(1026, 258, "response", size=15, fill=COLORS["white"], weight="bold", anchor="middle"), _text(1026, 280, "or failure", size=14, fill=COLORS["white"], anchor="middle")])
+    body.extend([
+        _rect(64, 220, 76, 92, fill=COLORS["navy"], radius=5),
+        _text(102, 258, "request", size=14, fill=COLORS["white"], weight="bold", anchor="middle"),
+        _text(102, 280, "context", size=14, fill=COLORS["white"], anchor="middle"),
+        _line(140, 266, 160, 266, stroke=COLORS["teal"], width=2, dash="5 4"),
+        _line(160, 210, 160, 382, stroke=COLORS["teal"], width=2, dash="5 4"),
+        _line(160, 229, 186, 229, stroke=COLORS["teal"], width=2, dash="5 4", marker="arrow"),
+        _line(160, 364, 186, 364, stroke=COLORS["teal"], width=2, dash="5 4", marker="arrow"),
+        f'<path d="M160,210 V175 H430 L446,229" fill="none" stroke="{COLORS["teal"]}" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow)"/>',
+        f'<path d="M160,382 V415 H430 L446,364" fill="none" stroke="{COLORS["teal"]}" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow)"/>',
+        _text(64, 445, "ContextVar copied into all four submitted tasks", size=13, fill=COLORS["teal"], weight="bold"),
+        _line(310, 229, 704, 258, stroke=COLORS["ink"], width=2, marker="arrow"),
+        _line(570, 229, 704, 258, stroke=COLORS["ink"], width=2, marker="arrow"),
+        _line(310, 364, 704, 292, stroke=COLORS["ink"], width=2, marker="arrow"),
+        _line(570, 364, 704, 292, stroke=COLORS["ink"], width=2, marker="arrow"),
+        _rect(704, 220, 172, 92, fill=COLORS["gold"], radius=5),
+        _text(790, 258, "restore original", size=14, fill=COLORS["white"], weight="bold", anchor="middle"),
+        _text(790, 280, "multiplier order", size=14, fill=COLORS["white"], anchor="middle"),
+        _line(876, 266, 966, 266, stroke=COLORS["ink"], width=2, marker="arrow"),
+        _rect(966, 220, 120, 92, fill=COLORS["orange"], radius=5),
+        _text(1026, 258, "response", size=15, fill=COLORS["white"], weight="bold", anchor="middle"),
+        _text(1026, 280, "or failure", size=14, fill=COLORS["white"], anchor="middle"),
+    ])
     body.extend([_rect(64, 470, 1022, 112, fill=COLORS["paper"], stroke=COLORS["line"], radius=6),
                  _text(88, 505, "Measured isolated result", size=15, weight="bold", fill=COLORS["teal"]),
                  _text(88, 535, f"{_fmt(two_worker['isolated_candidate_median_seconds'])} s median vs {_fmt(two_worker['isolated_baseline_median_seconds'])} s baseline ({_fmt(two_worker['isolated_improvement_percent'], 2)}% lower; n=3 each).", size=18),

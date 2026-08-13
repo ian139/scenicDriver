@@ -23,8 +23,13 @@
 <rect x="64.0" y="220.0" width="76.0" height="92.0" rx="5.0" fill="#315b7d" stroke="none" />
 <text x="102.0" y="258.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:14px;font-weight:bold;fill:#fffdf8;">request</text>
 <text x="102.0" y="280.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:14px;font-weight:normal;fill:#fffdf8;">context</text>
-<line x1="140.0" y1="245.0" x2="186.0" y2="225.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
-<line x1="140.0" y1="285.0" x2="186.0" y2="355.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
+<line x1="140.0" y1="266.0" x2="160.0" y2="266.0" stroke="#287271" stroke-width="2.0" stroke-dasharray="5 4"/>
+<line x1="160.0" y1="210.0" x2="160.0" y2="382.0" stroke="#287271" stroke-width="2.0" stroke-dasharray="5 4"/>
+<line x1="160.0" y1="229.0" x2="186.0" y2="229.0" stroke="#287271" stroke-width="2.0" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+<line x1="160.0" y1="364.0" x2="186.0" y2="364.0" stroke="#287271" stroke-width="2.0" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+<path d="M160,210 V175 H430 L446,229" fill="none" stroke="#287271" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+<path d="M160,382 V415 H430 L446,364" fill="none" stroke="#287271" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+<text x="64.0" y="445.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:bold;fill:#287271;">ContextVar copied into all four submitted tasks</text>
 <line x1="310.0" y1="229.0" x2="704.0" y2="258.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
 <line x1="570.0" y1="229.0" x2="704.0" y2="258.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
 <line x1="310.0" y1="364.0" x2="704.0" y2="292.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>

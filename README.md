@@ -2,7 +2,7 @@
 
 Scenic Drive finds routes that trade a small amount of travel time for better scenery. It combines satellite imagery, terrain signals, learned scenic scores, and a directed road graph behind a FastAPI service and a lightweight MapLibre web app.
 
-The current product surface is the **New England North** web app. It compares the fastest route with a scenic alternative, renders regional scenic scores, and exposes the active model result.
+The canonical default product surface is the **New England North** web app. It compares the fastest route with a scenic alternative, renders regional scenic scores, and exposes the active model result. The API also has a route-capable **Northeast Expanded** region for cross-region coverage; Masswhites, Philadelphia, and Pittsfield remain validation-only.
 
 ## What is here
 
@@ -217,7 +217,7 @@ uv run python scripts/modeling/export_prediction_heatmap.py \
 - [Roadmap](docs/roadmap.md) — current product, model, data, and routing priorities
 - [ML research log](docs/research/ml-research-log.md) — learned-score model history and promotion evidence
 - [Nationwide streaming score-map proposal](docs/research/nationwide-streaming-score-map.md) — proposed score-only CONUS architecture, cost hypothesis, and required gates
-- [Routing performance log](docs/research/routing-performance-autoresearch.md) — benchmark results and retained experiments
+- [Routing performance research](docs/research/routing-performance-autoresearch.md) — current conclusions, benchmark evidence, rejected experiments, and reproducible figures
 - [Archive manifest](archive/archive.md) — historical, non-primary material
 
 ## Tests

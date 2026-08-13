@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
-import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -111,11 +110,11 @@ class RoutingResearchFigureTests(unittest.TestCase):
     def test_svg_xml_accessibility_and_required_annotations(self) -> None:
         required_annotations = {
             "system-boundary.svg": ["Target:", "Complete response cache cleared", "Deadline:"],
-            "autoresearch-loop.svg": ["1 baseline + 11 candidates", "20 s not met", "Timeouts are deadline outcomes"],
+            "autoresearch-loop.svg": ["1 baseline + 11 candidates", "uncached median target &lt; 20 s", "not met", "Timeouts are deadline outcomes"],
             "experiment-outcomes.svg": ["median seconds", "TIMEOUT", "warm-up exceeded deadline"],
             "latency-distributions.svg": ["20 s research target", "n=3", "n=5", "Response-cache hit"],
             "profile-bottlenecks.svg": ["89.6%", "57.5%", "Do not add these shares"],
-            "two-worker-execution.svg": ["at most two", "62.682 s", "76.47 s", "n=3 each"],
+            "two-worker-execution.svg": ["at most two", "ContextVar copied into all four submitted tasks", "62.682 s", "76.47 s", "n=3 each"],
         }
         for filename in figures.CANONICAL_FILENAMES:
             path = ROOT / "docs/assets/research/routing" / filename
