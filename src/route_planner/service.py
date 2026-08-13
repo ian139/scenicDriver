@@ -538,6 +538,12 @@ def clear_route_caches() -> None:
         _flush_compact_releases_locked()
 
 
+def clear_route_response_cache() -> None:
+    """Clear complete route responses while retaining preloaded route assets."""
+    with _CACHE_LOCK:
+        _ROUTE_RESPONSE_CACHE.clear()
+
+
 def _apply_tile_scores_to_graph_native(
     graph: RoadGraph,
     score_map: Mapping[tuple[int, int, int], float],

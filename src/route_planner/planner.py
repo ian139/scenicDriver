@@ -1,10 +1,11 @@
 from __future__ import annotations
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 import time
-
 from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
 import heapq
 import math
@@ -17,7 +18,7 @@ from scipy.sparse import csr_matrix as _scipy_csr_matrix
 from scipy.sparse.csgraph import dijkstra as _scipy_dijkstra
 from scipy.sparse.csgraph import shortest_path as _scipy_shortest_path
 
-from ._compact_search import run_compact_bidirectional_search
+from ._compact_search import compact_search_available, run_compact_bidirectional_search
 from .cancellation import RoutingDeadline, RoutingTimeout
 from .cost import (
     CostWeights,
@@ -5122,7 +5123,10 @@ class ScenicRoutePlanner:
         multipliers = (0.0, 0.25, 0.75, 1.5)
         weight_data = None if data is None else data.weights
         travel_time = topology.travel_time_minutes
-        for multiplier in multipliers:
+
+        def _search_multiplier(
+            multiplier: float,
+        ) -> Optional[Tuple[List[Edge], PathEvaluation]]:
             check_graph()
 
             def base_weight(position: int, m: float = multiplier) -> float:
@@ -5162,7 +5166,7 @@ class ScenicRoutePlanner:
             )
             check_graph()
             if result is None:
-                continue
+                return None
             path, rank_key = result
             best = (self._path_duration_minutes(path), path, rank_key)
             best_metric = sum(scalar_edge_cost(edge) for edge in path)
@@ -5182,7 +5186,7 @@ class ScenicRoutePlanner:
             if not self._duration_within_cap(
                 duration, duration_cap_minutes
             ):
-                continue
+                return None
             evaluation = evaluate_path(
                 best_path,
                 q=q,
@@ -5191,8 +5195,41 @@ class ScenicRoutePlanner:
                 policy=policy,
                 check_cancelled=_check_active_deadline,
             )
-            candidates.append((best_path, evaluation))
+            return (best_path, evaluation)
 
+        is_native_eligible = (
+            isinstance(base, CompactRoadGraph)
+            and signature is not None
+            and compact_search_available()
+        )
+
+        if is_native_eligible:
+            results: List[Optional[Tuple[List[Edge], PathEvaluation]]] = [
+                None
+            ] * len(multipliers)
+
+            def _worker(
+                idx: int, m: float
+            ) -> Tuple[int, Optional[Tuple[List[Edge], PathEvaluation]]]:
+                return idx, _search_multiplier(m)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(copy_context().run, _worker, i, m)
+                    for i, m in enumerate(multipliers)
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    idx, res = future.result()
+                    results[idx] = res
+
+            for res in results:
+                if res is not None:
+                    candidates.append(res)
+        else:
+            for multiplier in multipliers:
+                res = _search_multiplier(multiplier)
+                if res is not None:
+                    candidates.append(res)
         check_graph()
         best_edges, best_evaluation = candidates[0]
         for candidate_edges, candidate_evaluation in candidates[1:]:
