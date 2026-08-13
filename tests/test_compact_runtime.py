@@ -583,6 +583,14 @@ def test_compact_scored_plan_routes_avoids_native_clone(
         == result["routes"][0]["metrics"]["edge_ids"]
     )
 
+    route_service.clear_route_response_cache()
+    fourth = route_service.plan_routes(request)
+    assert fourth["diagnostics"]["route_response_cache_hit"] is False
+    assert fourth["diagnostics"]["graph_cache_hit"] is True
+    assert fourth["diagnostics"]["tile_score_cache_hit"] is True
+    assert fourth["diagnostics"]["scored_graph_cache_hit"] is True
+    assert fourth["score_mapping"] == result["score_mapping"]
+
     class Cancelled:
         def is_set(self) -> bool:
             return True
