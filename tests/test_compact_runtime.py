@@ -3540,3 +3540,50 @@ def test_compact_comparator_alloc_failure_preserves_minus_one_and_frees_scratch(
         control_rss,
     )
 
+
+def test_heap_item_rank_key_encoding_and_parity(tmp_path: Path) -> None:
+    """Verify 64-bit rank_key encoding handles full signed int32 domain and
+    matches lexicographical (rank_primary, rank_secondary) comparison exactly.
+    """
+    def encode_rank_key(primary: int, secondary: int) -> int:
+        u_p = (primary & 0xFFFFFFFF) ^ 0x80000000
+        u_s = (secondary & 0xFFFFFFFF) ^ 0x80000000
+        return (u_p << 32) | u_s
+
+    INT32_MIN = -2147483648
+    INT32_MAX = 2147483647
+    test_values = [INT32_MIN, -1000000, -1, 0, 1, 1000000, INT32_MAX]
+
+    # Test monotonicity and exact comparison match for all pairs in test_values
+    pairs = [(p, s) for p in test_values for s in test_values]
+    for i, a in enumerate(pairs):
+        key_a = encode_rank_key(a[0], a[1])
+        for b in pairs[i:]:
+            key_b = encode_rank_key(b[0], b[1])
+            if a < b:
+                assert key_a < key_b, f"Expected {a} < {b}, got keys {hex(key_a)} >= {hex(key_b)}"
+            elif a > b:
+                assert key_a > key_b, f"Expected {a} > {b}, got keys {hex(key_a)} <= {hex(key_b)}"
+            else:
+                assert key_a == key_b, f"Expected {a} == {b}, got keys {hex(key_a)} != {hex(key_b)}"
+
+    # Verify search parity with native C library on signed/negative rank pairs
+    from src.route_planner._compact_search import run_compact_bidirectional_search
+
+    graph = _diamond_graph()
+    sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    planner = ScenicRoutePlanner(graph=compact)
+    topology = planner._csr_topology()
+    assert topology is not None
+    cost_function = planner._make_fastest_cost_function()
+
+    # Equal-cost duplicate seeds with negative/signed ranks
+    result1 = run_compact_bidirectional_search(
+        topology,
+        cost_function,
+        [("n0", 0.0, (-100, 50), None), ("n0", 0.0, (-200, 10), None)],
+        [("n3", 0.0, (0, 0), None)],
+    )
+    assert result1 is not None
+    assert result1[2] == 1  # (-200, 10) is smaller than (-100, 50), so index 1 wins

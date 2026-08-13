@@ -43,9 +43,8 @@ typedef struct {
 typedef struct {
     double dist;
     uint64_t sequence;
+    uint64_t rank_key;
     int32_t node_rank;
-    int32_t rank_primary;
-    int32_t rank_secondary;
     int32_t label_id;
 } HeapItem;
 
@@ -54,6 +53,12 @@ typedef struct {
     int32_t capacity;
     int32_t size;
 } MinHeap;
+
+static inline uint64_t encode_rank_key(int32_t rank_primary, int32_t rank_secondary) {
+    uint64_t u_primary = (uint32_t)rank_primary ^ 0x80000000U;
+    uint64_t u_secondary = (uint32_t)rank_secondary ^ 0x80000000U;
+    return (u_primary << 32) | u_secondary;
+}
 
 static bool checked_size_mul(size_t count, size_t element_size, size_t* out_bytes) {
     if (element_size != 0 && count > SIZE_MAX / element_size) return false;
@@ -64,11 +69,7 @@ static bool checked_size_mul(size_t count, size_t element_size, size_t* out_byte
 static int heap_item_compare(const HeapItem* a, const HeapItem* b) {
     int order = (a->dist > b->dist) - (a->dist < b->dist);
     if (order != 0) return order;
-    order = (a->rank_primary > b->rank_primary)
-        - (a->rank_primary < b->rank_primary);
-    if (order != 0) return order;
-    order = (a->rank_secondary > b->rank_secondary)
-        - (a->rank_secondary < b->rank_secondary);
+    order = (a->rank_key > b->rank_key) - (a->rank_key < b->rank_key);
     if (order != 0) return order;
     return (a->sequence > b->sequence) - (a->sequence < b->sequence);
 }
@@ -123,9 +124,8 @@ static bool heap_push(
     HeapItem item = {
         .dist = dist,
         .sequence = sequence,
+        .rank_key = encode_rank_key(rank_primary, rank_secondary),
         .node_rank = node_rank,
-        .rank_primary = rank_primary,
-        .rank_secondary = rank_secondary,
         .label_id = label_id,
     };
     int32_t i = h->size++;
