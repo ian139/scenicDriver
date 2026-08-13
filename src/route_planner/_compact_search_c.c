@@ -26,16 +26,6 @@ typedef struct {
      * back to numeric edge ranks. */
     const uint8_t* edge_id_strings;
     const int64_t* edge_id_offsets;
-    /* Admissible scalar-cost completion bounds indexed by node rank:
-     * node_bound_forward[v] bounds the remaining cost from v through the
-     * reverse seed side, node_bound_reverse[v] toward the forward seed
-     * side.  Both may be NULL, which disables completion-bound pruning.
-     * Every complete path through v costs at least the partial prefix plus
-     * the matching bound, so a label is pruned only when
-     * ``next_cost + bound[neighbor] > cost_limit`` (strict, preserving
-     * equal-cost ties and the fastest path itself). */
-    const double* node_bound_forward;
-    const double* node_bound_reverse;
 } CompactGraphSpec;
 
 typedef struct {
@@ -48,10 +38,6 @@ typedef struct {
     double scenic_byway_bonus;
     double lagrangian_multiplier;
     double cost_limit;
-    /* Conservative nonnegative scalar-cost-per-duration floor used only
-     * when the node-bound arrays are present: 0.0 leaves the completion
-     * prune disabled. */
-    double bound_per_minute;
 } CostSpec;
 
 typedef struct {
@@ -525,36 +511,6 @@ static inline double compute_edge_cost(
         cost += c->lagrangian_multiplier * duration;
     }
     return cost;
-}
-
-/* Completion-bound prune: a relaxed label at ``rank`` with partial cost
- * ``next_cost`` is discarded only when the admissible remaining-cost bound
- * for the opposite seed side makes the total strictly exceed the unchanged
- * fastest-path scalar ``cost_limit``.  Strictness preserves equal-cost ties,
- * and the fastest path itself (total == cost_limit) is never pruned.  The
- * bound arrays are paired: when only one side is available the other
- * contributes zero, which can only make the prune *less* aggressive and
- * stays admissible. */
-static inline bool completion_bound_exceeds(
-    const CompactGraphSpec* graph,
-    const CostSpec* cost_spec,
-    int32_t rank,
-    double next_cost,
-    bool forward_side
-) {
-    if (cost_spec->cost_limit <= 0.0 || !(cost_spec->bound_per_minute > 0.0)) {
-        return false;
-    }
-    const double* bounds = forward_side
-        ? graph->node_bound_forward
-        : graph->node_bound_reverse;
-    if (!bounds) return false;
-    if (rank < 0 || (int64_t)rank >= graph->node_count) return false;
-    double bound = bounds[rank];
-    if (!(bound > 0.0) || !isfinite(bound)) return false;
-    double total = next_cost + bound;
-    if (!isfinite(total)) return false;
-    return total > cost_spec->cost_limit;
 }
 
 /* Bounded deadline enforcement.  ``deadline_seconds < 0.0`` means unlimited;
@@ -1197,10 +1153,9 @@ static int32_t compact_search_impl(
                 if (invalid_edge_rank) goto cleanup;
                 if (!isfinite(w)) continue;
                 double next_cost = item.dist + w;
+                if (cost_spec->cost_limit > 0.0 && next_cost > cost_spec->cost_limit) continue;
                 int32_t v = graph->forward_indices[pos];
                 if (v < 0 || (int64_t)v >= node_count) continue; /* reject invalid neighbor ranks */
-                if (cost_spec->cost_limit > 0.0 && next_cost > cost_spec->cost_limit) continue;
-                if (completion_bound_exceeds(graph, cost_spec, v, next_cost, true)) continue;
                 int32_t edge_rank = graph->trav_edge_rank ? graph->trav_edge_rank[pos] : (int32_t)pos;
                 int32_t new_path_id = -1;
                 if (!path_arena_push(
@@ -1272,10 +1227,9 @@ static int32_t compact_search_impl(
                 if (invalid_edge_rank) goto cleanup;
                 if (!isfinite(w)) continue;
                 double next_cost = item.dist + w;
+                if (cost_spec->cost_limit > 0.0 && next_cost > cost_spec->cost_limit) continue;
                 int32_t v = graph->reverse_indices[rev_pos];
                 if (v < 0 || (int64_t)v >= node_count) continue; /* reject invalid neighbor ranks */
-                if (cost_spec->cost_limit > 0.0 && next_cost > cost_spec->cost_limit) continue;
-                if (completion_bound_exceeds(graph, cost_spec, v, next_cost, false)) continue;
                 int32_t edge_rank = graph->trav_edge_rank ? graph->trav_edge_rank[pos] : (int32_t)pos;
                 int32_t new_path_id = -1;
                 if (!path_arena_push(

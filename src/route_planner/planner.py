@@ -17,10 +17,7 @@ from scipy.sparse import csr_matrix as _scipy_csr_matrix
 from scipy.sparse.csgraph import dijkstra as _scipy_dijkstra
 from scipy.sparse.csgraph import shortest_path as _scipy_shortest_path
 
-from ._compact_search import (
-    _scalar_cost_bound_per_minute as _compact_scalar_cost_bound_per_minute,
-    run_compact_bidirectional_search,
-)
+from ._compact_search import run_compact_bidirectional_search
 from .cancellation import RoutingDeadline, RoutingTimeout
 from .cost import (
     CostWeights,
@@ -1683,8 +1680,6 @@ class ScenicRoutePlanner:
         local_cost_override: Optional[Callable[[Edge], float]] = None,
         cost_limit: Optional[float] = None,
         lagrangian_multiplier: float = 0.0,
-        bound_forward: Optional[np.ndarray] = None,
-        bound_reverse: Optional[np.ndarray] = None,
     ) -> Optional[Tuple[List[Edge], Tuple[object, ...]]]:
         """Shared ranked bidirectional search over compact CSR and local edges.
 
@@ -1692,11 +1687,6 @@ class ScenicRoutePlanner:
         E-sized temporary weight array; ``local_cost_override`` supplies
         request-local (endpoint) edge costs; ``cost_limit`` prunes every label
         whose partial cost already exceeds the bound (weights are nonnegative).
-        ``bound_forward``/``bound_reverse`` are admissible scalar-cost
-        completion lower bounds indexed by compact node rank (the native
-        search adds them to each relaxed label and prunes only when the sum is
-        strictly greater than ``cost_limit``, so equal-cost ties and the
-        fastest path itself are never removed).
         """
         graph = self.graph
         assert graph is not None
@@ -1724,8 +1714,6 @@ class ScenicRoutePlanner:
                 lagrangian_multiplier=lagrangian_multiplier,
                 cost_limit=cost_limit,
                 deadline_seconds=_active_deadline_remaining_seconds(),
-                bound_forward=bound_forward,
-                bound_reverse=bound_reverse,
             )
             if c_res is not None:
                 positions, total_cost, fwd_idx, rev_idx = c_res
@@ -5134,17 +5122,6 @@ class ScenicRoutePlanner:
         multipliers = (0.0, 0.25, 0.75, 1.5)
         weight_data = None if data is None else data.weights
         travel_time = topology.travel_time_minutes
-        compact_base = isinstance(base, CompactRoadGraph)
-        if compact_base and not hasattr(request, "_compact_duration_bounds"):
-            # Chunked, reusable, endpoint-aware geodesic duration bounds for
-            # every base node toward both requested coordinates.  Built once
-            # for the request and shared by all multipliers below; None
-            # disables the native completion prune without changing results.
-            request._compact_duration_bounds = (
-                self._compact_request_duration_bounds(
-                    request, base, scenic_cost
-                )
-            )
         for multiplier in multipliers:
             check_graph()
 
@@ -5173,27 +5150,15 @@ class ScenicRoutePlanner:
                 scenic_cost,
                 scalar_edge_cost=scalar_edge_cost,
             )
-            bound_forward, bound_reverse = (None, None)
-            if compact_base:
-                bound_forward, bound_reverse = self._scalar_completion_bounds(
-                    request,
-                    scenic_cost,
-                    forward_seeds,
-                    reverse_seeds,
-                    multiplier,
-                    scalar_cost_limit,
-                )
             result = self._bidirectional_search_core(
                 scenic_cost,
                 forward_seeds,
                 reverse_seeds,
                 strict_mutation=True,
-                base_weight_override=base_weight if not compact_base else None,
-                local_cost_override=scalar_edge_cost if not compact_base else None,
+                base_weight_override=base_weight if not isinstance(base, CompactRoadGraph) else None,
+                local_cost_override=scalar_edge_cost if not isinstance(base, CompactRoadGraph) else None,
                 cost_limit=scalar_cost_limit,
-                lagrangian_multiplier=multiplier if compact_base else 0.0,
-                bound_forward=bound_forward,
-                bound_reverse=bound_reverse,
+                lagrangian_multiplier=multiplier if isinstance(base, CompactRoadGraph) else 0.0,
             )
             check_graph()
             if result is None:
@@ -6129,171 +6094,6 @@ class ScenicRoutePlanner:
         ):
             cache.popitem(last=False)
         return result
-
-    def _scalar_cost_bound_per_minute(
-        self,
-        cost_function: ScenicCostFunction,
-        lagrangian_multiplier: float,
-    ) -> float:
-        """Return a conservative nonnegative scalar-cost-per-duration floor.
-
-        Every built-in edge cost obeys ``cost(edge) >= w0 * duration(edge)``
-        with ``w0 = 0.5e-6 + lambda`` when the Lagrangian multiplier is
-        included additively (see the shared derivation in ``_compact_search``):
-
-        - the weighted scenic/travel base is clamped to at least
-          ``1e-6 * duration``;
-        - a scenic byway multiplies that base by ``(1 - bonus)`` with the
-          bonus capped at ``SCENIC_BYWAY_DISCOUNT_CAP = 0.5``, leaving at
-          least ``0.5e-6 * duration`` (the *global* floor must hold even for
-          a maximally discounted byway, so the half-scale base is used);
-        - highway adjustments and the Lagrangian term ``lambda * duration``
-          are duration-scaled and nonnegative.
-
-        The result is scaled by a downward safety factor so accumulated
-        floating-point error can never turn it into an overestimate, and any
-        non-finite/negative multiplier degenerates to the zero bound instead
-        of pruning.  ``0.0`` disables completion-bound pruning.  The formula
-        is shared with the ctypes wrapper (``_compact_search``) so the native
-        cost spec and the planner always agree.
-        """
-        return _compact_scalar_cost_bound_per_minute(
-            cost_function, lagrangian_multiplier
-        )
-
-    def _compact_request_duration_bounds(
-        self,
-        request: _EndpointAccessRequest,
-        base: CompactRoadGraph,
-        cost_function: ScenicCostFunction,
-    ) -> Optional[Tuple[Optional[np.ndarray], Optional[np.ndarray]]]:
-        """Return chunked node-rank duration bounds toward both endpoints.
-
-        The forward array bounds the remaining duration from each base node to
-        the requested destination, the reverse array bounds it toward the
-        requested start.  Both are built once per frozen request from the
-        persisted lat/lon arrays and the artifact-certified geodesic maximum
-        speed, then reused verbatim across every Lagrangian multiplier.
-        Unavailable speed certification or malformed coordinates yield
-        ``None`` arrays, which disables the native completion prune exactly
-        like today's zero-bound fallback.
-
-        The speed bound must dominate every edge the search can actually
-        traverse, so the highway-excluding variant is used only when the
-        active cost function blocks highways (``strict_highways``); otherwise
-        the all-edges variant is used even for ``avoid_highways`` requests,
-        which is always admissible (a larger maximum speed only weakens the
-        bound).
-        """
-        avoid_highways = bool(cost_function.strict_highways)
-        bound_speed = self._endpoint_geodesic_bound_speed(
-            base, avoid_highways
-        )
-        if bound_speed is None:
-            return None
-        end_coordinates: List[Tuple[float, float]] = []
-        start_coordinates: List[Tuple[float, float]] = []
-        for projection in request.end_projections:
-            end_coordinates.append(
-                (float(projection.lat), float(projection.lon))
-            )
-        for projection in request.start_projections:
-            start_coordinates.append(
-                (float(projection.lat), float(projection.lon))
-            )
-        # Endpoint overlays that collapsed onto base nodes carry no
-        # projections; bound toward the collapsed node coordinates so the
-        # prune still engages for that common shape.
-        if not end_coordinates:
-            end_node = base.nodes.get(request.end_node_id)
-            if end_node is not None:
-                end_coordinates.append(
-                    (float(end_node.lat), float(end_node.lon))
-                )
-        if not start_coordinates:
-            start_node = base.nodes.get(request.start_node_id)
-            if start_node is not None:
-                start_coordinates.append(
-                    (float(start_node.lat), float(start_node.lon))
-                )
-        forward_bounds = base.compact_endpoint_duration_bounds(
-            tuple(end_coordinates),
-            bound_speed,
-            check_cancelled=_check_active_deadline,
-        )
-        reverse_bounds = base.compact_endpoint_duration_bounds(
-            tuple(start_coordinates),
-            bound_speed,
-            check_cancelled=_check_active_deadline,
-        )
-        if forward_bounds is None or reverse_bounds is None:
-            return None
-        return (forward_bounds, reverse_bounds)
-
-    def _scalar_completion_bounds(
-        self,
-        request: _EndpointAccessRequest,
-        cost_function: ScenicCostFunction,
-        forward_seeds: List[Tuple[str, float, Tuple[object, ...], Optional[Edge]]],
-        reverse_seeds: List[Tuple[str, float, Tuple[object, ...], Optional[Edge]]],
-        lagrangian_multiplier: float,
-        scalar_cost_limit: Optional[float],
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """Build per-node scalar-cost completion bounds for one multiplier.
-
-        ``bound_fwd[node] = duration_bound_to_destination[node] * w0 +
-        min(reverse seed cost)`` and symmetrically ``bound_rev``, where
-        ``w0`` is the conservative scalar-cost-per-duration floor.  Any
-        complete path through ``node`` then costs at least the partial prefix
-        plus ``bound_fwd[node]``, so the native strict ``>`` prune stays
-        admissible.
-
-        A relative comparison margin (the codebase's standard ``1e-9``
-        round-off allowance, matching ``_cost_bound_exceeds_incumbent``) is
-        subtracted before clamping at zero: ``next_cost`` and ``cost_limit``
-        are themselves floating accumulations whose worst-case error grows
-        with the path length, and this margin guarantees the prune can never
-        fire on a label whose true completion is within the limit - in
-        particular the fastest path's own prefix labels, whose remaining
-        cost can be a single minimum-cost edge while the prefix sum error is
-        far larger.  A zero/absent array disables pruning.
-        """
-        duration_bounds = getattr(request, "_compact_duration_bounds", None)
-        if duration_bounds is None:
-            return (None, None)
-        forward_duration, reverse_duration = duration_bounds
-        if forward_duration is None or reverse_duration is None:
-            return (None, None)
-        bound_per_minute = self._scalar_cost_bound_per_minute(
-            cost_function, lagrangian_multiplier
-        )
-        if bound_per_minute <= 0.0:
-            return (None, None)
-        reverse_seed_cost = min(
-            (float(seed[1]) for seed in reverse_seeds), default=float("inf")
-        )
-        forward_seed_cost = min(
-            (float(seed[1]) for seed in forward_seeds), default=float("inf")
-        )
-        if not math.isfinite(reverse_seed_cost) or not math.isfinite(
-            forward_seed_cost
-        ):
-            return (None, None)
-        margin = 0.0
-        if scalar_cost_limit is not None and math.isfinite(
-            float(scalar_cost_limit)
-        ):
-            margin = 1e-9 * max(1.0, abs(float(scalar_cost_limit)))
-        bound_forward = (
-            forward_duration * bound_per_minute + reverse_seed_cost
-        )
-        bound_reverse = (
-            reverse_duration * bound_per_minute + forward_seed_cost
-        )
-        if margin > 0.0:
-            bound_forward = np.maximum(bound_forward - margin, 0.0)
-            bound_reverse = np.maximum(bound_reverse - margin, 0.0)
-        return (bound_forward, bound_reverse)
 
     def _edge_distances_are_geodesic_lower_bounds(self) -> bool:
         """Return whether stored traversable distances cover endpoint geodesics."""

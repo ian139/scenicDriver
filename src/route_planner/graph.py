@@ -36,8 +36,6 @@ _KD_SMALL_SUBTREE_CUTOFF = 32
 _EDGE_PROJECTION_CHUNK_SIZE = 65_536
 _EDGE_PROJECTION_TIE_TOLERANCE_KM = 1e-9
 _CANCELLATION_CHECK_INTERVAL = 1024
-_COMPACT_ENDPOINT_BOUND_CHUNK_SIZE = 65_536
-_COMPACT_BOUND_SAFETY_FACTOR = 1.0 - 1e-12
 
 
 class _NodeRow(msgspec.Struct):
@@ -3155,83 +3153,6 @@ class CompactRoadGraph(RoadGraph):
                 mask[codes == code] = True
         self._edge_highway_mask_cache = mask
         return mask
-
-    def compact_endpoint_duration_bounds(
-        self,
-        target_coordinates: Sequence[Tuple[float, float]],
-        max_speed_kmh: float,
-        *,
-        safety_factor: float = _COMPACT_BOUND_SAFETY_FACTOR,
-        check_cancelled: Optional[Callable[[], None]] = None,
-    ) -> Optional[np.ndarray]:
-        """Return conservative per-node duration lower bounds (minutes).
-
-        For every node rank the result is the minimum over the supplied
-        ``target_coordinates`` of ``haversine(node, target) / max_speed_kmh *
-        60``, with each geodesic scaled by a downward safety factor so
-        floating-point error can never overestimate the exact value.  A node
-        that must cross ``geodesic_km`` of the road network at any legal
-        speed takes at least ``geodesic_km / max_speed_kmh`` hours, so the
-        values are admissible travel-duration lower bounds whenever
-        ``max_speed_kmh`` dominates every traversable edge speed and the
-        graph's stored distances cover the node geodesics (the artifact
-        ``geodesic_bound_speed`` contract).  The computation streams in
-        bounded chunks over the persisted lat/lon arrays and writes one
-        reusable float64 array, so peak temporary memory stays O(chunk), not
-        O(nodes).  ``check_cancelled`` is invoked per chunk when supplied.
-        """
-        if check_cancelled is not None:
-            check_cancelled()
-        if not isinstance(target_coordinates, Sequence) or not target_coordinates:
-            return None
-        finite_targets: List[Tuple[float, float]] = []
-        for target in target_coordinates:
-            try:
-                lat, lon = float(target[0]), float(target[1])
-            except (TypeError, ValueError, OverflowError):
-                return None
-            if not (math.isfinite(lat) and math.isfinite(lon)):
-                return None
-            finite_targets.append((lat, lon))
-        if not finite_targets:
-            return None
-        try:
-            speed = float(max_speed_kmh)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if not math.isfinite(speed) or speed <= 0.0:
-            return None
-        lat = self._sections.get("node_lat")
-        lon = self._sections.get("node_lon")
-        if lat is None or lon is None:
-            return None
-        target_lats = np.asarray([target[0] for target in finite_targets])
-        target_lons = np.asarray([target[1] for target in finite_targets])
-        minutes_per_km = (60.0 / speed) * float(safety_factor)
-        if not math.isfinite(minutes_per_km) or minutes_per_km < 0.0:
-            return None
-        bounds = np.empty(self.node_count, dtype=np.float64)
-        node_count = len(lat)
-        chunk = _COMPACT_ENDPOINT_BOUND_CHUNK_SIZE
-        for row_start in range(0, node_count, chunk):
-            if check_cancelled is not None:
-                check_cancelled()
-            row_stop = min(row_start + chunk, node_count)
-            row_lat = np.asarray(lat[row_start:row_stop], dtype=np.float64)
-            row_lon = np.asarray(lon[row_start:row_stop], dtype=np.float64)
-            dlat = np.radians(target_lats[None, :] - row_lat[:, None])
-            dlon = np.radians(target_lons[None, :] - row_lon[:, None])
-            a = np.sin(dlat / 2.0) ** 2
-            a = a + np.cos(np.radians(row_lat[:, None])) * np.cos(
-                np.radians(target_lats[None, :])
-            ) * np.sin(dlon / 2.0) ** 2
-            np.clip(a, 0.0, 1.0, out=a)
-            geodesic_km = 2.0 * 6371.0 * np.arcsin(np.sqrt(a))
-            row_minutes = np.min(geodesic_km, axis=1) * minutes_per_km
-            bounds[row_start:row_stop] = row_minutes
-        if not np.all(np.isfinite(bounds)):
-            return None
-        return bounds
 
     def endpoint_geodesic_bound_speed(self, avoid_highways: bool) -> Optional[float]:
         """Vectorized equivalent of the planner's graph-wide speed bound."""
