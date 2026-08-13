@@ -447,22 +447,14 @@ static inline double compute_edge_cost(
     const CompactGraphSpec* g,
     const CostSpec* c,
     int64_t pos,
-    const double* edge_scenic_score_by_rank,
-    bool* invalid_edge_rank
+    const double* edge_scenic_score_by_rank
 ) {
-    *invalid_edge_rank = false;
-    int32_t edge_rank = -1;
-    if (edge_scenic_score_by_rank) {
-        if (!g->trav_edge_rank) {
-            *invalid_edge_rank = true;
-            return INFINITY;
-        }
-        edge_rank = g->trav_edge_rank[pos];
-        if (edge_rank < 0 || (int64_t)edge_rank >= g->edge_count) {
-            *invalid_edge_rank = true;
-            return INFINITY;
-        }
-    }
+    /* Sidecar ranks were exhaustively validated before search allocation, so
+     * the hot relaxation loop can index directly without repeating bounds
+     * checks for every scanned traversal. */
+    int32_t edge_rank = edge_scenic_score_by_rank
+        ? g->trav_edge_rank[pos]
+        : -1;
     if (c->strict_highways && g->trav_highway_mask[pos]) {
         return INFINITY;
     }
@@ -1145,12 +1137,9 @@ static int32_t compact_search_impl(
             int64_t row_start = graph->forward_indptr[u];
             int64_t row_end = graph->forward_indptr[u + 1];
             for (int64_t pos = row_start; pos < row_end; pos++) {
-                bool invalid_edge_rank = false;
                 double w = compute_edge_cost(
-                    graph, cost_spec, pos, edge_scenic_score_by_rank,
-                    &invalid_edge_rank
+                    graph, cost_spec, pos, edge_scenic_score_by_rank
                 );
-                if (invalid_edge_rank) goto cleanup;
                 if (!isfinite(w)) continue;
                 double next_cost = item.dist + w;
                 if (cost_spec->cost_limit > 0.0 && next_cost > cost_spec->cost_limit) continue;
@@ -1219,12 +1208,9 @@ static int32_t compact_search_impl(
             int64_t row_end = graph->reverse_indptr[u + 1];
             for (int64_t rev_pos = row_start; rev_pos < row_end; rev_pos++) {
                 int64_t pos = graph->reverse_positions[rev_pos];
-                bool invalid_edge_rank = false;
                 double w = compute_edge_cost(
-                    graph, cost_spec, pos, edge_scenic_score_by_rank,
-                    &invalid_edge_rank
+                    graph, cost_spec, pos, edge_scenic_score_by_rank
                 );
-                if (invalid_edge_rank) goto cleanup;
                 if (!isfinite(w)) continue;
                 double next_cost = item.dist + w;
                 if (cost_spec->cost_limit > 0.0 && next_cost > cost_spec->cost_limit) continue;
