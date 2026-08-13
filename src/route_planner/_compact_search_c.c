@@ -1154,6 +1154,7 @@ static int32_t compact_search_impl(
                 if (!isfinite(w)) continue;
                 double next_cost = item.dist + w;
                 if (cost_spec->cost_limit > 0.0 && next_cost > cost_spec->cost_limit) continue;
+                if (isfinite(best_cost) && next_cost > best_cost) continue;
                 int32_t v = graph->forward_indices[pos];
                 if (v < 0 || (int64_t)v >= node_count) continue; /* reject invalid neighbor ranks */
                 int32_t edge_rank = graph->trav_edge_rank ? graph->trav_edge_rank[pos] : (int32_t)pos;
@@ -1228,6 +1229,7 @@ static int32_t compact_search_impl(
                 if (!isfinite(w)) continue;
                 double next_cost = item.dist + w;
                 if (cost_spec->cost_limit > 0.0 && next_cost > cost_spec->cost_limit) continue;
+                if (isfinite(best_cost) && next_cost > best_cost) continue;
                 int32_t v = graph->reverse_indices[rev_pos];
                 if (v < 0 || (int64_t)v >= node_count) continue; /* reject invalid neighbor ranks */
                 int32_t edge_rank = graph->trav_edge_rank ? graph->trav_edge_rank[pos] : (int32_t)pos;
