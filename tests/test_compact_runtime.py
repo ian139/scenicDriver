@@ -22,7 +22,12 @@ from src.route_planner.graph import (
     RoadGraph,
     write_compact_graph,
 )
-from src.route_planner.planner import ScenicRoutePlanner
+from src.route_planner.cost import ScenicCostFunction
+from src.route_planner.planner import (
+    ScenicRoutePlanner,
+    evaluate_path,
+    resolve_routing_policy,
+)
 
 # The eager score pass lives in the service module; import it there to avoid
 # depending on private graph-module aliases.
@@ -805,6 +810,68 @@ def test_compact_large_path_parity_with_sqlite(
     assert compact_avoid.exactness_status == reference_avoid.exactness_status
 
 
+def test_compact_lagrangian_scalar_precomputation_call_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Precomputed fastest path and direct candidates avoid repeated evaluations across multipliers."""
+    graph = _fixture_graph()
+    _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest_path)
+    planner = ScenicRoutePlanner(graph=compact)
+
+    start = (42.0, -72.0)
+    end = (42.1, -72.1)
+    policy = resolve_routing_policy(scenic_weight=0.8, kappa=1.8, avoid_highways=False)
+    request = planner._build_endpoint_access_request(start, end, avoid_highways=False)
+    assert request is not None
+    ranked = planner._multi_access_builtin_path(
+        request.overlay,
+        request.start_projections,
+        request.end_projections,
+        planner._make_fastest_cost_function(),
+        request.direct_candidates,
+    )
+    assert ranked is not None
+    fastest_edges = list(ranked[1])
+    fastest_eval = evaluate_path(fastest_edges, q=0.8, kappa=1.8, fastest_duration_minutes=ranked[0], policy=policy)
+
+    calc_calls = 0
+    dur_calls = 0
+
+    orig_calc = ScenicCostFunction.calculate
+    orig_dur = ScenicRoutePlanner._edge_duration_minutes
+
+    def spy_calc(self_sf, edge):
+        nonlocal calc_calls
+        calc_calls += 1
+        return orig_calc(self_sf, edge)
+
+    def spy_dur(*args, **kwargs):
+        nonlocal dur_calls
+        dur_calls += 1
+        return orig_dur(args[-1])
+    monkeypatch.setattr(ScenicCostFunction, "calculate", spy_calc)
+    monkeypatch.setattr(ScenicRoutePlanner, "_edge_duration_minutes", spy_dur)
+
+    edges, eval_res, diag = planner._compact_lagrangian_scenic_search(
+        request,
+        q=0.8,
+        kappa=1.8,
+        fastest_duration_minutes=ranked[0],
+        duration_cap_minutes=ranked[0] * 1.8,
+        policy=policy,
+        fastest_edges=fastest_edges,
+        fastest_evaluation=fastest_eval,
+    )
+
+    # In 4 multiplier iterations:
+    # - Precomputing fastest_edges base scalar & duration takes len(fastest_edges) calls (not 4 * len(fastest_edges)).
+    # - Precomputing direct_candidates base scalar & duration takes len(direct_candidates) calls (not 4 * len(direct_candidates)).
+    # - Path metrics for final path evaluation in loop take 1 call per path edge per multiplier result.
+    # Since there are 4 multipliers, 4 * len(fastest_edges) without precomputing would be 4 calls for fastest_edges limit alone.
+    # With precomputing, fastest_edges scalar limit is computed ONCE (1 call), plus 1 call for winning path metric = 2 total calc_calls for fastest path edges!
+    assert calc_calls < 4 * len(fastest_edges) + len(request.direct_candidates) + 4
+    assert len(edges) > 0
 def test_compact_include_baseline_runs_one_native_search(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

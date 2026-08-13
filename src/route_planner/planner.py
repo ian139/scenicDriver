@@ -5122,6 +5122,33 @@ class ScenicRoutePlanner:
         multipliers = (0.0, 0.25, 0.75, 1.5)
         weight_data = None if data is None else data.weights
         travel_time = topology.travel_time_minutes
+        avoids_highways = self._avoids_highways(scenic_cost)
+        fastest_base_scalar = sum(
+            scenic_cost.calculate(edge) for edge in fastest_edges
+        )
+        fastest_duration_sum = float(
+            sum(self._edge_duration_minutes(edge) for edge in fastest_edges)
+        )
+        precomputed_direct_candidates = []
+        for start_index, end_index, direction, edge in request.direct_candidates:
+            if avoids_highways and is_highway_road_type(edge.road_type):
+                precomputed_direct_candidates.append(
+                    (start_index, end_index, direction, edge, True, 0.0, 0.0)
+                )
+            else:
+                base_cost = scenic_cost.calculate(edge)
+                duration = self._edge_duration_minutes(edge)
+                precomputed_direct_candidates.append(
+                    (
+                        start_index,
+                        end_index,
+                        direction,
+                        edge,
+                        False,
+                        base_cost,
+                        duration,
+                    )
+                )
         for multiplier in multipliers:
             check_graph()
 
@@ -5138,9 +5165,7 @@ class ScenicRoutePlanner:
                     + m * self._edge_duration_minutes(edge)
                 )
 
-            scalar_cost_limit = sum(
-                scalar_edge_cost(edge) for edge in fastest_edges
-            )
+            scalar_cost_limit = fastest_base_scalar + multiplier * fastest_duration_sum
             if not math.isfinite(scalar_cost_limit):
                 scalar_cost_limit = None
             forward_seeds, reverse_seeds = self._endpoint_access_seeds(
@@ -5166,14 +5191,19 @@ class ScenicRoutePlanner:
             path, rank_key = result
             best = (self._path_duration_minutes(path), path, rank_key)
             best_metric = sum(scalar_edge_cost(edge) for edge in path)
-            for start_index, end_index, direction, edge in request.direct_candidates:
+            for (
+                start_index,
+                end_index,
+                direction,
+                edge,
+                is_avoided,
+                base_cost,
+                duration,
+            ) in precomputed_direct_candidates:
                 _check_active_deadline_at(start_index + end_index)
-                if self._avoids_highways(scenic_cost) and is_highway_road_type(
-                    edge.road_type
-                ):
+                if is_avoided:
                     continue
-                duration = self._path_duration_minutes([edge])
-                metric = scalar_edge_cost(edge)
+                metric = base_cost + multiplier * duration
                 direct_rank_key = (start_index, end_index, 2, direction, ())
                 if (metric, direct_rank_key) < (best_metric, best[2]):
                     best = (duration, [edge], direct_rank_key)
