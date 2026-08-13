@@ -5213,7 +5213,7 @@ class ScenicRoutePlanner:
             ) -> Tuple[int, Optional[Tuple[List[Edge], PathEvaluation]]]:
                 return idx, _search_multiplier(m)
 
-            with ThreadPoolExecutor(max_workers=3) as executor:
+            with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [
                     executor.submit(copy_context().run, _worker, i, m)
                     for i, m in enumerate(multipliers)
