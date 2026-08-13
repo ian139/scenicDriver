@@ -3540,7 +3540,7 @@ def test_compact_comparator_alloc_failure_preserves_minus_one_and_frees_scratch(
         control_rss,
     )
 
-def test_compact_lagrangian_two_worker_overlap(
+def test_compact_lagrangian_three_worker_overlap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import time
@@ -3591,7 +3591,7 @@ def test_compact_lagrangian_two_worker_overlap(
         route = planner.find_scenic_route(start, end, scenic_weight=0.8)
 
     assert route is not None
-    assert max_active_workers == 2
+    assert max_active_workers == 3
     assert saw_active_deadline
     assert all(saw_active_deadline)
 
