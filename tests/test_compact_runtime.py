@@ -1050,7 +1050,6 @@ def test_compact_no_scan_no_copy_and_compiled_traversal(
 ) -> None:
     """Verify offline metadata speed bound, zero-copy prewarm, and C search parity."""
     import json
-    import numpy as np
     graph = _fixture_graph()
     sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
     with open(manifest_path, "r", encoding="utf-8") as f:
@@ -2511,7 +2510,6 @@ def _native_library():
 def _native_cost_spec(planner) -> object:
     """Replicate the wrapper's CostSpec construction for the fastest
     cost function, so native-level probes exercise the same parameters."""
-    import ctypes as _ctypes
 
     from src.route_planner._compact_search import _CostSpec
 
@@ -2547,7 +2545,6 @@ def _native_cost_spec(planner) -> object:
 def _scenic_cost_spec() -> object:
     """CostSpec matching ScenicRoutePlanner._make_cost_function(0.8) on a
     default-weights planner (travel_time=1, scenic_reward=1)."""
-    import ctypes as _ctypes
 
     from src.route_planner._compact_search import _CostSpec
 
@@ -3049,7 +3046,6 @@ def test_compact_native_rejects_absurd_graph_metadata(
 ) -> None:
     """Zero or unrepresentable node counts must fail with generic -1 before
     any per-node allocation is attempted."""
-    import ctypes as _ctypes
 
     lib = _native_library()
     graph = _fixture_graph()

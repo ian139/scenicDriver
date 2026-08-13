@@ -6,6 +6,167 @@ Retain the bounded scenic scalar traversal implemented in `86bbfde3` and merged 
 
 Do not retain the later incumbent-bound, precomputed-sum, or sparse-transpose experiments. Do not begin frontier pruning, CCH, or MLD work without new profiler evidence that the retained implementation still has a material scalar-traversal bottleneck.
 
+## Northeast Expanded uncached exact-search campaign
+
+### Decision and stop condition
+
+The 2026-08-12 follow-up did **not** meet the target of a median uncached
+complete `plan_routes` request below 20 seconds. The experiment cap stopped
+the campaign after one immutable baseline and eleven measured candidates.
+Retain only bounded two-worker execution of the four independent native
+Lagrangian multiplier searches (`ae06d45e`, acceptance record `eabe78b5`).
+Its isolated three-run median was 62.682 seconds, 18.03% below the fresh
+76.470-second baseline. Every rejected candidate was removed from the retained
+tree.
+
+The required five-run confirmation produced
+`82.3048, 114.4851, 92.0760, 70.9841, 61.6257` seconds: median 82.3048,
+minimum 61.6257, maximum 114.4851, median CPU 120.2403 seconds, and peak RSS
+12.834 GiB. This is a 7.63% regression from the fresh baseline, not success.
+The confirmation was sequential and cache-empty, but the host load averages
+were `16.95, 31.52, 30.53`; the wide distribution is therefore retained as
+honest same-host evidence rather than replaced by the best isolated candidate
+result.
+
+The three fresh preload processes took `54.9429, 24.3246, 25.2018` seconds
+(median 25.2018, median CPU 18.0786 seconds). The in-process session preload
+took 18.1814 seconds and recorded 502,630 minor faults and no major faults.
+One repeated identical response-cache hit took 0.2663 seconds and is reported
+only as operational cache evidence; it is not an uncached-search improvement.
+
+### Immutable workload and identities
+
+| Item | Value |
+|---|---|
+| Experiment baseline | `6e0a5e58ed65580bc2b5a0454595f32bb3196401` |
+| Final measured tree | `3608c246a9828524901ce63581269ce80ed4f27d` plus test-only cache assertions |
+| Graph SHA-256 | `26c5a61392a83056729848f3f12cf898e2a1f5a2e5cb71ecd909f588ff8b4195` |
+| Report SHA-256 | `eb656ca4abf5e1cc1b9b53849ddf3f94a3e3d323b81cf0609a89a999dd0b51ff` |
+| Native library SHA-256 | `62f0f232b2743ace1d693df82438f403f64b8f2f35d10542b842532b22358cb8` |
+| Request | Burlington `(44.475884, -73.214003)` → Pittsburgh `(40.44062, -79.99589)` |
+| Policy | `q=0.8`, `kappa=1.8`, highways allowed, baseline included, 1.0 km snap limit |
+| Deadline / cache policy | 120 seconds; complete response cache cleared before every uncached run |
+| Host | Apple M2 Max, 12 logical CPUs, 32 GiB RAM, macOS 26.5.1 |
+| Runtime | Python 3.11.14; Apple clang 17.0.0; native `-O3 -shared -fPIC` |
+
+The harness verifies the pinned graph and report hashes before loading,
+performs one uncached warm-up, clears the complete response cache, executes the
+normal scenic-plus-baseline service path, and compares every response with the
+pinned oracle. It never self-seeds a missing oracle.
+
+### Baseline and retained candidate
+
+| Measurement | Wall distribution | CPU median | Peak RSS |
+|---|---:|---:|---:|
+| Fresh uncached baseline | `76.4699, 78.9445, 74.2697 s` | 75.6767 s | 15.320 GiB |
+| Retained two-worker candidate | `60.8398, 62.6824, 65.7794 s` | 103.0387 s | 14.223 GiB |
+| Five-run final confirmation | `82.3048, 114.4851, 92.0760, 70.9841, 61.6257 s` | 120.2403 s | 12.834 GiB |
+
+The retained change overlaps two independent native multiplier searches at a
+time, propagates the request `ContextVar` into each worker, joins all futures
+on success or failure, and restores results to original multiplier order. It
+does not change the multiplier set, costs, legal search space, endpoint seeds,
+or candidate comparison order. Four-worker and three-worker variants were
+rejected: more overlap increased total CPU and was unstable under host
+contention.
+
+### Semantic oracle
+
+All completed measured requests matched
+`226c52550ba6c0a91ad6ca54969422e2a946a1b3cb7189b7715542388896ef28`.
+That normalized response covers ordered edge and traversal IDs, full segment
+identity (direction, source fraction, endpoints, and scores), requested and
+snapped coordinates, geometry, route metrics, objective components, cap and
+bounds, exactness, score mapping, and deterministic order.
+
+The scenic result has 9,779 ordered edges/traversals (edge-list SHA-256
+`184b9ca5f1cd0b71d53222487269c1f3a316b6c089a00eaf9113e4853dd8ee94`,
+traversal-list SHA-256
+`46862a2ba46a9b7cf88590eeeac3f6a5c21fdf18a4f862de41a89faa8cdeaf7b`);
+distance 937.700507 km; duration 600.727441 minutes; normalized scenic score
+0.2995467594; objective 0.2995467594; certified upper bound 1.0; optimality
+gap 0.7004532406; status `approximate-certified`.
+
+The exact baseline has 9,747 ordered edges/traversals (edge-list SHA-256
+`40243dafeae778ab3065480f87f7f469d66761da30f67801440c3a696fe8ec4a`,
+traversal-list SHA-256
+`38cadb8d357610f46b018cd5452fd861abcf1f14a011c837087ac9b359d5deaa`);
+distance 937.181596 km; duration 598.975765 minutes; normalized scenic score
+0.2983780611; status `exact`. Both routes retain snapped start
+`(44.47588398089589, -73.21400352711352)` and snapped end
+`(40.44063269795303, -79.99592276294266)`. Native/Python route ordering,
+deadline propagation, cancellation, exception cleanup, and sequential fallback
+are covered by focused compact-runtime and cancellation checks.
+
+### Measured experiment ledger
+
+| Run | One hypothesis | Median | Disposition |
+|---:|---|---:|---|
+| 111 | Immutable cache-empty baseline | 76.470 s | Baseline |
+| 112 | Pack heap rank pair into one `uint64_t` | timeout | Reject: warm-up exceeded deadline |
+| 113 | Skip relaxations already above finite incumbent | 97.403 s | Reject: 27.4% slower |
+| 114 | Geodesic scalar completion bound | 113.276 s | Reject: 48.1% slower |
+| 115 | Two concurrent native multiplier searches | 62.682 s | **Retain:** 18.03% faster |
+| 116 | Four concurrent multiplier searches | 59.673 s | Reject: 4.8% below retained, within 8.13-second spread; CPU +39% |
+| 117 | Hash compact payload and source concurrently | 76.426 s | Reject: 1.1% preload gain, search regression/variance |
+| 118 | Reject cost/rank-dominated label before path allocation | 64.142 s | Reject: 2.3% slower than retained |
+| 119 | Three concurrent multiplier searches | timeout | Reject: warm-up exceeded deadline |
+| 120 | Remove post-preflight per-relaxation rank checks | 62.377 s | Reject: 0.49% gain within 15.81-second spread |
+| 121 | Reuse path-comparator scratch buffers | 76.570 s | Reject: 22.2% slower than retained |
+| 122 | Reuse native workspaces with generation counters | timeout | Reject: warm-up exceeded deadline |
+
+Unmeasured after the cap: a bitwise-verified shared multiplier-invariant
+base-cost sidecar (about 509 MiB/request) and additional exact index designs.
+They were not retained without production timings.
+
+### Ranked research matrix
+
+| Rank / family | Mechanism and profile evidence | Exactness; dynamic-cost and endpoint compatibility | Preprocess / disk / RAM / request allocation | Expected effect / complexity | Verification, artifact impact, and operational risk | Recommendation |
+|---|---|---|---|---|---|---|
+| 1. Exact customizable indexes | CCH/MLD/partitions reduce the native search that dominated samples | Exact after per-policy customization; overlays need explicit connector search and stable reconstruction | Large offline preprocess and new mapped sections; material disk/RAM; low request allocation | Only family plausibly capable of the remaining >3× reduction; high complexity | Differential route/tie corpus plus customization proofs; graph/deployment schema change and production generation required | **Approval-gated pursue** |
+| 2. ALT/directed landmarks | Stronger admissible lower bounds reduce settled labels; current straight-line bound candidate regressed | Exact admissible potentials possible for dynamic costs using safe lower envelopes; overlay seeds add potential offsets | Offline landmark distances, substantial disk/mmap RAM, small request vectors | Profile-backed potential >5%; high design complexity | Prove consistency for highway/scenic formulas and exact meeting termination; artifact format change | **Approval-gated design** |
+| 3. Two-worker Lagrangian execution | Overlap four independent native calls; measured 18.03% isolated gain | Byte-identical multiplier set and ordered results; overlays are immutable/shared | No preprocess/disk; shared graph; existing per-search allocations; higher CPU | Material wall gain; moderate lifecycle complexity | Ordering, exception, deadline, cancellation, two-request tests; scheduler contention risk | **Retain** |
+| 4. Shared base-cost sidecar | Compute multiplier-invariant cost once instead of four graph scans; native search dominates | Bitwise operation-order proof; supports rank sidecar, highway modes, and overlay seeds | One streaming pass; no disk; about 509 MiB/request | Estimated 5–15%; moderate ABI/planner work | 480 bitwise cost cases and route parity passed in lane; unmeasured before cap, added RSS | Defer to next campaign |
+| 5. Heap/frontier layout | Reduce comparator branches, record footprint, and cache misses; prior samples attributed 57.5% to heap pop | Comparator must retain distance, rank pair, path key, sequence exactly | No preprocess/disk; heap-only RAM | Prior aligned/comparator work helped; new packed rank timed out | Strict differential equal-cost/tie tests and assembly/profile inspection | Defer pending fresh counter profile |
+| 6. Bidirectional termination/balance | Change expansion balance or strengthen exact meeting bounds | Existing `top_f + top_r > best` is exact; dynamic costs and overlays supported | No persistent cost | Instrumented fixtures showed identical pop/relax sets; near 0% expected | Meeting-node/edge and tie reconstruction are high-risk | Reject balance-only changes |
+| 7. Incumbent pruning | Skip relaxations whose accumulated one-sided cost exceeds incumbent | Mathematically exact with nonnegative costs; overlay-compatible | No preprocess/disk/RAM | Measured 27.4% regression | Route/tie parity passed; added branch cost dominated | Reject |
+| 8. Runtime geodesic bound | Add admissible destination completion lower bound | Exact safe speed/cost floor; supports policies and overlays when seeded correctly | Per-request node-sized bound arrays and scans | Measured 48.1% regression | Parity passed; allocation/random reads outweighed pruning | Reject |
+| 9. Reusable request state | Generation stamps avoid repeated clears/allocations | Exact if every read is generation-gated; concurrent requests require isolated workspaces | No disk; retains large per-thread buffers | Expected >5%, but production warm-up timed out | Lifecycle, graph switch, wrap, timeout, cancellation tests passed; idle RSS and coupling risk | Reject implementation |
+| 10. Score/rank indirection | Validate rank table once, then direct-index score sidecar | Exact after exhaustive immutable preflight; all policies/overlays compatible | No persistent/request cost | Measured 0.49%, below noise | Corruption must fail before allocation; focused malformed-rank tests | Reject |
+| 11. Endpoint projection/seeds | Reuse projection BVH results and canonical seed sorting | Must preserve every legal direction, source fraction, rank, and direct candidate | Existing 3.07 GB mmap sidecar; small request objects | Endpoint diagnostics were not dominant; <5% expected | Oracle pins snapped endpoints and segment identities; stale index risk | Defer |
+| 12. Graph load/mmap | Parallel hashes, alignment, prefaulting, zero-copy sections | Search semantics unaffected if identities/hashes stay fail-closed | Existing mapped payloads; no format change for scheduling-only work | Parallel hash: 1.1% preload gain and unstable search | Hash/source ordering, cancellation, cleanup, RSS checks | Reject measured candidate |
+| 13. Path comparator allocation | Reuse exact lexicographic materialization buffers | Exact per-search scratch preserves path order and concurrency | No disk; small geometric scratch | Measured 22.2% regression | Deep-prefix, allocation-failure, and multithread tests passed | Reject |
+| 14. Early label/path allocation | Compare cost and seed rank before materializing path records | Exact only when full path-key tie remains deferred to original comparator | No persistent cost; fewer arena writes | Measured 2.3% regression | Equal-cost/tie/native parity passed | Reject |
+| 15. Native/Python boundary | Batch immutable inputs and avoid repeated marshalling | Exact and overlay-compatible; C ABI must remain fail-closed | No preprocess/disk; small wrappers | ctypes entry/exit was minor relative to native search; <5% | ABI probes, malformed pointers, Python/native parity | Defer |
+| 16. Cancellation polling/compiler | Reduce clock checks or enable vectorization without weakening deadlines | Poll cadence is observable cancellation behavior; costs and tie order fixed | No persistent cost | Polling not a dominant sample; <5% | Strict `-Wall -Wextra -Werror`, deadline latency, generated assembly | Reject without new evidence |
+| 17. Reconstruction/response construction | Reduce ordered edge lookup and serialization work | Must retain geometry, IDs, metrics, and deterministic order | No preprocess; response-sized allocations | Planning/search dominates; <5% expected | Complete response oracle catches drift; cache-hit path is out of scope | Defer |
+| 18. Safe wider concurrency | Run 3–4 multipliers simultaneously | Exact ordered join possible; immutable graph shared | No disk; duplicated search state and CPU/RSS | Four workers only 4.8% below retained within noise; three workers timed out | Two concurrent API requests, cancellation latency, CPU/RSS required | Reject beyond two |
+
+### Verification and remaining bottleneck
+
+The affected verification set comprises 491 unique compact-runtime, planner,
+route-oracle, cancellation, API, benchmark, route-service, and artifact tests.
+An initial combined run exposed one load-sensitive frontier stress timeout and
+three stale response-cache test assumptions. The stress case passed in
+isolation; the cache tests now clear the complete-response cache when
+intentionally changing mocked endpoint state and assert truthful response-hit
+diagnostics. The two affected modules then passed 110/110. Native C compiled
+cleanly with `clang -O3 -shared -fPIC -Wall -Wextra -Werror`.
+Independent review of the retained implementation, tests, benchmark, and
+evidence passed with no findings and confirmed that every rejected candidate
+was absent. Residual risks are scheduler/host-load variance and the pre-existing
+fact that a Python cancellation event cannot interrupt a native call until it
+returns or its native deadline poll fires.
+
+The remaining bottleneck is the exact native compact Lagrangian traversal, not
+preload or the Python boundary. Sampling attributed about 89.6% of request
+samples to native compact search and about 57.5% of total samples to heap pop.
+No remaining non-artifact method had measured evidence for a repeatable 5%
+gain when the cap fired. The next plausible step is approval-gated exact
+precomputed index design and production artifact generation; approximation,
+reduced multipliers/seeds, cost changes, tie changes, dependency additions,
+deployment changes, and remote compute were not attempted.
+
 ## Northeast Expanded exact warm-request study
 
 ### Decision

@@ -219,6 +219,7 @@ def test_plan_routes_uses_unrestricted_baseline_for_filtered_scenic_cap(
             self.calls.append(("fastest", bool(kwargs["avoid_highways"])))
             return route(10.0, 8.0, 4.0)
 
+    route_service.clear_route_caches()
     monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
     request = route_service.RouteRequest(
         graph_geojson=str(graph_path),
@@ -862,9 +863,10 @@ def test_plan_routes_caches_graph_and_tile_parsing_and_preserves_response_shape(
         "routes",
         "geojson",
     }
-    assert second["diagnostics"]["graph_cache_hit"] is True
-    assert second["diagnostics"]["tile_score_cache_hit"] is True
-    assert second["diagnostics"]["scored_graph_cache_hit"] is True
+    assert second["diagnostics"]["route_response_cache_hit"] is True
+    assert second["diagnostics"]["graph_cache_hit"] is False
+    assert second["diagnostics"]["tile_score_cache_hit"] is False
+    assert second["diagnostics"]["scored_graph_cache_hit"] is False
     assert second["score_mapping"] == first["score_mapping"]
 
 
@@ -1133,6 +1135,7 @@ def test_plan_routes_accepts_snap_limit_boundary_and_rejects_coverage(
         "_endpoint_snap_diagnostics",
         lambda graph, request, **kwargs: dict(over_limit),
     )
+    route_service.clear_route_response_cache()
     with pytest.raises(route_service.RouteCoverageError) as caught:
         route_service.plan_routes(
             route_service.RouteRequest(
