@@ -5,7 +5,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
 import heapq
 import math
@@ -5215,7 +5215,7 @@ class ScenicRoutePlanner:
 
             with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [
-                    executor.submit(_worker, i, m)
+                    executor.submit(copy_context().run, _worker, i, m)
                     for i, m in enumerate(multipliers)
                 ]
                 for future in concurrent.futures.as_completed(futures):

@@ -3560,12 +3560,16 @@ def test_compact_lagrangian_two_worker_overlap(
     lock = threading.Lock()
     active_workers = 0
     max_active_workers = 0
+    saw_active_deadline: list[bool] = []
 
     orig_native_search = planner_module.run_compact_bidirectional_search
 
     def hooked_search(*args: object, **kwargs: object) -> object:
         nonlocal active_workers, max_active_workers
         with lock:
+            saw_active_deadline.append(
+                planner_module._ACTIVE_ROUTING_DEADLINE.get() is not None
+            )
             active_workers += 1
             if active_workers > max_active_workers:
                 max_active_workers = active_workers
@@ -3583,10 +3587,13 @@ def test_compact_lagrangian_two_worker_overlap(
     planner = ScenicRoutePlanner(graph=compact)
     start = (42.0, -72.0)
     end = (42.1, -72.1)
-    route = planner.find_scenic_route(start, end, scenic_weight=0.8)
+    with planner_module._routing_deadline_scope(RoutingDeadline.after(5.0)):
+        route = planner.find_scenic_route(start, end, scenic_weight=0.8)
 
     assert route is not None
     assert max_active_workers == 2
+    assert saw_active_deadline
+    assert all(saw_active_deadline)
 
 
 def test_compact_lagrangian_result_ordering_and_identical_evaluation(
