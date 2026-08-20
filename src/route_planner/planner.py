@@ -2930,9 +2930,34 @@ class ScenicRoutePlanner:
                 base_distance, base_duration, base_exposure = path_stats(
                     base_path
                 )
+                base_score = (
+                    base_exposure / base_distance
+                    if base_distance > 0.0
+                    else 0.0
+                )
                 if base_duration > duration_cap_minutes + 1e-12:
                     continue
                 indexed_edges = list(enumerate(base_path[:64]))
+                edge_metrics: Dict[str, tuple[float, float, float]] = {}
+
+                def metric(edge: Edge) -> tuple[float, float, float]:
+                    identity = str(
+                        getattr(edge, "traversal_id", "") or edge.id
+                    )
+                    cached = edge_metrics.get(identity)
+                    if cached is not None:
+                        return cached
+                    distance = self._validated_nonnegative(
+                        edge.distance_km, "edge distance_km"
+                    )
+                    result = (
+                        distance,
+                        self._edge_duration_minutes(edge),
+                        distance * clamp_scenic_score(edge.scenic_score) / 10.0,
+                    )
+                    edge_metrics[identity] = result
+                    return result
+
                 alternatives: List[List[Edge]] = []
                 for _, edge in indexed_edges:
                     current_identity = str(
@@ -2947,19 +2972,13 @@ class ScenicRoutePlanner:
                             if str(alternative.end_node_id)
                             == str(edge.end_node_id)
                             and str(
-                                getattr(
-                                    alternative,
-                                    "traversal_id",
-                                    "",
-                                )
+                                getattr(alternative, "traversal_id", "")
                                 or alternative.id
                             )
                             != current_identity
                             and not (
                                 avoid_highways
-                                and is_highway_road_type(
-                                    alternative.road_type
-                                )
+                                and is_highway_road_type(alternative.road_type)
                             )
                         ]
                     )
@@ -2979,24 +2998,28 @@ class ScenicRoutePlanner:
                                     break
                                 if expired():
                                     break
+                                left_distance, left_duration, left_exposure = metric(
+                                    left_alternative
+                                )
+                                right_distance, right_duration, right_exposure = metric(
+                                    right_alternative
+                                )
+                                old_left = metric(left_edge)
+                                old_right = metric(indexed_edges[right_index][1])
+                                distance = base_distance + left_distance + right_distance - old_left[0] - old_right[0]
+                                duration = base_duration + left_duration + right_duration - old_left[1] - old_right[1]
+                                exposure = base_exposure + left_exposure + right_exposure - old_left[2] - old_right[2]
+                                if (
+                                    duration > duration_cap_minutes + 1e-12
+                                    or distance <= 0.0
+                                    or exposure / distance <= base_score + 1e-12
+                                ):
+                                    continue
                                 candidate = list(base_path)
                                 candidate[left_index] = left_alternative
                                 candidate[right_index] = right_alternative
-                                distance, duration, exposure = path_stats(
-                                    candidate
-                                )
-                                if (
-                                    duration
-                                    > duration_cap_minutes + 1e-12
-                                    or distance <= 0.0
-                                ):
-                                    continue
+                                distance, duration, exposure = path_stats(candidate)
                                 score = exposure / distance
-                                base_score = (
-                                    base_exposure / base_distance
-                                    if base_distance > 0.0
-                                    else 0.0
-                                )
                                 if score <= base_score + 1e-12:
                                     continue
                                 pair_candidates.append((score, candidate))
@@ -3004,14 +3027,7 @@ class ScenicRoutePlanner:
                                     key=lambda item: (
                                         -item[0],
                                         tuple(
-                                            str(
-                                                getattr(
-                                                    edge,
-                                                    "traversal_id",
-                                                    "",
-                                                )
-                                                or edge.id
-                                            )
+                                            str(getattr(edge, "traversal_id", "") or edge.id)
                                             for edge in item[1]
                                         ),
                                     )
