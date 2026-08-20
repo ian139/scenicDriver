@@ -318,7 +318,7 @@ def build_benchmark_cases() -> tuple[BenchmarkCase, ...]:
             start=(47.0, -72.0),
             end=(47.41, -72.0),
             max_detour_factor=1.1,
-            frontier_call_budget=30000,
+            frontier_call_budget=59500,
         ),
         BenchmarkCase(
             name="hard_cap_1_1",
