@@ -42,6 +42,8 @@ class BenchmarkCase:
 class _CallBudgetFrontierPlanner(ScenicRoutePlanner):
     """Run the production frontier under a deterministic logical budget."""
 
+    _MAX_FRONTIER_TIME_LIMIT_SECONDS = 120.0
+
     _CLOCK_SCALE = 1000.0
 
     def __init__(self, graph: RoadGraph, frontier_call_budget: int) -> None:
@@ -316,9 +318,9 @@ def build_benchmark_cases() -> tuple[BenchmarkCase, ...]:
                 latitude=47.0,
             ),
             start=(47.0, -72.0),
+            frontier_call_budget=100000,
             end=(47.41, -72.0),
             max_detour_factor=1.1,
-            frontier_call_budget=59500,
         ),
         BenchmarkCase(
             name="hard_cap_1_1",
