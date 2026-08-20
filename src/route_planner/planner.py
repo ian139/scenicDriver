@@ -2875,7 +2875,16 @@ class ScenicRoutePlanner:
             ):
                 add_path(path)
         if duration_cap_minutes is not None and paths:
+            stats_cache: Dict[Tuple[str, ...], tuple[float, float, float]] = {}
+
             def path_stats(path: List[Edge]) -> tuple[float, float, float]:
+                identity = tuple(
+                    str(getattr(edge, "traversal_id", "") or edge.id)
+                    for edge in path
+                )
+                cached = stats_cache.get(identity)
+                if cached is not None:
+                    return cached
                 distance = 0.0
                 duration = 0.0
                 exposure = 0.0
@@ -2892,7 +2901,9 @@ class ScenicRoutePlanner:
                         * clamp_scenic_score(edge.scenic_score)
                         / 10.0
                     )
-                return distance, duration, exposure
+                result = (distance, duration, exposure)
+                stats_cache[identity] = result
+                return result
 
             pair_candidates: List[tuple[float, List[Edge]]] = []
             pair_budget = 20_000
