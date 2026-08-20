@@ -3645,7 +3645,7 @@ class ScenicRoutePlanner:
             certified_upper_bound = float(
                 getattr(incumbent_evaluation, "objective")
             )
-            for live_id in active:
+            for live_id in sorted(active):
                 certified_upper_bound = max(
                     certified_upper_bound, upper_bound(labels[live_id])
                 )
