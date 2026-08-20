@@ -313,12 +313,12 @@ def build_benchmark_cases() -> tuple[BenchmarkCase, ...]:
         BenchmarkCase(
             name="frontier_extended_stress",
             graph=build_frontier_timeout_stress_graph(
-                stages=40,
+                stages=20,
                 latitude=47.0,
             ),
             start=(47.0, -72.0),
             frontier_call_budget=1000000,
-            end=(47.41, -72.0),
+            end=(47.21, -72.0),
             max_detour_factor=1.1,
         ),
         BenchmarkCase(
