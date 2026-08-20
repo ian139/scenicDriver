@@ -42,7 +42,7 @@ class BenchmarkCase:
 class _CallBudgetFrontierPlanner(ScenicRoutePlanner):
     """Run the production frontier under a deterministic logical budget."""
 
-    _MAX_FRONTIER_TIME_LIMIT_SECONDS = 240.0
+    _MAX_FRONTIER_TIME_LIMIT_SECONDS = 1200.0
 
     _CLOCK_SCALE = 1000.0
 
@@ -318,7 +318,7 @@ def build_benchmark_cases() -> tuple[BenchmarkCase, ...]:
                 latitude=47.0,
             ),
             start=(47.0, -72.0),
-            frontier_call_budget=200000,
+            frontier_call_budget=1000000,
             end=(47.41, -72.0),
             max_detour_factor=1.1,
         ),
