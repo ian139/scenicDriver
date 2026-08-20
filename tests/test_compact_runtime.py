@@ -975,7 +975,9 @@ def _grid_graph() -> RoadGraph:
     return graph
 
 
-def test_compact_frontier_search_path(tmp_path: Path) -> None:
+def test_compact_frontier_search_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The deadline-bounded frontier search works on a compact base graph."""
     graph = _grid_graph()
     sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
@@ -983,9 +985,9 @@ def test_compact_frontier_search_path(tmp_path: Path) -> None:
     assert compact.node_count == 16
     assert compact.traversal_count == 48
 
-    ScenicRoutePlanner._LARGE_GRAPH_EDGE_THRESHOLD = 2
-    ScenicRoutePlanner._ENDPOINT_OVERLAY_MAX_NODES = 2
-    ScenicRoutePlanner._COMPILED_SCENIC_MIN_NODES = 10**9
+    monkeypatch.setattr(ScenicRoutePlanner, "_LARGE_GRAPH_EDGE_THRESHOLD", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_ENDPOINT_OVERLAY_MAX_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_COMPILED_SCENIC_MIN_NODES", 10**9)
     planner = ScenicRoutePlanner(graph=compact)
     route = planner.find_scenic_route(
         (42.0, -72.0), (42.03, -71.97), scenic_weight=0.8
