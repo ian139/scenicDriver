@@ -2501,6 +2501,7 @@ class ScenicRoutePlanner:
         beam_ids = [0]
         goal_ids: List[int] = []
         next_label_id = 1
+        sorted_edges_cache: Dict[str, List[Edge]] = {}
         expanded = 0
         maximum_suffix_rate = (
             max_distance_per_minute
@@ -2555,15 +2556,19 @@ class ScenicRoutePlanner:
                     goal_ids.append(label_id)
                     continue
                 expanded += 1
-                for edge in sorted(
-                    self._iter_edges(label.node_id),
-                    key=lambda item: (
-                        -float(clamp_scenic_score(item.scenic_score)),
-                        float(self._edge_duration_minutes(item)),
-                        str(getattr(item, "traversal_id", "") or item.id),
-                        str(item.end_node_id),
-                    ),
-                ):
+                edges = sorted_edges_cache.get(label.node_id)
+                if edges is None:
+                    edges = sorted(
+                        self._iter_edges(label.node_id),
+                        key=lambda item: (
+                            -float(clamp_scenic_score(item.scenic_score)),
+                            float(self._edge_duration_minutes(item)),
+                            str(getattr(item, "traversal_id", "") or item.id),
+                            str(item.end_node_id),
+                        ),
+                    )
+                    sorted_edges_cache[label.node_id] = edges
+                for edge in edges:
                     if expired():
                         break
                     if (
