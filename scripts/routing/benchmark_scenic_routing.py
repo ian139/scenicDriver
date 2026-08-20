@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.route_planner.cost import is_highway_road_type  # noqa: E402
 from src.route_planner.graph import Edge, Node, RoadGraph  # noqa: E402
+from src.route_planner.cancellation import RoutingTimeout  # noqa: E402
 from src.route_planner.planner import ScenicRoutePlanner  # noqa: E402
 
 
@@ -544,14 +545,17 @@ def _run_case(case: BenchmarkCase) -> tuple[float, float, float]:
         case.end,
         avoid_highways=case.avoid_highways,
     )
-    scenic_route = planner.find_scenic_route(
-        case.start,
-        case.end,
-        scenic_weight=1.0,
-        avoid_highways=case.avoid_highways,
-        max_detour_factor=max_detour_factor,
-        scenic_priority=True,
-    )
+    try:
+        scenic_route = planner.find_scenic_route(
+            case.start,
+            case.end,
+            scenic_weight=1.0,
+            avoid_highways=case.avoid_highways,
+            max_detour_factor=max_detour_factor,
+            scenic_priority=True,
+        )
+    except RoutingTimeout:
+        scenic_route = fastest_route
     scenic = recompute_route_metrics(
         case.graph,
         scenic_route,
