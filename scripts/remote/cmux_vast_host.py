@@ -989,7 +989,6 @@ def workspace_closed(state: dict) -> bool:
     )
 
 def destroy_instance(state: dict) -> None:
-    require_commands(["vastai"])
     try:
         result = run_command(["vastai", "destroy", "instance", str(state["instance_id"]), "--yes"])
         if result.returncode != 0:
