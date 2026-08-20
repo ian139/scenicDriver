@@ -20,7 +20,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.route_planner.cost import is_highway_road_type  # noqa: E402
 from src.route_planner.graph import Edge, Node, RoadGraph  # noqa: E402
-from src.route_planner.cancellation import RoutingTimeout  # noqa: E402
 from src.route_planner.planner import ScenicRoutePlanner  # noqa: E402
 
 
@@ -42,8 +41,7 @@ class BenchmarkCase:
 
 class _CallBudgetFrontierPlanner(ScenicRoutePlanner):
     """Run the production frontier under a deterministic logical budget."""
-    _MAX_FRONTIER_TIME_LIMIT_SECONDS = 120.0
-    _CLOCK_SCALE = 100000.0
+    _CLOCK_SCALE = 1000.0
 
     def __init__(self, graph: RoadGraph, frontier_call_budget: int) -> None:
         if frontier_call_budget <= 0:
@@ -313,12 +311,12 @@ def build_benchmark_cases() -> tuple[BenchmarkCase, ...]:
         BenchmarkCase(
             name="frontier_extended_stress",
             graph=build_frontier_timeout_stress_graph(
-                stages=20,
+                stages=40,
                 latitude=47.0,
             ),
             start=(47.0, -72.0),
-            frontier_call_budget=1000000,
-            end=(47.21, -72.0),
+            frontier_call_budget=30000,
+            end=(47.41, -72.0),
             max_detour_factor=1.1,
         ),
         BenchmarkCase(
@@ -543,17 +541,14 @@ def _run_case(case: BenchmarkCase) -> tuple[float, float, float]:
         case.end,
         avoid_highways=case.avoid_highways,
     )
-    try:
-        scenic_route = planner.find_scenic_route(
-            case.start,
-            case.end,
-            scenic_weight=1.0,
-            avoid_highways=case.avoid_highways,
-            max_detour_factor=max_detour_factor,
-            scenic_priority=True,
-        )
-    except RoutingTimeout:
-        scenic_route = fastest_route
+    scenic_route = planner.find_scenic_route(
+        case.start,
+        case.end,
+        scenic_weight=1.0,
+        avoid_highways=case.avoid_highways,
+        max_detour_factor=max_detour_factor,
+        scenic_priority=True,
+    )
     scenic = recompute_route_metrics(
         case.graph,
         scenic_route,
