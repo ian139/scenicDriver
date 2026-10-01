@@ -117,8 +117,10 @@ def encode_terrain_rgb(
     land_bool = (
         np.ones(dem_arr.shape, dtype=bool)
         if land_mask is None
-        else np.asarray(land_mask, dtype=bool)
+        else np.asarray(land_mask)
     )
+    if land_bool.dtype != np.bool_:
+        raise TypeError("land_mask must have boolean dtype")
     if land_bool.shape != dem_arr.shape:
         raise ValueError("land_mask shape must match the DEM")
     land_values = dem_arr[land_bool]
@@ -216,7 +218,9 @@ def rasterize_land_geometry(land_geometry: Any, target_grid: TargetGrid) -> np.n
     if isinstance(land_geometry, np.ndarray):
         if land_geometry.shape != (height, width):
             raise ValueError("land mask shape must match the target grid")
-        return land_geometry.astype(bool, copy=True)
+        if land_geometry.dtype != np.bool_:
+            raise TypeError("land mask must have boolean dtype")
+        return land_geometry.copy()
 
     if isinstance(land_geometry, dict):
         geom = shapely.geometry.shape(land_geometry)
@@ -376,11 +380,12 @@ def process_imagery(
     min_land_variance: float = 0.0,
     reject_all_black: bool = True,
     reject_all_white: bool = True,
-) -> tuple[np.ndarray, dict[str, Any]]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """
     Reprojects and mosaics local imagery source files into uint8 RGB array (shape (3, H, W)).
     Validates zero no-data pixels on land; fills outside-land with fill_value after masking.
-    Returns (rgb_array, qc_stats_dict).
+    Returns (rgb_array, land_mask, qc_stats_dict). The boolean (H, W) mask
+    must accompany the imagery downstream; black outside-land fill is sea.
     """
     validated_paths = [validate_local_path(p) for p in source_paths]
     if not validated_paths:
@@ -433,15 +438,15 @@ def process_imagery(
         target_data[c, outside_land_mask] = fill_value[c]
     land_pixel_count = int(np.sum(land_mask))
 
-    land_data = target_data[:, land_mask] if land_pixel_count > 0 else target_data
-    land_variance = float(np.var(land_data.astype(np.float64)))
-    if reject_all_black and bool(np.all(land_data == 0)):
+    land_data = target_data[:, land_mask]
+    land_variance = float(np.var(land_data.astype(np.float64))) if land_pixel_count else 0.0
+    if land_pixel_count and reject_all_black and bool(np.all(land_data == 0)):
         raise ValueError("Satellite tile is all black over land")
-    if reject_all_white and bool(np.all(land_data == 255)):
+    if land_pixel_count and reject_all_white and bool(np.all(land_data == 255)):
         raise ValueError("Satellite tile is all white over land")
     if not np.isfinite(min_land_variance) or min_land_variance < 0:
         raise ValueError("min_land_variance must be finite and non-negative")
-    if land_variance < min_land_variance:
+    if land_pixel_count and land_variance < min_land_variance:
         raise ValueError(
             "Satellite tile land variance "
             f"{land_variance:.6f} is below {min_land_variance:.6f}"
@@ -483,7 +488,7 @@ def process_imagery(
         },
     }
 
-    return target_data, qc_stats
+    return target_data, land_mask, qc_stats
 
 
 def process_dem(
@@ -491,16 +496,16 @@ def process_dem(
     target_grid: TargetGrid,
     land_geometry: Any,
     resampling: str = "bilinear",
-    outside_land_elevation: float = -10000.0,
     mosaic_order: str = "first",
     source_vertical_datum: str | Sequence[str] | None = "NAVD88",
     target_vertical_datum: str | None = "NAVD88",
-) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """
     Reprojects float DEM sources, validates land values, encodes to Terrain-RGB uint8 array (3, H, W).
     Rejects unimplemented vertical datum transformations.
-    Fills outside-land with outside_land_elevation.
-    Returns (terrain_rgb_array, float_dem_array, qc_stats_dict).
+    Outside-land fill is always -10000m (black), reserved in persisted PNGs.
+    Returns (terrain_rgb_array, float_dem_array, land_mask, qc_stats_dict).
+    Consumers must pass the boolean (H, W) mask to terrain feature extraction.
     """
     validated_paths = [validate_local_path(p) for p in source_paths]
     if not validated_paths:
@@ -570,14 +575,14 @@ def process_dem(
             "Non-finite DEM elevation values (NaN/Inf) found on land."
         )
 
-    if np.any((land_dem_values < -10000.0) | (land_dem_values > 1667721.5)):
+    if np.any((land_dem_values <= -9999.95) | (land_dem_values > 1667721.5)):
         raise TerrainRGBRangeError(
-            f"Land elevation out of Terrain-RGB encoding bounds [-10000.0, 1667721.5]. Min: {np.min(land_dem_values)}, Max: {np.max(land_dem_values)}"
+            f"Land elevation must encode above reserved black fill (-10000m) and at most 1667721.5m. Min: {np.min(land_dem_values)}, Max: {np.max(land_dem_values)}"
         )
 
     # Fill outside-land after land validation
     outside_land_mask = ~land_mask
-    target_dem[outside_land_mask] = outside_land_elevation
+    target_dem[outside_land_mask] = -10000.0
 
     # Encode float DEM into Terrain-RGB uint8 array
     terrain_rgb = encode_terrain_rgb(target_dem, land_mask=land_mask)
@@ -617,7 +622,6 @@ def process_dem(
         },
         "parameters": {
             "resampling": resampling,
-            "outside_land_elevation": outside_land_elevation,
             "mosaic_order": mosaic_order,
             "vertical_datum": {
                 "source": source_vertical_datum,
@@ -626,4 +630,4 @@ def process_dem(
         },
     }
 
-    return terrain_rgb, target_dem, qc_stats
+    return terrain_rgb, target_dem, land_mask, qc_stats

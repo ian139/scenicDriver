@@ -6,7 +6,7 @@ import argparse
 import base64
 from dataclasses import dataclass
 import hashlib
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
@@ -75,6 +75,29 @@ def _iter_objects(s3: Any, bucket: str, prefix: str) -> Any:
         yield from page.get("Contents", [])
 
 
+def _download_target(key: str, prefix: str, root: Path) -> Path | None:
+    components = key.split("/")
+    if key.endswith("/"):
+        components = components[:-1]
+    if (
+        not key
+        or key.startswith("/")
+        or "\\" in key
+        or PureWindowsPath(key).drive
+        or any(component in {"", ".", ".."} for component in components)
+        or "\x00" in key
+        or not key.startswith(prefix)
+    ):
+        raise ValueError(f"Unsafe S3 key: {key!r}")
+    if key.endswith("/"):
+        return None
+    relative = key[len(prefix) :].removeprefix("/")
+    target = (root / relative).resolve()
+    if target == root or not target.is_relative_to(root):
+        raise ValueError(f"Unsafe S3 download target for key: {key!r}")
+    return target
+
+
 def download_prefix(
     bucket: str,
     prefix: str,
@@ -84,21 +107,21 @@ def download_prefix(
     required: bool = True,
 ) -> int:
     s3 = _client(client)
-    objects = [
-        obj
-        for obj in _iter_objects(s3, bucket, prefix)
-        if not obj.get("Key", "").endswith("/")
-    ]
-    if not objects:
+    root = dest.resolve()
+    keys: list[str] = []
+    for obj in _iter_objects(s3, bucket, prefix):
+        key = obj["Key"]
+        target = _download_target(key, prefix, root)
+        if target is not None:
+            keys.append(key)
+    if not keys:
         _missing(bucket, prefix, required=required)
         return 0
     count = 0
-    for obj in objects:
-        key = obj["Key"]
-        relative = (
-            key[len(prefix) :].lstrip("/") if key.startswith(prefix) else Path(key).name
-        )
-        target = dest / relative
+    for key in keys:
+        # Re-check after earlier downloads in case the destination has changed.
+        target = _download_target(key, prefix, root)
+        assert target is not None
         target.parent.mkdir(parents=True, exist_ok=True)
         s3.download_file(bucket, key, str(target))
         count += 1

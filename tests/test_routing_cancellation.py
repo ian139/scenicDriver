@@ -1,3 +1,6 @@
+import multiprocessing
+import os
+import signal
 from threading import Event
 
 import pytest
@@ -12,7 +15,24 @@ from src.route_planner.cancellation import (
     RoutingCancelled,
     RoutingDeadline,
     RoutingTimeout,
+    SharedCancelFlag,
 )
+
+
+def _report_flag_then_try_to_write(flag: SharedCancelFlag, conn) -> None:
+    conn.send(flag.is_set())
+    try:
+        flag.clear()
+    except RuntimeError:
+        conn.send("refused")
+    else:
+        conn.send("wrote")
+
+
+def _spin_on_flag(flag: SharedCancelFlag) -> None:
+    deadline = RoutingDeadline(cancel_event=flag)
+    while True:
+        deadline.check()
 
 
 class _CustomCancelToken:
@@ -185,3 +205,42 @@ def test_deadline_accepts_cancel_token_protocol() -> None:
 def test_cancel_token_protocol_is_runtime_checkable() -> None:
     assert isinstance(_CustomCancelToken(), CancelToken)
     assert not isinstance(object(), CancelToken)
+
+
+def test_shared_cancel_flag_is_owner_written_and_child_read_only() -> None:
+    flag = SharedCancelFlag()
+    flag.set()
+    ctx = multiprocessing.get_context("fork")
+    parent_conn, child_conn = ctx.Pipe()
+    child = ctx.Process(target=_report_flag_then_try_to_write, args=(flag, child_conn))
+    child.start()
+    try:
+        assert parent_conn.poll(5.0)
+        assert parent_conn.recv() is True
+        assert parent_conn.recv() == "refused"
+    finally:
+        child.join(timeout=5.0)
+    assert flag.is_set()
+
+
+def test_shared_cancel_flag_survives_reader_killed_mid_check() -> None:
+    flag = SharedCancelFlag()
+    ctx = multiprocessing.get_context("fork")
+    for _ in range(5):
+        child = ctx.Process(target=_spin_on_flag, args=(flag,))
+        child.start()
+        child.join(timeout=0.05)
+        os.kill(child.pid, signal.SIGKILL)
+        child.join(timeout=5.0)
+        # The owner can still write and read without any lock to recover.
+        flag.set()
+        assert flag.is_set()
+        flag.clear()
+        assert not flag.is_set()
+
+    flag.set()
+    child = ctx.Process(target=_spin_on_flag, args=(flag,))
+    child.start()
+    child.join(timeout=5.0)
+    # A reader started after cancellation observes it and exits.
+    assert child.exitcode not in (None, 0)

@@ -33,8 +33,6 @@ import msgspec
 import numpy as np
 
 _KD_SMALL_SUBTREE_CUTOFF = 32
-_EDGE_PROJECTION_CHUNK_SIZE = 65_536
-_EDGE_PROJECTION_TIE_TOLERANCE_KM = 1e-9
 _CANCELLATION_CHECK_INTERVAL = 1024
 
 
@@ -1303,8 +1301,6 @@ class EndpointRoadGraph(RoadGraph):
         """Yield request-local incoming refs without exposing mutable lists."""
         return iter(self._local_predecessors.get(node_id, ()))
 
-        self._advance_heuristic_epoch()
-
     def freeze(self) -> None:
         """Reject subsequent endpoint collection mutation."""
         self._frozen = True
@@ -1887,9 +1883,9 @@ def _graph_from_osmnx(G: Any, scenic_scores: Dict[str, float]) -> RoadGraph:
 # ---------------------------------------------------------------------------
 #
 # ``road_graph.compact.json`` is the explicit runtime entry point for large
-# graphs.  It references a little-endian binary section payload
-# (``road_graph.compact.bin``) plus the source SQLite audit artifact, and it
-# never materializes Node/Edge objects: nodes, canonical edges, and directed
+# graphs.  Its relative dependency paths reference a content-addressed immutable
+# generation containing the binary, SQLite audit snapshot, and projection index.
+# It never materializes Node/Edge objects: nodes, canonical edges, and directed
 # traversals are mmap-backed numeric/string-table arrays.  A deterministic
 # per-report score sidecar (``road_graph.compact.score.<signature>*.bin``)
 # stores scenic costs keyed by canonical edge rank.
@@ -1902,21 +1898,6 @@ _COMPACT_BIN_SUFFIX = ".compact.bin"
 _COMPACT_MANIFEST_SUFFIX = ".compact.json"
 _COMPACT_ID_CACHE_CAPACITY = 65_536
 _COMPACT_SCENIC_BYWAY_ROAD_TYPE = "scenic_byway"
-# Mirrors ``src.route_planner.cost.HIGHWAY_ROAD_TYPES``.  Both the converter
-# and the runtime derive the mask from the same module (lazy import avoids the
-# cost<->graph import cycle); the manifest records the joined set so a stale
-# artifact is rejected instead of silently re-masked.
-_COMPACT_HIGHWAY_ROAD_TYPES = frozenset(
-    {
-        "highway",
-        "motorway",
-        "motorway_link",
-        "primary",
-        "primary_link",
-        "trunk",
-        "trunk_link",
-    }
-)
 
 
 def _compact_highway_road_types() -> frozenset:
@@ -2030,6 +2011,60 @@ def _write_atomic_bytes(path: Path, payload: bytes) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def _publish_compact_generation(
+    manifest_path: Path,
+    dependencies: Mapping[str, tuple[Path, str]],
+    *,
+    check_cancelled: Callable[[], None] | None,
+) -> Path:
+    """Durably publish immutable dependencies before swapping their manifest."""
+    stem = manifest_path.name[: -len(_COMPACT_MANIFEST_SUFFIX)]
+    generation_digest = hashlib.sha256(
+        json.dumps(
+            {name: digest for name, (_path, digest) in dependencies.items()},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    generation_path = manifest_path.parent / f".{stem}.generation.{generation_digest}"
+    with tempfile.TemporaryDirectory(
+        prefix=f".{stem}.staging.", dir=manifest_path.parent
+    ) as temporary:
+        stage = Path(temporary)
+        for name, (source, expected_digest) in dependencies.items():
+            digest = hashlib.sha256()
+            with source.open("rb") as reader, (stage / name).open("xb") as writer:
+                while True:
+                    if check_cancelled is not None:
+                        check_cancelled()
+                    chunk = reader.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                    digest.update(chunk)
+                writer.flush()
+                os.fsync(writer.fileno())
+            if digest.hexdigest() != expected_digest:
+                raise ValueError(f"Compact dependency changed during publication: {source}")
+        _fsync_parent(stage / "dependency")
+        if check_cancelled is not None:
+            check_cancelled()
+        try:
+            os.rename(stage, generation_path)
+        except OSError:
+            if not generation_path.is_dir():
+                raise
+            # An identical conversion may already have published this content.
+            # Never replace it: old readers can still depend on its inodes.
+            for name, (_source, expected_digest) in dependencies.items():
+                if _sha256_file(
+                    generation_path / name, check_cancelled=check_cancelled
+                ).hex() != expected_digest:
+                    raise ValueError(f"Corrupt compact generation: {generation_path}")
+        _fsync_parent(generation_path)
+    return generation_path
+
+
 def _iter_sqlite_edge_rank_rows(
     connection: sqlite3.Connection,
     *,
@@ -2098,8 +2133,9 @@ def write_compact_graph(
 
     The SQLite artifact is the authoritative source; this converter streams
     its rows in deterministic rowid order and never rebuilds Node/Edge
-    objects.  All sections are little-endian, digest-signed, and published
-    atomically next to the manifest.
+    objects.  Binary, source, and projection dependencies are hash-verified and
+    fsynced in an immutable content-addressed generation. The manifest is swapped
+    atomically last; previous generations remain intact for existing readers.
     """
     if array("q").itemsize != 8 or array("i").itemsize != 4:
         raise RuntimeError("compact artifact requires 64-bit array support")
@@ -2115,6 +2151,7 @@ def write_compact_graph(
         connection = sqlite3.connect(uri, uri=True)
     except sqlite3.DatabaseError as exc:
         raise ValueError(f"Invalid SQLite road graph: {sqlite_path}") from exc
+    temporary_bin: Path | None = None
     try:
         connection.execute("PRAGMA query_only=ON")
         metadata = _sqlite_metadata(connection, check_cancelled=check_cancelled)
@@ -2501,6 +2538,7 @@ def write_compact_graph(
         section_descriptors: Dict[str, Dict[str, Any]] = {}
         bin_offset = 0
         bin_digest = hashlib.sha256()
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             prefix=f".{bin_path.name}.",
             suffix=".tmp",
@@ -2538,8 +2576,6 @@ def write_compact_graph(
             except Exception:
                 temporary_bin.unlink(missing_ok=True)
                 raise
-        os.replace(temporary_bin, bin_path)
-        _fsync_parent(bin_path)
         if check_cancelled is not None:
             check_cancelled()
         projection_path = EdgeProjectionIndex.sidecar_path(resolved_source)
@@ -2551,13 +2587,33 @@ def write_compact_graph(
                 projection_path, check_cancelled=check_cancelled
             ).hex()
             projection_info["size_bytes"] = int(projection_path.stat().st_size)
+        dependencies = {
+            bin_path.name: (temporary_bin, bin_digest.hexdigest()),
+            resolved_source.name: (resolved_source, source_sha256.hex()),
+        }
+        if len(dependencies) != 2:
+            raise ValueError("Compact source and binary filenames must differ")
+        if "sha256" in projection_info:
+            dependencies[projection_path.name] = (
+                projection_path, projection_info["sha256"]
+            )
+        generation_path = _publish_compact_generation(
+            manifest_path, dependencies, check_cancelled=check_cancelled
+        )
+        bin_path = generation_path / bin_path.name
+        published_source = generation_path / resolved_source.name
+        projection_info["path"] = (
+            generation_path.relative_to(manifest_path.parent) / projection_path.name
+        ).as_posix()
+        if check_cancelled is not None:
+            check_cancelled()
         manifest = {
             "format": _COMPACT_FORMAT,
             "schema_version": _COMPACT_SCHEMA_VERSION,
             "source": {
-                "path": resolved_source.name,
+                "path": published_source.relative_to(manifest_path.parent).as_posix(),
                 "sha256": source_sha256.hex(),
-                "size_bytes": int(resolved_source.stat().st_size),
+                "size_bytes": int(published_source.stat().st_size),
                 "schema_version": int(metadata["schema_version"]),
                 "node_count": int(node_total),
                 "edge_count": int(edge_total),
@@ -2583,7 +2639,7 @@ def write_compact_graph(
                     else None
                 ),
             },
-            "bin_path": bin_path.name,
+            "bin_path": bin_path.relative_to(manifest_path.parent).as_posix(),
             "bin_sha256": bin_digest.hexdigest(),
             "bin_size_bytes": int(bin_offset),
             "sections": section_descriptors,
@@ -2614,6 +2670,8 @@ def write_compact_graph(
         }
     finally:
         connection.close()
+        if temporary_bin is not None:
+            temporary_bin.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)

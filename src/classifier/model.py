@@ -224,8 +224,6 @@ class LandscapeClassifier(nn.Module):
         # Handle different checkpoint formats
         if "model_state_dict" in state_dict:
             state_dict = state_dict["model_state_dict"]
-        elif "state_dict" in state_dict:
-            state_dict = state_dict["state_dict"]
 
         self.load_state_dict(state_dict)
         print(f"Loaded weights from {path}")

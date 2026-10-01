@@ -278,6 +278,32 @@ def _extract_report_identities(
     return dim_map, field_map
 
 
+def recover_report_run_info(
+    content: dict[str, Any], *, source: str, guidance: str
+) -> dict[str, Any]:
+    """Recover admitted provenance without guessing a legacy run's scoring mode."""
+    if not isinstance(content, dict):
+        raise ValueError(f"Invalid report metadata in {source}; {guidance}")
+    raw_info = content.get("run_info")
+    if raw_info is not None and not isinstance(raw_info, dict):
+        raise ValueError(f"Invalid run_info in {source}; {guidance}")
+    run_info = dict(raw_info or {})
+    dim_map, fields = _extract_report_identities(content)
+    mode = str(run_info.get("scoring_mode") or content.get("scoring_mode") or "").strip().lower()
+    if mode not in {"learned", "heuristic"}:
+        raise ValueError(f"Missing or invalid scoring_mode in {source}; {guidance}")
+    if mode == "heuristic" and _is_learned_report(content, dim_map, fields):
+        raise ValueError(f"Conflicting heuristic scoring_mode and learned identity in {source}; {guidance}")
+    run_info.update(fields)
+    run_info["scoring_mode"] = mode
+    if _is_learned_report(content, dim_map, fields):
+        for field in REQUIRED_LEARNED_FIELDS.values():
+            if field not in fields:
+                raise ValueError(f"Missing required learned identity {field!r} in {source}; {guidance}")
+    validate_report_union_compatibility([{"run_info": run_info}])
+    return run_info
+
+
 def validate_report_union_compatibility(
     reports_or_contents: Sequence[dict[str, Any]],
 ) -> None:

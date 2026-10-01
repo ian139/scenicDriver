@@ -28,6 +28,7 @@ from .common import (
     jsonable,
     sha256_bytes,
     sha256_file,
+    stable_json_bytes,
     validate_run_name,
 )
 from .water import (
@@ -1369,9 +1370,6 @@ def select_candidates(
     return artifacts.selected
 
 
-select_active_learning = select_candidates
-
-
 def _tile_block(row: pd.Series, block_size: int, block_degrees: float) -> str:
     region = _clean_text(row.get("region")) or "unknown"
     z = _finite_number(row.get("z"))
@@ -1673,6 +1671,39 @@ def load_candidate_table(path: str | Path) -> pd.DataFrame:
     raise ValueError(f"candidate input must be CSV or Parquet: {source}")
 
 
+def _existing_selection_matches(
+    paths: Mapping[str, Path], artifacts: SelectionArtifacts
+) -> bool:
+    """Admit only a complete, unchanged selection contract for an existing run."""
+    if not any(path.exists() for path in paths.values()):
+        return False
+    error = "existing selection contract is incomplete or changed; use a new run name"
+    if not all(path.is_file() for path in paths.values()):
+        raise ValueError(error)
+    try:
+        manifest = json.loads(paths["batch_manifest_json"].read_text(encoding="utf-8"))
+        diagnostics = json.loads(
+            paths["selection_diagnostics_json"].read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError(error) from exc
+    if not isinstance(manifest, dict) or "run_identity" not in manifest:
+        raise ValueError(error)
+    if manifest["run_identity"] != artifacts.batch_manifest["run_identity"]:
+        raise ValueError("selection run identity changed; use a new run name")
+    if manifest != artifacts.batch_manifest or diagnostics != artifacts.diagnostics:
+        raise ValueError(error)
+    for key in ("annotation_batch_csv", "geographic_splits_csv", "leakage_audit_json"):
+        record = manifest["outputs"][key]
+        path = paths[key]
+        if (
+            path.stat().st_size != record["bytes"]
+            or sha256_file(path) != record["sha256"]
+        ):
+            raise ValueError(error)
+    return True
+
+
 def run_selection(
     candidate_input: str | Path,
     *,
@@ -1681,7 +1712,7 @@ def run_selection(
     config: SelectionConfig | None = None,
     prior_annotations: Any = None,
 ) -> SelectionArtifacts:
-    """Run selection and persist the contracted batch artifacts."""
+    """Persist a fixed selection contract, refusing changed or incomplete reruns."""
     run_name = validate_run_name(run_name)
     source = Path(candidate_input)
     candidates = load_candidate_table(source)
@@ -1704,30 +1735,41 @@ def run_selection(
         candidates, config=config, prior_annotations=prior_annotations
     )
     base = Path(output_dir) / run_name
-    base.mkdir(parents=True, exist_ok=True)
+    if isinstance(prior_annotations, (str, Path)):
+        prior_digest = sha256_file(prior_annotations)
+    elif isinstance(prior_annotations, pd.DataFrame):
+        prior_digest = sha256_bytes(
+            prior_annotations.to_csv(index=False, lineterminator="\n").encode("utf-8")
+        )
+    else:
+        prior_digest = None
     batch_path = base / "annotation_batch.csv"
     split_path = base / "geographic_splits.csv"
     diagnostics_path = base / "selection_diagnostics.json"
     manifest_path = base / "batch_manifest.json"
     leakage_path = base / "leakage_audit.json"
-    atomic_write_text(
-        batch_path, artifacts.selected.to_csv(index=False, lineterminator="\n")
-    )
-    atomic_write_text(
-        split_path, artifacts.geographic_splits.to_csv(index=False, lineterminator="\n")
-    )
-    atomic_write_json(leakage_path, artifacts.leakage_audit)
+    batch_text = artifacts.selected.to_csv(index=False, lineterminator="\n")
+    split_text = artifacts.geographic_splits.to_csv(index=False, lineterminator="\n")
+    batch_payload = batch_text.encode("utf-8")
+    split_payload = split_text.encode("utf-8")
+    leakage_payload = stable_json_bytes(artifacts.leakage_audit)
     input_digest = sha256_file(source)
-    batch_digest = sha256_file(batch_path)
-    split_digest = sha256_file(split_path)
-    leakage_digest = sha256_file(leakage_path)
-    batch_bytes = int(batch_path.stat().st_size)
-    split_bytes = int(split_path.stat().st_size)
-    leakage_bytes = int(leakage_path.stat().st_size)
+    batch_digest = sha256_bytes(batch_payload)
+    split_digest = sha256_bytes(split_payload)
+    leakage_digest = sha256_bytes(leakage_payload)
+    batch_bytes = len(batch_payload)
+    split_bytes = len(split_payload)
+    leakage_bytes = len(leakage_payload)
     artifacts.batch_manifest["candidate_input"] = {
         "path": str(source),
         "sha256": input_digest,
         "rows": int(len(candidates)),
+    }
+    artifacts.batch_manifest["run_identity"] = {
+        "candidate_input": artifacts.batch_manifest["candidate_input"],
+        "seed": artifacts.batch_manifest["seed"],
+        "selection_config": artifacts.batch_manifest["selection_config"],
+        "prior_annotations_sha256": prior_digest,
     }
     artifacts.batch_manifest["outputs"] = {
         "annotation_batch_csv": {
@@ -1753,6 +1795,19 @@ def run_selection(
         "sha256": input_digest,
     }
     artifacts.diagnostics["outputs"] = artifacts.batch_manifest["outputs"]
+    paths = {
+        "annotation_batch_csv": batch_path,
+        "geographic_splits_csv": split_path,
+        "leakage_audit_json": leakage_path,
+        "batch_manifest_json": manifest_path,
+        "selection_diagnostics_json": diagnostics_path,
+    }
+    if _existing_selection_matches(paths, artifacts):
+        return artifacts
+    base.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(batch_path, batch_text)
+    atomic_write_text(split_path, split_text)
+    atomic_write_json(leakage_path, artifacts.leakage_audit)
     atomic_write_json(manifest_path, artifacts.batch_manifest)
     atomic_write_json(diagnostics_path, artifacts.diagnostics)
     return artifacts

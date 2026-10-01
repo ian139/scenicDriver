@@ -2076,28 +2076,39 @@ def create_app() -> FastAPI:
     def contrib_session_start(
         payload: ContributorSessionStartRequest,
     ) -> dict[str, Any]:
-        profile = repo.upsert_profile(payload.contributor_id, payload.display_name)
-        tasks = repo.next_tasks(payload.contributor_id, payload.region, count=25)
+        try:
+            profile = repo.upsert_profile(payload.contributor_id, payload.display_name)
+            tasks = repo.next_tasks(payload.contributor_id, payload.region, count=25)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
         return {"profile": profile, "tasks": tasks, "region": payload.region}
 
     @app.get("/v1/contrib/tasks/next")
     def contrib_next_tasks(
         contributor_id: str, region: str = "pittsfield", count: int = 25
     ) -> dict[str, Any]:
-        profile = repo.upsert_profile(contributor_id)
-        tasks = repo.next_tasks(contributor_id, region, count=count)
+        try:
+            profile = repo.upsert_profile(contributor_id)
+            tasks = repo.next_tasks(contributor_id, region, count=count)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
         return {"profile": profile, "tasks": tasks, "region": region}
 
     @app.post("/v1/contrib/labels")
     def contrib_submit_label(payload: ContributorLabelRequest) -> dict[str, Any]:
-        repo.upsert_profile(payload.contributor_id)
-        rec = repo.submit_label(payload.model_dump())
-        profile = repo.get_profile(payload.contributor_id)
+        try:
+            rec = repo.submit_label(payload.model_dump())
+            profile = repo.get_profile(payload.contributor_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
         return {"saved": True, "record": rec, "profile": profile, "credits_delta": 0.0}
 
     @app.get("/v1/contrib/profile")
     def contrib_profile(contributor_id: str) -> dict[str, Any]:
-        return {"profile": repo.get_profile(contributor_id)}
+        try:
+            return {"profile": repo.get_profile(contributor_id)}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
 
     @app.get("/v1/contrib/leaderboard")
     def contrib_leaderboard(limit: int = 25) -> dict[str, Any]:
@@ -2105,8 +2116,21 @@ def create_app() -> FastAPI:
 
     @app.post("/v1/admin/contrib/review/run")
     def contrib_review_run(
-        min_overlap: int = 1, min_agreement: float = 0.65
+        request: Request, min_overlap: int = 1, min_agreement: float = 0.65
     ) -> dict[str, Any]:
+        """Require X-Admin-Token matching the configured CONTRIB_ADMIN_TOKEN."""
+        from secrets import compare_digest
+
+        configured_token = os.environ.get("CONTRIB_ADMIN_TOKEN")
+        if not configured_token:
+            raise HTTPException(
+                status_code=503, detail="Contributor admin token is not configured"
+            )
+        supplied_token = request.headers.get("X-Admin-Token")
+        if not supplied_token:
+            raise HTTPException(status_code=401, detail="Admin token is required")
+        if not compare_digest(supplied_token.encode(), configured_token.encode()):
+            raise HTTPException(status_code=403, detail="Invalid admin token")
         return repo.run_qa_promotion(
             min_overlap=min_overlap, min_agreement=min_agreement
         )

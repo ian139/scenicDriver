@@ -6,12 +6,14 @@ from typing import Any, Optional
 import re
 import os
 from io import BytesIO
+import hashlib
+import json
 
 import numpy as np
 import pandas as pd
 from PIL import Image
 
-from src.terrain.features import compute_terrain_features
+from src.terrain.features import compute_terrain_features, compute_terrain_valid_mask
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -71,7 +73,11 @@ def run_heuristic_labeling(
     seed: int,
     device: str = "auto",
     learned_regression_ckpt: str | Path | None = None,
+    learned_run_json: str | Path | None = None,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]], dict[str, Any]]:
+    """Score paired tiles; learned identities must be attested by checkpoint metadata
+    or learned_run_json. Checkpoint hashes always identify the bytes actually loaded.
+    """
     from math import ceil
 
     try:
@@ -157,6 +163,15 @@ def run_heuristic_labeling(
         device=clf_device,
         warnings=warnings,
     )
+    learned_identity = (
+        _learned_report_identity(
+            model=learned_model,
+            classifier_checkpoint=classifier_best_ckpt,
+            regression_checkpoint=learned_regression_ckpt,
+            learned_run_json=learned_run_json,
+        )
+        if learned_model is not None else {}
+    )
 
     rows: list[dict[str, Any]] = []
     tiles: list[dict[str, Any]] = []
@@ -186,7 +201,11 @@ def run_heuristic_labeling(
         sat_img = _open_image(sat_path, s3_bucket, s3_client=s3_client).convert("RGB")
         terrain_img = _open_image(terrain_path, s3_bucket, s3_client=s3_client).convert("RGB")
 
-        terrain_result = compute_terrain_features(terrain_img, sat_img)
+        terrain_result = compute_terrain_features(
+            terrain_img,
+            sat_img,
+            valid_mask=compute_terrain_valid_mask(terrain_img),
+        )
         terrain_features = terrain_result.features.to_array().astype(np.float32)
         relief = terrain_result.relief
         roughness = terrain_result.roughness
@@ -289,6 +308,7 @@ def run_heuristic_labeling(
     raw_dir_config = raw_dir if isinstance(raw_dir, str) and raw_dir.startswith("s3://") else str(raw_root)
 
     run_info = {
+        **learned_identity,
         "counts": {
             "satellite_total": len(sat_files),
             "terrain_total": len(terrain_files),
@@ -316,8 +336,63 @@ def run_heuristic_labeling(
             "default_lon": default_lon,
         },
     }
+    if learned_run_json is not None:
+        run_info["config"]["learned_run_json"] = str(learned_run_json)
 
     return labels_df, tiles, run_info
+
+
+def _learned_report_identity(
+    *, model: Any, classifier_checkpoint: str | Path,
+    regression_checkpoint: str | Path, learned_run_json: str | Path | None,
+) -> dict[str, Any]:
+    from src.heuristics.report import (
+        REQUIRED_LEARNED_FIELDS, _extract_report_identities,
+        validate_report_union_compatibility,
+    )
+
+    identity = dict(model.report_identity)
+    guidance = (
+        "Supply the exact identity in the regression checkpoint metadata or "
+        "pass --learned-run-json <path> to an attested run record; "
+        "legacy artifacts without recoverable identity must be re-scored."
+    )
+    if identity.get("scoring_mode", "learned") != "learned":
+        raise ValueError(f"scoring_mode in regression checkpoint metadata is not learned; {guidance}")
+    if learned_run_json is not None:
+        try:
+            content = json.loads(Path(learned_run_json).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Cannot read learned identity from {learned_run_json}; {guidance}") from exc
+        if not isinstance(content, dict):
+            raise ValueError(f"Invalid learned identity in {learned_run_json}; {guidance}")
+        run_info = content.get("run_info") or {}
+        if not isinstance(run_info, dict):
+            raise ValueError(f"Invalid run_info in {learned_run_json}; {guidance}")
+        mode = run_info.get("scoring_mode") or content.get("scoring_mode")
+        if mode is not None and mode != "learned":
+            raise ValueError(f"scoring_mode in {learned_run_json} is not learned; {guidance}")
+        _, supplied = _extract_report_identities(content)
+        for field, value in supplied.items():
+            if field in identity and identity[field] != value:
+                raise ValueError(f"{field} in --learned-run-json does not match regression checkpoint metadata")
+            identity[field] = value
+
+    for field, path in (
+        ("classifier_checkpoint_sha256", classifier_checkpoint),
+        ("regression_checkpoint_sha256", regression_checkpoint),
+    ):
+        with Path(path).open("rb") as stream:
+            actual = hashlib.file_digest(stream, "sha256").hexdigest()
+        if field in identity and identity[field] != actual:
+            raise ValueError(f"{field} does not match actual checkpoint bytes at {path}; {guidance}")
+        identity[field] = actual
+    for field in REQUIRED_LEARNED_FIELDS.values():
+        if field not in identity:
+            raise ValueError(f"Missing required learned identity {field!r}; {guidance}")
+    identity["scoring_mode"] = "learned"
+    validate_report_union_compatibility([{"run_info": identity}])
+    return identity
 
 
 def _list_images(root: Path) -> list[Path]:
@@ -524,6 +599,9 @@ def _load_learned_regressor(
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
+    from src.heuristics.report import _extract_report_identities
+
+    _, model.report_identity = _extract_report_identities(ckpt)
     warnings.append(f"Using learned regression checkpoint: {ckpt_path}")
     return model
 

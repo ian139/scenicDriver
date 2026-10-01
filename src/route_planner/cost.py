@@ -321,10 +321,11 @@ def evaluate_path(
     fastest = _required_finite(
         fastest_duration_minutes, "fastest duration", minimum=0.0
     )
-    highway_cost = (
-        resolved.highway_preference
-        * highway_duration
-        / max(fastest, MIN_EDGE_COST)
+    highway_ratio = _required_finite(
+        highway_duration / max(fastest, MIN_EDGE_COST), "highway duration ratio"
+    )
+    highway_cost = _checked_product(
+        resolved.highway_preference, highway_ratio, "highway cost"
     )
     objective = base_objective - highway_cost
     return PathEvaluation(
@@ -433,6 +434,19 @@ class CostWeights:
     scenic_byway_bonus: float = 1.0
 
 
+def normalize_cost_weights(weights: CostWeights) -> CostWeights:
+    """Snapshot finite, nonnegative cost controls once for all backends."""
+    return CostWeights(
+        travel_time=_finite_nonnegative(weights.travel_time),
+        scenic_reward=_finite_nonnegative(weights.scenic_reward),
+        highway_penalty=_finite_nonnegative(weights.highway_penalty),
+        scenic_byway_bonus=min(
+            _finite_nonnegative(weights.scenic_byway_bonus),
+            SCENIC_BYWAY_DISCOUNT_CAP,
+        ),
+    )
+
+
 class ScenicCostFunction:
     """
     Edge cost for scenic routing.
@@ -443,7 +457,8 @@ class ScenicCostFunction:
     Scenic exposure is the time spent on an edge multiplied by its clamped
     scenic disutility, so subdividing a road geometry does not change its
     total cost.  Costs are always finite and clamped to ``>= 1e-6`` for
-    shortest-path search.  At ``scenic_weight=1`` this remains a positive
+    shortest-path search; inactive components are skipped and overflow saturates
+    at the largest finite float.  At ``scenic_weight=1`` this remains a positive
     additive disutility objective, not a route-average scenic-score ratio.
     """
 
@@ -469,22 +484,25 @@ class ScenicCostFunction:
             else bool(strict_highways)
         )
         self.highway_preference = _finite_nonnegative(highway_preference)
-        self.weights = weights or CostWeights()
+        self.weights = normalize_cost_weights(weights or CostWeights())
 
     def calculate(self, edge: Edge) -> float:
         alpha = 1.0 - self.scenic_weight
         beta = self.scenic_weight
 
         travel_time_minutes = _finite_nonnegative(edge.travel_time_minutes)
-        travel = travel_time_minutes * _finite_nonnegative(self.weights.travel_time)
-        scenic_score = min(_finite_nonnegative(edge.scenic_score), 10.0)
-        scenic_exposure = (
-            travel_time_minutes
-            * (10.0 - scenic_score)
-            / 10.0
-            * _finite_nonnegative(self.weights.scenic_reward)
-        )
-        weighted_base_cost = alpha * travel + beta * scenic_exposure
+        weighted_base_cost = 0.0
+        if alpha > 0.0 and self.weights.travel_time > 0.0:
+            weighted_base_cost = alpha * (
+                travel_time_minutes * self.weights.travel_time
+            )
+        if beta > 0.0 and self.weights.scenic_reward > 0.0:
+            scenic_score = min(_finite_nonnegative(edge.scenic_score), 10.0)
+            weighted_base_cost += beta * (
+                travel_time_minutes
+                * ((10.0 - scenic_score) / 10.0)
+                * self.weights.scenic_reward
+            )
         # Keep even a perfectly scenic, fully weighted edge duration-sensitive.
         # This is a proportional floor rather than a per-edge constant, so
         # splitting an edge cannot manufacture extra floor cost.
@@ -493,10 +511,7 @@ class ScenicCostFunction:
             MIN_EDGE_COST * travel_time_minutes,
         )
         if str(edge.road_type).lower() == "scenic_byway":
-            discount = min(
-                _finite_nonnegative(self.weights.scenic_byway_bonus),
-                SCENIC_BYWAY_DISCOUNT_CAP,
-            )
+            discount = self.weights.scenic_byway_bonus
             base_cost *= 1.0 - discount
 
         # Highway penalties intentionally remain duration-scaled and additive.
@@ -505,7 +520,7 @@ class ScenicCostFunction:
         )
         raw = base_cost + road_adjustment
         if not math.isfinite(raw):
-            return sys.float_info.max if raw > 0.0 else MIN_EDGE_COST
+            return sys.float_info.max
         return max(raw, MIN_EDGE_COST)
 
     def _road_type_adjustment(self, road_type: str) -> float:
@@ -514,5 +529,5 @@ class ScenicCostFunction:
         if self.highway_preference > 0.0:
             return self.highway_preference
         if self.strict_highways:
-            return _finite_nonnegative(self.weights.highway_penalty)
+            return self.weights.highway_penalty
         return 0.0

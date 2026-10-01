@@ -140,6 +140,15 @@ def compact_search_available() -> bool:
     return _ensure_compiled_library() is not None
 
 
+def validate_cost_limit(cost_limit: Optional[float]) -> Optional[float]:
+    if cost_limit is None:
+        return None
+    limit = float(cost_limit)
+    if not math.isfinite(limit) or limit < 0.0:
+        raise ValueError("cost limit must be finite and non-negative")
+    return limit
+
+
 def run_compact_bidirectional_search(
     topology: Any,
     cost_function: Any,
@@ -150,6 +159,7 @@ def run_compact_bidirectional_search(
     cost_limit: Optional[float] = None,
     deadline_seconds: Optional[float] = None,
 ) -> Optional[Tuple[List[int], float, int, int]]:
+    cost_limit = validate_cost_limit(cost_limit)
     lib = _ensure_compiled_library()
     if lib is None:
         return None
@@ -274,7 +284,7 @@ def run_compact_bidirectional_search(
         highway_penalty=float(getattr(weights, "highway_penalty", 0.0) if weights else 0.0),
         scenic_byway_bonus=float(getattr(weights, "scenic_byway_bonus", 0.0) if weights else 0.0),
         lagrangian_multiplier=float(lagrangian_multiplier),
-        cost_limit=float(cost_limit) if cost_limit is not None else 0.0,
+        cost_limit=float(cost_limit) if cost_limit is not None else -1.0,
     )
 
     node_index = topology.node_index
@@ -370,6 +380,8 @@ def run_compact_bidirectional_search(
 
     if res == -2:
         raise RoutingTimeout("compiled compact search deadline exceeded")
+    if res == -3:
+        raise ValueError("cumulative calculated cost must be finite and non-negative")
     if res < 0 or out_fwd_idx.value < 0 or out_rev_idx.value < 0:
         return None
 

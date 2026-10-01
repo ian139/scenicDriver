@@ -25,12 +25,11 @@ from scripts.modeling.run_active_scenic_autoresearch import (
     detect_heldout_test_exposure,
     determine_aggregate_run_state,
     has_validation_evidence,
-    is_valid_paused_experiment,
+    is_valid_resumable_experiment,
     load_existing_experiments,
     parse_args,
     resolve_stage_one_handoff,
     sanitize_command,
-    select_best_candidate,
     select_validation_finalist,
     validate_confirmation_summary,
     validate_experiment_record,
@@ -397,34 +396,6 @@ def test_parse_args_max_seconds_default_and_validation(
         parse_args()
 
 
-def test_select_best_candidate_corr_descending_mae_ascending() -> None:
-    records = [
-        {
-            "exp_id": "exp_01",
-            "all_gates_pass": True,
-            "metrics": {"pearson_corr": 0.80, "mae": 0.10},
-        },
-        {
-            "exp_id": "exp_02",
-            "all_gates_pass": True,
-            "metrics": {"pearson_corr": 0.85, "mae": 0.20},
-        },
-        {
-            "exp_id": "exp_03",
-            "all_gates_pass": True,
-            "metrics": {"pearson_corr": 0.85, "mae": 0.12},
-        },
-        {
-            "exp_id": "exp_04",
-            "all_gates_pass": False,
-            "metrics": {"pearson_corr": 0.95, "mae": 0.01},
-        },
-    ]
-    best = select_best_candidate(records)
-    assert best is not None
-    assert best["exp_id"] == "exp_03"
-
-
 def test_validate_experiment_record_contract(tmp_path: Path) -> None:
     ckpt, eval_p, val_p, hash_val = _create_valid_exp_files(
         tmp_path, "exp_val", baseline_sha256="expected_base"
@@ -720,7 +691,7 @@ def test_validate_experiment_record_rejects_nonfinite_metrics(
     assert validate_experiment_record(validated_rec) is True
 
 
-def test_string_gates_pass_not_reusable_or_selected(tmp_path: Path) -> None:
+def test_string_gates_are_not_reusable(tmp_path: Path) -> None:
     ckpt, eval_p, val_p, hash_val = _create_valid_exp_files(
         tmp_path, "exp_str_gate", baseline_sha256="expected_base"
     )
@@ -760,20 +731,6 @@ def test_string_gates_pass_not_reusable_or_selected(tmp_path: Path) -> None:
         )
         is False
     )
-
-    records_with_str_gate = [
-        {
-            "exp_id": "exp_str1",
-            "all_gates_pass": "false",
-            "metrics": {"pearson_corr": 0.9, "mae": 0.1},
-        },
-        {
-            "exp_id": "exp_str2",
-            "all_gates_pass": "true",
-            "metrics": {"pearson_corr": 0.95, "mae": 0.05},
-        },
-    ]
-    assert select_best_candidate(records_with_str_gate) is None
 
 
 def test_candidate_ladder_is_bounded_and_deterministic() -> None:
@@ -1065,22 +1022,22 @@ def test_determine_aggregate_run_state() -> None:
     assert determine_aggregate_run_state(recs_validated_paused, 2) == "paused"
 
 
-def test_is_valid_paused_experiment(tmp_path: Path) -> None:
+def test_is_valid_resumable_experiment(tmp_path: Path) -> None:
     exp_dir = tmp_path / "exp_01"
-    assert not is_valid_paused_experiment(exp_dir)
+    assert not is_valid_resumable_experiment(exp_dir)
 
     exp_dir.mkdir(parents=True, exist_ok=True)
     resume_pt = exp_dir / "resume.pt"
     summary_json = exp_dir / "training_summary.json"
 
     resume_pt.write_bytes(b"dummy")
-    assert not is_valid_paused_experiment(exp_dir)
+    assert not is_valid_resumable_experiment(exp_dir)
 
     summary_json.write_text(json.dumps({"state": "completed"}), encoding="utf-8")
-    assert not is_valid_paused_experiment(exp_dir)
+    assert not is_valid_resumable_experiment(exp_dir)
 
     summary_json.write_text(json.dumps({"state": "paused"}), encoding="utf-8")
-    assert is_valid_paused_experiment(exp_dir)
+    assert is_valid_resumable_experiment(exp_dir)
 
 
 def test_resume_passes_resume_false_to_fresh_later_experiments(
@@ -2455,27 +2412,6 @@ def test_data_limited_mode_skips_eval_and_promotion(
     assert summary_data["registry_status"] == "unchanged"
     assert summary_data["observed_expanded_val_samples"] == 1
     assert summary_data["min_expanded_validation_samples"] == 5
-
-
-def test_select_best_candidate_ignores_rejected() -> None:
-    from scripts.modeling.run_active_scenic_autoresearch import select_best_candidate
-
-    records = [
-        {
-            "exp_id": "exp_01",
-            "status": "rejected",
-            "all_gates_pass": False,
-            "rejection_reason": "insufficient_expanded_human_validation_support",
-            "metrics": {"pearson_corr": 0.95, "mae": 0.1},
-        },
-        {
-            "exp_id": "exp_02",
-            "status": "completed",
-            "all_gates_pass": False,
-            "metrics": {"pearson_corr": 0.85, "mae": 0.2},
-        },
-    ]
-    assert select_best_candidate(records) is None
 
 
 def test_supplemental_args_all_or_none(monkeypatch: pytest.MonkeyPatch) -> None:

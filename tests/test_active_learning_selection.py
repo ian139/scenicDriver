@@ -442,6 +442,186 @@ def test_selection_rejects_invalid_run_names(tmp_path: Path) -> None:
             run_selection(csv_path, output_dir=tmp_path / "runs", run_name=bad_name)
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        "candidate_content",
+        "candidate_path",
+        "seed",
+        "batch_size",
+        "adjacency_radius",
+        "min_separation_km",
+        "qa_overlap_count",
+        "qa_overlap_fraction",
+        "random_control_count",
+        "random_control_fraction",
+        "weights",
+        "prior_file",
+        "prior_frame",
+    ],
+)
+def test_selection_rejects_changed_run_identity(tmp_path: Path, change: str) -> None:
+    from dataclasses import replace
+
+    from src.active_learning.selection import SelectionConfig, run_selection
+
+    candidates = _candidates()
+    source = tmp_path / "candidates.csv"
+    candidates.to_csv(source, index=False)
+    prior = pd.DataFrame([{"image_path": "other.png", "scenic_human": 5}])
+    prior_path = tmp_path / "prior.csv"
+    prior.to_csv(prior_path, index=False)
+    prior_annotations = prior if change == "prior_frame" else prior_path
+    config = SelectionConfig(batch_size=2, seed=7, run_name="fixed")
+    output_dir = tmp_path / "runs"
+    run_selection(
+        source,
+        output_dir=output_dir,
+        run_name="fixed",
+        config=config,
+        prior_annotations=prior_annotations,
+    )
+    run_dir = output_dir / "fixed"
+    before = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in run_dir.iterdir()
+    }
+
+    if change == "candidate_content":
+        candidates.loc[0, "model_score"] = 0.8
+        candidates.to_csv(source, index=False)
+    elif change == "candidate_path":
+        other_source = tmp_path / "other_candidates.csv"
+        other_source.write_bytes(source.read_bytes())
+        source = other_source
+    elif change in {"prior_file", "prior_frame"}:
+        # Changing label values must reject reuse even when excluded identities
+        # and the selected batch would remain identical.
+        prior.loc[0, "scenic_human"] = 6
+        if change == "prior_file":
+            prior.to_csv(prior_path, index=False)
+    elif change == "weights":
+        config = replace(config, weights={"uncertainty": 0.3})
+    else:
+        config = replace(
+            config,
+            **{change: 0.1 if change.endswith(("fraction", "_km")) else 3},
+        )
+
+    with pytest.raises(ValueError, match="new run name"):
+        run_selection(
+            source,
+            output_dir=output_dir,
+            run_name="fixed",
+            config=config,
+            prior_annotations=prior_annotations,
+        )
+    assert {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in run_dir.iterdir()
+    } == before
+
+
+@pytest.mark.parametrize("prior_kind", ["none", "file", "frame"])
+def test_selection_identical_rerun_preserves_fixed_artifacts(
+    tmp_path: Path, prior_kind: str
+) -> None:
+    from src.active_learning.selection import SelectionConfig, run_selection
+
+    source = tmp_path / "candidates.csv"
+    _candidates().to_csv(source, index=False)
+    prior = pd.DataFrame([{"image_path": "other.png", "scenic_human": 5}])
+    prior_path = tmp_path / "prior.csv"
+    prior.to_csv(prior_path, index=False)
+    prior_annotations = {"none": None, "file": prior_path, "frame": prior}[prior_kind]
+    kwargs = {
+        "output_dir": tmp_path / "runs",
+        "run_name": "fixed",
+        "config": SelectionConfig(batch_size=2, seed=7, run_name="fixed"),
+        "prior_annotations": prior_annotations,
+    }
+    first = run_selection(source, **kwargs)
+    run_dir = tmp_path / "runs" / "fixed"
+    before = {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in run_dir.iterdir()
+    }
+    second = run_selection(source, **kwargs)
+
+    pd.testing.assert_frame_equal(first.selected, second.selected)
+    pd.testing.assert_frame_equal(first.geographic_splits, second.geographic_splits)
+    assert first.batch_manifest == second.batch_manifest
+    assert first.diagnostics == second.diagnostics
+    assert {
+        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in run_dir.iterdir()
+    } == before
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "annotation_batch.csv",
+        "geographic_splits.csv",
+        "leakage_audit.json",
+        "selection_diagnostics.json",
+        "batch_manifest.json",
+        "run_identity",
+        "selection_contract",
+        "outputs",
+        "invalid_json",
+        "tampered_batch",
+    ],
+)
+def test_selection_refuses_incomplete_existing_contract(
+    tmp_path: Path, damage: str
+) -> None:
+    from src.active_learning.selection import run_selection
+
+    source = tmp_path / "candidates.csv"
+    _candidates().to_csv(source, index=False)
+    output_dir = tmp_path / "runs"
+    run_selection(source, output_dir=output_dir, run_name="fixed")
+    run_dir = output_dir / "fixed"
+    manifest_path = run_dir / "batch_manifest.json"
+    if damage.endswith((".csv", ".json")):
+        (run_dir / damage).unlink()
+    elif damage == "invalid_json":
+        manifest_path.write_text("{", encoding="utf-8")
+    elif damage == "tampered_batch":
+        batch_path = run_dir / "annotation_batch.csv"
+        batch_path.write_bytes(batch_path.read_bytes() + b"\n")
+    else:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.pop(damage, None)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in run_dir.iterdir()}
+
+    with pytest.raises(ValueError, match="new run name"):
+        run_selection(source, output_dir=output_dir, run_name="fixed")
+    assert {path.name: path.read_bytes() for path in run_dir.iterdir()} == before
+
+
+def test_selection_allows_run_directory_without_selection_artifacts(
+    tmp_path: Path,
+) -> None:
+    from src.active_learning.selection import run_selection
+
+    output_dir = tmp_path / "runs"
+    run_dir = output_dir / "fixed"
+    run_dir.mkdir(parents=True)
+    source = run_dir / "candidate_pool.csv"
+    _candidates().to_csv(source, index=False)
+    original = source.read_bytes()
+
+    selected = run_selection(source, output_dir=output_dir, run_name="fixed")
+
+    assert source.read_bytes() == original
+    assert pd.read_csv(run_dir / "annotation_batch.csv")["image_path"].tolist() == (
+        selected.selected["image_path"].tolist()
+    )
+
+
 def test_prepare_for_selection_filters_scorer_columns_and_fails_closed() -> None:
     from src.active_learning.selection import _prepare_for_selection
 

@@ -1097,7 +1097,6 @@ def test_nearest_edge_index_build_cancellation_does_not_publish_partial_cache() 
 def test_nearest_edge_projection_cancellation_after_numpy_chunk_keeps_cache(
     monkeypatch,
 ) -> None:
-    import src.route_planner.graph as graph_module
 
     graph = RoadGraph()
     graph.add_node(Node(id="a", lat=0.0, lon=0.0))
@@ -1114,8 +1113,6 @@ def test_nearest_edge_projection_cancellation_after_numpy_chunk_keeps_cache(
         )
     graph.find_nearest_edge_positions_with_distance(0.0, 0.5)
     cached_index = graph._nearest_edge_projection_index
-    original_chunk_size = graph_module._EDGE_PROJECTION_CHUNK_SIZE
-    monkeypatch.setattr(graph_module, "_EDGE_PROJECTION_CHUNK_SIZE", 2)
     original_project = graph._project_edge_chunk
     chunks = 0
     error = RuntimeError("cancelled")
@@ -1140,7 +1137,6 @@ def test_nearest_edge_projection_cancellation_after_numpy_chunk_keeps_cache(
     assert raised.value is error
     assert chunks == 1
     assert graph._nearest_edge_projection_index is cached_index
-    assert original_chunk_size > 0
 
 
 def test_nearest_edge_projection_ties_remain_deterministic() -> None:

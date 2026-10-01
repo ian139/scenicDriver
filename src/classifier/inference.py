@@ -58,7 +58,6 @@ def get_training_transform(
     Augmentations designed for satellite/aerial imagery:
     - Random horizontal/vertical flips (orientation invariance)
     - Random rotation (viewing angle invariance)
-    - Color jitter (lighting condition variance)
     - Random resized crop (scale invariance)
 
     Args:
@@ -76,8 +75,6 @@ def get_training_transform(
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
         transforms.RandomRotation(degrees=15),
-        # NOTE: Avoid ColorJitter hue on some PIL/torchvision stacks where
-        # negative hue factors can underflow uint8.
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])

@@ -46,7 +46,6 @@ SCHEMA_VERSION = 1
 MAX_JSON_BYTES = 1_000_000
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE_PATH = Path(__file__).with_name("annotate_scenic_web.html")
-HTML_PAGE = TEMPLATE_PATH.read_text(encoding="utf-8")
 SECRET_COLUMN = re.compile(
     r"(^|_)(secret|token|password|passwd|credential|authorization|cookie|api_?key|access_?key)($|_)",
     re.IGNORECASE,

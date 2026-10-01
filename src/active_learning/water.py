@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import numpy as np
 from PIL import Image
+from scipy.ndimage import uniform_filter
 from typing import Any, Mapping
 
 MAX_SELECTABLE_WATER_FRACTION: float = 0.50
@@ -25,21 +26,52 @@ def _finite_float(value: Any) -> float | None:
         return None
 
 
-def compute_satellite_water_fraction(image: Image.Image | np.ndarray) -> float:
-    """Estimate open-water coverage from low-texture blue satellite pixels."""
+def compute_satellite_water_fraction(
+    image: Image.Image | np.ndarray, *, land_mask: np.ndarray | None = None
+) -> float:
+    """Estimate water coverage with local texture and optional land geometry.
+
+    False pixels in the boolean (H, W) land mask are known outside-land sea,
+    even when canonical imagery fills them black. They count as water in the
+    full-tile denominator, not as RGB evidence in neighboring texture windows.
+    Without geometry, only RGB evidence is used. Clouds/whitecaps can obscure
+    individual pixels but cannot veto water elsewhere in the tile.
+    """
     if isinstance(image, Image.Image):
         values = np.asarray(image.convert("RGB"), dtype=np.float32)
     else:
         values = np.asarray(image, dtype=np.float32)
     if values.ndim != 3 or values.shape[-1] < 3:
         raise ValueError(f"Expected RGB image array, got shape {values.shape}")
+    if not values.shape[0] or not values.shape[1]:
+        raise ValueError("Water imagery must have positive dimensions")
+    if land_mask is None:
+        land = np.ones(values.shape[:2], dtype=bool)
+    else:
+        land = np.asarray(land_mask)
+        if land.dtype != np.bool_:
+            raise TypeError("land_mask must have boolean dtype")
+        if land.shape != values.shape[:2]:
+            raise ValueError("land_mask shape must match satellite dimensions")
+    if not np.isfinite(values[land]).all():
+        raise ValueError("Land satellite pixels must be finite")
     values = values[..., :3] / 255.0
     r, g, b = values[..., 0], values[..., 1], values[..., 2]
     brightness = (r + g + b) / 3.0
     maxc = np.maximum(r, np.maximum(g, b))
     minc = np.minimum(r, np.minimum(g, b))
     saturation = (maxc - minc) / np.maximum(maxc + 1e-6, 1e-6)
-    texture = float((0.2989 * r + 0.5870 * g + 0.1140 * b).std())
+    luminance = 0.2989 * r + 0.5870 * g + 0.1140 * b
+    weights = uniform_filter(land.astype(np.float32), size=3, mode="constant")
+    mean = np.divide(
+        uniform_filter(np.where(land, luminance, 0.0), size=3, mode="constant"),
+        weights, out=np.zeros_like(luminance), where=weights > 0,
+    )
+    mean_square = np.divide(
+        uniform_filter(np.where(land, luminance**2, 0.0), size=3, mode="constant"),
+        weights, out=np.zeros_like(luminance), where=weights > 0,
+    )
+    texture = np.sqrt(np.maximum(mean_square - mean**2, 0.0))
     water_mask = (
         (b > r * 1.2)
         & (b > g * 1.15)
@@ -47,7 +79,7 @@ def compute_satellite_water_fraction(image: Image.Image | np.ndarray) -> float:
         & (saturation > 0.18)
         & (texture < 0.12)
     )
-    return float(water_mask.mean())
+    return float((~land | (land & water_mask)).mean())
 
 
 def compute_effective_water_fraction(

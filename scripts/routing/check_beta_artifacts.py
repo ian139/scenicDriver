@@ -39,12 +39,6 @@ DEFAULT_CHECKPOINT_PATH = Path(
 
 _SQLITE_GRAPH_FORMAT = "scenic-roadgraph-sqlite"
 _SQLITE_SCHEMA_VERSION = 1
-_REQUIRED_PROBES = (
-    "rutland_usps",
-    "lisbon_police",
-    "burlington",
-    "bangor",
-)
 _CANONICAL_PROBE_COORDINATES = {
     "rutland_usps": (43.60784414, -72.98226538),
     "lisbon_police": (44.02516775, -70.10003245),
@@ -289,26 +283,6 @@ def _configured_route_regions(
     return route_regions, issues
 
 
-def _configured_region(root: Path) -> tuple[dict[str, Any] | None, list[str]]:
-    """Load the default configured region without validating artifacts."""
-    regions, issues = _configured_route_regions(root)
-    for reg in regions:
-        if reg["is_default"]:
-            return reg["region_dict"], issues
-    return (regions[0]["region_dict"] if regions else None), issues
-
-
-def _configured_new_england(root: Path) -> tuple[Path, str, list[str]]:
-    """Read the default graph/run settings, with canonical fallbacks."""
-    regions, issues = _configured_route_regions(root)
-    for reg in regions:
-        if reg["is_default"]:
-            return reg["graph_path"], reg["run_name"], issues
-    if regions:
-        return regions[0]["graph_path"], regions[0]["run_name"], issues
-    return root / DEFAULT_GRAPH_PATH, DEFAULT_RUN_NAME, issues
-
-
 def _metadata_bbox_matches(metadata_bbox: Any, configured_bbox: Any) -> bool:
     if not isinstance(metadata_bbox, Mapping) or not isinstance(
         configured_bbox, Mapping
@@ -526,7 +500,7 @@ def _sha256_file(path: Path) -> bytes:
 def _validate_compact_graph(
     manifest_path: Path, region: Mapping[str, Any] | None
 ) -> list[str]:
-    """Validate compact graph manifest, binary payload, source, and projection sidecar."""
+    """Validate dependencies resolved relative to the manifest, including generations."""
     label = str(manifest_path)
     try:
         manifest: Any = json.loads(manifest_path.read_text(encoding="utf-8"))

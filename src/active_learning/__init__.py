@@ -23,7 +23,6 @@ from .selection import (
     build_geographic_splits,
     load_candidate_table,
     run_selection,
-    select_active_learning,
     select_candidates,
 )
 from .water import (
@@ -69,7 +68,6 @@ __all__ = [
     "run_active_learning_scoring",
     "run_selection",
     "score_tile_manifest",
-    "select_active_learning",
     "select_candidates",
     "validate_scoring_inputs",
 ]

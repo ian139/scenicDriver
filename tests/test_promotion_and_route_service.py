@@ -88,7 +88,7 @@ def test_promote_regression_model_smoke(tmp_path: Path) -> None:
         str(decision_json),
         "--candidate-checkpoint",
         str(candidate_ckpt),
-        "--registry-json",
+        "--registry",
         str(registry_json),
         "--expected-registry-sha256",
         reg_sha,
@@ -1315,7 +1315,11 @@ def test_concurrent_report_builds_publish_isolated_native_variants(
     )
 
 
-def test_deadline_seconds_from_env_default_and_validation() -> None:
+def test_deadline_seconds_from_env_default_and_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SCENIC_ROUTE_DEADLINE_SECONDS", raising=False)
+    monkeypatch.delenv("SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS", raising=False)
     route_service.clear_route_caches()
     assert route_service._deadline_seconds_from_env() == 20.0
     assert route_service.validate_route_configuration() is None

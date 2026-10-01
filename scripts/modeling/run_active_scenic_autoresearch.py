@@ -1240,32 +1240,6 @@ def validate_experiment_record(
     return True
 
 
-def select_best_candidate(records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Select best passing candidate based on highest correlation then lowest MAE.
-    Tie-breaking: correlation descending, MAE ascending.
-    Ignores rejected candidates.
-    """
-    passing_candidates = [
-        r
-        for r in records
-        if r.get("all_gates_pass") is True and r.get("status") != "rejected"
-    ]
-    if not passing_candidates:
-        return None
-
-    def candidate_sort_key(r: Dict[str, Any]) -> Tuple[float, float]:
-        metrics = r.get("metrics", {})
-        corr = metrics.get("pearson_corr")
-        if corr is None:
-            corr = metrics.get("corr", 0.0)
-        mae = metrics.get("mae", float("inf"))
-        return (float(corr), -float(mae))
-
-    passing_candidates.sort(key=candidate_sort_key, reverse=True)
-    return passing_candidates[0]
-
-
 def select_validation_finalist(
     records: List[Dict[str, Any]], ladder_exp_ids: List[str]
 ) -> Optional[Dict[str, Any]]:
@@ -1363,9 +1337,6 @@ def is_valid_resumable_experiment(exp_dir: Path) -> bool:
         return False
     except Exception:
         return False
-
-
-is_valid_paused_experiment = is_valid_resumable_experiment
 
 
 def get_completed_candidate_checkpoint(exp_dir: Path) -> Optional[str]:

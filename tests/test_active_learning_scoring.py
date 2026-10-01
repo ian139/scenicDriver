@@ -36,6 +36,7 @@ def _manifest(root: Path) -> pd.DataFrame:
         rows.append(
             {
                 "image_path": f"images/satellite/z14/fixture/{100 + index}_200.png",
+                "provider": "mapbox_v1",
                 "region": "fixture",
                 "z": 14,
                 "x": 100 + index,
@@ -56,7 +57,7 @@ def _dependencies(counters: dict[str, int]) -> ScoringDependencies:
     def transform(image: Image.Image) -> np.ndarray:
         return np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
 
-    def terrain(_terrain: Image.Image, _satellite: Image.Image) -> dict[str, object]:
+    def terrain(_terrain: Image.Image, _satellite: Image.Image, *, valid_mask: np.ndarray) -> dict[str, object]:
         return {
             "features": np.asarray([0.2, 0.3, 0.4, 0.5, 0.0, 0.0], dtype=np.float32),
             "relief": 100.0,
@@ -288,6 +289,7 @@ def test_scorer_flushes_pending_images_at_batch_size(tmp_path: Path) -> None:
         rows.append(
             {
                 "image_path": f"images/satellite/z14/batch/{index}.png",
+                "provider": "mapbox_v1",
                 "region": "fixture",
                 "z": 14,
                 "x": index,
@@ -309,7 +311,7 @@ def test_scorer_flushes_pending_images_at_batch_size(tmp_path: Path) -> None:
     def transform(image: Image.Image) -> np.ndarray:
         return np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
 
-    def terrain(_terrain: Image.Image, _satellite: Image.Image) -> dict[str, object]:
+    def terrain(_terrain: Image.Image, _satellite: Image.Image, *, valid_mask: np.ndarray) -> dict[str, object]:
         return {
             "features": np.asarray([0.2, 0.3, 0.4, 0.5, 0.0, 0.0], dtype=np.float32),
             "relief": 100.0,
@@ -366,6 +368,7 @@ def test_uncached_pending_payload_high_water_is_bounded(
         rows.append(
             {
                 "image_path": f"images/satellite/z14/bounded/{index}.png",
+                "provider": "mapbox_v1",
                 "region": "fixture",
                 "z": 14,
                 "x": index,
@@ -579,10 +582,11 @@ def test_water_scoring_classification_fresh_and_cache_hit(
             },
         ]
     )
+    manifest["provider"] = "mapbox_v1"
 
     counters = {"classifier": 0, "regression": 0}
 
-    def terrain_fn(_terrain: Image.Image, satellite: Image.Image) -> dict[str, object]:
+    def terrain_fn(_terrain: Image.Image, satellite: Image.Image, *, valid_mask: np.ndarray) -> dict[str, object]:
         # Custom terrain function providing a 0.60 sea-level proxy for item 2.
         arr = np.asarray(satellite, dtype=np.float32)
         is_sat2 = tuple(arr[0, 0, :3]) == (41.0, 120.0, 70.0)
@@ -713,6 +717,7 @@ def test_all_water_manifest_scoring(tmp_path: Path) -> None:
             }
         ]
     )
+    manifest["provider"] = "mapbox_v1"
     counters = {"classifier": 0, "regression": 0}
     dependencies = _dependencies(counters)
     all_water_root = tmp_path / "run_all_water"
@@ -793,3 +798,222 @@ def test_old_active_data_readable_only_as_explicit_mapbox_v1_identities(
         manifest_missing_canonical, run_root=run_dir, dependencies=deps
     )
     assert res3["counts"]["cache_hits"] == 0
+
+
+def test_mixed_shoreline_water_is_not_gated_by_land_texture():
+    from src.active_learning.water import compute_satellite_water_fraction
+
+    satellite = np.full((100, 100, 3), [15, 30, 100], dtype=np.uint8)
+    land = np.indices((100, 40)).sum(axis=0) % 2
+    satellite[:, 60:] = np.where(land[..., None], 255, 0)
+    assert compute_satellite_water_fraction(satellite) == pytest.approx(0.6, abs=0.02)
+
+
+def test_water_geometry_counts_canonical_black_sea_with_sparse_land():
+    from src.active_learning.water import compute_satellite_water_fraction
+
+    satellite = np.zeros((10, 10, 3), dtype=np.uint8)
+    land = np.zeros((10, 10), dtype=bool)
+    land[0, 0] = True
+    satellite[0, 0] = [40, 120, 70]
+    assert compute_satellite_water_fraction(satellite, land_mask=land) == pytest.approx(0.99)
+    land[:] = False
+    assert compute_satellite_water_fraction(satellite, land_mask=land) == 1.0
+
+
+def test_flat_blue_water_with_clouds_retains_local_water_detection():
+    from src.active_learning.water import compute_satellite_water_fraction
+
+    satellite = np.full((100, 100, 3), [15, 30, 100], dtype=np.uint8)
+    satellite[30:70, 30:70] = 255
+    satellite[10:12, 10:12] = 255  # small whitecap/cloud
+    assert compute_satellite_water_fraction(satellite) == pytest.approx(0.84, abs=0.03)
+
+
+@pytest.mark.parametrize("mask,error", [
+    (np.ones((2, 2), dtype=np.uint8), TypeError),
+    (np.ones((1, 2), dtype=bool), ValueError),
+])
+def test_water_rejects_invalid_land_masks(mask, error):
+    from src.active_learning.water import compute_satellite_water_fraction
+
+    with pytest.raises(error):
+        compute_satellite_water_fraction(np.zeros((2, 2, 3)), land_mask=mask)
+
+
+@pytest.mark.parametrize("provider", [None, "", "  ", "mapbox_v1"])
+def test_scoring_coast_requires_attribution_and_uses_land_only_features(tmp_path, provider):
+    from src.terrain.features import compute_terrain_features
+
+    manifest = _manifest(tmp_path).iloc[:1].copy()
+    if provider is None:
+        manifest = manifest.drop(columns=["provider"])
+    else:
+        manifest["provider"] = provider
+    terrain = np.full((20, 20, 3), [1, 134, 160], dtype=np.uint8)
+    terrain[:, :8] = 0
+    satellite = np.full((20, 20, 3), [10, 80, 10], dtype=np.uint8)
+    satellite[:, :8] = 0
+    Image.fromarray(terrain).save(tmp_path / "terrain-0.png")
+    Image.fromarray(satellite).save(tmp_path / "sat-0.png")
+    counters = {"classifier": 0, "regression": 0}
+    deps = _dependencies(counters)
+    deps.terrain_feature_fn = compute_terrain_features
+    captured = []
+
+    def regression(embeddings, terrain_features, logits):
+        captured.append(terrain_features.copy())
+        return np.zeros(len(embeddings), dtype=np.float32)
+
+    deps.regression_predictor = regression
+    result = score_tile_manifest(manifest, run_root=tmp_path / "run", dependencies=deps)
+    if provider != "mapbox_v1":
+        assert result["counts"]["error_rows"] == 1
+        assert result["counts"]["scored_rows"] == 0
+        assert counters == {"classifier": 0, "regression": 0}
+        assert captured == []
+        row = pd.read_csv(tmp_path / "run" / "candidate_pool.csv").iloc[0]
+        assert "missing_source_attribution" in row["error"]
+        assert not row["selector_eligible"]
+        return
+    assert result["counts"]["scored_rows"] == 1
+    assert result["counts"]["selector_eligible_rows"] == 1
+    row = pd.read_csv(tmp_path / "run" / "candidate_pool.csv").iloc[0]
+    assert row["relief"] == row["roughness"] == row["slope_mean"] == 0.0
+    assert row["vegetation_density"] == pytest.approx(0.8)
+    assert row["water_fraction"] == pytest.approx(0.4)
+    assert captured[0].shape == (1, 6)
+    assert captured[0][0, 0] == captured[0][0, 1] == 0.0
+
+
+def _acquisition_manifest(root):
+    from src.data_pipeline.source_contracts import compute_acquisition_tile_identity
+
+    manifest = _manifest(root).iloc[:1].copy()
+    manifest["provider"] = "naip"
+    manifest["satellite_source"] = "naip-visualization"
+    manifest["terrain_source"] = "usgs-3dep"
+    manifest["grid_sha256"] = "a" * 64
+    manifest["source_contract_sha256"] = "b" * 64
+    manifest["preprocessing_contract_sha256"] = "c" * 64
+    manifest["satellite_output_sha256"] = sha256_file(root / "sat-0.png")
+    manifest["terrain_output_sha256"] = sha256_file(root / "terrain-0.png")
+    row = manifest.iloc[0]
+    manifest["acquisition_tile_identity_sha256"] = compute_acquisition_tile_identity(
+        z=int(row["z"]), x=int(row["x"]), y=int(row["y"]), region=row["region"],
+        target_grid_sha256=row["grid_sha256"],
+        source_contract_sha256=row["source_contract_sha256"],
+        preprocessing_contract_sha256=row["preprocessing_contract_sha256"],
+        satellite_output_sha256=row["satellite_output_sha256"],
+        terrain_output_sha256=row["terrain_output_sha256"],
+    ).sha256()
+    return manifest
+
+
+def test_canonical_scoring_requires_acquisition_provenance(tmp_path):
+    manifest = _manifest(tmp_path).iloc[:1].copy()
+    manifest["provider"] = "naip"
+    manifest["satellite_source"] = "naip-visualization"
+    counters = {"classifier": 0, "regression": 0}
+    result = score_tile_manifest(
+        manifest, run_root=tmp_path / "run", dependencies=_dependencies(counters)
+    )
+    assert result["counts"]["error_rows"] == 1
+    assert result["counts"]["scored_rows"] == 0
+    assert counters == {"classifier": 0, "regression": 0}
+    row = pd.read_csv(tmp_path / "run" / "candidate_pool.csv").iloc[0]
+    assert "missing_acquisition_provenance" in row["error"]
+    assert not row["selector_eligible"]
+
+
+def test_canonical_scoring_accepts_matching_acquisition(tmp_path):
+    manifest = _acquisition_manifest(tmp_path)
+    result = score_tile_manifest(
+        manifest, run_root=tmp_path / "run",
+        dependencies=_dependencies({"classifier": 0, "regression": 0}),
+    )
+    assert result["counts"]["scored_rows"] == 1
+    assert result["counts"]["error_rows"] == 0
+
+
+@pytest.mark.parametrize("style", ["satellite", "terrain"])
+def test_canonical_scoring_rejects_tampered_png_before_cache_or_models(tmp_path, style):
+    manifest = _acquisition_manifest(tmp_path)
+    counters = {"classifier": 0, "regression": 0}
+    dependencies = _dependencies(counters)
+    run_root = tmp_path / "run"
+    score_tile_manifest(manifest, run_root=run_root, dependencies=dependencies)
+    counters.update(classifier=0, regression=0)
+    path = manifest.iloc[0][f"{style}_path"]
+    _png(tmp_path / path, (60, 130, 90))
+    result = score_tile_manifest(manifest, run_root=run_root, dependencies=dependencies)
+    assert result["counts"]["scored_rows"] == result["counts"]["cache_hits"] == 0
+    assert result["counts"]["error_rows"] == 1
+    assert counters == {"classifier": 0, "regression": 0}
+    row = pd.read_csv(run_root / "candidate_pool.csv").iloc[0]
+    assert f"{style}_output_sha256_mismatch" in row["error"]
+
+
+def test_canonical_scoring_rejects_forged_acquisition_identity(tmp_path):
+    manifest = _acquisition_manifest(tmp_path)
+    manifest["acquisition_tile_identity_sha256"] = "d" * 64
+    counters = {"classifier": 0, "regression": 0}
+    result = score_tile_manifest(
+        manifest, run_root=tmp_path / "run", dependencies=_dependencies(counters)
+    )
+    assert result["counts"]["error_rows"] == 1
+    assert counters == {"classifier": 0, "regression": 0}
+    row = pd.read_csv(tmp_path / "run" / "candidate_pool.csv").iloc[0]
+    assert "acquisition_identity_mismatch" in row["error"]
+
+
+def test_planner_coastal_inventory_counts_black_sea(tmp_path):
+    from scripts.ingest.plan_active_learning_region import _assess_water_inventory
+
+    terrain = np.full((10, 10, 3), [1, 134, 160], dtype=np.uint8)
+    satellite = np.full((10, 10, 3), [10, 80, 10], dtype=np.uint8)
+    terrain[:, :6] = 0
+    satellite[:, :6] = 0
+    terrain_path = tmp_path / "coast-terrain.png"
+    satellite_path = tmp_path / "coast-satellite.png"
+    Image.fromarray(terrain).save(terrain_path)
+    Image.fromarray(satellite).save(satellite_path)
+    row = {
+        "satellite_path": str(satellite_path),
+        "terrain_path": str(terrain_path),
+        "satellite_present": True,
+        "terrain_present": True,
+    }
+
+    result = _assess_water_inventory([row])
+
+    assert row["satellite_water_fraction"] == pytest.approx(0.6)
+    assert row["effective_water_fraction"] == pytest.approx(0.6)
+    assert row["water_filter_status"] == "excessive_water"
+    assert result["assessed"] == result["excessive"] == 1
+    assert result["eligible"] == result["unknown"] == 0
+
+
+@pytest.mark.parametrize("geometry", ["missing", "different_grid"])
+def test_planner_inventory_without_matching_geometry_remains_unknown(tmp_path, geometry):
+    from scripts.ingest.plan_active_learning_region import _assess_water_inventory
+
+    satellite_path = tmp_path / "satellite.png"
+    terrain_path = tmp_path / "terrain.png"
+    _png(satellite_path, (0, 0, 0))
+    if geometry == "different_grid":
+        Image.new("RGB", (2, 2), color=(1, 134, 160)).save(terrain_path)
+    row = {
+        "satellite_path": str(satellite_path),
+        "terrain_path": str(terrain_path),
+        "satellite_present": True,
+        "terrain_present": geometry != "missing",
+    }
+
+    result = _assess_water_inventory([row])
+
+    assert row["satellite_water_fraction"] == ""
+    assert row["effective_water_fraction"] == ""
+    assert row["water_filter_status"] == "unknown"
+    assert result["unknown"] == 1
+    assert result["assessed"] == result["eligible"] == 0

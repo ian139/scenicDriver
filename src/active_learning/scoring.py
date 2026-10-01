@@ -7,6 +7,12 @@ flags only for successfully scored rows.  Production model loading follows
 the repository's classifier, terrain, regression, and active-registry
 contracts; dependency injection keeps focused tests free of real weights and
 network access.
+
+Canonical acquisition claims must match inventory provenance and both PNG
+hashes before decoding or cache reuse. Persisted canonical terrain PNGs reserve
+black for outside-land sea: that mask excludes fill from terrain/vegetation
+features and counts known sea in water coverage. Schema 4 invalidates earlier
+unmasked feature caches without changing the six-value terrain vector.
 """
 
 from __future__ import annotations
@@ -45,9 +51,9 @@ from .water import (
     evaluate_water_status,
     is_excessive_water,
 )
-from src.terrain.features import compute_terrain_features
+from src.terrain.features import compute_terrain_features, compute_terrain_valid_mask
 
-SCORING_SCHEMA_VERSION = 3
+SCORING_SCHEMA_VERSION = 4
 SCHEMA_VERSION = SCORING_SCHEMA_VERSION
 CANONICAL_TILE_COLUMNS = (
     "region",
@@ -592,8 +598,38 @@ def _terrain_values(result: Any) -> tuple[np.ndarray, dict[str, float]]:
     return terrain_array, metrics
 
 
-def _satellite_metrics(image: Image.Image) -> dict[str, float]:
-    return {"water_fraction": compute_satellite_water_fraction(image)}
+def _satellite_metrics(image: Image.Image, *, land_mask: np.ndarray) -> dict[str, float]:
+    return {"water_fraction": compute_satellite_water_fraction(image, land_mask=land_mask)}
+
+
+def _requires_acquisition_provenance(row: Mapping[str, Any]) -> bool:
+    """Require attributable sources; only explicit Mapbox markers stay legacy."""
+    sources = [
+        _clean_text(row.get(key)).lower()
+        for key in (
+            "provider", "satellite_provider", "terrain_provider",
+            "satellite_collection", "satellite_source",
+            "terrain_collection", "terrain_source",
+        )
+    ]
+    acquisition_claim = any(
+        _clean_text(row.get(key))
+        for key in (
+            "grid_sha256", "preprocessing_contract_sha256",
+            "satellite_output_sha256", "terrain_output_sha256",
+            "acquisition_tile_identity_sha256", "acquisition_tile_sha256",
+        )
+    )
+    if acquisition_claim or any("naip" in source or "3dep" in source for source in sources):
+        return True
+    attributed = [source for source in sources if source]
+    if attributed and all(source.startswith("mapbox") for source in attributed):
+        return False
+    if _clean_text(row.get("source_contract_sha256")):
+        return True
+    if attributed:
+        raise ValueError("unrecognized_source_attribution: tile source cannot be attributed")
+    raise ValueError("missing_source_attribution: tile source cannot be attributed")
 
 
 class _ScoringDataset:
@@ -632,7 +668,11 @@ class _ScoringDataset:
                 raise ValueError(
                     "satellite and terrain imagery must have matching positive dimensions"
                 )
-            terrain_result = self._terrain_feature_fn(terrain, satellite)
+            # Scoring reads persisted canonical PNGs; black DEM is reserved sea fill.
+            valid_mask = compute_terrain_valid_mask(terrain)
+            terrain_result = self._terrain_feature_fn(
+                terrain, satellite, valid_mask=valid_mask
+            )
             terrain_features, terrain_metrics = _terrain_values(terrain_result)
             transformed = (
                 self._classifier_transform(satellite)
@@ -645,7 +685,7 @@ class _ScoringDataset:
                 transformed=transformed,
                 terrain_features=terrain_features,
                 terrain_metrics=terrain_metrics,
-                satellite_metrics=_satellite_metrics(satellite),
+                satellite_metrics=_satellite_metrics(satellite, land_mask=valid_mask),
                 satellite_hash=str(item.satellite.content_hash),
                 terrain_hash=str(item.terrain.content_hash),
             )
@@ -1734,6 +1774,17 @@ def score_tile_manifest(
 
     for index, (_, source_row) in enumerate(frame.iterrows()):
         row, result = source_row.to_dict(), results[index]
+        try:
+            requires_provenance = _requires_acquisition_provenance(row)
+            if requires_provenance:
+                from src.data_pipeline.tile_inventory import acquisition_provenance_reason
+
+                reason = acquisition_provenance_reason(row)
+                if reason is not None:
+                    raise ValueError(reason)
+        except Exception as exc:
+            record_error(index, f"{type(exc).__name__}: {exc}")
+            continue
         if (
             not result["manifest_satellite_present"]
             or not result["manifest_terrain_present"]
@@ -1767,6 +1818,10 @@ def score_tile_manifest(
             assert (
                 satellite.content_hash is not None and terrain.content_hash is not None
             )
+            if requires_provenance:
+                for style, source in (("satellite", satellite), ("terrain", terrain)):
+                    if source.content_hash != _clean_text(row.get(f"{style}_output_sha256")):
+                        raise ValueError(f"{style}_output_sha256_mismatch")
             result["satellite_content_sha256"] = satellite.content_hash
             result["terrain_content_sha256"] = terrain.content_hash
             cached_row = cache.rows.get(result["source_identity"]) if cache else None

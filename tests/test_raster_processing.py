@@ -116,7 +116,7 @@ def test_vertical_datum_rejection():
             )
 
         # Matching vertical datum passes
-        rgb_terrain, dem_out, stats = process_dem(
+        rgb_terrain, dem_out, returned_mask, stats = process_dem(
             [dem_path],
             grid,
             land_mask,
@@ -124,6 +124,7 @@ def test_vertical_datum_rejection():
             target_vertical_datum="NAVD88",
         )
         assert rgb_terrain.shape == (3, 16, 16)
+        np.testing.assert_array_equal(returned_mask, land_mask)
 
 
 def test_terrain_rgb_encode_decode_precision():
@@ -226,7 +227,7 @@ def test_process_imagery_and_no_data_validation():
             ],
         }
 
-        rgb_out, stats = process_imagery(
+        rgb_out, returned_mask, stats = process_imagery(
             [img_path], grid, land_geojson, fill_value=(0, 0, 0)
         )
         assert rgb_out.shape == (3, 16, 16)
@@ -236,6 +237,8 @@ def test_process_imagery_and_no_data_validation():
 
         # Outside land (bottom half) filled with fill_value (0, 0, 0)
         assert np.all(rgb_out[:, 8:16, :] == 0)
+        assert returned_mask.dtype == bool
+        assert np.all(returned_mask[:8]) and not np.any(returned_mask[8:])
 
         # Reject remote paths in process_imagery
         with pytest.raises(RemotePathError):
@@ -265,8 +268,8 @@ def test_process_dem_and_qc_stats():
             ],
         }
 
-        rgb_terrain, dem_out, stats = process_dem(
-            [dem_path], grid, land_geojson, outside_land_elevation=-10000.0
+        rgb_terrain, dem_out, returned_mask, stats = process_dem(
+            [dem_path], grid, land_geojson
         )
 
         assert rgb_terrain.shape == (3, 16, 16)
@@ -276,6 +279,8 @@ def test_process_dem_and_qc_stats():
 
         # Outside land (bottom half) filled with -10000.0
         assert np.all(dem_out[8:16, :] == -10000.0)
+        assert returned_mask.dtype == bool
+        assert np.all(returned_mask[:8]) and not np.any(returned_mask[8:])
 
 
 def test_process_dem_nodata_on_land_failure():
@@ -329,11 +334,12 @@ def test_dem_resampling_does_not_bleed_nodata_into_valid_land() -> None:
                 ]
             ],
         }
-        _rgb, dem_out, stats = process_dem([dem_path], grid, land_geojson)
+        _rgb, dem_out, returned_mask, stats = process_dem([dem_path], grid, land_geojson)
         assert stats["stats"]["elevation_min"] == pytest.approx(100.0)
         assert stats["stats"]["elevation_max"] == pytest.approx(100.0)
         land_mask = rasterize_land_geometry(land_geojson, grid)
         assert np.allclose(dem_out[land_mask], 100.0)
+        np.testing.assert_array_equal(returned_mask, land_mask)
 
 
 def test_mosaic_order_precedence():
@@ -348,13 +354,13 @@ def test_mosaic_order_precedence():
         path2 = _create_georeferenced_tif(Path(tmpdir) / "img2.tif", img2_arr, grid)
 
         # "first" order: img1 takes precedence
-        rgb_first, _ = process_imagery(
+        rgb_first, _, _ = process_imagery(
             [path1, path2], grid, land_mask, mosaic_order="first"
         )
         assert np.all(rgb_first == 100)
 
         # "last" order: img2 takes precedence
-        rgb_last, _ = process_imagery(
+        rgb_last, _, _ = process_imagery(
             [path1, path2], grid, land_mask, mosaic_order="last"
         )
         assert np.all(rgb_last == 200)
@@ -363,3 +369,61 @@ def test_mosaic_order_precedence():
             process_imagery([path1, path2], grid, land_mask, mosaic_order="frist")
         with pytest.raises(ValueError, match="Unsupported mosaic_order"):
             process_dem([path1, path2], grid, land_mask, mosaic_order="newest")
+
+
+def test_raster_coast_mask_carries_land_only_features(tmp_path):
+    from src.terrain.features import compute_terrain_features, compute_terrain_valid_mask
+
+    grid = TargetGrid.from_tile(z=10, x=100, y=200, width=20, height=20)
+    land = np.zeros((20, 20), dtype=bool)
+    land[:, 10:] = True
+    dem_path = _create_georeferenced_tif(tmp_path / "dem.tif", np.zeros((20, 20)), grid, is_float=True)
+    image_path = _create_georeferenced_tif(
+        tmp_path / "satellite.tif", np.full((20, 20, 3), [10, 80, 10], dtype=np.uint8), grid
+    )
+    terrain, dem, dem_mask, _ = process_dem([dem_path], grid, land)
+    satellite, image_mask, _ = process_imagery([image_path], grid, land)
+    np.testing.assert_array_equal(dem_mask, land)
+    np.testing.assert_array_equal(image_mask, land)
+    np.testing.assert_array_equal(compute_terrain_valid_mask(terrain.transpose(1, 2, 0)), land)
+    result = compute_terrain_features(
+        terrain.transpose(1, 2, 0), satellite.transpose(1, 2, 0), valid_mask=dem_mask
+    )
+    assert result.relief == result.roughness == result.slope_mean == 0.0
+    assert result.features.vegetation_density == pytest.approx(0.8)
+    assert np.all(dem[~land] == -10000.0)
+
+
+def test_all_sea_rasters_have_empty_masks_and_finite_qc(tmp_path):
+    grid = TargetGrid.from_tile(z=10, x=100, y=200, width=4, height=4)
+    land = np.zeros((4, 4), dtype=bool)
+    dem_path = _create_georeferenced_tif(tmp_path / "dem.tif", np.zeros((4, 4)), grid, is_float=True)
+    image_path = _create_georeferenced_tif(tmp_path / "satellite.tif", np.zeros((4, 4, 3)), grid)
+    terrain, dem, dem_mask, dem_qc = process_dem([dem_path], grid, land)
+    satellite, image_mask, image_qc = process_imagery([image_path], grid, land)
+    assert not dem_mask.any() and not image_mask.any()
+    assert not terrain.any() and not satellite.any()
+    assert np.all(dem == -10000.0)
+    assert all(np.isfinite(value) for value in dem_qc["stats"].values())
+    assert all(np.isfinite(value) for value in image_qc["stats"].values())
+
+
+@pytest.mark.parametrize("mask,error", [
+    (np.ones((4, 4), dtype=np.uint8), TypeError),
+    (np.ones((4, 3), dtype=bool), ValueError),
+])
+def test_raster_land_mask_rejects_dtype_or_shape_mismatch(mask, error):
+    grid = TargetGrid.from_tile(z=10, x=100, y=200, width=4, height=4)
+    with pytest.raises(error):
+        rasterize_land_geometry(mask, grid)
+    with pytest.raises(error):
+        encode_terrain_rgb(np.zeros((4, 4)), land_mask=mask)
+
+
+def test_processed_land_cannot_collide_with_reserved_black_fill(tmp_path):
+    grid = TargetGrid.from_tile(z=10, x=100, y=200, width=4, height=4)
+    dem_path = _create_georeferenced_tif(
+        tmp_path / "dem.tif", np.full((4, 4), -10000.0), grid, is_float=True
+    )
+    with pytest.raises(TerrainRGBRangeError):
+        process_dem([dem_path], grid, np.ones((4, 4), dtype=bool))

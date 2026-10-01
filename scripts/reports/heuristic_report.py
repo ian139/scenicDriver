@@ -1,5 +1,6 @@
 """
-Run heuristic scoring, write labels/run metadata, and generate a local report.
+Score paired tiles and report their admitted provenance. Learned identity comes
+from checkpoint metadata or --learned-run-json; checkpoint hashes are verified.
 """
 
 from __future__ import annotations
@@ -65,6 +66,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Classifier checkpoint path (required for --scoring learned)",
     )
+    parser.add_argument(
+        "--learned-run-json", type=Path, default=None,
+        help="Attested learned run metadata supplying missing checkpoint identities; declared identities must match loaded artifacts.",
+    )
     return parser.parse_args()
 
 
@@ -100,6 +105,8 @@ def run_report(args: argparse.Namespace) -> Path:
 
     if args.scoring == "learned" and args.no_classifier:
         raise ValueError("--no-classifier cannot be used with --scoring learned")
+    if args.scoring != "learned" and getattr(args, "learned_run_json", None) is not None:
+        raise ValueError("--learned-run-json requires --scoring learned")
     if args.scoring == "learned" and not Path(cfg.classifier_best_ckpt).exists():
         raise FileNotFoundError(
             "Learned scoring requires a classifier checkpoint for embeddings, but it was not found at "
@@ -123,6 +130,7 @@ def run_report(args: argparse.Namespace) -> Path:
         seed=seed,
         device=args.device,
         learned_regression_ckpt=learned_regression_ckpt,
+        learned_run_json=getattr(args, "learned_run_json", None),
     )
 
     run_dir = Path(cfg.processed_dir) / "heuristic_runs" / run_name

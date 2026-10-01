@@ -73,8 +73,13 @@ Every Stage-One run owns one ignored directory:
 `candidate_pool.csv` contains scalar scores and identities only. Dense
 embeddings, class outputs, and terrain vectors stay in
 `feature_embeddings.npz` with explicit row indices. Missing imagery remains a
-status row and is never selector-eligible. Do not overwrite a prior run name
-or move generated artifacts into Git.
+status row and is never selector-eligible. A run's selection contract owns its
+candidate input path and SHA-256, normalized settings (including the seed), and
+prior-label SHA-256. Identical reruns preserve the existing fixed artifacts
+unchanged; changed inputs, settings, or prior labels require a new run name.
+Incomplete or modified selection artifacts must not be overwritten. Existing
+acquisition/scoring-only directories may receive their first selection.
+Do not move generated artifacts into Git.
 
 
 ## Training and Validation Working Sets
@@ -156,6 +161,18 @@ The checker validates the SQLite format/schema, configured bbox, row counts,
 coverage probes, and integrity before startup. Keep the previous corridor
 artifact and manifest for rollback: restore its graph/config/manifest paths,
 rerun the checker, and restart only after the rollback artifact passes.
+
+### Compact Artifact Publication
+
+`road_graph.compact.json` is the compact runtime entry point. Its dependency
+paths resolve relative to the manifest, into an adjacent immutable,
+content-addressed generation containing the binary payload, source SQLite
+snapshot, and projection sidecar when present. All dependencies are staged,
+hash-verified, and fsynced before the manifest is atomically replaced last.
+Cancellation or failure before the manifest swap leaves the previous generation
+loadable, even if the input SQLite file has changed. Retain old generation
+directories while their manifests or existing readers may still reference them.
+
 
 ## Git Policy
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import mmap
+import os
 import time
 from typing import Callable, Protocol, runtime_checkable
 
@@ -22,6 +24,42 @@ class RoutingCancelled(RuntimeError):
 
 class RoutingTimeout(TimeoutError):
     """Raised when a routing request exhausts its monotonic deadline."""
+
+
+class SharedCancelFlag:
+    """Kill-safe cancellation byte shared with forked children.
+
+    The flag is one byte of anonymous ``MAP_SHARED`` memory created before
+    ``fork``.  No lock guards it: single-byte loads and stores are atomic, so a
+    reader that is SIGKILLed at any instruction cannot leave the flag in a
+    state that blocks anyone else.
+
+    Owner ordering: the creating process is the only writer.  It calls
+    ``clear`` before handing a job to a child and ``set`` to cancel that job;
+    forked children only call ``is_set``.  ``set``/``clear`` from any other
+    process raise ``RuntimeError``.
+    """
+
+    __slots__ = ("_memory", "_owner_pid")
+
+    def __init__(self) -> None:
+        self._memory = mmap.mmap(-1, 1)
+        self._owner_pid = os.getpid()
+
+    def is_set(self) -> bool:
+        return self._memory[0] != 0
+
+    def set(self) -> None:
+        self._write(1)
+
+    def clear(self) -> None:
+        self._write(0)
+
+    def _write(self, value: int) -> None:
+        if os.getpid() != self._owner_pid:
+            raise RuntimeError("only the creating process may change a SharedCancelFlag")
+        self._memory[0] = value
+
 
 @dataclass(frozen=True, slots=True)
 class RoutingDeadline:

@@ -70,6 +70,7 @@ from src.data_pipeline.source_contracts import (
     SourceAsset,
     compute_acquisition_tile_identity,
 )
+from src.data_pipeline.tile_inventory import acquisition_provenance_reason
 from src.data_pipeline.usgs_3dep import (
     VALID_ELEVATION_UNITS,
     VALID_VERTICAL_DATUMS,
@@ -3921,7 +3922,7 @@ def process_tile_pair(
         raise SourceContractError("every terrain asset requires a vertical datum")
     source_vertical_datums = [str(value) for value in terrain_vertical_datums]
     satellite_qc_contract = preprocessing.get("satellite_qc", {})
-    satellite_rgb, satellite_qc = process_imagery(
+    satellite_rgb, _satellite_land_mask, satellite_qc = process_imagery(
         list(satellite_paths),
         grid,
         land_geometry,
@@ -3932,14 +3933,11 @@ def process_tile_pair(
         reject_all_black=bool(satellite_qc_contract.get("reject_all_black", True)),
         reject_all_white=bool(satellite_qc_contract.get("reject_all_white", True)),
     )
-    terrain_rgb, _dem, terrain_qc = process_dem(
+    terrain_rgb, _dem, _terrain_land_mask, terrain_qc = process_dem(
         list(terrain_paths),
         grid,
         land_geometry,
         resampling=str(preprocessing["terrain_resampling"]),
-        outside_land_elevation=float(
-            preprocessing.get("outside_land_elevation", -10000.0)
-        ),
         mosaic_order=str(preprocessing.get("mosaic_order", "first")),
         source_vertical_datum=source_vertical_datums,
         target_vertical_datum=str(preprocessing["target_vertical_datum"]),
@@ -4047,9 +4045,9 @@ def _validate_existing_record(
     """Return (valid, reason, record).
 
     A tile is valid only when BOTH outputs exist, the adjacent run record
-    carries this exact run id and execution-plan SHA, and every recorded
-    output SHA-256 matches the bytes on disk.  Existence or non-zero size
-    alone is never trusted.
+    carries this exact run id and execution-plan SHA, and its full acquisition
+    identity is proven. Every recorded output SHA-256 must match bytes on disk;
+    existence or non-zero size alone is never trusted.
     """
     if not sat_path.is_file() or not ter_path.is_file():
         return False, "missing_output", None
@@ -4064,10 +4062,15 @@ def _validate_existing_record(
         or record.get("execution_plan_sha256") != plan_sha
     ):
         return False, "foreign_owner", record
+    provenance_reason = acquisition_provenance_reason(record)
+    if provenance_reason:
+        return False, provenance_reason, record
     for style, path in (("satellite", sat_path), ("terrain", ter_path)):
         recorded = (record.get(style) or {}).get("sha256")
         if not isinstance(recorded, str) or not recorded:
             return False, f"{style}_record_missing_sha", record
+        if recorded != record[f"{style}_output_sha256"]:
+            return False, f"{style}_record_sha_mismatch", record
         if file_sha256(path) != recorded:
             return False, f"{style}_content_mismatch", record
     return True, None, record
@@ -4078,20 +4081,6 @@ def _quarantine(path: Path) -> None:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     quarantine = path.with_name(f"{path.name}.quarantine.{timestamp}")
     os.replace(path, quarantine)
-
-
-def _read_checkpoint(run_dir: Path, plan_sha: str) -> dict[str, Any] | None:
-    path = run_dir / "checkpoint.json"
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if data.get("execution_plan_sha256") != plan_sha:
-        # Checkpoint belongs to a different plan; treated as foreign.
-        return None
-    return data
 
 
 def _write_checkpoint(
@@ -4138,6 +4127,9 @@ def execute_plan(
     ``transport_factory`` is dependency-injectable so tests run against local
     fixtures with no network; it receives
     ``(bucket, caps, ledger, rate_card, requester_pays, shared_budget)``.
+
+    Successful acquisitions and validated resume skips restore manifest source
+    attribution from the pinned source contract and recomputed tile plan.
     """
     if workers < 1 or workers > MAX_WORKERS:
         raise ValueError(f"workers must be between 1 and {MAX_WORKERS}, got {workers}")
@@ -4628,6 +4620,21 @@ def execute_plan(
         provenance["terrain"]["asset_ids"] = terrain_asset_ids
         provenance["state"] = tile_plan.get("state")
         provenance["warnings"] = tile_plan.get("warnings", [])
+        provenance["source_contract_sha256"] = contract_sha
+        provenance["preprocessing_contract_sha256"] = preprocessing_sha
+        provenance["satellite_output_sha256"] = provenance["satellite"]["output_sha256"]
+        provenance["terrain_output_sha256"] = provenance["terrain"]["output_sha256"]
+        provenance["acquisition_tile_identity_sha256"] = compute_acquisition_tile_identity(
+            z=z,
+            x=x,
+            y=y,
+            region=region,
+            target_grid_sha256=provenance["grid_sha256"],
+            satellite_output_sha256=provenance["satellite_output_sha256"],
+            terrain_output_sha256=provenance["terrain_output_sha256"],
+            source_contract_sha256=contract_sha,
+            preprocessing_contract_sha256=preprocessing_sha,
+        ).sha256()
         record = {
             "state": "complete",
             "run_id": run_name,
@@ -4635,6 +4642,13 @@ def execute_plan(
             "source_contract_sha256": contract_sha,
             "preprocessing_contract_sha256": preprocessing_sha,
             "grid_sha256": provenance["grid_sha256"],
+            "region": region,
+            "z": z,
+            "x": x,
+            "y": y,
+            "satellite_output_sha256": provenance["satellite_output_sha256"],
+            "terrain_output_sha256": provenance["terrain_output_sha256"],
+            "acquisition_tile_identity_sha256": provenance["acquisition_tile_identity_sha256"],
             "satellite": {
                 "path": provenance["satellite"]["path"],
                 "sha256": provenance["satellite"]["output_sha256"],
@@ -4768,13 +4782,14 @@ def execute_plan(
         row["terrain_output_sha256"] = ter["output_sha256"]
         row["terrain_valid_fraction"] = f"{ter['valid_fraction']:.6f}"
         row["grid_sha256"] = outcome.provenance["grid_sha256"]
+        row["source_contract_sha256"] = outcome.provenance["source_contract_sha256"]
+        row["preprocessing_contract_sha256"] = outcome.provenance[
+            "preprocessing_contract_sha256"
+        ]
+        row["acquisition_tile_identity_sha256"] = outcome.provenance[
+            "acquisition_tile_identity_sha256"
+        ]
         tile_plan = tile_plans_by_key[key]
-        row["satellite_asset_ids"] = json.dumps(
-            tile_plan["satellite_asset_ids"], sort_keys=True, separators=(",", ":")
-        )
-        row["terrain_asset_ids"] = json.dumps(
-            tile_plan["terrain_asset_ids"], sort_keys=True, separators=(",", ":")
-        )
 
         def _asset_contributions(
             asset_ids: Sequence[str], qc: Mapping[str, Any]
@@ -4825,29 +4840,41 @@ def execute_plan(
             row["terrain_valid_fraction"] = str(
                 record.get("terrain", {}).get("valid_fraction", "")
             )
-            row["grid_sha256"] = record.get("grid_sha256", "")
-
-    for row in rows:
-        if not all(
-            row.get(name)
-            for name in (
+            for field in (
                 "grid_sha256",
-                "satellite_output_sha256",
-                "terrain_output_sha256",
-            )
-        ):
+                "source_contract_sha256",
+                "preprocessing_contract_sha256",
+                "acquisition_tile_identity_sha256",
+            ):
+                row[field] = record[field]
+
+    # Inventory clears attribution for unproven rows. Restore it only after
+    # acquisition or an exact resume validation proves the pair again.
+    for key, outcome in results.items():
+        if not outcome.skipped and outcome.provenance is None:
             continue
-        row["acquisition_tile_identity_sha256"] = compute_acquisition_tile_identity(
-            z=int(row["z"]),
-            x=int(row["x"]),
-            y=int(row["y"]),
-            region=str(row["region"]),
-            target_grid_sha256=str(row["grid_sha256"]),
-            satellite_output_sha256=str(row["satellite_output_sha256"]),
-            terrain_output_sha256=str(row["terrain_output_sha256"]),
-            source_contract_sha256=contract_sha,
-            preprocessing_contract_sha256=preprocessing_sha,
-        ).sha256()
+        row = row_by_key[key]
+        tile_plan = tile_plans_by_key[key]
+        for style, source in (("satellite", "imagery"), ("terrain", "terrain")):
+            for suffix in ("provider", "collection", "license", "attribution"):
+                row[f"{style}_{suffix}"] = contract[source][suffix]
+            row[f"{style}_asset_ids"] = json.dumps(
+                tile_plan[f"{style}_asset_ids"],
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            row[f"{style}_source_checksums"] = json.dumps(
+                tile_plan.get(f"{style}_source_checksums", {}),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        for field in (
+            "satellite_acquisition_year",
+            "satellite_capture_date",
+            "terrain_vertical_datum",
+            "terrain_native_resolution",
+        ):
+            row[field] = tile_plan.get(field) or ""
 
     provenance_lines.sort(
         key=lambda p: (p["region"], int(p["z"]), int(p["x"]), int(p["y"]))

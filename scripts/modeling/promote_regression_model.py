@@ -35,7 +35,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--candidate-checkpoint", type=Path)
     p.add_argument(
         "--registry",
-        "--registry-json",
         dest="registry",
         type=Path,
         default=Path("data/processed/regression/model_registry.json"),

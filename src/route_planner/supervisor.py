@@ -10,16 +10,23 @@ deadline and SIGKILL'd at ``deadline + grace``.  After a hard kill, a fresh
 child is forked from the still-preloaded supervisor.  The supervisor remains
 reusable.
 
-A single persistent fork-shared cancellation byte (``multiprocessing.Event``)
-is created in ``start`` and inherited by the supervisor and every worker.  The
-parent mirrors any caller ``cancel_event`` into this shared byte; the worker's
-``RoutingDeadline`` observes it; the supervisor polls it and terminates the
-worker promptly.  This keeps ``cancel_event`` semantics across processes
-without serializing the original event object.
+Cancellation uses one lock-free ``SharedCancelFlag`` created by the parent in
+``start`` and inherited by the supervisor and every worker.  The parent is its
+only writer: it clears the flag after admitting a job and before sending it,
+and sets it when the caller's ``cancel_event`` fires.  The supervisor and the
+workers only read it, so killing either at any instruction can never wedge
+the parent.
 
-IPC uses ``Connection.send_bytes`` / ``recv_bytes`` with explicit ``pickle``
-framing so payloads are not limited to ``PIPE_BUF``.  The implementation
-retries on ``InterruptedError`` and never relies on a single ``os.write``.
+IPC uses length-prefixed pickle frames over non-blocking socket pairs.  Every
+read and write is bounded by the job's absolute deadline and by a per-frame
+transfer budget, and partial input is retained between short polls, so
+deadline enforcement is never blocked behind a stalled or half-written frame;
+a broken stream is classified as a worker failure and the worker is killed.
+
+Exceptions cross process boundaries as explicit envelopes carrying the exact
+type plus its ``args`` and instance attributes, so structured errors such as
+``RouteCoverageError`` keep their fields.  An envelope that cannot be rebuilt
+becomes a job-scoped ``SupervisorError``; the dispatch loop keeps serving.
 
 On non-POSIX systems the supervisor refuses to start, because neither
 ``fork`` nor true hard cancellation are available.
@@ -27,25 +34,42 @@ On non-POSIX systems the supervisor refuses to start, because neither
 
 from __future__ import annotations
 
-import builtins
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import multiprocessing
 from multiprocessing.context import ForkContext
 from multiprocessing.process import BaseProcess
 import os
 import pickle
+import select
+import socket
+import struct
 import sys
-import time
 import threading
-import traceback
+import time
 from typing import Any, Callable
 
-from .cancellation import RoutingCancelled, RoutingDeadline, RoutingTimeout
+from .cancellation import (
+    CancelToken,
+    RoutingCancelled,
+    RoutingDeadline,
+    RoutingTimeout,
+    SharedCancelFlag,
+)
 
 
 _PRELOAD_MARKER: Any = None
-_CANCEL_EVENT: Any | None = None
+
+_FRAME_HEADER = struct.Struct("!Q")
+# Largest pickled message accepted in either direction.
+_MAX_FRAME_BYTES = 512 * 1024 * 1024
+# A frame, once started, must finish within this budget even without a deadline.
+_FRAME_TRANSFER_BUDGET_SECONDS = 10.0
+_RECV_CHUNK_BYTES = 1 << 20
+# Granularity at which waits re-check deadlines and cancellation.
+_POLL_SLICE_SECONDS = 0.05
+# How long past ``deadline + grace`` the caller waits for the supervisor.
+_SUPERVISOR_RESPONSE_MARGIN_SECONDS = 2.0
 
 
 def get_preload_marker() -> Any:
@@ -56,11 +80,6 @@ def get_preload_marker() -> Any:
 def _set_preload_marker(value: Any) -> None:
     global _PRELOAD_MARKER
     _PRELOAD_MARKER = value
-
-
-def _set_cancel_event(event: Any) -> None:
-    global _CANCEL_EVENT
-    _CANCEL_EVENT = event
 
 
 @dataclass(frozen=True)
@@ -106,10 +125,18 @@ class _WorkerJob:
 
 @dataclass(frozen=True)
 class _SerializedError:
-    type_name: str
-    module_name: str | None
+    """Transport envelope: exact exception type plus its pickled state.
+
+    ``state`` is ``pickle((args, instance __dict__))`` or ``None`` when that
+    state could not be pickled.  It is kept as bytes so a payload that cannot
+    be unpickled on the receiving side only fails reconstruction of this one
+    error, never the frame that carries it.
+    """
+
+    module_name: str
+    qualname: str
     message: str
-    traceback_text: str
+    state: bytes | None
 
 
 @dataclass(frozen=True)
@@ -122,7 +149,7 @@ class _WorkerResult:
 @dataclass(frozen=True)
 class _JobResult:
     value: Any = None
-    error: BaseException | None = None
+    error: _SerializedError | None = None
     worker_pid: int | None = None
 
 
@@ -135,119 +162,248 @@ def _is_posix() -> bool:
 
 
 def _serialize_error(exc: BaseException) -> _SerializedError:
+    cls = type(exc)
+    try:
+        state: bytes | None = pickle.dumps(
+            (exc.args, dict(vars(exc))), protocol=pickle.HIGHEST_PROTOCOL
+        )
+    except Exception:
+        state = None
     return _SerializedError(
-        type_name=type(exc).__name__,
-        module_name=getattr(type(exc), "__module__", None),
+        module_name=cls.__module__,
+        qualname=cls.__qualname__,
         message=str(exc),
-        traceback_text=traceback.format_exc(),
+        state=state,
     )
 
 
-def _deserialize_error(serialized: _SerializedError) -> BaseException:
-    """Reconstruct an exception where the class is available locally."""
-    # Exact routing cancellation exceptions first.
-    if serialized.module_name == "src.route_planner.cancellation":
-        if serialized.type_name == "RoutingTimeout":
-            return RoutingTimeout(serialized.message)
-        if serialized.type_name == "RoutingCancelled":
-            return RoutingCancelled(serialized.message)
-
-    # Built-in exceptions.
-    builtin = getattr(builtins, serialized.type_name, None)
-    if isinstance(builtin, type) and issubclass(builtin, BaseException):
-        return builtin(serialized.message)
-
-    # Try to locate the class dynamically.
-    module = sys.modules.get(serialized.module_name or "")
-    if module is not None:
-        cls = getattr(module, serialized.type_name, None)
-        if isinstance(cls, type) and issubclass(cls, BaseException):
-            try:
-                return cls(serialized.message)
-            except Exception:
-                pass
-
-    return SupervisorError(f"{serialized.type_name}: {serialized.message}")
+def _rebuild_error(serialized: _SerializedError) -> BaseException:
+    if serialized.state is None:
+        raise ValueError("exception state could not be transferred")
+    # Only classes already loaded here can be caught here; never import.
+    target: Any = sys.modules[serialized.module_name]
+    for part in serialized.qualname.split("."):
+        target = getattr(target, part)
+    if not (isinstance(target, type) and issubclass(target, BaseException)):
+        raise TypeError(f"{serialized.qualname} is not an exception class")
+    args, attributes = pickle.loads(serialized.state)
+    try:
+        error = target(*args)
+    except Exception:
+        # Constructors whose signature differs from ``args`` (for example
+        # keyword-field errors) are rebuilt the way pickle restores state.
+        error = target.__new__(target, *args)
+    error.args = args
+    error.__dict__.update(attributes)
+    return error
 
 
-def _send_object(conn, obj: Any) -> None:
-    """Send a pickled object over a Connection, retrying on EINTR.
+def _reconstruct_error(serialized: _SerializedError) -> BaseException:
+    """Rebuild an exception, containing even BaseException from pickle reducers."""
+    try:
+        return _rebuild_error(serialized)
+    except BaseException as exc:
+        return SupervisorError(
+            f"{serialized.module_name}.{serialized.qualname}: {serialized.message} "
+            f"(could not be reconstructed: {exc!r})"
+        )
 
-    ``Connection.send_bytes`` handles the write-all loop internally; we add
-    our own ``pickle`` framing so callers are not limited to ``PIPE_BUF``.
+
+class _ChannelBroken(Exception):
+    """The stream is unusable: EOF, stalled transfer, or protocol violation."""
+
+
+class _FrameTimeout(Exception):
+    """No complete frame arrived in time; partial input is retained."""
+
+
+class _FrameDecodeError(Exception):
+    """A complete frame could not be unpickled; the stream is still in sync."""
+
+
+class _FrameEncodeError(Exception):
+    """A message could not be framed; nothing was written."""
+
+
+class _FramedChannel:
+    """Length-prefixed pickle frames over a non-blocking stream socket.
+
+    ``recv`` never waits longer than its timeout, and a started frame must
+    complete within ``_FRAME_TRANSFER_BUDGET_SECONDS``.  ``send`` gives up at
+    the earlier of its deadline and that budget.  Partial input survives a
+    ``recv`` timeout, so callers interleave deadline checks with transfers.
     """
-    data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-    while True:
+
+    def __init__(self, sock: socket.socket) -> None:
+        sock.setblocking(False)
+        self._sock = sock
+        self._header = bytearray(_FRAME_HEADER.size)
+        self._header_received = 0
+        self._payload: bytearray | None = None
+        self._payload_received = 0
+        self._frame_started_at: float | None = None
+
+    def close(self) -> None:
+        self._sock.close()
+
+    def send(self, message: Any, *, deadline_at: float | None = None) -> None:
         try:
-            conn.send_bytes(data)
-            return
-        except InterruptedError:
-            continue
-        except (BrokenPipeError, EOFError, OSError):
-            raise
+            payload = pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as exc:
+            raise _FrameEncodeError(f"message could not be pickled: {exc!r}") from exc
+        if len(payload) > _MAX_FRAME_BYTES:
+            raise _FrameEncodeError(
+                f"message of {len(payload)} bytes is too large "
+                f"(limit {_MAX_FRAME_BYTES} bytes)"
+            )
+        stop_at = time.monotonic() + _FRAME_TRANSFER_BUDGET_SECONDS
+        if deadline_at is not None:
+            stop_at = min(stop_at, deadline_at)
+        self._send_all(memoryview(_FRAME_HEADER.pack(len(payload))), stop_at)
+        self._send_all(memoryview(payload), stop_at)
 
-
-def _recv_object(conn, timeout: float | None = None) -> Any:
-    """Receive a pickled object from a Connection, retrying on EINTR."""
-    if timeout is not None:
-        deadline = time.monotonic() + timeout
-        while True:
+    def _send_all(self, view: memoryview, stop_at: float) -> None:
+        while view:
+            remaining = stop_at - time.monotonic()
+            if remaining <= 0.0:
+                raise _ChannelBroken("send exceeded its deadline")
             try:
-                if conn.poll(timeout):
-                    break
-                raise TimeoutError("IPC read timed out")
-            except InterruptedError:
-                timeout = max(0.0, deadline - time.monotonic())
+                sent = self._sock.send(view)
+            except BlockingIOError:
+                sent = 0
+            except OSError as exc:
+                raise _ChannelBroken(f"send failed: {exc!r}") from exc
+            remaining = stop_at - time.monotonic()
+            if remaining <= 0.0:
+                raise _ChannelBroken("send exceeded its deadline")
+            view = view[sent:]
+            if view and not sent:
+                try:
+                    select.select([], [self._sock], [], remaining)
+                except (OSError, ValueError) as exc:
+                    raise _ChannelBroken(f"send failed: {exc!r}") from exc
+
+    def recv(self, *, timeout: float | None) -> Any:
+        """Return the next message, waiting at most ``timeout`` seconds.
+
+        ``timeout=None`` waits indefinitely for a frame to start; a started
+        frame is still bounded by the transfer budget.
+        """
+        wait_until = None if timeout is None else time.monotonic() + timeout
+        while True:
+            # Progress does not extend either absolute bound.  Check before
+            # accepting a completed frame as well as before reading more bytes.
+            now = time.monotonic()
+            limit = wait_until
+            if self._frame_started_at is not None:
+                budget_end = self._frame_started_at + _FRAME_TRANSFER_BUDGET_SECONDS
+                if now >= budget_end:
+                    raise _ChannelBroken("frame transfer exceeded its budget")
+                limit = budget_end if limit is None else min(limit, budget_end)
+            if wait_until is not None and now >= wait_until:
+                raise _FrameTimeout()
+            frame = self._take_frame()
+            if frame is not None:
+                try:
+                    return pickle.loads(frame)
+                except BaseException as exc:
+                    raise _FrameDecodeError(repr(exc)) from exc
+            if self._receive_some():
                 continue
-            except (BrokenPipeError, EOFError, OSError):
-                raise
+            try:
+                select.select([self._sock], [], [], None if limit is None else limit - now)
+            except (OSError, ValueError) as exc:
+                raise _ChannelBroken(f"receive failed: {exc!r}") from exc
 
-    while True:
+    def _receive_some(self) -> bool:
+        """Read whatever is available; return ``False`` if nothing was."""
+        if self._payload is None:
+            target = memoryview(self._header)[self._header_received :]
+        else:
+            target = memoryview(self._payload)[self._payload_received :]
         try:
-            data = conn.recv_bytes()
-            return pickle.loads(data)
-        except InterruptedError:
-            continue
-        except (BrokenPipeError, EOFError, OSError):
-            raise
+            count = self._sock.recv_into(target, min(len(target), _RECV_CHUNK_BYTES))
+        except BlockingIOError:
+            return False
+        except OSError as exc:
+            raise _ChannelBroken(f"receive failed: {exc!r}") from exc
+        if count == 0:
+            raise _ChannelBroken("peer closed the channel")
+        if self._frame_started_at is None:
+            self._frame_started_at = time.monotonic()
+        if self._payload is not None:
+            self._payload_received += count
+            return True
+        self._header_received += count
+        if self._header_received == _FRAME_HEADER.size:
+            (length,) = _FRAME_HEADER.unpack(self._header)
+            if length > _MAX_FRAME_BYTES:
+                raise _ChannelBroken(
+                    f"incoming frame of {length} bytes exceeds the "
+                    f"{_MAX_FRAME_BYTES}-byte limit"
+                )
+            self._payload = bytearray(length)
+            self._payload_received = 0
+        return True
+
+    def _take_frame(self) -> bytearray | None:
+        payload = self._payload
+        if payload is None or self._payload_received < len(payload):
+            return None
+        self._payload = None
+        self._header_received = 0
+        self._frame_started_at = None
+        return payload
 
 
-def _run_one_job(job: _WorkerJob) -> _WorkerResult:
+def _send_result(
+    channel: _FramedChannel, result: _WorkerResult | _JobResult
+) -> None:
+    """Send ``result``; if it cannot be framed, send a job-scoped error instead."""
+    try:
+        channel.send(result)
+    except _FrameEncodeError as exc:
+        failure = SupervisorError(f"job result could not be transferred: {exc}")
+        channel.send(replace(result, value=None, error=_serialize_error(failure)))
+
+
+def _run_one_job(job: _WorkerJob, cancel_flag: SharedCancelFlag) -> _WorkerResult:
     """Execute a single job in the persistent worker."""
     try:
-        deadline = RoutingDeadline(
-            expires_at=job.expires_at,
-            cancel_event=_CANCEL_EVENT,
-        )
+        deadline = RoutingDeadline(expires_at=job.expires_at, cancel_event=cancel_flag)
         value = job.func(deadline, *job.args, **job.kwargs)
-        return _WorkerResult(value=value, error=None, worker_pid=os.getpid())
+        return _WorkerResult(value=value, worker_pid=os.getpid())
     except BaseException as exc:
-        return _WorkerResult(
-            value=None, error=_serialize_error(exc), worker_pid=os.getpid()
-        )
+        return _WorkerResult(error=_serialize_error(exc), worker_pid=os.getpid())
 
 
-def _persistent_worker_entry(work_conn) -> None:
+def _persistent_worker_entry(
+    sock: socket.socket, peer_sock: socket.socket, cancel_flag: SharedCancelFlag
+) -> None:
     """Main loop of the persistent disposable planning child."""
+    peer_sock.close()
+    channel = _FramedChannel(sock)
+    worker_pid = os.getpid()
     try:
         while True:
             try:
-                msg = _recv_object(work_conn)
-            except EOFError:
-                break
-            if msg is None or isinstance(msg, _Stop):
-                break
-            if isinstance(msg, _WorkerJob):
-                result = _run_one_job(msg)
-                try:
-                    _send_object(work_conn, result)
-                except (BrokenPipeError, EOFError, OSError):
-                    break
+                message = channel.recv(timeout=None)
+            except _FrameDecodeError as exc:
+                result = _WorkerResult(
+                    error=_serialize_error(
+                        SupervisorError(f"worker could not decode the job: {exc}")
+                    ),
+                    worker_pid=worker_pid,
+                )
+            else:
+                if not isinstance(message, _WorkerJob):
+                    return
+                result = _run_one_job(message, cancel_flag)
+            _send_result(channel, result)
+    except _ChannelBroken:
+        return
     finally:
-        try:
-            work_conn.close()
-        except Exception:
-            pass
+        channel.close()
 
 
 def _reap_process(process: BaseProcess, timeout: float = 5.0) -> None:
@@ -265,192 +421,201 @@ def _reap_process(process: BaseProcess, timeout: float = 5.0) -> None:
 class _WorkerHandle:
     """One persistent disposable child of the supervisor."""
 
-    def __init__(self, ctx: ForkContext, cancel_event: Any) -> None:
+    def __init__(self, ctx: ForkContext, cancel_flag: SharedCancelFlag) -> None:
         self._ctx = ctx
-        self._cancel_event = cancel_event
+        self._cancel_flag = cancel_flag
         self._proc: BaseProcess | None = None
-        self._work_conn: Any | None = None
+        self._channel: _FramedChannel | None = None
 
-    def _ensure_worker(self) -> None:
-        if self._proc is not None and self._proc.is_alive():
-            return
-        self._shutdown_worker()
-        work_parent, work_child = self._ctx.Pipe(duplex=True)
-        proc = self._ctx.Process(
-            target=_persistent_worker_entry,
-            args=(work_child,),
-            daemon=False,
-        )
-        proc.start()
-        work_child.close()
-        self._proc = proc
-        self._work_conn = work_parent
+    def _ensure_worker(self) -> tuple[BaseProcess, _FramedChannel]:
+        if self._proc is None or self._channel is None or not self._proc.is_alive():
+            self._shutdown_worker()
+            parent_sock, child_sock = socket.socketpair()
+            proc = self._ctx.Process(
+                target=_persistent_worker_entry,
+                args=(child_sock, parent_sock, self._cancel_flag),
+                daemon=False,
+            )
+            proc.start()
+            child_sock.close()
+            self._proc = proc
+            self._channel = _FramedChannel(parent_sock)
+        return self._proc, self._channel
 
     def _shutdown_worker(self) -> None:
-        if self._work_conn is not None:
-            try:
-                self._work_conn.close()
-            except Exception:
-                pass
-            self._work_conn = None
+        if self._channel is not None:
+            self._channel.close()
+            self._channel = None
         if self._proc is not None:
             _reap_process(self._proc, timeout=2.0)
             self._proc = None
 
     def shutdown(self) -> None:
         """Politely stop the worker, then reap it."""
-        if (
-            self._work_conn is not None
-            and self._proc is not None
-            and self._proc.is_alive()
-        ):
+        if self._channel is not None and self._proc is not None and self._proc.is_alive():
             try:
-                _send_object(self._work_conn, _Stop())
-            except (BrokenPipeError, EOFError, OSError):
+                self._channel.send(_Stop(), deadline_at=time.monotonic() + 0.5)
+            except _ChannelBroken:
                 pass
         self._shutdown_worker()
 
-    def _dispose_and_return(
-        self, error: BaseException, worker_pid: int | None
-    ) -> _JobResult:
-        """Kill the current worker and return a routing-cancellation/timeout error."""
-        if worker_pid is not None:
-            error.worker_pid = worker_pid  # type: ignore[attr-defined]
+    def kill(self) -> None:
+        """Hard-stop the worker; the next job forks a fresh one."""
         if self._proc is not None and self._proc.is_alive():
             self._proc.kill()
             self._proc.join(timeout=1.0)
         self._shutdown_worker()
-        return _JobResult(value=None, error=error, worker_pid=worker_pid)
+
+    def _dispose(self, error: BaseException, worker_pid: int | None) -> _JobResult:
+        self.kill()
+        return _JobResult(error=_serialize_error(error), worker_pid=worker_pid)
+
+    def _failure_error(self, deadline_at: float | None, reason: str) -> BaseException:
+        """Classify a worker that broke the protocol or died without a result."""
+        if self._cancel_flag.is_set():
+            return RoutingCancelled("routing request was cancelled")
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            return RoutingTimeout("routing request deadline exceeded")
+        return SupervisorError(reason)
 
     def run_job(self, job: _Job) -> _JobResult:
         """Forward a job to the persistent child and enforce its deadline."""
-        self._ensure_worker()
-        assert self._work_conn is not None and self._proc is not None
-
-        worker_pid = self._proc.pid
+        proc, channel = self._ensure_worker()
+        worker_pid = proc.pid
         deadline_at = job.expires_at
-        hard_at = (
-            deadline_at + job.grace_seconds
-            if deadline_at is not None and job.grace_seconds is not None
-            else None
-        )
+        hard_at = None if deadline_at is None else deadline_at + job.grace_seconds
 
         worker_job = _WorkerJob(
             func=job.func,
             args=job.args,
             kwargs=job.kwargs,
-            expires_at=job.expires_at,
+            expires_at=deadline_at,
         )
-
         try:
-            _send_object(self._work_conn, worker_job)
-        except (BrokenPipeError, EOFError, OSError):
-            pid = self._proc.pid if self._proc is not None else worker_pid
-            error = SupervisorError("worker pipe closed before job could be sent")
-            if pid is not None:
-                error.worker_pid = pid  # type: ignore[attr-defined]
-            return _JobResult(value=None, error=error, worker_pid=pid)
+            channel.send(worker_job, deadline_at=hard_at)
+        except _FrameEncodeError as exc:
+            return _JobResult(
+                error=_serialize_error(
+                    SupervisorError(f"job could not be sent to the worker: {exc}")
+                ),
+                worker_pid=worker_pid,
+            )
+        except _ChannelBroken as exc:
+            return self._dispose(
+                self._failure_error(deadline_at, f"worker channel broke: {exc}"),
+                worker_pid,
+            )
 
         terminated = False
-        worker_result: _WorkerResult | None = None
         while True:
             now = time.monotonic()
             if hard_at is not None and now >= hard_at:
-                return self._dispose_and_return(
+                return self._dispose(
                     RoutingTimeout("routing request deadline exceeded"), worker_pid
                 )
             if deadline_at is not None and not terminated and now >= deadline_at:
-                if self._proc is not None and self._proc.is_alive():
-                    self._proc.terminate()
+                if proc.is_alive():
+                    proc.terminate()
                 terminated = True
-            if self._cancel_event.is_set():
-                return self._dispose_and_return(
+            if self._cancel_flag.is_set():
+                return self._dispose(
                     RoutingCancelled("routing request was cancelled"), worker_pid
                 )
-            try:
-                worker_result = _recv_object(self._work_conn, timeout=0.05)
-                break
-            except TimeoutError:
-                continue
-            except (EOFError, BrokenPipeError, OSError):
-                break
-
-        if worker_result is None:
-            # Worker died or stopped responding without a usable result.
+            wait = _POLL_SLICE_SECONDS
             if hard_at is not None:
-                error: BaseException = RoutingTimeout(
-                    "routing request deadline exceeded"
+                wait = min(wait, hard_at - now)
+            try:
+                worker_result = channel.recv(timeout=wait)
+            except _FrameTimeout:
+                continue
+            except _FrameDecodeError as exc:
+                return self._dispose(
+                    self._failure_error(
+                        deadline_at, f"worker result could not be decoded: {exc}"
+                    ),
+                    worker_pid,
                 )
-            else:
-                error = SupervisorError("worker process did not return a result")
-            return self._dispose_and_return(error, worker_pid)
+            except _ChannelBroken as exc:
+                return self._dispose(
+                    self._failure_error(
+                        deadline_at, f"worker exited without a result: {exc}"
+                    ),
+                    worker_pid,
+                )
+            break
 
-        # A late response that crossed expires_at or a cancellation must be
-        # rejected before deserializing/propagating any worker-produced error,
-        # so that a non-timeout error returned after the deadline still becomes
-        # a RoutingTimeout and the worker is disposed.
+        if not isinstance(worker_result, _WorkerResult):
+            return self._dispose(
+                SupervisorError(f"unexpected message from worker: {worker_result!r}"),
+                worker_pid,
+            )
+        # A late response that crossed expires_at or a cancellation is
+        # rejected before any worker-produced error can win.
         if deadline_at is not None and time.monotonic() >= deadline_at:
-            return self._dispose_and_return(
+            return self._dispose(
                 RoutingTimeout("routing request deadline exceeded"), worker_pid
             )
-        if self._cancel_event.is_set():
-            return self._dispose_and_return(
+        if self._cancel_flag.is_set():
+            return self._dispose(
                 RoutingCancelled("routing request was cancelled"), worker_pid
             )
-
         if worker_result.error is None:
-            return _JobResult(
-                value=worker_result.value,
-                error=None,
-                worker_pid=worker_result.worker_pid,
-            )
+            return _JobResult(value=worker_result.value, worker_pid=worker_result.worker_pid)
 
-        # The worker returned an exception.  Cancellation and timeout from the
-        # worker dispose the child; other exceptions keep it alive.
-        error = _deserialize_error(worker_result.error)
-        if worker_result.worker_pid is not None:
-            error.worker_pid = worker_result.worker_pid  # type: ignore[attr-defined]
-
+        # Cancellation and timeout from the worker dispose the child; other
+        # exceptions keep it alive and travel on in their original envelope.
+        error = _reconstruct_error(worker_result.error)
         if isinstance(error, (RoutingCancelled, RoutingTimeout)):
-            return self._dispose_and_return(error, worker_result.worker_pid)
-
-        return _JobResult(value=None, error=error, worker_pid=worker_result.worker_pid)
+            return self._dispose(error, worker_result.worker_pid)
+        return _JobResult(error=worker_result.error, worker_pid=worker_result.worker_pid)
 
 
 def _supervisor_entry(
-    cmd_conn,
+    sock: socket.socket,
+    peer_sock: socket.socket,
     preload_marker: Any,
-    cancel_event: Any,
+    cancel_flag: SharedCancelFlag,
 ) -> None:
     """Main loop of the long-lived supervisor process."""
+    peer_sock.close()
     _set_preload_marker(preload_marker)
-    _set_cancel_event(cancel_event)
-    ctx: ForkContext = multiprocessing.get_context("fork")
-    worker = _WorkerHandle(ctx, cancel_event)
+    channel = _FramedChannel(sock)
+    worker = _WorkerHandle(multiprocessing.get_context("fork"), cancel_flag)
     try:
-        _send_object(cmd_conn, _Ready())
+        channel.send(_Ready())
         while True:
             try:
-                msg = _recv_object(cmd_conn)
-            except EOFError:
-                break
-            if msg is None or isinstance(msg, _Stop):
-                break
-            if isinstance(msg, _DiscardWorker):
-                _send_object(cmd_conn, _Discarded())
-                worker.shutdown()
+                message = channel.recv(timeout=None)
+            except _FrameDecodeError as exc:
+                channel.send(
+                    _JobResult(
+                        error=_serialize_error(
+                            SupervisorError(f"supervisor could not decode the job: {exc}")
+                        )
+                    )
+                )
                 continue
-            if isinstance(msg, _Job):
-                result = worker.run_job(msg)
-                _send_object(cmd_conn, result)
-    except (BrokenPipeError, OSError):
-        pass
+            if isinstance(message, _DiscardWorker):
+                worker.kill()
+                channel.send(_Discarded())
+                continue
+            if not isinstance(message, _Job):
+                return
+            try:
+                result = worker.run_job(message)
+            except BaseException as exc:
+                worker.kill()
+                result = _JobResult(
+                    error=_serialize_error(
+                        SupervisorError(f"supervisor failed while running the job: {exc!r}")
+                    )
+                )
+            _send_result(channel, result)
+    except _ChannelBroken:
+        return
     finally:
         worker.shutdown()
-        try:
-            cmd_conn.close()
-        except Exception:
-            pass
+        channel.close()
 
 
 class PreloadedRouteSupervisor:
@@ -461,16 +626,14 @@ class PreloadedRouteSupervisor:
     the caller, it inherits the preload caches and marker without a
     per-request load.
 
-    Jobs are run sequentially: ``run_job`` acquires a lock, so concurrent
-    calls are serialized.  The supervisor maintains a single persistent
+    Jobs run one at a time.  A queued caller waits for the job slot no longer
+    than its own deadline and gives up on its own cancellation without
+    touching the active job.  The supervisor maintains a single persistent
     disposable planning child.  Successful jobs reuse that child so mutated
     caches survive, while an unresponsive child is SIGTERM'd at the deadline
     and SIGKILL'd at ``deadline + grace``; a fresh child is then forked from
-    the still-preloaded supervisor.  A persistent fork-shared cancellation
-    byte propagates ``RoutingDeadline.cancel_event`` across processes.
-
-    IPC uses ``Connection.send_bytes`` / ``recv_bytes`` with explicit
-    ``pickle`` framing so that payloads are not limited to ``PIPE_BUF``.
+    the still-preloaded supervisor.  A kill-safe ``SharedCancelFlag``
+    propagates ``RoutingDeadline.cancel_event`` across processes.
 
     Example::
 
@@ -484,17 +647,17 @@ class PreloadedRouteSupervisor:
     def __init__(
         self,
         process: BaseProcess,
-        cmd_conn: Any,
-        cancel_event: Any,
+        channel: _FramedChannel,
+        cancel_flag: SharedCancelFlag,
         default_deadline_seconds: float | None,
         default_grace_seconds: float,
     ) -> None:
         self._process = process
-        self._cmd = cmd_conn
-        self._cancel_event = cancel_event
+        self._channel = channel
+        self._cancel_flag = cancel_flag
         self._default_deadline_seconds = default_deadline_seconds
         self._default_grace_seconds = default_grace_seconds
-        self._lock = threading.Lock()
+        self._slot = threading.Lock()
         self._closed = False
 
     @classmethod
@@ -514,22 +677,24 @@ class PreloadedRouteSupervisor:
             )
 
         ctx: ForkContext = multiprocessing.get_context("fork")
-        cancel_event = ctx.Event()
-        cmd_parent, cmd_child = ctx.Pipe(duplex=True)
+        cancel_flag = SharedCancelFlag()
+        parent_sock, child_sock = socket.socketpair()
         proc = ctx.Process(
             target=_supervisor_entry,
-            args=(cmd_child, preload_marker, cancel_event),
+            args=(child_sock, parent_sock, preload_marker, cancel_flag),
             daemon=False,
         )
         proc.start()
-        cmd_child.close()
+        child_sock.close()
+        channel = _FramedChannel(parent_sock)
 
         try:
-            if not cmd_parent.poll(timeout=start_timeout):
-                proc.terminate()
-                proc.join(timeout=5.0)
-                raise SupervisorError("supervisor process did not become ready")
-            ready = _recv_object(cmd_parent)
+            try:
+                ready = channel.recv(timeout=start_timeout)
+            except _FrameTimeout as exc:
+                raise SupervisorError("supervisor process did not become ready") from exc
+            except (_ChannelBroken, _FrameDecodeError) as exc:
+                raise SupervisorError("supervisor process failed during startup") from exc
             if not isinstance(ready, _Ready):
                 raise SupervisorError(
                     f"supervisor sent unexpected ready message: {ready!r}"
@@ -538,13 +703,13 @@ class PreloadedRouteSupervisor:
             if proc.is_alive():
                 proc.kill()
                 proc.join(timeout=5.0)
-            cmd_parent.close()
+            channel.close()
             raise
 
         return cls(
             process=proc,
-            cmd_conn=cmd_parent,
-            cancel_event=cancel_event,
+            channel=channel,
+            cancel_flag=cancel_flag,
             default_deadline_seconds=default_deadline_seconds,
             default_grace_seconds=default_grace_seconds,
         )
@@ -566,15 +731,67 @@ class PreloadedRouteSupervisor:
             return RoutingDeadline.after(float(effective_seconds))
         return RoutingDeadline()
 
+    def _acquire_slot(self, deadline: RoutingDeadline) -> None:
+        """Wait for the job slot no longer than the caller's own deadline.
+
+        A queued caller only consults its own deadline and cancel token, so
+        giving up never touches the shared flag or channel of the active job.
+        """
+        while True:
+            remaining = deadline.remaining_seconds()
+            wait = _POLL_SLICE_SECONDS if remaining is None else min(_POLL_SLICE_SECONDS, remaining)
+            if self._slot.acquire(timeout=wait):
+                break
+        try:
+            deadline.check()
+        except BaseException:
+            self._slot.release()
+            raise
+
+    def _abandon(self) -> None:
+        """Kill a supervisor whose channel can no longer be trusted."""
+        self._closed = True
+        if self._process.is_alive():
+            self._process.kill()
+            self._process.join(timeout=2.0)
+        self._channel.close()
+
+    def _recv_bounded(
+        self, stop_at: float | None, caller_cancel: CancelToken | None = None
+    ) -> Any:
+        """Receive the supervisor's next message, abandoning it at ``stop_at``.
+
+        While waiting, a set ``caller_cancel`` is mirrored into the shared flag.
+        """
+        while True:
+            if caller_cancel is not None and caller_cancel.is_set():
+                self._cancel_flag.set()
+            if not self._process.is_alive():
+                self._abandon()
+                raise SupervisorError("supervisor process died")
+            now = time.monotonic()
+            if stop_at is not None and now >= stop_at:
+                self._abandon()
+                raise SupervisorError("supervisor did not respond before its deadline")
+            wait = _POLL_SLICE_SECONDS if stop_at is None else min(_POLL_SLICE_SECONDS, stop_at - now)
+            try:
+                return self._channel.recv(timeout=wait)
+            except _FrameTimeout:
+                continue
+            except _FrameDecodeError as exc:
+                raise SupervisorError(f"supervisor reply could not be decoded: {exc}") from exc
+            except _ChannelBroken as exc:
+                self._abandon()
+                raise SupervisorError("supervisor process closed unexpectedly") from exc
+
     def _discard_worker(self) -> None:
         """Dispose the idle planning child before another job can start."""
         try:
-            _send_object(self._cmd, _DiscardWorker())
-            response = _recv_object(self._cmd)
-        except (BrokenPipeError, EOFError, OSError) as exc:
-            raise SupervisorError(
-                "supervisor process closed while discarding worker"
-            ) from exc
+            self._channel.send(_DiscardWorker())
+        except _ChannelBroken as exc:
+            self._abandon()
+            raise SupervisorError("supervisor process closed while discarding worker") from exc
+        response = self._recv_bounded(time.monotonic() + _SUPERVISOR_RESPONSE_MARGIN_SECONDS)
         if not isinstance(response, _Discarded):
             raise SupervisorError(
                 f"unexpected discard response from supervisor: {response!r}"
@@ -594,16 +811,18 @@ class PreloadedRouteSupervisor:
         The job callable receives a single ``RoutingDeadline`` as its first
         positional argument, followed by ``*args`` and ``**kwargs``.  It may
         raise ``RoutingTimeout``/``RoutingCancelled`` or any other exception,
-        which will be propagated to the caller where the exception class is
-        available.
+        which is rebuilt with its type, ``args`` and attributes where the
+        exception class is loaded in this process, and otherwise surfaces as
+        ``SupervisorError``.
 
         ``deadline`` and ``deadline_seconds`` are mutually exclusive.  If
         ``deadline`` is supplied, its absolute ``expires_at`` and any
         ``cancel_event`` are used; the local ``cancel_event`` is mirrored into
-        a fork-shared byte so the worker and supervisor can observe it.  If
-        ``deadline_seconds`` is supplied, ``expires_at`` is computed from the
-        current monotonic clock before queue/IPC so delays do not extend the
-        budget.  ``grace_seconds`` defaults to the value supplied to ``start``.
+        the shared cancellation flag so the worker and supervisor observe it.
+        If ``deadline_seconds`` is supplied, ``expires_at`` is computed from
+        the current monotonic clock before queue/IPC so delays do not extend
+        the budget.  The same deadline bounds the wait for the job slot.
+        ``grace_seconds`` defaults to the value supplied to ``start``.
         """
         if self._closed:
             raise SupervisorError("supervisor is closed")
@@ -614,79 +833,64 @@ class PreloadedRouteSupervisor:
             raise ValueError("deadline and deadline_seconds are mutually exclusive")
 
         parent_deadline = self._parent_deadline(deadline, deadline_seconds)
-        expires_at = parent_deadline.expires_at
-
-        if grace_seconds is None:
-            grace_seconds = self._default_grace_seconds
-        if grace_seconds is not None:
-            grace_seconds = float(grace_seconds)
-            if grace_seconds < 0.0 or not math.isfinite(grace_seconds):
-                raise ValueError("grace_seconds must be non-negative and finite")
+        grace = float(
+            self._default_grace_seconds if grace_seconds is None else grace_seconds
+        )
+        if grace < 0.0 or not math.isfinite(grace):
+            raise ValueError("grace_seconds must be non-negative and finite")
 
         job = _Job(
             func=func,
             args=args,
             kwargs=kwargs,
-            expires_at=expires_at,
-            grace_seconds=grace_seconds,
+            expires_at=parent_deadline.expires_at,
+            grace_seconds=grace,
         )
 
-        with self._lock:
-            # Jobs serialize; clear any stale cancellation before starting.
-            self._cancel_event.clear()
+        parent_deadline.check()
+        self._acquire_slot(parent_deadline)
+        try:
+            if self._closed:
+                raise SupervisorError("supervisor is closed")
+            return self._run_admitted(job, parent_deadline)
+        finally:
+            self._slot.release()
 
-            # Caller-side deadline/cancellation check before IPC only. Once the
-            # job is dispatched, the supervisor owns the absolute deadline and
-            # hard kill, and returns a typed _JobResult preserving worker_pid.
-            try:
-                parent_deadline.check()
-            except (RoutingCancelled, RoutingTimeout):
-                self._cancel_event.set()
-                raise
+    def _run_admitted(self, job: _Job, parent_deadline: RoutingDeadline) -> Any:
+        hard_at = None if job.expires_at is None else job.expires_at + job.grace_seconds
+        # Owner ordering: clear the shared flag before the job is sent, so the
+        # supervisor and worker only ever observe this job's cancellation.
+        self._cancel_flag.clear()
+        try:
+            self._channel.send(job, deadline_at=hard_at)
+        except _FrameEncodeError as exc:
+            raise SupervisorError(f"routing job could not be sent: {exc}") from exc
+        except _ChannelBroken as exc:
+            self._abandon()
+            raise SupervisorError("supervisor process closed unexpectedly") from exc
 
-            try:
-                _send_object(self._cmd, job)
-            except (BrokenPipeError, EOFError, OSError) as exc:
-                raise SupervisorError("supervisor process closed unexpectedly") from exc
+        response_at = (
+            None if hard_at is None else hard_at + _SUPERVISOR_RESPONSE_MARGIN_SECONDS
+        )
+        result = self._recv_bounded(response_at, parent_deadline.cancel_event)
 
-            while True:
-                # Propagate a caller-side cancellation to the supervisor; let
-                # the supervisor return RoutingCancelled with worker_pid attached.
-                if parent_deadline.cancel_event is not None:
-                    if parent_deadline.cancel_event.is_set():
-                        self._cancel_event.set()
-
-                if not self._process.is_alive():
-                    raise SupervisorError("supervisor process died")
-
-                try:
-                    result = _recv_object(self._cmd, timeout=0.05)
-                    break
-                except TimeoutError:
-                    continue
-                except (BrokenPipeError, EOFError, OSError) as exc:
-                    raise SupervisorError(
-                        "supervisor process closed unexpectedly"
-                    ) from exc
-
-            if not isinstance(result, _JobResult):
-                raise SupervisorError(f"unexpected result from supervisor: {result!r}")
-            if isinstance(result.error, (RoutingCancelled, RoutingTimeout)):
-                if result.worker_pid is not None:
-                    result.error.worker_pid = result.worker_pid  # type: ignore[attr-defined]
-                raise result.error
-            try:
-                parent_deadline.check()
-            except (RoutingCancelled, RoutingTimeout) as exc:
-                if result.worker_pid is not None:
-                    exc.worker_pid = result.worker_pid  # type: ignore[attr-defined]
-                self._discard_worker()
-                raise
-            if result.error is not None:
-                if result.worker_pid is not None:
-                    result.error.worker_pid = result.worker_pid  # type: ignore[attr-defined]
-                raise result.error
-            return result.value
+        if not isinstance(result, _JobResult):
+            raise SupervisorError(f"unexpected result from supervisor: {result!r}")
+        error = None if result.error is None else _reconstruct_error(result.error)
+        if error is not None and result.worker_pid is not None:
+            error.worker_pid = result.worker_pid  # type: ignore[attr-defined]
+        if isinstance(error, (RoutingCancelled, RoutingTimeout)):
+            raise error
+        try:
+            parent_deadline.check()
+        except (RoutingCancelled, RoutingTimeout) as exc:
+            if result.worker_pid is not None:
+                exc.worker_pid = result.worker_pid  # type: ignore[attr-defined]
+            self._discard_worker()
+            raise
+        if error is not None:
+            raise error
+        return result.value
 
     def health(self) -> dict[str, Any]:
         """Return a small health snapshot."""
@@ -706,14 +910,10 @@ class PreloadedRouteSupervisor:
         self._closed = True
 
         try:
-            _send_object(self._cmd, _Stop())
-        except (BrokenPipeError, EOFError, OSError):
+            self._channel.send(_Stop(), deadline_at=time.monotonic() + 1.0)
+        except _ChannelBroken:
             pass
-
-        try:
-            self._cmd.close()
-        except Exception:
-            pass
+        self._channel.close()
 
         if self._process.is_alive():
             self._process.join(timeout=timeout)

@@ -1,13 +1,14 @@
 """
-Rebuild heuristic report artifacts from an existing labels.csv.
+Rebuild report artifacts from labels.csv and its admitted source run.json.
 
-Useful when scoring completed but report writing failed (e.g. disk pressure).
+Labels alone cannot recover provenance. In-place rebuilds leave run.json untouched
+and write rebuild.json; a new output directory receives the full source identity.
 """
 
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -24,13 +25,17 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.classifier.model import TERRAIN_CLASSES  # noqa: E402
 from src.heuristics.labeler import parse_tile_coords  # noqa: E402
-from src.heuristics.report import build_report  # noqa: E402
+from src.heuristics.report import build_report, recover_report_run_info  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rebuild report from labels.csv")
     parser.add_argument("--labels-csv", type=Path, required=True)
     parser.add_argument("--report-dir", type=Path, default=None)
+    parser.add_argument(
+        "--source-run-json", type=Path, default=None,
+        help="Admitted source run record (default: run.json beside labels.csv); required for labels-only inputs.",
+    )
     parser.add_argument("--raw-dir", type=str, default="data/raw")
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--s3-bucket", type=str, default=None)
@@ -83,6 +88,18 @@ def main() -> None:
     labels_csv = args.labels_csv
     if not labels_csv.exists():
         raise FileNotFoundError(f"labels.csv not found: {labels_csv}")
+    source_path = args.source_run_json or (labels_csv.parent / "run.json")
+    guidance = (
+        "Pass --source-run-json <path> to the complete original run.json; "
+        "labels.csv alone cannot recover identity. Re-score legacy runs whose identity is unavailable."
+    )
+    try:
+        source_record = json.loads(source_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Cannot recover source identity from {source_path}; {guidance}") from exc
+    run_info = recover_report_run_info(
+        source_record, source=str(source_path), guidance=guidance
+    )
 
     if args.s3_bucket:
         os.environ["SCENIC_S3_BUCKET"] = args.s3_bucket
@@ -100,33 +117,18 @@ def main() -> None:
     t_tiles0 = perf_counter()
     tiles = _labels_to_tiles(df)
     t_tiles1 = perf_counter()
-    run_name = args.run_name or labels_csv.parent.name
+    run_name = args.run_name or source_record.get("run_name") or labels_csv.parent.name
 
     report_dir = args.report_dir or (labels_csv.parent / "report")
     run_dir = report_dir.parent
 
-    run_info = {
-        "counts": {
-            "paired": len(tiles),
-            "satellite_total": len(tiles),
-            "terrain_total": len(tiles),
-            "missing_pairs": 0,
-        },
-        "used_classifier": "class_id" in df.columns,
-        "device": "n/a",
-        "coords_available": all("x" in t and "y" in t and "z" in t for t in tiles),
-        "warnings": ["report rebuilt from labels.csv"],
-        "seed": None,
-        "config": {
-            "satellite_dir": "rebuild_from_labels",
-            "terrain_dir": "rebuild_from_labels",
-            "raw_dir": args.raw_dir,
-            "s3_bucket": os.getenv("SCENIC_S3_BUCKET"),
-            "s3_only": os.getenv("SCENIC_S3_ONLY", "0") in ("1", "true", "yes"),
-            "max_tiles": len(tiles),
-            "use_classifier": "class_id" in df.columns,
-        },
-    }
+    record_path = run_dir / "run.json"
+    if record_path.exists():
+        if run_dir.resolve() != source_path.parent.resolve():
+            raise ValueError("Output run.json already exists; use a new --report-dir to preserve its provenance.")
+        record_path = run_dir / "rebuild.json"
+        if record_path.resolve() == source_path.resolve():
+            record_path = run_dir / "rebuild-record.json"
 
     t_report0 = perf_counter()
     report_json = build_report(
@@ -139,26 +141,26 @@ def main() -> None:
     t_report1 = perf_counter()
 
     run_record = {
+        **source_record,
         "run_name": run_name,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "labels_path": str(labels_csv),
-        "raw_labels_path": None,
         "report_dir": str(report_dir),
         "summary": report_json["summary"],
         "histogram": report_json["histogram"],
         "run_info": run_info,
-        "config": {
-            "rebuild_from_labels": True,
-            "max_tiles": len(tiles),
+        "rebuild": {
+            "source_run_json": str(source_path.resolve()),
+            "include_thumbs": not args.skip_thumbs,
         },
     }
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    with open(run_dir / "run.json", "w", encoding="utf-8") as f:
+    with open(record_path, "w", encoding="utf-8") as f:
         json.dump(run_record, f, indent=2)
 
     print(f"Report rebuilt at {report_dir}")
-    print(f"Run record written to {run_dir / 'run.json'}")
+    print(f"Run record written to {record_path}")
     if args.benchmark:
         total = perf_counter() - t0
         print(f"Benchmark: read_labels_s={t_read1 - t_read0:.2f}")

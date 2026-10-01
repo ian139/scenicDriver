@@ -21,8 +21,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--candidate-input",
-        "--candidates",
-        "--input",
         dest="candidate_input",
         type=Path,
         required=True,

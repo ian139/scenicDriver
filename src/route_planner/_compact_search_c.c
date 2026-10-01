@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <time.h>
+#include <float.h>
 
 typedef struct {
     int64_t node_count;
@@ -37,7 +38,7 @@ typedef struct {
     double highway_penalty;
     double scenic_byway_bonus;
     double lagrangian_multiplier;
-    double cost_limit;
+    double cost_limit; /* -1 means absent; zero is an active bound. */
 } CostSpec;
 
 typedef struct {
@@ -448,7 +449,8 @@ static inline double compute_edge_cost(
     const CostSpec* c,
     int64_t pos,
     const double* edge_scenic_score_by_rank,
-    bool* invalid_edge_rank
+    bool* invalid_edge_rank,
+    bool* cost_overflow
 ) {
     *invalid_edge_rank = false;
     int32_t edge_rank = -1;
@@ -476,19 +478,28 @@ static inline double compute_edge_cost(
         if (c->lagrangian_multiplier > 0.0) {
             cost += c->lagrangian_multiplier * duration;
         }
+        if (!isfinite(cost)) *cost_overflow = true;
         return cost;
     }
 
-    double raw_score = edge_scenic_score_by_rank
-        ? edge_scenic_score_by_rank[edge_rank]
-        : (g->trav_scenic_score ? g->trav_scenic_score[pos] : 5.0);
-    if (!isfinite(raw_score)) raw_score = 0.0;
-    if (raw_score < 0.0) raw_score = 0.0;
-    if (raw_score > 10.0) raw_score = 10.0;
-
-    double weighted_base = (1.0 - c->scenic_weight) * duration * c->travel_weight
-        + c->scenic_weight * duration * (10.0 - raw_score) / 10.0 * c->scenic_reward;
-    double base = weighted_base > 1e-6 * duration ? weighted_base : 1e-6 * duration;
+    /* Do not turn an inactive overflowing component into 0 * infinity (NaN). */
+    double weighted_base = 0.0;
+    if (c->scenic_weight < 1.0 && c->travel_weight > 0.0) {
+        weighted_base = (1.0 - c->scenic_weight) * (duration * c->travel_weight);
+    }
+    if (c->scenic_weight > 0.0 && c->scenic_reward > 0.0) {
+        double raw_score = edge_scenic_score_by_rank
+            ? edge_scenic_score_by_rank[edge_rank]
+            : (g->trav_scenic_score ? g->trav_scenic_score[pos] : 5.0);
+        if (!isfinite(raw_score)) raw_score = 0.0;
+        if (raw_score < 0.0) raw_score = 0.0;
+        if (raw_score > 10.0) raw_score = 10.0;
+        weighted_base += c->scenic_weight
+            * (duration * ((10.0 - raw_score) / 10.0) * c->scenic_reward);
+    }
+    double base = isfinite(weighted_base)
+        ? (weighted_base > 1e-6 * duration ? weighted_base : 1e-6 * duration)
+        : weighted_base;
 
     if (g->trav_scenic_byway_mask && g->trav_scenic_byway_mask[pos]) {
         double bonus = c->scenic_byway_bonus > 0.5 ? 0.5 : c->scenic_byway_bonus;
@@ -504,12 +515,13 @@ static inline double compute_edge_cost(
     }
 
     double cost = base + adjustment;
+    if (!isfinite(cost)) cost = DBL_MAX;
     if (cost < 1e-6) cost = 1e-6;
-    if (!isfinite(cost)) cost = 1e-6;
 
     if (c->lagrangian_multiplier > 0.0) {
         cost += c->lagrangian_multiplier * duration;
     }
+    if (!isfinite(cost)) *cost_overflow = true;
     return cost;
 }
 
@@ -862,6 +874,8 @@ static bool label_candidate_better(
  * failure. */
 static bool consider_meeting(
     const CompactGraphSpec* graph,
+    const CostSpec* cost_spec,
+    bool* cost_overflow,
     const DirectionState* ds_f,
     const DirectionState* ds_r,
     int32_t node,
@@ -877,6 +891,11 @@ static bool consider_meeting(
     int32_t* best_r_path
 ) {
     double total = ds_f->dist[node] + ds_r->dist[node];
+    if (!isfinite(total)) {
+        *cost_overflow = true;
+        return false;
+    }
+    if (cost_spec->cost_limit >= 0.0 && total > cost_spec->cost_limit) return true;
     if (*best_node != -1 && total > *best_cost) return true;
     if (*best_node != -1 && total == *best_cost) {
         if (ds_f->rank_primary[node] != *best_f_primary) {
@@ -959,7 +978,7 @@ static bool path_arena_push(
  * sidecar can never be silently misread.  NULL keeps the legacy traversal-
  * indexed scoring (or the 5.0 default when ``trav_scenic_score`` is NULL).
  *
- * Negative returns: -1 generic failure, -2 deadline exceeded. */
+ * Negative returns: -1 generic failure, -2 deadline exceeded, -3 cost overflow. */
 static int32_t compact_search_impl(
     const CompactGraphSpec* graph,
     const CostSpec* cost_spec,
@@ -1038,6 +1057,7 @@ static int32_t compact_search_impl(
     int32_t path_capacity = 0;
     int32_t path_count = 0;
     bool compare_ok = true; /* path-key comparison scratch failures */
+    bool cost_overflow = false;
     uint64_t next_sequence = 0; /* shared across both sides, like Python */
     int32_t next_label_f = 0;
     int32_t next_label_r = 0;
@@ -1045,7 +1065,11 @@ static int32_t compact_search_impl(
     for (int32_t i = 0; i < fwd_seed_count; i++) {
         int32_t node = fwd_seed_nodes[i];
         double cost = fwd_seed_costs[i];
-        if (cost_spec->cost_limit > 0.0 && cost > cost_spec->cost_limit) continue;
+        if (!isfinite(cost) || cost < 0.0) {
+            cost_overflow = true;
+            goto cleanup;
+        }
+        if (cost_spec->cost_limit >= 0.0 && cost > cost_spec->cost_limit) continue;
         if (node < 0 || (int64_t)node >= node_count) continue; /* reject invalid seed ranks */
         int32_t rank_primary = ranked ? fwd_seed_rank_primary[i] : 0;
         int32_t rank_secondary = ranked ? fwd_seed_rank_secondary[i] : 0;
@@ -1070,7 +1094,11 @@ static int32_t compact_search_impl(
     for (int32_t i = 0; i < rev_seed_count; i++) {
         int32_t node = rev_seed_nodes[i];
         double cost = rev_seed_costs[i];
-        if (cost_spec->cost_limit > 0.0 && cost > cost_spec->cost_limit) continue;
+        if (!isfinite(cost) || cost < 0.0) {
+            cost_overflow = true;
+            goto cleanup;
+        }
+        if (cost_spec->cost_limit >= 0.0 && cost > cost_spec->cost_limit) continue;
         if (node < 0 || (int64_t)node >= node_count) continue; /* reject invalid seed ranks */
         int32_t rank_primary = ranked ? rev_seed_rank_primary[i] : 0;
         int32_t rank_secondary = ranked ? rev_seed_rank_secondary[i] : 0;
@@ -1133,7 +1161,7 @@ static int32_t compact_search_impl(
 
             if (state_seen(&ds_r, u, k_search_gen)) {
                 if (!consider_meeting(
-                        graph, &ds_f, &ds_r, u, path_records, path_count,
+                        graph, cost_spec, &cost_overflow, &ds_f, &ds_r, u, path_records, path_count,
                         &best_cost, &best_meeting_node, &best_f_primary,
                         &best_r_primary, &best_f_secondary, &best_r_secondary,
                         &best_f_path, &best_r_path
@@ -1148,12 +1176,16 @@ static int32_t compact_search_impl(
                 bool invalid_edge_rank = false;
                 double w = compute_edge_cost(
                     graph, cost_spec, pos, edge_scenic_score_by_rank,
-                    &invalid_edge_rank
+                    &invalid_edge_rank, &cost_overflow
                 );
-                if (invalid_edge_rank) goto cleanup;
+                if (invalid_edge_rank || cost_overflow) goto cleanup;
                 if (!isfinite(w)) continue;
                 double next_cost = item.dist + w;
-                if (cost_spec->cost_limit > 0.0 && next_cost > cost_spec->cost_limit) continue;
+                if (!isfinite(next_cost)) {
+                    cost_overflow = true;
+                    goto cleanup;
+                }
+                if (cost_spec->cost_limit >= 0.0 && next_cost > cost_spec->cost_limit) continue;
                 int32_t v = graph->forward_indices[pos];
                 if (v < 0 || (int64_t)v >= node_count) continue; /* reject invalid neighbor ranks */
                 int32_t edge_rank = graph->trav_edge_rank ? graph->trav_edge_rank[pos] : (int32_t)pos;
@@ -1186,7 +1218,7 @@ static int32_t compact_search_impl(
                 }
                 if (state_seen(&ds_r, v, k_search_gen)) {
                     if (!consider_meeting(
-                            graph, &ds_f, &ds_r, v, path_records, path_count,
+                            graph, cost_spec, &cost_overflow, &ds_f, &ds_r, v, path_records, path_count,
                             &best_cost, &best_meeting_node, &best_f_primary,
                             &best_r_primary, &best_f_secondary,
                             &best_r_secondary, &best_f_path, &best_r_path
@@ -1206,7 +1238,7 @@ static int32_t compact_search_impl(
 
             if (state_seen(&ds_f, u, k_search_gen)) {
                 if (!consider_meeting(
-                        graph, &ds_f, &ds_r, u, path_records, path_count,
+                        graph, cost_spec, &cost_overflow, &ds_f, &ds_r, u, path_records, path_count,
                         &best_cost, &best_meeting_node, &best_f_primary,
                         &best_r_primary, &best_f_secondary, &best_r_secondary,
                         &best_f_path, &best_r_path
@@ -1222,12 +1254,16 @@ static int32_t compact_search_impl(
                 bool invalid_edge_rank = false;
                 double w = compute_edge_cost(
                     graph, cost_spec, pos, edge_scenic_score_by_rank,
-                    &invalid_edge_rank
+                    &invalid_edge_rank, &cost_overflow
                 );
-                if (invalid_edge_rank) goto cleanup;
+                if (invalid_edge_rank || cost_overflow) goto cleanup;
                 if (!isfinite(w)) continue;
                 double next_cost = item.dist + w;
-                if (cost_spec->cost_limit > 0.0 && next_cost > cost_spec->cost_limit) continue;
+                if (!isfinite(next_cost)) {
+                    cost_overflow = true;
+                    goto cleanup;
+                }
+                if (cost_spec->cost_limit >= 0.0 && next_cost > cost_spec->cost_limit) continue;
                 int32_t v = graph->reverse_indices[rev_pos];
                 if (v < 0 || (int64_t)v >= node_count) continue; /* reject invalid neighbor ranks */
                 int32_t edge_rank = graph->trav_edge_rank ? graph->trav_edge_rank[pos] : (int32_t)pos;
@@ -1260,7 +1296,7 @@ static int32_t compact_search_impl(
                 }
                 if (state_seen(&ds_f, v, k_search_gen)) {
                     if (!consider_meeting(
-                            graph, &ds_f, &ds_r, v, path_records, path_count,
+                            graph, cost_spec, &cost_overflow, &ds_f, &ds_r, v, path_records, path_count,
                             &best_cost, &best_meeting_node, &best_f_primary,
                             &best_r_primary, &best_f_secondary,
                             &best_r_secondary, &best_f_path, &best_r_path
@@ -1395,6 +1431,7 @@ static int32_t compact_search_impl(
     }
 
 cleanup:
+    if (cost_overflow) total_positions = -3;
     heap_free(heap_f);
     heap_free(heap_r);
     direction_state_free(&ds_f);

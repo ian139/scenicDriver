@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class LatLon(BaseModel):
@@ -40,21 +40,19 @@ class ContributorSessionStartRequest(BaseModel):
     region: str = "pittsfield"
 
 
-class ContributorTask(BaseModel):
-    task_id: str
-    image_path: str
-    class_id: int | None = None
-    class_name: str | None = None
-    scenic_score: float | None = None
-
-
 class ContributorLabelRequest(BaseModel):
     contributor_id: str
     task_id: str
     image_path: str
-    scenic_human: float = Field(ge=0.0, le=10.0)
+    scenic_human: float | None = Field(default=None, ge=0.0, le=10.0, allow_inf_nan=False)
     confidence: str = "medium"
     skip: bool = False
     notes: str = ""
     region: str = "pittsfield"
+
+    @model_validator(mode="after")
+    def require_score_unless_skipping(self) -> "ContributorLabelRequest":
+        if not self.skip and self.scenic_human is None:
+            raise ValueError("scenic_human is required unless skip is true")
+        return self
 

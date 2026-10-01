@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import pickle
 import signal
+import socket
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -13,6 +15,7 @@ from src.route_planner.cancellation import (
     RoutingCancelled,
     RoutingDeadline,
     RoutingTimeout,
+    SharedCancelFlag,
 )
 from src.route_planner import supervisor as supervisor_module
 from src.route_planner.supervisor import (
@@ -125,6 +128,229 @@ def _wait_for_process_exit(pid: int, timeout: float = 2.0) -> None:
             return
         time.sleep(0.02)
     raise AssertionError(f"process {pid} is still alive")
+
+
+def _job_die_inside_cancellation_checks(deadline) -> None:
+    """SIGKILL this worker while other threads are inside cancellation checks."""
+
+    def spin() -> None:
+        while True:
+            deadline.check()
+
+    for _ in range(3):
+        threading.Thread(target=spin, daemon=True).start()
+    time.sleep(0.05)
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _job_sleep(deadline, seconds: float) -> str:
+    time.sleep(seconds)
+    return "slow-done"
+
+
+def _job_raise_route_coverage_error(deadline) -> None:
+    from src.route_planner.service import RouteCoverageError
+
+    raise RouteCoverageError("start", 1.234, 1.0)
+
+
+def _job_raise_unicode_decode_error(deadline) -> None:
+    b"ok\xff".decode("utf-8")
+
+
+_ALLOW_UNCONSTRUCTIBLE = False
+
+
+class _UnconstructibleError(Exception):
+    """Only constructible in a process that opted in (the worker)."""
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "_UnconstructibleError":
+        if not _ALLOW_UNCONSTRUCTIBLE:
+            raise RuntimeError("cannot construct outside the worker")
+        return super().__new__(cls, *args, **kwargs)
+
+
+def _job_raise_unconstructible(deadline) -> None:
+    global _ALLOW_UNCONSTRUCTIBLE
+    _ALLOW_UNCONSTRUCTIBLE = True
+    raise _UnconstructibleError("worker only")
+
+
+def _job_raise_unpicklable_args(deadline) -> None:
+    raise ValueError(lambda: None)
+
+
+def _abort_error_restore(kind: str) -> None:
+    if kind == "SystemExit":
+        raise SystemExit("error state restore aborted")
+    raise KeyboardInterrupt("error state restore interrupted")
+
+
+class _AbortingErrorArgument:
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+
+    def __reduce__(self):
+        return _abort_error_restore, (self.kind,)
+
+
+def _job_raise_aborting_state(deadline, kind: str) -> None:
+    raise ValueError(_AbortingErrorArgument(kind))
+
+
+def _run_bounded(func: Callable[[], Any], timeout: float) -> tuple[Any, BaseException | None]:
+    """Run ``func`` on a daemon thread; fail if it does not finish in ``timeout``."""
+    outcome: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            outcome["value"] = func()
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the test
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise AssertionError(f"call did not finish within {timeout}s (wedged)")
+    return outcome.get("value"), outcome.get("error")
+
+
+def test_worker_killed_inside_cancellation_check_does_not_wedge_cancellation() -> None:
+    """A worker SIGKILLed mid cancellation check must not wedge later cancels."""
+    with PreloadedRouteSupervisor.start() as sup:
+        for _ in range(5):
+            _, error = _run_bounded(
+                lambda: sup.run_job(
+                    _job_die_inside_cancellation_checks, deadline_seconds=5.0
+                ),
+                timeout=5.0,
+            )
+            assert isinstance(error, SupervisorError)
+
+            cancel_event = threading.Event()
+            deadline = RoutingDeadline.after(10.0, cancel_event=cancel_event)
+            threading.Timer(0.1, cancel_event.set).start()
+            start = time.monotonic()
+            _, error = _run_bounded(
+                lambda: sup.run_job(
+                    _job_uncooperative_until_cancelled,
+                    deadline=deadline,
+                    grace_seconds=0.5,
+                ),
+                timeout=5.0,
+            )
+            assert isinstance(error, RoutingCancelled)
+            assert time.monotonic() - start < 2.0
+
+        result = sup.run_job(_job_success, "after-kills", deadline_seconds=5.0)
+    assert result["token"] == "after-kills"
+
+
+def test_queued_caller_with_expiring_deadline_times_out_without_waiting() -> None:
+    with PreloadedRouteSupervisor.start() as sup:
+        slow: dict[str, Any] = {}
+        slow_thread = threading.Thread(
+            target=lambda: slow.setdefault(
+                "value", sup.run_job(_job_sleep, 1.0, deadline_seconds=5.0)
+            )
+        )
+        slow_thread.start()
+        time.sleep(0.2)  # the slow job now holds the only job slot
+
+        start = time.monotonic()
+        with pytest.raises(RoutingTimeout, match="deadline exceeded"):
+            sup.run_job(_job_success, "queued", deadline_seconds=0.1)
+        timed_out_after = time.monotonic() - start
+
+        cancel_event = threading.Event()
+        threading.Timer(0.1, cancel_event.set).start()
+        start = time.monotonic()
+        with pytest.raises(RoutingCancelled, match="was cancelled"):
+            sup.run_job(
+                _job_success,
+                "queued-cancel",
+                deadline=RoutingDeadline.after(5.0, cancel_event=cancel_event),
+            )
+        cancelled_after = time.monotonic() - start
+
+        slow_thread.join(timeout=5.0)
+
+    assert timed_out_after < 0.4
+    assert cancelled_after < 0.4
+    # The active job is unaffected by the queued callers giving up.
+    assert slow["value"] == "slow-done"
+
+
+def test_route_coverage_error_survives_transport_with_fields() -> None:
+    from src.route_planner.service import RouteCoverageError
+
+    with PreloadedRouteSupervisor.start() as sup:
+        with pytest.raises(RouteCoverageError) as exc_info:
+            sup.run_job(_job_raise_route_coverage_error, deadline_seconds=5.0)
+        result = sup.run_job(_job_success, "after-coverage", deadline_seconds=5.0)
+
+    error = exc_info.value
+    assert error.endpoint == "start"
+    assert error.snap_distance_km == pytest.approx(1.234)
+    assert error.max_snap_distance_km == pytest.approx(1.0)
+    assert str(error) == "The start point is too far from the supported road network."
+    assert result["token"] == "after-coverage"
+
+
+def test_multi_arg_builtin_error_round_trips_and_supervisor_survives() -> None:
+    with PreloadedRouteSupervisor.start() as sup:
+        with pytest.raises(UnicodeDecodeError) as exc_info:
+            sup.run_job(_job_raise_unicode_decode_error, deadline_seconds=5.0)
+        result = sup.run_job(_job_success, "after-unicode", deadline_seconds=5.0)
+
+    error = exc_info.value
+    assert error.encoding == "utf-8"
+    assert error.object == b"ok\xff"
+    assert (error.start, error.end) == (2, 3)
+    assert result["token"] == "after-unicode"
+
+
+@pytest.mark.parametrize(
+    "job", [_job_raise_unconstructible, _job_raise_unpicklable_args]
+)
+def test_unreconstructible_error_is_job_scoped_supervisor_error(job) -> None:
+    with PreloadedRouteSupervisor.start() as sup:
+        worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+        with pytest.raises(SupervisorError):
+            sup.run_job(job, deadline_seconds=5.0)
+        assert sup.health()["alive"]
+        result = sup.run_job(_job_success, "after-unknown", deadline_seconds=5.0)
+        next_worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+
+    assert result["token"] == "after-unknown"
+    # A job-scoped error does not cost the warm worker.
+    assert next_worker_pid == worker_pid
+
+
+@pytest.mark.parametrize("kind", ["SystemExit", "KeyboardInterrupt"])
+def test_error_state_base_exception_is_job_scoped(kind: str) -> None:
+    with PreloadedRouteSupervisor.start() as sup:
+        worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+        with pytest.raises(SupervisorError, match="could not be reconstructed"):
+            sup.run_job(_job_raise_aborting_state, kind, deadline_seconds=5.0)
+        assert sup.health()["alive"]
+        result = sup.run_job(_job_success, "after-aborted-restore", deadline_seconds=5.0)
+        assert sup.run_job(_job_return_pid, deadline_seconds=5.0) == worker_pid
+    assert result["token"] == "after-aborted-restore"
+
+
+def test_oversized_result_is_job_scoped_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Forked supervisor/worker inherit the reduced frame limit.
+    monkeypatch.setattr(supervisor_module, "_MAX_FRAME_BYTES", 256 * 1024)
+    with PreloadedRouteSupervisor.start() as sup:
+        with pytest.raises(SupervisorError, match="too large"):
+            sup.run_job(_job_large_response, deadline_seconds=5.0)
+        result = sup.run_job(_job_success, "after-oversize", deadline_seconds=5.0)
+    assert result["token"] == "after-oversize"
+
 
 
 def test_successful_response() -> None:
@@ -288,15 +514,16 @@ def test_parent_deadline_overrides_error_delayed_in_final_ipc(
 ) -> None:
     with PreloadedRouteSupervisor.start() as sup:
         original_worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
-        original_recv = supervisor_module._recv_object
+        original_recv = supervisor_module._FramedChannel.recv
 
-        def delayed_recv(conn: Any, timeout: float | None = None) -> Any:
-            result = original_recv(conn, timeout)
+        def delayed_recv(channel: Any, *, timeout: float | None) -> Any:
+            result = original_recv(channel, timeout=timeout)
             if isinstance(result, supervisor_module._JobResult):
                 time.sleep(0.08)
             return result
 
-        monkeypatch.setattr(supervisor_module, "_recv_object", delayed_recv)
+        # Patched after start: only this (caller) process sees the delay.
+        monkeypatch.setattr(supervisor_module._FramedChannel, "recv", delayed_recv)
         with pytest.raises(RoutingTimeout, match="deadline exceeded") as exc_info:
             sup.run_job(
                 _job_raise_value_error,
@@ -311,22 +538,23 @@ def test_parent_deadline_overrides_error_delayed_in_final_ipc(
     _wait_for_process_exit(original_worker_pid)
 
 
-def test_parent_cancellation_overrides_error_in_final_ipc(
+def test_cancellation_arriving_during_error_reconstruction_wins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cancel_event = threading.Event()
     deadline = RoutingDeadline.after(5.0, cancel_event=cancel_event)
     with PreloadedRouteSupervisor.start() as sup:
         original_worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
-        original_recv = supervisor_module._recv_object
+        original_reconstruct = supervisor_module._reconstruct_error
 
-        def cancelling_recv(conn: Any, timeout: float | None = None) -> Any:
-            result = original_recv(conn, timeout)
-            if isinstance(result, supervisor_module._JobResult):
-                cancel_event.set()
-            return result
+        def cancelling_reconstruct(serialized: Any) -> BaseException:
+            error = original_reconstruct(serialized)
+            cancel_event.set()
+            return error
 
-        monkeypatch.setattr(supervisor_module, "_recv_object", cancelling_recv)
+        monkeypatch.setattr(
+            supervisor_module, "_reconstruct_error", cancelling_reconstruct
+        )
         with pytest.raises(RoutingCancelled, match="was cancelled") as exc_info:
             sup.run_job(
                 _job_raise_value_error,
@@ -509,3 +737,217 @@ def test_health_check() -> None:
     health = sup.health()
     assert health["alive"] is False
     assert health["closed"] is True
+
+
+class _FakeProcess:
+    """Peer process stand-in that ignores SIGTERM and records hard kills."""
+
+    pid = 999_999
+
+    def __init__(self) -> None:
+        self.terminated = False
+        self.killed = False
+
+    def is_alive(self) -> bool:
+        return not self.killed
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def join(self, timeout: float | None = None) -> None:
+        pass
+
+
+def _stalled_peer(claimed_bytes: int, sent_bytes: int) -> tuple[socket.socket, socket.socket]:
+    """Socket pair whose peer wrote a frame header and a partial body, then stalled."""
+    ours, peer = socket.socketpair()
+    peer.sendall(
+        supervisor_module._FRAME_HEADER.pack(claimed_bytes) + b"x" * sent_bytes
+    )
+    return ours, peer
+
+
+def _handle_reading_from(ours: socket.socket) -> tuple[Any, _FakeProcess]:
+    process = _FakeProcess()
+    handle = supervisor_module._WorkerHandle(
+        multiprocessing.get_context("fork"), SharedCancelFlag()
+    )
+    handle._proc = process
+    handle._channel = supervisor_module._FramedChannel(ours)
+    return handle, process
+
+
+def _worker_job(expires_at: float | None, grace_seconds: float) -> Any:
+    return supervisor_module._Job(
+        func=_job_success,
+        args=("x",),
+        kwargs={},
+        expires_at=expires_at,
+        grace_seconds=grace_seconds,
+    )
+
+
+def _job_error(result: Any) -> BaseException:
+    assert result.error is not None
+    return supervisor_module._reconstruct_error(result.error)
+
+
+def test_partial_frame_then_stall_is_hard_stopped_at_deadline() -> None:
+    ours, peer = _stalled_peer(claimed_bytes=1_000, sent_bytes=10)
+    handle, process = _handle_reading_from(ours)
+    start = time.monotonic()
+    result = handle.run_job(_worker_job(start + 0.2, grace_seconds=0.1))
+    elapsed = time.monotonic() - start
+    peer.close()
+
+    assert isinstance(_job_error(result), RoutingTimeout)
+    assert process.terminated and process.killed
+    assert 0.25 <= elapsed < 0.6, f"hard stop not enforced at deadline: {elapsed}"
+
+
+def test_partial_frame_without_deadline_is_bounded_by_transfer_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(supervisor_module, "_FRAME_TRANSFER_BUDGET_SECONDS", 0.2)
+    ours, peer = _stalled_peer(claimed_bytes=1_000, sent_bytes=10)
+    handle, process = _handle_reading_from(ours)
+    start = time.monotonic()
+    result = handle.run_job(_worker_job(None, grace_seconds=0.1))
+    elapsed = time.monotonic() - start
+    peer.close()
+
+    assert isinstance(_job_error(result), SupervisorError)
+    assert process.killed
+    assert elapsed < 0.6
+
+
+def test_oversized_incoming_frame_kills_worker_immediately() -> None:
+    ours, peer = _stalled_peer(
+        claimed_bytes=supervisor_module._MAX_FRAME_BYTES + 1, sent_bytes=0
+    )
+    handle, process = _handle_reading_from(ours)
+    start = time.monotonic()
+    result = handle.run_job(_worker_job(start + 5.0, grace_seconds=0.1))
+    elapsed = time.monotonic() - start
+    peer.close()
+
+    assert isinstance(_job_error(result), SupervisorError)
+    assert process.killed
+    assert elapsed < 0.5
+
+
+def test_caller_abandons_supervisor_that_stalls_mid_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(supervisor_module, "_SUPERVISOR_RESPONSE_MARGIN_SECONDS", 0.2)
+    ours, peer = _stalled_peer(claimed_bytes=1_000, sent_bytes=10)
+    process = _FakeProcess()
+    sup = PreloadedRouteSupervisor(
+        process=process,  # type: ignore[arg-type]
+        channel=supervisor_module._FramedChannel(ours),
+        cancel_flag=SharedCancelFlag(),
+        default_deadline_seconds=None,
+        default_grace_seconds=0.1,
+    )
+    start = time.monotonic()
+    with pytest.raises(SupervisorError):
+        sup.run_job(_job_success, "x", deadline_seconds=0.1)
+    elapsed = time.monotonic() - start
+    peer.close()
+
+    assert process.killed
+    assert sup.health()["closed"] is True
+    assert elapsed < 0.8
+
+
+class _ProgressingSocket:
+    """Real socket that advances a deterministic clock on every byte transferred."""
+
+    def __init__(self, sock: socket.socket, *, writing: bool = False) -> None:
+        self.sock = sock
+        self.now = 0.0
+        self.writing = writing
+
+    def setblocking(self, value: bool) -> None:
+        self.sock.setblocking(value)
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def send(self, data: memoryview) -> int:
+        count = self.sock.send(data[:1] if self.writing else data)
+        if self.writing:
+            self.now += 0.001
+        return count
+
+    def recv_into(self, target: memoryview, size: int) -> int:
+        count = self.sock.recv_into(target, min(size, 1))
+        self.now += 0.001
+        return count
+
+
+@pytest.mark.parametrize("bound", ["deadline", "budget"])
+def test_continuously_progressing_send_is_bounded(monkeypatch, bound: str) -> None:
+    ours, peer = socket.socketpair()
+    progressing = _ProgressingSocket(ours, writing=True)
+    channel = supervisor_module._FramedChannel(progressing)
+    monkeypatch.setattr(supervisor_module.time, "monotonic", lambda: progressing.now)
+    monkeypatch.setattr(
+        supervisor_module, "_FRAME_TRANSFER_BUDGET_SECONDS",
+        0.02 if bound == "budget" else 10.0,
+    )
+    try:
+        with pytest.raises(supervisor_module._ChannelBroken, match="deadline"):
+            channel.send("x" * 100, deadline_at=0.02 if bound == "deadline" else None)
+        assert progressing.now <= 0.021
+    finally:
+        channel.close()
+        peer.close()
+
+
+@pytest.mark.parametrize("bound", ["deadline", "budget"])
+def test_continuously_progressing_receive_is_bounded(monkeypatch, bound: str) -> None:
+    ours, peer = socket.socketpair()
+    message = "x" * 100
+    payload = pickle.dumps(message)
+    peer.sendall(supervisor_module._FRAME_HEADER.pack(len(payload)) + payload)
+    progressing = _ProgressingSocket(ours)
+    channel = supervisor_module._FramedChannel(progressing)
+    monkeypatch.setattr(supervisor_module.time, "monotonic", lambda: progressing.now)
+    monkeypatch.setattr(
+        supervisor_module, "_FRAME_TRANSFER_BUDGET_SECONDS",
+        0.02 if bound == "budget" else 10.0,
+    )
+    expected_error = (
+        supervisor_module._ChannelBroken if bound == "budget"
+        else supervisor_module._FrameTimeout
+    )
+    try:
+        with pytest.raises(expected_error):
+            channel.recv(timeout=0.02 if bound == "deadline" else None)
+        assert progressing.now <= 0.022
+        if bound == "deadline":
+            assert channel.recv(timeout=1.0) == message
+    finally:
+        channel.close()
+        peer.close()
+
+
+def test_continuously_progressing_worker_reply_is_hard_stopped(monkeypatch) -> None:
+    ours, peer = socket.socketpair()
+    payload = pickle.dumps(supervisor_module._WorkerResult(value="x" * 100))
+    peer.sendall(supervisor_module._FRAME_HEADER.pack(len(payload)) + payload)
+    progressing = _ProgressingSocket(ours)
+    handle, process = _handle_reading_from(progressing)
+    monkeypatch.setattr(supervisor_module.time, "monotonic", lambda: progressing.now)
+    try:
+        result = handle.run_job(_worker_job(0.05, grace_seconds=0.02))
+        assert isinstance(_job_error(result), RoutingTimeout)
+        assert process.terminated and process.killed
+        assert progressing.now <= 0.072
+    finally:
+        handle.kill()
+        peer.close()

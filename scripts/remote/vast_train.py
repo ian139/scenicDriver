@@ -471,15 +471,6 @@ def _check_run_preconditions(config: VastTrainConfig) -> None:
         raise SystemExit("--train-dataset-key must be under --s3-data-prefix")
 
 
-def _record_destroy_after_failure(state: dict, exc: BaseException) -> None:
-    state["error"] = str(exc)
-    write_state(state)
-    if destroy_recorded_instance(state):
-        update_status(state, "failed_destroyed")
-    else:
-        update_status(state, "failed_kept")
-
-
 def _handle_training_result(config: VastTrainConfig, state: dict, remote_status: str) -> int:
     update_status(state, "copying_artifacts", remote_training_status=remote_status)
     copy_training_artifacts(state, required=remote_status == "done")

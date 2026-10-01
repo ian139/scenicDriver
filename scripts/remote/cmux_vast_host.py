@@ -23,8 +23,6 @@ DEFAULT_IMAGE = "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04"
 DEFAULT_BRANCH = "Ian139/RemoteTraining"
 DEFAULT_REMOTE_REPO_DIR = "/workspace/scenic-drive"
 DEFAULT_REMOTE_ENV_FILE = "/root/.scenic/aws.env"
-DEFAULT_S3_DATA_PREFIX = "processed/regression/"
-DEFAULT_S3_MODELS_PREFIX = "models/"
 DEFAULT_VALIDATION_DATASET_KEY = (
     "processed/regression/features_masswhites_z14_mixed5000_v4_h4.npz"
 )
@@ -164,17 +162,6 @@ def parse_json_output(result: subprocess.CompletedProcess[str], description: str
     return parse_json_text(result.stdout, description)
 
 
-
-
-def select_offer_id(query: str) -> int:
-    result = run_command(["vastai", "search", "offers", query, "-o", "dlperf_usd-", "--raw"])
-    offers = parse_json_output(result, "vastai search offers")
-    if not isinstance(offers, list) or not offers:
-        raise SystemExit("No Vast offers matched query")
-    offer_id = offers[0].get("id") if isinstance(offers[0], dict) else None
-    if offer_id is None:
-        raise RuntimeError("vastai search offers did not return an offer id")
-    return int(offer_id)
 
 
 def select_offer_id_at(query: str, index: int) -> int:

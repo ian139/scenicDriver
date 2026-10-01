@@ -30,7 +30,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.classifier.inference import get_inference_transform  # noqa: E402
 from src.classifier.model import LandscapeClassifier  # noqa: E402
-from src.terrain.features import compute_terrain_features  # noqa: E402
+from src.terrain.features import (  # noqa: E402
+    compute_terrain_features,
+    compute_terrain_valid_mask,
+)
 from src.scenic_scorer.regression import resolve_device  # noqa: E402
 
 
@@ -112,7 +115,9 @@ def _open_image(path: str, raw_dir: str, s3_client: Any | None) -> Image.Image:
 
 def _terrain_features_from_images(terrain_img: Image.Image, sat_img: Image.Image) -> np.ndarray:
     """Return the canonical terrain vector for regression export."""
-    return compute_terrain_features(terrain_img, sat_img).features.to_array().astype(np.float32)
+    return compute_terrain_features(
+        terrain_img, sat_img, valid_mask=compute_terrain_valid_mask(terrain_img)
+    ).features.to_array().astype(np.float32)
 
 
 def _terrain_path_from_sat(image_path: str) -> str:

@@ -4,12 +4,30 @@ import io
 import json
 from pathlib import Path
 import struct
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
+import time
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+import pandas as pd
 
 from PIL import Image
 import pytest
 from fastapi.testclient import TestClient
 
-import src.app_api.main as app_api
+from src.app_api.contrib_repo import ContribConfig, ContribRepo
+
+# The exported app retains this repository, so retain its root for the module's
+# lifetime too. Restore main's by-value constructor binding after the import.
+_import_directory = TemporaryDirectory(prefix="scenic-api-tests-")
+with patch(
+    "src.app_api.contrib_repo.ContribRepo",
+    return_value=ContribRepo(ContribConfig(root_dir=Path(_import_directory.name))),
+):
+    import src.app_api.main as app_api
+app_api.ContribRepo = ContribRepo
 
 from src.route_planner.cancellation import (
     RoutingCancelled,
@@ -33,7 +51,22 @@ def _stub_named_test_run_report(
     )
 
 
-client = TestClient(create_app())
+@pytest.fixture(autouse=True)
+def contrib_repo(tmp_path, monkeypatch):
+    source = tmp_path / "source.csv"
+    seed = tmp_path / "seed.csv"
+    rows = [{"image_path": f"philadelphia/{i}.jpg", "scenic_human": 6.5} for i in range(40)]
+    pd.DataFrame(rows).to_csv(source, index=False)
+    pd.DataFrame(rows).to_csv(seed, index=False)
+    repo = ContribRepo(ContribConfig(tmp_path / "contrib", seed, source))
+    monkeypatch.setattr(app_api, "ContribRepo", lambda: repo)
+    global client
+    client = TestClient(create_app())
+    try:
+        yield repo
+    finally:
+        client.close()
+        del client
 
 
 def test_healthz() -> None:
@@ -594,8 +627,7 @@ def test_contrib_session_and_label_flow() -> None:
     s_payload = start.json()
     assert "profile" in s_payload
     tasks = s_payload.get("tasks", [])
-    if not tasks:
-        return
+    assert tasks
 
     task = tasks[0]
     label = client.post(
@@ -618,6 +650,342 @@ def test_contrib_session_and_label_flow() -> None:
     profile = client.get("/v1/contrib/profile", params={"contributor_id": "tester_api"})
     assert profile.status_code == 200
     assert "profile" in profile.json()
+
+
+def _contrib_payload(repo, contributor_id="tester", **changes):
+    task = repo.next_tasks(contributor_id, "philadelphia", count=1)[0]
+    return {"contributor_id": contributor_id, "task_id": task["task_id"],
+            "image_path": task["image_path"], "scenic_human": 6.5, **changes}
+
+
+def test_contrib_concurrent_submissions_lose_nothing(contrib_repo):
+    repo = contrib_repo
+    tasks = repo.next_tasks("parallel", "philadelphia", count=25)
+    # Independent instances must share the same process/file lock.
+    repos = [ContribRepo(repo.cfg) for _ in tasks]
+    with ThreadPoolExecutor(max_workers=10) as workers:
+        list(workers.map(
+            lambda item: item[0].submit_label({
+                "contributor_id": "parallel", "task_id": item[1]["task_id"],
+                "image_path": item[1]["image_path"], "scenic_human": 6.5,
+            }), zip(repos, tasks)))
+    pending = pd.read_csv(repo.pending_path)
+    assert set(pending["task_id"]) == {task["task_id"] for task in tasks}
+    assert repo.get_profile("parallel")["pending_labels"] == 25
+
+
+@pytest.mark.parametrize("marker", ["", "NA", "N/A", "nan", "NaN", "null", "None"])
+@pytest.mark.parametrize("column", ["class_id", "scenic_score"])
+def test_contrib_optional_numeric_metadata_is_missing(contrib_repo, marker, column):
+    pd.DataFrame([{
+        "image_path": "philadelphia/NA.jpg", "class_id": "",
+        "class_name": "NA", "scenic_score": "", column: marker,
+    }]).to_csv(contrib_repo.cfg.labels_source_csv, index=False)
+    response = client.post("/v1/contrib/session/start", json={
+        "contributor_id": "NA", "region": "philadelphia",
+    })
+    assert response.status_code == 200
+    task = response.json()["tasks"][0]
+    assert task["class_id"] is None
+    assert task["scenic_score"] is None
+    assert task["class_name"] == "NA"
+    assert task["image_path"] == "philadelphia/NA.jpg"
+
+
+def test_contrib_float_form_class_ids_beside_blanks(contrib_repo):
+    pd.DataFrame([
+        {"image_path": "philadelphia/1.jpg", "class_id": "1.0", "scenic_score": "6.5"},
+        {"image_path": "philadelphia/2.jpg", "class_id": "", "scenic_score": ""},
+    ]).to_csv(contrib_repo.cfg.labels_source_csv, index=False)
+    response = client.post("/v1/contrib/session/start", json={
+        "contributor_id": "numeric", "region": "philadelphia",
+    })
+    assert response.status_code == 200
+    tasks = response.json()["tasks"]
+    assert [(task["class_id"], task["scenic_score"]) for task in tasks] == [(1, 6.5), (None, None)]
+
+
+@pytest.mark.parametrize("score", ["inf", "-inf", "Infinity", "-Infinity", "1e309"])
+def test_contrib_nonfinite_task_scores_are_rejected(contrib_repo, score):
+    pd.DataFrame([{
+        "image_path": "philadelphia/bad.jpg", "scenic_score": score,
+    }]).to_csv(contrib_repo.cfg.labels_source_csv, index=False)
+    response = client.post("/v1/contrib/session/start", json={
+        "contributor_id": "nonfinite", "region": "philadelphia",
+    })
+    assert response.status_code == 422
+    assert pd.read_csv(contrib_repo.tasks_path).empty
+
+
+@pytest.mark.parametrize("class_id", ["1.5", "inf", "unknown"])
+def test_contrib_invalid_class_ids_are_rejected(contrib_repo, class_id):
+    pd.DataFrame([{
+        "image_path": "philadelphia/bad.jpg", "class_id": class_id,
+    }]).to_csv(contrib_repo.cfg.labels_source_csv, index=False)
+    response = client.post("/v1/contrib/session/start", json={
+        "contributor_id": "invalid", "region": "philadelphia",
+    })
+    assert response.status_code == 422
+    assert pd.read_csv(contrib_repo.tasks_path).empty
+
+
+def _exercise_unpatched_apps(root):
+    # Spawned processes import this module without running its pytest fixtures.
+    cfg = ContribConfig(root_dir=Path(root))
+    with patch("src.app_api.contrib_repo.ContribConfig", return_value=cfg):
+        fresh = create_app()
+    results = []
+    for app, contributor_id in [(app_api.app, "imported"), (fresh, "fresh")]:
+        with TestClient(app) as test_client:
+            response = test_client.get("/v1/contrib/profile", params={"contributor_id": contributor_id})
+            results.append((response.status_code, response.json()["profile"]["contributor_id"]))
+    return results, (cfg.root_dir / "contributor_profiles.csv").exists()
+
+
+def test_contrib_imported_app_and_unpatched_factory_remain_usable(tmp_path):
+    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as workers:
+        results, persisted = workers.submit(_exercise_unpatched_apps, tmp_path / "factory").result(timeout=60)
+    assert results == [(200, "imported"), (200, "fresh")]
+    assert persisted
+
+
+@pytest.mark.parametrize("contributor_id", ["007", "NA", "nan", "1e5"])
+def test_contrib_identifier_round_trip(contrib_repo, contributor_id, monkeypatch):
+    import src.app_api.contrib_repo as storage
+    repo = contrib_repo
+    monkeypatch.setattr(storage.uuid, "uuid4", lambda: contributor_id)
+    repo.upsert_profile(contributor_id)
+    payload = _contrib_payload(repo, contributor_id)
+    assert payload["task_id"] == contributor_id
+    repo = ContribRepo(repo.cfg)
+    saved = repo.submit_label(payload)
+    assert saved["task_id"] == contributor_id
+    assert repo.get_profile(contributor_id)["contributor_id"] == contributor_id
+    assert repo.run_qa_promotion()["promoted"] == 1
+    assert repo.get_profile(contributor_id)["credits"] == 1.5
+    assert len(pd.read_csv(repo.profiles_path)) == 1
+
+
+@pytest.mark.parametrize("score", [None, 6.5])
+def test_contrib_skip_never_approved_or_credited(contrib_repo, score):
+    payload = _contrib_payload(contrib_repo, skip=True)
+    if score is None:
+        payload.pop("scenic_human")
+    response = client.post("/v1/contrib/labels", json=payload)
+    assert response.status_code == 200
+    result = contrib_repo.run_qa_promotion()
+    assert result["promoted"] == 0
+    assert result["remaining_pending"] == 0
+    profile = contrib_repo.get_profile("tester")
+    assert profile["credits"] == profile["approved_labels"] == profile["pending_labels"] == 0
+    assert pd.read_csv(contrib_repo.approved_path).empty
+    events = pd.read_csv(contrib_repo.events_path)
+    assert json.loads(events.iloc[0]["metadata"])["status"] == "skipped"
+
+
+def test_contrib_replay_foreign_and_mismatched_tasks_rejected(contrib_repo):
+    payload = _contrib_payload(contrib_repo, "owner")
+    for changes in ({"contributor_id": "stranger"}, {"task_id": "unknown"},
+                    {"image_path": "philadelphia/other.jpg"}, {"task_id": " "}):
+        assert client.post("/v1/contrib/labels", json={**payload, **changes}).status_code == 422
+    assert client.post("/v1/contrib/labels", json=payload).status_code == 200
+    assert client.post("/v1/contrib/labels", json=payload).status_code == 422
+    assert contrib_repo.run_qa_promotion()["promoted"] == 1
+    assert client.post("/v1/contrib/labels", json=payload).status_code == 422
+    assert contrib_repo.get_profile("owner")["credits"] == 1.5
+    # Different contributors may annotate the same image independently.
+    other = _contrib_payload(contrib_repo, "other")
+    assert other["image_path"] == payload["image_path"]
+    assert client.post("/v1/contrib/labels", json=other).status_code == 200
+
+
+def test_contrib_concurrent_replay_earns_one_credit(contrib_repo):
+    payload = _contrib_payload(contrib_repo)
+
+    def submit(_):
+        try:
+            contrib_repo.submit_label(payload)
+            return "saved"
+        except ValueError:
+            return "rejected"
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        results = list(workers.map(submit, range(8)))
+    assert results.count("saved") == 1
+    assert results.count("rejected") == 7
+    assert contrib_repo.run_qa_promotion()["promoted"] == 1
+    assert contrib_repo.get_profile("tester")["credits"] == 1.5
+
+
+def _submit_process_batch(cfg, payloads):
+    repo = ContribRepo(cfg)
+    original_read = repo._read
+
+    def slow_read(path):
+        table = original_read(path)
+        if path == repo.pending_path:
+            # Widen the read/modify/write window so an absent file lock loses rows.
+            time.sleep(0.05)
+        return table
+
+    repo._read = slow_read
+    _submission_barrier.wait(timeout=30)
+    results = []
+    for payload in payloads:
+        try:
+            repo.submit_label(payload)
+            results.append(("saved", payload["task_id"]))
+        except ValueError:
+            results.append(("rejected", payload["task_id"]))
+    return results
+
+
+def _init_process_barrier(barrier):
+    global _submission_barrier
+    _submission_barrier = barrier
+
+
+def test_contrib_multiprocess_submissions_and_replay(contrib_repo):
+    repo = contrib_repo
+    tasks = repo.next_tasks("processes", "philadelphia", count=20)
+    payloads = [{"contributor_id": "processes", "task_id": task["task_id"],
+                 "image_path": task["image_path"], "scenic_human": 6.5} for task in tasks]
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(4)
+    with ProcessPoolExecutor(max_workers=4, mp_context=context,
+                             initializer=_init_process_barrier, initargs=(barrier,)) as workers:
+        futures = [workers.submit(_submit_process_batch, repo.cfg, payloads[i::4]) for i in range(4)]
+        saved = [row for future in futures for row in future.result(timeout=60)]
+        assert set(saved) == {("saved", task["task_id"]) for task in tasks}
+        pending = pd.read_csv(repo.pending_path)
+        assert len(pending) == 20
+        assert set(pending["task_id"]) == {task["task_id"] for task in tasks}
+        assert repo.get_profile("processes")["pending_labels"] == 20
+
+        replay = _contrib_payload(repo, "replay")
+        futures = [workers.submit(_submit_process_batch, repo.cfg, [replay]) for _ in range(4)]
+        results = [row for future in futures for row in future.result(timeout=60)]
+        assert results.count(("saved", replay["task_id"])) == 1
+        assert results.count(("rejected", replay["task_id"])) == 3
+    pending = pd.read_csv(repo.pending_path)
+    expected = {task["task_id"] for task in tasks} | {replay["task_id"]}
+    assert len(pending) == 21
+    assert set(pending["task_id"]) == expected
+    assert repo.run_qa_promotion()["promoted"] == 21
+    assert repo.run_qa_promotion()["promoted"] == 0
+    assert repo.get_profile("replay")["credits"] == 1.5
+    assert repo.get_profile("replay")["approved_labels"] == 1
+    assert repo.get_profile("processes")["credits"] == 30
+    approved = pd.read_csv(repo.approved_path)
+    assert len(approved) == 21
+    assert set(approved["task_id"]) == expected
+    events = pd.read_csv(repo.events_path)
+    assert len(events) == 21
+    assert set(events["contributor_id"]) == {"processes", "replay"}
+
+
+
+
+def test_contrib_mid_promotion_failure_rolls_back(contrib_repo, monkeypatch):
+    import src.app_api.contrib_repo as storage
+    repo = contrib_repo
+    repo.submit_label(_contrib_payload(repo))
+    paths = [repo.profiles_path, repo.events_path, repo.approved_path, repo.pending_path]
+    before = {path: path.read_bytes() for path in paths}
+    original_replace = storage.os.replace
+    failed = False
+
+    def fail_after_credits(source, target):
+        nonlocal failed
+        if Path(target) == repo.events_path and not failed:
+            failed = True
+            raise OSError("injected event persistence failure")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(storage.os, "replace", fail_after_credits)
+    with pytest.raises(OSError, match="injected"):
+        repo.run_qa_promotion()
+    assert {path: path.read_bytes() for path in paths} == before
+    assert repo.run_qa_promotion()["promoted"] == 1
+    assert repo.get_profile("tester")["credits"] == 1.5
+
+
+def test_contrib_promotion_staging_failure_changes_nothing(contrib_repo, monkeypatch):
+    repo = contrib_repo
+    repo.submit_label(_contrib_payload(repo))
+    paths = [repo.profiles_path, repo.events_path, repo.approved_path, repo.pending_path]
+    before = {path: path.read_bytes() for path in paths}
+    original_stage = repo._stage
+
+    def fail_staging(path, table):
+        if path == repo.approved_path:
+            raise OSError("injected CSV staging failure")
+        return original_stage(path, table)
+
+    monkeypatch.setattr(repo, "_stage", fail_staging)
+    with pytest.raises(OSError, match="staging"):
+        repo.run_qa_promotion()
+    assert {path: path.read_bytes() for path in paths} == before
+
+
+def test_contrib_failed_rollback_recovers_on_reopen(contrib_repo, monkeypatch):
+    import src.app_api.contrib_repo as storage
+    repo = contrib_repo
+    repo.submit_label(_contrib_payload(repo))
+    paths = [repo.profiles_path, repo.events_path, repo.approved_path, repo.pending_path]
+    before = {path: path.read_bytes() for path in paths}
+    original_replace = storage.os.replace
+    rolling_back = False
+
+    def interrupted_replace(source, target):
+        nonlocal rolling_back
+        if Path(target) == repo.approved_path:
+            rolling_back = True
+            raise OSError("interrupted promotion")
+        if rolling_back and Path(target) == repo.events_path:
+            raise OSError("interrupted rollback")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(storage.os, "replace", interrupted_replace)
+    with pytest.raises(OSError, match="rollback"):
+        repo.run_qa_promotion()
+    monkeypatch.setattr(storage.os, "replace", original_replace)
+    reopened = ContribRepo(repo.cfg)
+    assert {path: path.read_bytes() for path in paths} == before
+    assert reopened.run_qa_promotion()["promoted"] == 1
+    assert reopened.get_profile("tester")["credits"] == 1.5
+
+
+def test_contrib_admin_authorization(monkeypatch):
+    monkeypatch.setenv("CONTRIB_ADMIN_TOKEN", "test-admin-secret")
+    endpoint = "/v1/admin/contrib/review/run"
+    assert client.post(endpoint).status_code == 401
+    assert client.post(endpoint, headers={"X-Admin-Token": "wrong"}).status_code == 403
+    assert client.post(endpoint, headers={"X-Admin-Token": "test-admin-secret"}).status_code == 200
+    monkeypatch.delenv("CONTRIB_ADMIN_TOKEN")
+    response = client.post(endpoint, headers={"X-Admin-Token": "test-admin-secret"})
+    assert response.status_code == 503
+    assert "configured" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize("contributor_id", ["", " ", "\t"])
+def test_contrib_blank_identifier_rejected(contrib_repo, contributor_id):
+    assert client.post("/v1/contrib/session/start", json={
+        "contributor_id": contributor_id}).status_code == 422
+    assert client.get("/v1/contrib/profile", params={
+        "contributor_id": contributor_id}).status_code == 422
+    assert client.get("/v1/contrib/tasks/next", params={
+        "contributor_id": contributor_id}).status_code == 422
+    payload = _contrib_payload(contrib_repo)
+    for field in ("contributor_id", "task_id"):
+        assert client.post("/v1/contrib/labels", json={
+            **payload, field: contributor_id}).status_code == 422
+
+
+def test_contrib_score_required_unless_skipping(contrib_repo):
+    payload = _contrib_payload(contrib_repo)
+    payload.pop("scenic_human")
+    assert client.post("/v1/contrib/labels", json=payload).status_code == 422
 
 
 def test_route_compare_contract() -> None:

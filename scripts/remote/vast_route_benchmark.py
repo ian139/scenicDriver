@@ -100,9 +100,6 @@ def quote(value: object) -> str:
     return shlex.quote(str(value))
 
 
-_quote = quote
-
-
 def generated_run_id(task_name: str) -> str:
     return f"{task_name}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
 
@@ -416,10 +413,6 @@ aws s3 cp "$OUTPUT" "$FINAL_S3" --only-show-errors
 """.strip()
         + "\n"
     )
-
-
-def build_script(config: VastRouteConfig, workers: int, group_size: int) -> str:
-    return build_remote_script(config, workers=workers, group_size=group_size)
 
 
 def build_initial_state(

@@ -55,7 +55,10 @@ from src.data_pipeline.web_mercator import (  # noqa: E402
     tile_bounds_wgs84,
     tile_to_lat_lon_center,
 )
-from src.terrain.features import compute_terrain_sea_level_fraction  # noqa: E402
+from src.terrain.features import (  # noqa: E402
+    compute_terrain_sea_level_fraction,
+    compute_terrain_valid_mask,
+)
 
 from scripts.ingest.naip_3dep_workflow import (  # noqa: E402
     MANIFEST_COLUMNS,
@@ -134,18 +137,35 @@ def _assess_water_inventory(rows: list[dict[str, Any]]) -> dict[str, Any]:
     excessive = 0
     unknown = 0
     for row in rows:
-        satellite_path_text = row.get("satellite_path")
-        satellite_path = Path(satellite_path_text) if satellite_path_text else None
-        satellite_fraction = None
-        if row.get("satellite_present") and satellite_path and satellite_path.is_file():
-            with Image.open(satellite_path) as satellite_image:
-                satellite_fraction = compute_satellite_water_fraction(satellite_image)
-
+        # Canonical terrain carries the only stored land geometry: black fill is
+        # outside-land sea. Without it, black satellite fill cannot be told
+        # apart from dark land, so water stays unknown rather than zero.
         terrain_path_text = row.get("terrain_path")
         terrain_path = Path(terrain_path_text) if terrain_path_text else None
         terrain_fraction = None
+        land_mask = None
         if row.get("terrain_present") and terrain_path and terrain_path.is_file():
-            terrain_fraction = compute_terrain_sea_level_fraction(terrain_path)
+            with Image.open(terrain_path) as terrain_image:
+                terrain_rgb = terrain_image.convert("RGB")
+            land_mask = compute_terrain_valid_mask(terrain_rgb)
+            terrain_fraction = compute_terrain_sea_level_fraction(
+                terrain_rgb, valid_mask=land_mask
+            )
+
+        satellite_path_text = row.get("satellite_path")
+        satellite_path = Path(satellite_path_text) if satellite_path_text else None
+        satellite_fraction = None
+        if (
+            land_mask is not None
+            and row.get("satellite_present")
+            and satellite_path
+            and satellite_path.is_file()
+        ):
+            with Image.open(satellite_path) as satellite_image:
+                if satellite_image.size[::-1] == land_mask.shape:
+                    satellite_fraction = compute_satellite_water_fraction(
+                        satellite_image, land_mask=land_mask
+                    )
 
         effective, status, reason = evaluate_water_status(
             satellite_fraction,

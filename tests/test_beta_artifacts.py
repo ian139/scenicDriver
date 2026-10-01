@@ -419,7 +419,8 @@ def test_corrupt_compact_payload_sha_rejected_by_checker(
     manifest_path = sqlite_path.with_name("road_graph.compact.json")
     write_compact_graph(sqlite_path, manifest_path)
 
-    bin_path = sqlite_path.with_name("road_graph.compact.bin")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    bin_path = (manifest_path.parent / manifest["bin_path"]).resolve()
     bin_bytes = bytearray(bin_path.read_bytes())
     bin_bytes[0] ^= 0xFF
     bin_path.write_bytes(bytes(bin_bytes))
@@ -429,8 +430,9 @@ def test_corrupt_compact_payload_sha_rejected_by_checker(
     assert "compact binary SHA-256 mismatch" in output
 
 
+@pytest.mark.parametrize("sidecar_state", ["corrupt", "missing"])
 def test_corrupt_projection_sidecar_rejected_by_checker(
-    tmp_path: Path, capsys
+    tmp_path: Path, capsys, sidecar_state: str
 ) -> None:
     relative_sqlite = "data/processed/road_graphs/candidate/road_graph.sqlite3"
     _write_project(tmp_path, graph=relative_sqlite)
@@ -442,15 +444,25 @@ def test_corrupt_projection_sidecar_rejected_by_checker(
     manifest_path = sqlite_path.with_name("road_graph.compact.json")
     write_compact_graph(sqlite_path, manifest_path)
 
-    sidecar_path = sqlite_path.with_name("road_graph.sqlite3.edge_projection_index")
-    sidecar_bytes = bytearray(sidecar_path.read_bytes())
-    sidecar_bytes[-1] ^= 0xFF
-    sidecar_path.write_bytes(bytes(sidecar_bytes))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    sidecar_path = (
+        manifest_path.parent / manifest["projection_index"]["path"]
+    ).resolve()
+    if sidecar_state == "missing":
+        sidecar_path.unlink()
+    else:
+        sidecar_bytes = bytearray(sidecar_path.read_bytes())
+        sidecar_bytes[-1] ^= 0xFF
+        sidecar_path.write_bytes(bytes(sidecar_bytes))
 
     assert checker.check_artifacts(tmp_path, graph=manifest_path) == 1
     output = capsys.readouterr().out
     assert "invalid:" in output
     assert "projection_index" in output or "edge_projection_index" in output
+    if sidecar_state == "missing":
+        assert "projection sidecar is missing" in output
+    else:
+        assert "projection sidecar SHA-256 mismatch" in output
 
 
 def test_multiple_enabled_regions_pass(tmp_path: Path) -> None:

@@ -470,3 +470,208 @@ def test_upload_prefix_directory_deterministic_and_relative_keys(
     assert count == 2
     assert uploaded_keys == ["prefix/b.txt", "prefix/sub/a.txt"]
     assert verified_keys == ["prefix/b.txt", "prefix/sub/a.txt"]
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["a/../../x", "/etc/x", r"a\b", "a/../x", "C:/outside.tif", "../folder/"],
+)
+def test_download_prefix_rejects_unsafe_keys_without_writes(
+    tmp_path: Path, key: str
+) -> None:
+    from src.data_pipeline.s3 import download_prefix
+
+    downloads: list[str] = []
+
+    class FakePaginator:
+        def paginate(self, **kwargs: str) -> list[dict]:
+            return [{"Contents": [{"Key": "ok/a.tif"}, {"Key": key}]}]
+
+    class FakeS3Client:
+        def get_paginator(self, operation: str) -> FakePaginator:
+            return FakePaginator()
+
+        def download_file(self, bucket: str, key: str, filename: str) -> None:
+            downloads.append(key)
+
+    dest = tmp_path / "download"
+    with pytest.raises(ValueError, match="Unsafe S3"):
+        download_prefix("bucket", "", dest, client=FakeS3Client())
+
+    assert downloads == []
+    assert not dest.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("symlink_kind", ["directory", "file"])
+def test_download_prefix_rejects_resolved_target_outside_destination(
+    tmp_path: Path, symlink_kind: str
+) -> None:
+    from src.data_pipeline.s3 import download_prefix
+
+    dest = tmp_path / "download"
+    dest.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "a.tif"
+    sentinel.write_bytes(b"unchanged")
+    if symlink_kind == "directory":
+        (dest / "ok").symlink_to(outside, target_is_directory=True)
+    else:
+        (dest / "ok").mkdir()
+        (dest / "ok" / "a.tif").symlink_to(sentinel)
+    downloads: list[str] = []
+
+    class FakePaginator:
+        def paginate(self, **kwargs: str) -> list[dict]:
+            return [{"Contents": [{"Key": "first.tif"}, {"Key": "ok/a.tif"}]}]
+
+    class FakeS3Client:
+        def get_paginator(self, operation: str) -> FakePaginator:
+            return FakePaginator()
+
+        def download_file(self, bucket: str, key: str, filename: str) -> None:
+            downloads.append(key)
+
+    with pytest.raises(ValueError, match="Unsafe S3"):
+        download_prefix("bucket", "", dest, client=FakeS3Client())
+
+    assert downloads == []
+    assert not (dest / "first.tif").exists()
+    assert sentinel.read_bytes() == b"unchanged"
+    assert list(outside.iterdir()) == [sentinel]
+
+
+@pytest.mark.parametrize("prefix", ["", "raw/", "raw"])
+def test_download_prefix_writes_normal_relative_key(
+    tmp_path: Path, prefix: str
+) -> None:
+    from src.data_pipeline.s3 import download_prefix
+
+    key = f"{prefix.rstrip('/')}/ok/a.tif" if prefix else "ok/a.tif"
+
+    class FakePaginator:
+        def paginate(self, **kwargs: str) -> list[dict]:
+            return [{"Contents": [{"Key": key}]}]
+
+    class FakeS3Client:
+        def get_paginator(self, operation: str) -> FakePaginator:
+            return FakePaginator()
+
+        def download_file(self, bucket: str, key: str, filename: str) -> None:
+            Path(filename).write_bytes(b"tile payload")
+
+    dest = tmp_path / "download"
+    assert download_prefix("bucket", prefix, dest, client=FakeS3Client()) == 1
+    assert (dest / "ok" / "a.tif").read_bytes() == b"tile payload"
+
+
+def test_inventory_does_not_attribute_or_reuse_unproven_valid_tiles(
+    tmp_path: Path,
+) -> None:
+    from src.data_pipeline.tile_inventory import (
+        build_inventory_report,
+        scan_tile_inventory,
+    )
+
+    for style in ("satellite", "terrain"):
+        path = tmp_path / style / "z14" / "fixture" / "1_2.png"
+        path.parent.mkdir(parents=True)
+        Image.new("RGB", (4, 4), color="green").save(path)
+    source = {
+        "region": "fixture",
+        "z": 14,
+        "x": 1,
+        "y": 2,
+        "satellite_provider": "usda_naip",
+        "satellite_collection": "naip-visualization",
+        "satellite_asset_ids": '["planned-naip-asset"]',
+        "terrain_provider": "usgs",
+        "terrain_collection": "usgs-3dep-13as",
+        "terrain_asset_ids": '["planned-3dep-asset"]',
+    }
+
+    rows, counts = scan_tile_inventory([source], image_root=tmp_path)
+
+    row = rows[0]
+    assert counts["complete_pairs"] == 1
+    assert counts["reusable_pairs"] == 0
+    assert not row["satellite_present"]
+    assert not row["terrain_present"]
+    for style in ("satellite", "terrain"):
+        assert row[f"{style}_reason"] == "missing_acquisition_provenance"
+        for field in ("provider", "collection", "asset_ids"):
+            assert not row[f"{style}_{field}"]
+    assert not row.get("acquisition_tile_identity_sha256")
+    assert build_inventory_report(rows, counts)["reusable_pairs"] == 0
+
+
+@pytest.mark.parametrize("changed", ["", "satellite", "terrain", "identity"])
+def test_inventory_reuse_requires_matching_acquisition_and_output_hashes(
+    tmp_path: Path, changed: str
+) -> None:
+    import hashlib
+
+    from src.data_pipeline.source_contracts import compute_acquisition_tile_identity
+    from src.data_pipeline.tile_inventory import scan_tile_inventory
+
+    row = {
+        "region": "fixture",
+        "z": 14,
+        "x": 1,
+        "y": 2,
+        "grid_sha256": "1" * 64,
+        "source_contract_sha256": "2" * 64,
+        "preprocessing_contract_sha256": "3" * 64,
+        "satellite_provider": "usda_naip",
+        "terrain_provider": "usgs",
+    }
+    paths = {}
+    for style in ("satellite", "terrain"):
+        path = tmp_path / style / "z14" / "fixture" / "1_2.png"
+        path.parent.mkdir(parents=True)
+        Image.new("RGB", (4, 4), color="green").save(path)
+        paths[style] = path
+        row[f"{style}_output_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    row["acquisition_tile_identity_sha256"] = compute_acquisition_tile_identity(
+        z=14,
+        x=1,
+        y=2,
+        region="fixture",
+        target_grid_sha256=row["grid_sha256"],
+        satellite_output_sha256=row["satellite_output_sha256"],
+        terrain_output_sha256=row["terrain_output_sha256"],
+        source_contract_sha256=row["source_contract_sha256"],
+        preprocessing_contract_sha256=row["preprocessing_contract_sha256"],
+    ).sha256()
+    if changed in paths:
+        Image.new("RGB", (4, 4), color="blue").save(paths[changed])
+    elif changed == "identity":
+        row["acquisition_tile_identity_sha256"] = "f" * 64
+
+    rows, counts = scan_tile_inventory([row], image_root=tmp_path)
+
+    if not changed:
+        assert counts["reusable_pairs"] == 1
+        assert rows[0]["satellite_present"]
+        assert rows[0]["terrain_present"]
+        assert rows[0]["satellite_provider"] == "usda_naip"
+        assert rows[0]["terrain_provider"] == "usgs"
+    else:
+        assert counts["reusable_pairs"] == 0
+        assert not rows[0].get("acquisition_tile_identity_sha256")
+        if changed == "identity":
+            assert not rows[0]["satellite_present"]
+            assert not rows[0]["terrain_present"]
+        else:
+            assert not rows[0][f"{changed}_present"]
+
+
+def test_inventory_report_does_not_reuse_unproven_s3_pairs() -> None:
+    from src.data_pipeline.tile_inventory import build_inventory_report
+
+    report = build_inventory_report(
+        [{"satellite_s3_present": True, "terrain_s3_present": True}], {}
+    )
+
+    assert report["reusable_pairs"] == 0

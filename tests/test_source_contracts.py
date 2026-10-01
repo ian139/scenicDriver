@@ -8,9 +8,7 @@ from src.data_pipeline.source_contracts import (
     AcquisitionTileIdentity,
     EmbeddingFeatureIdentity,
     PredictionReportIdentity,
-    PreprocessingContract,
     SourceAsset,
-    SourceContract,
     compute_acquisition_tile_identity,
     compute_embedding_feature_identity,
     compute_prediction_report_identity,
@@ -111,29 +109,6 @@ def test_deterministic_round_trips():
     asset_rt = SourceAsset.from_dict(asset_dict)
     assert asset == asset_rt
     assert asset.sha256() == asset_rt.sha256()
-
-    contract = SourceContract(
-        provider="USDA",
-        collection="NAIP",
-        assets=(asset,),
-        horizontal_crs="EPSG:26918",
-        native_resolution=1.0,
-    )
-    contract_dict = contract.to_dict()
-    contract_rt = SourceContract.from_dict(contract_dict)
-    assert contract == contract_rt
-    assert contract.sha256() == contract_rt.sha256()
-
-    preproc = PreprocessingContract(
-        contract_id="naip_resample_v1",
-        target_crs="EPSG:3857",
-        target_resolution=1.0,
-        resample_alg="bilinear",
-    )
-    preproc_dict = preproc.to_dict()
-    preproc_rt = PreprocessingContract.from_dict(preproc_dict)
-    assert preproc == preproc_rt
-    assert preproc.sha256() == preproc_rt.sha256()
 
     acq_tile = sample_acquisition()
     acq_rt = AcquisitionTileIdentity.from_dict(acq_tile.to_dict())

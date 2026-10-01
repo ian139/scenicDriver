@@ -282,13 +282,15 @@ def test_compact_publication_is_deterministic(tmp_path: Path) -> None:
     graph = _fixture_graph()
     sqlite_path, manifest_path, _first = _publish_compact(tmp_path, graph)
     first_manifest = manifest_path.read_bytes()
-    first_bin = (tmp_path / "road_graph.compact.bin").read_bytes()
+    first_dependencies = json.loads(first_manifest)
+    first_bin = (manifest_path.parent / first_dependencies["bin_path"]).read_bytes()
 
     other = tmp_path / "other"
     other.mkdir()
     second_manifest_path = other / "road_graph.compact.json"
     second = write_compact_graph(sqlite_path, second_manifest_path)
-    assert (other / "road_graph.compact.bin").read_bytes() == first_bin
+    second_dependencies = json.loads(second_manifest_path.read_bytes())
+    assert (second_manifest_path.parent / second_dependencies["bin_path"]).read_bytes() == first_bin
     assert second_manifest_path.read_bytes() == first_manifest
     assert second["bin_sha256"] == _first["bin_sha256"]
     assert second["manifest_sha256"] == _first["manifest_sha256"]
@@ -307,7 +309,8 @@ def test_compact_rejects_tampered_source_hash(tmp_path: Path) -> None:
 def test_compact_rejects_tampered_binary_payload(tmp_path: Path) -> None:
     graph = _fixture_graph()
     _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
-    bin_path = tmp_path / "road_graph.compact.bin"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    bin_path = manifest_path.parent / manifest["bin_path"]
     bin_path.write_bytes(bin_path.read_bytes()[:-1])
     with pytest.raises(ValueError, match="SHA-256|size|truncated"):
         CompactRoadGraph.load(manifest_path)
@@ -2540,7 +2543,7 @@ def _native_cost_spec(planner) -> object:
             else 0.0
         ),
         lagrangian_multiplier=0.0,
-        cost_limit=0.0,
+        cost_limit=-1.0,
     )
 
 
@@ -2559,7 +2562,7 @@ def _scenic_cost_spec() -> object:
         highway_penalty=2.0,
         scenic_byway_bonus=1.0,
         lagrangian_multiplier=0.0,
-        cost_limit=0.0,
+        cost_limit=-1.0,
     )
 
 
@@ -3725,3 +3728,258 @@ def test_compact_lagrangian_sequential_fallback(
 
     assert route is not None
     assert executed_threads == {threading.get_ident()}
+
+
+@pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf"), 0.0, 1.0])
+@pytest.mark.parametrize("multiplier", [0.0, 0.75])
+@pytest.mark.parametrize("limit", [None, 0.0, 0.5, 1.0, 100.0])
+def test_compact_cost_weight_limit_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    weight: float, multiplier: float, limit: float | None,
+) -> None:
+    from src.route_planner import planner as planner_module
+    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from src.route_planner.cost import CostWeights, ScenicCostFunction
+
+    assert _native_library() is not None
+    graph = _rank_permutation_graph()
+    graph.edges["e0"].distance_km = 2.0
+    graph.edges["e3"].distance_km = 2.0
+    graph.edges["e1"].road_type = "scenic_byway"
+    _, manifest, _ = _publish_compact(tmp_path, graph)
+    compact = CompactRoadGraph.load(manifest)
+    planner = ScenicRoutePlanner(graph=compact)
+    cost = ScenicCostFunction(
+        scenic_weight=0.5,
+        weights=CostWeights(weight, weight, weight, weight),
+    )
+    topology = planner._csr_topology()
+    fwd = [("n0", 0.0, (0, 0), None)]
+    rev = [("n1", 0.0, (0, 0), None)]
+    native = run_compact_bidirectional_search(
+        topology, cost, fwd, rev,
+        lagrangian_multiplier=multiplier, cost_limit=limit,
+    )
+    monkeypatch.setattr(planner_module, "run_compact_bidirectional_search", lambda *a, **k: None)
+    fallback = planner._bidirectional_search_core(
+        cost, fwd, rev, lagrangian_multiplier=multiplier, cost_limit=limit,
+    )
+    assert (native is None) == (fallback is None)
+    if fallback is not None:
+        edges = fallback[0]
+        expected_cost = sum(cost.calculate(e) + multiplier * e.travel_time_minutes for e in edges)
+        assert [topology.edge_refs[p][0] for p in native[0]] == [e.id for e in edges]
+        assert native[1] == pytest.approx(expected_cost, rel=1e-12)
+        if limit is not None:
+            assert expected_cost <= limit
+
+
+def test_compact_lagrangian_seed_and_internal_costs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.route_planner import planner as planner_module
+    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from src.route_planner.cost import ScenicCostFunction
+
+    assert _native_library() is not None
+    graph = _rank_permutation_graph()
+    # Scenic route B takes four minutes; route A takes two.
+    for edge_id in ("e0", "e3"):
+        graph.edges[edge_id].distance_km = 2.0
+        graph.edges[edge_id].scenic_score = 10.0
+    _, manifest, _ = _publish_compact(tmp_path, graph)
+    planner = ScenicRoutePlanner(graph=CompactRoadGraph.load(manifest))
+    cost = ScenicCostFunction(scenic_weight=1.0)
+    topology = planner._csr_topology()
+    # Seed access costs already include their duration multiplier.
+    fwd = [("n0", 1.25, (0, 0), None)]
+    rev = [("n1", 0.75, (0, 0), None)]
+    native = run_compact_bidirectional_search(
+        topology, cost, fwd, rev, lagrangian_multiplier=1.0, cost_limit=5.0,
+    )
+    assert native is not None
+    assert [topology.edge_refs[p][0] for p in native[0]] == ["e1", "e2"]
+    assert native[1] == pytest.approx(5.0)
+    monkeypatch.setattr(planner_module, "run_compact_bidirectional_search", lambda *a, **k: None)
+    fallback = planner._bidirectional_search_core(
+        cost, fwd, rev, lagrangian_multiplier=1.0, cost_limit=5.0,
+    )
+    assert fallback is not None
+    assert [e.id for e in fallback[0]] == ["e1", "e2"]
+
+
+def test_compact_highway_overflow_remains_expensive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.route_planner import planner as planner_module
+    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from src.route_planner.cost import ScenicCostFunction
+
+    assert _native_library() is not None
+    graph = RoadGraph()
+    graph.add_node(Node("s", 42.0, -72.0))
+    graph.add_node(Node("t", 42.1, -72.0))
+    graph.add_edge(Edge("highway", "s", "t", distance_km=10.0, scenic_score=0.0,
+                        road_type="trunk", speed_limit_kmh=60, one_way=True))
+    _, manifest, _ = _publish_compact(tmp_path, graph)
+    planner = ScenicRoutePlanner(graph=CompactRoadGraph.load(manifest))
+    cost = ScenicCostFunction(highway_preference=1e308)
+    native = run_compact_bidirectional_search(
+        planner._csr_topology(), cost,
+        [("s", 0.0, (), None)], [("t", 0.0, (), None)],
+    )
+    assert native is not None
+    assert native[1] == cost.calculate(graph.edges["highway"]) == sys.float_info.max
+    monkeypatch.setattr(planner_module, "run_compact_bidirectional_search", lambda *a, **k: None)
+    fallback = planner._bidirectional_search_core(
+        cost, [("s", 0.0, (), None)], [("t", 0.0, (), None)],
+    )
+    assert fallback is not None
+    assert [e.id for e in fallback[0]] == ["highway"]
+    assert sum(cost.calculate(e) for e in fallback[0]) == native[1]
+    assert planner._bidirectional_search_core(
+        cost, [("s", 0.0, (), None)], [("t", 0.0, (), None)], cost_limit=1e307,
+    ) is None
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_compact_negative_cost_limit_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native: bool,
+) -> None:
+    from src.route_planner import planner as planner_module
+    from src.route_planner.cost import ScenicCostFunction
+
+    assert _native_library() is not None
+    _, manifest, _ = _publish_compact(tmp_path, _rank_permutation_graph())
+    planner = ScenicRoutePlanner(graph=CompactRoadGraph.load(manifest))
+    if not native:
+        monkeypatch.setattr(planner_module, "run_compact_bidirectional_search", lambda *a, **k: None)
+    with pytest.raises(ValueError, match="cost limit"):
+        planner._bidirectional_search_core(
+            ScenicCostFunction(), [("n0", 0.0, (), None)],
+            [("n1", 0.0, (), None)], cost_limit=-1.0,
+        )
+
+
+@pytest.mark.parametrize("q", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("duration", [0.0, 10.0])
+@pytest.mark.parametrize("travel,scenic,bonus,normalized", [
+    (-1.0, 1.0, 1.0, (0.0, 1.0, 0.5)),
+    (float("nan"), 1.0, float("nan"), (0.0, 1.0, 0.0)),
+    (1.0, float("inf"), float("inf"), (1.0, 0.0, 0.0)),
+    (1.0, -1.0, -1.0, (1.0, 0.0, 0.0)),
+    (1e308, 1.0, 0.0, (1e308, 1.0, 0.0)),
+    (1.0, 1e308, 0.0, (1.0, 1e308, 0.0)),
+])
+def test_compact_single_edge_scalar_csr_native_parity(
+    tmp_path: Path, q: float, duration: float,
+    travel: float, scenic: float, bonus: float,
+    normalized: tuple[float, float, float],
+) -> None:
+    from decimal import Decimal
+    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from src.route_planner.cost import CostWeights, ScenicCostFunction
+
+    assert _native_library() is not None
+    graph = RoadGraph()
+    graph.add_node(Node("s", 42.0, -72.0))
+    graph.add_node(Node("t", 42.1, -72.0))
+    edge = Edge("only", "s", "t", duration, 0.0, road_type="scenic_byway",
+                speed_limit_kmh=60, one_way=True)
+    graph.add_edge(edge)
+    _, manifest, _ = _publish_compact(tmp_path, graph)
+    planner = ScenicRoutePlanner(graph=CompactRoadGraph.load(manifest))
+    cost = ScenicCostFunction(q, weights=CostWeights(travel, scenic, 2.0, bonus))
+    topology = planner._csr_topology()
+    signature = planner._built_in_cost_signature(cost)
+    csr = planner._vectorized_builtin_weights(topology, signature)
+    # Independent arithmetic oracle: inactive components contribute exactly zero,
+    # and costs beyond the floating-point range saturate rather than becoming cheap.
+    travel_factor, scenic_factor, discount = map(lambda v: Decimal(str(v)), normalized)
+    duration_decimal, q_decimal = Decimal(str(duration)), Decimal(str(q))
+    base = max(
+        duration_decimal * ((1 - q_decimal) * travel_factor + q_decimal * scenic_factor),
+        Decimal("1e-6") * duration_decimal,
+    )
+    exact = max(base * (1 - discount), Decimal("1e-6"))
+    expected = float(min(exact, Decimal.from_float(sys.float_info.max)))
+    assert cost.calculate(edge) == pytest.approx(expected, rel=1e-12)
+    assert csr[0] == pytest.approx(expected, rel=1e-12)
+    native = run_compact_bidirectional_search(
+        topology, cost, [("s", 0.0, (), None)], [("t", 0.0, (), None)],
+    )
+    assert native is not None
+    assert native[0] == [0]
+    assert native[1] == pytest.approx(expected, rel=1e-12)
+
+
+@pytest.mark.parametrize("multiplier", [0.0, 1e308])
+def test_compact_fastest_zero_duration_accepts_zero_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, multiplier: float,
+) -> None:
+    from src.route_planner import planner as planner_module
+    from src.route_planner._compact_search import run_compact_bidirectional_search
+
+    assert _native_library() is not None
+    graph = RoadGraph()
+    graph.add_node(Node("s", 42.0, -72.0))
+    graph.add_node(Node("t", 42.1, -72.0))
+    graph.add_edge(Edge("zero", "s", "t", 0.0, 0.0, one_way=True))
+    _, manifest, _ = _publish_compact(tmp_path, graph)
+    planner = ScenicRoutePlanner(graph=CompactRoadGraph.load(manifest))
+    cost = planner._make_fastest_cost_function()
+    fwd, rev = [("s", 0.0, (), None)], [("t", 0.0, (), None)]
+    native = run_compact_bidirectional_search(
+        planner._csr_topology(), cost, fwd, rev,
+        lagrangian_multiplier=multiplier, cost_limit=0.0,
+    )
+    assert native is not None and native[1] == 0.0
+    monkeypatch.setattr(planner_module, "run_compact_bidirectional_search", lambda *a, **k: None)
+    fallback = planner._bidirectional_search_core(
+        cost, fwd, rev, lagrangian_multiplier=multiplier, cost_limit=0.0,
+    )
+    assert fallback is not None
+    assert [e.id for e in fallback[0]] == ["zero"]
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("overflow", ["sum", "meeting", "multiplier"])
+def test_compact_rejects_cost_accumulation_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native: bool, overflow: str,
+) -> None:
+    from src.route_planner import planner as planner_module
+    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from src.route_planner.cost import CostWeights, ScenicCostFunction
+
+    assert _native_library() is not None
+    graph = _rank_permutation_graph()
+    _, manifest, _ = _publish_compact(tmp_path, graph)
+    planner = ScenicRoutePlanner(graph=CompactRoadGraph.load(manifest))
+    cost = ScenicCostFunction(0.0, weights=CostWeights(1e308, 0.0, 0.0, 0.0))
+    seed = 1e308 if overflow == "meeting" else 0.0
+    fwd, rev = [("n0", seed, (), None)], [("n1", seed, (), None)]
+    multiplier = 1e308 if overflow == "multiplier" else 0.0
+    if native:
+        with pytest.raises(ValueError, match="calculated cost"):
+            run_compact_bidirectional_search(
+                planner._csr_topology(), cost, fwd, rev,
+                lagrangian_multiplier=multiplier,
+            )
+    else:
+        monkeypatch.setattr(planner_module, "run_compact_bidirectional_search", lambda *a, **k: None)
+        with pytest.raises(ValueError, match="calculated cost"):
+            planner._bidirectional_search_core(
+                cost, fwd, rev, lagrangian_multiplier=multiplier,
+            )
+
+
+def test_highway_objective_ratio_prevents_intermediate_overflow() -> None:
+    from src.route_planner.cost import evaluate_path
+
+    edge = Edge("h", "s", "t", 10.0, 0.0, road_type="trunk", speed_limit_kmh=60)
+    evaluation = evaluate_path(
+        [edge], q=0.5, kappa=1.0,
+        fastest_duration_minutes=10.0, highway_preference=1e308,
+    )
+    assert evaluation.highway_cost == 1e308
+    assert evaluation.objective == -1e308

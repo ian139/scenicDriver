@@ -3,6 +3,7 @@ execution, resume, caps, provenance). All fixtures are local; no network."""
 
 from __future__ import annotations
 
+import csv
 import math
 import hashlib
 import json
@@ -375,6 +376,134 @@ def test_resume_skips_valid_and_repairs_corrupt(tmp_path: Path) -> None:
         assert img.size == (512, 512)
     quarantined = list(corrupt_png.parent.glob(f"{corrupt_png.name}.quarantine.*"))
     assert len(quarantined) == 1
+
+
+@pytest.mark.parametrize("repair", [False, True], ids=["valid_skip", "repair"])
+def test_resume_restores_cleared_source_attribution(
+    tmp_path: Path, repair: bool
+) -> None:
+    from src.data_pipeline.tile_inventory import scan_tile_inventory
+
+    plan, plan_sha, plan_path = _plan_and_execute(tmp_path, run_name="attribution")
+    objects = build_fixture_objects()
+    execution_args = {
+        "expected_plan_sha256": plan_sha,
+        "allow_requester_pays": True,
+        "max_source_requests": 200,
+        "max_transfer_bytes": 100_000_000,
+        "max_local_bytes": 100_000_000,
+        "max_requester_pays_usd": Decimal("500"),
+        "workers": 1,
+        "transport_factory": make_transport_factory(objects),
+    }
+    execute_plan(plan_path, **execution_args)
+    contract, _ = load_source_contract(plan["inputs"]["source_contract_path"])
+    terrain_asset = wf.load_3dep_catalog(
+        contract["terrain"]["catalog_snapshot"], None
+    )[0]
+    expected = {
+        "satellite_acquisition_year": "2021",
+        "satellite_capture_date": "2021-08-16",
+        "terrain_vertical_datum": "NAVD88",
+        "terrain_native_resolution": str(terrain_asset.native_resolution),
+    }
+    for style, source, asset_ids, source_key in (
+        ("satellite", "imagery", plan["unique_naip_assets"], NAIP_SAT_KEY),
+        ("terrain", "terrain", plan["unique_3dep_assets"], TNM_DEM_KEY),
+    ):
+        for suffix in ("provider", "collection", "license", "attribution"):
+            expected[f"{style}_{suffix}"] = contract[source][suffix]
+        expected[f"{style}_asset_ids"] = json.dumps(
+            asset_ids, sort_keys=True, separators=(",", ":")
+        )
+        expected[f"{style}_source_checksums"] = json.dumps(
+            {
+                asset_id: hashlib.sha256(objects[source_key]).hexdigest()
+                for asset_id in asset_ids
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    manifest_path = plan_path.parent / "tile_manifest.csv"
+    with manifest_path.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    x, y = TILE_COORDS[0]
+    row = next(row for row in rows if (int(row["x"]), int(row["y"])) == (x, y))
+    row.update(expected)
+    row["acquisition_tile_identity_sha256"] = ""
+    cleared_rows, _ = scan_tile_inventory(
+        rows, image_root=tmp_path / "images", expected_dimensions=(512, 512)
+    )
+    cleared = next(
+        row for row in cleared_rows if (int(row["x"]), int(row["y"])) == (x, y)
+    )
+    assert all(cleared[field] == "" for field in expected)
+    wf.write_manifest_csv(manifest_path, cleared_rows)
+    sat_path = tmp_path / "images" / "satellite" / "z14" / "sne_pilot" / f"{x}_{y}.png"
+    if repair:
+        sat_path.write_bytes(b"corrupt-satellite")
+
+    result = execute_plan(plan_path, **execution_args)
+
+    assert result["state"] == "acquired"
+    with manifest_path.open(newline="", encoding="utf-8") as stream:
+        restored_rows = list(csv.DictReader(stream))
+    restored = next(
+        row for row in restored_rows if (int(row["x"]), int(row["y"])) == (x, y)
+    )
+    assert {field: restored[field] for field in expected} == expected
+    assert restored["satellite_present"] == restored["terrain_present"] == "True"
+    assert bool(list(sat_path.parent.glob(f"{sat_path.name}.quarantine.*"))) is repair
+
+
+@pytest.mark.parametrize("style", ["satellite", "terrain"])
+def test_resume_reacquires_inconsistent_nested_and_identity_hashes(
+    tmp_path: Path, style: str
+) -> None:
+    _plan, plan_sha, plan_path = _plan_and_execute(tmp_path, run_name="hash_binding")
+    execution_args = {
+        "expected_plan_sha256": plan_sha,
+        "allow_requester_pays": True,
+        "max_source_requests": 200,
+        "max_transfer_bytes": 100_000_000,
+        "max_local_bytes": 100_000_000,
+        "max_requester_pays_usd": Decimal("500"),
+        "workers": 1,
+        "transport_factory": make_transport_factory(build_fixture_objects()),
+    }
+    execute_plan(plan_path, **execution_args)
+    x, y = TILE_COORDS[0]
+    output_path = tmp_path / "images" / style / "z14" / "sne_pilot" / f"{x}_{y}.png"
+    record_path = plan_path.parent / "tile_records" / f"sne_pilot_z14_{x}_{y}.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    original_sha = record[f"{style}_output_sha256"]
+    Image.new("RGB", (512, 512), color=(1, 2, 3)).save(output_path)
+    replacement_sha = file_sha256(output_path)
+    assert replacement_sha != original_sha
+    record[style]["sha256"] = replacement_sha
+    atomic_write_json(record_path, record)
+    assert wf.acquisition_provenance_reason(record) is None
+
+    result = execute_plan(plan_path, **execution_args)
+
+    assert result["state"] == "acquired"
+    assert file_sha256(output_path) == original_sha
+    quarantined = list(output_path.parent.glob(f"{output_path.name}.quarantine.*"))
+    assert len(quarantined) == 1
+    assert file_sha256(quarantined[0]) == replacement_sha
+    repaired_record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert (
+        repaired_record[style]["sha256"]
+        == repaired_record[f"{style}_output_sha256"]
+        == original_sha
+    )
+    manifest_path = plan_path.parent / "tile_manifest.csv"
+    with manifest_path.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    repaired_row = next(row for row in rows if (int(row["x"]), int(row["y"])) == (x, y))
+    assert repaired_row["satellite_present"] == repaired_row["terrain_present"] == "True"
+    assert wf.acquisition_provenance_reason(repaired_row) is None
 
 
 def test_resume_repairs_interrupted_pair_with_installing_record(

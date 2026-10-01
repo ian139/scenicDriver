@@ -18,7 +18,11 @@ from scipy.sparse import csr_matrix as _scipy_csr_matrix
 from scipy.sparse.csgraph import dijkstra as _scipy_dijkstra
 from scipy.sparse.csgraph import shortest_path as _scipy_shortest_path
 
-from ._compact_search import compact_search_available, run_compact_bidirectional_search
+from ._compact_search import (
+    compact_search_available,
+    run_compact_bidirectional_search,
+    validate_cost_limit,
+)
 from .cancellation import RoutingDeadline, RoutingTimeout
 from .cost import (
     CostWeights,
@@ -713,157 +717,6 @@ class ScenicRoutePlanner:
             scenic_byway_mask=np.asarray(scenic_byway_mask, dtype=np.bool_),
         )
 
-    @staticmethod
-    def _compiled_distance_equal(first: float, second: float) -> bool:
-        scale = max(1.0, abs(first), abs(second))
-        return abs(first - second) <= max(
-            1e-12, 8.0 * np.finfo(np.float64).eps * scale
-        )
-
-    def _compiled_shortest_duration_scenic_path(
-        self,
-        start: Node,
-        goal: Node,
-        scenic_cost: ScenicCostFunction,
-    ) -> Optional[List[Edge]]:
-        """Optimize scenic cost over the globally shortest-duration subgraph."""
-        if start.id == goal.id:
-            return [] if start.id == goal.id else None
-        fastest_cost = ScenicCostFunction(
-            scenic_weight=0.0,
-            strict_highways=self._avoids_highways(scenic_cost),
-            weights=CostWeights(
-                travel_time=1.0,
-                scenic_reward=0.0,
-                highway_penalty=0.0,
-                scenic_byway_bonus=0.0,
-            ),
-        )
-        fastest_signature = self._built_in_cost_signature(fastest_cost)
-        scenic_signature = self._built_in_cost_signature(scenic_cost)
-        if fastest_signature is None or scenic_signature is None:
-            return None
-        duration_data = self._csr_data(fastest_cost, fastest_signature)
-        scenic_data = self._csr_data(scenic_cost, scenic_signature)
-        if duration_data is None or scenic_data is None:
-            return None
-        topology = duration_data.topology
-        start_index = topology.node_index.get(start.id)
-        goal_index = topology.node_index.get(goal.id)
-        if start_index is None or goal_index is None:
-            return None
-        forward_distances = _scipy_shortest_path(
-            duration_data.matrix,
-            directed=True,
-            indices=start_index,
-            return_predecessors=False,
-            unweighted=False,
-            method="D",
-        )
-        total_duration = float(forward_distances[goal_index])
-        if not math.isfinite(total_duration):
-            return None
-        row_lengths = np.diff(topology.indptr)
-        source_indices = np.repeat(
-            np.arange(len(topology.node_ids), dtype=np.int64),
-            row_lengths,
-        )
-        target_indices = topology.indices
-        with np.errstate(over="ignore", invalid="ignore"):
-            candidate_prefixes = (
-                forward_distances[source_indices] + duration_data.weights
-            )
-            prefix_differences = np.abs(
-                candidate_prefixes - forward_distances[target_indices]
-            )
-        prefix_scales = np.maximum(
-            1.0,
-            np.maximum(
-                np.abs(candidate_prefixes),
-                np.abs(forward_distances[target_indices]),
-            ),
-        )
-        shortest_edge_mask = (
-            np.isfinite(candidate_prefixes)
-            & np.isfinite(forward_distances[target_indices])
-            & (forward_distances[target_indices] <= total_duration)
-            & (
-                prefix_differences
-                <= np.maximum(
-                    1e-12,
-                    8.0 * np.finfo(np.float64).eps * prefix_scales,
-                )
-            )
-        )
-        scenic_weights = scenic_data.weights.copy()
-        scenic_weights[~shortest_edge_mask] = np.inf
-        scenic_matrix = _scipy_csr_matrix(
-            (
-                scenic_weights,
-                topology.indices,
-                topology.indptr,
-            ),
-            shape=(len(topology.node_ids), len(topology.node_ids)),
-            copy=False,
-        )
-        scenic_distances, predecessors = _scipy_shortest_path(
-            scenic_matrix,
-            directed=True,
-            indices=start_index,
-            return_predecessors=True,
-            unweighted=False,
-            method="D",
-        )
-        if not math.isfinite(float(scenic_distances[goal_index])):
-            return None
-        path_reversed: List[Edge] = []
-        current_index = goal_index
-        visited = {current_index}
-        while current_index != start_index:
-            predecessor = int(predecessors[current_index])
-            if (
-                predecessor < 0
-                or predecessor >= len(topology.node_ids)
-                or predecessor in visited
-            ):
-                return None
-            row_start = int(topology.indptr[predecessor])
-            row_end = int(topology.indptr[predecessor + 1])
-            best_position: Optional[int] = None
-            best_residual = float("inf")
-            predecessor_distance = float(scenic_distances[predecessor])
-            current_distance = float(scenic_distances[current_index])
-            for position in range(row_start, row_end):
-                if (
-                    int(topology.indices[position]) != current_index
-                    or not shortest_edge_mask[position]
-                ):
-                    continue
-                residual = abs(
-                    predecessor_distance
-                    + float(scenic_weights[position])
-                    - current_distance
-                )
-                if residual < best_residual:
-                    best_residual = residual
-                    best_position = position
-            if best_position is None or best_residual > max(
-                1e-9, abs(current_distance) * 1e-10
-            ):
-                return None
-            edge_id, reverse = topology.edge_refs[best_position]
-            path_reversed.append(
-                self._edge_from_reverse_index(edge_id, reverse)
-            )
-            current_index = predecessor
-            visited.add(current_index)
-        if (
-            self.graph is not topology.graph
-            or topology.graph._heuristic_cache_stamp() != topology.stamp
-        ):
-            return None
-        path_reversed.reverse()
-        return path_reversed
     def _compiled_weighted_path_with_positions(
         self,
         topology: _CSRTopology,
@@ -957,122 +810,6 @@ class ScenicRoutePlanner:
         )
         return result[0] if result is not None else None
 
-    def _compiled_shortest_duration_average_path(
-        self,
-        start: Node,
-        goal: Node,
-        avoid_highways: bool,
-    ) -> Optional[List[Edge]]:
-        """Maximize distance-weighted scenic score among fastest paths.
-
-        Dinkelbach iterations solve the fractional distance-score objective on
-        the shortest-duration DAG.  A duration shift makes every transformed
-        edge weight nonnegative without changing the ranking because every
-        feasible path has identical total duration.
-        """
-        if start.id == goal.id:
-            return [] if start.id == goal.id else None
-        fastest_cost = ScenicCostFunction(
-            scenic_weight=0.0,
-            strict_highways=avoid_highways,
-            weights=CostWeights(
-                travel_time=1.0,
-                scenic_reward=0.0,
-                highway_penalty=0.0,
-                scenic_byway_bonus=0.0,
-            ),
-        )
-        signature = self._built_in_cost_signature(fastest_cost)
-        if signature is None:
-            return None
-        duration_data = self._csr_data(fastest_cost, signature)
-        if duration_data is None:
-            return None
-        topology = duration_data.topology
-        start_index = topology.node_index.get(start.id)
-        goal_index = topology.node_index.get(goal.id)
-        if start_index is None or goal_index is None:
-            return None
-        forward = _scipy_shortest_path(
-            duration_data.matrix,
-            directed=True,
-            indices=start_index,
-            return_predecessors=False,
-            unweighted=False,
-            method="D",
-        )
-        reverse = _scipy_shortest_path(
-            duration_data.matrix.transpose(),
-            directed=True,
-            indices=goal_index,
-            return_predecessors=False,
-            unweighted=False,
-            method="D",
-        )
-        total_duration = float(forward[goal_index])
-        if not math.isfinite(total_duration):
-            return None
-        row_lengths = np.diff(topology.indptr)
-        source_indices = np.repeat(
-            np.arange(len(topology.node_ids), dtype=np.int64), row_lengths
-        )
-        target_indices = topology.indices
-        prefix = forward[source_indices] + duration_data.weights
-        suffix = reverse[target_indices]
-        residual = np.abs(prefix + suffix - total_duration)
-        scale = np.maximum(
-            1.0,
-            np.maximum(np.abs(prefix + suffix), abs(total_duration)),
-        )
-        shortest_mask = (
-            np.isfinite(prefix)
-            & np.isfinite(suffix)
-            & (
-                residual <= np.maximum(1e-12, 1e-12 * scale)
-            )
-        )
-        if avoid_highways:
-            shortest_mask &= ~topology.highway_mask
-        if not shortest_mask.any():
-            return None
-        distance = topology.distance_km
-        reward = distance * np.minimum(np.maximum(topology.scenic_score, 0.0), 10.0)
-        duration = topology.travel_time_minutes
-        ratio = 0.0
-        best_path: Optional[List[Edge]] = None
-        for _ in range(12):
-            transformed = np.full_like(duration, np.inf, dtype=np.float64)
-            active = shortest_mask & np.isfinite(distance) & (distance >= 0.0)
-            valid_duration = active & np.isfinite(duration) & (duration > 0.0)
-            shift = 0.0
-            if valid_duration.any():
-                shift = float(
-                    np.max(
-                        np.maximum(
-                            0.0,
-                            (reward[valid_duration] - ratio * distance[valid_duration])
-                            / duration[valid_duration],
-                        )
-                    )
-                )
-            transformed[active] = (
-                shift * duration[active]
-                + ratio * distance[active]
-                - reward[active]
-            )
-            transformed[active] = np.maximum(transformed[active], 0.0)
-            candidate = self._compiled_weighted_path(
-                topology, start_index, goal_index, transformed
-            )
-            if candidate is None:
-                return best_path
-            candidate_score = distance_weighted_scenic_score(candidate)
-            if best_path is not None and abs(candidate_score - ratio) <= 1e-10:
-                best_path = candidate
-                break
-            best_path = candidate
-            ratio = candidate_score
-        return best_path
     def _csr_topology(
         self,
         *,
@@ -1144,31 +881,24 @@ class ScenicRoutePlanner:
         ):
             weights = topology.travel_time_minutes.copy()
         else:
-            def finite_nonnegative(value: object) -> float:
-                try:
-                    number = float(value)
-                except (TypeError, ValueError, OverflowError):
-                    return 0.0
-                return number if math.isfinite(number) and number >= 0.0 else 0.0
-
-            scenic_weight = finite_nonnegative(signature[0])
-            travel_weight = finite_nonnegative(signature[3])
-            scenic_reward = finite_nonnegative(signature[4])
-            highway_penalty = finite_nonnegative(signature[5])
-            byway_bonus = min(finite_nonnegative(signature[6]), 0.5)
+            scenic_weight = float(signature[0])
+            travel_weight = float(signature[3])
+            scenic_reward = float(signature[4])
+            highway_penalty = float(signature[5])
+            byway_bonus = float(signature[6])
             duration = topology.travel_time_minutes
             scenic_score = np.minimum(
                 np.maximum(np.nan_to_num(topology.scenic_score, nan=0.0), 0.0),
                 10.0,
             )
-            weighted_base = (
-                (1.0 - scenic_weight) * duration * travel_weight
-                + scenic_weight
-                * duration
-                * (10.0 - scenic_score)
-                / 10.0
-                * scenic_reward
-            )
+            with np.errstate(over="ignore", invalid="ignore"):
+                weighted_base = np.zeros_like(duration)
+                if scenic_weight < 1.0 and travel_weight > 0.0:
+                    weighted_base = (1.0 - scenic_weight) * (duration * travel_weight)
+                if scenic_weight > 0.0 and scenic_reward > 0.0:
+                    weighted_base += scenic_weight * (
+                        duration * ((10.0 - scenic_score) / 10.0) * scenic_reward
+                    )
             base = np.maximum(weighted_base, 1e-6 * duration)
             base = np.where(
                 topology.scenic_byway_mask,
@@ -1190,7 +920,7 @@ class ScenicRoutePlanner:
             weights = np.where(
                 np.isfinite(raw),
                 np.maximum(raw, 1e-6),
-                np.where(raw > 0.0, np.finfo(np.float64).max, 1e-6),
+                np.finfo(np.float64).max,
             )
         weights = np.asarray(weights, dtype=np.float64)
         weights[blocked] = np.inf
@@ -1689,6 +1419,7 @@ class ScenicRoutePlanner:
         request-local (endpoint) edge costs; ``cost_limit`` prunes every label
         whose partial cost already exceeds the bound (weights are nonnegative).
         """
+        cost_limit = validate_cost_limit(cost_limit)
         graph = self.graph
         assert graph is not None
         active_stamp = graph._heuristic_cache_stamp()
@@ -1762,9 +1493,15 @@ class ScenicRoutePlanner:
                 return self._validated_nonnegative(
                     local_cost_override(traversed), "edge calculated cost"
                 )
-            return self._validated_nonnegative(
+            cost = self._validated_nonnegative(
                 cost_function.calculate(traversed), "edge calculated cost"
             )
+            if lagrangian_multiplier > 0.0:
+                cost = self._validated_nonnegative(
+                    cost + lagrangian_multiplier * self._edge_duration_minutes(traversed),
+                    "edge calculated cost",
+                )
+            return cost
 
         def base_cost(position: int) -> float:
             if base_weight_override is not None:
@@ -1772,14 +1509,20 @@ class ScenicRoutePlanner:
                 # caller exactly like the cached weights-array path.
                 return float(base_weight_override(position))
             if weights is not None:
-                return float(weights[position])
+                cost = float(weights[position])
+                if math.isfinite(cost) and lagrangian_multiplier > 0.0:
+                    cost = self._validated_nonnegative(
+                        cost + lagrangian_multiplier * float(topology.travel_time_minutes[position]),
+                        "edge calculated cost",
+                    )
+                return cost
             edge_id, reverse = topology.edge_refs[position]
             edge = topology_graph.edges[edge_id]
             if self._avoids_highways(cost_function) and is_highway_road_type(
                 edge.road_type
             ):
                 return float("inf")
-            return self._validated_nonnegative(
+            cost = self._validated_nonnegative(
                 cost_function.calculate(
                     self._edge_from_reverse_index(edge_id, reverse)
                     if reverse
@@ -1787,6 +1530,12 @@ class ScenicRoutePlanner:
                 ),
                 "edge calculated cost",
             )
+            if lagrangian_multiplier > 0.0:
+                cost = self._validated_nonnegative(
+                    cost + lagrangian_multiplier * self._edge_duration_minutes(edge),
+                    "edge calculated cost",
+                )
+            return cost
 
         def forward_steps(
             node_id: str,
@@ -1936,6 +1685,7 @@ class ScenicRoutePlanner:
         if compact_rank_keys:
             empty_path_key = None
         for node_id, cost, rank, seed_edge in forward_seeds:
+            cost = self._validated_nonnegative(cost, "cumulative calculated cost")
             if cost_limit is not None and cost > cost_limit:
                 continue
             add_label(
@@ -1949,6 +1699,7 @@ class ScenicRoutePlanner:
                 rank,
             )
         for node_id, cost, rank, seed_edge in reverse_seeds:
+            cost = self._validated_nonnegative(cost, "cumulative calculated cost")
             if cost_limit is not None and cost > cost_limit:
                 continue
             add_label(
@@ -1969,6 +1720,12 @@ class ScenicRoutePlanner:
             nonlocal best
             forward = labels["f"][forward_id]
             reverse = labels["r"][reverse_id]
+            total_cost = self._validated_nonnegative(
+                float(forward["cost"]) + float(reverse["cost"]),
+                "cumulative calculated cost",
+            )
+            if cost_limit is not None and total_cost > cost_limit:
+                return
             middle_key = path_tokens(forward["key"][1]) + path_tokens(
                 reverse["key"][1]
             )
@@ -1980,7 +1737,7 @@ class ScenicRoutePlanner:
                 else (middle_key,)
             )
             candidate = (
-                float(forward["cost"]) + float(reverse["cost"]),
+                total_cost,
                 forward_id,
                 reverse_id,
                 rank_key,

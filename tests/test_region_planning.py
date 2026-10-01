@@ -626,15 +626,22 @@ def test_schema_and_per_coordinate_metadata(tmp_path: Path) -> None:
         )
 
 
-def test_builtin_spec_structure_and_missing_file_blocker() -> None:
+def test_builtin_spec_structure_and_missing_file_blocker(tmp_path: Path) -> None:
     spec = get_builtin_region_spec()
     assert spec["version"] == 1
     assert "bbox-only" not in spec["geographic_source"]
     assert len(spec["regions"]) >= 2
 
-    # Calling parse_and_validate_region_spec when boundary file is missing must raise FileNotFoundError
+    app_regions = tmp_path / "app_regions.json"
+    app_regions.write_text(
+        json.dumps(
+            {"regions": [{"region": "new_england_north", "bbox": spec["regions"][0]["bbox"]}]}
+        ),
+        encoding="utf-8",
+    )
+    spec["regions"][1]["geometry_file"] = str(tmp_path / "missing-boundary.geojson")
     with pytest.raises(FileNotFoundError, match="Authoritative boundary file"):
-        parse_and_validate_region_spec(spec)
+        parse_and_validate_region_spec(spec, app_regions_path=app_regions)
 
 
 def test_pinned_jurisdiction_land_intersection_records_audit_metrics(
