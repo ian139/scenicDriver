@@ -6,7 +6,7 @@
 <rect x="0.0" y="0.0" width="1200.0" height="720.0" rx="0.0" fill="#fffdf8" stroke="none" />
 <g aria-label="Research figure">
 <text x="64.0" y="66.0" text-anchor="start" style="font-family:Georgia, 'Times New Roman', serif;font-size:29px;font-weight:bold;fill:#1f2933;">Bounded autoresearch loop</text>
-<text x="64.0" y="96.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:15px;font-weight:normal;fill:#52616b;">One immutable baseline, eleven measured candidates, and a fixed stop condition.</text>
+<text x="64.0" y="96.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:15px;font-weight:normal;fill:#52616b;">1 immutable baseline, 11 measured candidates, and a cap of 11.</text>
 <line x1="64.0" y1="116.0" x2="1136.0" y2="116.0" stroke="#c8c4ba" stroke-width="1.5"/>
 <circle cx="156.0" cy="260.0" r="50.0" fill="#f7f5ef" stroke="#315b7d" stroke-width="4"/>
 <text x="156.0" y="253.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:21px;font-weight:bold;fill:#315b7d;">1</text>
@@ -35,9 +35,9 @@
 <rect x="150.0" y="430.0" width="900.0" height="150.0" rx="6.0" fill="#f7f5ef" stroke="#c8c4ba" />
 <line x1="730.0" y1="448.0" x2="730.0" y2="562.0" stroke="#c8c4ba" stroke-width="1.5"/>
 <text x="180.0" y="463.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:bold;fill:#287271;">ACCEPTANCE RECORD</text>
-<text x="180.0" y="496.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:17px;font-weight:bold;fill:#1f2933;">Retained: two native workers, 62.682 s isolated median</text>
-<text x="180.0" y="524.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:15px;font-weight:normal;fill:#1f2933;">18.03% below the fresh 76.470 s baseline</text>
-<text x="180.0" y="552.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">Timeouts are deadline outcomes; rejected source was removed.</text>
+<text x="180.0" y="496.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:17px;font-weight:bold;fill:#1f2933;">Retained: Two native workers, 62.682 s isolated median</text>
+<text x="180.0" y="524.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:15px;font-weight:normal;fill:#1f2933;">18.03% lower than the fresh 76.47 s baseline</text>
+<text x="180.0" y="552.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">Timeouts are deadline outcomes, not measured latencies.</text>
 <text x="1020.0" y="463.0" text-anchor="end" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:bold;fill:#b85c38;">STOP CONDITION</text>
 <text x="1020.0" y="496.0" text-anchor="end" style="font-family:Arial, Helvetica, sans-serif;font-size:17px;font-weight:bold;fill:#1f2933;">1 baseline + 11 candidates</text>
 <text x="1020.0" y="524.0" text-anchor="end" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">uncached median target &lt; 20 s</text>

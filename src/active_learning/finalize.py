@@ -167,18 +167,13 @@ def _registry_checkpoint_candidates(
 ) -> list[Path]:
     """Ordered candidate locations for a stored registry checkpoint.
 
-    The value itself (absolute or working-directory-relative), then relative to
-    the registry directory (checkpoints/<sha>.pt), then project-root-relative
-    (models/...) against the working directory.
+    Published checkpoint paths resolve relative to the registry first. A
+    working-directory-relative project path is only a fallback.
     """
     checkpoint_value = Path(raw_checkpoint)
-    candidates = [checkpoint_value]
-    if not checkpoint_value.is_absolute():
-        candidates += [
-            registry_path.parent / checkpoint_value,
-            Path.cwd() / checkpoint_value,
-        ]
-    return candidates
+    if checkpoint_value.is_absolute():
+        return [checkpoint_value]
+    return [registry_path.parent / checkpoint_value, Path.cwd() / checkpoint_value]
 
 
 def _resolve_registry_checkpoint(
@@ -587,10 +582,47 @@ def _validate_human_table(
         )
         return False, len(frame)
     sources = frame["label_source"].astype(str).str.strip().str.lower()
+    identities = frame["image_path"].astype(str).str.strip()
+    scores = pd.to_numeric(frame["scenic_score"], errors="coerce")
+    if frame["image_path"].isna().any() or identities.eq("").any() or identities.duplicated().any():
+        blockers.append("mixed-label CSV has empty or duplicate image identities")
+        valid = False
+    if not np.isfinite(scores.to_numpy(dtype=float)).all() or not scores.between(0, 10).all():
+        blockers.append("mixed-label CSV scenic_score must be finite and in [0, 10]")
+        valid = False
+    if frame["label_source"].isna().any() or sources.eq("").any():
+        blockers.append("mixed-label CSV lacks explicit label provenance")
+        valid = False
     if not sources.eq("human_override").any():
         blockers.append("mixed-label CSV contains no human_override provenance")
         valid = False
     return bool(valid), len(frame)
+
+
+def _validate_mixed_consumption(
+    paths: Mapping[str, Path | None], blockers: list[str]
+) -> bool:
+    """Use the training consumer's identity, coverage and target precedence rules."""
+    from src.scenic_scorer.active_training import (
+        _candidate_identity, _mixed_label_targets, _read_filtered_indices,
+    )
+
+    try:
+        required = ("candidate_pool", "filtered_index", "mixed_labels", "absolute_annotations")
+        if any(paths.get(key) is None or not paths[key].is_file() for key in required):
+            raise ValueError("missing mixed-label consuming artifacts")
+        candidate = pd.read_csv(paths["candidate_pool"], low_memory=False)
+        all_paths = _candidate_identity(candidate)
+        selected = _read_filtered_indices(paths["filtered_index"], candidate)
+        selected_paths = [all_paths[index] for index in selected]
+        _mixed_label_targets(
+            paths["mixed_labels"], paths["absolute_annotations"], candidate,
+            selected, selected_paths, all_paths,
+        )
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        blockers.append(f"mixed-label consuming contract invalid: {exc}")
+        return False
+    return True
 
 
 def _validate_benchmark_pre_dataset(
@@ -917,7 +949,7 @@ def _validate_scoring_artifacts(
     root: Path,
     blockers: list[str],
 ) -> tuple[bool, int, int]:
-    """Validate the selector handoff table, dense arrays, and their hashes."""
+    """Admit scored rows and explicit successful exclusions with full Stage Two arrays."""
     blocker_start = len(blockers)
 
     candidate, error = _read_csv(candidate_path)
@@ -965,8 +997,27 @@ def _validate_scoring_artifacts(
     )
     if not bool(scored.any()):
         blockers.append("candidate pool contains no successfully scored rows")
-    if bool(scored.any()) and not bool(scored.all()):
-        blockers.append("candidate pool contains unscored or failed rows")
+    excluded = (
+        candidate["score_status"].astype(str).str.lower().eq("unusable")
+        if "score_status" in candidate
+        else pd.Series(False, index=candidate.index)
+    )
+    valid_exclusions = pd.Series(False, index=candidate.index)
+    if excluded.any():
+        exclusion_columns = {"unusable_reason", "water_filter_status", "availability_state", "error", "selector_eligible"}
+        if not exclusion_columns.issubset(candidate.columns):
+            blockers.append("unusable candidate rows lack explicit successful exclusion evidence")
+        else:
+            valid_exclusions = (
+                excluded
+                & candidate["unusable_reason"].eq("excessive_water")
+                & candidate["water_filter_status"].eq("excessive_water")
+                & candidate["availability_state"].eq("unusable")
+                & ~candidate["selector_eligible"].map(_bool)
+                & (candidate["error"].isna() | candidate["error"].astype(str).str.strip().eq(""))
+            )
+    if not (scored | valid_exclusions).all():
+        blockers.append("candidate pool contains unscored, failed, or invalid exclusion rows")
     if "regression_prediction" in candidate and not bool(
         pd.to_numeric(candidate.loc[scored, "regression_prediction"], errors="coerce")
         .notna()
@@ -975,39 +1026,24 @@ def _validate_scoring_artifacts(
         blockers.append("candidate pool contains no active regression predictions")
     row_indices: np.ndarray | None = None
     try:
-        with np.load(embedding_path, allow_pickle=False) as arrays:
-            if "embeddings" not in arrays or "row_indices" not in arrays:
-                blockers.append(
-                    "feature embeddings NPZ lacks embeddings/row_indices arrays"
-                )
-                embedding_rows = 0
-            else:
-                embeddings = np.asarray(arrays["embeddings"])
-                row_indices = np.asarray(arrays["row_indices"])
-                assert row_indices is not None
-                embedding_rows = int(len(embeddings))
-                if (
-                    embeddings.ndim != 2
-                    or embedding_rows <= 0
-                    or embeddings.shape[1] <= 0
-                ):
-                    blockers.append(
-                        "feature embeddings NPZ embeddings array is empty or not 2-D"
-                    )
-                if (
-                    row_indices.ndim != 1
-                    or len(row_indices) != embedding_rows
-                    or not np.issubdtype(row_indices.dtype, np.integer)
-                    or len(np.unique(row_indices)) != len(row_indices)
-                ):
-                    blockers.append("feature embeddings NPZ row_indices are invalid")
-                if (
-                    not np.issubdtype(embeddings.dtype, np.number)
-                    or not np.isfinite(embeddings).all()
-                ):
-                    blockers.append(
-                        "feature embeddings NPZ embeddings are not finite numeric values"
-                    )
+        from src.scenic_scorer.active_training import _read_feature_arrays
+
+        arrays = _read_feature_arrays(embedding_path)
+        embeddings = arrays["embeddings"]
+        row_indices = arrays["row_indices"]
+        embedding_rows = len(embeddings)
+        if embedding_rows <= 0 or embedding_rows != int(scored.sum()):
+            blockers.append("feature embeddings NPZ must contain exactly the scored rows")
+        if np.any(row_indices < 0) or np.any(row_indices >= len(candidate)):
+            blockers.append("feature embeddings NPZ row_indices are outside candidate pool")
+        probabilities = arrays["class_probs"]
+        if probabilities.shape != arrays["class_logits"].shape:
+            blockers.append("feature embeddings NPZ class_probs/logits shape mismatch")
+        elif (
+            np.any(probabilities < 0) or np.any(probabilities > 1)
+            or not np.allclose(probabilities.sum(axis=1), 1.0, rtol=0.0, atol=1e-5)
+        ):
+            blockers.append("feature embeddings NPZ class_probs are not probability distributions")
     except (OSError, ValueError, TypeError) as exc:
         blockers.append(f"invalid feature embeddings NPZ: {exc}")
         embedding_rows = 0
@@ -1053,12 +1089,14 @@ def _validate_scoring_artifacts(
             scored_rows = int(counts["scored_rows"])
             missing_rows = int(counts["missing_rows"])
             error_rows = int(counts["error_rows"])
+            unusable_rows = int(counts.get("unusable_rows", 0))
         except (KeyError, TypeError, ValueError, OverflowError):
             blockers.append("scoring manifest contains invalid counts")
         else:
             if (
                 manifest_rows != len(candidate)
                 or scored_rows != int(scored.sum())
+                or unusable_rows != int(valid_exclusions.sum())
                 or missing_rows != 0
                 or error_rows != 0
             ):
@@ -1489,7 +1527,7 @@ def finalize_stage1(
         if (
             candidate_frame is not None
             and annotation_frame is not None
-            and "image_path" in candidate_frame
+            and {"image_path", "score_status", "selector_eligible"}.issubset(candidate_frame.columns)
             and set(ABSOLUTE_COLUMNS).issubset(annotation_frame.columns)
         ):
             annotation_scores = pd.to_numeric(
@@ -1517,7 +1555,9 @@ def finalize_stage1(
                 .map(_stable_identity)
             )
             filtered = candidate_frame.reset_index(names="candidate_row_index").loc[
-                ~candidate_identities.isin(skipped_identities),
+                ~candidate_identities.isin(skipped_identities)
+                & candidate_frame["score_status"].astype(str).str.lower().eq("scored")
+                & candidate_frame["selector_eligible"].map(_bool),
                 ["candidate_row_index", "image_path"],
             ]
             if filtered.empty:
@@ -1624,6 +1664,7 @@ def finalize_stage1(
         blockers,
     )
     mixed_ok, mixed_rows = _validate_human_table(paths["mixed_labels"], blockers)
+    mixed_consumption_ok = _validate_mixed_consumption(paths, blockers)
     registry_ok, baseline = _validate_registry(
         paths["baseline_registry"]
         or Path("data/processed/regression/model_registry.json"),
@@ -1655,6 +1696,7 @@ def finalize_stage1(
         "scoring_valid": bool(scoring_ok),
         "annotations_valid": bool(batch_ok and annotation_ok),
         "splits_valid": bool(split_ok),
+        "mixed_labels_valid": bool(mixed_ok and mixed_consumption_ok),
         "benchmark_valid": bool(
             benchmark_ok
             and benchmark_dataset_ok

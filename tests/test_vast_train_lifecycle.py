@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -8,73 +9,44 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.remote import cmux_vast_host, vast_train
+from scripts.remote import vast_train
 from src.scenic_scorer.regression import ScenicRegressionModel
 
 
-def make_config(**overrides: object) -> vast_train.VastTrainConfig:
-    values: dict[str, object] = {
-        "task_name": "scenic-train-smoke",
-        "run_id": "run-123",
-        "train_dataset_key": "processed/regression/smoke/tiny_features.npz",
-        "s3_bucket": "scenicdriver-data",
-        "s3_data_prefix": "processed/regression/smoke/",
-        "s3_models_prefix": "models/smoke/",
-        "validation_checkpoint_key": "models/smoke/tiny_regression.pt",
-        "s3_output_prefix": "outputs/vast/run-123/",
-        "image": vast_train.DEFAULT_IMAGE,
-        "offer_query": vast_train.DEFAULT_OFFER_QUERY,
-        "offer_id": None,
-        "disk_gb": 64,
-        "allocation_attempts": 1,
-        "identity_file": "~/.ssh/id_ed25519",
-        "ssh_public_key": "~/.ssh/id_ed25519.pub",
-        "local_secrets_env_file": ".secrets/aws.env",
-        "remote_env_file": vast_train.DEFAULT_REMOTE_ENV_FILE,
-        "timeout_seconds": 1800,
-        "poll_seconds": 30,
-        "epochs": 40,
-        "batch_size": 128,
-        "lr": 1e-3,
-        "val_split": 0.15,
-        "seed": 42,
-        "destroy": True,
-        "keep_on_failure": False,
-    }
-    values.update(overrides)
-    return vast_train.VastTrainConfig(**values)
-
-
-def parse_run_args(tmp_path: Path, *extra: str) -> object:
+def run_argv(tmp_path: Path, *extra: str) -> list[str]:
     identity = tmp_path / "id_ed25519"
     public_key = tmp_path / "id_ed25519.pub"
     secrets = tmp_path / "aws.env"
     identity.write_text("private", encoding="utf-8")
     public_key.write_text("public", encoding="utf-8")
     secrets.write_text("AWS_ACCESS_KEY_ID=x\nAWS_SECRET_ACCESS_KEY=y\n", encoding="utf-8")
-    return vast_train.build_parser().parse_args(
-        [
-            "run",
-            "scenic-train-smoke",
-            "--train-dataset-key",
-            "processed/regression/smoke/tiny_features.npz",
-            "--s3-bucket",
-            "scenicdriver-data",
-            "--identity-file",
-            str(identity),
-            "--ssh-public-key",
-            str(public_key),
-            "--local-secrets-env-file",
-            str(secrets),
-            "--allocation-attempts",
-            "1",
-            "--timeout-seconds",
-            "1",
-            "--poll-seconds",
-            "1",
-            *extra,
-        ]
-    )
+    return [
+        "run",
+        "scenic-train-smoke",
+        "--train-dataset-key",
+        "processed/regression/smoke/tiny_features.npz",
+        "--benchmark-split-key",
+        "processed/benchmark/smoke/benchmark_split.csv",
+        "--s3-bucket",
+        "scenicdriver-data",
+        "--identity-file",
+        str(identity),
+        "--ssh-public-key",
+        str(public_key),
+        "--local-secrets-env-file",
+        str(secrets),
+        "--allocation-attempts",
+        "1",
+        "--timeout-seconds",
+        "1",
+        "--poll-seconds",
+        "1",
+        *extra,
+    ]
+
+
+def parse_run_args(tmp_path: Path, *extra: str) -> object:
+    return vast_train.build_parser().parse_args(run_argv(tmp_path, *extra))
 
 
 def patch_successful_allocation(
@@ -129,6 +101,22 @@ def test_train_run_requires_exact_dataset_key() -> None:
         vast_train.build_parser().parse_args(["run", "scenic-train-smoke"])
 
 
+def test_train_run_requires_explicit_benchmark_split_key() -> None:
+    with pytest.raises(SystemExit):
+        vast_train.build_parser().parse_args(
+            ["run", "scenic-train-smoke", "--train-dataset-key", "processed/regression/smoke/tiny_features.npz"]
+        )
+
+
+def test_train_run_rejects_blank_benchmark_split_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    args = parse_run_args(tmp_path, "--benchmark-split-key", " ")
+    monkeypatch.setattr(vast_train, "state_path", lambda task_name: tmp_path / "absent.json")
+    monkeypatch.setattr(vast_train, "require_commands", lambda required: None)
+
+    with pytest.raises(SystemExit, match="--benchmark-split-key is required"):
+        vast_train._check_run_preconditions(vast_train._config_from_args(args))
+
+
 def test_train_run_requires_dataset_key_under_data_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     args = parse_run_args(
         tmp_path,
@@ -158,71 +146,6 @@ def test_train_run_requires_checkpoint_key_under_models_prefix(tmp_path: Path, m
     with pytest.raises(SystemExit, match="--validation-checkpoint-key must be under --s3-models-prefix"):
         vast_train._check_run_preconditions(vast_train._config_from_args(args))
 
-
-def test_remote_training_script_runs_validation_before_training() -> None:
-    script = vast_train.build_remote_training_script(make_config())
-
-    validation_index = script.index("python scripts/remote/vast_train.py validate")
-    training_index = script.index("python scripts/modeling/train_regression_baseline.py")
-
-    assert validation_index < training_index
-
-
-def test_remote_training_script_writes_sentinels_and_uploads_outputs() -> None:
-    script = vast_train.build_remote_training_script(make_config())
-
-    required_snippets = [
-        "started.json",
-        "done.json",
-        "failed.json",
-        "exit_code.txt",
-        "python scripts/remote/vast_train.py validate",
-        "export SCENIC_DATASET_PATH=/workspace/data/processed/regression/tiny_features.npz",
-        "export SCENIC_CHECKPOINT_PATH=/workspace/models/tiny_regression.pt",
-    ]
-    for snippet in required_snippets:
-        assert snippet in script
-
-
-def test_remote_training_script_escapes_python_newline_literal() -> None:
-    script = vast_train.build_remote_training_script(make_config())
-
-    assert r'handle.write("\n")' in script
-    assert 'handle.write("\n")' not in script
-
-
-def test_cli_config_drives_validation_artifact_exports(tmp_path: Path) -> None:
-    args = parse_run_args(
-        tmp_path,
-        "--s3-data-prefix",
-        "processed/regression/custom/",
-        "--s3-models-prefix",
-        "models/custom/",
-        "--train-dataset-key",
-        "processed/regression/custom/features_v6.npz",
-        "--validation-checkpoint-key",
-        "models/custom/scenic_regression_v4.pt",
-    )
-
-    script = vast_train.build_remote_training_script(vast_train._config_from_args(args))
-
-    assert "export SCENIC_DATASET_PATH=/workspace/data/processed/regression/features_v6.npz" in script
-    assert "export SCENIC_CHECKPOINT_PATH=/workspace/models/scenic_regression_v4.pt" in script
-
-
-def test_training_statuses_are_accepted_by_shared_state_loader() -> None:
-    emitted_statuses = {
-        "provisioning",
-        "training_running",
-        "copying_artifacts",
-        "destroying",
-        "completed_kept",
-        "failed_destroyed",
-        "failed_kept",
-        "destroyed",
-    }
-
-    assert emitted_statuses <= cmux_vast_host.VALID_STATUSES
 
 
 def test_failed_kept_state_is_not_reused_without_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -260,11 +183,12 @@ def test_train_run_no_destroy_still_destroys_bootstrap_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A confirmed-never-launched allocation is disposable even under --no-destroy."""
     commands, writes = patch_successful_allocation(monkeypatch, tmp_path, poll_status="done")
     monkeypatch.setattr(
         vast_train,
-        "launch_remote_training",
-        lambda target, state, script: (_ for _ in ()).throw(RuntimeError("launch failed")),
+        "copy_secrets",
+        lambda target, local_path, remote_path: (_ for _ in ()).throw(RuntimeError("bootstrap failed")),
     )
     args = parse_run_args(tmp_path, "--no-destroy")
 
@@ -272,6 +196,99 @@ def test_train_run_no_destroy_still_destroys_bootstrap_failure(
 
     assert ["vastai", "destroy", "instance", "12345", "--yes"] in commands
     assert writes[-1]["status"] == "failed_destroyed"
+    assert writes[-1].get("launch_attempted") is not True
+
+
+def test_launch_attempted_is_persisted_before_remote_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands, writes = patch_successful_allocation(monkeypatch, tmp_path, poll_status="done")
+    observed: dict[str, object] = {}
+
+    def observe_launch(target: object, state: dict, script: str) -> None:
+        observed["state_flag"] = state.get("launch_attempted")
+        observed["persisted"] = bool(writes) and writes[-1].get("launch_attempted") is True
+
+    monkeypatch.setattr(vast_train, "launch_remote_training", observe_launch)
+    args = parse_run_args(tmp_path)
+
+    assert vast_train.handle_run(args) == 0
+
+    assert observed == {"state_flag": True, "persisted": True}
+    assert any(write.get("launch_outcome") == "launched" for write in writes)
+    assert writes[-1]["status"] == "destroyed"
+
+
+@pytest.mark.parametrize("flags", [[], ["--keep-on-failure"], ["--no-destroy"]])
+def test_raised_after_launch_retains_host_under_every_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    flags: list[str],
+) -> None:
+    """An unacknowledged launch is ambiguous: training may be running, so the host is retained."""
+    commands, writes = patch_successful_allocation(monkeypatch, tmp_path, poll_status="done")
+    monkeypatch.setattr(
+        vast_train,
+        "launch_remote_training",
+        lambda target, state, script: (_ for _ in ()).throw(RuntimeError("ssh ack lost")),
+    )
+    args = parse_run_args(tmp_path, *flags)
+
+    assert vast_train.handle_run(args) == 1
+
+    assert ["vastai", "destroy", "instance", "12345", "--yes"] not in commands
+    assert writes[-1]["status"] == "failed_kept"
+    assert writes[-1]["launch_attempted"] is True
+    assert writes[-1]["launch_outcome"] == "unknown"
+    assert "Launch outcome unknown" in capsys.readouterr().err
+
+
+def test_ambiguous_launch_never_rents_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands, writes = patch_successful_allocation(monkeypatch, tmp_path, poll_status="done")
+    creations: list[int] = []
+    monkeypatch.setattr(
+        vast_train,
+        "create_instance",
+        lambda offer_id, image, disk_gb: creations.append(offer_id) or 12345,
+    )
+    monkeypatch.setattr(
+        vast_train,
+        "launch_remote_training",
+        lambda target, state, script: (_ for _ in ()).throw(RuntimeError("ssh ack lost")),
+    )
+    args = parse_run_args(tmp_path, "--allocation-attempts", "2")
+
+    assert vast_train.handle_run(args) == 1
+
+    assert len(creations) == 1
+    assert ["vastai", "destroy", "instance", "12345", "--yes"] not in commands
+    assert writes[-1]["launch_outcome"] == "unknown"
+
+
+def test_interrupt_during_launch_retains_host_even_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands, writes = patch_successful_allocation(monkeypatch, tmp_path, poll_status="done")
+
+    def interrupt(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(vast_train, "launch_remote_training", interrupt)
+    args = parse_run_args(tmp_path)
+
+    with pytest.raises(KeyboardInterrupt):
+        vast_train.handle_run(args)
+
+    assert ["vastai", "destroy", "instance", "12345", "--yes"] not in commands
+    assert writes[-1]["status"] == "failed_kept"
+    assert writes[-1]["launch_attempted"] is True
+    assert writes[-1]["launch_outcome"] == "unknown"
 
 
 def test_train_cleanup_uses_recorded_instance_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -309,18 +326,6 @@ def test_train_cleanup_uses_recorded_instance_id(tmp_path: Path, monkeypatch: py
 
     assert ["copy-artifacts"] in commands
     assert ["vastai", "destroy", "instance", "12345", "--yes"] in commands
-
-
-
-def test_remote_training_script_downloads_validation_inputs_before_validate() -> None:
-    script = vast_train.build_remote_training_script(make_config())
-
-    dataset_index = script.index('--dest "$SCENIC_DATASET_PATH"')
-    checkpoint_index = script.index('--dest "$SCENIC_CHECKPOINT_PATH"')
-    validation_index = script.index("python scripts/remote/vast_train.py validate")
-
-    assert dataset_index < validation_index
-    assert checkpoint_index < validation_index
 
 
 def _write_validation_fixture(tmp_path: Path, *, compatible: bool = True) -> tuple[Path, Path]:
@@ -442,3 +447,139 @@ def test_validate_rejects_corrupt_checkpoint(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="corrupt or unreadable checkpoint"):
         vast_train.handle_validate(args)
+
+
+def test_validate_refuses_malicious_pickle_without_executing_it(tmp_path: Path) -> None:
+    _, dataset = _write_validation_fixture(tmp_path)
+    marker = tmp_path / "pwned"
+
+    class Exploit:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (os.mkdir, (str(marker),))
+
+    checkpoint = tmp_path / "malicious.pt"
+    torch.save({"model_state_dict": Exploit(), "vit_dim": 3, "terrain_dim": 2, "num_classes": 4}, checkpoint)
+    args = vast_train.build_parser().parse_args(
+        ["validate", "--device", "cpu", "--checkpoint", str(checkpoint), "--dataset", str(dataset)]
+    )
+
+    with pytest.raises(ValueError, match="corrupt or unreadable checkpoint"):
+        vast_train.handle_validate(args)
+    assert not marker.exists()
+
+
+def _fail_remote_copy_with_false(target: object, remote: str, local: Path, *, required: bool) -> bool:
+    return False
+
+
+def _fail_remote_copy_with_oserror(target: object, remote: str, local: Path, *, required: bool) -> bool:
+    raise OSError("scp transport broke")
+
+
+@pytest.mark.parametrize("copy_remote_path", [_fail_remote_copy_with_false, _fail_remote_copy_with_oserror])
+def test_completed_training_keeps_host_when_required_artifact_recovery_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    copy_remote_path: object,
+) -> None:
+    real_copy_training_artifacts = vast_train.copy_training_artifacts
+    commands, writes = patch_successful_allocation(monkeypatch, tmp_path, poll_status="done")
+    monkeypatch.setattr(vast_train, "copy_training_artifacts", real_copy_training_artifacts)
+    monkeypatch.setattr(vast_train, "copy_remote_path", copy_remote_path)
+    args = parse_run_args(tmp_path)
+
+    assert vast_train.handle_run(args) == 1
+
+    assert ["vastai", "destroy", "instance", "12345", "--yes"] not in commands
+    assert writes[-1]["status"] == "failed_kept"
+    assert "artifact recovery failed" in writes[-1]["error"]
+
+
+def test_failed_training_still_destroys_when_best_effort_copy_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_copy_training_artifacts = vast_train.copy_training_artifacts
+    commands, writes = patch_successful_allocation(monkeypatch, tmp_path, poll_status="failed")
+    monkeypatch.setattr(vast_train, "copy_training_artifacts", real_copy_training_artifacts)
+    monkeypatch.setattr(vast_train, "copy_remote_path", _fail_remote_copy_with_oserror)
+    args = parse_run_args(tmp_path)
+
+    assert vast_train.handle_run(args) == 1
+
+    assert ["vastai", "destroy", "instance", "12345", "--yes"] in commands
+    assert writes[-1]["status"] == "failed_destroyed"
+    assert "scp transport broke" in writes[-1]["artifact_copy_error"]
+
+
+@pytest.mark.parametrize("phase", ["provisioning", "polling"])
+@pytest.mark.parametrize(
+    ("flags", "retained"),
+    [([], False), (["--keep-on-failure"], True), (["--no-destroy"], True)],
+)
+def test_interrupt_applies_retention_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    flags: list[str],
+    retained: bool,
+) -> None:
+    commands, writes = patch_successful_allocation(monkeypatch, tmp_path, poll_status="done")
+
+    def interrupt(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(vast_train, "wait_for_ssh" if phase == "provisioning" else "poll_remote_training", interrupt)
+    args = parse_run_args(tmp_path, *flags)
+
+    with pytest.raises(KeyboardInterrupt):
+        vast_train.handle_run(args)
+
+    destroyed = ["vastai", "destroy", "instance", "12345", "--yes"] in commands
+    assert destroyed is not retained
+    assert writes[-1]["status"] == ("failed_kept" if retained else "failed_destroyed")
+    assert "interrupted" in writes[-1]["error"]
+
+
+def test_cli_returns_130_after_interrupt_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    commands, writes = patch_successful_allocation(monkeypatch, tmp_path, poll_status="done")
+
+    def interrupt(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(vast_train, "poll_remote_training", interrupt)
+
+    assert vast_train.main(run_argv(tmp_path)) == 130
+    assert writes[-1]["status"] == "failed_destroyed"
+
+
+def test_cleanup_does_not_destroy_when_requested_artifact_copy_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+    state = {
+        "task_name": "scenic-train-smoke",
+        "run_id": "run-123",
+        "instance_id": 12345,
+        "ssh_host": "ssh5.vast.ai",
+        "ssh_port": 2222,
+        "identity_file": str(tmp_path / "id_ed25519"),
+        "remote_output_root": "/workspace/scenic_artifacts/vast/run-123",
+        "status": "completed_kept",
+    }
+    monkeypatch.setattr(vast_train, "load_state", lambda task_name: state)
+    monkeypatch.setattr(vast_train, "copy_remote_path", lambda target, remote, local, *, required: False)
+    monkeypatch.setattr(vast_train, "update_status", lambda current, status, **updates: current.update(status=status, **updates))
+
+    def run_command(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(vast_train, "run_command", run_command)
+    args = vast_train.build_parser().parse_args(["cleanup", "scenic-train-smoke", "--copy-artifacts", "--destroy", "--yes"])
+
+    assert vast_train.handle_cleanup(args) == 1
+
+    assert commands == []
+    assert state["status"] == "completed_kept"

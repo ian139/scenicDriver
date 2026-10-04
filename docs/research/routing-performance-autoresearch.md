@@ -363,19 +363,21 @@ stress case failed in the shared run and passed in isolation. Native C compiled
 with `-O3 -shared -fPIC -Wall -Wextra -Werror`. Independent exact-diff review
 passed after verifying cancellation-safe cache publication.
 
-With the ignored production artifacts mounted, reproduce the fixed warm
-request with:
+With the ignored production graph/report artifacts and the original immutable
+`baseline_oracle.json` mounted, reproduce the fixed warm request with:
 
 ```bash
 uv run python scripts/routing/northeast_expanded_autoresearch_benchmark.py \
   --timed-runs 5
 ```
 
-The harness writes its complete local oracle and latest result under
-`data/processed/routing_benchmarks/northeast_expanded_autoresearch/`. Those
-outputs and OMP experiment ledgers are intentionally Git-ignored; the harness,
-artifact hashes, protocol, distributions, and decisions above are the durable
-repository evidence.
+The harness requires the original oracle under
+`data/processed/routing_benchmarks/northeast_expanded_autoresearch/` and writes
+only `latest_result.json` there. It verifies the oracle against the source-pinned
+semantic fingerprint and never creates or self-seeds a replacement from the
+implementation under test. These artifacts are intentionally Git-ignored and
+must be supplied externally; the harness, artifact hashes, protocol,
+distributions, and decisions above are the durable repository evidence.
 
 ### Remaining gate
 

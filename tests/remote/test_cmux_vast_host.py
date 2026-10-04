@@ -31,6 +31,7 @@ def make_up_args(**overrides: object) -> argparse.Namespace:
         "workspace_cwd": "/tmp/scenic-drive",
         "cmux_focus": False,
         "timeout_seconds": 600,
+        "bootstrap_timeout_seconds": 600,
         "bootstrap": "none",
     }
     values.update(overrides)
@@ -41,22 +42,122 @@ def completed(stdout: str = "", returncode: int = 0) -> subprocess.CompletedProc
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
 
 
+@pytest.fixture(autouse=True)
+def isolated_state_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cmux_vast_host, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(cmux_vast_host, "STATE_DIR", tmp_path / ".cmux-vast" / "state")
+    monkeypatch.setattr(cmux_vast_host, "ARTIFACTS_DIR", tmp_path / ".cmux-vast" / "artifacts")
 
 
-def test_ssh_commands_ignore_ephemeral_vast_known_hosts() -> None:
-    target = cmux_vast_host.SshTarget(
+def make_target() -> cmux_vast_host.SshTarget:
+    return cmux_vast_host.SshTarget(
         host="ssh3.vast.ai",
         port=12908,
         user="root",
         identity_file="/tmp/id_ed25519",
     )
 
-    ssh_command = cmux_vast_host.ssh_base(target)
-    scp_command = cmux_vast_host.scp_base(target)
 
-    for command in (ssh_command, scp_command):
-        assert "StrictHostKeyChecking=no" in command
-        assert "UserKnownHostsFile=/dev/null" in command
+class FakeSubprocess:
+    """Records argv and answers ssh/scp like OpenSSH with a given host-key verdict."""
+
+    def __init__(self, *, host_trusted: bool) -> None:
+        self.host_trusted = host_trusted
+        self.commands: list[list[str]] = []
+
+    def __call__(self, command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        self.commands.append(command)
+        assert "StrictHostKeyChecking=yes" in command
+        if not self.host_trusted:
+            return subprocess.CompletedProcess(
+                command,
+                255,
+                stdout="",
+                stderr="No ED25519 host key is known for [ssh3.vast.ai]:12908.\nHost key verification failed.\n",
+            )
+        stdout = "vast-ssh-ok\n" if command[-1] == "echo vast-ssh-ok" else ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+
+def test_ssh_commands_require_trusted_host_keys() -> None:
+    target = make_target()
+
+    for command in (cmux_vast_host.ssh_base(target), cmux_vast_host.scp_base(target)):
+        assert "StrictHostKeyChecking=yes" in command
+        assert not any(option.startswith("UserKnownHostsFile") for option in command)
+        assert "StrictHostKeyChecking=no" not in command
+
+
+def test_copy_secrets_refuses_transfer_to_unauthenticated_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secrets = tmp_path / "aws.env"
+    secrets.write_text("AWS_SECRET_ACCESS_KEY=secret\n")
+    fake = FakeSubprocess(host_trusted=False)
+    monkeypatch.setattr(cmux_vast_host.subprocess, "run", fake)
+
+    with pytest.raises(RuntimeError, match="Host key verification failed"):
+        cmux_vast_host.copy_secrets(make_target(), str(secrets), "/root/.scenic/aws.env")
+
+    assert [command[0] for command in fake.commands] == ["ssh"]
+    assert not any(str(secrets) in command for command in fake.commands)
+
+
+def test_copy_secrets_transfers_only_after_strict_authentication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secrets = tmp_path / "aws.env"
+    secrets.write_text("AWS_SECRET_ACCESS_KEY=secret\n")
+    fake = FakeSubprocess(host_trusted=True)
+    monkeypatch.setattr(cmux_vast_host.subprocess, "run", fake)
+
+    cmux_vast_host.copy_secrets(make_target(), str(secrets), "/root/.scenic/aws.env")
+
+    assert [command[0] for command in fake.commands] == ["ssh", "scp"]
+    assert str(secrets) in fake.commands[1]
+
+
+def test_wait_for_ssh_fails_fast_on_untrusted_host_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeSubprocess(host_trusted=False)
+    monkeypatch.setattr(cmux_vast_host.subprocess, "run", fake)
+    monkeypatch.setattr(cmux_vast_host.time, "sleep", lambda _: pytest.fail("must not retry an untrusted host key"))
+
+    with pytest.raises(cmux_vast_host.HostKeyUntrustedError):
+        cmux_vast_host.wait_for_ssh(make_target(), 600)
+
+    assert len(fake.commands) == 1
+
+
+def test_run_command_is_killed_at_lifecycle_deadline() -> None:
+    started = cmux_vast_host.time.monotonic()
+
+    with cmux_vast_host.lifecycle_deadline(0.5):
+        with pytest.raises(cmux_vast_host.LifecycleDeadlineExceeded):
+            cmux_vast_host.run_command([sys.executable, "-c", "import time; time.sleep(30)"])
+        with pytest.raises(cmux_vast_host.LifecycleDeadlineExceeded):
+            cmux_vast_host.run_command([sys.executable, "-c", "pass"])
+
+    assert cmux_vast_host.time.monotonic() - started < 10
+
+
+def test_task_lock_rejects_concurrent_claim_and_start_task_does_not_allocate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocations: list[argparse.Namespace] = []
+    monkeypatch.setattr(cmux_vast_host, "do_up", lambda args: allocations.append(args))
+    args = argparse.Namespace(task_name="claimed", workspace_name=None, bootstrap="full")
+
+    with cmux_vast_host.task_lock("claimed"):
+        with pytest.raises(cmux_vast_host.TaskLockedError):
+            with cmux_vast_host.task_lock("claimed"):
+                pass
+        assert cmux_vast_host.handle_start_task(args) == 1
+
+    assert allocations == []
+    with cmux_vast_host.task_lock("claimed"):
+        pass
+
+
 def test_select_offer_id_at_returns_indexed_offer(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         assert command[:3] == ["vastai", "search", "offers"]
@@ -118,11 +219,14 @@ def test_do_up_retries_destroying_failed_ssh_attempt(monkeypatch: pytest.MonkeyP
         if command[:3] == ["vastai", "destroy", "instance"]:
             destroy_commands.append(command)
             return completed()
+        if command == ["vastai", "show", "instances", "--raw"]:
+            return completed("[]")
         raise AssertionError(f"unexpected command: {command}")
 
     monkeypatch.setattr(cmux_vast_host, "run_command", fake_run_command)
 
-    def fake_wait_for_instance_endpoint(instance_id: int, timeout_seconds: int) -> tuple[str, int]:
+    def fake_wait_for_instance_endpoint(instance_id: int, timeout_seconds: float) -> tuple[str, int]:
+        assert 0 < timeout_seconds <= args.timeout_seconds
         endpoint_calls.append(instance_id)
         return (f"host-{instance_id}", 22000 + instance_id)
 
@@ -146,6 +250,46 @@ def test_do_up_retries_destroying_failed_ssh_attempt(monkeypatch: pytest.MonkeyP
     assert state["ssh_host"] == "host-222"
     assert state["ssh_port"] == 22222
     assert any(write.get("status") == "destroyed" and write.get("instance_id") == 111 for write in state_writes)
+
+
+def test_do_up_never_allocates_replacement_before_destroy_is_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = make_up_args()
+    created: list[int] = []
+    writes: list[dict] = []
+
+    monkeypatch.setattr(cmux_vast_host, "check_up_preconditions", lambda _: None)
+    monkeypatch.setattr(cmux_vast_host, "DESTROY_CONFIRM_TIMEOUT_SECONDS", 5)
+    monkeypatch.setattr(cmux_vast_host.time, "sleep", lambda _: None)
+    monkeypatch.setattr(cmux_vast_host, "write_state", lambda state: writes.append(dict(state)))
+    monkeypatch.setattr(cmux_vast_host, "create_instance", lambda offer_id, image, disk_gb: created.append(offer_id) or 111)
+    monkeypatch.setattr(cmux_vast_host, "attach_ssh_key", lambda instance_id, public_key: None)
+    monkeypatch.setattr(cmux_vast_host, "reboot_instance", lambda instance_id: None)
+    monkeypatch.setattr(cmux_vast_host, "wait_for_instance_endpoint", lambda instance_id, timeout_seconds: ("host-111", 22111))
+
+    def failing_ssh(target: cmux_vast_host.SshTarget, timeout_seconds: float) -> None:
+        raise RuntimeError("ssh failed")
+
+    def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        if command[:3] == ["vastai", "search", "offers"]:
+            return completed('[{"id": 9001}, {"id": 9002}]')
+        if command[:3] == ["vastai", "destroy", "instance"]:
+            return completed()
+        if command == ["vastai", "show", "instances", "--raw"]:
+            return completed('[{"id": 111, "actual_status": "running"}]')
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(cmux_vast_host, "wait_for_ssh", failing_ssh)
+    monkeypatch.setattr(cmux_vast_host, "run_command", fake_run_command)
+
+    with pytest.raises(RuntimeError, match="Not allocating a replacement"):
+        cmux_vast_host.do_up(args)
+
+    assert created == [9001]
+    assert writes[-1]["status"] == "failed_kept"
+    assert not any(write.get("status") == "destroyed" for write in writes)
+
 
 
 
@@ -207,8 +351,9 @@ def test_handle_start_task_returns_after_new_bootstrap_none_host(monkeypatch: py
     assert cmux_vast_host.handle_start_task(args) == 0
     output = capsys.readouterr().out
     assert "Vast host ready (bootstrap none): ssh-only" in output
-    assert "ssh -i /tmp/id_ed25519 -p 2222" in output
-    assert "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@203.0.113.10" in output
+    assert "ssh -i /tmp/id_ed25519 " in output
+    assert "-o StrictHostKeyChecking=yes" in output
+    assert output.rstrip().splitlines()[1].endswith("-p 2222 root@203.0.113.10")
 
 
 
@@ -407,6 +552,7 @@ def test_handle_start_task_registers_workspace_and_persists_distinct_identities(
         "cmux_workspace_registered": False,
         "cmux_workspace_ref": None,
         "cmux_workspace_id": None,
+        **ready_host_fields(),
     }
     args = argparse.Namespace(
         task_name="register-me",
@@ -421,6 +567,9 @@ def test_handle_start_task_registers_workspace_and_persists_distinct_identities(
 
     def fake_run_command(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         commands.append(command)
+        if command[0] == "ssh":
+            assert command[-1] == "mkdir -p /workspace/scenic-drive/scenic_artifacts"
+            return completed()
         assert command[:3] == ["cmux", "rpc", "workspace.create"]
         assert json.loads(command[3]) == {
             "cwd": "/tmp/cmux-register",
@@ -435,7 +584,8 @@ def test_handle_start_task_registers_workspace_and_persists_distinct_identities(
 
     assert cmux_vast_host.handle_start_task(args) == 0
 
-    assert len(commands) == 1
+    assert [command[0] for command in commands] == ["ssh", "cmux"]
+    assert "workspace_handoff" in state["completed_phases"]
     assert state["status"] == "workspace_pending"
     assert state["cmux_workspace_ref"] == "cmux-ref-7"
     assert state["cmux_workspace_id"] == "6e2f3e0c-3a2d-4c9d-8f54-9a0e2f7d1b63"
@@ -455,6 +605,7 @@ def test_handle_start_task_registration_failure_keeps_pending_without_identity_o
         "cmux_workspace_registered": False,
         "cmux_workspace_ref": None,
         "cmux_workspace_id": None,
+        **ready_host_fields(),
     }
     args = argparse.Namespace(
         task_name="registration-retry",
@@ -470,7 +621,7 @@ def test_handle_start_task_registration_failure_keeps_pending_without_identity_o
     monkeypatch.setattr(
         cmux_vast_host,
         "run_command",
-        lambda command, **_: completed(returncode=1),
+        lambda command, **_: completed() if command[0] == "ssh" else completed(returncode=1),
     )
 
     assert cmux_vast_host.handle_start_task(args) == 1
@@ -484,6 +635,59 @@ def test_handle_start_task_registration_failure_keeps_pending_without_identity_o
     assert writes[-1]["cmux_workspace_ref"] is None
     assert writes[-1]["cmux_workspace_id"] is None
     assert destroy_calls == []
+    assert "workspace_handoff" not in state["completed_phases"]
+
+    # Teardown after the failed handoff must not demand scenic_artifacts/.
+    copied: list[str] = []
+
+    def copy_all_but_workspace_outputs(target: object, remote_path: str, local_path: Path, *, required: bool) -> bool:
+        copied.append(remote_path)
+        return not remote_path.endswith("/scenic_artifacts/")
+
+    monkeypatch.setattr(cmux_vast_host, "load_state", lambda task_name: state)
+    monkeypatch.setattr(cmux_vast_host, "copy_remote_path", copy_all_but_workspace_outputs)
+    down_args = argparse.Namespace(task_name="registration-retry", destroy=True, yes=True, copy_artifacts=False)
+
+    assert cmux_vast_host.handle_down(down_args) == 0
+    assert "/workspace/scenic-drive/scenic_artifacts/" in copied
+    assert destroy_calls == [state]
+
+
+def ready_host_fields() -> dict[str, object]:
+    return {
+        "instance_id": 12345,
+        "ssh_host": "ssh5.vast.ai",
+        "ssh_port": 2222,
+        "identity_file": "/tmp/id_ed25519",
+        "remote_repo_dir": "/workspace/scenic-drive",
+        "completed_phases": ["bootstrap", "container_validation"],
+    }
+
+
+@pytest.mark.parametrize("status", ["ready", "failed_kept"])
+def test_down_destroy_copies_phase_required_artifacts_without_copy_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    state = {"task_name": "down-guard", "status": status, **ready_host_fields()}
+    requested: dict[str, bool] = {}
+    destroy_calls: list[dict] = []
+
+    def missing_remote_path(target: object, remote_path: str, local_path: Path, *, required: bool) -> bool:
+        requested[remote_path] = required
+        return False
+
+    monkeypatch.setattr(cmux_vast_host, "load_state", lambda task_name: state)
+    monkeypatch.setattr(cmux_vast_host, "copy_remote_path", missing_remote_path)
+    monkeypatch.setattr(cmux_vast_host, "destroy_instance", lambda current: destroy_calls.append(current))
+    args = argparse.Namespace(task_name="down-guard", destroy=True, yes=True, copy_artifacts=False)
+
+    assert cmux_vast_host.handle_down(args) == 1
+
+    assert requested["/workspace/scenic-drive/data/processed/regression/"] is True
+    assert requested["/tmp/scenic_container_validation.json"] is True
+    assert destroy_calls == []
+    assert state["status"] == status
 
 
 def test_handle_start_task_skips_workspace_create_when_already_registered(
@@ -556,11 +760,10 @@ def test_destroy_failure_persists_terminal_failed_kept_state(
     }
     writes: list[dict] = []
     monkeypatch.setattr(cmux_vast_host, "write_state", lambda current: writes.append(dict(current)))
-    monkeypatch.setattr(
-        cmux_vast_host,
-        "run_command",
-        lambda command, **kwargs: completed(returncode=1),
-    )
+    def rejected_destroy(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise RuntimeError(f"Command failed: {command}")
+
+    monkeypatch.setattr(cmux_vast_host, "run_command", rejected_destroy)
 
     with pytest.raises(RuntimeError, match="destroy"):
         cmux_vast_host.destroy_instance(state)
@@ -568,3 +771,53 @@ def test_destroy_failure_persists_terminal_failed_kept_state(
     assert state["status"] == "failed_kept"
     assert "error" in state
     assert writes[-1]["status"] == "failed_kept"
+
+
+@pytest.mark.parametrize(
+    ("completed_phases", "required_paths"),
+    [
+        ([], set()),
+        (["bootstrap"], {"/workspace/scenic-drive/data/processed/regression/"}),
+        (
+            ["bootstrap", "container_validation", "workspace_handoff"],
+            {
+                "/workspace/scenic-drive/data/processed/regression/",
+                "/tmp/scenic_container_validation.json",
+                "/workspace/scenic-drive/scenic_artifacts/",
+            },
+        ),
+        (
+            None,
+            {
+                "/workspace/scenic-drive/data/processed/regression/",
+                "/tmp/scenic_container_validation.json",
+                "/workspace/scenic-drive/scenic_artifacts/",
+            },
+        ),
+    ],
+)
+def test_teardown_requires_only_artifacts_of_completed_phases(
+    monkeypatch: pytest.MonkeyPatch,
+    completed_phases: list[str] | None,
+    required_paths: set[str],
+) -> None:
+    state = {
+        "task_name": "phase-aware",
+        "status": "failed",
+        "ssh_host": "ssh5.vast.ai",
+        "ssh_port": 2222,
+        "identity_file": "/tmp/id_ed25519",
+        "remote_repo_dir": "/workspace/scenic-drive",
+    }
+    if completed_phases is not None:
+        state["completed_phases"] = completed_phases
+    requested: dict[str, bool] = {}
+
+    def missing_remote_path(target: object, remote_path: str, local_path: Path, *, required: bool) -> bool:
+        requested[remote_path] = required
+        return False
+
+    monkeypatch.setattr(cmux_vast_host, "copy_remote_path", missing_remote_path)
+
+    assert cmux_vast_host.copy_artifacts(state) is (not required_paths)
+    assert {path for path, required in requested.items() if required} == required_paths

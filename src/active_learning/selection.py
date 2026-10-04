@@ -484,7 +484,7 @@ def _prepare_for_selection(
     seed: int,
     prior_annotations: Any = None,
 ) -> pd.DataFrame:
-    out = _canonicalise(candidates, seed=seed)
+    out = _canonicalise(candidates, seed=seed, deduplicate=False)
     if "unusable_reason" in out.columns:
         out = out.loc[
             out["unusable_reason"].map(_clean_text).str.lower()
@@ -525,6 +525,11 @@ def _prepare_for_selection(
         )
     if out.empty:
         raise ValueError("candidate input contains no eligible scored candidates")
+    # Choose a physical-tile representative only among eligible rows, so an
+    # unavailable or unscored alias cannot hide usable imagery for the tile.
+    out = out.drop_duplicates(subset=["_tile_key"], keep="first").reset_index(
+        drop=True
+    )
     model = _column_numeric(out, MODEL_COLUMNS)
     heuristic = _column_numeric(out, HEURISTIC_COLUMNS)
     uncertainty = _column_numeric(out, UNCERTAINTY_COLUMNS)
@@ -820,7 +825,12 @@ def select_batch(
     config: SelectionConfig | None = None,
     prior_annotations: Any = None,
 ) -> SelectionArtifacts:
-    """Select one deterministic batch and produce split/audit data in memory."""
+    """Select a bounded batch, drawing controls before score shortlisting.
+
+    QA overlap never exceeds its requested quota, even if fresh candidates
+    cannot fill the regular capacity. Spatial exclusions can underfill either
+    quota.
+    """
 
     config = config or SelectionConfig()
     if int(config.batch_size) < 0:
@@ -861,44 +871,6 @@ def select_batch(
     requested_controls = max(0, min(batch_size - requested_overlap, requested_controls))
     regular_capacity = max(0, batch_size - requested_overlap)
     eligible_pool_count = len(eligible)
-    shortlist_limit = max(5_000, regular_capacity * 50)
-    if len(eligible) > shortlist_limit:
-        eligible = eligible.copy()
-        eligible["_static_selection_score"] = (
-            eligible["score_disagreement"] * weights["disagreement"]
-            + eligible["score_uncertainty"] * weights["uncertainty"]
-            + eligible["score_diversity"] * weights["diversity"]
-            + eligible["score_underrepresented"] * weights["underrepresented"]
-            + eligible["score_band_score"] * weights["score_band"]
-        )
-        representative_indices = (
-            eligible.sort_values(
-                ["_static_selection_score", "_stable_key"],
-                ascending=[False, True],
-                kind="mergesort",
-            )
-            .groupby(["region", "class_id"], sort=True)
-            .head(1)
-            .index.tolist()
-        )
-        ranked_indices = (
-            eligible.sort_values(
-                ["_static_selection_score", "_stable_key"],
-                ascending=[False, True],
-                kind="mergesort",
-            )
-            .head(max(1, shortlist_limit * 3 // 4))
-            .index.tolist()
-        )
-        exploratory_indices = (
-            eligible.sort_values(["_random_key", "_stable_key"], kind="mergesort")
-            .head(shortlist_limit - len(ranked_indices))
-            .index.tolist()
-        )
-        shortlist = list(
-            dict.fromkeys(representative_indices + ranked_indices + exploratory_indices)
-        )
-        eligible = eligible.loc[shortlist[:shortlist_limit]].copy()
     selected_indices: list[int] = []
     records: dict[int, dict[str, Any]] = {}
     selected_rows: list[pd.Series] = []
@@ -967,6 +939,45 @@ def select_batch(
             )
             add(index, components, reason="random_control", control=True)
 
+    shortlist_limit = max(5_000, regular_capacity * 50)
+    if len(eligible) > shortlist_limit:
+        eligible = eligible.copy()
+        eligible["_static_selection_score"] = (
+            eligible["score_disagreement"] * weights["disagreement"]
+            + eligible["score_uncertainty"] * weights["uncertainty"]
+            + eligible["score_diversity"] * weights["diversity"]
+            + eligible["score_underrepresented"] * weights["underrepresented"]
+            + eligible["score_band_score"] * weights["score_band"]
+        )
+        representative_indices = (
+            eligible.sort_values(
+                ["_static_selection_score", "_stable_key"],
+                ascending=[False, True],
+                kind="mergesort",
+            )
+            .groupby(["region", "class_id"], sort=True)
+            .head(1)
+            .index.tolist()
+        )
+        ranked_indices = (
+            eligible.sort_values(
+                ["_static_selection_score", "_stable_key"],
+                ascending=[False, True],
+                kind="mergesort",
+            )
+            .head(max(1, shortlist_limit * 3 // 4))
+            .index.tolist()
+        )
+        exploratory_indices = (
+            eligible.sort_values(["_random_key", "_stable_key"], kind="mergesort")
+            .head(shortlist_limit - len(ranked_indices))
+            .index.tolist()
+        )
+        shortlist = list(
+            dict.fromkeys(representative_indices + ranked_indices + exploratory_indices)
+        )
+        eligible = eligible.loc[shortlist[:shortlist_limit]].copy()
+
     while (
         len([item for item in selected_indices if not records[item]["is_qa_overlap"]])
         < regular_capacity
@@ -1010,8 +1021,9 @@ def select_batch(
                 prepared.loc[index, "_image_identity"],
             ),
         )
+        selected_overlap_count = 0
         for index in overlap_order:
-            if len(selected_indices) >= batch_size:
+            if selected_overlap_count >= requested_overlap:
                 break
             row = prepared.loc[index]
             if _blocked(
@@ -1025,32 +1037,7 @@ def select_batch(
                 row, selected_rows, selected_regions, selected_clusters, band_targets
             )
             add(index, components, reason="qa_overlap", overlap=True)
-
-    # If no explicit prior file was supplied, a candidate may carry a prior
-    # marker.  It is useful as an overlap source only when requested.
-    if requested_overlap and len(selected_indices) < batch_size:
-        remaining = [
-            index
-            for index in prepared.index.tolist()
-            if index not in records and bool(prepared.loc[index, "_prior_annotated"])
-        ]
-        for index in sorted(
-            remaining, key=lambda item: str(prepared.loc[item, "_stable_key"])
-        ):
-            if len(selected_indices) >= batch_size:
-                break
-            row = prepared.loc[index]
-            if _blocked(
-                row,
-                selected_rows,
-                adjacency_radius=int(config.adjacency_radius),
-                min_separation_km=float(config.min_separation_km),
-            ):
-                continue
-            components = _dynamic_components(
-                row, selected_rows, selected_regions, selected_clusters, band_targets
-            )
-            add(index, components, reason="qa_overlap", overlap=True)
+            selected_overlap_count += 1
 
     output = (
         prepared.loc[selected_indices].copy()
@@ -1394,7 +1381,7 @@ def build_geographic_splits(
     adjacency_radius: int = 1,
     adjacency_distance_km: float = 0.0,
 ) -> pd.DataFrame:
-    """Assign deterministic geographic blocks and remove cross-split boundaries."""
+    """Assign positive-fraction geographic splits and remove their boundaries."""
     if (
         not 0 <= val_fraction < 1
         or not 0 <= test_fraction < 1
@@ -1446,6 +1433,7 @@ def build_geographic_splits(
         "val": val_fraction,
         "test": test_fraction,
     }
+    fractions = {name: fraction for name, fraction in fractions.items() if fraction > 0}
     targets = {
         name: max(1, int(round(len(prepared) * fraction)))
         for name, fraction in fractions.items()

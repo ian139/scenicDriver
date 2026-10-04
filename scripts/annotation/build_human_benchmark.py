@@ -5,11 +5,9 @@ Example:
   uv run python scripts/annotation/build_human_benchmark.py \
     --annotations-csv data/raw/labels_human.csv \
     --labels-csv data/processed/regression/labels_masswhites_z14_mixed5000.csv \
+    --geographic-splits-csv data/processed/active_learning/run/geographic_splits.csv \
     --output-dir data/processed/regression \
-    --run-name masswhites_human_benchmark_v1 \
-    --val-frac 0.2 \
-    --test-frac 0.2 \
-    --seed 42
+    --run-name masswhites_human_benchmark_v1
 """
 
 from __future__ import annotations
@@ -91,7 +89,7 @@ def _prepare_annotations(path: Path) -> tuple[pd.DataFrame, int]:
     if missing:
         raise ValueError(f"Missing required annotation columns: {sorted(missing)}")
 
-    ann["image_path"] = ann["image_path"].astype(str).str.strip()
+    ann["image_path"] = ann["image_path"].fillna("").astype(str).str.strip()
     ann["annotator_id"] = ann["annotator_id"].fillna("").astype(str).str.strip()
     ann["scenic_human"] = pd.to_numeric(ann["scenic_human"], errors="coerce")
 
@@ -107,14 +105,15 @@ def _prepare_annotations(path: Path) -> tuple[pd.DataFrame, int]:
     ann["_row_id"] = np.arange(len(ann))
 
     ann = ann.loc[
-        ~ann["skip"]
-        & ann["scenic_human"].notna()
-        & ann["image_path"].ne("")
+        ann["image_path"].ne("")
         & ann["annotator_id"].ne("")
         & ann["annotator_id"].str.lower().ne("nan")
     ].copy()
+    # The latest decision per image/annotator wins, so a later skip or invalid
+    # score retracts that annotator's earlier score instead of resurrecting it.
     ann = ann.sort_values(["_timestamp", "_row_id"])
     ann = ann.drop_duplicates(subset=["image_path", "annotator_id"], keep="last")
+    ann = ann.loc[~ann["skip"] & ann["scenic_human"].between(0.0, 10.0)].copy()
     ann = ann.drop(columns=["_row_id"])
     return ann, total_rows
 

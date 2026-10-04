@@ -92,8 +92,9 @@ class ContribRepo:
 
     @staticmethod
     def _identifier(value: str, name: str) -> str:
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"{name} must not be blank")
+        limit = 2048 if name == "image_path" else 128
+        if not isinstance(value, str) or not value.strip() or len(value) > limit:
+            raise ValueError(f"{name} must not be blank or exceed {limit} characters")
         return value
 
     def _read(self, path: Path) -> pd.DataFrame:
@@ -186,6 +187,10 @@ class ContribRepo:
 
     def upsert_profile(self, contributor_id: str, display_name: str | None = None) -> dict:
         self._identifier(contributor_id, "contributor_id")
+        if display_name is not None and (
+            not isinstance(display_name, str) or len(display_name) > 128
+        ):
+            raise ValueError("display_name must not exceed 128 characters")
         with self._locked():
             profiles, idx = self._profile_row(self._read(self.profiles_path), contributor_id, display_name)
             profiles.at[idx, "updated_at"] = self._now()
@@ -203,16 +208,31 @@ class ContribRepo:
             self._write(self.profiles_path, profiles)
             return profiles.loc[idx].to_dict()
 
+    @staticmethod
+    def _image_region(row) -> str:
+        if row.get("region"):
+            return str(row["region"])
+        parts = str(row["image_path"]).replace("\\", "/").split("/")
+        # Labeler paths are relative to raw_dir; a zoom directory identifies
+        # its region parent even when images/satellite precedes it.
+        generic = {"data", "raw", "images", "satellite", "terrain"}
+        for index, part in enumerate(parts[:-1]):
+            if index and part.startswith("z") and part[1:].isdigit():
+                parent = parts[index - 1]
+                return parent if parent not in generic else "unknown"
+        return parts[0] if len(parts) > 1 and parts[0] not in generic else "unknown"
+
     def _task_pool(self, region: str) -> pd.DataFrame:
         src = self._read(self.cfg.labels_source_csv)
         if src.empty:
             return pd.DataFrame(columns=["image_path"])
         region = region.strip().lower()
         if region:
-            filtered = src.loc[src["image_path"].str.contains(region, case=False, regex=False)]
-            if not filtered.empty:
-                src = filtered
-        cols = [c for c in ["image_path", "class_id", "class_name", "scenic_score"] if c in src.columns]
+            if "region" in src.columns:
+                src = src.loc[src["region"].str.lower() == region]
+            else:
+                src = src.loc[src["image_path"].str.contains(region, case=False, regex=False)]
+        cols = [c for c in ["image_path", "region", "class_id", "class_name", "scenic_score"] if c in src.columns]
         return src[cols].drop_duplicates("image_path")
 
     @staticmethod
@@ -238,6 +258,8 @@ class ContribRepo:
 
     def next_tasks(self, contributor_id: str, region: str, count: int = 25) -> list[dict]:
         self._identifier(contributor_id, "contributor_id")
+        if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 100:
+            raise ValueError("count must be between 1 and 100")
         with self._locked():
             pool = self._task_pool(region)
             if pool.empty:
@@ -248,7 +270,7 @@ class ContribRepo:
             for path in (self.pending_path, self.approved_path):
                 labels = self._read(path)
                 done.update(labels.loc[labels["contributor_id"] == contributor_id, "image_path"])
-            tasks = pool.loc[~pool["image_path"].isin(done)].head(max(1, int(count)))
+            tasks = pool.loc[~pool["image_path"].isin(done)].head(count)
             out, new_bindings = [], []
             for _, row in tasks.iterrows():
                 binding = issued.loc[(issued["contributor_id"] == contributor_id)
@@ -269,6 +291,11 @@ class ContribRepo:
     def submit_label(self, payload: dict) -> dict:
         contributor_id = self._identifier(payload["contributor_id"], "contributor_id")
         task_id = self._identifier(payload["task_id"], "task_id")
+        self._identifier(payload["image_path"], "image_path")
+        for field, limit in (("notes", 4096), ("confidence", 32)):
+            value = payload.get(field, "")
+            if not isinstance(value, str) or len(value) > limit:
+                raise ValueError(f"{field} must not exceed {limit} characters")
         skip = bool(payload.get("skip", False))
         score = payload.get("scenic_human")
         if score is not None:
@@ -286,6 +313,12 @@ class ContribRepo:
                 raise ValueError("task_id was not issued to this contributor for this image")
             if (binding["status"] != "issued").any():
                 raise ValueError("task_id has already been submitted")
+            source = self._read(self.cfg.labels_source_csv)
+            assigned = source.loc[source["image_path"] == payload["image_path"]]
+            if assigned.empty:
+                raise ValueError("assigned image is no longer available")
+            image = assigned.iloc[0]
+            image_region = self._image_region(image)
             pending = self._read(self.pending_path)
             approved = self._read(self.approved_path)
             for labels in (pending, approved):
@@ -293,7 +326,7 @@ class ContribRepo:
                     & (labels["image_path"] == payload["image_path"])).any():
                     raise ValueError("image already submitted by this contributor")
             record = {"task_id": task_id, "contributor_id": contributor_id,
-                      "image_path": payload["image_path"], "region": payload.get("region", "unknown"),
+                      "image_path": payload["image_path"], "region": image_region,
                       "scenic_human": score, "confidence": payload.get("confidence", "medium"),
                       "skip": skip, "notes": payload.get("notes", ""), "status": "pending",
                       "timestamp": self._now(), "agreement_score": None, "qa_reason": ""}
@@ -306,6 +339,10 @@ class ContribRepo:
             return record
 
     def run_qa_promotion(self, min_overlap: int = 1, min_agreement: float = 0.65) -> dict:
+        if not isinstance(min_overlap, int) or isinstance(min_overlap, bool) or min_overlap < 1:
+            raise ValueError("min_overlap must be at least 1")
+        if not math.isfinite(min_agreement) or not 0 <= min_agreement <= 1:
+            raise ValueError("min_agreement must be finite and between 0 and 1")
         with self._locked():
             pending = self._read(self.pending_path)
             if pending.empty:
@@ -319,7 +356,7 @@ class ContribRepo:
             if "scenic_human" not in seed.columns and "scenic_score" in seed.columns:
                 seed = seed.rename(columns={"scenic_score": "scenic_human"})
             seed["scenic_human"] = pd.to_numeric(seed["scenic_human"], errors="coerce")
-            seed_ref = seed.dropna(subset=["scenic_human"]).groupby("image_path")["scenic_human"].mean()
+            seed_ref = seed.loc[seed["scenic_human"].map(math.isfinite)].groupby("image_path")["scenic_human"].agg(["mean", "count"])
             promoted = rejected = skipped = 0
             keep_pending, approved_records, event_records = [], [], []
             for _, row in pending.iterrows():
@@ -332,14 +369,14 @@ class ContribRepo:
                     rec.update(status="skipped", qa_reason="contributor_skipped")
                     skipped += 1
                 else:
-                    candidates = [seed_ref[row["image_path"]]] if row["image_path"] in seed_ref.index else []
-                    if len(candidates) < min_overlap:
+                    reference = seed_ref.loc[row["image_path"]] if row["image_path"] in seed_ref.index else None
+                    if reference is None or reference["count"] < min_overlap:
                         keep_pending.append(rec)
                         continue
                     score = float(row["scenic_human"])
                     if not math.isfinite(score) or not 0 <= score <= 10:
                         raise ValueError("Invalid pending scenic_human score")
-                    agreement = max(0.0, 1.0 - abs(score - float(candidates[0])) / 10.0)
+                    agreement = max(0.0, 1.0 - abs(score - float(reference["mean"])) / 10.0)
                     rec["agreement_score"] = round(agreement, 4)
                     if agreement >= min_agreement:
                         rec.update(status="approved", qa_reason="agreement_pass")
@@ -370,9 +407,11 @@ class ContribRepo:
                     "skipped": skipped, "remaining_pending": len(keep_pending)}
 
     def leaderboard(self, limit: int = 25) -> list[dict]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
         with self._locked():
             profiles = self._read(self.profiles_path)
             if profiles.empty:
                 return []
-            profiles = profiles.sort_values(["credits", "approved_labels"], ascending=[False, False]).head(max(1, int(limit)))
+            profiles = profiles.sort_values(["credits", "approved_labels"], ascending=[False, False]).head(limit)
             return profiles.to_dict(orient="records")

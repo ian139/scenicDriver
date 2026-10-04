@@ -2,7 +2,13 @@
 Build a RoadGraph from local OSM PBF extracts.
 
 The repeatable local-PBF inputs are merged, filtered, and converted to XML
-before OSMnx loads the resulting graph.
+before OSMnx loads the resulting graph. Edges are retained when their geometry
+intersects the requested region (bbox or tile footprint), so roads crossing
+the boundary keep their outside endpoints. Graph artifacts are staged and
+validated privately. Publication is atomic per entry point, not for the whole
+artifact set: ``run.json`` is the run's readiness gate. It is withdrawn before
+the first content swap and republished only after every member is published
+and verified. Consumers must treat a missing ``run.json`` as "not ready".
 """
 
 from __future__ import annotations
@@ -17,15 +23,12 @@ import shutil
 import re
 import subprocess
 import sys
+import tempfile
 import gc
 from typing import AbstractSet, Any, Iterable, Mapping
 
-try:
-    from shapely.geometry import LineString, box as shapely_box, shape as shapely_shape
-except ImportError:  # pragma: no cover - dependency is declared by the project
-    LineString = None
-    shapely_box = None
-    shapely_shape = None
+from shapely.geometry import LineString, Point, box as shapely_box, shape as shapely_shape
+from shapely.prepared import prep as shapely_prep
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -104,13 +107,20 @@ def parse_args() -> argparse.Namespace:
         "--tile-buffer",
         type=int,
         default=1,
-        help="Integer tile-count connectivity buffer around the report tiles (default: 1).",
+        help=(
+            "Integer tile-count connectivity buffer around the report tiles "
+            "(default: 1). Buffering is clamped at the Web Mercator grid edges."
+        ),
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="Explicit graph output path. If omitted, a deterministic run folder is used.",
+        help=(
+            "Explicit graph output path. Its suffix must match --graph-format "
+            "(.json for json, .sqlite3 for sqlite3/compact). If omitted, a "
+            "deterministic run folder is used."
+        ),
     )
     parser.add_argument(
         "--output-root",
@@ -165,6 +175,11 @@ def _validate_mode_flags(
     parser: argparse.ArgumentParser | None,
     args: argparse.Namespace,
 ) -> None:
+    def fail(message: str) -> None:
+        if parser is not None:
+            parser.error(message)
+        raise ValueError(message)
+
     bbox_flags = [
         name
         for name, value in (
@@ -177,25 +192,54 @@ def _validate_mode_flags(
     ]
     tile_report = getattr(args, "tile_report", None)
     if tile_report is not None and bbox_flags:
-        message = (
+        fail(
             "--tile-report is mutually exclusive with the bbox flags "
             f"({', '.join(bbox_flags)})"
         )
-        if parser is not None:
-            parser.error(message)
-        raise ValueError(message)
     if tile_report is None and len(bbox_flags) != 4:
-        message = "bbox mode requires --min-lat, --min-lon, --max-lat and --max-lon"
-        if parser is not None:
-            parser.error(message)
-        raise ValueError(message)
+        fail("bbox mode requires --min-lat, --min-lon, --max-lat and --max-lon")
+    if tile_report is None:
+        try:
+            _bbox(args)
+        except ValueError as exc:
+            fail(str(exc))
     if getattr(args, "tile_buffer", DEFAULT_TILE_BUFFER) < 0:
-        message = "--tile-buffer must be >= 0"
-        if parser is not None:
-            parser.error(message)
-        raise ValueError(message)
+        fail("--tile-buffer must be >= 0")
+    output = getattr(args, "output", None)
+    if output is not None:
+        try:
+            _validate_output_suffix(Path(output), getattr(args, "graph_format", "json"))
+        except ValueError as exc:
+            fail(str(exc))
 
 
+def _graph_suffix(graph_format: str) -> str:
+    if graph_format in ("sqlite3", "compact"):
+        return ".sqlite3"
+    if graph_format == "json":
+        return ".json"
+    raise ValueError(f"Unsupported --graph-format: {graph_format!r}")
+
+
+def _validate_output_suffix(output: Path, graph_format: str) -> None:
+    """Reject explicit outputs whose name would dispatch to another loader.
+
+    ``RoadGraph.load`` selects the backend from the file name: ``*.compact.json``
+    is a compact manifest, ``*.sqlite3`` is SQLite, everything else is JSON.
+    """
+    expected = _graph_suffix(graph_format)
+    name = output.name
+    if (
+        output.suffix != expected
+        or name.lower().endswith(".compact.json")
+        or name.startswith(".")
+        or not output.stem
+    ):
+        raise ValueError(
+            f"--output {output} does not match --graph-format {graph_format}: "
+            f"expected a non-hidden *{expected} file name"
+            + (" that is not *.compact.json" if expected == ".json" else "")
+        )
 
 
 def _slug_float(value: float) -> str:
@@ -217,40 +261,59 @@ def _default_run_name(args: argparse.Namespace) -> str:
 
 
 def _resolve_output_paths(args: argparse.Namespace) -> tuple[Path, Path, str]:
-    suffix = (
-        ".sqlite3"
-        if args.graph_format in ("sqlite3", "compact")
-        else ".json"
-    )
+    suffix = _graph_suffix(args.graph_format)
     if args.output is not None:
+        _validate_output_suffix(args.output, args.graph_format)
         run_name = args.run_name or args.output.stem
         return args.output, args.output.parent, run_name
+
 
     run_name = args.run_name or _default_run_name(args)
     run_dir = args.output_root / run_name
     return run_dir / f"road_graph{suffix}", run_dir, run_name
 
 
+def _recorded_path(path: Path | str) -> str:
+    """Record an artifact path the readiness gate can resolve on any host.
+
+    Paths under the project root are recorded project-root-relative: the runtime
+    gate resolves relative records against its own project root, so a build run
+    with absolute paths must not bake build-machine directories into ``run.json``.
+    Paths outside the project root are recorded as given.
+    """
+    candidate = Path(path)
+    try:
+        return candidate.resolve().relative_to(PROJECT_ROOT).as_posix()
+    except (OSError, ValueError):
+        return str(candidate)
+
+
 def _bbox(args: argparse.Namespace) -> dict[str, float]:
-    min_lat = getattr(args, "min_lat", None)
-    min_lon = getattr(args, "min_lon", None)
-    max_lat = getattr(args, "max_lat", None)
-    max_lon = getattr(args, "max_lon", None)
-    if (
-        min_lat is None
-        or min_lon is None
-        or max_lat is None
-        or max_lon is None
-        or min_lat >= max_lat
-        or min_lon >= max_lon
-    ):
-        raise ValueError("Invalid bbox: --min-lat < --max-lat and --min-lon < --max-lon required")
-    return {
-        "min_lat": float(min_lat),
-        "min_lon": float(min_lon),
-        "max_lat": float(max_lat),
-        "max_lon": float(max_lon),
+    """Return the validated WGS84 bbox: finite, in world bounds, strictly ordered."""
+    raw = {
+        key: getattr(args, key, None)
+        for key in ("min_lat", "min_lon", "max_lat", "max_lon")
     }
+    if any(value is None for value in raw.values()):
+        raise ValueError("Invalid bbox: --min-lat, --min-lon, --max-lat and --max-lon are required")
+    try:
+        values = {key: float(value) for key, value in raw.items()}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid bbox: coordinates must be numbers") from exc
+    if not all(math.isfinite(value) for value in values.values()):
+        raise ValueError("Invalid bbox: coordinates must be finite")
+    if not (
+        -90.0 <= values["min_lat"] <= 90.0
+        and -90.0 <= values["max_lat"] <= 90.0
+        and -180.0 <= values["min_lon"] <= 180.0
+        and -180.0 <= values["max_lon"] <= 180.0
+    ):
+        raise ValueError(
+            "Invalid bbox: latitudes must be within [-90, 90] and longitudes within [-180, 180]"
+        )
+    if values["min_lat"] >= values["max_lat"] or values["min_lon"] >= values["max_lon"]:
+        raise ValueError("Invalid bbox: --min-lat < --max-lat and --min-lon < --max-lon required")
+    return values
 
 
 def _parse_probes(values: Iterable[Iterable[str]]) -> list[dict[str, float | str]]:
@@ -331,13 +394,22 @@ def _compact_tile_rectangles(
     coords: list[tuple[int, int]],
     buffer: int,
 ) -> list[tuple[int, int, int, int]]:
+    """Merge buffered tiles into rectangles of valid ``zoom`` grid IDs.
+
+    The buffer is clamped to ``[0, 2**zoom - 1]`` on both axes: the Web
+    Mercator grid has no tiles beyond its poles, and the footprint envelope is
+    a non-wrapping bbox, so buffering does not wrap across the antimeridian.
+    """
     if buffer < 0:
         raise ValueError("tile buffer must be >= 0")
+    limit = 2**zoom - 1
     buffered: set[tuple[int, int]] = set()
     for x, y in coords:
-        for dx in range(-buffer, buffer + 1):
-            for dy in range(-buffer, buffer + 1):
-                buffered.add((x + dx, y + dy))
+        if not (0 <= x <= limit and 0 <= y <= limit):
+            raise ValueError(f"Tile ({x}, {y}) is outside the z{zoom} grid")
+        for buffered_x in range(max(0, x - buffer), min(limit, x + buffer) + 1):
+            for buffered_y in range(max(0, y - buffer), min(limit, y + buffer) + 1):
+                buffered.add((buffered_x, buffered_y))
 
     runs: dict[int, list[tuple[int, int]]] = {}
     for y in sorted({y for _x, y in buffered}):
@@ -524,8 +596,26 @@ def _write_build_state(
         payload["tile_footprint"] = _footprint_metadata(footprint)
     if extra:
         payload.update(extra)
+    _write_json_atomic(path, payload)
+
+
+def _write_json_atomic(path: Path, payload: Any) -> None:
+    """Write JSON via a fsynced sibling temp file and an atomic rename."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, indent=2, sort_keys=True))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -668,10 +758,10 @@ def _buffered_bbox(bbox: Mapping[str, float], buffer_m: float = 500.0) -> tuple[
     lon_scale = max(math.cos(math.radians(center_lat)), 0.1)
     lon_delta = buffer_m / (111_320.0 * lon_scale)
     return (
-        float(bbox["min_lon"]) - lon_delta,
-        float(bbox["min_lat"]) - lat_delta,
-        float(bbox["max_lon"]) + lon_delta,
-        float(bbox["max_lat"]) + lat_delta,
+        max(-180.0, float(bbox["min_lon"]) - lon_delta),
+        max(-90.0, float(bbox["min_lat"]) - lat_delta),
+        min(180.0, float(bbox["max_lon"]) + lon_delta),
+        min(90.0, float(bbox["max_lat"]) + lat_delta),
     )
 
 
@@ -837,24 +927,6 @@ def _drive_edge_allowed(data: Mapping[str, Any]) -> bool:
     return True
 
 
-def _truncate_graph_to_bbox(
-    G: Any,
-    bbox: tuple[float, float, float, float],
-) -> Any:
-    west, south, east, north = bbox
-    remove_nodes = [
-        node_id
-        for node_id, data in G.nodes(data=True)
-        if not (
-            south <= float(data.get("y")) <= north
-            and west <= float(data.get("x")) <= east
-        )
-    ]
-    if remove_nodes:
-        G.remove_nodes_from(remove_nodes)
-    return G
-
-
 def _largest_weak_component(G: Any) -> Any:
     if len(G.nodes) == 0:
         return G
@@ -868,60 +940,70 @@ def _largest_weak_component(G: Any) -> Any:
     return G
 
 
-def _truncate_graph_to_footprint(G: Any, footprint: Mapping[str, Any]) -> Any:
-    if LineString is None or shapely_box is None or shapely_shape is None:  # pragma: no cover
-        raise RuntimeError("shapely is required for tile footprint graph filtering")
-    footprint_geometry = shapely_shape(footprint["geojson"]["features"][0]["geometry"])
+def _footprint_geometry(footprint: Mapping[str, Any]) -> Any:
+    return shapely_shape(footprint["geojson"]["features"][0]["geometry"])
+
+
+def _edge_line(G: Any, u: Any, v: Any, data: Mapping[str, Any]) -> Any:
+    """Return the edge's own geometry, or the straight segment between its nodes.
+
+    OSMnx stores simplified edge geometry as a shapely LineString; GeoJSON-like
+    mappings are accepted too. Unsimplified OSM segments carry no geometry.
+    """
+    geometry = data.get("geometry")
+    line: Any = None
+    if isinstance(geometry, Mapping):
+        try:
+            line = shapely_shape(geometry)
+        except Exception:
+            line = None
+    elif geometry is not None and hasattr(geometry, "geom_type"):
+        line = geometry
+    if line is not None and not line.is_empty:
+        return line
+    u_data = G.nodes[u]
+    v_data = G.nodes[v]
+    return LineString(
+        [
+            (float(u_data["x"]), float(u_data["y"])),
+            (float(v_data["x"]), float(v_data["y"])),
+        ]
+    )
+
+
+def _truncate_graph_to_region(G: Any, region: Any) -> Any:
+    """Keep edges whose geometry intersects ``region`` (a shapely geometry).
+
+    Edges crossing the boundary are retained whole, including their endpoint
+    nodes outside the region. Nodes left without incident edges are dropped
+    unless the region covers them.
+    """
+    prepared = shapely_prep(region)
+    min_x, min_y, max_x, max_y = region.bounds
     remove_edges: list[tuple[Any, Any, Any]] = []
     for u, v, key, data in G.edges(keys=True, data=True):
-        geometry = data.get("geometry")
-        line: Any = None
-        if isinstance(geometry, dict):
-            try:
-                line = shapely_shape(geometry)
-            except Exception:
-                line = None
-        if line is None or line.is_empty:
-            u_data = G.nodes.get(u)
-            v_data = G.nodes.get(v)
-            if u_data is None or v_data is None:
-                remove_edges.append((u, v, key))
-                continue
-            line = LineString(
-                [
-                    (float(u_data.get("x")), float(u_data.get("y"))),
-                    (float(v_data.get("x")), float(v_data.get("y"))),
-                ]
-            )
-        if footprint_geometry.intersects(line):
-            continue
-        remove_edges.append((u, v, key))
+        line = _edge_line(G, u, v, data)
+        line_min_x, line_min_y, line_max_x, line_max_y = line.bounds
+        if (
+            line_max_x < min_x
+            or line_min_x > max_x
+            or line_max_y < min_y
+            or line_min_y > max_y
+            or not prepared.intersects(line)
+        ):
+            remove_edges.append((u, v, key))
     if remove_edges:
         G.remove_edges_from(remove_edges)
 
-    incident_nodes = {
-        node_id
-        for u, v in G.edges()
-        for node_id in (u, v)
-    }
     remove_nodes = [
         node_id
-        for node_id in G.nodes
-        if node_id not in incident_nodes
-        and not footprint_geometry.covers(
-            shapely_box(
-                float(G.nodes[node_id].get("x")),
-                float(G.nodes[node_id].get("y")),
-                float(G.nodes[node_id].get("x")),
-                float(G.nodes[node_id].get("y")),
-            )
-        )
+        for node_id, data in G.nodes(data=True)
+        if G.degree(node_id) == 0
+        and not prepared.covers(Point(float(data["x"]), float(data["y"])))
     ]
     if remove_nodes:
         G.remove_nodes_from(remove_nodes)
     return G
-
-
 
 
 def _load_local_osm_graph(
@@ -941,17 +1023,9 @@ def _load_local_osm_graph(
         simplify=False,
         retain_all=True,
     )
+    graph = _filter_drive_graph(graph)
     if footprint is not None:
-        graph = _filter_drive_graph(
-            graph,
-            (
-                footprint["bbox"]["min_lon"],
-                footprint["bbox"]["min_lat"],
-                footprint["bbox"]["max_lon"],
-                footprint["bbox"]["max_lat"],
-            ),
-        )
-        graph = _truncate_graph_to_footprint(graph, footprint)
+        graph = _truncate_graph_to_region(graph, _footprint_geometry(footprint))
         graph = ox.simplify_graph(graph)
         return graph
     if bbox is None:
@@ -964,31 +1038,24 @@ def _load_local_osm_graph(
             "max_lon": bbox[2],
         }
     )
-    graph = _filter_drive_graph(graph, buffered_bbox)
+    graph = _truncate_graph_to_region(graph, shapely_box(*buffered_bbox))
     graph = _largest_weak_component(graph)
     graph = ox.simplify_graph(graph)
-    graph = _truncate_graph_to_bbox(graph, bbox)
+    # Simplified edges span several OSM segments; keep any whose geometry
+    # reaches the exact bbox, including those with both endpoints outside it.
+    graph = _truncate_graph_to_region(graph, shapely_box(*bbox))
     graph = _largest_weak_component(graph)
     return graph
-def _filter_drive_graph(G: Any, bbox: tuple[float, float, float, float]) -> Any:
-    west, south, east, north = bbox
+
+
+def _filter_drive_graph(G: Any) -> Any:
+    """Drop edges outside the drive network and the nodes they isolate."""
     remove_edges: list[tuple[Any, Any, Any]] = []
     for u, v, key, data in G.edges(keys=True, data=True):
         if not _drive_edge_allowed(data):
             remove_edges.append((u, v, key))
     if remove_edges:
         G.remove_edges_from(remove_edges)
-
-    remove_nodes = [
-        node_id
-        for node_id, data in G.nodes(data=True)
-        if not (
-            south <= float(data.get("y")) <= north
-            and west <= float(data.get("x")) <= east
-        )
-    ]
-    if remove_nodes:
-        G.remove_nodes_from(remove_nodes)
     isolates = [node_id for node_id in G.nodes if G.degree(node_id) == 0]
     if isolates:
         G.remove_nodes_from(isolates)
@@ -1032,6 +1099,56 @@ def _update_sqlite_metadata(path: Path, updates: Mapping[str, Any]) -> None:
         connection.commit()
 
 
+def _staging_dir(output_path: Path, run_dir: Path) -> Path:
+    """Private same-filesystem directory whose files keep their final names."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return Path(
+        tempfile.mkdtemp(prefix=f".{output_path.name}.publish.", dir=run_dir)
+    )
+
+
+def _withdraw(paths: Iterable[Path]) -> None:
+    for path in paths:
+        Path(path).unlink(missing_ok=True)
+
+
+def _stale_format_entry_points(
+    output_path: Path,
+    run_dir: Path,
+    graph_format: str,
+) -> list[Path]:
+    """Return other formats' canonical graph entry points beside ``output_path``.
+
+    Readers discover a run's graph by fixed names (``<stem>.json`` before
+    ``<stem>.sqlite3``; ``<stem>.compact.json`` as the runtime manifest), so a
+    format switch must retire the previous format's entry points or they would
+    keep serving the old generation. Immutable compact generations and payloads
+    are never removed: readers that already opened them keep working.
+    """
+    stem = output_path.stem
+    json_graph = run_dir / f"{stem}.json"
+    sqlite_graph = run_dir / f"{stem}.sqlite3"
+    compact_manifest = run_dir / f"{stem}.compact.json"
+    if graph_format == "json":
+        return [
+            sqlite_graph,
+            EdgeProjectionIndex.sidecar_path(sqlite_graph),
+            compact_manifest,
+        ]
+    if graph_format == "sqlite3":
+        return [json_graph, compact_manifest]
+    if graph_format == "compact":
+        return [json_graph]
+    raise ValueError(f"Unsupported --graph-format: {graph_format!r}")
+
+
+def _release_graph(G: Any) -> None:
+    clear_graph = getattr(G, "clear", None)
+    if callable(clear_graph):
+        clear_graph()
+    gc.collect()
+
+
 def _publish_sqlite_graph(
     output_path: Path,
     run_dir: Path,
@@ -1039,48 +1156,151 @@ def _publish_sqlite_graph(
     scenic_scores: Mapping[str, float],
     metadata: Mapping[str, Any],
     probes: list[dict[str, float | str]],
-) -> tuple[int, int, dict[str, Any]]:
-    candidate = run_dir / f".{output_path.stem}.candidate.sqlite3"
-    candidate_sidecar = EdgeProjectionIndex.sidecar_path(candidate)
-    candidate.unlink(missing_ok=True)
-    candidate_sidecar.unlink(missing_ok=True)
+    *,
+    compact: bool = False,
+    withdraw: Iterable[Path] = (),
+) -> tuple[int, int, dict[str, Any], dict[str, Any] | None]:
+    """Stage, validate, then publish the SQLite graph artifact set.
+
+    Atomicity is per entry point, not for the whole set. The SQLite graph,
+    its coverage metadata and projection sidecar are built from a private
+    staging copy that keeps the final file names; nothing visible changes
+    until staging succeeds. ``withdraw`` holds the run's readiness gate
+    (``run.json``): it is removed before the first content swap, and the
+    caller republishes it only after every member is complete and verified,
+    so a missing gate means "not ready". The compact manifest then swaps
+    atomically to its immutable, self-contained generation. Other formats'
+    stale entry points and the previous sidecar are removed before the SQLite
+    swap, so a direct SQLite reader sees the old graph, or the new graph
+    without an index (rebuilt on load), never a graph with another
+    generation's index.
+    """
+    staging = _staging_dir(output_path, run_dir)
+    staged = staging / output_path.name
+    staged_sidecar = EdgeProjectionIndex.sidecar_path(staged)
     try:
         counts = _write_sqlite_graph(
-            candidate,
+            staged,
             _iter_osmnx_graph_rows(G, scenic_scores),
             metadata=metadata,
         )
-        clear_graph = getattr(G, "clear", None)
-        if callable(clear_graph):
-            clear_graph()
+        _release_graph(G)
         del G
-        gc.collect()
-        loaded = RoadGraph.load(candidate)
+        loaded = RoadGraph.load(staged)
         probe_metadata = _coverage_metadata(loaded, probes)
-        _update_sqlite_metadata(candidate, {"coverage_probes": probe_metadata})
-        loaded.persist_edge_projection_index(candidate)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        _update_sqlite_metadata(staged, {"coverage_probes": probe_metadata})
+        loaded.persist_edge_projection_index(staged)
+        del loaded
+        compact_record: dict[str, Any] | None = None
+        _withdraw(withdraw)
+        if compact:
+            compact_record = _publish_compact_graph(staged, run_dir)
+            if compact_record["node_count"] != counts[0]:
+                raise ValueError(
+                    "Compact node count does not match the published SQLite "
+                    f"({compact_record['node_count']} != {counts[0]})"
+                )
+            if compact_record["edge_count"] != counts[1]:
+                raise ValueError(
+                    "Compact edge count does not match the published SQLite "
+                    f"({compact_record['edge_count']} != {counts[1]})"
+                )
         output_sidecar = EdgeProjectionIndex.sidecar_path(output_path)
-        os.replace(candidate, output_path)
-        os.replace(candidate_sidecar, output_sidecar)
-        return counts[0], counts[1], probe_metadata
+        stale = _stale_format_entry_points(
+            output_path, run_dir, "compact" if compact else "sqlite3"
+        )
+        _withdraw([*stale, output_sidecar])
+        os.replace(staged, output_path)
+        os.replace(staged_sidecar, output_sidecar)
+        return counts[0], counts[1], probe_metadata, compact_record
     finally:
-        candidate.unlink(missing_ok=True)
-        candidate_sidecar.unlink(missing_ok=True)
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _publish_json_graph(
+    output_path: Path,
+    run_dir: Path,
+    G: Any,
+    probes: list[dict[str, float | str]],
+    *,
+    withdraw: Iterable[Path] = (),
+) -> tuple[int, int, dict[str, Any]]:
+    """Stage the legacy JSON graph privately, then swap it in atomically.
+
+    ``withdraw`` paths and the SQLite/compact entry points of a previous
+    format are removed only at commit, immediately before the swap.
+    """
+    graph = _graph_from_osmnx(G, scenic_scores={})
+    _release_graph(G)
+    del G
+    probe_metadata = _coverage_metadata(graph, probes)
+    staging = _staging_dir(output_path, run_dir)
+    try:
+        staged = staging / output_path.name
+        graph.save(staged)
+        _withdraw(
+            [*withdraw, *_stale_format_entry_points(output_path, run_dir, "json")]
+        )
+        os.replace(staged, output_path)
+        return len(graph.nodes), len(graph.edges), probe_metadata
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _publish_compact_graph(
     sqlite_path: Path,
     run_dir: Path,
 ) -> dict[str, Any]:
-    """Publish the canonical compact runtime artifacts from a published SQLite.
+    """Publish ``<run_dir>/<stem>.compact.json`` from a finished SQLite graph.
 
     The SQLite file is the authoritative audit source; conversion streams its
     rows in deterministic rowid order and never rebuilds Node/Edge objects.
+    The SQLite, its projection sidecar and the binary are copied into an
+    immutable content-addressed generation before the manifest swaps, so the
+    source may be a staged copy that keeps its final file name.
     """
-    manifest_path = sqlite_path.with_name(f"{sqlite_path.stem}.compact.json")
+    manifest_path = run_dir / f"{sqlite_path.stem}.compact.json"
     return write_compact_graph(sqlite_path, manifest_path)
 
+
+def _verify_published_set(
+    output_path: Path,
+    run_dir: Path,
+    graph_format: str,
+    graph_sha256: str,
+    compact_record: Mapping[str, Any] | None,
+) -> None:
+    """Check every published member before the readiness gate is republished.
+
+    The SQLite sidecar must bind the published graph bytes, the compact
+    manifest must be the one just written and reference that same SQLite, and
+    no other format's entry point may remain beside the graph.
+    """
+    if graph_format in ("sqlite3", "compact"):
+        index = EdgeProjectionIndex.load(
+            EdgeProjectionIndex.sidecar_path(output_path), output_path
+        )
+        index.close()
+    if graph_format == "compact":
+        if compact_record is None:
+            raise ValueError("Compact build finished without a compact manifest")
+        manifest_path = Path(compact_record["manifest_path"])
+        manifest_bytes = manifest_path.read_bytes()
+        if hashlib.sha256(manifest_bytes).hexdigest() != compact_record["manifest_sha256"]:
+            raise ValueError(f"Compact manifest changed after publication: {manifest_path}")
+        source_sha256 = json.loads(manifest_bytes)["source"]["sha256"]
+        if source_sha256 != graph_sha256:
+            raise ValueError(
+                "Compact manifest does not reference the published SQLite "
+                f"({source_sha256} != {graph_sha256})"
+            )
+    stale = [
+        path
+        for path in _stale_format_entry_points(output_path, run_dir, graph_format)
+        if path.exists()
+    ]
+    if stale:
+        raise ValueError(f"Stale graph entry points remain: {[str(path) for path in stale]}")
 
 
 
@@ -1230,36 +1450,28 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
                 "path": str(extraction_geometry),
                 "sha256": _digest_file(extraction_geometry, "sha256"),
             }
+        run_record_path = run_dir / "run.json"
+        compact_record: dict[str, Any] | None = None
         if args.graph_format in ("sqlite3", "compact"):
-            node_count, edge_count, probe_metadata = _publish_sqlite_graph(
+            node_count, edge_count, probe_metadata, compact_record = _publish_sqlite_graph(
                 output_path,
                 run_dir,
                 G,
                 {},
                 base_metadata,
                 probes,
+                compact=args.graph_format == "compact",
+                withdraw=[run_record_path],
             )
         else:
-            graph = _graph_from_osmnx(G, scenic_scores={})
-            del G
-            gc.collect()
-            probe_metadata = _coverage_metadata(graph, probes)
-            graph.save(output_path)
-            node_count, edge_count = len(graph.nodes), len(graph.edges)
-
-        compact_record: dict[str, Any] | None = None
-        if args.graph_format == "compact":
-            compact_record = _publish_compact_graph(output_path, run_dir)
-            if compact_record["node_count"] != node_count:
-                raise ValueError(
-                    "Compact node count does not match the published SQLite "
-                    f"({compact_record['node_count']} != {node_count})"
-                )
-            if compact_record["edge_count"] != edge_count:
-                raise ValueError(
-                    "Compact edge count does not match the published SQLite "
-                    f"({compact_record['edge_count']} != {edge_count})"
-                )
+            node_count, edge_count, probe_metadata = _publish_json_graph(
+                output_path,
+                run_dir,
+                G,
+                probes,
+                withdraw=[run_record_path],
+            )
+        del G
 
         _write_build_state(
             build_state_path,
@@ -1285,8 +1497,8 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
         run_record = {
             "run_name": run_name,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "output_graph": str(output_path),
-            "output_dir": str(run_dir),
+            "output_graph": _recorded_path(output_path),
+            "output_dir": _recorded_path(run_dir),
             "bbox": bbox,
             "network": args.network,
             "graph_format": args.graph_format,
@@ -1302,7 +1514,7 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
             run_record["tile_footprint"] = _footprint_metadata(footprint)
             run_record["extraction_geometry"] = base_metadata["extraction_geometry"]
         if compact_record is not None:
-            run_record["compact_graph"] = compact_record["manifest_path"]
+            run_record["compact_graph"] = _recorded_path(compact_record["manifest_path"])
             run_record["compact_manifest_sha256"] = compact_record[
                 "manifest_sha256"
             ]
@@ -1311,11 +1523,15 @@ def _build(args: argparse.Namespace) -> dict[str, Any]:
             run_record["compact_traversal_count"] = compact_record[
                 "traversal_count"
             ]
-            run_record["runtime_graph"] = compact_record["manifest_path"]
-        (run_dir / "run.json").write_text(
-            json.dumps(run_record, indent=2, sort_keys=True),
-            encoding="utf-8",
+            run_record["runtime_graph"] = _recorded_path(compact_record["manifest_path"])
+        _verify_published_set(
+            output_path,
+            run_dir,
+            args.graph_format,
+            run_record["graph_sha256"],
+            compact_record,
         )
+        _write_json_atomic(run_record_path, run_record)
         _write_build_state(
             build_state_path,
             run_name=run_name,

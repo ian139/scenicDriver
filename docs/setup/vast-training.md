@@ -46,14 +46,32 @@ docker build --platform linux/amd64 \
 ```
 
 Run canonical validation locally. Use CPU on a non-CUDA host and CUDA on a host
-exposing an NVIDIA GPU:
+exposing an NVIDIA GPU. The image ships no checkpoint or dataset, so download
+both inputs first and mount them into the container:
 
 ```bash
-docker run --rm --platform linux/amd64 scenicdriver/remote-training:vast-smoke \
+uv run python -m src.data_pipeline.s3 download-file \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --key <checkpoint-key> \
+  --dest models/<checkpoint>.pt \
+  --required
+uv run python -m src.data_pipeline.s3 download-file \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --key <features-key> \
+  --dest data/processed/regression/<features>.npz \
+  --required
+
+docker run --rm --platform linux/amd64 \
+  -v "$PWD/models:/workspace/models:ro" \
+  -v "$PWD/data/processed/regression:/workspace/data/processed/regression:ro" \
+  scenicdriver/remote-training:vast-smoke \
   python scripts/remote/vast_train.py validate --device cpu \
   --checkpoint models/<checkpoint>.pt --dataset data/processed/regression/<features>.npz
 
-docker run --rm --gpus all scenicdriver/remote-training:vast-smoke \
+docker run --rm --gpus all \
+  -v "$PWD/models:/workspace/models:ro" \
+  -v "$PWD/data/processed/regression:/workspace/data/processed/regression:ro" \
+  scenicdriver/remote-training:vast-smoke \
   python scripts/remote/vast_train.py validate --device cuda \
   --checkpoint models/<checkpoint>.pt --dataset data/processed/regression/<features>.npz
 ```
@@ -117,18 +135,42 @@ docker pull ian139/scenicdriver-remote-training:latest
 mkdir -p /workspace/scenic-data /workspace/scenic-models /workspace/scenic-artifacts /root/.scenic
 # Copy /root/.scenic/aws.env out-of-band; do not bake credentials into the image.
 
-docker run --gpus all --name scenic-vast-validate \
+# Exact S3 keys chosen for this run (the same values passed to
+# `vast_train.py run --train-dataset-key/--validation-checkpoint-key`).
+export SCENIC_S3_BUCKET=scenicdriver-data
+export SCENIC_TRAIN_DATASET_KEY='<features-key>'
+export SCENIC_VALIDATION_CHECKPOINT_KEY='<checkpoint-key>'
+
+docker run --rm \
   --env-file /root/.scenic/aws.env \
-  -e SCENIC_S3_BUCKET=scenicdriver-data \
-  -e SCENIC_S3_DATA_PREFIX="$SCENIC_S3_DATA_PREFIX" \
-  -e SCENIC_S3_MODELS_PREFIX="$SCENIC_S3_MODELS_PREFIX" \
-  -e SCENIC_S3_OUTPUT_PREFIX="$SCENIC_S3_OUTPUT_PREFIX" \
-  -e SCENIC_TIMEOUT_MINUTES=30 \
+  -v /workspace/scenic-data:/workspace/data/processed/regression \
+  -v /workspace/scenic-models:/workspace/models \
+  ian139/scenicdriver-remote-training:latest \
+  python -m src.data_pipeline.s3 download-file \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --key "$SCENIC_VALIDATION_CHECKPOINT_KEY" \
+  --dest models/validation_checkpoint.pt \
+  --required
+docker run --rm \
+  --env-file /root/.scenic/aws.env \
+  -v /workspace/scenic-data:/workspace/data/processed/regression \
+  -v /workspace/scenic-models:/workspace/models \
+  ian139/scenicdriver-remote-training:latest \
+  python -m src.data_pipeline.s3 download-file \
+  --bucket "$SCENIC_S3_BUCKET" \
+  --key "$SCENIC_TRAIN_DATASET_KEY" \
+  --dest data/processed/regression/validation_features.npz \
+  --required
+
+docker run --rm --gpus all --name scenic-vast-validate \
   -v /workspace/scenic-data:/workspace/data/processed/regression \
   -v /workspace/scenic-models:/workspace/models \
   -v /workspace/scenic-artifacts:/workspace/scenic_artifacts \
   ian139/scenicdriver-remote-training:latest \
   python scripts/remote/vast_train.py validate --device cuda \
+  --checkpoint models/validation_checkpoint.pt \
+  --dataset data/processed/regression/validation_features.npz \
+  --output scenic_artifacts/validation_result.json
 ```
 
 ### Provisioning gates
@@ -269,13 +311,17 @@ For a normal run, use the repository wrapper. It allocates a host, copies the
 runtime secret env file, validates the remote setup before training, copies
 artifacts back, and destroys the instance by default. Set `SCENIC_S3_BUCKET` in
 the environment or pass `--s3-bucket`; `--train-dataset-key` is the S3 object key
-for the training dataset.
+for the training dataset and `--benchmark-split-key` is the exact S3 object key
+of the benchmark split CSV whose val/test identities are excluded from training.
+Both are required and downloaded with `--required`, so a missing key fails the
+run before training starts.
 
 ```bash
 export SCENIC_S3_BUCKET=scenicdriver-data
 
 python scripts/remote/vast_train.py run <task-name> \
   --train-dataset-key <key> \
+  --benchmark-split-key <split-csv-key> \
   --epochs 1 \
   --batch-size 64
 
@@ -293,7 +339,13 @@ that file untracked. State is recorded at
 sentinel paths), so if the local orchestrator dies, rerun the cleanup command.
 Use `--no-destroy` only when deliberately retaining the host for investigation;
 otherwise failed runs are destroyed by default unless `--keep-on-failure` is
-requested.
+requested. One exception is never destroyed automatically: when the remote
+training launch itself is unacknowledged (the call raising after the detached
+command may already be running), the run records `launch_outcome: "unknown"`
+in the state file and keeps the host regardless of `--no-destroy` /
+`--keep-on-failure`, because training may be running on it. Recover or destroy
+that host only via the explicit `cleanup ... --copy-artifacts --destroy --yes`
+command.
 
 ## Monitoring and emergency cleanup
 

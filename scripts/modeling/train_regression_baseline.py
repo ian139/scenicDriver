@@ -1,7 +1,13 @@
 """
 Train baseline scenic regression model from exported .npz features.
 
-Expected input comes from scripts/modeling/export_regression_dataset.py.
+Expected input comes from scripts/modeling/export_regression_dataset.py. Fixed
+benchmark val/test identities (and embedded held-out splits) are excluded before
+the remaining training population receives its internal validation split. The
+resulting validation membership is derived by the shared derivation in
+scripts/modeling/regression_split.py, passed explicitly to the trainer, and
+persisted as a split artifact consumed by evaluate_regression_baseline.py so
+evaluation scores exactly the rows the model validated on.
 """
 
 from __future__ import annotations
@@ -9,22 +15,41 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+import tempfile
+
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.scenic_scorer.regression import resolve_device, train_regression_model  # noqa: E402
+from scripts.modeling.regression_split import (  # noqa: E402
+    derive_validation_membership,
+    training_arrays,
+    write_split_artifact,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train scenic regression baseline")
     parser.add_argument("--dataset", type=Path, required=True, help="Path to exported .npz dataset")
+    parser.add_argument("--benchmark-split-csv", type=Path, required=True)
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("models/scenic_regression_baseline.pt"),
         help="Where to save best baseline checkpoint",
+    )
+    parser.add_argument(
+        "--split-artifact",
+        type=Path,
+        default=None,
+        help=(
+            "Where to write the training validation-membership split artifact "
+            "consumed by evaluate_regression_baseline.py "
+            "(default: <output stem>.split.json)"
+        ),
     )
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -40,7 +65,12 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Use sample_weights array from dataset during optimization",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.epochs < 1:
+        parser.error("--epochs must be >= 1")
+    if args.split_artifact is None:
+        args.split_artifact = args.output.with_suffix(".split.json")
+    return args
 
 
 def main() -> None:
@@ -48,22 +78,42 @@ def main() -> None:
 
     device = resolve_device(args.device)
 
-    best_corr = train_regression_model(
-        data_path=args.dataset,
-        output_path=args.output,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        learning_rate=args.lr,
+    membership = derive_validation_membership(
+        args.dataset,
+        args.benchmark_split_csv,
         val_split=args.val_split,
         seed=args.seed,
-        device=device,
-        weight_decay=args.weight_decay,
-        use_sample_weights=args.use_sample_weights,
+    )
+    arrays = training_arrays(args.dataset, args.benchmark_split_csv)
+    with tempfile.TemporaryDirectory(prefix="scenic-baseline-") as directory:
+        training_path = Path(directory) / "training.npz"
+        np.savez_compressed(training_path, **arrays)
+        best_corr = train_regression_model(
+            data_path=training_path,
+            output_path=args.output,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            learning_rate=args.lr,
+            val_split=args.val_split,
+            seed=args.seed,
+            device=device,
+            weight_decay=args.weight_decay,
+            use_sample_weights=args.use_sample_weights,
+            train_indices=membership.train_indices,
+            val_indices=membership.val_indices,
+        )
+
+    write_split_artifact(
+        args.split_artifact,
+        membership,
+        dataset_path=args.dataset,
+        benchmark_split_csv=args.benchmark_split_csv,
     )
 
     print(f"Best validation correlation: {best_corr:.4f}")
     print(f"Saved checkpoint: {args.output}")
+    print(f"Saved split artifact: {args.split_artifact}")
 
 
 if __name__ == "__main__":

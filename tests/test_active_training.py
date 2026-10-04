@@ -266,6 +266,134 @@ def test_prepare_intersects_fixed_split_and_emits_exact_filtered_artifacts(
     )
 
 
+def _rewrite_candidate_tiles(
+    handoff: Path, run: Path, updates: dict[int, dict[str, Any]]
+) -> None:
+    candidate_path = run / "candidate_pool.csv"
+    candidate = pd.read_csv(candidate_path)
+    for row, values in updates.items():
+        for column, value in values.items():
+            candidate.loc[row, column] = value
+    candidate.to_csv(candidate_path, index=False)
+    payload = json.loads(handoff.read_text(encoding="utf-8"))
+    payload["artifacts"]["candidate_pool"]["sha256"] = _sha256(candidate_path)
+    handoff.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_prepare_rejects_same_physical_tile_across_regions_and_splits(
+    tmp_path: Path,
+) -> None:
+    handoff, _, run = _fixture(tmp_path)
+    # tile-2 (val) is the physical tile of tile-0 (train) under another region.
+    _rewrite_candidate_tiles(
+        handoff,
+        run,
+        {2: {"region": "other", "x": 0, "tile_identity": "other/z14/x0/y0"}},
+    )
+    with pytest.raises(ActiveTrainingError, match="geographic leakage"):
+        prepare_active_dataset(handoff, run / "prepared.npz")
+
+
+def test_prepare_rejects_adjacent_physical_tiles_across_regions(
+    tmp_path: Path,
+) -> None:
+    handoff, _, run = _fixture(tmp_path)
+    _rewrite_candidate_tiles(
+        handoff,
+        run,
+        {2: {"region": "other", "x": 1, "tile_identity": "other/z14/x1/y0"}},
+    )
+    with pytest.raises(ActiveTrainingError, match="adjacent geographic tiles"):
+        prepare_active_dataset(handoff, run / "prepared.npz")
+
+
+def test_prepare_rejects_tile_identity_disagreeing_with_coordinates(
+    tmp_path: Path,
+) -> None:
+    handoff, _, run = _fixture(tmp_path)
+    # A region-qualified tile_identity cannot relocate a row's physical tile.
+    _rewrite_candidate_tiles(handoff, run, {2: {"tile_identity": "other/z14/x0/y0"}})
+    with pytest.raises(ActiveTrainingError, match="tile_identity disagrees"):
+        prepare_active_dataset(handoff, run / "prepared.npz")
+
+
+def test_prepare_deduplicates_physical_tile_within_split(tmp_path: Path) -> None:
+    handoff, _, run = _fixture(tmp_path)
+    # tile-1 (train, weak) duplicates tile-0 (train, human) under another region.
+    _rewrite_candidate_tiles(
+        handoff,
+        run,
+        {1: {"region": "other", "x": 0, "tile_identity": "other/z14/x0/y0"}},
+    )
+    result = prepare_active_dataset(handoff, run / "prepared.npz")
+
+    assert result["dropped_physical_duplicates"] == 1
+    assert result["counts"] == {
+        "rows": 5,
+        "train": 1,
+        "val": 2,
+        "test": 2,
+        "human": 1,
+        "weak": 4,
+    }
+    expected_paths = ["tile-0.png", "tile-2.png", "tile-3.png", "tile-4.png", "tile-5.png"]
+    with np.load(run / "prepared.npz", allow_pickle=False) as arrays:
+        assert arrays["image_paths"].tolist() == expected_paths
+        assert arrays["scenic_scores"].tolist() == [8, 3, 4, 5, 6]
+        assert arrays["label_sources"].tolist()[0] == "human"
+        assert arrays["vit_embeddings"][:, 0].tolist() == [0, 8, 12, 16, 20]
+    filtered_index = pd.read_csv(result["filtered_index_path"])
+    filtered_labels = pd.read_csv(result["filtered_labels_path"])
+    assert filtered_index["image_path"].tolist() == expected_paths
+    assert filtered_index["candidate_row_index"].tolist() == [0, 2, 3, 4, 5]
+    assert filtered_labels["image_path"].tolist() == expected_paths
+
+
+def _rebind_registry_active(
+    handoff: Path, run: Path, active: dict[str, Any]
+) -> None:
+    registry = run / "registry.json"
+    registry.write_text(json.dumps({"active": active}), encoding="utf-8")
+    payload = json.loads(handoff.read_text(encoding="utf-8"))
+    payload["artifacts"]["baseline_registry"]["sha256"] = _sha256(registry)
+    payload["baseline"]["registry_sha256"] = _sha256(registry)
+    payload["baseline"]["active"] = active
+    handoff.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_baseline_checkpoint_must_be_registry_active_checkpoint(
+    tmp_path: Path,
+) -> None:
+    handoff, _, run = _fixture(tmp_path)
+    other = run / "other.pt"
+    other.write_bytes(b"different active checkpoint")
+    # The registry-active record names other.pt while the handoff baseline
+    # still hash-verifies the unrelated baseline.pt.
+    _rebind_registry_active(handoff, run, {"checkpoint": other.name})
+    with pytest.raises(ActiveTrainingError, match="registry-active checkpoint"):
+        prepare_active_dataset(handoff, run / "prepared.npz")
+
+
+def test_baseline_registry_active_sha_must_match_checkpoint(tmp_path: Path) -> None:
+    handoff, _, run = _fixture(tmp_path)
+    _rebind_registry_active(
+        handoff, run, {"checkpoint": "baseline.pt", "sha256": "0" * 64}
+    )
+    with pytest.raises(ActiveTrainingError, match="registry-active checkpoint"):
+        prepare_active_dataset(handoff, run / "prepared.npz")
+
+
+def test_baseline_accepts_registry_relative_active_checkpoint(tmp_path: Path) -> None:
+    handoff, _, run = _fixture(tmp_path)
+    _rebind_registry_active(
+        handoff,
+        run,
+        {"checkpoint": "baseline.pt", "sha256": _sha256(run / "baseline.pt")},
+    )
+    result = prepare_active_dataset(handoff, run / "prepared.npz")
+    assert result["counts"]["rows"] == 6
+
+
 def test_false_readiness_and_hash_mismatch_fail_closed(tmp_path: Path) -> None:
     handoff, _, run = _fixture(tmp_path)
     payload = json.loads(handoff.read_text(encoding="utf-8"))
@@ -1366,3 +1494,257 @@ def test_resume_does_not_require_initial_checkpoint_file(tmp_path: Path) -> None
     assert resumed["state"] == "completed"
     assert resumed["initial_checkpoint"] is not None
     assert resumed["initial_checkpoint"]["sha256"] == initial_sha
+
+
+@pytest.mark.parametrize("training", [True, False])
+def test_metrics_restores_model_mode(training: bool) -> None:
+    from src.scenic_scorer.active_training import _metrics
+
+    model = ScenicRegressionModel(vit_dim=2, terrain_dim=1, num_classes=1)
+    model.train(training)
+    arrays = {
+        "vit_embeddings": np.zeros((3, 2), dtype=np.float32),
+        "terrain_features": np.zeros((3, 1), dtype=np.float32),
+        "class_logits": np.zeros((3, 1), dtype=np.float32),
+        "scenic_scores": np.array([1, 2, 3], dtype=np.float32),
+        "sample_weights": np.ones(3, dtype=np.float32),
+    }
+    _metrics(model, arrays, np.arange(3), "cpu", True)
+    assert model.training is training
+
+
+def test_metrics_restores_training_mode_after_inference_failure() -> None:
+    from src.scenic_scorer.active_training import _metrics
+
+    class BrokenModel(torch.nn.Module):
+        def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
+            assert not self.training
+            raise RuntimeError("inference failed")
+
+    model = BrokenModel()
+    arrays = {
+        "vit_embeddings": np.zeros((1, 2), dtype=np.float32),
+        "terrain_features": np.zeros((1, 1), dtype=np.float32),
+        "class_logits": np.zeros((1, 1), dtype=np.float32),
+        "scenic_scores": np.array([1], dtype=np.float32),
+        "sample_weights": np.ones(1, dtype=np.float32),
+    }
+    with pytest.raises(RuntimeError, match="inference failed"):
+        _metrics(model, arrays, np.arange(1), "cpu", True)
+    assert model.training
+
+
+@pytest.mark.parametrize("weighted", [True, False])
+def test_metrics_bounds_inference_and_preserves_statistics(weighted: bool) -> None:
+    from src.scenic_scorer.active_training import _metrics
+
+    class IdentityModel(torch.nn.Module):
+        def forward(self, vit: torch.Tensor, *inputs: torch.Tensor) -> torch.Tensor:
+            assert not self.training
+            assert len(vit) <= 2
+            return vit[:, :1]
+
+    model = IdentityModel()
+    target = np.array([2, 1, 5, 4, 6], dtype=np.float32)
+    prediction = np.array([1, 2, 3, 4, 5], dtype=np.float32)
+    weights = np.array([1, 2, 3, 4, 5], dtype=np.float32)
+    arrays = {
+        "vit_embeddings": prediction.reshape(-1, 1),
+        "terrain_features": np.zeros((5, 1), dtype=np.float32),
+        "class_logits": np.zeros((5, 1), dtype=np.float32),
+        "scenic_scores": target,
+        "sample_weights": weights,
+    }
+    result = _metrics(model, arrays, np.arange(5), "cpu", weighted, batch_size=2)
+    metric_weights = weights if weighted else np.ones_like(weights)
+    error = prediction - target
+    assert result["mse"] == pytest.approx(np.average(error ** 2, weights=metric_weights))
+    assert result["mae"] == pytest.approx(np.average(abs(error), weights=metric_weights))
+    assert result["pearson"] == pytest.approx(np.corrcoef(prediction, target)[0, 1])
+    assert result["count"] == 5
+    assert model.training
+
+
+class _HardKill(BaseException):
+    """Stand-in for SIGKILL: no training exception handler may observe it."""
+
+
+def _prepared(tmp_path: Path) -> tuple[Path, Path, Path]:
+    handoff, split_csv, run = _fixture(tmp_path)
+    dataset = run / "prepared.npz"
+    prepare_active_dataset(handoff, dataset)
+    return dataset, split_csv, run
+
+
+def test_hard_kill_after_batch_commit_resumes_latest_generation_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.scenic_scorer.active_training as active_training
+
+    dataset, split_csv, run = _prepared(tmp_path)
+    config = ActiveTrainingConfig(epochs=3, batch_size=1, device="cpu", seed=7)
+    reference = train_active_model(dataset, split_csv, run / "reference", config)
+    assert reference["state"] == "completed"
+
+    output = run / "killed"
+    real_atomic_torch = active_training._atomic_torch
+    resume_commits = 0
+
+    def kill_after_third_resume_commit(path: Path, value: Any) -> None:
+        nonlocal resume_commits
+        real_atomic_torch(path, value)
+        if path.name == "resume.pt":
+            resume_commits += 1
+            if resume_commits == 3:
+                raise _HardKill
+
+    monkeypatch.setattr(
+        active_training, "_atomic_torch", kill_after_third_resume_commit
+    )
+    with pytest.raises(_HardKill):
+        train_active_model(dataset, split_csv, output, config)
+    monkeypatch.undo()
+    # Initial generation plus two batch generations committed; no sidecar yet.
+    assert not (output / "training_summary.json").exists()
+
+    resumed = train_active_model(dataset, split_csv, output, config, resume=True)
+    assert resumed["state"] == "completed"
+    assert resumed["global_step"] == reference["global_step"] == 6
+    assert resumed["steps_this_invocation"] == 4
+    assert resumed["history"] == reference["history"]
+    assert resumed["metrics"] == reference["metrics"]
+    expected = torch.load(run / "reference" / "candidate.pt", weights_only=False)
+    actual = torch.load(output / "candidate.pt", weights_only=False)
+    for key, tensor in expected["model_state_dict"].items():
+        assert torch.equal(actual["model_state_dict"][key], tensor), key
+
+
+def test_sidecar_publication_failure_recovers_paused_and_completed_generations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.scenic_scorer.active_training as active_training
+
+    dataset, split_csv, run = _prepared(tmp_path)
+    output = run / "training"
+    summary_path = output / "training_summary.json"
+    real_atomic_json = active_training._atomic_json
+
+    def fail_summary_in_state(state: str) -> Any:
+        def publish(path: Path, value: Any) -> None:
+            if path.name == "training_summary.json" and value.get("state") == state:
+                raise OSError("injected sidecar failure")
+            real_atomic_json(path, value)
+
+        return publish
+
+    monkeypatch.setattr(active_training, "_atomic_json", fail_summary_in_state("paused"))
+    with pytest.raises(OSError, match="injected sidecar failure"):
+        train_active_model(
+            dataset,
+            split_csv,
+            output,
+            ActiveTrainingConfig(epochs=1, batch_size=1, max_steps=1, device="cpu"),
+        )
+    assert not summary_path.exists()
+
+    monkeypatch.setattr(
+        active_training, "_atomic_json", fail_summary_in_state("completed")
+    )
+    with pytest.raises(OSError, match="injected sidecar failure"):
+        train_active_model(
+            dataset,
+            split_csv,
+            output,
+            ActiveTrainingConfig(epochs=1, batch_size=1, max_steps=8, device="cpu"),
+            resume=True,
+        )
+    # Resume republished the committed paused generation before training on.
+    stale = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert stale["state"] == "paused"
+    assert stale["global_step"] == 1
+    monkeypatch.undo()
+
+    recovered = train_active_model(
+        dataset,
+        split_csv,
+        output,
+        ActiveTrainingConfig(epochs=1, batch_size=1, max_steps=8, device="cpu"),
+        resume=True,
+    )
+    assert recovered["reused"] is True
+    assert recovered["state"] == "completed"
+    assert recovered["global_step"] == 2
+    assert recovered["run_id"] == stale["run_id"]
+    assert recovered["resume_generation"] > stale["resume_generation"]
+    assert recovered["candidate_checkpoint_sha256"] == _sha256(output / "candidate.pt")
+    assert recovered["resume_checkpoint_sha256"] == _sha256(output / "resume.pt")
+
+
+def _pause_during_metrics_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_call: int
+) -> tuple[dict[str, Any], Path, Path, Path, ActiveTrainingConfig]:
+    import src.scenic_scorer.active_training as active_training
+
+    dataset, split_csv, run = _prepared(tmp_path)
+    output = run / "training"
+    config = ActiveTrainingConfig(epochs=2, batch_size=2, device="cpu")
+    real_metrics = active_training._metrics
+    calls = 0
+
+    def deadline_on_call(*args: Any, **kwargs: Any) -> dict[str, float]:
+        nonlocal calls
+        calls += 1
+        if calls == failing_call:
+            raise TimeoutError("orchestrator deadline exceeded")
+        return real_metrics(*args, **kwargs)
+
+    monkeypatch.setattr(active_training, "_metrics", deadline_on_call)
+    paused = train_active_model(dataset, split_csv, output, config)
+    monkeypatch.undo()
+    return paused, dataset, split_csv, output, config
+
+
+@pytest.mark.parametrize(
+    ("failing_call", "epochs_completed"),
+    [(3, 1), (5, 2)],  # final-epoch history metrics; finalization metrics
+)
+def test_final_epoch_deadline_resumes_to_completion_without_training(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_call: int,
+    epochs_completed: int,
+) -> None:
+    paused, dataset, split_csv, output, config = _pause_during_metrics_call(
+        tmp_path, monkeypatch, failing_call
+    )
+    assert paused["state"] == "paused"
+    assert paused["global_step"] == 2
+    assert paused["epochs_completed"] == epochs_completed
+    assert len(paused["history"]) == epochs_completed
+
+    resumed = train_active_model(dataset, split_csv, output, config, resume=True)
+    assert resumed["state"] == "completed"
+    assert resumed["global_step"] == 2
+    assert resumed["steps_this_invocation"] == 0
+    assert [entry["epoch"] for entry in resumed["history"]] == [0, 1]
+    assert set(resumed["metrics"]) == {"train", "val"}
+
+
+def test_final_epoch_cursor_rejects_batch_offset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, dataset, split_csv, output, config = _pause_during_metrics_call(
+        tmp_path, monkeypatch, failing_call=5
+    )
+    resume_path = output / "resume.pt"
+    summary_path = output / "training_summary.json"
+    checkpoint = torch.load(resume_path, weights_only=False)
+    assert (checkpoint["next_epoch"], checkpoint["next_batch"]) == (2, 0)
+    # Cursor arithmetic stays consistent so only the final-cursor rule rejects.
+    checkpoint["next_batch"], checkpoint["global_step"] = 1, 3
+    torch.save(checkpoint, resume_path)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["resume_checkpoint_sha256"] = _sha256(resume_path)
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    with pytest.raises(ActiveTrainingError, match="final epoch cursor"):
+        train_active_model(dataset, split_csv, output, config, resume=True)

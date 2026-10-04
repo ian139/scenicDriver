@@ -1,5 +1,10 @@
 """
 Evaluate a trained scenic regression baseline checkpoint on an exported .npz dataset.
+
+Validation membership is not guessed here: it is exactly the membership the
+trained model used during training, reproduced from the split artifact written
+by train_regression_baseline.py through the shared derivation in
+scripts/modeling/regression_split.py.
 """
 
 from __future__ import annotations
@@ -18,29 +23,23 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.scenic_scorer.regression import ScenicRegressionModel, ScenicScoreDataset, resolve_device  # noqa: E402
+from scripts.modeling.regression_split import load_validation_membership  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate scenic regression baseline")
     parser.add_argument("--dataset", type=Path, required=True, help="Path to exported .npz dataset")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to trained baseline checkpoint")
-    parser.add_argument("--val-split", type=float, default=0.15, help="Validation split used during training")
-    parser.add_argument("--seed", type=int, default=42, help="Split seed")
+    parser.add_argument(
+        "--split-artifact",
+        type=Path,
+        required=True,
+        help="Training split artifact whose validation membership is evaluated",
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument("--metrics-json", type=Path, default=None, help="Optional output metrics json path")
     return parser.parse_args()
-
-
-def _build_val_indices(n: int, val_split: float, seed: int) -> np.ndarray:
-    indices = np.arange(n)
-    np.random.seed(seed)
-    np.random.shuffle(indices)
-    split = max(1, int(n * (1 - val_split)))
-    val_idx = indices[split:]
-    if len(val_idx) == 0:
-        val_idx = indices[-1:]
-    return val_idx
 
 
 def _safe_corr(preds: np.ndarray, targets: np.ndarray) -> float:
@@ -55,9 +54,9 @@ def main() -> None:
 
     device = resolve_device(args.device)
 
+    membership = load_validation_membership(args.dataset, args.split_artifact)
     ds = ScenicScoreDataset(args.dataset)
-    val_idx = _build_val_indices(len(ds), args.val_split, args.seed)
-    val_ds = torch.utils.data.Subset(ds, val_idx.tolist())
+    val_ds = torch.utils.data.Subset(ds, membership.val_dataset_indices.tolist())
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     ckpt = torch.load(args.checkpoint, map_location=device)
@@ -94,8 +93,9 @@ def main() -> None:
         "mae": mae,
         "rmse": rmse,
         "corr": corr,
-        "val_split": args.val_split,
-        "seed": args.seed,
+        "val_split": membership.val_split,
+        "seed": membership.seed,
+        "split_artifact": str(args.split_artifact),
         "dataset": str(args.dataset),
         "checkpoint": str(args.checkpoint),
     }

@@ -282,6 +282,11 @@ def _load_and_reproject_raster(
     Returns (data_array, valid_mask_array).
     data_array shape: (bands_count, H, W)
     valid_mask_array shape: (H, W)
+
+    Source validity is the dataset mask AND each used band's effective GDAL
+    mask (per-dataset mask, then alpha, then nodata precedence) AND finite
+    band values. DEM sources must declare identity scale/offset because their
+    stored values are consumed as raw meters.
     """
     local_p = validate_local_path(source_path)
     height = target_grid.height
@@ -311,6 +316,15 @@ def _load_and_reproject_raster(
                 raise ValueError(
                     f"DEM source must be a single floating-point band: {local_p}"
                 )
+            scale, offset = float(src.scales[0]), float(src.offsets[0])
+            if not (math.isfinite(scale) and math.isfinite(offset)) or (
+                scale,
+                offset,
+            ) != (1.0, 0.0):
+                raise ValueError(
+                    "DEM source must declare identity scale/offset for raw "
+                    f"meters, got scale={scale} offset={offset}: {local_p}"
+                )
         elif src.count < bands_count or any(
             np.dtype(dtype) != np.dtype("uint8") for dtype in src.dtypes[:bands_count]
         ):
@@ -321,13 +335,7 @@ def _load_and_reproject_raster(
         source_bands: list[np.ndarray] = []
         for b in range(1, src_count + 1):
             band_data = src.read(b).astype(np.float64)
-            band_valid = np.isfinite(band_data)
-            if src.nodata is not None:
-                if np.isnan(src.nodata):
-                    band_valid &= ~np.isnan(band_data)
-                else:
-                    band_valid &= band_data != src.nodata
-            src_valid &= band_valid
+            src_valid &= (src.read_masks(b) > 0) & np.isfinite(band_data)
             source_bands.append(band_data)
 
         reprojected = np.full((bands_count, height, width), np.nan, dtype=np.float64)

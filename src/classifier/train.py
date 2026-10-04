@@ -15,6 +15,9 @@ Target: 94%+ accuracy on RESISC45 test set
 """
 
 import argparse
+import hashlib
+import json
+import math
 from pathlib import Path
 from typing import Optional, Tuple, Union
 import random
@@ -26,7 +29,10 @@ from torchvision import datasets, transforms
 from tqdm import tqdm
 import numpy as np
 
+from src.scenic_scorer.regression import resolve_device
+
 from .inference import get_training_transform, get_inference_transform
+from .model import TERRAIN_CLASSES
 
 
 def seed_everything(seed: int = 42) -> None:
@@ -47,6 +53,58 @@ def _best_acc_from_checkpoint(checkpoint: dict) -> float:
             "resume checkpoints must be written by the current classifier trainer"
         )
     return float(checkpoint["best_acc"])
+
+
+_HISTORY_KEYS = ("train_loss", "val_loss", "val_acc", "lr")
+
+
+def _history_from_checkpoint(checkpoint: dict) -> dict:
+    """
+    Read the canonical metric history required by current checkpoints.
+
+    Raises:
+        ValueError: If 'history' is missing, not a dict, or lacks a required list
+    """
+    if "history" not in checkpoint:
+        raise ValueError(
+            "Checkpoint is missing required 'history'; "
+            "resume checkpoints must be written by the current classifier trainer"
+        )
+    history = checkpoint["history"]
+    if not isinstance(history, dict):
+        raise ValueError(
+            "Checkpoint 'history' must be a dict of metric lists; "
+            "resume checkpoints must be written by the current classifier trainer"
+        )
+    for key in _HISTORY_KEYS:
+        if not isinstance(history.get(key), list):
+            raise ValueError(
+                f"Checkpoint 'history' is missing required list '{key}'; "
+                "resume checkpoints must be written by the current classifier trainer"
+            )
+    return history
+
+
+def _verify_split_identity(checkpoint: dict, split_identity: dict) -> None:
+    """
+    Fail resume unless the checkpoint records the run's dataset split identity.
+
+    Raises:
+        ValueError: If 'split_identity' is missing or differs from the split
+            created for this run
+    """
+    if "split_identity" not in checkpoint:
+        raise ValueError(
+            "Checkpoint is missing required 'split_identity'; "
+            "resume checkpoints must be written by the current classifier trainer"
+        )
+    recorded = checkpoint["split_identity"]
+    if recorded != split_identity:
+        raise ValueError(
+            "Checkpoint 'split_identity' does not match the dataset split created "
+            f"for this run; checkpoint={recorded!r}, current={split_identity!r}. "
+            "Resume against the same dataset contents and seed, or train from scratch"
+        )
 
 
 
@@ -76,6 +134,11 @@ def create_dataloaders(
     The dataset is split into train/val maintaining class balance.
     Training uses augmentation, validation uses only resize + normalize.
 
+    Each class keeps at least one training image; singleton classes are train-only.
+    Classes with two or more images also keep at least one validation image.
+    A dataset must provide at least one validation image overall. For training
+    sets smaller than one batch, the partial batch is retained rather than dropped.
+
     Args:
         data_dir: Path to RESISC45 dataset root directory
         batch_size: Batch size for training (default: 256)
@@ -89,9 +152,11 @@ def create_dataloaders(
         Tuple of (train_loader, val_loader)
 
     Raises:
-        ValueError: If data_dir doesn't exist or is empty
+        ValueError: If the dataset/classes/split cannot support training and validation
     """
     data_dir = Path(data_dir)
+    if not 0 < val_split < 1:
+        raise ValueError("val_split must be strictly between 0 and 1")
     if not data_dir.exists():
         raise ValueError(f"Dataset directory not found: {data_dir}")
 
@@ -108,6 +173,11 @@ def create_dataloaders(
 
     # Load full dataset with train transform (we'll override for val)
     full_dataset = datasets.ImageFolder(root=data_dir, transform=train_transform)
+    if full_dataset.classes != TERRAIN_CLASSES:
+        raise ValueError(
+            "Dataset class order must match classifier TERRAIN_CLASSES: "
+            f"expected {TERRAIN_CLASSES}, got {full_dataset.classes}"
+        )
 
     print(f"Total images: {len(full_dataset)}")
     print(f"Classes: {full_dataset.classes[:5]}... ({len(full_dataset.classes)} total)")
@@ -127,9 +197,14 @@ def create_dataloaders(
     rng = np.random.RandomState(seed)
     for label, indices in class_indices.items():
         rng.shuffle(indices)
-        split_point = int(len(indices) * (1 - val_split))
+        split_point = max(1, int(len(indices) * (1 - val_split)))
+        if len(indices) > 1:
+            split_point = min(split_point, len(indices) - 1)
         train_indices.extend(indices[:split_point])
         val_indices.extend(indices[split_point:])
+
+    if not val_indices:
+        raise ValueError("Dataset needs at least one class with two images for validation")
 
     print(f"Train samples: {len(train_indices)}")
     print(f"Val samples: {len(val_indices)}")
@@ -152,7 +227,7 @@ def create_dataloaders(
     train_loader = DataLoader(
         train_dataset,
         shuffle=True,
-        drop_last=True,  # Drop incomplete batches for stable batch norm
+        drop_last=len(train_dataset) >= batch_size,
         **loader_kwargs,
     )
 
@@ -338,6 +413,12 @@ def train(
     4. Apply label smoothing for better generalization
     5. Use gradient clipping for stability
 
+    Checkpoints preserve optimizer, scheduler, scaler, and metric history across
+    resume. Split identity records the seed and a SHA256 manifest of class order,
+    relative image paths, labels, and train/validation membership (not file contents).
+    Resume verifies the checkpoint's split identity against the split created from
+    the dataset on disk and fails when they differ.
+
     Args:
         data_dir: Path to RESISC45 dataset
         output_dir: Directory to save checkpoints and best model
@@ -355,16 +436,14 @@ def train(
         label_smoothing: Label smoothing factor (default: 0.1)
         gradient_clip: Max gradient norm (default: 1.0)
     """
+    if resume is not None and not Path(resume).is_file():
+        raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
+
     # Set seeds for reproducibility
     seed_everything(seed)
 
     if device is None:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+        device = resolve_device()
 
     print("=" * 60)
     print("Landscape Classifier Training")
@@ -405,9 +484,28 @@ def train(
         data_dir,
         batch_size=batch_size,
         num_workers=num_workers,
+        seed=seed,
         use_resisc45_stats=use_resisc45_stats,
         pin_memory=pin_memory,
     )
+    dataset = train_loader.dataset.dataset
+    split_manifest = {
+        "classes": dataset.classes,
+        "train": [
+            (Path(dataset.samples[i][0]).relative_to(data_dir).as_posix(), dataset.samples[i][1])
+            for i in train_loader.dataset.indices
+        ],
+        "validation": [
+            (Path(dataset.samples[i][0]).relative_to(data_dir).as_posix(), dataset.samples[i][1])
+            for i in val_loader.dataset.indices
+        ],
+    }
+    split_identity = {
+        "seed": seed,
+        "sha256": hashlib.sha256(
+            json.dumps(split_manifest, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+    }
 
     # Training setup
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
@@ -428,34 +526,35 @@ def train(
             return (epoch + 1) / warmup_epochs
         else:
             progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
+            return 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Resume from checkpoint
     start_epoch = 0
     best_acc = 0.0
-
-    if resume and Path(resume).exists():
-        print(f"\nResuming from checkpoint: {resume}")
-        checkpoint = torch.load(resume, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scaler.load_state_dict(checkpoint["scaler_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
-        best_acc = _best_acc_from_checkpoint(checkpoint)
-        print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2%}")
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Training history for logging
     history = {
         "train_loss": [],
         "val_loss": [],
         "val_acc": [],
         "lr": [],
     }
+
+    if resume is not None:
+        print(f"\nResuming from checkpoint: {resume}")
+        checkpoint = torch.load(resume, map_location=device, weights_only=True)
+        _verify_split_identity(checkpoint, split_identity)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1
+        best_acc = _best_acc_from_checkpoint(checkpoint)
+        history = _history_from_checkpoint(checkpoint)
+        print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2%}")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Freeze backbone if requested
     if freeze_backbone_epochs > 0 and start_epoch < freeze_backbone_epochs:
@@ -513,6 +612,7 @@ def train(
             "val_acc": val_acc,
             "best_acc": best_acc,
             "history": history,
+            "split_identity": split_identity,
         }, output_dir / "checkpoint.pt")
 
         # Early stopping check - if we hit target accuracy
@@ -520,7 +620,6 @@ def train(
             print(f"\n*** Target accuracy (94%) reached at epoch {epoch + 1}! ***")
 
     # Save training history
-    import json
     with open(output_dir / "training_history.json", "w") as f:
         json.dump(history, f, indent=2)
 

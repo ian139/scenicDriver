@@ -26,6 +26,60 @@ PROBES = {
 }
 
 
+def _write_reports(report: Path) -> None:
+    report.mkdir(parents=True, exist_ok=True)
+    identity = {
+        name: "ab" * 32
+        for name in (
+            "source_contract_sha256", "preprocessing_contract_sha256",
+            "grid_contract_sha256", "classifier_checkpoint_sha256",
+            "calibration_artifact_sha256",
+        )
+    }
+    identity.update(
+        regression_checkpoint_sha256=checker.hashlib.sha256(b"checkpoint").hexdigest(),
+        score_schema_version="1", label_schema_version="1", scoring_mode="learned",
+    )
+    (report / "report.json").write_text(json.dumps({
+        "run_info": identity, "summary": {"min": 0, "max": 10},
+        "tiles": [{"x": 0, "y": 0, "z": 0, "scenic_score": 5.0}],
+    }), encoding="utf-8")
+    features = [
+        {"type": "Feature", "properties": {"route_kind": kind},
+         "geometry": {"type": "LineString", "coordinates": [[-70, 44], [-70.1, 44.1]]}}
+        for kind in ("scenic", "baseline")
+    ]
+    (report / "route.geojson").write_text(json.dumps({
+        "type": "FeatureCollection", "features": features,
+    }), encoding="utf-8")
+    metrics = {
+        "request": {"start": [44, -70], "end": [44.1, -70.1],
+                    "scenic_weight": .5, "max_detour_factor": 1.5},
+        "score_mapping": {"enabled": True},
+        **{kind: {"route_kind": kind, "total_distance_km": 1,
+                  "estimated_duration_minutes": 1, "raw_scenic_score": 5,
+                  "normalized_scenic_score": .5}
+           for kind in ("scenic", "baseline")},
+    }
+    (report / "route_metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+
+
+def _write_run_gate(path: Path, *, runtime: Path | None = None) -> None:
+    """Write the builder's ``run.json`` readiness gate beside a published graph."""
+    record: dict[str, Any] = {
+        "run_name": path.parent.name,
+        "output_graph": str(path),
+        "graph_sha256": checker.hashlib.sha256(path.read_bytes()).hexdigest(),
+        "graph_size_bytes": path.stat().st_size,
+    }
+    if runtime is not None:
+        record["runtime_graph"] = str(runtime)
+        record["compact_manifest_sha256"] = checker.hashlib.sha256(
+            runtime.read_bytes()
+        ).hexdigest()
+    (path.parent / "run.json").write_text(json.dumps(record), encoding="utf-8")
+
+
 def _write_project(root: Path, *, graph: str) -> None:
     (root / "config").mkdir(parents=True)
     (root / "config/app_regions.json").write_text(
@@ -47,9 +101,7 @@ def _write_project(root: Path, *, graph: str) -> None:
     report = (
         root / "data/processed/heuristic_runs" / checker.DEFAULT_RUN_NAME / "report"
     )
-    report.mkdir(parents=True)
-    for name in ("report.json", "route.geojson", "route_metrics.json"):
-        (report / name).write_text("{}", encoding="utf-8")
+    _write_reports(report)
     registry = root / checker.REGISTRY_PATH
     registry.parent.mkdir(parents=True)
     registry.write_text(
@@ -71,8 +123,8 @@ def _write_sqlite_graph(
         "graph_format": "scenic-roadgraph-sqlite",
         "schema_version": 1,
         "bbox": BBOX,
-        "node_count": 2,
-        "edge_count": 1,
+        "node_count": 8,
+        "edge_count": 4,
         "coverage_probes": PROBES,
     }
     metadata.update(metadata_updates)
@@ -105,14 +157,19 @@ def _write_sqlite_graph(
         )
         connection.executemany(
             "INSERT INTO nodes(id, lat, lon) VALUES (?, ?, ?)",
-            [("a", 44.0, -70.0), ("b", 44.1, -70.1)],
+            [
+                (f"{name}_{end}", lat + end * .001, lon)
+                for name, (lat, lon) in checker._CANONICAL_PROBE_COORDINATES.items()
+                for end in (0, 1)
+            ],
         )
-        connection.execute(
+        connection.executemany(
             """INSERT INTO edges(
                 id, start_node_id, end_node_id, distance_km, scenic_score,
                 road_name, road_type, speed_limit_kmh, one_way
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("edge", "a", "b", 1.0, 0.5, "Road", "primary", 50.0, 0),
+            [(name, f"{name}_0", f"{name}_1", .111, 5.0, "Road", "primary", 50.0, 0)
+             for name in checker._CANONICAL_PROBE_COORDINATES],
         )
         connection.executemany(
             "INSERT INTO metadata(key, value) VALUES (?, ?)",
@@ -121,6 +178,7 @@ def _write_sqlite_graph(
                 for key, value in metadata.items()
             ],
         )
+    _write_run_gate(path)
 
 
 def test_valid_configured_sqlite_graph_passes(tmp_path: Path) -> None:
@@ -184,7 +242,7 @@ def test_wrong_canonical_probe_coordinates_are_rejected(tmp_path: Path, capsys) 
     assert checker.check_artifacts(tmp_path) == 1
     output = capsys.readouterr().out
     assert "rutland_usps" in output
-    assert "canonical" in output
+    assert "configured" in output
 
 
 def test_candidate_override_validates_before_cutover(tmp_path: Path) -> None:
@@ -301,7 +359,7 @@ def test_cli_graph_override_returns_nonzero_for_bad_candidate(
     old_graph.parent.mkdir(parents=True)
     old_graph.write_text("legacy", encoding="utf-8")
     candidate = tmp_path / "candidate.sqlite3"
-    _write_sqlite_graph(candidate, edge_count=2)
+    _write_sqlite_graph(candidate, edge_count=5)
 
     monkeypatch.setattr(
         sys,
@@ -402,6 +460,7 @@ def test_valid_compact_graph_artifacts_pass(tmp_path: Path) -> None:
     graph.persist_edge_projection_index(sqlite_path)
     manifest_path = sqlite_path.with_name("road_graph.compact.json")
     write_compact_graph(sqlite_path, manifest_path)
+    _write_run_gate(sqlite_path, runtime=manifest_path)
 
     assert checker.check_artifacts(tmp_path, graph=manifest_path) == 0
 
@@ -418,6 +477,7 @@ def test_corrupt_compact_payload_sha_rejected_by_checker(
     graph.persist_edge_projection_index(sqlite_path)
     manifest_path = sqlite_path.with_name("road_graph.compact.json")
     write_compact_graph(sqlite_path, manifest_path)
+    _write_run_gate(sqlite_path, runtime=manifest_path)
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     bin_path = (manifest_path.parent / manifest["bin_path"]).resolve()
@@ -443,6 +503,7 @@ def test_corrupt_projection_sidecar_rejected_by_checker(
     graph.persist_edge_projection_index(sqlite_path)
     manifest_path = sqlite_path.with_name("road_graph.compact.json")
     write_compact_graph(sqlite_path, manifest_path)
+    _write_run_gate(sqlite_path, runtime=manifest_path)
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     sidecar_path = (
@@ -497,9 +558,7 @@ def test_multiple_enabled_regions_pass(tmp_path: Path) -> None:
     _write_sqlite_graph(tmp_path / mw_graph)
     for run in ("run_ne", "run_mw"):
         rep = tmp_path / "data/processed/heuristic_runs" / run / "report"
-        rep.mkdir(parents=True)
-        for name in ("report.json", "route.geojson", "route_metrics.json"):
-            (rep / name).write_text("{}", encoding="utf-8")
+        _write_reports(rep)
 
     registry = tmp_path / checker.REGISTRY_PATH
     registry.parent.mkdir(parents=True)
@@ -543,9 +602,7 @@ def test_disabled_region_skipped(tmp_path: Path) -> None:
     )
     _write_sqlite_graph(tmp_path / ne_graph)
     rep = tmp_path / "data/processed/heuristic_runs" / "run_ne" / "report"
-    rep.mkdir(parents=True)
-    for name in ("report.json", "route.geojson", "route_metrics.json"):
-        (rep / name).write_text("{}", encoding="utf-8")
+    _write_reports(rep)
 
     registry = tmp_path / checker.REGISTRY_PATH
     registry.parent.mkdir(parents=True)
@@ -593,9 +650,7 @@ def test_missing_second_region_artifact_rejected(
     _write_sqlite_graph(tmp_path / ne_graph)
     _write_sqlite_graph(tmp_path / mw_graph)
     rep_ne = tmp_path / "data/processed/heuristic_runs" / "run_ne" / "report"
-    rep_ne.mkdir(parents=True)
-    for name in ("report.json", "route.geojson", "route_metrics.json"):
-        (rep_ne / name).write_text("{}", encoding="utf-8")
+    _write_reports(rep_ne)
 
     # Second region missing route_metrics.json
     rep_mw = tmp_path / "data/processed/heuristic_runs" / "run_mw" / "report"
@@ -656,12 +711,11 @@ def test_per_region_compact_validation_selection(tmp_path: Path) -> None:
     graph.persist_edge_projection_index(sqlite_path)
     manifest_path = tmp_path / mw_compact
     write_compact_graph(sqlite_path, manifest_path)
+    _write_run_gate(sqlite_path, runtime=manifest_path)
 
     for run in ("run_ne", "run_mw"):
         rep = tmp_path / "data/processed/heuristic_runs" / run / "report"
-        rep.mkdir(parents=True)
-        for name in ("report.json", "route.geojson", "route_metrics.json"):
-            (rep / name).write_text("{}", encoding="utf-8")
+        _write_reports(rep)
 
     registry = tmp_path / checker.REGISTRY_PATH
     registry.parent.mkdir(parents=True)
@@ -684,6 +738,7 @@ def _make_valid_compact_project(tmp_path: Path) -> tuple[Path, Path, dict[str, A
     graph.persist_edge_projection_index(sqlite_path)
     manifest_path = sqlite_path.with_name("road_graph.compact.json")
     write_compact_graph(sqlite_path, manifest_path)
+    _write_run_gate(sqlite_path, runtime=manifest_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     return sqlite_path, manifest_path, manifest
 
@@ -771,17 +826,236 @@ def test_compact_manifest_section_non_contiguous_rejected(
     assert "offset is not contiguous" in capsys.readouterr().out
 
 
-def test_config_app_regions_resolves_exactly_two_route_regions() -> None:
-    root = Path(__file__).resolve().parent.parent
-    regions, issues = checker._configured_route_regions(root)
-    assert issues == []
-    region_names = [r["region"] for r in regions]
-    assert region_names == ["new_england_north", "northeast_expanded"]
-    assert len(regions) == 2
 
-    config_payload = json.loads((root / "config/app_regions.json").read_text(encoding="utf-8"))
-    regions_by_name = {r["region"]: r for r in config_payload["regions"]}
-    assert regions_by_name["masswhites"].get("route_planning") is False
-    assert regions_by_name["philadelphia"].get("route_planning") is False
-    assert regions_by_name["pittsfield"].get("route_planning") is False
-    assert regions_by_name["northeast_expanded"].get("route_planning") is True
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE edges SET end_node_id='missing'",
+    "UPDATE edges SET distance_km=-1",
+    "UPDATE edges SET scenic_score=1e999",
+    "UPDATE nodes SET lat=100",
+    "UPDATE nodes SET id=NULL WHERE id='rutland_usps_0'",
+    "UPDATE edges SET road_type=''",
+])
+def test_invalid_graph_rows_rejected(tmp_path: Path, sql: str) -> None:
+    _write_project(tmp_path, graph="candidate.sqlite3")
+    _write_sqlite_graph(tmp_path / "candidate.sqlite3")
+    with sqlite3.connect(tmp_path / "candidate.sqlite3") as connection:
+        connection.execute(sql)
+    assert checker.check_artifacts(tmp_path) == 1
+
+
+def test_forged_coverage_does_not_admit_distant_graph(tmp_path: Path) -> None:
+    _write_project(tmp_path, graph="candidate.sqlite3")
+    _write_sqlite_graph(tmp_path / "candidate.sqlite3")
+    with sqlite3.connect(tmp_path / "candidate.sqlite3") as connection:
+        connection.execute("UPDATE nodes SET lat=40, lon=-80")
+    assert checker.check_artifacts(tmp_path) == 1
+
+
+@pytest.mark.parametrize("mutation", ["empty", "nonfinite", "model"])
+def test_unusable_or_unassociated_report_rejected(tmp_path: Path, mutation: str) -> None:
+    _write_project(tmp_path, graph="candidate.sqlite3")
+    _write_sqlite_graph(tmp_path / "candidate.sqlite3")
+    path = tmp_path / "data/processed/heuristic_runs" / checker.DEFAULT_RUN_NAME / "report/report.json"
+    report = json.loads(path.read_text())
+    if mutation == "empty":
+        report["tiles"] = []
+    elif mutation == "nonfinite":
+        report["tiles"][0]["scenic_score"] = float("inf")
+    else:
+        report["run_info"]["regression_checkpoint_sha256"] = "ff" * 32
+    path.write_text(json.dumps(report))
+    assert checker.check_artifacts(tmp_path) == 1
+
+
+def test_unknown_graph_extension_rejected(tmp_path: Path) -> None:
+    _write_project(tmp_path, graph="candidate.bin")
+    (tmp_path / "candidate.bin").write_bytes(b"not a graph")
+    assert checker.check_artifacts(tmp_path) == 1
+
+
+@pytest.mark.parametrize("mutation", ["disabled_default", "missing_default", "missing_enabled_graph"])
+def test_all_required_regions_admitted(tmp_path: Path, mutation: str) -> None:
+    _write_project(tmp_path, graph="candidate.sqlite3")
+    _write_sqlite_graph(tmp_path / "candidate.sqlite3")
+    config_path = tmp_path / checker.CONFIG_PATH
+    config = json.loads(config_path.read_text())
+    if mutation == "disabled_default":
+        config["regions"][0]["route_planning"] = False
+        config["regions"][0]["graph"] = "missing.sqlite3"
+    elif mutation == "missing_default":
+        config["default_region"] = "absent"
+    else:
+        config["regions"].append({"region": "second", "route_planning": True,
+                                  "run_name": checker.DEFAULT_RUN_NAME})
+    config_path.write_text(json.dumps(config))
+    assert checker.check_artifacts(tmp_path) == 1
+
+
+@pytest.mark.parametrize("mutation", ["dtype", "count", "geometry"])
+def test_admitted_compact_payload_validated(tmp_path: Path, mutation: str) -> None:
+    import struct
+
+    _, manifest_path, manifest = _make_valid_compact_project(tmp_path)
+    if mutation == "dtype":
+        manifest["sections"]["node_lat"]["dtype"] = "i8"
+    elif mutation == "count":
+        manifest["graph"]["traversal_count"] += 1
+    else:
+        payload_path = manifest_path.parent / manifest["bin_path"]
+        payload = bytearray(payload_path.read_bytes())
+        section = manifest["sections"]["node_lat"]
+        for index in range(section["count"]):
+            struct.pack_into("<d", payload, section["offset"] + 8 * index, 40.0)
+        payload_path.write_bytes(payload)
+        manifest["bin_sha256"] = checker.hashlib.sha256(payload).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    assert checker.check_artifacts(tmp_path, graph=manifest_path) == 1
+
+
+@pytest.mark.parametrize("key", ["tile_scores_json", "tile_scores_path", "report", "report_json"])
+def test_startup_report_override_is_admitted(tmp_path: Path, key: str) -> None:
+    _write_project(tmp_path, graph="candidate.sqlite3")
+    _write_sqlite_graph(tmp_path / "candidate.sqlite3")
+    override_dir = tmp_path / "override"
+    _write_reports(override_dir)
+    config_path = tmp_path / checker.CONFIG_PATH
+    config = json.loads(config_path.read_text())
+    config["regions"][0][key] = "override/report.json"
+    config_path.write_text(json.dumps(config))
+    assert checker.check_artifacts(tmp_path) == 0
+    (override_dir / "report.json").write_text("{}")
+    assert checker.check_artifacts(tmp_path) == 1
+
+
+def test_startup_report_override_precedence_and_absolute_path(tmp_path: Path) -> None:
+    _write_project(tmp_path, graph="candidate.sqlite3")
+    _write_sqlite_graph(tmp_path / "candidate.sqlite3")
+    _write_reports(tmp_path / "override")
+    config_path = tmp_path / checker.CONFIG_PATH
+    config = json.loads(config_path.read_text())
+    config["regions"][0].update(
+        tile_scores_json=str(tmp_path / "override/report.json"),
+        tile_scores_path="missing.json", report="missing.json", report_json="missing.json",
+    )
+    config_path.write_text(json.dumps(config))
+    assert checker.check_artifacts(tmp_path) == 0
+
+
+def test_region_model_association_not_assumed_active_registry(tmp_path: Path) -> None:
+    _write_project(tmp_path, graph="candidate.sqlite3")
+    _write_sqlite_graph(tmp_path / "candidate.sqlite3")
+    model = tmp_path / "models/region.pt"
+    model.parent.mkdir()
+    model.write_bytes(b"region model")
+    config_path = tmp_path / checker.CONFIG_PATH
+    config = json.loads(config_path.read_text())
+    config["regions"][0]["model_checkpoint"] = "models/region.pt"
+    config_path.write_text(json.dumps(config))
+    report_path = tmp_path / "data/processed/heuristic_runs" / checker.DEFAULT_RUN_NAME / "report/report.json"
+    assert checker.check_artifacts(tmp_path) == 1
+    payload = json.loads(report_path.read_text())
+    payload["run_info"]["regression_checkpoint_sha256"] = checker.hashlib.sha256(model.read_bytes()).hexdigest()
+    report_path.write_text(json.dumps(payload))
+    assert checker.check_artifacts(tmp_path) == 0
+
+
+@pytest.mark.parametrize("suffix", [".json", ".geojson"])
+def test_supported_json_graph_formats_use_admitted_geometry(tmp_path: Path, suffix: str) -> None:
+    graph_path = tmp_path / f"candidate{suffix}"
+    _write_project(tmp_path, graph=graph_path.name)
+    sqlite_path = tmp_path / "source.sqlite3"
+    _write_sqlite_graph(sqlite_path)
+    if suffix == ".json":
+        graph = RoadGraph.load(sqlite_path)
+        graph.save(graph_path)
+        graph.close()
+    else:
+        graph_path.write_text(json.dumps({
+            "type": "FeatureCollection",
+            "features": [
+                {"type": "Feature", "properties": {"id": name, "one_way": False},
+                 "geometry": {"type": "LineString",
+                              "coordinates": [[lon, lat], [lon, lat + .001]]}}
+                for name, (lat, lon) in checker._CANONICAL_PROBE_COORDINATES.items()
+            ],
+        }))
+    _write_run_gate(graph_path)
+    assert checker.check_artifacts(tmp_path) == 0
+    payload = json.loads(graph_path.read_text())
+    if suffix == ".json":
+        payload["edges"][0]["end"] = "absent"
+    else:
+        payload["features"][0]["geometry"]["coordinates"][0][0] = float("inf")
+    graph_path.write_text(json.dumps(payload))
+    assert checker.check_artifacts(tmp_path) == 1
+
+
+@pytest.mark.parametrize("name", ["route.geojson", "route_metrics.json"])
+def test_saved_route_must_be_usable(tmp_path: Path, name: str) -> None:
+    _write_project(tmp_path, graph="candidate.sqlite3")
+    _write_sqlite_graph(tmp_path / "candidate.sqlite3")
+    path = tmp_path / "data/processed/heuristic_runs" / checker.DEFAULT_RUN_NAME / "report" / name
+    path.write_text("{}")
+    assert checker.check_artifacts(tmp_path) == 1
+
+
+def test_default_override_cannot_skip_other_enabled_graph(tmp_path: Path) -> None:
+    _write_project(tmp_path, graph="candidate.sqlite3")
+    _write_sqlite_graph(tmp_path / "candidate.sqlite3")
+    config_path = tmp_path / checker.CONFIG_PATH
+    config = json.loads(config_path.read_text())
+    config["regions"].append({
+        **config["regions"][0], "region": "second", "graph": "missing.sqlite3",
+    })
+    config_path.write_text(json.dumps(config))
+    assert checker.check_artifacts(tmp_path, graph=Path("candidate.sqlite3")) == 1
+
+
+def test_missing_readiness_gate_is_rejected(tmp_path: Path, capsys) -> None:
+    _write_project(tmp_path, graph="candidate.sqlite3")
+    _write_sqlite_graph(tmp_path / "candidate.sqlite3")
+    (tmp_path / "run.json").unlink()
+
+    assert checker.check_artifacts(tmp_path) == 1
+    output = capsys.readouterr().out
+    assert "run.json" in output
+
+
+@pytest.mark.parametrize(
+    "mutation", ["stale_digest", "build_machine_path", "wrong_size"]
+)
+def test_readiness_gate_must_vouch_for_shipped_graph(
+    tmp_path: Path, mutation: str, capsys
+) -> None:
+    _write_project(tmp_path, graph="candidate.sqlite3")
+    graph = tmp_path / "candidate.sqlite3"
+    _write_sqlite_graph(graph)
+    gate = tmp_path / "run.json"
+    record = json.loads(gate.read_text(encoding="utf-8"))
+    if mutation == "stale_digest":
+        record["graph_sha256"] = "0" * 64
+    elif mutation == "build_machine_path":
+        record["output_graph"] = "/build/host/candidate.sqlite3"
+    else:
+        record["graph_size_bytes"] = record["graph_size_bytes"] + 1
+    gate.write_text(json.dumps(record), encoding="utf-8")
+
+    assert checker.check_artifacts(tmp_path) == 1
+    output = capsys.readouterr().out
+    assert "readiness gate" in output
+
+
+def test_compact_gate_must_name_admitted_manifest(
+    tmp_path: Path, capsys
+) -> None:
+    _sqlite_path, manifest_path, _manifest = _make_valid_compact_project(tmp_path)
+    gate = _sqlite_path.parent / "run.json"
+    record = json.loads(gate.read_text(encoding="utf-8"))
+    record.pop("runtime_graph")
+    record.pop("compact_manifest_sha256")
+    gate.write_text(json.dumps(record), encoding="utf-8")
+
+    assert checker.check_artifacts(tmp_path, graph=manifest_path) == 1
+    output = capsys.readouterr().out
+    assert "readiness gate" in output

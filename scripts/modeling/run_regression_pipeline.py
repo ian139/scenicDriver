@@ -3,13 +3,12 @@ Run a promotion-ready regression pipeline by orchestrating existing scripts:
 1) Build mixed labels (human-overlap aware aggregation).
 2) Export regression dataset features.
 3) Train candidate checkpoint.
-4) Evaluate candidate and compare with baseline metrics.
+4) Compare candidate and baseline on the same complete fixed human test benchmark.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 import subprocess
 import sys
@@ -23,6 +22,9 @@ def parse_args() -> argparse.Namespace:
         default=Path("data/processed/regression/labels_masswhites_z14_mixed5000.csv"),
     )
     parser.add_argument("--annotations-csv", type=Path, default=Path("data/raw/labels_human.csv"))
+    parser.add_argument("--geographic-splits-csv", type=Path, required=True)
+    parser.add_argument("--benchmark-split-csv", type=Path, required=True)
+    parser.add_argument("--baseline-checkpoint", type=Path, required=True)
     parser.add_argument(
         "--labels-output",
         type=Path,
@@ -41,12 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--candidate-metrics",
         type=Path,
-        default=Path("data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v4_weighted_h4.json"),
-    )
-    parser.add_argument(
-        "--baseline-metrics",
-        type=Path,
-        default=Path("data/processed/regression/baseline_metrics_masswhites_z14_mixed5000_v2_weighted_h4.json"),
+        default=Path("data/processed/regression/benchmark_comparison.json"),
     )
     parser.add_argument("--raw-dir", type=str, default="s3://scenicdriver-data/raw")
     parser.add_argument("--classifier-ckpt", type=Path, default=Path("models/classifier/best_model.pt"))
@@ -58,18 +55,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.epochs < 1:
+        parser.error("--epochs must be >= 1")
+    return args
 
 
 def _run(cmd: list[str]) -> None:
     print("+", " ".join(cmd))
     subprocess.run(cmd, check=True)
-
-
-def _load_metrics(path: Path) -> dict:
-    if not path.exists():
-        raise FileNotFoundError(f"metrics json not found: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def main() -> None:
@@ -91,6 +85,8 @@ def main() -> None:
             str(args.annotations_csv),
             "--output",
             str(args.labels_output),
+            "--geographic-splits-csv",
+            str(args.geographic_splits_csv),
             "--aggregate",
             args.aggregate,
         ]
@@ -127,6 +123,8 @@ def main() -> None:
             "scripts/modeling/train_regression_baseline.py",
             "--dataset",
             str(args.features_output),
+            "--benchmark-split-csv",
+            str(args.benchmark_split_csv),
             "--output",
             str(args.candidate_ckpt),
             "--epochs",
@@ -150,32 +148,23 @@ def main() -> None:
     _run(
         [
             py,
-            "scripts/modeling/evaluate_regression_baseline.py",
+            "scripts/modeling/compare_regression_on_benchmark.py",
             "--dataset",
             str(args.features_output),
-            "--checkpoint",
+            "--labels-csv",
+            str(args.labels_output),
+            "--benchmark-split-csv",
+            str(args.benchmark_split_csv),
+            "--candidate-checkpoint",
             str(args.candidate_ckpt),
-            "--val-split",
-            str(args.val_split),
-            "--seed",
-            str(args.seed),
+            "--baseline-checkpoint",
+            str(args.baseline_checkpoint),
             "--device",
             args.device,
-            "--metrics-json",
+            "--output-json",
             str(args.candidate_metrics),
         ]
     )
-
-    candidate = _load_metrics(args.candidate_metrics)
-    baseline = _load_metrics(args.baseline_metrics)
-    summary = {
-        "candidate_metrics": str(args.candidate_metrics),
-        "baseline_metrics": str(args.baseline_metrics),
-        "corr_delta": float(candidate["corr"]) - float(baseline["corr"]),
-        "mae_delta": float(candidate["mae"]) - float(baseline["mae"]),
-        "rmse_delta": float(candidate["rmse"]) - float(baseline["rmse"]),
-    }
-    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

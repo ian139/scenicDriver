@@ -186,13 +186,13 @@ def duration_component(
     if fastest == 0.0:
         return 1.0 if duration == 0.0 else 0.0
     duration_cap = _checked_product(detour, fastest, "duration cap")
-    denominator = _checked_product(
-        detour - 1.0, fastest, "duration utility denominator"
-    )
-    numerator = duration_cap - duration
-    if not math.isfinite(numerator):
-        raise ValueError("duration utility numerator overflowed finite range")
-    value = numerator / denominator
+    # Normalize before dividing by the detour increment: multiplying that
+    # increment by a subnormal baseline can round the denominator to zero.
+    if duration <= fastest:
+        return 1.0
+    if duration >= duration_cap:
+        return 0.0
+    value = 1.0 - ((duration - fastest) / fastest) / (detour - 1.0)
     if not math.isfinite(value):
         raise ValueError("duration utility overflowed finite range")
     return min(1.0, max(0.0, value))
@@ -456,9 +456,10 @@ class ScenicCostFunction:
     highway avoidance penalty remains an additive, duration-scaled adjustment.
     Scenic exposure is the time spent on an edge multiplied by its clamped
     scenic disutility, so subdividing a road geometry does not change its
-    total cost.  Costs are always finite and clamped to ``>= 1e-6`` for
-    shortest-path search; inactive components are skipped and overflow saturates
-    at the largest finite float.  At ``scenic_weight=1`` this remains a positive
+    total cost. The only cost floor is proportional to duration (``1e-6``
+    per minute), before the byway discount; zero-duration edges cost zero.
+    Inactive components are skipped and overflow saturates at the largest
+    finite float. At ``scenic_weight=1`` this remains a positive
     additive disutility objective, not a route-average scenic-score ratio.
     """
 
@@ -521,7 +522,7 @@ class ScenicCostFunction:
         raw = base_cost + road_adjustment
         if not math.isfinite(raw):
             return sys.float_info.max
-        return max(raw, MIN_EDGE_COST)
+        return raw
 
     def _road_type_adjustment(self, road_type: str) -> float:
         if not is_highway_road_type(road_type):

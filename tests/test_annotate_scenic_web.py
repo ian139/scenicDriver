@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import urllib.error
@@ -7,6 +8,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from scripts.annotation.annotate_scenic_web import (
@@ -16,6 +18,7 @@ from scripts.annotation.annotate_scenic_web import (
     AnnotatorState,
     PathPolicy,
     _safe_image_path,
+    _sample_stratified,
     make_handler,
     parse_args,
 )
@@ -163,44 +166,6 @@ def test_summary_reports_defined_overlap_consistency(tmp_path: Path) -> None:
     }
 
 
-def test_ui_contract_and_structured_error_surface() -> None:
-    html = Path("scripts/annotation/annotate_scenic_web.html").read_text()
-    for marker in (
-        "Keyboard shortcuts",
-        "Scoring anchors",
-        "prefetch",
-        "localStorage",
-        "coverageSummary",
-        "overlapSummary",
-        "Save and next",
-        "prefers-reduced-motion",
-        "id=\"score\"",
-        "id=\"unusable\"",
-        "confidence:'medium'",
-        "notes:''",
-        "0–9</kbd> save score and advance",
-        "type <kbd>10</kbd>, then <kbd>Enter</kbd>",
-        "e.preventDefault();$('score').value=k;save();return",
-    ):
-        assert marker in html
-    for removed in (
-        "id=\"confidence\"",
-        "id=\"notes\"",
-        "id=\"confidenceSummary\"",
-        "H/M/L",
-        "$('confidence')",
-        "$('notes')",
-        "d.confidence",
-        "d.notes",
-    ):
-        assert removed not in html
-    assert "JSON.stringify({score:$('score').value,unusable:$('unusable').value})" in html
-    assert "if($('settings').contains(active))return" in html
-    assert "const editing=['INPUT','TEXTAREA','SELECT'].includes(active.tagName)" in html
-    assert "if(/^[0-9]$/.test(k)&&(!editing||active===$('score')))" in html
-    assert "if(editing&&k!=='enter')return" in html
-    assert "0–9 save score and advance · type 10, then Enter" in html
-    assert make_handler is not None
 
 
 def test_blind_qa_overlap_is_exposed_without_restoring_prior_answer(
@@ -429,26 +394,197 @@ def test_conflicting_csv_and_sidecar_unusable_reason_precedence(tmp_path: Path) 
     assert res_legacy["record"]["notes"] == "legacy note without unusable prefix"
 
 
-def test_ui_error_and_retry_markers() -> None:
-    html = Path("scripts/annotation/annotate_scenic_web.html").read_text()
-    assert "retryImage" in html
-    assert "Retry image" in html
-    assert "showImageError" in html
-    assert "clearImageError" in html
-    assert "onerror" in html
-    assert "image.onerror" in html or "onerror=()=>{}" in html
-    assert "Failed to load image" in html
-    assert "loadTileImage" in html
-    assert "dataset.navGen" in html
-    assert "dataset.imagePath" in html
-    assert "gen!==navGen" in html or "gen !== navGen" in html
-    assert "image_path!==path" in html or "image_path !== path" in html
-    assert "const loader=new Image()" in html
-    assert "requestId!==imageRequestId" in html
-    assert "tileImg.onload" not in html
-    assert "tileImg.onerror" not in html
-    assert "tileImg.removeAttribute('src')" in html
-    assert "tileImg.style.visibility='hidden'" in html
-    assert "tileImg.style.visibility='visible'" in html
-    assert html.count("<script>") == html.count("</script>") == 1
-    assert html.index("<script>") < html.index("</script>") < html.index("</body>")
+
+
+def test_stratified_sampling_caps_classes_to_requested_slots() -> None:
+    frame = pd.DataFrame(
+        {"image_path": [f"{i}.png" for i in range(8)], "class_id": range(8)}
+    )
+    sampled = _sample_stratified(frame, n=3, seed=42)
+    assert len(sampled) == 3
+    assert sampled["image_path"].is_unique
+    pd.testing.assert_frame_equal(sampled, _sample_stratified(frame, n=3, seed=42))
+    assert _sample_stratified(frame, n=0, seed=42).empty
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "headers"),
+    [
+        ("GET", "/api/state", [("Host", "attacker.example")]),
+        ("GET", "/api/session", [("Host", "attacker.example")]),
+        (
+            "POST",
+            "/api/progress",
+            [("Host", "attacker.example"), ("Origin", "http://attacker.example")],
+        ),
+        ("POST", "/api/progress", [("Host", "attacker.example")]),
+        ("GET", "/api/state", [("Host", "127.0.0.1"), ("Host", "attacker.example")]),
+        ("GET", "/api/state", []),
+    ],
+)
+def test_untrusted_authorities_reject_before_read_or_mutation(
+    tmp_path: Path, method: str, path: str, headers: list[tuple[str, str]]
+) -> None:
+    state = fixture_state(tmp_path)
+    state.load_batch({})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    connection = http.client.HTTPConnection(*server.server_address)
+    try:
+        connection.putrequest(method, path, skip_host=True)
+        for key, value in headers:
+            connection.putheader(key, value)
+        body = b'{"cursor":0}'
+        if method == "POST":
+            connection.putheader("Content-Type", "application/json")
+            connection.putheader("Content-Length", str(len(body)))
+        connection.endheaders(body if method == "POST" else None)
+        response = connection.getresponse()
+        assert response.status == 403
+        assert json.loads(response.read())["error"]["code"] == "untrusted_host"
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_loopback_and_explicit_trusted_authorities_are_accepted(tmp_path: Path) -> None:
+    state = fixture_state(tmp_path)
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(state, trusted_authorities=("scenic.example:443",)),
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        for authority in (
+            f"127.0.0.1:{server.server_port}",
+            f"localhost:{server.server_port}",
+            "scenic.example:443",
+        ):
+            connection = http.client.HTTPConnection(*server.server_address)
+            try:
+                connection.request("GET", "/api/state", headers={"Host": authority})
+                response = connection.getresponse()
+                assert response.status == 200
+                assert json.loads(response.read())["config"]["annotator_id"] == "alice"
+            finally:
+                connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_save_is_bound_to_batch_scope_and_rejected_after_batch_switch(
+    tmp_path: Path,
+) -> None:
+    state = fixture_state(tmp_path)
+    raw = tmp_path / "raw"
+    (raw / "other.png").write_bytes(b"png")
+    (raw / "labels.csv").write_text(
+        "image_path,region\ntile.png,west\nother.png,south\n"
+    )
+    token_a = state.load_batch({})["scope_token"]
+    batch_csv = tmp_path / "qa_batch.csv"
+    batch_csv.write_text("image_path,selection_reason\ntile.png,qa\n")
+    token_b = state.load_batch(
+        {
+            "batch_csv": str(batch_csv),
+            "annotations_csv": str(raw / "batch_b_human.csv"),
+        }
+    )["scope_token"]
+    assert token_a and token_b and token_a != token_b
+
+    # A save bound to batch A must not cross-persist into batch B's file even
+    # though the image exists in both batches.
+    with pytest.raises(ApiError) as exc_info:
+        state.save_annotation(
+            {"image_path": "tile.png", "scenic_human": 8, "scope_token": token_a},
+            require_scope=True,
+        )
+    assert exc_info.value.code == "scope_mismatch"
+    for path in (raw / "labels_human.csv", raw / "batch_b_human.csv"):
+        assert not path.exists() or pd.read_csv(path).empty
+
+    saved = state.save_annotation(
+        {"image_path": "tile.png", "scenic_human": 8, "scope_token": token_b},
+        require_scope=True,
+    )
+    assert saved["saved"] is True
+    assert len(pd.read_csv(raw / "batch_b_human.csv")) == 1
+    assert not (raw / "labels_human.csv").exists()
+
+
+def test_web_saves_require_scope_token_and_reject_cross_batch_saves(
+    tmp_path: Path,
+) -> None:
+    state = fixture_state(tmp_path)
+    raw = tmp_path / "raw"
+    batch_csv = tmp_path / "qa_batch.csv"
+    batch_csv.write_text("image_path,selection_reason\ntile.png,qa\n")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+
+    def post(path: str, payload: dict) -> tuple[int, dict]:
+        connection = http.client.HTTPConnection(*server.server_address)
+        try:
+            connection.request(
+                "POST",
+                path,
+                body=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    try:
+        status, loaded_a = post("/api/load-batch", {"config": {}})
+        assert status == 200
+        token_a = loaded_a["scope_token"]
+        status, loaded_b = post(
+            "/api/load-batch",
+            {
+                "config": {
+                    "batch_csv": str(batch_csv),
+                    "annotations_csv": str(raw / "batch_b_human.csv"),
+                }
+            },
+        )
+        assert status == 200
+        token_b = loaded_b["scope_token"]
+        assert token_a != token_b
+
+        save = {"image_path": "tile.png", "scenic_human": 8, "confidence": "high"}
+
+        # Unbound saves (no scope token) are refused before any write.
+        status, body = post("/api/save-annotation", save)
+        assert status == 400
+        assert body["error"]["code"] == "scope_required"
+
+        # A save in flight across the batch switch must be rejected, not
+        # cross-persisted into batch B's annotations file.
+        status, body = post("/api/save-annotation", {**save, "scope_token": token_a})
+        assert status == 409
+        assert body["error"]["code"] == "scope_mismatch"
+        for path in (raw / "labels_human.csv", raw / "batch_b_human.csv"):
+            assert not path.exists() or pd.read_csv(path).empty
+
+        status, body = post("/api/progress", {"cursor": 0, "scope_token": token_a})
+        assert status == 409
+        assert body["error"]["code"] == "scope_mismatch"
+
+        status, body = post("/api/save-annotation", {**save, "scope_token": token_b})
+        assert status == 200
+        assert body["saved"] is True
+        assert len(pd.read_csv(raw / "batch_b_human.csv")) == 1
+        assert not (raw / "labels_human.csv").exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

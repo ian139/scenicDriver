@@ -5,17 +5,23 @@ from pathlib import Path
 from typing import Any, NoReturn
 from array import array
 from functools import lru_cache
+import asyncio
+from functools import partial
+import threading
 import io
 import json
 import logging
+import hashlib
 import math
 import re
 import sys
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from scalar_fastapi import get_scalar_api_reference
 from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import requests
@@ -79,7 +85,13 @@ def _safe_asset_name(value: str, *, kind: str) -> str:
 
 
 def _raise_routing_http_exception(exc: BaseException) -> NoReturn:
-    """Map routing timeout/cancellation to explicit HTTP responses."""
+    """Map routing timeout/cancellation to explicit HTTP responses.
+
+    ``detail["reason"]`` carries the structured cause's own reason string
+    verbatim (the messages raised in ``route_planner.cancellation`` and the
+    planner search stages) so clients can read the cause without parsing
+    ``message`` prose.
+    """
     if isinstance(exc, RoutingTimeout):
         _LOGGER.error("Routing deadline exceeded: %s", exc)
         raise HTTPException(
@@ -87,6 +99,7 @@ def _raise_routing_http_exception(exc: BaseException) -> NoReturn:
             detail={
                 "error": "routing_deadline_exceeded",
                 "message": "The route planning deadline was exceeded.",
+                "reason": str(exc),
             },
         ) from exc
     if isinstance(exc, RoutingCancelled):
@@ -96,14 +109,112 @@ def _raise_routing_http_exception(exc: BaseException) -> NoReturn:
             detail={
                 "error": "routing_cancelled",
                 "message": "The route planning request was cancelled.",
+                "reason": str(exc),
             },
         ) from exc
     raise exc
 
 
+# Planner no-route reason strings.  ``src/route_planner/service.py`` matches
+# these verbatim to classify a failed search, so they are the structured cause
+# of a 422 ``no_route_found``.  Any other ``ValueError`` is not a recognized
+# cause and is reported without a ``reason`` (clients fall back to ``message``).
+_PLANNER_NO_ROUTE_REASONS = frozenset({
+    "No route found between the given coordinates.",
+    "No route satisfies the requested duration cap.",
+})
+
+
 def _run_report_path(run_name: str) -> Path:
     safe_run = _safe_asset_name(run_name, kind="run_name")
     return RUNS_DIR / safe_run / "report/report.json"
+
+
+def _region_score_report(item: dict[str, Any] | None, run_name: str | None) -> Path | None:
+    configured_path = next(
+        (item.get(key) for key in ("tile_scores_json", "tile_scores_path", "report", "report_json")
+         if item.get(key)),
+        None,
+    ) if item else None
+    return Path(configured_path) if configured_path else _run_report_path(run_name) if run_name else None
+
+
+def _route_deadline_seconds(item: dict[str, Any] | None) -> float:
+    """SCENIC_ROUTE_DEADLINE_SECONDS overrides region route_deadline_seconds."""
+    override = os.getenv("SCENIC_ROUTE_DEADLINE_SECONDS", "").strip()
+    if override or not item or item.get("route_deadline_seconds") is None:
+        return _deadline_seconds_from_env()
+    try:
+        value = float(item["route_deadline_seconds"])
+    except (TypeError, ValueError) as exc:
+        raise RouteConfigurationError("Invalid region routing deadline") from exc
+    if not math.isfinite(value) or value < 0:
+        raise RouteConfigurationError("Invalid region routing deadline")
+    return value
+
+
+async def _run_routing_connected(request: Request, routing_deadline: RoutingDeadline, function, *args, **kwargs):
+    async def observe_disconnect():
+        while True:
+            if await request.is_disconnected():
+                routing_deadline.cancel_event.set()
+                return
+            await asyncio.sleep(0.05)
+
+    observer = asyncio.create_task(observe_disconnect())
+    try:
+        return await run_in_threadpool(partial(function, *args, **kwargs))
+    except asyncio.CancelledError:
+        routing_deadline.cancel_event.set()
+        raise
+    finally:
+        observer.cancel()
+        await asyncio.gather(observer, return_exceptions=True)
+
+
+def _search_provider(url: str, params: dict[str, Any], field: str) -> list[dict[str, Any]]:
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        if not response.ok:
+            raise ValueError("provider returned an unsuccessful status")
+        payload = response.json()
+        rows = payload.get(field) if isinstance(payload, dict) else None
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise ValueError("invalid provider envelope")
+        return rows
+    except requests.Timeout:
+        raise HTTPException(status_code=504, detail={"message": "Address search provider timed out"}) from None
+    except (requests.RequestException, ValueError, TypeError):
+        raise HTTPException(status_code=502, detail={"message": "Address search provider failed"}) from None
+
+
+class _RequestBodyLimit:
+    """Reject bodies above 64 KiB before request model parsing, including streams."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] not in {"POST", "PUT", "PATCH"}:
+            return await self.app(scope, receive, send)
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) > 65536:
+                return await JSONResponse(status_code=413, content={"detail": {"message": "Request body exceeds 64 KiB"}})(scope, receive, send)
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+        consumed = False
+        async def replay():
+            nonlocal consumed
+            if not consumed:
+                consumed = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return await receive()
+        await self.app(scope, replay, send)
 
 
 def _load_app_region_config() -> dict[str, Any]:
@@ -177,15 +288,72 @@ def _load_active_training_result() -> dict[str, Any]:
 
 
 @lru_cache(maxsize=4)
+def _parse_heatmap_artifact(report_path: str, modified_ns: int) -> dict[str, Any]:
+    del modified_ns
+    try:
+        payload = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    except OSError:
+        raise HTTPException(status_code=404, detail={"message": "Learned heatmap artifact is unavailable"}) from None
+    except (UnicodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=502, detail={"message": "Learned heatmap artifact is invalid"}) from None
+    try:
+        if not isinstance(payload, dict):
+            raise ValueError("invalid report")
+        tiles = payload["tiles"]
+        summary = payload.get("summary", {})
+        if not isinstance(tiles, list) or not tiles or not isinstance(summary, dict):
+            raise ValueError("invalid tiles or summary")
+        for tile in tiles:
+            if not isinstance(tile, dict):
+                raise ValueError("invalid tile")
+            x, y, z = (tile[key] for key in ("x", "y", "z"))
+            if any(isinstance(value, bool) or not isinstance(value, int) for value in (x, y, z)):
+                raise ValueError("tile coordinates must be integers")
+            if not 0 <= z <= 30 or not 0 <= x < 2 ** z or not 0 <= y < 2 ** z:
+                raise ValueError("tile coordinates out of bounds")
+            score = tile["scenic_score"]
+            if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score) or abs(score) > 3.402823466e38:
+                raise ValueError("invalid tile score")
+        if len({tile["z"] for tile in tiles}) != 1:
+            raise ValueError("mixed zooms")
+        for value in summary.values():
+            if isinstance(value, (int, float)) and not math.isfinite(value):
+                raise ValueError("invalid summary")
+        scores = [float(tile["scenic_score"]) for tile in tiles]
+        low = float(summary.get("min", min(scores)))
+        high = float(summary.get("max", max(scores)))
+        if not math.isfinite(low) or not math.isfinite(high) or high <= low or not math.isfinite(high - low):
+            raise ValueError("invalid normalization")
+        width = max(tile["x"] for tile in tiles) - min(tile["x"] for tile in tiles) + 1
+        height = max(tile["y"] for tile in tiles) - min(tile["y"] for tile in tiles) + 1
+        if width * height > 16_777_216:
+            raise ValueError("heatmap grid is too large")
+        return {**payload, "summary": {**summary, "min": low, "max": high}}
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise HTTPException(status_code=502, detail={"message": "Learned heatmap artifact is invalid"}) from None
+
+
+def _heatmap_artifact(region: str, run_name: str | None) -> tuple[str, Path, dict[str, Any]]:
+    _safe_asset_name(region, kind="region")
+    selected_run = run_name or _latest_run_for_region(region)
+    if not selected_run:
+        raise HTTPException(status_code=404, detail={"message": "No run report available"})
+    selected_run = _safe_asset_name(selected_run, kind="run_name")
+    report = _run_report_path(selected_run)
+    try:
+        modified_ns = report.stat().st_mtime_ns
+    except OSError:
+        raise HTTPException(status_code=404, detail={"message": "Learned heatmap artifact is unavailable"}) from None
+    return selected_run, report, _parse_heatmap_artifact(str(report), modified_ns)
+
+
+@lru_cache(maxsize=4)
 def _load_tile_score_grid(
     report_path: str, modified_ns: int
 ) -> tuple[bytes, int, int, int, int, int]:
-    del modified_ns
-    payload = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    payload = _parse_heatmap_artifact(report_path, modified_ns)
     tiles = payload["tiles"]
     zooms = {int(tile["z"]) for tile in tiles}
-    if len(zooms) != 1:
-        raise ValueError("mixed tile zooms")
     xs = [int(tile["x"]) for tile in tiles]
     ys = [int(tile["y"]) for tile in tiles]
     min_x, max_x = min(xs), max(xs)
@@ -232,14 +400,92 @@ def _default_region_key() -> str | None:
     return str(default_region).strip().lower() if default_region else None
 
 
+def _readiness_file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+@lru_cache(maxsize=16)
+def _readiness_file_digest(path: Path, identity: tuple[int, int, int, int, int]) -> str:
+    with path.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    if _readiness_file_identity(path) != identity:
+        raise ValueError("Graph changed while validating readiness")
+    return digest
+
+
+def _graph_readiness(graph: Path | None) -> dict[str, Any] | None:
+    """Validate the builder's publication gate, never bare graph existence.
+
+    Digests are reused only for unchanged files; the gate is reread on every
+    call so withdrawing it immediately disables even preloaded regions.
+    """
+    if graph is None:
+        return None
+    gate = graph.parent / "run.json"
+    try:
+        gate_identity = _readiness_file_identity(gate)
+        record = json.loads(gate.read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            return None
+        output = record.get("output_graph")
+        digest = record.get("graph_sha256")
+        size = record.get("graph_size_bytes")
+        if (
+            not isinstance(output, str) or not output
+            or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or type(size) is not int or size < 0
+        ):
+            return None
+        source = Path(output)
+        if not source.is_absolute():
+            source = PROJECT_ROOT / source
+        source = source.resolve()
+        source_identity = _readiness_file_identity(source)
+        if source_identity[2] != size or _readiness_file_digest(source, source_identity) != digest:
+            return None
+        graph_identity = source_identity
+        if graph.resolve() != source:
+            compact = record.get("runtime_graph") or record.get("compact_graph")
+            compact_digest = record.get("compact_manifest_sha256")
+            if not isinstance(compact, str) or not isinstance(compact_digest, str):
+                return None
+            compact_path = Path(compact)
+            if not compact_path.is_absolute():
+                compact_path = PROJECT_ROOT / compact_path
+            if compact_path.resolve() != graph.resolve():
+                return None
+            graph_identity = _readiness_file_identity(graph)
+            if _readiness_file_digest(graph, graph_identity) != compact_digest:
+                return None
+        if (
+            _readiness_file_identity(source) != source_identity
+            or _readiness_file_identity(graph) != graph_identity
+            or _readiness_file_identity(gate) != gate_identity
+        ):
+            return None
+        return record
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return None
+
+
 def _region_to_graph(region: str) -> Path:
+    # Check-then-open window (inherent, bounded): the readiness gate above is
+    # validated here and the planner opens the graph later.  The builder
+    # withdraws run.json before swapping graph content, and each file is
+    # replaced by an atomic per-file swap, so a request whose gate check
+    # preceded the withdrawal may still open post-swap content — never torn
+    # content — for the remainder of that one request.  The gate is reread on
+    # every call and never cached across requests, so the window is strictly
+    # request-scoped and no request outlives a withdrawn publication.  Per-call
+    # gate semantics hold; a lock redesign is deliberately out of scope.
     configured = _app_region(region)
     if configured and configured.get("graph_path"):
         graph_path = Path(configured["graph_path"])
-        if graph_path.exists():
+        if graph_path.exists() and _graph_readiness(graph_path) is not None:
             return graph_path
         raise FileNotFoundError(
-            f"Configured road graph for region '{region}' is missing: {graph_path}"
+            f"Configured road graph readiness for region '{region}' is unavailable: {graph_path}"
         )
 
     key = region.strip().lower()
@@ -252,9 +498,9 @@ def _region_to_graph(region: str) -> Path:
         ROAD_GRAPHS_DIR / key / "road_graph.sqlite3",
     ]
     for c in candidates:
-        if c.exists():
+        if c.exists() and _graph_readiness(c) is not None:
             return c
-    raise FileNotFoundError(f"No road graph found for region '{region}'")
+    raise FileNotFoundError(f"No road graph readiness found for region '{region}'")
 
 
 def _latest_run_for_region(region: str) -> str | None:
@@ -350,19 +596,7 @@ def _preload_configured_route_assets(
             if item.get("run_name")
             else _latest_run_for_region(region)
         )
-        tile_value = (
-            item.get("tile_scores_json")
-            or item.get("tile_scores_path")
-            or item.get("report")
-            or item.get("report_json")
-        )
-        tile_path = (
-            Path(tile_value)
-            if tile_value
-            else RUNS_DIR / run_name / "report/report.json"
-            if run_name
-            else None
-        )
+        tile_path = _region_score_report(item, run_name)
         region_diag: dict[str, Any] = {
             "region": region,
             "default": is_default,
@@ -384,6 +618,8 @@ def _preload_configured_route_assets(
             missing.append("graph")
         if tile_path is None or not tile_path.exists():
             missing.append("report")
+        if graph_path is not None and graph_path.exists() and _graph_readiness(graph_path) is None:
+            missing.append("readiness metadata")
         if missing:
             reason = f"missing {', '.join(missing)} asset(s)"
             if is_default and mode == "required":
@@ -545,7 +781,10 @@ def _list_regions() -> list[dict[str, Any]]:
                 "display_name": item.get("display_name", region),
                 "description": item.get("description"),
                 "graph_exists": bool(graph and graph.exists()),
-                "route_planning_enabled": item.get("route_planning", True) is not False,
+                "route_planning_enabled": (
+                    item.get("route_planning", True) is not False
+                    and _graph_readiness(graph) is not None
+                ),
                 "latest_run_name": latest_run,
                 "bbox": item.get("bbox"),
                 "map": item.get("map"),
@@ -577,22 +816,16 @@ def _list_regions() -> list[dict[str, Any]]:
         if graph.resolve() in configured_graphs:
             continue
         latest_run = _latest_run_for_region(region)
-        bbox = None
-        run_json = d / "run.json"
-        if run_json.exists():
-            try:
-                payload = __import__("json").loads(run_json.read_text(encoding="utf-8"))
-                bbox = payload.get("bbox")
-            except Exception:
-                bbox = None
-        if bbox is None and graph.suffix != ".sqlite3":
+        readiness = _graph_readiness(graph)
+        bbox = readiness.get("bbox") if readiness is not None else None
+        if readiness is not None and bbox is None and graph.suffix != ".sqlite3":
             bbox = _compute_geojson_bbox(graph)
         regions.append(
             {
                 "region": region,
                 "display_name": region,
                 "graph_exists": True,
-                "route_planning_enabled": True,
+                "route_planning_enabled": readiness is not None,
                 "latest_run_name": latest_run,
                 "bbox": bbox,
                 "is_default": region.lower() == default_region,
@@ -881,28 +1114,13 @@ def _validate_certified_bound(
             )
         return
     if upper_bound is None:
-        if approximate:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "error": "invalid_route_service_response",
-                    "message": f"{label} approximate result has no certified upper bound",
-                },
-            )
-        if gap is not None and (
-            isinstance(gap, bool)
-            or not isinstance(gap, (int, float))
-            or not math.isfinite(float(gap))
-            or abs(float(gap)) > 1e-9
-        ):
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "error": "invalid_route_service_response",
-                    "message": f"{label} exact result has a nonzero optimality gap",
-                },
-            )
-        return
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "invalid_route_service_response",
+                "message": f"{label} approximate result has no certified upper bound",
+            },
+        )
     if (
         isinstance(objective, bool)
         or isinstance(upper_bound, bool)
@@ -1392,8 +1610,15 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="ScenicDrive API",
         version="0.1.0",
+        description=(
+            "Request bodies are limited to 64 KiB. Batch limits must be positive "
+            "and within the documented maximum; offsets must be non-negative. "
+            "Missing heatmap artifacts return 404; malformed artifacts return 502. "
+            "SCENIC_ROUTE_DEADLINE_SECONDS overrides per-region route_deadline_seconds."
+        ),
         lifespan=_api_lifespan,
     )
+    app.add_middleware(_RequestBodyLimit)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -1487,16 +1712,9 @@ def create_app() -> FastAPI:
                 f"{bbox['min_lon']},{bbox['min_lat']},"
                 f"{bbox['max_lon']},{bbox['max_lat']}"
             )
-        response = requests.get(
-            "https://api.mapbox.com/search/searchbox/v1/suggest",
-            params=params,
-            timeout=15,
+        rows = _search_provider(
+            "https://api.mapbox.com/search/searchbox/v1/suggest", params, "suggestions"
         )
-        if not response.ok:
-            raise HTTPException(
-                status_code=502, detail="Address search provider failed"
-            )
-        rows = response.json().get("suggestions", [])
         return {
             "suggestions": [
                 {
@@ -1519,33 +1737,26 @@ def create_app() -> FastAPI:
         token = os.getenv("MAPBOX_ACCESS_TOKEN")
         if not token:
             raise HTTPException(status_code=503, detail="Address search is unavailable")
-        response = requests.get(
-            "https://api.mapbox.com/search/searchbox/v1/retrieve/"
-            + quote(mapbox_id, safe=""),
-            params={
-                "access_token": token,
-                "session_token": session_token,
-            },
-            timeout=15,
+        features = _search_provider(
+            "https://api.mapbox.com/search/searchbox/v1/retrieve/" + quote(mapbox_id, safe=""),
+            {"access_token": token, "session_token": session_token},
+            "features",
         )
-        if not response.ok:
-            raise HTTPException(
-                status_code=502, detail="Address search provider failed"
-            )
-        features = response.json().get("features", [])
         feature = features[0] if features else None
-        coordinates = (
-            feature.get("geometry", {}).get("coordinates")
-            if isinstance(feature, dict)
-            else None
-        )
-        properties = feature.get("properties", {}) if isinstance(feature, dict) else {}
-        if (
-            not isinstance(coordinates, list)
-            or len(coordinates) < 2
-            or not all(isinstance(value, (int, float)) for value in coordinates[:2])
-        ):
+        if feature is None:
             raise HTTPException(status_code=404, detail="Address result is unavailable")
+        geometry = feature.get("geometry")
+        properties = feature.get("properties")
+        coordinates = geometry.get("coordinates") if isinstance(geometry, dict) else None
+        if (
+            not isinstance(geometry, dict) or geometry.get("type") != "Point"
+            or not isinstance(properties, dict)
+            or not isinstance(coordinates, list) or len(coordinates) != 2
+            or not all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in coordinates)
+            or any(value is not None and not isinstance(value, str) for key, value in properties.items()
+                   if key in {"name", "full_address", "place_formatted"})
+        ):
+            raise HTTPException(status_code=502, detail={"message": "Search provider returned an invalid result"})
         lat = float(coordinates[1])
         lon = float(coordinates[0])
         if (
@@ -1570,7 +1781,7 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/v1/route/compare")
-    def route_compare(request: Request, payload: RouteCompareRequest) -> dict[str, Any]:
+    async def route_compare(request: Request, payload: RouteCompareRequest) -> dict[str, Any]:
         configured = _app_region(payload.region)
         if configured is not None and configured.get("route_planning") is False:
             raise HTTPException(
@@ -1596,7 +1807,8 @@ def create_app() -> FastAPI:
                 detail=f"No run report available for region '{payload.region}'",
             )
         run_name = _safe_asset_name(run_name, kind="run_name")
-        report_json = _run_report_path(run_name)
+        score_config = configured if payload.run_name is None or (configured and configured.get("run_name") == run_name) else None
+        report_json = _region_score_report(score_config, run_name)
         if not report_json.is_file():
             raise HTTPException(
                 status_code=404,
@@ -1612,18 +1824,19 @@ def create_app() -> FastAPI:
             max_detour_factor=payload.max_detour_factor,
             include_baseline=payload.include_baseline,
             tile_scores_json=str(report_json),
+            tile_score_zoom=configured.get("tile_score_zoom") if configured else None,
             tile_score_fallback=None,
             max_snap_distance_km=(
                 configured.get("max_route_snap_km") if configured is not None else None
             ),
         )
-        deadline = RoutingDeadline.after(_deadline_seconds_from_env())
         try:
+            deadline = RoutingDeadline.after(_route_deadline_seconds(configured), cancel_event=threading.Event())
             supervisor = getattr(request.app.state, "route_supervisor", None)
             if supervisor is not None:
-                result = supervisor.run_job(_plan_routes_worker, req, deadline=deadline)
+                result = await _run_routing_connected(request, deadline, supervisor.run_job, _plan_routes_worker, req, deadline=deadline)
             else:
-                result = plan_routes(req, deadline=deadline)
+                result = await _run_routing_connected(request, deadline, plan_routes, req, deadline=deadline)
             diagnostics, routes = _validate_route_contract(
                 result, request=req, deadline=deadline
             )
@@ -1657,6 +1870,8 @@ def create_app() -> FastAPI:
                     "hint": (
                         "Choose a point within the selected region's route coverage."
                     ),
+                    # Structured cause: RouteCoverageError's own reason string.
+                    "reason": str(exc),
                     "endpoint": exc.endpoint,
                     "snap_distance_km": float(exc.snap_distance_km),
                     "max_snap_distance_km": float(exc.max_snap_distance_km),
@@ -1664,13 +1879,15 @@ def create_app() -> FastAPI:
             ) from exc
         except (RoutingTimeout, RoutingCancelled) as exc:
             _raise_routing_http_exception(exc)
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise HTTPException(status_code=500, detail={"error": "route_assets_invalid", "message": "Route planning assets are invalid."}) from exc
         except ValueError as exc:
             try:
-                diagnostics = diagnose_route_request(req, deadline=deadline)
+                diagnostics = await _run_routing_connected(request, deadline, diagnose_route_request, req, deadline=deadline)
             except (RoutingTimeout, RoutingCancelled) as routing_exc:
                 _raise_routing_http_exception(routing_exc)
-            except Exception:
-                diagnostics = {}
+            except Exception as asset_exc:
+                raise HTTPException(status_code=500, detail={"error": "route_assets_invalid", "message": "Route planning assets are invalid."}) from asset_exc
             if req.avoid_highways:
                 message = (
                     "No route satisfies the requested controls, including "
@@ -1686,15 +1903,18 @@ def create_app() -> FastAPI:
                     f"Try different points in region '{payload.region}' "
                     "or increase max detour."
                 )
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "no_route_found",
-                    "message": message,
-                    "hint": hint,
-                    "diagnostics": diagnostics,
-                },
-            ) from exc
+            detail: dict[str, Any] = {
+                "error": "no_route_found",
+                "message": message,
+                "hint": hint,
+                "diagnostics": diagnostics,
+            }
+            reason = str(exc)
+            if reason in _PLANNER_NO_ROUTE_REASONS:
+                # Structured cause: the planner's own reason string, reused
+                # verbatim so clients never parse message prose for it.
+                detail["reason"] = reason
+            raise HTTPException(status_code=422, detail=detail) from exc
 
         scenic = routes["scenic"]
         baseline = routes.get("baseline")
@@ -1725,19 +1945,22 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/v1/validated-route")
-    def validated_route(region: str) -> dict[str, Any]:
-        configured = _app_region(region)
-        run_name = str(configured.get("run_name", "")) if configured else ""
+    def validated_route(region: str, run_name: str | None = None) -> dict[str, Any]:
+        _safe_asset_name(region, kind="region")
+        run_name = run_name or _latest_run_for_region(region)
+        if not run_name:
+            raise HTTPException(status_code=404, detail={"message": "Validated route artifacts are unavailable"})
+        run_name = _safe_asset_name(run_name, kind="run_name")
         report_dir = RUNS_DIR / run_name / "report"
         route_path = report_dir / "route.geojson"
         metrics_path = report_dir / "route_metrics.json"
         try:
             route_geojson = json.loads(route_path.read_text(encoding="utf-8"))
             metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            raise HTTPException(
-                status_code=404, detail="Validated route artifacts are unavailable"
-            ) from None
+        except OSError:
+            raise HTTPException(status_code=404, detail={"message": "Validated route artifacts are unavailable"}) from None
+        except (UnicodeError, json.JSONDecodeError):
+            raise HTTPException(status_code=502, detail={"message": "Validated route artifacts are invalid"}) from None
 
         features = (
             route_geojson.get("features") if isinstance(route_geojson, dict) else None
@@ -1752,13 +1975,14 @@ def create_app() -> FastAPI:
             isinstance(route_geojson, dict)
             and route_geojson.get("type") == "FeatureCollection"
             and isinstance(features, list)
+            and len(features) == 2
             and all(isinstance(feature, dict) for feature in features)
-            and {
-                feature.get("properties", {}).get("route_kind")
+            and all(
+                isinstance(feature.get("properties"), dict)
+                and isinstance(feature["properties"].get("route_kind"), str)
                 for feature in features
-                if isinstance(feature.get("properties"), dict)
-            }
-            == {"scenic", "baseline"}
+            )
+            and {feature["properties"]["route_kind"] for feature in features} == {"scenic", "baseline"}
         )
         if (
             not valid_route_features
@@ -1768,8 +1992,31 @@ def create_app() -> FastAPI:
             or not isinstance(baseline, dict)
         ):
             raise HTTPException(
-                status_code=404, detail="Validated route artifacts are unavailable"
+                status_code=502, detail={"message": "Validated route artifacts are invalid"}
             )
+        for feature in features:
+            geometry = feature.get("geometry")
+            if (
+                not isinstance(geometry, dict) or geometry.get("type") != "LineString"
+                or not isinstance(geometry.get("coordinates"), list)
+                or len(geometry["coordinates"]) < 2
+            ):
+                _invalid_route_geometry("Saved route requires complete LineString geometry")
+            for coordinate in geometry["coordinates"]:
+                _route_coordinate(coordinate, label="Saved route")
+        for kind, route in (("scenic", scenic), ("baseline", baseline)):
+            if route.get("route_kind") != kind:
+                _invalid_route_geometry("Saved route metrics have incorrect route kind")
+            for key in ("total_distance_km", "estimated_duration_minutes", "raw_scenic_score", "normalized_scenic_score"):
+                value = route.get(key)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    _invalid_route_geometry(f"Saved route is missing finite {key}")
+        for endpoint in ("start", "end"):
+            _route_coordinate(request.get(endpoint), label=f"Saved {endpoint}", latitude_first=True)
+        for key in ("scenic_weight", "max_detour_factor"):
+            value = request.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                _invalid_route_geometry(f"Saved request is missing finite {key}")
 
         public_mapping_fields = (
             "enabled",
@@ -1805,63 +2052,25 @@ def create_app() -> FastAPI:
     def heatmap(
         region: str,
         run_name: str | None = None,
-        max_points: int = 3000,
-        max_tiles: int = 12000,
-        tile_offset: int | None = None,
+        max_points: int = Query(default=3000, ge=1, le=10000),
+        max_tiles: int = Query(default=12000, ge=1, le=100000),
+        tile_offset: int | None = Query(default=None, ge=0),
     ) -> dict[str, Any]:
-        _safe_asset_name(region, kind="region")
-        selected_run = run_name or _latest_run_for_region(region)
-        if not selected_run:
-            raise HTTPException(
-                status_code=404, detail=f"No run report available for region '{region}'"
-            )
-        selected_run = _safe_asset_name(selected_run, kind="run_name")
-        report_json = _run_report_path(selected_run)
-        if not report_json.exists():
-            raise HTTPException(
-                status_code=404, detail=f"Report not found for run '{selected_run}'"
-            )
-        payload = __import__("json").loads(report_json.read_text(encoding="utf-8"))
-        tiles = payload.get("tiles", [])
-        z_counts: dict[int, int] = {}
-        for t in tiles:
-            z_v = t.get("z")
-            if z_v is None:
-                continue
-            z_i = int(z_v)
-            z_counts[z_i] = z_counts.get(z_i, 0) + 1
-        tile_zoom = max(z_counts.items(), key=lambda kv: kv[1])[0] if z_counts else None
-        xs = [int(t["x"]) for t in tiles if t.get("x") is not None]
-        ys = [int(t["y"]) for t in tiles if t.get("y") is not None]
-        min_x = min(xs) if xs else None
-        max_x = max(xs) if xs else None
-        min_y = min(ys) if ys else None
-        max_y = max(ys) if ys else None
+        selected_run, report_json, payload = _heatmap_artifact(region, run_name)
+        tiles = payload["tiles"]
+        tile_zoom = tiles[0]["z"]
+        xs = [tile["x"] for tile in tiles]
+        ys = [tile["y"] for tile in tiles]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
 
         summary = payload.get("summary", {})
-        scores = [
-            float(tile["scenic_score"])
-            for tile in tiles
-            if tile.get("scenic_score") is not None
-        ]
-        try:
-            norm_min = float(summary["min"])
-            norm_max = float(summary["max"])
-        except (KeyError, TypeError, ValueError):
-            norm_min = min(scores) if scores else 0.0
-            norm_max = max(scores) if scores else 10.0
-        if (
-            not math.isfinite(norm_min)
-            or not math.isfinite(norm_max)
-            or norm_max <= norm_min
-        ):
-            raise HTTPException(
-                status_code=404, detail=f"Invalid report for run '{selected_run}'"
-            )
+        norm_min = summary["min"]
+        norm_max = summary["max"]
 
         feats = []
         tile_feats = []
-        point_limit = max(1, int(max_points))
+        point_limit = max_points
         if len(tiles) <= point_limit:
             point_tiles = tiles
         else:
@@ -1870,9 +2079,9 @@ def create_app() -> FastAPI:
             step = len(tiles) / float(point_limit)
             point_tiles = [tiles[int(i * step)] for i in range(point_limit)]
 
-        tile_limit = max(1, int(max_tiles))
+        tile_limit = max_tiles
         if tile_offset is not None:
-            offset = max(0, int(tile_offset))
+            offset = tile_offset
             polygon_tiles = tiles[offset : offset + tile_limit]
         elif len(tiles) <= tile_limit:
             offset = 0
@@ -1883,17 +2092,12 @@ def create_app() -> FastAPI:
             polygon_tiles = [tiles[int(i * step)] for i in range(tile_limit)]
 
         for tile in point_tiles:
-            x = tile.get("x")
-            y = tile.get("y")
-            z = tile.get("z")
-            scenic = tile.get("scenic_score")
-            if x is None or y is None or z is None or scenic is None:
-                continue
-            lat, lon = _tile_to_center_latlon(int(x), int(y), int(z))
+            x, y, z = tile["x"], tile["y"], tile["z"]
+            scenic = tile["scenic_score"]
+            lat, lon = _tile_to_center_latlon(x, y, z)
             scenic_f = float(scenic)
             score_norm = (scenic_f - norm_min) / (norm_max - norm_min)
             score_norm = max(0.0, min(1.0, score_norm))
-            lat_s, lon_w, lat_n, lon_e = _tile_to_bounds(int(x), int(y), int(z))
             feats.append(
                 {
                     "type": "Feature",
@@ -1903,12 +2107,8 @@ def create_app() -> FastAPI:
             )
 
         for tile in polygon_tiles:
-            x = tile.get("x")
-            y = tile.get("y")
-            z = tile.get("z")
-            scenic = tile.get("scenic_score")
-            if x is None or y is None or z is None or scenic is None:
-                continue
+            x, y, z = tile["x"], tile["y"], tile["z"]
+            scenic = tile["scenic_score"]
             scenic_f = float(scenic)
             score_norm = (scenic_f - norm_min) / (norm_max - norm_min)
             score_norm = max(0.0, min(1.0, score_norm))
@@ -1962,36 +2162,13 @@ def create_app() -> FastAPI:
     def heatmap_image(region: str, run_name: str | None = None) -> Response:
         from PIL import Image
 
-        _safe_asset_name(region, kind="region")
-        selected_run = run_name or _latest_run_for_region(region)
-        if not selected_run:
-            raise HTTPException(status_code=404, detail="No run report available")
-        selected_run = _safe_asset_name(selected_run, kind="run_name")
-        report_json = _run_report_path(selected_run)
-        try:
-            payload = json.loads(report_json.read_text(encoding="utf-8"))
-            tiles = payload["tiles"]
-            summary = payload["summary"]
-            norm_min = float(summary["min"])
-            norm_max = float(summary["max"])
-            zooms = {int(tile["z"]) for tile in tiles}
-            xs = [int(tile["x"]) for tile in tiles]
-            ys = [int(tile["y"]) for tile in tiles]
-        except (
-            OSError,
-            UnicodeError,
-            json.JSONDecodeError,
-            KeyError,
-            TypeError,
-            ValueError,
-        ):
-            raise HTTPException(
-                status_code=404, detail="Learned heatmap artifact is unavailable"
-            ) from None
-        if len(zooms) != 1 or norm_max <= norm_min:
-            raise HTTPException(
-                status_code=404, detail="Learned heatmap artifact is unavailable"
-            )
+        selected_run, report_json, payload = _heatmap_artifact(region, run_name)
+        tiles = payload["tiles"]
+        summary = payload["summary"]
+        norm_min, norm_max = summary["min"], summary["max"]
+        zooms = {tile["z"] for tile in tiles}
+        xs = [tile["x"] for tile in tiles]
+        ys = [tile["y"] for tile in tiles]
 
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
@@ -2038,27 +2215,13 @@ def create_app() -> FastAPI:
 
     @app.get("/v1/heatmap-scores.bin")
     def heatmap_scores(region: str, run_name: str | None = None) -> Response:
-        _safe_asset_name(region, kind="region")
-        selected_run = run_name or _latest_run_for_region(region)
-        if not selected_run:
-            raise HTTPException(status_code=404, detail="No run report available")
-        selected_run = _safe_asset_name(selected_run, kind="run_name")
-        report_json = _run_report_path(selected_run)
+        selected_run, report_json, payload = _heatmap_artifact(region, run_name)
         try:
             data, zoom, min_x, min_y, width, height = _load_tile_score_grid(
                 str(report_json), report_json.stat().st_mtime_ns
             )
-        except (
-            OSError,
-            UnicodeError,
-            json.JSONDecodeError,
-            KeyError,
-            TypeError,
-            ValueError,
-        ):
-            raise HTTPException(
-                status_code=404, detail="Learned heatmap scores are unavailable"
-            ) from None
+        except OSError:
+            raise HTTPException(status_code=404, detail={"message": "Learned heatmap artifact is unavailable"}) from None
         return Response(
             data,
             media_type="application/octet-stream",
@@ -2085,7 +2248,7 @@ def create_app() -> FastAPI:
 
     @app.get("/v1/contrib/tasks/next")
     def contrib_next_tasks(
-        contributor_id: str, region: str = "pittsfield", count: int = 25
+        contributor_id: str, region: str = "pittsfield", count: int = Query(default=25, ge=1, le=100)
     ) -> dict[str, Any]:
         try:
             profile = repo.upsert_profile(contributor_id)
@@ -2111,12 +2274,13 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from None
 
     @app.get("/v1/contrib/leaderboard")
-    def contrib_leaderboard(limit: int = 25) -> dict[str, Any]:
+    def contrib_leaderboard(limit: int = Query(default=25, ge=1, le=100)) -> dict[str, Any]:
         return {"leaderboard": repo.leaderboard(limit=limit)}
 
     @app.post("/v1/admin/contrib/review/run")
     def contrib_review_run(
-        request: Request, min_overlap: int = 1, min_agreement: float = 0.65
+        request: Request, min_overlap: int = Query(default=1, ge=1),
+        min_agreement: float = Query(default=0.65, ge=0, le=1, allow_inf_nan=False),
     ) -> dict[str, Any]:
         """Require X-Admin-Token matching the configured CONTRIB_ADMIN_TOKEN."""
         from secrets import compare_digest

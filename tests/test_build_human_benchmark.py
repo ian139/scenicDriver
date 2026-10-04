@@ -204,3 +204,70 @@ def test_prepare_annotations_rejects_missing_and_literal_nan_annotator_ids(
     assert ann["annotator_id"].tolist() == ["alice"]
     assert "nan" not in ann["annotator_id"].tolist()
     assert "unknown" not in ann["annotator_id"].tolist()
+
+
+def test_prepare_annotations_latest_skip_or_invalid_retracts_earlier_score(
+    tmp_path: Path,
+) -> None:
+    annotations_csv = tmp_path / "labels_human.csv"
+    pd.DataFrame(
+        [
+            {
+                "image_path": "skipped.png",
+                "scenic_human": 7.0,
+                "annotator_id": "alice",
+                "skip": False,
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+            {
+                "image_path": "skipped.png",
+                "scenic_human": None,
+                "annotator_id": "alice",
+                "skip": True,
+                "timestamp": "2026-01-02T00:00:00Z",
+            },
+            {
+                "image_path": "rescored.png",
+                "scenic_human": 6.0,
+                "annotator_id": "alice",
+                "skip": False,
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+            {
+                "image_path": "rescored.png",
+                "scenic_human": 42.0,
+                "annotator_id": "alice",
+                "skip": False,
+                "timestamp": "2026-01-02T00:00:00Z",
+            },
+            {
+                "image_path": "skipped.png",
+                "scenic_human": 5.0,
+                "annotator_id": "bob",
+                "skip": False,
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+            {
+                "image_path": "unskipped.png",
+                "scenic_human": None,
+                "annotator_id": "bob",
+                "skip": True,
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+            {
+                "image_path": "unskipped.png",
+                "scenic_human": 3.0,
+                "annotator_id": "bob",
+                "skip": False,
+                "timestamp": "2026-01-02T00:00:00Z",
+            },
+        ]
+    ).to_csv(annotations_csv, index=False)
+
+    ann, total = _prepare_annotations(annotations_csv)
+
+    assert total == 7
+    decisions = sorted(
+        zip(ann["image_path"], ann["annotator_id"], ann["scenic_human"])
+    )
+    assert decisions == [("skipped.png", "bob", 5.0), ("unskipped.png", "bob", 3.0)]

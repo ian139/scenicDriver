@@ -12,6 +12,13 @@ import sys
 import pytest
 from types import SimpleNamespace
 from typing import Any
+import shutil
+import subprocess
+
+import scripts.routing.benchmark_scenic_routing as synthetic_benchmark
+import scripts.routing.northeast_expanded_autoresearch_benchmark as autoresearch_benchmark
+from src.route_planner.graph import Edge, Node, RoadGraph, write_compact_graph
+from src.data_pipeline.web_mercator import lat_lon_to_tile
 
 import scripts.routing.production_benchmark as production_benchmark
 from scripts.routing.production_benchmark import (
@@ -1270,33 +1277,35 @@ def test_sqlite_benchmark_requires_mmap_loaded_edge_projection_index() -> None:
         )
 
 
-def test_checkpoint_fingerprint_includes_routing_implementation(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("source_name", ["_compact_search.py", "_compact_search_c.c"])
+def test_checkpoint_fingerprint_changes_with_compact_search_source(
+    tmp_path, monkeypatch, source_name
 ) -> None:
-    fingerprinted: list[Path] = []
+    paths = {
+        name: tmp_path / path.name
+        for name, path in production_benchmark._BENCHMARK_IMPLEMENTATION_PATHS.items()
+    }
+    for path in paths.values():
+        path.write_text("implementation")
+    source = tmp_path / source_name
+    source.write_text("original compact search")
+    monkeypatch.setattr(production_benchmark, "_BENCHMARK_IMPLEMENTATION_PATHS", paths)
 
-    def record_identity(path: Path) -> dict[str, object]:
-        fingerprinted.append(path.resolve())
-        return {"exists": True, "size_bytes": 1, "sha256": str(path)}
+    def fingerprint():
+        return production_benchmark._checkpoint_fingerprint(
+            corpus_path=tmp_path / "corpus.json",
+            corpus={"pairs": []},
+            graph_path=tmp_path / "graph",
+            report_path=tmp_path / "report",
+            case_timeout_seconds=10.0,
+            strict_service_full=False,
+            workers=1,
+            group_size=1,
+        )
 
-    monkeypatch.setattr(
-        production_benchmark, "_path_identity", record_identity
-    )
-    production_benchmark._checkpoint_fingerprint(
-        corpus_path=tmp_path / "corpus.json",
-        corpus={"pairs": []},
-        graph_path=tmp_path / "graph",
-        report_path=tmp_path / "report",
-        case_timeout_seconds=10.0,
-        strict_service_full=False,
-        workers=1,
-        group_size=1,
-    )
-
-    assert {
-        path.resolve()
-        for path in production_benchmark._BENCHMARK_IMPLEMENTATION_PATHS.values()
-    } <= set(fingerprinted)
+    before = fingerprint()
+    source.write_text("modified compact search")
+    assert fingerprint() != before
 
 
 def test_benchmark_resume_rejects_incompatible_checkpoint(
@@ -1701,3 +1710,241 @@ def test_run_benchmark_hard_timeout_wall_ms_is_nonzero(tmp_path, monkeypatch) ->
     row = rows[0]
     assert row["reason"] == "timeout"
     assert row["wall_ms"] >= 50.0
+
+
+def _highway_budget_graph() -> RoadGraph:
+    graph = RoadGraph()
+    for node_id, latitude, longitude in (
+        ("S", 42.0, -72.0),
+        ("A", 42.01, -72.01),
+        ("G", 42.02, -72.0),
+    ):
+        graph.add_node(Node(node_id, latitude, longitude))
+    for edge_id, start, end, distance, score, road_type in (
+        ("highway", "S", "G", 6.0, 0.0, "motorway"),
+        ("eligible", "S", "G", 9.0, 4.0, "secondary"),
+        ("scenic-west", "S", "A", 6.0, 9.0, "secondary"),
+        ("scenic-east", "A", "G", 6.0, 9.0, "secondary"),
+    ):
+        graph.add_edge(Edge(
+            edge_id, start, end, distance_km=distance, scenic_score=score,
+            road_type=road_type, speed_limit_kmh=60, one_way=True,
+        ))
+    return graph
+
+
+def test_synthetic_avoidance_uses_unrestricted_cap_and_restricted_uplift() -> None:
+    case = synthetic_benchmark.BenchmarkCase(
+        name="distinct-highway-reference",
+        graph=_highway_budget_graph(),
+        start=(42.0, -72.0),
+        end=(42.02, -72.0),
+        max_detour_factor=2.0,
+        avoid_highways=True,
+    )
+    score, uplift, ratio = _run_case(case)
+    assert score == pytest.approx(0.9)
+    assert uplift == pytest.approx(0.5)
+    assert ratio == pytest.approx(2.0)
+
+
+def test_synthetic_rejects_detour_outside_unrestricted_highway_budget(monkeypatch) -> None:
+    graph = _highway_budget_graph()
+    graph.add_node(Node("B", 42.01, -71.99))
+    for edge_id, start, end in (("over-west", "S", "B"), ("over-east", "B", "G")):
+        graph.add_edge(Edge(
+            edge_id, start, end, distance_km=9.0, scenic_score=10.0,
+            road_type="secondary", speed_limit_kmh=60, one_way=True,
+        ))
+    case = synthetic_benchmark.BenchmarkCase(
+        name="outside-unrestricted-budget", graph=graph,
+        start=(42.0, -72.0), end=(42.02, -72.0),
+        max_detour_factor=2.0, avoid_highways=True,
+    )
+    # A genuine highway-free route fits the restricted 18-minute reference
+    # budget but exceeds the public contract's unrestricted 12-minute cap.
+    route = synthetic_benchmark.ScenicRoutePlanner(graph=graph).find_scenic_route(
+        case.start, case.end, scenic_weight=1.0, avoid_highways=True,
+        max_detour_factor=3.0, scenic_priority=True,
+    )
+    assert route.estimated_duration_minutes == pytest.approx(18.0)
+    monkeypatch.setattr(
+        synthetic_benchmark.ScenicRoutePlanner, "find_scenic_route",
+        lambda *args, **kwargs: route,
+    )
+    with pytest.raises(ValueError, match="scenic route exceeds its duration cap"):
+        _run_case(case)
+
+
+def _autoresearch_artifacts(tmp_path, monkeypatch):
+    graph = _highway_budget_graph()
+    source = tmp_path / "road_graph.sqlite3"
+    graph.save(source)
+    manifest_path = tmp_path / "road_graph.compact.json"
+    write_compact_graph(source, manifest_path)
+    report = tmp_path / "report.json"
+    rows = []
+    for edge in graph.edges.values():
+        start = graph.nodes[edge.start_node_id]
+        end = graph.nodes[edge.end_node_id]
+        x, y = lat_lon_to_tile((start.lat + end.lat) / 2, (start.lon + end.lon) / 2, 14)
+        rows.append({"x": x, "y": y, "z": 14, "scenic_score": edge.scenic_score})
+    report.write_text(json.dumps({"tiles": rows}))
+    monkeypatch.setattr(autoresearch_benchmark, "GRAPH_PATH", manifest_path)
+    monkeypatch.setattr(autoresearch_benchmark, "REPORT_PATH", report)
+    monkeypatch.setattr(
+        autoresearch_benchmark, "EXPECTED_GRAPH_SHA256",
+        autoresearch_benchmark._sha256_file(manifest_path),
+    )
+    monkeypatch.setattr(
+        autoresearch_benchmark, "EXPECTED_REPORT_SHA256",
+        autoresearch_benchmark._sha256_file(report),
+    )
+    monkeypatch.setattr(autoresearch_benchmark, "ORACLE_PATH", tmp_path / "absent-oracle.json")
+    return manifest_path, report
+
+
+@pytest.mark.parametrize("payload", ["binary", "source"])
+@pytest.mark.parametrize("corruption", ["digest", "size"])
+def test_autoresearch_rejects_corrupt_payload_before_timing(
+    tmp_path, monkeypatch, payload, corruption
+) -> None:
+    manifest_path, _ = _autoresearch_artifacts(tmp_path, monkeypatch)
+    manifest = json.loads(manifest_path.read_text())
+    path = manifest_path.parent / (
+        manifest["bin_path"] if payload == "binary" else manifest["source"]["path"]
+    )
+    data = bytearray(path.read_bytes())
+    if corruption == "digest":
+        data[-1] ^= 1
+    else:
+        data.extend(b"trailing")
+    path.write_bytes(data)
+    monkeypatch.setattr(
+        autoresearch_benchmark, "_run_preload_worker",
+        lambda: pytest.fail("timing started with corrupt artifacts"),
+    )
+    with pytest.raises(ValueError, match="SHA-256|size mismatch"):
+        autoresearch_benchmark.run_benchmark(timed_runs=1, preload_runs=1)
+    assert not autoresearch_benchmark.ORACLE_PATH.exists()
+
+
+def test_autoresearch_rejects_wrong_declared_source_size(tmp_path, monkeypatch) -> None:
+    manifest_path, _ = _autoresearch_artifacts(tmp_path, monkeypatch)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["source"]["size_bytes"] += 1
+    manifest_path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(
+        autoresearch_benchmark, "EXPECTED_GRAPH_SHA256",
+        autoresearch_benchmark._sha256_file(manifest_path),
+    )
+    with pytest.raises(ValueError, match="size mismatch"):
+        autoresearch_benchmark.run_benchmark(timed_runs=1, preload_runs=1)
+
+
+def test_autoresearch_missing_oracle_never_seeds_or_starts_timing(
+    tmp_path, monkeypatch
+) -> None:
+    _autoresearch_artifacts(tmp_path, monkeypatch)
+    monkeypatch.setattr(autoresearch_benchmark, "LATEST_PATH", tmp_path / "latest.json")
+    monkeypatch.setattr(
+        autoresearch_benchmark, "_run_preload_worker",
+        lambda: pytest.fail("timing started without the immutable oracle"),
+    )
+    with pytest.raises(FileNotFoundError, match="must not be self-seeded"):
+        autoresearch_benchmark.run_benchmark(timed_runs=1, preload_runs=1)
+    assert not autoresearch_benchmark.ORACLE_PATH.exists()
+    assert not autoresearch_benchmark.LATEST_PATH.exists()
+
+
+def test_autoresearch_parent_and_preload_worker_ignore_cwd(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "project"
+    script = root / "scripts/routing/northeast_expanded_autoresearch_benchmark.py"
+    script.parent.mkdir(parents=True)
+    shutil.copyfile(autoresearch_benchmark.__file__, script)
+    graph_path = root / autoresearch_benchmark.GRAPH_PATH.relative_to(
+        autoresearch_benchmark.PROJECT_ROOT
+    )
+    report_path = root / autoresearch_benchmark.REPORT_PATH.relative_to(
+        autoresearch_benchmark.PROJECT_ROOT
+    )
+    graph_path.parent.mkdir(parents=True)
+    report_path.parent.mkdir(parents=True)
+    manifest_path, report = _autoresearch_artifacts(graph_path.parent, monkeypatch)
+    manifest_path.rename(graph_path)
+    report.rename(report_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    code = (
+        "import json,runpy,sys;"
+        "ns=runpy.run_path(sys.argv[1]);"
+        "g=ns['_artifact_identity'].__globals__;"
+        f"g['EXPECTED_GRAPH_SHA256']={autoresearch_benchmark.EXPECTED_GRAPH_SHA256!r};"
+        f"g['EXPECTED_REPORT_SHA256']={autoresearch_benchmark.EXPECTED_REPORT_SHA256!r};"
+        "ns['_preload_worker_main']() if sys.argv[2]=='worker' else None;"
+        "print('IDENTITY '+json.dumps(ns['_artifact_identity'](),sort_keys=True))"
+    )
+    env = {**os.environ, "PYTHONPATH": str(autoresearch_benchmark.PROJECT_ROOT)}
+    identities = []
+    for mode, cwd in (("parent", root), ("parent", elsewhere), ("worker", elsewhere)):
+        completed = subprocess.run(
+            [sys.executable, "-c", code, str(script), mode],
+            cwd=cwd, env=env, capture_output=True, text=True, timeout=60, check=True,
+        )
+        identities.append(json.loads(next(
+            line.removeprefix("IDENTITY ") for line in completed.stdout.splitlines()
+            if line.startswith("IDENTITY ")
+        )))
+        if mode == "worker":
+            preload = json.loads(next(
+                line.removeprefix("PRELOAD_RESULT ") for line in completed.stdout.splitlines()
+                if line.startswith("PRELOAD_RESULT ")
+            ))
+            assert preload["diagnostics"]["graph_cache_hit"] is False
+            assert preload["peak_rss_bytes"] > 0
+    assert identities[0] == identities[1] == identities[2]
+
+
+@pytest.mark.parametrize(
+    "exceed_phase,expected_phases",
+    [
+        ("initial", []),
+        ("session", ["fresh", "session"]),
+        ("warmup", ["fresh", "session", "warmup"]),
+        ("timed", ["fresh", "session", "warmup", "timed"]),
+    ],
+)
+def test_autoresearch_rss_stop_prevents_later_planning(
+    monkeypatch, exceed_phase, expected_phases
+) -> None:
+    phases = []
+    rss = autoresearch_benchmark.MAX_RSS_BYTES + 1 if exceed_phase == "initial" else 1
+    monkeypatch.setattr(autoresearch_benchmark, "_peak_rss_bytes", lambda: rss)
+    monkeypatch.setattr(autoresearch_benchmark, "_artifact_identity", lambda: {})
+    monkeypatch.setattr(autoresearch_benchmark, "_load_pinned_oracle", lambda: ({}, {}))
+    monkeypatch.setattr(autoresearch_benchmark, "clear_route_caches", lambda: None)
+    monkeypatch.setattr(autoresearch_benchmark, "clear_route_response_cache", lambda: None)
+    monkeypatch.setattr(autoresearch_benchmark, "_assert_response_cache_state", lambda *a, **kw: None)
+    monkeypatch.setattr(autoresearch_benchmark, "_validate_response_semantics", lambda *a, **kw: "fixture")
+
+    def preload(phase):
+        nonlocal rss
+        phases.append(phase)
+        if exceed_phase == phase:
+            rss = autoresearch_benchmark.MAX_RSS_BYTES + 1
+        return {"wall_seconds": 1.0, "cpu_seconds": 1.0, "peak_rss_bytes": rss}
+
+    def request(_):
+        nonlocal rss
+        phase = "warmup" if "warmup" not in phases else "timed"
+        phases.append(phase)
+        if exceed_phase == phase:
+            rss = autoresearch_benchmark.MAX_RSS_BYTES + 1
+        return {}, 1.0, 1.0
+
+    monkeypatch.setattr(autoresearch_benchmark, "_run_preload_worker", lambda: preload("fresh"))
+    monkeypatch.setattr(autoresearch_benchmark, "_measure_preload", lambda: preload("session"))
+    monkeypatch.setattr(autoresearch_benchmark, "_timed_request", request)
+    with pytest.raises(MemoryError, match="hard stop"):
+        autoresearch_benchmark.run_benchmark(timed_runs=2, preload_runs=1)
+    assert phases == expected_phases

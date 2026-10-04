@@ -14,6 +14,7 @@ import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from src.data_pipeline.source_contracts import SourceAsset
 
 
@@ -54,10 +55,75 @@ VALID_HORIZONTAL_CRS = {"EPSG:4269", "EPSG:4326", "NAD83", "WGS84"}
 VALID_VERTICAL_DATUMS = {"NAVD88", "EPSG:5703", "NAVD 88", "NAVD88_HEIGHT"}
 VALID_ELEVATION_UNITS = {"m", "meter", "meters"}
 
-# Canonical S3 key pattern: prd-tnm/StagedProducts/Elevation/13/TIFF/current/.../USGS_13_*.tif
-CANONICAL_URI_REGEX = re.compile(
-    r"^(?:s3://|https://[^/]+/)?(?:prd-tnm/)?StagedProducts/Elevation/13/TIFF/current/(?:[^/]+/)*(USGS_13_[a-zA-Z0-9_\-]+\.tif)$"
+USGS_3DEP_BUCKET = "prd-tnm"
+
+# Exact S3 object key inside the prd-tnm bucket:
+# StagedProducts/Elevation/13/TIFF/current/<tile dirs>/USGS_13_*.tif
+_CANONICAL_KEY_REGEX = re.compile(
+    r"StagedProducts/Elevation/13/TIFF/current/"
+    r"(?:(?!\.{1,2}/)[A-Za-z0-9_.\-]+/)*"
+    r"(USGS_13_[A-Za-z0-9_\-]+\.tif)"
 )
+# AWS S3 endpoints: s3.amazonaws.com or s3.<region>.amazonaws.com
+_S3_ENDPOINT_REGEX = re.compile(r"s3(?:\.[a-z]{2}(?:-[a-z]+)+-\d)?\.amazonaws\.com")
+
+
+def canonical_3dep_s3_uri(uri: str) -> tuple[str, str] | None:
+    """Normalize a supported prd-tnm reference to ``(s3://prd-tnm/<key>, filename)``.
+
+    Accepted forms, all naming the ``prd-tnm`` bucket and keeping the full object key
+    (including intermediate tile directories such as ``n42w072/``):
+
+    - ``s3://prd-tnm/<key>``
+    - ``https://prd-tnm.s3[.<region>].amazonaws.com/<key>`` (virtual-hosted style)
+    - ``https://s3[.<region>].amazonaws.com/prd-tnm/<key>`` (path style)
+    - bare ``prd-tnm/<key>`` or ``<key>`` (bucket implied by the provider contract)
+
+    Any other scheme, host, bucket, userinfo, port, query, fragment, or a key outside
+    ``StagedProducts/Elevation/13/TIFF/current/.../USGS_13_*.tif`` returns ``None``.
+    """
+    if "://" in uri:
+        parsed = urlsplit(uri)
+        if (
+            parsed.query
+            or parsed.fragment
+            or "?" in uri
+            or "#" in uri
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port is not None
+        ):
+            return None
+        host = parsed.netloc
+        path = parsed.path
+        if parsed.scheme == "s3":
+            if host != USGS_3DEP_BUCKET:
+                return None
+            key = path[1:] if path.startswith("/") else None
+        elif parsed.scheme == "https":
+            host = host.lower()
+            if host.startswith(f"{USGS_3DEP_BUCKET}.") and _S3_ENDPOINT_REGEX.fullmatch(
+                host[len(USGS_3DEP_BUCKET) + 1 :]
+            ):
+                key = path[1:] if path.startswith("/") else None
+            elif _S3_ENDPOINT_REGEX.fullmatch(host) and path.startswith(
+                f"/{USGS_3DEP_BUCKET}/"
+            ):
+                key = path[len(USGS_3DEP_BUCKET) + 2 :]
+            else:
+                return None
+        else:
+            return None
+    elif uri.startswith(f"{USGS_3DEP_BUCKET}/"):
+        key = uri[len(USGS_3DEP_BUCKET) + 1 :]
+    else:
+        key = uri
+    if key is None:
+        return None
+    match = _CANONICAL_KEY_REGEX.fullmatch(key)
+    if not match:
+        return None
+    return f"s3://{USGS_3DEP_BUCKET}/{key}", match.group(1)
 
 
 def load_hash_pinned_catalog(
@@ -299,15 +365,14 @@ def validate_3dep_record(record: dict[str, Any]) -> SourceAsset:
     if not uri or not isinstance(uri, str):
         raise WeakIdentityError("Missing or non-string canonical URI")
 
-    # Reject URIs that rely solely on dynamic endpoints, OBJECTID, Best, or lack specific USGS_13_ filename
-    match = CANONICAL_URI_REGEX.match(uri)
-    if not match:
+    # Reject URIs outside the prd-tnm bucket or lacking a specific USGS_13_ object key
+    normalized = canonical_3dep_s3_uri(uri)
+    if normalized is None:
         raise WeakIdentityError(
             f"Canonical URI '{uri}' does not match official 3DEP 1/3-arc-second TIFF pattern "
-            f"'prd-tnm/StagedProducts/Elevation/13/TIFF/current/.../USGS_13_*.tif'"
+            f"'s3://prd-tnm/StagedProducts/Elevation/13/TIFF/current/.../USGS_13_*.tif'"
         )
-
-    filename = match.group(1)
+    canonical_uri, filename = normalized
     filename_asset_id = filename.rsplit(".", 1)[0]
     asset_id = record.get("asset_id") or filename_asset_id
     if asset_id != filename_asset_id:
@@ -425,17 +490,6 @@ def validate_3dep_record(record: dict[str, Any]) -> SourceAsset:
 
     # Validate coordinates inside footprint
     parse_footprint_bounds(footprint_raw)
-
-    # Build canonical URI
-    canonical_uri = uri
-    if not canonical_uri.startswith("s3://"):
-        if "prd-tnm/" in canonical_uri:
-            idx = canonical_uri.index("prd-tnm/")
-            canonical_uri = "s3://" + canonical_uri[idx:]
-        else:
-            canonical_uri = (
-                f"s3://prd-tnm/StagedProducts/Elevation/13/TIFF/current/{filename}"
-            )
 
     return SourceAsset(
         provider="USGS",

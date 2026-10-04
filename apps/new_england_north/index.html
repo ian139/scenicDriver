@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Scenic Drive</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css?v=route-popup-v1" />
+    <link rel="stylesheet" href="/styles.css?v=viewer-hardening-v1" />
   </head>
   <body>
     <main class="viewer-shell">
@@ -18,10 +18,10 @@
         <aside class="control-panel" aria-label="Route controls">
           <header class="panel-header">
             <div class="panel-meta">
-              <div id="inspector" class="inspector" role="group" aria-label="Scenic score readout" aria-live="off">
+              <div id="inspector" class="inspector" role="group" aria-label="Scenic score readout" aria-live="off" aria-atomic="true">
                 <span class="overline">Scenic score</span>
                 <strong id="inspectorScore">--</strong>
-                <span id="inspectorCoords">Move over a heatmap cell</span>
+                <span id="inspectorCoords">Move over a heatmap cell or focus the map to inspect its center</span>
               </div>
               <span class="status-chip" id="apiStatus">API: checking</span>
             </div>
@@ -200,6 +200,6 @@
     </main>
 
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <script type="module" src="./viewer.js?v=expanded-heatmap-v2"></script>
+    <script type="module" src="/viewer.js?v=viewer-hardening-v1"></script>
   </body>
 </html>

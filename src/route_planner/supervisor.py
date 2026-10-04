@@ -23,6 +23,19 @@ transfer budget, and partial input is retained between short polls, so
 deadline enforcement is never blocked behind a stalled or half-written frame;
 a broken stream is classified as a worker failure and the worker is killed.
 
+Process ownership survives abrupt loss of any ancestor.  The supervisor polls
+its caller's PID (captured before ``fork``) both while idle and while a job
+runs, and turns SIGTERM into a shutdown that kills and reaps the worker.  The
+supervisor's direct child is a tiny guardian that forks the actual planning
+worker, relays SIGTERM/SIGKILL requests to it, ``waitpid``\\ s it and reports
+its real exit code.  The guardian holds a control socket whose only other
+end is the supervisor's; when the supervisor dies the guardian SIGKILLs and
+reaps the worker, independent of the worker's GIL or signal handling, then
+exits (its own adoption by init is then unavoidable).  The supervisor joins
+the guardian on every controlled stop, and SIGKILLs and joins an
+unresponsive one.  Children close every inherited channel endpoint they do
+not own.
+
 Exceptions cross process boundaries as explicit envelopes carrying the exact
 type plus its ``args`` and instance attributes, so structured errors such as
 ``RouteCoverageError`` keep their fields.  An envelope that cannot be rebuilt
@@ -42,11 +55,13 @@ from multiprocessing.process import BaseProcess
 import os
 import pickle
 import select
+import signal
 import socket
 import struct
 import sys
 import threading
 import time
+import traceback
 from typing import Any, Callable
 
 from .cancellation import (
@@ -70,6 +85,17 @@ _RECV_CHUNK_BYTES = 1 << 20
 _POLL_SLICE_SECONDS = 0.05
 # How long past ``deadline + grace`` the caller waits for the supervisor.
 _SUPERVISOR_RESPONSE_MARGIN_SECONDS = 2.0
+# How long a forced caller-side shutdown lets the supervisor reap its worker
+# after SIGTERM before it is SIGKILL'd.
+_SUPERVISOR_SHUTDOWN_GRACE_SECONDS = 2.0
+# How often an idle worker guardian re-checks that its worker is still alive.
+_GUARDIAN_POLL_SECONDS = 0.5
+# How long the supervisor waits for a guardian to report a requested kill
+# before it SIGKILLs the worker and the guardian itself.
+_GUARDIAN_RESPONSE_SECONDS = 0.5
+# How long a job without a deadline waits for the previous worker's guardian
+# to finish reaping it before giving up.
+_UNRESOLVED_REAP_GRACE_SECONDS = 1.0
 
 
 def get_preload_marker() -> Any:
@@ -157,6 +183,297 @@ class SupervisorError(RuntimeError):
     """The supervisor process could not start or communicate."""
 
 
+class _SupervisorShutdown(BaseException):
+    """The supervisor must stop now: SIGTERM, or its caller process is gone.
+
+    A ``BaseException`` so the per-job error envelope never contains it.
+    """
+
+
+def _raise_shutdown(signum: int, frame: Any) -> None:
+    """SIGTERM handler of the supervisor; one-shot so cleanup is not re-entered."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise _SupervisorShutdown("supervisor received SIGTERM")
+
+
+def _check_owner(owner_pid: int | None) -> None:
+    """Raise ``_SupervisorShutdown`` once the process that forked us is gone.
+
+    ``owner_pid`` is captured before ``fork``, so an owner that dies before
+    the child first runs is still detected after reparenting.
+    """
+    if owner_pid is not None and os.getppid() != owner_pid:
+        raise _SupervisorShutdown(f"owner process {owner_pid} exited")
+
+
+# Guardian -> supervisor status records: worker PID once forked, exit code once reaped.
+_GUARDIAN_STATUS = struct.Struct("!cq")
+_STATUS_WORKER_PID = b"P"
+_STATUS_WORKER_EXIT = b"X"
+# Supervisor -> guardian requests.
+_CONTROL_TERMINATE = b"T"
+_CONTROL_KILL = b"K"
+
+
+def _ignore_signal(signum: int, frame: Any) -> None:
+    """Guardian signal handler; the wakeup fd carries the signal number."""
+
+
+def _guard_worker(control: socket.socket, worker_pid: int, wakeup_fd: int) -> None:
+    """Relay control requests to the worker, reap it and report its exit code.
+
+    A closed control socket means the supervisor is gone or done with this
+    worker; SIGTERM to the guardian means the same.  Either SIGKILLs the
+    worker.  Only this process ever waits for ``worker_pid``, so it is never
+    reused while a request is relayed to it.
+    """
+    control.settimeout(1.0)
+    try:
+        control.sendall(_GUARDIAN_STATUS.pack(_STATUS_WORKER_PID, worker_pid))
+    except OSError:
+        pass
+    while True:
+        kill = False
+        try:
+            readable, _, _ = select.select(
+                [control, wakeup_fd], [], [], _GUARDIAN_POLL_SECONDS
+            )
+        except (OSError, ValueError):
+            readable, kill = [], True
+        if wakeup_fd in readable:
+            try:
+                signals = os.read(wakeup_fd, 512)
+            except BlockingIOError:
+                signals = b""
+            if int(signal.SIGTERM) in signals:
+                kill = True
+        if control in readable:
+            try:
+                requests: bytes | None = control.recv(512)
+            except (BlockingIOError, TimeoutError):
+                requests = None
+            except OSError:
+                requests = b""
+            if requests is not None:
+                if not requests or _CONTROL_KILL in requests:
+                    kill = True
+                elif _CONTROL_TERMINATE in requests:
+                    # Resume a stopped worker first: its SIGTERM is only
+                    # delivered once it runs again.  The guardian alone
+                    # signals the worker, so a reaped PID is never targeted.
+                    os.kill(worker_pid, signal.SIGCONT)
+                    os.kill(worker_pid, signal.SIGTERM)
+        if kill:
+            os.kill(worker_pid, signal.SIGKILL)
+        pid, status = os.waitpid(worker_pid, 0 if kill else os.WNOHANG)
+        if pid:
+            break
+    try:
+        control.sendall(
+            _GUARDIAN_STATUS.pack(_STATUS_WORKER_EXIT, os.waitstatus_to_exitcode(status))
+        )
+    except OSError:
+        pass
+
+
+def _guardian_entry(
+    worker_sock: socket.socket,
+    worker_peer: socket.socket,
+    control: socket.socket,
+    control_peer: socket.socket,
+    cancel_flag: SharedCancelFlag,
+    ancestor_socks: tuple[socket.socket, ...],
+) -> None:
+    """Own one planning worker: fork it, relay control, reap it, report its exit.
+
+    Closes every inherited endpoint it does not own (the supervisor's side of
+    both channels and the supervisor's caller channel) before forking, so the
+    worker inherits none of them and the supervisor's death is observable.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    worker_peer.close()
+    control_peer.close()
+    for ancestor in ancestor_socks:
+        ancestor.close()
+    worker_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    wakeup_read, wakeup_write = os.pipe()
+    os.set_blocking(wakeup_read, False)
+    os.set_blocking(wakeup_write, False)
+    signal.signal(signal.SIGTERM, _ignore_signal)
+    signal.signal(signal.SIGCHLD, _ignore_signal)
+    signal.set_wakeup_fd(wakeup_write)
+    worker_pid = os.fork()
+    if worker_pid == 0:
+        exitcode = 1
+        try:
+            signal.set_wakeup_fd(-1)
+            signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+            # The deadline SIGTERM is meant to terminate the job by default.
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            if worker_sigint is not None:
+                signal.signal(signal.SIGINT, worker_sigint)
+            os.close(wakeup_read)
+            os.close(wakeup_write)
+            control.close()
+            _persistent_worker_loop(worker_sock, cancel_flag)
+            exitcode = 0
+        except BaseException:
+            traceback.print_exc()
+        finally:
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
+            os._exit(exitcode)
+    worker_sock.close()
+    try:
+        _guard_worker(control, worker_pid, wakeup_read)
+    finally:
+        signal.set_wakeup_fd(-1)
+        control.close()
+        os.close(wakeup_read)
+        os.close(wakeup_write)
+
+
+class _GuardedWorker:
+    """Process-like view of the planning worker owned by its guardian.
+
+    ``pid`` and ``exitcode`` are the actual worker's.  The worker is only ever
+    signalled by its guardian, which alone reaps it, so no request can reach
+    a reused PID.  The supervisor signals only the guardian, its own unjoined
+    child, and never kills it before the worker's reap has been reported.
+    ``join`` reaps the guardian, so a controlled stop leaves no descendant.
+    """
+
+    def __init__(self, guardian: BaseProcess, control: socket.socket) -> None:
+        control.setblocking(False)
+        self._guardian = guardian
+        self._control = control
+        self._buffer = bytearray()
+        self._detached = False
+        self.pid: int | None = None
+        self.exitcode: int | None = None
+
+    def _detach(self) -> None:
+        if not self._detached:
+            self._detached = True
+            self._control.close()
+
+    def _read_status(self, timeout: float | None, *, need_pid: bool = False) -> None:
+        """Consume guardian status until the worker exited or ``timeout`` passes."""
+        stop_at = None if timeout is None else time.monotonic() + timeout
+        while not (
+            self._detached
+            or self.exitcode is not None
+            or (need_pid and self.pid is not None)
+        ):
+            wait = None if stop_at is None else max(0.0, stop_at - time.monotonic())
+            try:
+                readable, _, _ = select.select([self._control], [], [], wait)
+            except (OSError, ValueError):
+                self._detach()
+                return
+            if not readable:
+                return
+            try:
+                data = self._control.recv(512)
+            except BlockingIOError:
+                continue
+            except OSError:
+                data = b""
+            if not data:
+                self._detach()
+                return
+            self._buffer += data
+            while len(self._buffer) >= _GUARDIAN_STATUS.size:
+                tag, value = _GUARDIAN_STATUS.unpack_from(self._buffer)
+                del self._buffer[: _GUARDIAN_STATUS.size]
+                if tag == _STATUS_WORKER_PID:
+                    self.pid = value
+                elif tag == _STATUS_WORKER_EXIT:
+                    self.exitcode = value
+
+    def _send(self, request: bytes) -> None:
+        if not self._detached:
+            try:
+                self._control.send(request)
+            except OSError:
+                pass
+
+    def wait_started(self, timeout: float) -> None:
+        self._read_status(timeout, need_pid=True)
+        if self.pid is None:
+            raise SupervisorError("worker guardian did not report a planning worker")
+
+    def is_alive(self) -> bool:
+        """Whether the worker may still run (its exit is unreported)."""
+        self._read_status(0.0)
+        return self.exitcode is None and not self._detached and self._guardian.is_alive()
+
+    def _signal_guardian(self, signum: int) -> None:
+        # Unjoined child: its PID cannot be reused while is_alive() is true.
+        if self._guardian.is_alive():
+            try:
+                os.kill(self._guardian.pid, signum)  # type: ignore[arg-type]
+            except ProcessLookupError:
+                pass
+
+    def terminate(self) -> None:
+        """Ask the guardian to SIGTERM the worker at the job deadline.
+
+        The guardian is resumed here and resumes the worker in turn before
+        relaying the SIGTERM, so a stopped worker still receives it; a
+        running one is unaffected.
+        """
+        if self.exitcode is None:
+            self._signal_guardian(signal.SIGCONT)
+            self._send(_CONTROL_TERMINATE)
+
+    def kill(self) -> None:
+        """Have the guardian SIGKILL and reap the worker, resuming it if stopped.
+
+        Escalates from a kill request to SIGTERM on the guardian, which runs
+        the same kill-and-reap path.  The guardian is never killed while it
+        may be the worker's only reaper; one that has not reported yet stays
+        unresolved for ``collected`` to finish later.
+        """
+        for escalation in (_CONTROL_KILL, signal.SIGTERM):
+            if self.exitcode is not None or self._detached:
+                return
+            self._signal_guardian(signal.SIGCONT)
+            if escalation is _CONTROL_KILL:
+                self._send(_CONTROL_KILL)
+            else:
+                self._signal_guardian(signal.SIGTERM)
+            self._read_status(_GUARDIAN_RESPONSE_SECONDS)
+
+    def join(self, timeout: float | None = None) -> None:
+        """Wait for the worker's reported exit, then reap the guardian."""
+        self._read_status(timeout)
+        if self.exitcode is None and not self._detached:
+            return
+        if self._guardian.is_alive():
+            self._signal_guardian(signal.SIGCONT)
+            self._guardian.join(timeout=_GUARDIAN_RESPONSE_SECONDS)
+        if self.exitcode is not None and self._guardian.is_alive():
+            # The worker's reap is known, so the guardian owns nothing more.
+            self._guardian.kill()
+            self._guardian.join(timeout=2.0)
+        if not self._guardian.is_alive():
+            self._detach()
+
+    def collected(self) -> bool:
+        """Make non-blocking progress; true once the guardian has been reaped.
+
+        A reaped guardian has itself reaped the worker, unless the guardian
+        was killed from outside, which leaves the worker to init.
+        """
+        self.join(timeout=0)
+        return not self._guardian.is_alive()
+
+
 def _is_posix() -> bool:
     return os.name == "posix"
 
@@ -199,9 +516,14 @@ def _rebuild_error(serialized: _SerializedError) -> BaseException:
 
 
 def _reconstruct_error(serialized: _SerializedError) -> BaseException:
-    """Rebuild an exception, containing even BaseException from pickle reducers."""
+    """Rebuild an exception, containing even BaseException from pickle reducers.
+
+    Only the supervisor's own shutdown request escapes the containment.
+    """
     try:
         return _rebuild_error(serialized)
+    except _SupervisorShutdown:
+        raise
     except BaseException as exc:
         return SupervisorError(
             f"{serialized.module_name}.{serialized.qualname}: {serialized.message} "
@@ -306,6 +628,8 @@ class _FramedChannel:
             if frame is not None:
                 try:
                     return pickle.loads(frame)
+                except _SupervisorShutdown:
+                    raise
                 except BaseException as exc:
                     raise _FrameDecodeError(repr(exc)) from exc
             if self._receive_some():
@@ -377,11 +701,8 @@ def _run_one_job(job: _WorkerJob, cancel_flag: SharedCancelFlag) -> _WorkerResul
         return _WorkerResult(error=_serialize_error(exc), worker_pid=os.getpid())
 
 
-def _persistent_worker_entry(
-    sock: socket.socket, peer_sock: socket.socket, cancel_flag: SharedCancelFlag
-) -> None:
-    """Main loop of the persistent disposable planning child."""
-    peer_sock.close()
+def _persistent_worker_loop(sock: socket.socket, cancel_flag: SharedCancelFlag) -> None:
+    """Main loop of the persistent disposable planning worker."""
     channel = _FramedChannel(sock)
     worker_pid = os.getpid()
     try:
@@ -406,7 +727,7 @@ def _persistent_worker_entry(
         channel.close()
 
 
-def _reap_process(process: BaseProcess, timeout: float = 5.0) -> None:
+def _reap_process(process: BaseProcess | _GuardedWorker, timeout: float = 5.0) -> None:
     """Join a process; escalate to SIGTERM/SIGKILL if necessary."""
     if process.is_alive():
         process.join(timeout=timeout)
@@ -416,31 +737,96 @@ def _reap_process(process: BaseProcess, timeout: float = 5.0) -> None:
     if process.is_alive():
         process.kill()
         process.join(timeout=2.0)
+    # Collect whatever already exited (for a guarded worker, its guardian).
+    process.join(timeout=0)
+
+
+def _force_stop_supervisor(process: BaseProcess) -> None:
+    """SIGTERM so the supervisor kills and reaps its worker, then SIGKILL.
+
+    If the supervisor cannot finish in time, its worker's guardian still
+    SIGKILLs and reaps the worker once the supervisor's control socket closes.
+    """
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=_SUPERVISOR_SHUTDOWN_GRACE_SECONDS)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=2.0)
 
 
 class _WorkerHandle:
     """One persistent disposable child of the supervisor."""
 
-    def __init__(self, ctx: ForkContext, cancel_flag: SharedCancelFlag) -> None:
+    def __init__(
+        self,
+        ctx: ForkContext,
+        cancel_flag: SharedCancelFlag,
+        *,
+        owner_pid: int | None = None,
+        ancestor_socks: tuple[socket.socket, ...] = (),
+    ) -> None:
         self._ctx = ctx
         self._cancel_flag = cancel_flag
-        self._proc: BaseProcess | None = None
+        # PID of the supervisor's caller; a job is abandoned once it is gone.
+        self._owner_pid = owner_pid
+        # Endpoints inherited by every worker that only the supervisor owns.
+        self._ancestor_socks = ancestor_socks
+        self._proc: _GuardedWorker | None = None
         self._channel: _FramedChannel | None = None
+        # A stopped worker whose guardian has not been reaped yet.  It stays
+        # owned and is collected from the idle loop; no replacement is forked
+        # until it is gone.
+        self._unresolved: _GuardedWorker | None = None
 
-    def _ensure_worker(self) -> tuple[BaseProcess, _FramedChannel]:
+    def _ensure_worker(
+        self, reap_budget: float
+    ) -> tuple[_GuardedWorker, _FramedChannel]:
         if self._proc is None or self._channel is None or not self._proc.is_alive():
             self._shutdown_worker()
+            # A guardian that reaps its worker slowly is waited out within the
+            # caller's own budget instead of failing the job outright; the
+            # idle loop keeps collecting it either way.
+            if not self.collect_until(reap_budget):
+                raise SupervisorError(
+                    "previous planning worker is still being reaped; retry later"
+                )
             parent_sock, child_sock = socket.socketpair()
-            proc = self._ctx.Process(
-                target=_persistent_worker_entry,
-                args=(child_sock, parent_sock, self._cancel_flag),
+            control_sock, guardian_control = socket.socketpair()
+            guardian = self._ctx.Process(
+                target=_guardian_entry,
+                args=(
+                    child_sock,
+                    parent_sock,
+                    guardian_control,
+                    control_sock,
+                    self._cancel_flag,
+                    self._ancestor_socks,
+                ),
                 daemon=False,
             )
-            proc.start()
-            child_sock.close()
-            self._proc = proc
+            try:
+                guardian.start()
+            except BaseException:
+                parent_sock.close()
+                control_sock.close()
+                raise
+            finally:
+                child_sock.close()
+                guardian_control.close()
+            self._proc = _GuardedWorker(guardian, control_sock)
             self._channel = _FramedChannel(parent_sock)
+            self._proc.wait_started(_FRAME_TRANSFER_BUDGET_SECONDS)
         return self._proc, self._channel
+
+    def _release_worker(self) -> None:
+        """Drop the current worker; keep owning a guardian not reaped yet."""
+        if self._channel is not None:
+            self._channel.close()
+            self._channel = None
+        proc, self._proc = self._proc, None
+        if isinstance(proc, _GuardedWorker) and not proc.collected():
+            self._unresolved = proc
 
     def _shutdown_worker(self) -> None:
         if self._channel is not None:
@@ -448,7 +834,21 @@ class _WorkerHandle:
             self._channel = None
         if self._proc is not None:
             _reap_process(self._proc, timeout=2.0)
-            self._proc = None
+        self._release_worker()
+
+    def collect(self) -> bool:
+        """Reap a guardian left unresolved by an earlier stop; true once none is left."""
+        if self._unresolved is not None and self._unresolved.collected():
+            self._unresolved = None
+        return self._unresolved is None
+
+    def collect_until(self, timeout: float) -> bool:
+        stop_at = time.monotonic() + timeout
+        while not self.collect():
+            if time.monotonic() >= stop_at:
+                return False
+            time.sleep(_POLL_SLICE_SECONDS)
+        return True
 
     def shutdown(self) -> None:
         """Politely stop the worker, then reap it."""
@@ -461,10 +861,10 @@ class _WorkerHandle:
 
     def kill(self) -> None:
         """Hard-stop the worker; the next job forks a fresh one."""
-        if self._proc is not None and self._proc.is_alive():
+        if self._proc is not None:
             self._proc.kill()
-            self._proc.join(timeout=1.0)
-        self._shutdown_worker()
+            self._proc.join(timeout=_GUARDIAN_RESPONSE_SECONDS)
+        self._release_worker()
 
     def _dispose(self, error: BaseException, worker_pid: int | None) -> _JobResult:
         self.kill()
@@ -478,11 +878,39 @@ class _WorkerHandle:
             return RoutingTimeout("routing request deadline exceeded")
         return SupervisorError(reason)
 
+    def _dispose_failure(
+        self, deadline_at: float | None, reason: str, worker_pid: int | None
+    ) -> _JobResult:
+        """Classify a worker failure at the moment it was seen, then dispose.
+
+        A worker failure that is neither cancellation nor actual expiry is a
+        ``SupervisorError`` carrying the worker's PID and exit code, which is
+        read after the kill so a worker that already exited reports its own.
+        """
+        error = self._failure_error(deadline_at, reason)
+        proc = self._proc
+        self.kill()
+        if isinstance(error, SupervisorError):
+            exitcode = getattr(proc, "exitcode", None)
+            error = SupervisorError(
+                f"{reason} (worker pid {worker_pid}, exitcode {exitcode})"
+            )
+            error.worker_pid = worker_pid  # type: ignore[attr-defined]
+            error.worker_exitcode = exitcode  # type: ignore[attr-defined]
+        return _JobResult(error=_serialize_error(error), worker_pid=worker_pid)
+
     def run_job(self, job: _Job) -> _JobResult:
         """Forward a job to the persistent child and enforce its deadline."""
-        proc, channel = self._ensure_worker()
-        worker_pid = proc.pid
         deadline_at = job.expires_at
+        # A slow reap of the previous worker is waited out within this job's
+        # own budget (or a small bounded grace when it has no deadline).
+        reap_budget = (
+            _UNRESOLVED_REAP_GRACE_SECONDS
+            if deadline_at is None
+            else max(0.0, deadline_at - time.monotonic())
+        )
+        proc, channel = self._ensure_worker(reap_budget)
+        worker_pid = proc.pid
         hard_at = None if deadline_at is None else deadline_at + job.grace_seconds
 
         worker_job = _WorkerJob(
@@ -501,13 +929,13 @@ class _WorkerHandle:
                 worker_pid=worker_pid,
             )
         except _ChannelBroken as exc:
-            return self._dispose(
-                self._failure_error(deadline_at, f"worker channel broke: {exc}"),
-                worker_pid,
+            return self._dispose_failure(
+                deadline_at, f"worker channel broke: {exc}", worker_pid
             )
 
         terminated = False
         while True:
+            _check_owner(self._owner_pid)
             now = time.monotonic()
             if hard_at is not None and now >= hard_at:
                 return self._dispose(
@@ -529,18 +957,12 @@ class _WorkerHandle:
             except _FrameTimeout:
                 continue
             except _FrameDecodeError as exc:
-                return self._dispose(
-                    self._failure_error(
-                        deadline_at, f"worker result could not be decoded: {exc}"
-                    ),
-                    worker_pid,
+                return self._dispose_failure(
+                    deadline_at, f"worker result could not be decoded: {exc}", worker_pid
                 )
             except _ChannelBroken as exc:
-                return self._dispose(
-                    self._failure_error(
-                        deadline_at, f"worker exited without a result: {exc}"
-                    ),
-                    worker_pid,
+                return self._dispose_failure(
+                    deadline_at, f"worker exited without a result: {exc}", worker_pid
                 )
             break
 
@@ -575,17 +997,35 @@ def _supervisor_entry(
     peer_sock: socket.socket,
     preload_marker: Any,
     cancel_flag: SharedCancelFlag,
+    owner_pid: int,
 ) -> None:
-    """Main loop of the long-lived supervisor process."""
+    """Main loop of the long-lived supervisor process.
+
+    ``owner_pid`` is the caller's PID captured before ``fork``.  Losing the
+    caller, SIGTERM, or a broken caller channel hard-stops and reaps the
+    worker; only an explicit ``_Stop`` asks the worker to exit politely.
+    """
+    signal.signal(signal.SIGTERM, _raise_shutdown)
     peer_sock.close()
     _set_preload_marker(preload_marker)
     channel = _FramedChannel(sock)
-    worker = _WorkerHandle(multiprocessing.get_context("fork"), cancel_flag)
+    worker = _WorkerHandle(
+        multiprocessing.get_context("fork"),
+        cancel_flag,
+        owner_pid=owner_pid,
+        ancestor_socks=(sock,),
+    )
+    polite = False
     try:
+        _check_owner(owner_pid)
         channel.send(_Ready())
         while True:
+            _check_owner(owner_pid)
+            worker.collect()
             try:
-                message = channel.recv(timeout=None)
+                message = channel.recv(timeout=_POLL_SLICE_SECONDS)
+            except _FrameTimeout:
+                continue
             except _FrameDecodeError as exc:
                 channel.send(
                     _JobResult(
@@ -600,9 +1040,12 @@ def _supervisor_entry(
                 channel.send(_Discarded())
                 continue
             if not isinstance(message, _Job):
+                polite = isinstance(message, _Stop)
                 return
             try:
                 result = worker.run_job(message)
+            except _SupervisorShutdown:
+                raise
             except BaseException as exc:
                 worker.kill()
                 result = _JobResult(
@@ -611,10 +1054,20 @@ def _supervisor_entry(
                     )
                 )
             _send_result(channel, result)
-    except _ChannelBroken:
+    except (_ChannelBroken, _SupervisorShutdown):
         return
     finally:
-        worker.shutdown()
+        try:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        except _SupervisorShutdown:
+            pass  # SIGTERM landed first; its handler already ignores repeats.
+        if polite:
+            worker.shutdown()
+        else:
+            worker.kill()
+        # Bounded here; multiprocessing's exit handler then still joins a
+        # guardian that is slower, unless the caller escalates to SIGKILL.
+        worker.collect_until(_SUPERVISOR_SHUTDOWN_GRACE_SECONDS / 2)
         channel.close()
 
 
@@ -679,9 +1132,12 @@ class PreloadedRouteSupervisor:
         ctx: ForkContext = multiprocessing.get_context("fork")
         cancel_flag = SharedCancelFlag()
         parent_sock, child_sock = socket.socketpair()
+        # Captured before fork: a caller that dies before the supervisor first
+        # runs must still be seen as lost after reparenting.
+        owner_pid = os.getpid()
         proc = ctx.Process(
             target=_supervisor_entry,
-            args=(child_sock, parent_sock, preload_marker, cancel_flag),
+            args=(child_sock, parent_sock, preload_marker, cancel_flag, owner_pid),
             daemon=False,
         )
         proc.start()
@@ -749,12 +1205,10 @@ class PreloadedRouteSupervisor:
             raise
 
     def _abandon(self) -> None:
-        """Kill a supervisor whose channel can no longer be trusted."""
+        """Force-stop a supervisor whose channel can no longer be trusted."""
         self._closed = True
-        if self._process.is_alive():
-            self._process.kill()
-            self._process.join(timeout=2.0)
         self._channel.close()
+        _force_stop_supervisor(self._process)
 
     def _recv_bounded(
         self, stop_at: float | None, caller_cancel: CancelToken | None = None
@@ -917,12 +1371,7 @@ class PreloadedRouteSupervisor:
 
         if self._process.is_alive():
             self._process.join(timeout=timeout)
-        if self._process.is_alive():
-            self._process.terminate()
-            self._process.join(timeout=2.0)
-        if self._process.is_alive():
-            self._process.kill()
-            self._process.join(timeout=2.0)
+        _force_stop_supervisor(self._process)
 
     def __enter__(self) -> "PreloadedRouteSupervisor":
         return self

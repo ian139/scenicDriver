@@ -1205,7 +1205,7 @@ def _diamond_graph() -> RoadGraph:
 
 
 def _shared_prefix_merge_graph() -> RoadGraph:
-    """Two equal-cost n0 -> n5 paths share the first edge (e0), split on the
+    r"""Two equal-cost n0 -> n5 paths share the first edge (e0), split on the
     middle suffix, and rejoin at n3 before sharing e5:
 
         n0 -e0-> n1 -e1-> n2 -e2-> n3 -e5-> n5
@@ -2548,8 +2548,7 @@ def _native_cost_spec(planner) -> object:
 
 
 def _scenic_cost_spec() -> object:
-    """CostSpec matching ScenicRoutePlanner._make_cost_function(0.8) on a
-    default-weights planner (travel_time=1, scenic_reward=1)."""
+    """CostSpec matching ScenicCostFunction(0.8) with default weights."""
 
     from src.route_planner._compact_search import _CostSpec
 
@@ -2650,57 +2649,6 @@ def _native_graph_spec(compact: CompactRoadGraph, arrays) -> object:
             else None
         ),
         edge_id_offsets=get_ptr("edge_id_offsets", _ctypes.c_int64),
-    )
-
-
-def _call_native_search(
-    lib,
-    spec,
-    cost_spec,
-    fwd_seeds,
-    rev_seeds,
-    deadline_seconds: float = -1.0,
-):
-    """Direct native call with explicit (rank, cost) seed pairs; returns
-    (rc, positions, out_cost, out_fwd_idx, out_rev_idx)."""
-    import ctypes as _ctypes
-
-    fwd_nodes = (_ctypes.c_int32 * len(fwd_seeds))()
-    fwd_costs = (_ctypes.c_double * len(fwd_seeds))()
-    for i, (rank, cost) in enumerate(fwd_seeds):
-        fwd_nodes[i] = int(rank)
-        fwd_costs[i] = float(cost)
-    rev_nodes = (_ctypes.c_int32 * len(rev_seeds))()
-    rev_costs = (_ctypes.c_double * len(rev_seeds))()
-    for i, (rank, cost) in enumerate(rev_seeds):
-        rev_nodes[i] = int(rank)
-        rev_costs[i] = float(cost)
-
-    out_pos_ptr = _ctypes.POINTER(_ctypes.c_int64)()
-    out_cost = _ctypes.c_double(0.0)
-    out_fwd = _ctypes.c_int32(-1)
-    out_rev = _ctypes.c_int32(-1)
-    rc = lib.compact_bidirectional_search_alloc(
-        _ctypes.byref(spec),
-        _ctypes.byref(cost_spec),
-        fwd_nodes,
-        fwd_costs,
-        len(fwd_seeds),
-        rev_nodes,
-        rev_costs,
-        len(rev_seeds),
-        _ctypes.byref(out_pos_ptr),
-        _ctypes.byref(out_cost),
-        _ctypes.byref(out_fwd),
-        _ctypes.byref(out_rev),
-        float(deadline_seconds),
-    )
-    positions = None
-    if rc >= 0:
-        positions = [int(out_pos_ptr[i]) for i in range(rc)]
-        lib.compact_free_positions(out_pos_ptr)
-    return rc, positions, float(out_cost.value), int(out_fwd.value), int(
-        out_rev.value
     )
 
 
@@ -2897,10 +2845,8 @@ def test_compact_native_ranked_duplicate_seed_returns_winning_index(
 def test_compact_native_equal_cost_paths_beat_csr_insertion_order(
     tmp_path: Path,
 ) -> None:
-    """The ranked native entry must choose the lexicographically smaller
-    canonical edge-id sequence for equal-total paths even when the CSR
-    insertion order visits the larger sequence first; the legacy entry keeps
-    its deterministic behavior for callers without rank metadata."""
+    """The ranked native entry chooses the lexicographically smaller
+    canonical edge-id sequence regardless of CSR insertion order."""
     lib = _native_library()
     graph = _diamond_graph()
     sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
@@ -2924,21 +2870,6 @@ def test_compact_native_equal_cost_paths_beat_csr_insertion_order(
     assert cost == pytest.approx(2.0)
     assert [topology.edge_refs[p][0] for p in positions] == ["e0", "e1"]
     assert (fwd_idx, rev_idx) == (0, 0)
-
-    # The e2/e3 path occupies earlier CSR positions (n0's forward row relaxes
-    # e2 before e0); the ranked search must ignore CSR order.  The legacy
-    # entry delegates to the same implementation with (0, 0) rank pairs, so
-    # it resolves the tie identically.
-    rc, positions, _cost, _fwd_idx, _rev_idx = _call_native_search(
-        lib,
-        spec,
-        cost_spec,
-        [(0, 0.0)],
-        [(3, 0.0)],
-    )
-    assert rc >= 0
-    assert positions is not None
-    assert [topology.edge_refs[p][0] for p in positions] == ["e0", "e1"]
 
     # Repeated ranked calls stay byte-identical.
     rc, positions2, _cost, _fwd_idx, _rev_idx = _call_native_search_ranked(
@@ -3006,15 +2937,15 @@ def test_compact_native_rejects_invalid_seed_and_neighbor_ranks(
 
     # Negative seed rank: rejected as invalid, so the forward frontier stays
     # empty and the search reports generic failure instead of indexing OOB.
-    rc, positions, _cost, _fwd, _rev = _call_native_search(
-        lib, spec, cost_spec, [(-5, 0.0)], [(3, 0.0)]
+    rc, positions, _cost, _fwd, _rev = _call_native_search_ranked(
+        lib, spec, cost_spec, [(-5, 0.0, 0, 0)], [(3, 0.0, 0, 0)]
     )
     assert rc == -1
     assert positions is None
 
     # Seed rank >= node_count: same safe rejection.
-    rc, positions, _cost, _fwd, _rev = _call_native_search(
-        lib, spec, cost_spec, [(999, 0.0)], [(3, 0.0)]
+    rc, positions, _cost, _fwd, _rev = _call_native_search_ranked(
+        lib, spec, cost_spec, [(999, 0.0, 0, 0)], [(3, 0.0, 0, 0)]
     )
     assert rc == -1
     assert positions is None
@@ -3030,8 +2961,8 @@ def test_compact_native_rejects_invalid_seed_and_neighbor_ranks(
     tampered["forward_indices"] = indices
     spec_tampered = _native_graph_spec(compact, tampered)
 
-    rc, positions, _cost, _fwd, _rev = _call_native_search(
-        lib, spec_tampered, cost_spec, [(0, 0.0)], [(3, 0.0)]
+    rc, positions, _cost, _fwd, _rev = _call_native_search_ranked(
+        lib, spec_tampered, cost_spec, [(0, 0.0, 0, 0)], [(3, 0.0, 0, 0)]
     )
     assert rc >= 0
     assert positions is not None
@@ -3063,8 +2994,8 @@ def test_compact_native_rejects_absurd_graph_metadata(
     for bad_count in (0, -1, 2**31):
         spec = _native_graph_spec(compact, arrays)
         spec.node_count = bad_count
-        rc, positions, _cost, _fwd, _rev = _call_native_search(
-            lib, spec, cost_spec, [(0, 0.0)], [(3, 0.0)]
+        rc, positions, _cost, _fwd, _rev = _call_native_search_ranked(
+            lib, spec, cost_spec, [(0, 0.0, 0, 0)], [(3, 0.0, 0, 0)]
         )
         assert rc == -1
         assert positions is None
@@ -3094,14 +3025,18 @@ def test_compact_native_negative_seed_count_and_deadline_return_code(
     out_cost = _ctypes.c_double(0.0)
     out_fwd = _ctypes.c_int32(-1)
     out_rev = _ctypes.c_int32(-1)
-    rc = lib.compact_bidirectional_search_alloc(
+    rc = lib.compact_bidirectional_search_alloc_ranked(
         _ctypes.byref(spec),
         _ctypes.byref(cost_spec),
         fwd_nodes,
         fwd_costs,
+        fwd_nodes,
+        fwd_nodes,
         -1,
         rev_nodes,
         rev_costs,
+        fwd_nodes,
+        fwd_nodes,
         1,
         _ctypes.byref(out_pos_ptr),
         _ctypes.byref(out_cost),
@@ -3123,12 +3058,12 @@ def test_compact_native_negative_seed_count_and_deadline_return_code(
     chain_cost = _native_cost_spec(chain_planner)
     chain_arrays = chain_compact._sections
     chain_spec = _native_graph_spec(chain_compact, chain_arrays)
-    rc, positions, _cost, _fwd, _rev = _call_native_search(
+    rc, positions, _cost, _fwd, _rev = _call_native_search_ranked(
         lib,
         chain_spec,
         chain_cost,
-        [(0, 0.0)],
-        [(edge_count, 0.0)],
+        [(0, 0.0, 0, 0)],
+        [(edge_count, 0.0, 0, 0)],
         deadline_seconds=0.0,
     )
     assert rc == -2
@@ -3188,7 +3123,8 @@ def test_compact_sidecar_native_uses_edge_rank_indexed_scores(
 
     eager_planner = ScenicRoutePlanner(graph=eager)
     compact_planner = ScenicRoutePlanner(graph=compact)
-    cost_function = compact_planner._make_cost_function(0.8)
+    from src.route_planner.cost import ScenicCostFunction
+    cost_function = ScenicCostFunction(scenic_weight=0.8)
     fwd = [("n0", 0.0, (), None)]
     rev = [("n1", 0.0, (), None)]
 
@@ -3273,9 +3209,7 @@ def test_compact_sidecar_native_uses_edge_rank_indexed_scores(
 def test_compact_native_edge_score_entry_rejects_malformed_ranks(
     tmp_path: Path,
 ) -> None:
-    """Out-of-range traversal ranks in sidecar mode must fail closed with -1
-    before any search allocation; the legacy traversal-indexed entry keeps
-    working with the same graph and rank table."""
+    """Out-of-range traversal ranks in sidecar mode fail closed with -1."""
     import ctypes as _ctypes
 
     import numpy as np
@@ -3351,16 +3285,6 @@ def test_compact_native_edge_score_entry_rejects_malformed_ranks(
     assert rc == -1
     assert positions is None
 
-    # The legacy traversal-indexed entry is untouched by the sidecar contract:
-    # the same (tampered) rank table still routes through the ranked entry.
-    rc, positions, _cost, _fi, _ri = _call_native_search_ranked(
-        lib,
-        _native_graph_spec(compact, arrays_upper),
-        scenic_spec,
-        fwd,
-        rev,
-    )
-    assert rc == 2
 
 
 # ---------------------------------------------------------------------------
@@ -3862,7 +3786,7 @@ def test_compact_negative_cost_limit_rejected(
 
 
 @pytest.mark.parametrize("q", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("duration", [0.0, 10.0])
+@pytest.mark.parametrize("duration", [0.0, 1e-9, 10.0])
 @pytest.mark.parametrize("travel,scenic,bonus,normalized", [
     (-1.0, 1.0, 1.0, (0.0, 1.0, 0.5)),
     (float("nan"), 1.0, float("nan"), (0.0, 1.0, 0.0)),
@@ -3901,16 +3825,16 @@ def test_compact_single_edge_scalar_csr_native_parity(
         duration_decimal * ((1 - q_decimal) * travel_factor + q_decimal * scenic_factor),
         Decimal("1e-6") * duration_decimal,
     )
-    exact = max(base * (1 - discount), Decimal("1e-6"))
+    exact = base * (1 - discount)
     expected = float(min(exact, Decimal.from_float(sys.float_info.max)))
-    assert cost.calculate(edge) == pytest.approx(expected, rel=1e-12)
-    assert csr[0] == pytest.approx(expected, rel=1e-12)
+    assert cost.calculate(edge) == pytest.approx(expected, rel=1e-12, abs=0.0)
+    assert csr[0] == pytest.approx(expected, rel=1e-12, abs=0.0)
     native = run_compact_bidirectional_search(
         topology, cost, [("s", 0.0, (), None)], [("t", 0.0, (), None)],
     )
     assert native is not None
     assert native[0] == [0]
-    assert native[1] == pytest.approx(expected, rel=1e-12)
+    assert native[1] == pytest.approx(expected, rel=1e-12, abs=0.0)
 
 
 @pytest.mark.parametrize("multiplier", [0.0, 1e308])
@@ -3983,3 +3907,212 @@ def test_highway_objective_ratio_prevents_intermediate_overflow() -> None:
     )
     assert evaluation.highway_cost == 1e308
     assert evaluation.objective == -1e308
+
+
+def test_compact_projection_survives_unrelated_graph_mutation(tmp_path: Path) -> None:
+    graph = _fixture_graph()
+    _, manifest, _ = _publish_compact(tmp_path, graph)
+    with CompactRoadGraph.load(manifest) as compact:
+        before = compact.find_nearest_edge_positions_with_distance(42.025, -72.0)
+        unrelated = _fixture_graph()
+        unrelated.nodes["n0"].lat += 0.01
+        unrelated.edges["e0"].distance_km += 1.0
+        assert compact.find_nearest_edge_positions_with_distance(42.025, -72.0) == before
+
+
+@pytest.mark.parametrize("speed", [5.0, 5.25])
+def test_compact_preserves_canonical_low_fractional_speed(tmp_path: Path, speed: float) -> None:
+    graph = RoadGraph()
+    graph.add_node(Node("s", 42.0, -72.0))
+    graph.add_node(Node("t", 42.01, -72.0))
+    graph.add_edge(Edge("slow", "s", "t", 1.0, 5.0, speed_limit_kmh=speed, one_way=True))
+    sqlite_path, manifest, _ = _publish_compact(tmp_path, graph)
+    with CompactRoadGraph.load(manifest) as compact:
+        eager = RoadGraph.load(sqlite_path)
+        assert compact.edges["slow"].speed_limit_kmh == eager.edges["slow"].speed_limit_kmh == speed
+        assert compact.edges["slow"].travel_time_minutes == pytest.approx(60.0 / speed)
+        assert compact.compact_csr_arrays().travel_time_minutes.tolist() == pytest.approx([60.0 / speed])
+
+
+@pytest.mark.parametrize("section,index,value", [
+    ("node_id_offsets", 1, -1),
+    ("edge_id_offsets", 1, 10**8),
+    ("road_type_offsets", 0, 1),
+    ("node_hash_keys", 0, 123456),
+    ("edge_hash_values", 0, 999),
+    ("forward_indptr", 0, 1),
+    ("forward_indptr", 1, 10**8),
+    ("reverse_indptr", 0, 1),
+    ("forward_indices", 0, 999),
+    ("reverse_indices", 0, 999),
+    ("reverse_positions", 0, 999),
+    ("trav_edge_rank", 0, 999),
+    ("edge_start_rank", 0, 999),
+    ("edge_road_type_codes", 0, 999),
+    ("trav_reverse", 0, 2),
+    ("edge_one_way", 0, 2),
+    ("trav_highway_mask", 0, 2),
+    ("trav_distance_km", 0, -1),
+    ("trav_travel_time_minutes", 0, float("inf")),
+])
+def test_compact_rejects_malformed_native_inputs_without_hash_verification(
+    tmp_path: Path, section: str, index: int, value: float,
+) -> None:
+    import struct
+
+    _, manifest_path, _ = _publish_compact(tmp_path, _fixture_graph())
+    manifest = json.loads(manifest_path.read_text())
+    descriptor = manifest["sections"][section]
+    formats = {"i8": "q", "i4": "i", "u8": "Q", "u1": "B", "f8": "d"}
+    fmt = "<" + formats[descriptor["dtype"]]
+    with (manifest_path.parent / manifest["bin_path"]).open("r+b") as stream:
+        stream.seek(descriptor["offset"] + index * struct.calcsize(fmt))
+        stream.write(struct.pack(fmt, value))
+    with pytest.raises(ValueError):
+        CompactRoadGraph.load(manifest_path, verify=False)
+
+
+@pytest.mark.parametrize("mutation", ["dtype", "count", "fractional_count"])
+def test_compact_rejects_section_contract_mismatch(tmp_path: Path, mutation: str) -> None:
+    _, path, _ = _publish_compact(tmp_path, _fixture_graph())
+    manifest = json.loads(path.read_text())
+    if mutation == "dtype":
+        manifest["sections"]["forward_indices"]["dtype"] = "f8"
+    elif mutation == "count":
+        manifest["graph"]["node_count"] += 1
+        manifest["source"]["node_count"] += 1
+    else:
+        manifest["sections"]["forward_indices"]["count"] = 1.5
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError):
+        CompactRoadGraph.load(path, verify=False)
+
+
+def test_compact_conversion_rejects_source_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.route_planner.graph as graph_module
+
+    source = tmp_path / "source.sqlite3"
+    _fixture_graph().save(source)
+    replacement = tmp_path / "replacement.sqlite3"
+    _fixture_graph_b().save(replacement)
+    original = graph_module._iter_sqlite_edge_rank_rows
+    replaced = False
+
+    def rows(*args, **kwargs):
+        nonlocal replaced
+        yield from original(*args, **kwargs)
+        if not replaced:
+            replacement.replace(source)
+            replaced = True
+
+    monkeypatch.setattr(graph_module, "_iter_sqlite_edge_rank_rows", rows)
+    path = tmp_path / "road_graph.compact.json"
+    with pytest.raises(ValueError, match="source changed"):
+        write_compact_graph(source, path)
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_compact_rejects_nonfinite_report_scores(
+    tmp_path: Path, value: float, fallback: bool,
+) -> None:
+    graph = _fixture_graph()
+    _, manifest, _ = _publish_compact(tmp_path, graph)
+    report, scores = _tile_report(tmp_path, graph, {"e0": value})
+    with CompactRoadGraph.load(manifest) as compact:
+        with pytest.raises(ValueError, match="finite"):
+            compact.activate_report_scores(
+                {} if fallback else scores, zoom=14,
+                fallback=value if fallback else None,
+                report_signature="nonfinite", normalization="test",
+                tile_scores_path=report,
+            )
+
+
+def test_compact_projection_rejects_wrong_total_without_decoding_keys(tmp_path: Path) -> None:
+
+    _, manifest, _ = _publish_compact(tmp_path, _fixture_graph())
+    with CompactRoadGraph.load(manifest) as compact:
+        index = compact._nearest_edge_projection_index
+        index._canonical_keys = None
+        index.total_edge_count += 1
+        with pytest.raises(ValueError, match="edge count"):
+            index.attach(compact)
+
+
+@pytest.mark.parametrize("missing", range(4))
+def test_native_rejects_null_output_pointer_without_crashing(missing: int) -> None:
+    import subprocess
+
+    script = """
+import ctypes as c
+from src.route_planner._compact_search import _ensure_compiled_library
+lib = _ensure_compiled_library()
+assert lib is not None
+positions = c.POINTER(c.c_int64)()
+cost, forward, reverse = c.c_double(), c.c_int32(), c.c_int32()
+outputs = [c.byref(positions), c.byref(cost), c.byref(forward), c.byref(reverse)]
+outputs[MISSING] = None
+result = lib.compact_bidirectional_search_alloc_ranked(
+    None, None, None, None, None, None, 0,
+    None, None, None, None, 0, *outputs, -1.0,
+)
+assert result == -1, result
+""".replace("MISSING", str(missing))
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_compact_rejects_invalid_utf8_ids(tmp_path: Path) -> None:
+    _, path, _ = _publish_compact(tmp_path, _fixture_graph())
+    manifest = json.loads(path.read_text())
+    with (path.parent / manifest["bin_path"]).open("r+b") as stream:
+        stream.seek(manifest["sections"]["edge_id_strings"]["offset"])
+        stream.write(b"\xff")
+    with pytest.raises(ValueError, match="UTF-8"):
+        CompactRoadGraph.load(path, verify=False)
+
+
+def test_compact_rejects_nonfinite_cached_score_payload(tmp_path: Path) -> None:
+    import struct
+
+    graph = _fixture_graph()
+    _, manifest, _ = _publish_compact(tmp_path, graph)
+    report, scores = _tile_report(tmp_path, graph, {"e0": 8.0})
+    kwargs = dict(zoom=14, fallback=None, report_signature="cached",
+                  normalization="test", tile_scores_path=report)
+    with CompactRoadGraph.load(manifest) as compact:
+        compact.activate_report_scores(scores, **kwargs)
+        score_path = compact._active_score_sidecar.path
+    with score_path.open("r+b") as stream:
+        stream.write(struct.pack("<d", float("inf")))
+    with CompactRoadGraph.load(manifest) as compact:
+        with pytest.raises(ValueError, match="finite"):
+            compact.activate_report_scores(scores, verify=False, **kwargs)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_native_rejects_score_payload_changed_after_activation(tmp_path: Path, value: float) -> None:
+    import struct
+    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from src.route_planner.cost import ScenicCostFunction
+
+    graph = _fixture_graph()
+    _, manifest, _ = _publish_compact(tmp_path, graph)
+    report, scores = _tile_report(tmp_path, graph, {"e0": 8.0})
+    with CompactRoadGraph.load(manifest) as compact:
+        compact.activate_report_scores(
+            scores, zoom=14, fallback=None, report_signature="live",
+            normalization="test", tile_scores_path=report,
+        )
+        with compact._active_score_sidecar.path.open("r+b") as stream:
+            stream.write(struct.pack("<d", value))
+        planner = ScenicRoutePlanner(graph=compact)
+        with pytest.raises(ValueError, match="non-finite scenic scores"):
+            run_compact_bidirectional_search(
+                planner._csr_topology(), ScenicCostFunction(0.8),
+                [("n0", 0.0, (), None)], [("n3", 0.0, (), None)],
+            )

@@ -428,20 +428,90 @@ static inline void state_set(
     ds->path_id[rank] = path_id;
 }
 
-static bool validate_edge_score_sidecar(
-    const CompactGraphSpec* graph,
-    const double* edge_scenic_score_by_rank
-) {
-    if (!graph || !edge_scenic_score_by_rank) return false;
-    if (graph->edge_count < 0 || graph->traversal_count < 0) return false;
-    if (graph->traversal_count > 0 && !graph->trav_edge_rank) return false;
-    for (int64_t pos = 0; pos < graph->traversal_count; pos++) {
-        int32_t edge_rank = graph->trav_edge_rank[pos];
-        if (edge_rank < 0 || (int64_t)edge_rank >= graph->edge_count) {
-            return false;
-        }
+/* One absolute deadline for the whole native call.  ``budget < 0.0`` means
+ * unlimited; otherwise it is the remaining wall-clock budget, measured from
+ * the first statement of the call on the same monotonic time base as the
+ * Python RoutingDeadline (time.monotonic / CLOCK_MONOTONIC).  Every phase --
+ * sidecar validation, allocation, seeding, expansion, path-key comparison
+ * and path reconstruction -- charges work units against it, and the clock
+ * is read once per k_deadline_check_interval units, so no per-node clock
+ * overhead is added.  Overshoot is bounded by one interval plus one
+ * indivisible step (a single allocation or path-chain walk).  A final
+ * unconditional check runs before success is committed, and a clock failure
+ * fails closed.  A cancel_event cannot interrupt the native call; the Python
+ * boundary check surfaces cancellation before and after the call. */
+typedef struct {
+    double budget;
+    struct timespec started;
+    int64_t work;
+    int64_t next_check;
+    bool expired;
+} SearchDeadline;
+
+static const int64_t k_deadline_check_interval = 1024;
+
+static bool deadline_start(SearchDeadline* d, double budget) {
+    d->budget = budget;
+    d->started.tv_sec = 0;
+    d->started.tv_nsec = 0;
+    d->work = 0;
+    d->next_check = 0;
+    d->expired = false;
+    if (budget < 0.0) return true;
+    if (clock_gettime(CLOCK_MONOTONIC, &d->started) != 0) {
+        d->expired = true;
+        return false;
     }
     return true;
+}
+
+static bool deadline_check_now(SearchDeadline* d) {
+    if (d->budget < 0.0 || d->expired) return d->expired;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        d->expired = true; /* fail closed */
+        return true;
+    }
+    double elapsed = (double)(now.tv_sec - d->started.tv_sec)
+        + (double)(now.tv_nsec - d->started.tv_nsec) / 1000000000.0;
+    if (elapsed >= d->budget) d->expired = true;
+    return d->expired;
+}
+
+/* Charge ``units`` (>= 0) of completed work; returns true once expired. */
+static inline bool deadline_charge(SearchDeadline* d, int64_t units) {
+    if (d->budget < 0.0) return false;
+    if (d->expired) return true;
+    d->work += units;
+    if (d->work < d->next_check) return false;
+    d->next_check = d->work + k_deadline_check_interval;
+    return deadline_check_now(d);
+}
+
+/* Validate the canonical-edge-rank score sidecar under the call deadline.
+ * Returns 0 when valid, -1 for a malformed rank table, -2 when the deadline
+ * expires, and -4 when any score is non-finite (rejected rather than
+ * silently coerced, so a corrupt report sidecar can never be misread). */
+static int32_t validate_edge_score_sidecar(
+    const CompactGraphSpec* graph,
+    const double* edge_scenic_score_by_rank,
+    SearchDeadline* deadline
+) {
+    if (!graph || !edge_scenic_score_by_rank) return -1;
+    if (graph->edge_count < 0 || graph->traversal_count < 0) return -1;
+    if (graph->traversal_count > 0 && !graph->trav_edge_rank) return -1;
+    for (int64_t pos = 0; pos < graph->traversal_count; pos++) {
+        if (deadline_charge(deadline, 1)) return -2;
+        int32_t edge_rank = graph->trav_edge_rank[pos];
+        if (edge_rank < 0 || (int64_t)edge_rank >= graph->edge_count) {
+            return -1;
+        }
+    }
+    for (int64_t rank = 0; rank < graph->edge_count; rank++) {
+        if (deadline_charge(deadline, 1)) return -2;
+        if (!isfinite(edge_scenic_score_by_rank[rank])) return -4;
+    }
+    return 0;
 }
 
 static inline double compute_edge_cost(
@@ -516,32 +586,12 @@ static inline double compute_edge_cost(
 
     double cost = base + adjustment;
     if (!isfinite(cost)) cost = DBL_MAX;
-    if (cost < 1e-6) cost = 1e-6;
 
     if (c->lagrangian_multiplier > 0.0) {
         cost += c->lagrangian_multiplier * duration;
     }
     if (!isfinite(cost)) *cost_overflow = true;
     return cost;
-}
-
-/* Bounded deadline enforcement.  ``deadline_seconds < 0.0`` means unlimited;
- * otherwise it is the remaining wall-clock budget for the whole native call,
- * measured on the same monotonic time base as the Python RoutingDeadline
- * (time.monotonic / CLOCK_MONOTONIC), so a search that would run past the
- * request deadline fails closed instead of completing.  The check is
- * amortized over batches of 1024 expansions so no per-node overhead is
- * added; overshoot is bounded by one batch plus a few clock reads.  A
- * cancel_event cannot interrupt the native call mid-search; the Python
- * boundary check surfaces cancellation before and after the call.
- */
-static inline bool deadline_exceeded(double deadline_seconds, struct timespec started) {
-    if (deadline_seconds < 0.0) return false;
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return true; /* fail closed */
-    double elapsed = (double)(now.tv_sec - started.tv_sec)
-        + (double)(now.tv_nsec - started.tv_nsec) / 1000000000.0;
-    return elapsed >= deadline_seconds;
 }
 
 /* ---- ranked-search ordering helpers ------------------------------------ */
@@ -651,6 +701,7 @@ static int path_record_compare(
     const PathRecord* records,
     int32_t record_count,
     bool newest_first,
+    SearchDeadline* deadline,
     bool* compare_ok
 ) {
     if (!compare_ok) return 0;
@@ -662,6 +713,14 @@ static int path_record_compare(
         ) ||
         !path_record_length(
             records, record_count, right_id, &right_length
+        )) {
+        *compare_ok = false;
+        return 0;
+    }
+    /* The chain walks above are the dominant O(path) work; charge them so a
+     * deep equal-cost comparison cannot outrun the deadline unchecked. */
+    if (deadline_charge(
+            deadline, (int64_t)left_length + (int64_t)right_length
         )) {
         *compare_ok = false;
         return 0;
@@ -722,6 +781,7 @@ static int middle_key_compare(
     int32_t rev_b,
     const PathRecord* records,
     int32_t record_count,
+    SearchDeadline* deadline,
     bool* compare_ok
 ) {
     if (!compare_ok) return 0;
@@ -741,6 +801,14 @@ static int middle_key_compare(
         ) ||
         !path_record_length(
             records, record_count, rev_b, &rev_length_b
+        )) {
+        *compare_ok = false;
+        return 0;
+    }
+    if (deadline_charge(
+            deadline,
+            (int64_t)fwd_length_a + (int64_t)fwd_length_b +
+                (int64_t)rev_length_a + (int64_t)rev_length_b
         )) {
         *compare_ok = false;
         return 0;
@@ -830,8 +898,8 @@ static int middle_key_compare(
  * given key wins equal-key ties, matching Python's ``<`` comparison.
  *
  * ``compare_ok`` is set false when the path-key comparison cannot be
- * completed (transient scratch allocation failed or a malformed chain was
- * detected); callers must then abort the search with a generic failure
+ * completed (transient scratch allocation failed, a malformed chain was
+ * detected, or ``deadline`` expired); callers must then abort the search
  * instead of trusting the boolean result. */
 static bool label_candidate_better(
     const CompactGraphSpec* graph,
@@ -844,6 +912,7 @@ static bool label_candidate_better(
     const PathRecord* records,
     int32_t record_count,
     bool newest_first,
+    SearchDeadline* deadline,
     bool* compare_ok
 ) {
     if (!compare_ok) return false;
@@ -859,7 +928,7 @@ static bool label_candidate_better(
     }
     int cmp = path_record_compare(
         graph, new_path_id, ds->path_id[rank], records, record_count,
-        newest_first, compare_ok
+        newest_first, deadline, compare_ok
     );
     if (!*compare_ok) return false;
     return cmp < 0;
@@ -868,10 +937,10 @@ static bool label_candidate_better(
 /* Consider the meeting candidate at ``node``: total = dist_f + dist_r, and
  * the Python rank_key ``(f_primary, r_primary, f_secondary, r_secondary,
  * middle_key)``.  Strictly better (cost, rank_key) replaces the incumbent;
- * the first candidate wins full ties.  Returns false only when the
- * middle-key comparison cannot be completed (transient scratch allocation
- * failure or malformed chain); callers must then abort with a generic
- * failure. */
+ * the first candidate wins full ties.  Returns false when the middle-key
+ * comparison cannot be completed (transient scratch allocation failure,
+ * malformed chain, or expired ``deadline``) or the total overflows; callers
+ * must then abort the search. */
 static bool consider_meeting(
     const CompactGraphSpec* graph,
     const CostSpec* cost_spec,
@@ -881,6 +950,7 @@ static bool consider_meeting(
     int32_t node,
     const PathRecord* records,
     int32_t record_count,
+    SearchDeadline* deadline,
     double* best_cost,
     int32_t* best_node,
     int32_t* best_f_primary,
@@ -916,6 +986,7 @@ static bool consider_meeting(
                 *best_r_path,
                 records,
                 record_count,
+                deadline,
                 &compare_ok
             );
             if (!compare_ok) return false;
@@ -964,21 +1035,130 @@ static bool path_arena_push(
     return true;
 }
 
-/* Shared implementation for all ABI entries.  When ``fwd_seed_rank_primary``
- * is NULL the caller uses the legacy seed format and every seed gets the rank
- * pair (0, 0); the Python wrapper always passes the ranked arrays so the
- * production path follows the Python ranked ordering exactly.
+/* Walk one direction's parent chain from ``meeting`` back to its seed label,
+ * collecting traversal positions meeting-first into a fresh heap buffer
+ * (NULL for an empty chain) and the winning compact seed index recorded on
+ * the seed label (duplicate-node seeds resolve by cost/rank/key, not by a
+ * rescan of the input arrays).  Fails -- leaving no allocation -- on a
+ * chain longer than node_count, a broken link, allocation failure, or
+ * deadline expiry. */
+static bool reconstruct_side(
+    const DirectionState* ds,
+    int32_t meeting,
+    SearchDeadline* deadline,
+    int64_t** out_positions,
+    int32_t* out_count,
+    int32_t* out_seed_idx
+) {
+    *out_positions = NULL;
+    *out_count = 0;
+    *out_seed_idx = -1;
+    int64_t* buffer = NULL;
+    int32_t capacity = 0;
+    int32_t count = 0;
+    int32_t curr = meeting;
+    for (int64_t steps = 0; steps < ds->node_count; steps++) {
+        if (deadline_charge(deadline, 1)) break;
+        if (!state_seen(ds, curr, k_search_gen)) break;
+        if (ds->parent[curr] == -1) {
+            if (ds->seed_idx[curr] < 0) break;
+            *out_positions = buffer;
+            *out_count = count;
+            *out_seed_idx = ds->seed_idx[curr];
+            return true;
+        }
+        if (count >= capacity) {
+            if (capacity > INT32_MAX / 2) break;
+            int32_t next_capacity = capacity > 0 ? capacity * 2 : 64;
+            size_t bytes = 0;
+            if (!checked_size_mul((size_t)next_capacity, sizeof(int64_t), &bytes)) {
+                break;
+            }
+            int64_t* next_buffer = (int64_t*)realloc(buffer, bytes);
+            if (!next_buffer) break;
+            buffer = next_buffer;
+            capacity = next_capacity;
+        }
+        buffer[count++] = ds->trav_pos[curr];
+        curr = ds->parent[curr];
+    }
+    free(buffer);
+    return false;
+}
+
+/* Seed one search direction from its ranked seed arrays.  Returns 0 on
+ * success, -3 for a non-finite or negative seed cost, and -1 for any other
+ * failure (including an expired ``deadline``, which the caller detects via
+ * ``deadline->expired``). */
+static int32_t seed_direction(
+    const CompactGraphSpec* graph,
+    const CostSpec* cost_spec,
+    DirectionState* ds,
+    MinHeap* heap,
+    const int32_t* seed_nodes,
+    const double* seed_costs,
+    const int32_t* seed_rank_primary,
+    const int32_t* seed_rank_secondary,
+    int32_t seed_count,
+    bool newest_first,
+    const PathRecord* records,
+    int32_t record_count,
+    uint64_t* next_sequence,
+    int32_t* next_label,
+    SearchDeadline* deadline
+) {
+    for (int32_t i = 0; i < seed_count; i++) {
+        if (deadline_charge(deadline, 1)) return -1;
+        int32_t node = seed_nodes[i];
+        double cost = seed_costs[i];
+        if (!isfinite(cost) || cost < 0.0) return -3;
+        if (cost_spec->cost_limit >= 0.0 && cost > cost_spec->cost_limit) continue;
+        if (node < 0 || (int64_t)node >= ds->node_count) continue; /* reject invalid seed ranks */
+        int32_t rank_primary = seed_rank_primary[i];
+        int32_t rank_secondary = seed_rank_secondary[i];
+        bool compare_ok = true;
+        if (!label_candidate_better(
+                graph, ds, node, cost, rank_primary, rank_secondary, -1,
+                records, record_count, newest_first, deadline, &compare_ok
+            )) {
+            if (!compare_ok) return -1;
+            continue;
+        }
+        state_set(
+            ds, node, -1, -1, cost, (*next_label)++, i, rank_primary,
+            rank_secondary, -1, k_search_gen
+        );
+        if (!heap_push(
+                heap, node, cost, rank_primary, rank_secondary,
+                (*next_sequence)++, ds->label_id[node]
+            )) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Shared implementation for the ranked ABI entries.  Seed rank pairs are
+ * required for every non-empty seed list so the search follows the Python
+ * ranked ordering exactly.
  *
  * ``edge_scenic_score_by_rank`` selects the scored-sidecar mode: scenic
  * scores are then indexed by canonical edge rank
  * ``edge_scenic_score_by_rank[trav_edge_rank[pos]]`` instead of by traversal
  * position (``trav_scenic_score[pos]``).  Every rank in the traversal table
  * is validated against ``graph->edge_count`` up front and again at cost
- * evaluation; a malformed rank fails the whole search with -1 so a corrupt
- * sidecar can never be silently misread.  NULL keeps the legacy traversal-
- * indexed scoring (or the 5.0 default when ``trav_scenic_score`` is NULL).
+ * evaluation; a malformed rank fails the whole search with -1 and a
+ * non-finite score fails it with -4, so a corrupt sidecar can never be
+ * silently misread.  NULL keeps the traversal-indexed scoring (or the 5.0
+ * default when ``trav_scenic_score`` is NULL).
  *
- * Negative returns: -1 generic failure, -2 deadline exceeded, -3 cost overflow. */
+ * Output pointers are validated before any dereference; on every failure
+ * ``*out_trav_positions`` is NULL and both seed indices are -1.  The single
+ * call-wide deadline (see SearchDeadline) starts before validation and is
+ * re-checked unconditionally before success is committed.
+ *
+ * Negative returns: -1 generic failure, -2 deadline exceeded, -3 cost
+ * overflow, -4 non-finite sidecar score. */
 static int32_t compact_search_impl(
     const CompactGraphSpec* graph,
     const CostSpec* cost_spec,
@@ -999,40 +1179,47 @@ static int32_t compact_search_impl(
     int32_t* out_rev_seed_index,
     double deadline_seconds
 ) {
-    *out_trav_positions = NULL;
-    int32_t total_positions = -1;
-    if (!graph || !cost_spec || !out_trav_positions || !out_total_cost ||
-        !out_fwd_seed_index || !out_rev_seed_index) {
+    SearchDeadline deadline;
+    const bool clock_ok = deadline_start(&deadline, deadline_seconds);
+    if (!out_trav_positions || !out_total_cost || !out_fwd_seed_index ||
+        !out_rev_seed_index) {
         return -1;
     }
+    *out_trav_positions = NULL;
+    *out_fwd_seed_index = -1;
+    *out_rev_seed_index = -1;
+    if (isnan(deadline_seconds)) return -1;
+    if (!clock_ok) return -2; /* deadline requested but unmeasurable */
+    if (!graph || !cost_spec) return -1;
     if (graph->node_count <= 0 || graph->node_count > (int64_t)INT32_MAX) {
         return -1;
     }
-    if (edge_scenic_score_by_rank &&
-        !validate_edge_score_sidecar(graph, edge_scenic_score_by_rank)) {
+    if (!graph->forward_indptr || !graph->forward_indices ||
+        !graph->reverse_indptr || !graph->reverse_indices ||
+        !graph->reverse_positions || !graph->trav_travel_time ||
+        !graph->trav_highway_mask) {
         return -1;
     }
     if (fwd_seed_count < 0 || rev_seed_count < 0) return -1;
-    if (fwd_seed_count > 0 && (!fwd_seed_nodes || !fwd_seed_costs)) return -1;
-    if (rev_seed_count > 0 && (!rev_seed_nodes || !rev_seed_costs)) return -1;
-    const bool ranked =
-        fwd_seed_rank_primary != NULL || fwd_seed_rank_secondary != NULL ||
-        rev_seed_rank_primary != NULL || rev_seed_rank_secondary != NULL;
-    if (ranked) {
-        if (!fwd_seed_rank_primary || !fwd_seed_rank_secondary ||
-            !rev_seed_rank_primary || !rev_seed_rank_secondary) {
-            return -1;
-        }
+    if (fwd_seed_count > 0 &&
+        (!fwd_seed_nodes || !fwd_seed_costs || !fwd_seed_rank_primary ||
+         !fwd_seed_rank_secondary)) {
+        return -1;
+    }
+    if (rev_seed_count > 0 &&
+        (!rev_seed_nodes || !rev_seed_costs || !rev_seed_rank_primary ||
+         !rev_seed_rank_secondary)) {
+        return -1;
+    }
+    if (deadline_check_now(&deadline)) return -2;
+    if (edge_scenic_score_by_rank) {
+        int32_t sidecar_status = validate_edge_score_sidecar(
+            graph, edge_scenic_score_by_rank, &deadline
+        );
+        if (sidecar_status != 0) return sidecar_status;
     }
     const int64_t node_count = graph->node_count;
 
-    struct timespec started_clock;
-    if (clock_gettime(CLOCK_MONOTONIC, &started_clock) != 0) {
-        /* Clock unavailable: cannot bound the search, fail closed only when a
-         * deadline was actually requested (the loop check below retries). */
-        started_clock.tv_sec = 0;
-        started_clock.tv_nsec = 0;
-    }
     MinHeap* heap_f = heap_create(128);
     MinHeap* heap_r = heap_create(128);
     DirectionState ds_f;
@@ -1050,9 +1237,10 @@ static int32_t compact_search_impl(
         heap_free(heap_r);
         if (ds_f_ok) direction_state_free(&ds_f);
         if (ds_r_ok) direction_state_free(&ds_r);
-        return -1;
+        return deadline_check_now(&deadline) ? -2 : -1;
     }
 
+    int32_t total_positions = -1;
     PathRecord* path_records = NULL;
     int32_t path_capacity = 0;
     int32_t path_count = 0;
@@ -1062,63 +1250,24 @@ static int32_t compact_search_impl(
     int32_t next_label_f = 0;
     int32_t next_label_r = 0;
 
-    for (int32_t i = 0; i < fwd_seed_count; i++) {
-        int32_t node = fwd_seed_nodes[i];
-        double cost = fwd_seed_costs[i];
-        if (!isfinite(cost) || cost < 0.0) {
-            cost_overflow = true;
-            goto cleanup;
-        }
-        if (cost_spec->cost_limit >= 0.0 && cost > cost_spec->cost_limit) continue;
-        if (node < 0 || (int64_t)node >= node_count) continue; /* reject invalid seed ranks */
-        int32_t rank_primary = ranked ? fwd_seed_rank_primary[i] : 0;
-        int32_t rank_secondary = ranked ? fwd_seed_rank_secondary[i] : 0;
-        if (!label_candidate_better(
-                graph, &ds_f, node, cost, rank_primary, rank_secondary, -1,
-                path_records, path_count, false, &compare_ok
-            )) {
-            if (!compare_ok) goto cleanup;
-            continue;
-        }
-        state_set(
-            &ds_f, node, -1, -1, cost, next_label_f++, i, rank_primary,
-            rank_secondary, -1, k_search_gen
+    /* The O(node_count) state allocation is indivisible; charge it here. */
+    if (deadline_check_now(&deadline)) goto cleanup;
+
+    int32_t seed_status = seed_direction(
+        graph, cost_spec, &ds_f, heap_f, fwd_seed_nodes, fwd_seed_costs,
+        fwd_seed_rank_primary, fwd_seed_rank_secondary, fwd_seed_count, false,
+        path_records, path_count, &next_sequence, &next_label_f, &deadline
+    );
+    if (seed_status == 0) {
+        seed_status = seed_direction(
+            graph, cost_spec, &ds_r, heap_r, rev_seed_nodes, rev_seed_costs,
+            rev_seed_rank_primary, rev_seed_rank_secondary, rev_seed_count, true,
+            path_records, path_count, &next_sequence, &next_label_r, &deadline
         );
-        if (!heap_push(
-                heap_f, node, cost, rank_primary, rank_secondary,
-                next_sequence++, ds_f.label_id[node]
-            )) {
-            goto cleanup;
-        }
     }
-    for (int32_t i = 0; i < rev_seed_count; i++) {
-        int32_t node = rev_seed_nodes[i];
-        double cost = rev_seed_costs[i];
-        if (!isfinite(cost) || cost < 0.0) {
-            cost_overflow = true;
-            goto cleanup;
-        }
-        if (cost_spec->cost_limit >= 0.0 && cost > cost_spec->cost_limit) continue;
-        if (node < 0 || (int64_t)node >= node_count) continue; /* reject invalid seed ranks */
-        int32_t rank_primary = ranked ? rev_seed_rank_primary[i] : 0;
-        int32_t rank_secondary = ranked ? rev_seed_rank_secondary[i] : 0;
-        if (!label_candidate_better(
-                graph, &ds_r, node, cost, rank_primary, rank_secondary, -1,
-                path_records, path_count, true, &compare_ok
-            )) {
-            if (!compare_ok) goto cleanup;
-            continue;
-        }
-        state_set(
-            &ds_r, node, -1, -1, cost, next_label_r++, i, rank_primary,
-            rank_secondary, -1, k_search_gen
-        );
-        if (!heap_push(
-                heap_r, node, cost, rank_primary, rank_secondary,
-                next_sequence++, ds_r.label_id[node]
-            )) {
-            goto cleanup;
-        }
+    if (seed_status != 0) {
+        cost_overflow = seed_status == -3;
+        goto cleanup;
     }
 
     double best_cost = INFINITY;
@@ -1129,16 +1278,9 @@ static int32_t compact_search_impl(
     int32_t best_r_secondary = 0;
     int32_t best_f_path = -1;
     int32_t best_r_path = -1;
-    bool timed_out = false;
-    int64_t outer_steps = 0;
 
     while (heap_f->size > 0 && heap_r->size > 0) {
-        if ((outer_steps++ & 1023) == 0) {
-            if (deadline_exceeded(deadline_seconds, started_clock)) {
-                timed_out = true;
-                break;
-            }
-        }
+        if (deadline_charge(&deadline, 1)) goto cleanup;
         const HeapItem* top_f = &heap_f->data[0];
         const HeapItem* top_r = &heap_r->data[0];
         if (top_f->dist + top_r->dist > best_cost) {
@@ -1161,7 +1303,7 @@ static int32_t compact_search_impl(
 
             if (state_seen(&ds_r, u, k_search_gen)) {
                 if (!consider_meeting(
-                        graph, cost_spec, &cost_overflow, &ds_f, &ds_r, u, path_records, path_count,
+                        graph, cost_spec, &cost_overflow, &ds_f, &ds_r, u, path_records, path_count, &deadline,
                         &best_cost, &best_meeting_node, &best_f_primary,
                         &best_r_primary, &best_f_secondary, &best_r_secondary,
                         &best_f_path, &best_r_path
@@ -1173,6 +1315,7 @@ static int32_t compact_search_impl(
             int64_t row_start = graph->forward_indptr[u];
             int64_t row_end = graph->forward_indptr[u + 1];
             for (int64_t pos = row_start; pos < row_end; pos++) {
+                if (deadline_charge(&deadline, 1)) goto cleanup;
                 bool invalid_edge_rank = false;
                 double w = compute_edge_cost(
                     graph, cost_spec, pos, edge_scenic_score_by_rank,
@@ -1199,7 +1342,7 @@ static int32_t compact_search_impl(
                 if (!label_candidate_better(
                         graph, &ds_f, v, next_cost, ds_f.rank_primary[u],
                         ds_f.rank_secondary[u], new_path_id, path_records,
-                        path_count, false, &compare_ok
+                        path_count, false, &deadline, &compare_ok
                     )) {
                     if (!compare_ok) goto cleanup;
                     continue;
@@ -1218,7 +1361,7 @@ static int32_t compact_search_impl(
                 }
                 if (state_seen(&ds_r, v, k_search_gen)) {
                     if (!consider_meeting(
-                            graph, cost_spec, &cost_overflow, &ds_f, &ds_r, v, path_records, path_count,
+                            graph, cost_spec, &cost_overflow, &ds_f, &ds_r, v, path_records, path_count, &deadline,
                             &best_cost, &best_meeting_node, &best_f_primary,
                             &best_r_primary, &best_f_secondary,
                             &best_r_secondary, &best_f_path, &best_r_path
@@ -1238,7 +1381,7 @@ static int32_t compact_search_impl(
 
             if (state_seen(&ds_f, u, k_search_gen)) {
                 if (!consider_meeting(
-                        graph, cost_spec, &cost_overflow, &ds_f, &ds_r, u, path_records, path_count,
+                        graph, cost_spec, &cost_overflow, &ds_f, &ds_r, u, path_records, path_count, &deadline,
                         &best_cost, &best_meeting_node, &best_f_primary,
                         &best_r_primary, &best_f_secondary, &best_r_secondary,
                         &best_f_path, &best_r_path
@@ -1250,6 +1393,7 @@ static int32_t compact_search_impl(
             int64_t row_start = graph->reverse_indptr[u];
             int64_t row_end = graph->reverse_indptr[u + 1];
             for (int64_t rev_pos = row_start; rev_pos < row_end; rev_pos++) {
+                if (deadline_charge(&deadline, 1)) goto cleanup;
                 int64_t pos = graph->reverse_positions[rev_pos];
                 bool invalid_edge_rank = false;
                 double w = compute_edge_cost(
@@ -1277,7 +1421,7 @@ static int32_t compact_search_impl(
                 if (!label_candidate_better(
                         graph, &ds_r, v, next_cost, ds_r.rank_primary[u],
                         ds_r.rank_secondary[u], new_path_id, path_records,
-                        path_count, true, &compare_ok
+                        path_count, true, &deadline, &compare_ok
                     )) {
                     if (!compare_ok) goto cleanup;
                     continue;
@@ -1296,7 +1440,7 @@ static int32_t compact_search_impl(
                 }
                 if (state_seen(&ds_f, v, k_search_gen)) {
                     if (!consider_meeting(
-                            graph, cost_spec, &cost_overflow, &ds_f, &ds_r, v, path_records, path_count,
+                            graph, cost_spec, &cost_overflow, &ds_f, &ds_r, v, path_records, path_count, &deadline,
                             &best_cost, &best_meeting_node, &best_f_primary,
                             &best_r_primary, &best_f_secondary,
                             &best_r_secondary, &best_f_path, &best_r_path
@@ -1308,130 +1452,65 @@ static int32_t compact_search_impl(
         }
     }
 
-    if (timed_out) {
-        total_positions = -2;
-    } else if (best_meeting_node != -1 && isfinite(best_cost)) {
-        *out_total_cost = best_cost;
-        int32_t fwd_pos_capacity = 1024;
-        int64_t* fwd_pos_buffer = (int64_t*)malloc(
-            sizeof(int64_t) * (size_t)fwd_pos_capacity
-        );
-        int32_t fwd_pos_count = 0;
+    if (best_meeting_node != -1 && isfinite(best_cost)) {
+        int64_t* fwd_positions = NULL;
+        int64_t* rev_positions = NULL;
+        int64_t* result_buffer = NULL;
+        int32_t fwd_count = 0;
+        int32_t rev_count = 0;
         int32_t fwd_start_seed_idx = -1;
-        bool reconstruction_failed = fwd_pos_buffer == NULL;
-        int32_t curr = best_meeting_node;
-        int64_t fwd_steps = 0;
-        while (!reconstruction_failed && curr != -1) {
-            if (++fwd_steps > graph->node_count) {
-                reconstruction_failed = true;
-                break;
-            }
-            if (!state_seen(&ds_f, curr, k_search_gen)) break;
-            if (ds_f.parent[curr] == -1) {
-                /* The seed label at this rank records the actual winning
-                 * compact seed index (duplicate-node seeds resolve by
-                 * cost/rank/key, not by a rescan of the input arrays). */
-                fwd_start_seed_idx = ds_f.seed_idx[curr];
-                break;
-            }
-            if (fwd_pos_count >= fwd_pos_capacity) {
-                if (fwd_pos_capacity > INT32_MAX / 2) {
-                    reconstruction_failed = true;
-                    break;
-                }
-                int32_t next_capacity = fwd_pos_capacity * 2;
-                int64_t* next_buffer = (int64_t*)realloc(
-                    fwd_pos_buffer,
-                    sizeof(int64_t) * (size_t)next_capacity
-                );
-                if (!next_buffer) {
-                    reconstruction_failed = true;
-                    break;
-                }
-                fwd_pos_buffer = next_buffer;
-                fwd_pos_capacity = next_capacity;
-            }
-            fwd_pos_buffer[fwd_pos_count++] = ds_f.trav_pos[curr];
-            curr = ds_f.parent[curr];
-        }
-
-        int32_t rev_pos_capacity = 1024;
-        int64_t* rev_pos_buffer = (int64_t*)malloc(
-            sizeof(int64_t) * (size_t)rev_pos_capacity
-        );
-        int32_t rev_pos_count = 0;
         int32_t rev_start_seed_idx = -1;
-        reconstruction_failed = reconstruction_failed || rev_pos_buffer == NULL;
-        curr = best_meeting_node;
-        int64_t rev_steps = 0;
-        while (!reconstruction_failed && curr != -1) {
-            if (++rev_steps > graph->node_count) {
-                reconstruction_failed = true;
-                break;
+        bool ok = reconstruct_side(
+                      &ds_f, best_meeting_node, &deadline, &fwd_positions,
+                      &fwd_count, &fwd_start_seed_idx
+                  ) &&
+                  reconstruct_side(
+                      &ds_r, best_meeting_node, &deadline, &rev_positions,
+                      &rev_count, &rev_start_seed_idx
+                  );
+        int64_t total = (int64_t)fwd_count + (int64_t)rev_count;
+        if (ok && total > INT32_MAX) ok = false;
+        if (ok && total > 0) {
+            size_t bytes = 0;
+            ok = checked_size_mul((size_t)total, sizeof(int64_t), &bytes);
+            if (ok) {
+                result_buffer = (int64_t*)malloc(bytes);
+                ok = result_buffer != NULL;
             }
-            if (!state_seen(&ds_r, curr, k_search_gen)) break;
-            if (ds_r.parent[curr] == -1) {
-                rev_start_seed_idx = ds_r.seed_idx[curr];
-                break;
-            }
-            if (rev_pos_count >= rev_pos_capacity) {
-                if (rev_pos_capacity > INT32_MAX / 2) {
-                    reconstruction_failed = true;
-                    break;
+            if (ok) {
+                /* The forward chain was collected meeting-first; emit it
+                 * seed-first, then the reverse chain meeting-first. */
+                int32_t idx = 0;
+                for (int32_t i = fwd_count - 1; i >= 0; i--) {
+                    result_buffer[idx++] = fwd_positions[i];
                 }
-                int32_t next_capacity = rev_pos_capacity * 2;
-                int64_t* next_buffer = (int64_t*)realloc(
-                    rev_pos_buffer,
-                    sizeof(int64_t) * (size_t)next_capacity
-                );
-                if (!next_buffer) {
-                    reconstruction_failed = true;
-                    break;
-                }
-                rev_pos_buffer = next_buffer;
-                rev_pos_capacity = next_capacity;
-            }
-            rev_pos_buffer[rev_pos_count++] = ds_r.trav_pos[curr];
-            curr = ds_r.parent[curr];
-        }
-
-        if (!reconstruction_failed) {
-            int64_t total = (int64_t)fwd_pos_count + (int64_t)rev_pos_count;
-            if (total > INT32_MAX) {
-                reconstruction_failed = true;
-            } else {
-                total_positions = (int32_t)total;
-                if (total > 0) {
-                    int64_t* result_buffer = (int64_t*)malloc(
-                        sizeof(int64_t) * (size_t)total
-                    );
-                    if (result_buffer == NULL) {
-                        reconstruction_failed = true;
-                    } else {
-                        int32_t idx = 0;
-                        for (int32_t i = fwd_pos_count - 1; i >= 0; i--) {
-                            result_buffer[idx++] = fwd_pos_buffer[i];
-                        }
-                        for (int32_t i = 0; i < rev_pos_count; i++) {
-                            result_buffer[idx++] = rev_pos_buffer[i];
-                        }
-                        *out_trav_positions = result_buffer;
-                    }
+                for (int32_t i = 0; i < rev_count; i++) {
+                    result_buffer[idx++] = rev_positions[i];
                 }
             }
         }
-        free(fwd_pos_buffer);
-        free(rev_pos_buffer);
-        if (!reconstruction_failed) {
+        free(fwd_positions);
+        free(rev_positions);
+        /* Final unconditional check: success is never committed past the
+         * deadline, however little amortized work remained. */
+        if (ok && deadline_check_now(&deadline)) ok = false;
+        if (ok) {
+            *out_trav_positions = result_buffer;
+            *out_total_cost = best_cost;
             *out_fwd_seed_index = fwd_start_seed_idx;
             *out_rev_seed_index = rev_start_seed_idx;
+            total_positions = (int32_t)total;
         } else {
-            total_positions = -1;
+            free(result_buffer);
         }
     }
 
 cleanup:
-    if (cost_overflow) total_positions = -3;
+    if (cost_overflow) {
+        total_positions = -3;
+    } else if (deadline.expired) {
+        total_positions = -2;
+    }
     heap_free(heap_f);
     heap_free(heap_r);
     direction_state_free(&ds_f);
@@ -1440,56 +1519,13 @@ cleanup:
     return total_positions;
 }
 
-/* Legacy ABI entry (unchanged signature).  No seed rank pairs are available,
- * so every seed gets the rank pair (0, 0); tie-breaking still follows the
- * deterministic (cost, rank, path key) ordering.  The Python wrapper uses
- * compact_bidirectional_search_alloc_ranked below, which carries the real
- * ranked seed metadata.
+/* Ranked ABI entry.  Per-seed (rank_primary, rank_secondary) pairs for both
+ * directions reproduce the Python ranked search's seed (index, direction)
+ * rank keys so duplicate-node seeds and equal-cost paths resolve
+ * identically; they are required whenever the matching seed count is > 0.
  *
- * Negative returns: -1 generic failure, -2 deadline exceeded. */
-int32_t compact_bidirectional_search_alloc(
-    const CompactGraphSpec* graph,
-    const CostSpec* cost_spec,
-    const int32_t* fwd_seed_nodes,
-    const double* fwd_seed_costs,
-    int32_t fwd_seed_count,
-    const int32_t* rev_seed_nodes,
-    const double* rev_seed_costs,
-    int32_t rev_seed_count,
-    int64_t** out_trav_positions,
-    double* out_total_cost,
-    int32_t* out_fwd_seed_index,
-    int32_t* out_rev_seed_index,
-    double deadline_seconds
-) {
-    return compact_search_impl(
-        graph,
-        cost_spec,
-        NULL,
-        fwd_seed_nodes,
-        fwd_seed_costs,
-        NULL,
-        NULL,
-        fwd_seed_count,
-        rev_seed_nodes,
-        rev_seed_costs,
-        NULL,
-        NULL,
-        rev_seed_count,
-        out_trav_positions,
-        out_total_cost,
-        out_fwd_seed_index,
-        out_rev_seed_index,
-        deadline_seconds
-    );
-}
-
-/* Ranked ABI entry: identical to compact_bidirectional_search_alloc plus
- * per-seed (rank_primary, rank_secondary) pairs for both directions.  These
- * reproduce the Python ranked search's seed (index, direction) rank keys so
- * duplicate-node seeds and equal-cost paths resolve identically.
- *
- * Negative returns: -1 generic failure, -2 deadline exceeded. */
+ * Negative returns: -1 generic failure, -2 deadline exceeded, -3 cost
+ * overflow. */
 int32_t compact_bidirectional_search_alloc_ranked(
     const CompactGraphSpec* graph,
     const CostSpec* cost_spec,
@@ -1535,13 +1571,13 @@ int32_t compact_bidirectional_search_alloc_ranked(
  * alloc_ranked plus the canonical-edge-rank-indexed scenic score array
  * ``edge_scenic_score_by_rank`` (length ``graph->edge_count``).  This is the
  * entry the wrapper selects only when the active CompactRoadGraph carries a
- * score sidecar; the existing ranked and legacy entries keep their
- * traversal-indexed scoring contract unchanged.  The sidecar is read-only:
- * no remap or E-sized copy is ever made.  A rank outside
- * [0, edge_count) fails with -1 before any search allocation.
+ * score sidecar; the ranked entry keeps its traversal-indexed scoring
+ * contract unchanged.  The sidecar is read-only: no remap or E-sized copy is
+ * ever made.  A rank outside [0, edge_count) fails with -1 and a non-finite
+ * score with -4, both before any search allocation.
  *
  * Negative returns: -1 generic failure (including malformed ranks),
- * -2 deadline exceeded. */
+ * -2 deadline exceeded, -3 cost overflow, -4 non-finite sidecar score. */
 int32_t compact_bidirectional_search_alloc_ranked_edge_scores(
     const CompactGraphSpec* graph,
     const CostSpec* cost_spec,

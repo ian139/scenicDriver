@@ -4,6 +4,9 @@ The runner deliberately calls the strict ``plan_routes`` service response for
 one preloaded graph/report and records every point in the q/kappa matrix.  It
 never silently drops a case: a timeout or a no-route response is a row with an
 exact reason.  Large output belongs under ignored ``data/processed``.
+Relative input/output paths are rooted at the project directory, independent
+of the invoking shell's directory. Resume fingerprints include both compact
+search implementations so Python/native search edits invalidate checkpoints.
 """
 
 from __future__ import annotations
@@ -65,6 +68,8 @@ DEFAULT_REPORT = Path(
 
 _BENCHMARK_IMPLEMENTATION_PATHS = {
     "production_benchmark": Path(__file__).resolve(),
+    "route_compact_search": PROJECT_ROOT / "src/route_planner/_compact_search.py",
+    "route_compact_search_c": PROJECT_ROOT / "src/route_planner/_compact_search_c.c",
     "route_cost": PROJECT_ROOT / "src/route_planner/cost.py",
     "route_edge_projection": PROJECT_ROOT / "src/route_planner/_edge_projection.py",
     "route_graph": PROJECT_ROOT / "src/route_planner/graph.py",
@@ -2821,9 +2826,11 @@ def run_benchmark(
     group_size: int = 0,
 ) -> dict[str, Any]:
     _validate_execution_options(workers, group_size)
+    corpus_path = (PROJECT_ROOT / corpus_path).resolve()
+    graph_path = (PROJECT_ROOT / graph_path).resolve()
+    report_path = (PROJECT_ROOT / report_path).resolve()
+    output_path = (PROJECT_ROOT / output_path).resolve()
     corpus = _load_corpus(corpus_path)
-    graph_path = Path(graph_path)
-    report_path = Path(report_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_path.with_suffix(".jsonl")
     checkpoint_fingerprint = _checkpoint_fingerprint(
@@ -3224,8 +3231,9 @@ def main() -> None:
             sort_keys=True,
         )
     )
-    print(f"Wrote {args.output}")
-    print(f"Wrote {args.output.with_suffix('.jsonl')}")
+    output_path = (PROJECT_ROOT / args.output).resolve()
+    print(f"Wrote {output_path}")
+    print(f"Wrote {output_path.with_suffix('.jsonl')}")
 
 
 if __name__ == "__main__":

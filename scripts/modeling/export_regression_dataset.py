@@ -8,6 +8,8 @@ Outputs an .npz with:
 - class_probs [N, 45]
 - scenic_scores [N]
 - class_ids [N]
+- image_paths [N] (exact identities of successfully exported rows)
+- splits [N] when labels supply fixed splits
 """
 
 from __future__ import annotations
@@ -109,7 +111,14 @@ def _open_image(path: str, raw_dir: str, s3_client: Any | None) -> Image.Image:
     if s3_client is None:
         raise RuntimeError("S3 client required for s3:// raw_dir")
     key = f"{prefix}/{path}" if prefix else path
-    obj = s3_client.get_object(Bucket=bucket, Key=key)
+    from botocore.exceptions import ClientError
+
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in {"NoSuchKey", "NotFound", "404"}:
+            raise FileNotFoundError(f"Missing S3 object: s3://{bucket}/{key}") from exc
+        raise
     return Image.open(BytesIO(obj["Body"].read())).convert("RGB")
 
 
@@ -192,6 +201,14 @@ def main() -> None:
     default_weight = _validate_positive_weight(args.default_weight, "--default-weight")
     has_label_source = args.label_source_column in df.columns
     has_scenic_human = "scenic_human" in df.columns
+    fixed_splits = None
+    if "split" in df.columns:
+        if df["image_path"].duplicated().any():
+            raise ValueError("labels.csv contains duplicate image_path identities")
+        splits = df["split"].astype(str).str.strip().str.lower().replace({"validation": "val"})
+        if not splits.isin(["train", "val", "test"]).all():
+            raise ValueError("labels.csv has invalid fixed split assignments")
+        fixed_splits = dict(zip(df["image_path"], splits, strict=True))
 
     s3_info = _parse_s3_raw(args.raw_dir)
     s3_client = None
@@ -220,6 +237,29 @@ def main() -> None:
     batch_imgs = []
     batch_meta = []
     missing_rows = 0
+
+    def flush_batch() -> None:
+        """Encode the buffered batch and append its rows to the export lists."""
+        if not batch_imgs:
+            return
+        x = torch.stack(batch_imgs, dim=0).to(device)
+        logits = model(x)
+        feats = model.get_features(x)
+        probs = torch.softmax(logits, dim=1)
+
+        for i in range(x.shape[0]):
+            terrain, score, class_id, sample_weight, image_path = batch_meta[i]
+            vit_embeddings.append(feats[i].detach().cpu().numpy().astype(np.float32))
+            terrain_features.append(terrain)
+            class_logits.append(logits[i].detach().cpu().numpy().astype(np.float32))
+            class_probs.append(probs[i].detach().cpu().numpy().astype(np.float32))
+            scenic_scores.append(np.float32(score))
+            class_ids.append(np.int64(class_id))
+            sample_weights.append(np.float32(sample_weight))
+            image_paths.append(str(image_path))
+
+        batch_imgs.clear()
+        batch_meta.clear()
 
     with torch.no_grad():
         for _, row in df.iterrows():
@@ -263,40 +303,9 @@ def main() -> None:
             if len(batch_imgs) < args.batch_size:
                 continue
 
-            x = torch.stack(batch_imgs, dim=0).to(device)
-            logits = model(x)
-            feats = model.get_features(x)
-            probs = torch.softmax(logits, dim=1)
+            flush_batch()
 
-            for i in range(x.shape[0]):
-                terrain, score, class_id, sample_weight, image_path = batch_meta[i]
-                vit_embeddings.append(feats[i].detach().cpu().numpy().astype(np.float32))
-                terrain_features.append(terrain)
-                class_logits.append(logits[i].detach().cpu().numpy().astype(np.float32))
-                class_probs.append(probs[i].detach().cpu().numpy().astype(np.float32))
-                scenic_scores.append(np.float32(score))
-                class_ids.append(np.int64(class_id))
-                sample_weights.append(np.float32(sample_weight))
-                image_paths.append(str(image_path))
-
-            batch_imgs = []
-            batch_meta = []
-
-        if batch_imgs:
-            x = torch.stack(batch_imgs, dim=0).to(device)
-            logits = model(x)
-            feats = model.get_features(x)
-            probs = torch.softmax(logits, dim=1)
-            for i in range(x.shape[0]):
-                terrain, score, class_id, sample_weight, image_path = batch_meta[i]
-                vit_embeddings.append(feats[i].detach().cpu().numpy().astype(np.float32))
-                terrain_features.append(terrain)
-                class_logits.append(logits[i].detach().cpu().numpy().astype(np.float32))
-                class_probs.append(probs[i].detach().cpu().numpy().astype(np.float32))
-                scenic_scores.append(np.float32(score))
-                class_ids.append(np.int64(class_id))
-                sample_weights.append(np.float32(sample_weight))
-                image_paths.append(str(image_path))
+        flush_batch()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -309,6 +318,8 @@ def main() -> None:
         class_ids=np.array(class_ids, dtype=np.int64),
         sample_weights=np.array(sample_weights, dtype=np.float32),
         image_paths=np.array(image_paths, dtype=str),
+        **({"splits": np.array([fixed_splits[path] for path in image_paths], dtype=str)}
+           if fixed_splits is not None else {}),
     )
     print(f"Wrote dataset: {args.output}")
     print(f"Samples: {len(vit_embeddings)}")

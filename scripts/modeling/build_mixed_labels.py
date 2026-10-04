@@ -1,11 +1,12 @@
 """
-Build mixed supervision labels by overlaying aggregated human annotations
-onto a heuristic labels CSV.
+Build a fixed-geographic run snapshot by overlaying aggregated human annotations
+onto heuristic labels. Identities are exact, whitespace-stripped image paths.
 
 Example:
   uv run python scripts/modeling/build_mixed_labels.py \
     --heuristic-labels data/processed/regression/labels_masswhites_z14_mixed5000.csv \
     --annotations-csv data/raw/labels_human.csv \
+    --geographic-splits-csv data/processed/active_learning/run/geographic_splits.csv \
     --output data/processed/regression/labels_masswhites_z14_mixed5000_v2.csv \
     --aggregate mean
 """
@@ -31,6 +32,12 @@ def parse_args() -> argparse.Namespace:
         "--annotations-csv", type=Path, default=Path("data/raw/labels_human.csv")
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--geographic-splits-csv",
+        type=Path,
+        required=True,
+        help="Fixed image_path/split assignments defining this run's snapshot",
+    )
     parser.add_argument("--aggregate", choices=["mean", "median"], default="mean")
     parser.add_argument(
         "--keep-existing-human",
@@ -44,14 +51,16 @@ def parse_args() -> argparse.Namespace:
 def _to_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
-    if value is None:
+    if value is None or pd.isna(value):
         return False
     if isinstance(value, (int, float)):
         return bool(value)
     return str(value).strip().lower() in BOOL_TRUE
 
 
-def _prepare_annotations(path: Path) -> tuple[pd.DataFrame, set[str]]:
+def _prepare_annotations(
+    path: Path, run_paths: set[str] | None = None
+) -> tuple[pd.DataFrame, set[str]]:
     if not path.exists():
         raise FileNotFoundError(f"annotations CSV not found: {path}")
     ann = pd.read_csv(path)
@@ -63,6 +72,8 @@ def _prepare_annotations(path: Path) -> tuple[pd.DataFrame, set[str]]:
     ann = ann.copy()
     ann["image_path"] = ann["image_path"].astype(str).str.strip()
     ann["annotator_id"] = ann["annotator_id"].astype(str).str.strip()
+    if run_paths is not None:
+        ann = ann.loc[ann["image_path"].isin(run_paths)].copy()
     ann["scenic_human"] = pd.to_numeric(ann["scenic_human"], errors="coerce")
     if "skip" in ann.columns:
         ann["skip"] = ann["skip"].map(_to_bool)
@@ -91,8 +102,9 @@ def _prepare_annotations(path: Path) -> tuple[pd.DataFrame, set[str]]:
         ["image_path", "annotator_id"], keep="last"
     )
 
-    # An image decision is skipped if skip is True or missing score on non-skip (fail-closed contradiction).
-    skipped_mask = ann["skip"] | ann["scenic_human"].isna()
+    # Latest unusable or invalid supervision excludes the whole image, even if
+    # another annotator scored it. NaN and infinities are outside the [0, 10] scale.
+    skipped_mask = ann["skip"] | ~ann["scenic_human"].between(0.0, 10.0)
     excluded_images = set(ann.loc[skipped_mask, "image_path"])
 
     admitted = ann.loc[~skipped_mask & ~ann["image_path"].isin(excluded_images)].copy()
@@ -125,6 +137,41 @@ def _prepare_annotations(path: Path) -> tuple[pd.DataFrame, set[str]]:
     return grouped, excluded_images
 
 
+def _load_geographic_splits(path: Path) -> pd.DataFrame:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing geographic splits CSV: {path}")
+    assignments = pd.read_csv(path)
+    required = {"image_path", "split"}
+    missing = required - set(assignments.columns)
+    if missing:
+        raise ValueError(f"Geographic splits CSV missing columns: {sorted(missing)}")
+    assignments["image_path"] = assignments["image_path"].fillna("").astype(str).str.strip()
+    if assignments["image_path"].eq("").any():
+        raise ValueError("Geographic splits CSV has empty image identities")
+    assignments["split"] = (
+        assignments["split"].fillna("").astype(str).str.strip().str.lower()
+        .replace("validation", "val")
+    )
+    if not assignments["split"].isin({"train", "val", "test"}).all():
+        raise ValueError("Geographic splits CSV has invalid split values")
+    if (assignments.groupby("image_path")["split"].nunique() > 1).any():
+        raise ValueError("Geographic splits CSV assigns one image to multiple splits")
+    if "geographic_block" in assignments:
+        blocks = assignments.loc[
+            assignments["geographic_block"].notna()
+            & assignments["geographic_block"].astype(str).str.strip().ne("")
+        ]
+        if (blocks.groupby("geographic_block")["split"].nunique() > 1).any():
+            raise ValueError(
+                "Geographic splits CSV assigns one geographic_block to multiple splits"
+            )
+    columns = [
+        column for column in ("image_path", "split", "geographic_block", "split_seed")
+        if column in assignments
+    ]
+    return assignments[columns].drop_duplicates("image_path", keep="first")
+
+
 def main() -> None:
     args = parse_args()
     if not args.heuristic_labels.exists():
@@ -136,10 +183,20 @@ def main() -> None:
             "heuristic labels CSV must contain image_path and scenic_score"
         )
     base = base.copy()
-    base["image_path"] = base["image_path"].astype(str)
-    base["scenic_score"] = pd.to_numeric(base["scenic_score"], errors="coerce")
-    unscored_count = int(base["scenic_score"].isna().sum())
-    base = base.loc[base["scenic_score"].notna()].copy()
+    base["image_path"] = base["image_path"].fillna("").astype(str).str.strip()
+    assignments = _load_geographic_splits(args.geographic_splits_csv)
+    base = base.drop(
+        columns=["split", "geographic_block", "split_seed"], errors="ignore"
+    ).merge(assignments, on="image_path", how="inner", validate="one_to_one")
+    heuristic_column = (
+        "scenic_score_heuristic" if "scenic_score_heuristic" in base else "scenic_score"
+    )
+    base["scenic_score_heuristic"] = pd.to_numeric(
+        base[heuristic_column], errors="coerce"
+    )
+    invalid_base = ~base["scenic_score_heuristic"].between(0.0, 10.0)
+    unscored_count = int(invalid_base.sum())
+    base = base.loc[~invalid_base].copy()
     unusable_base = pd.Series(False, index=base.index)
     for column in ("availability_state", "score_status"):
         if column in base.columns:
@@ -154,16 +211,31 @@ def main() -> None:
     unusable_base_count = int(unusable_base.sum())
     base = base.loc[~unusable_base].copy()
 
-    if "scenic_score_heuristic" not in base.columns:
-        base["scenic_score_heuristic"] = pd.to_numeric(
-            base["scenic_score"], errors="coerce"
-        )
-
-    human, excluded_images = _prepare_annotations(args.annotations_csv)
+    # Rebuild from the immutable weak target, not a previous human override.
+    base["scenic_score"] = base["scenic_score_heuristic"]
+    base["label_source"] = "heuristic"
+    existing_human = pd.to_numeric(
+        base.get("scenic_human", pd.Series(float("nan"), index=base.index)),
+        errors="coerce",
+    )
+    base["scenic_human"] = float("nan")
+    if args.keep_existing_human:
+        retained = existing_human.between(0.0, 10.0)
+        base.loc[retained, "scenic_human"] = existing_human[retained]
+        base.loc[retained, "scenic_score"] = existing_human[retained]
+        base.loc[retained, "label_source"] = "human_override"
+    audit_columns = [
+        "scenic_human_mean", "scenic_human_median", "scenic_human_std",
+        "human_annotation_count", "human_annotator_count",
+    ]
+    base = base.drop(columns=audit_columns, errors="ignore")
+    human, excluded_images = _prepare_annotations(
+        args.annotations_csv, set(assignments["image_path"])
+    )
     excluded_mask = base["image_path"].isin(excluded_images)
     excluded_count = int(excluded_mask.sum())
     base = base.loc[~excluded_mask].copy()
-    merged = base.merge(human, on="image_path", how="left")
+    merged = base.merge(human, on="image_path", how="left", validate="one_to_one")
 
     pick_col = (
         "scenic_human_mean" if args.aggregate == "mean" else "scenic_human_median"

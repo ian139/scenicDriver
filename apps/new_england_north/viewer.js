@@ -72,6 +72,7 @@ const el = {
   clearRoute: document.getElementById("clearRoute"),
   clearStartBtn: document.getElementById("clearStartBtn"),
   clearEndBtn: document.getElementById("clearEndBtn"),
+  inspector: document.getElementById("inspector"),
   inspectorScore: document.getElementById("inspectorScore"),
   inspectorCoords: document.getElementById("inspectorCoords"),
   routeResultsDialog: document.getElementById("routeResultsDialog"),
@@ -121,6 +122,7 @@ let activeRouteRequest = null;
 let pendingRouteRender = null;
 let verboseRouteResults = false;
 let latestRoutePayload = null;
+let displayedRouteRequest = null;
 let mapReady = false;
 
 let map;
@@ -570,8 +572,8 @@ async function loadHeatmap() {
       bounds,
       runName: payload.run_name,
       tileZoom: payload.tile_zoom,
+      totalTiles: payload.total_tiles,
       normalization: payload.normalization,
-      summary: payload.summary,
       scoreGrid,
     };
     setApiStatus("API: online", "ok");
@@ -776,10 +778,34 @@ function renderRoute(geojson, request = null) {
     removeLayer(ROUTE_ENDPOINT_CONNECTORS);
     removeSource(ROUTE_ENDPOINT_SOURCE);
   }
+  displayedRouteRequest = request;
   fitToGeojson(
     { type: "FeatureCollection", features: [...geojson.features, ...connectors.features] },
     { maxZoom: 12 }
   );
+}
+
+function drainPendingRouteRender() {
+  if (!pendingRouteRender) return;
+  if (pendingRouteRender.requestId !== routeRequestSequence) {
+    pendingRouteRender = null;
+    return;
+  }
+  if (!mapReady || !map.isStyleLoaded()) return;
+  const pending = pendingRouteRender;
+  pendingRouteRender = null;
+  renderRoute(pending.geojson, pending.request);
+}
+
+function installRouteRenderLifecycle() {
+  map.on("load", () => {
+    mapReady = true;
+    drainPendingRouteRender();
+    syncZoomElasticity();
+    el.submitRoute.disabled = !CONFIG.workingRun || !routePlanningAvailable();
+  });
+  // load fires once; tile activity can defer later route responses as well.
+  map.on("idle", drainPendingRouteRender);
 }
 
 function clearRoute() {
@@ -788,6 +814,7 @@ function clearRoute() {
   pendingRouteRender = null;
   activeRouteRequest = null;
   latestRoutePayload = null;
+  displayedRouteRequest = null;
   removeLayer(ROUTE_ENDPOINT_CONNECTORS);
   removeLayer(ROUTE_SCENIC);
   removeLayer(ROUTE_BASELINE);
@@ -1199,6 +1226,7 @@ function installAddressSearch(which) {
   let currentSuggestions = [];
   let activeSuggestion = -1;
   let timer = null;
+  let blurTimer = null;
   let addressRequestSequence = 0;
   let activeAddressRequest = null;
 
@@ -1218,6 +1246,7 @@ function installAddressSearch(which) {
     token.fingerprint === fingerprint;
 
   const closeSuggestions = ({ invalidate = true } = {}) => {
+    clearTimeout(blurTimer);
     if (invalidate) {
       beginAddressRequest(JSON.stringify({ kind: "close" }));
     }
@@ -1305,7 +1334,9 @@ function installAddressSearch(which) {
     suggestions.classList.add("open");
   };
 
+  input.addEventListener("focus", () => clearTimeout(blurTimer));
   input.addEventListener("input", () => {
+    clearTimeout(blurTimer);
     selectedRoutePoints[which] = null;
     clearTimeout(timer);
     const query = input.value.trim();
@@ -1368,7 +1399,8 @@ function installAddressSearch(which) {
   });
   input.addEventListener("blur", (event) => {
     if (!suggestions.contains(event.relatedTarget)) {
-      setTimeout(closeSuggestions, 120);
+      clearTimeout(blurTimer);
+      blurTimer = setTimeout(closeSuggestions, 120);
     }
   });
   clearButton?.addEventListener("click", () => {
@@ -1454,9 +1486,14 @@ async function planRoute(event) {
         detail && typeof detail === "object" ? detail.error : null;
       const message =
         detail && typeof detail === "object" ? detail.message : detail;
+      const reason = detail && typeof detail === "object" ? detail.reason : null;
       const hint = detail && typeof detail === "object" ? detail.hint : null;
+      // `detail.reason` is the server's machine-readable cause string.  When
+      // the server omits it (or reports a cause that only restates `message`)
+      // the generic message carries the text instead.
+      const shownReason = reason && reason !== message ? reason : null;
       const error = new Error(
-        [message || `${response.status} ${response.statusText}`, hint]
+        [message || `${response.status} ${response.statusText}`, shownReason, hint]
           .filter(Boolean)
           .join(" — ")
       );
@@ -1464,11 +1501,8 @@ async function planRoute(event) {
       throw error;
     }
     const routeGeojson = validateRouteGeojson(payload.geojson);
-    if (mapReady && map?.isStyleLoaded?.()) {
-      renderRoute(routeGeojson, payload.request);
-    } else {
-      pendingRouteRender = { requestId, geojson: routeGeojson, request: payload.request };
-    }
+    pendingRouteRender = { requestId, geojson: routeGeojson, request: requestBody };
+    drainPendingRouteRender();
     renderRouteComparison(payload);
     latestRoutePayload = payload;
     setRouteOutput("Route computed", routeOutputMarkup(payload));
@@ -1525,14 +1559,15 @@ function applyUrlParams() {
 }
 
 async function copyShareUrl() {
-  const start = parsePoint(el.startInput.value) || selectedRoutePoints.start;
-  const end = parsePoint(el.endInput.value) || selectedRoutePoints.end;
-  if (!start || !end) return;
+  const request = displayedRouteRequest;
+  if (!request) return;
+  const [startLon, startLat] = routeRequestCoordinate(request, "start");
+  const [endLon, endLat] = routeRequestCoordinate(request, "end");
   const shareUrl = buildShareUrl({
-    start,
-    end,
-    maxDetour: Number(el.detourFactor.value),
-    avoidHighways: Boolean(el.avoidHighways?.checked),
+    start: { lat: startLat, lon: startLon },
+    end: { lat: endLat, lon: endLon },
+    maxDetour: request.max_detour_factor,
+    avoidHighways: request.avoid_highways,
   });
   const originalLabel = el.shareRouteBtn.textContent;
   let copied = false;
@@ -1605,6 +1640,58 @@ function initAddressSearch() {
   installAddressSearch("end");
 }
 
+function installHeatmapInspector(heatmap) {
+  const mapCanvas = map.getCanvas();
+  const inspect = (lngLat) => {
+    const tile = lngLatToTile(lngLat.lng, lngLat.lat, heatmap.tileZoom);
+    const gridX = tile.x - heatmap.scoreGrid.minX;
+    const gridY = tile.y - heatmap.scoreGrid.minY;
+    const inGrid =
+      gridX >= 0 &&
+      gridY >= 0 &&
+      gridX < heatmap.scoreGrid.width &&
+      gridY < heatmap.scoreGrid.height;
+    const score = inGrid
+      ? heatmap.scoreGrid.values.getFloat32(
+          (gridY * heatmap.scoreGrid.width + gridX) * 4,
+          true
+        )
+      : Number.NaN;
+    if (Number.isFinite(score)) {
+      setText(el.inspectorScore, score.toFixed(2));
+      setText(
+        el.inspectorCoords,
+        `${lngLat.lat.toFixed(4)}, ${lngLat.lng.toFixed(4)} · z${heatmap.tileZoom}/${tile.x}/${tile.y}`
+      );
+    } else {
+      setText(el.inspectorScore, "--");
+      setText(el.inspectorCoords, "No learned score for this tile");
+    }
+  };
+  // MapLibre's keyboard controls pan/zoom the focused canvas. Read the center
+  // after those movements, using the same score lookup as pointer inspection.
+  mapCanvas.setAttribute("aria-label", "Scenic map. Use arrow keys to pan and plus or minus to zoom. The scenic score readout describes the center tile.");
+  mapCanvas.setAttribute("aria-describedby", "inspector");
+  mapCanvas.addEventListener("focus", () => {
+    el.inspector.setAttribute("aria-live", "polite");
+    inspect(map.getCenter());
+  });
+  mapCanvas.addEventListener("blur", () => el.inspector.setAttribute("aria-live", "off"));
+  map.on("moveend", () => {
+    if (document.activeElement === mapCanvas) inspect(map.getCenter());
+  });
+  mapCanvas.addEventListener("pointermove", (event) => {
+    inspect(map.unproject([event.offsetX, event.offsetY]));
+  });
+  mapCanvas.addEventListener("pointerleave", () => {
+    if (document.activeElement === mapCanvas) return;
+    setText(el.inspectorScore, "--");
+    setText(el.inspectorCoords, "Move over a heatmap cell or focus the map to inspect its center");
+  });
+  setText(el.inspectorScore, `${heatmap.totalTiles.toLocaleString()} tiles`);
+  setText(el.inspectorCoords, `Learned scores · z${heatmap.tileZoom}`);
+}
+
 async function main() {
   initBindings();
   const artifactErrors = [];
@@ -1675,6 +1762,7 @@ async function main() {
       };
       style.layers.push(routeEndpointConnectorLayer());
     }
+    displayedRouteRequest = validatedRoute.request;
   }
 
   const camera = regionCamera(selectedRegionMetadata);
@@ -1690,56 +1778,9 @@ async function main() {
   map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), "top-right");
   map.on("zoomstart", handleZoomStart);
   map.on("zoomend", handleZoomEnd);
-  map.on("load", () => {
-    mapReady = true;
-    const pending = pendingRouteRender;
-    pendingRouteRender = null;
-    if (pending?.requestId === routeRequestSequence) {
-      renderRoute(pending.geojson, pending.request);
-    }
-    syncZoomElasticity();
-    el.submitRoute.disabled = !CONFIG.workingRun || !routePlanningAvailable();
-  });
+  installRouteRenderLifecycle();
   map.on("resize", syncZoomElasticity);
-  if (heatmap) {
-
-    const mapCanvas = map.getCanvas();
-    mapCanvas.addEventListener("pointermove", (event) => {
-      const lngLat = map.unproject([event.offsetX, event.offsetY]);
-      const tile = lngLatToTile(lngLat.lng, lngLat.lat, heatmap.tileZoom);
-      const gridX = tile.x - heatmap.scoreGrid.minX;
-      const gridY = tile.y - heatmap.scoreGrid.minY;
-      const inGrid =
-        gridX >= 0 &&
-        gridY >= 0 &&
-        gridX < heatmap.scoreGrid.width &&
-        gridY < heatmap.scoreGrid.height;
-      const score = inGrid
-        ? heatmap.scoreGrid.values.getFloat32(
-            (gridY * heatmap.scoreGrid.width + gridX) * 4,
-            true
-          )
-        : Number.NaN;
-      if (Number.isFinite(score)) {
-        setText(el.inspectorScore, score.toFixed(2));
-        setText(
-          el.inspectorCoords,
-          `${lngLat.lat.toFixed(4)}, ${lngLat.lng.toFixed(4)} · z${heatmap.tileZoom}/${tile.x}/${tile.y}`
-        );
-      } else {
-        setText(el.inspectorScore, "--");
-        setText(el.inspectorCoords, "No learned score for this tile");
-      }
-    });
-    mapCanvas.addEventListener("pointerleave", () => {
-      setText(el.inspectorScore, "--");
-      setText(el.inspectorCoords, "Move over a heatmap cell");
-    });
-  }
-  if (heatmap) {
-    setText(el.inspectorScore, `${heatmap.summary.total_tiles.toLocaleString()} tiles`);
-    setText(el.inspectorCoords, `Learned scores · z${heatmap.tileZoom}`);
-  }
+  if (heatmap) installHeatmapInspector(heatmap);
   if (heatmap && routePlanningIntentionallyDisabled()) {
     const message =
       selectedRegionMetadata.description ||

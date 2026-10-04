@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -90,6 +91,56 @@ def _dependencies(counters: dict[str, int]) -> ScoringDependencies:
         regression_hash="regression-fixture",
         device="cpu",
     )
+
+@pytest.mark.parametrize("changed_model", ["classifier", "regression_model"])
+def test_injected_same_class_state_changes_invalidate_cache(tmp_path, changed_model):
+    class Model:
+        def __init__(self, weight):
+            self.weight = np.asarray([weight], dtype=np.float32)
+
+        def state_dict(self):
+            return {"weight": self.weight}
+
+        def __call__(self, batch, *features):
+            if features:
+                return batch.mean(axis=1) * self.weight[0]
+            return np.tile([[2.0, 0.0, -1.0]], (len(batch), 1))
+
+        def get_features(self, batch):
+            return np.full((len(batch), 4), self.weight[0], dtype=np.float32)
+
+    manifest = _manifest(tmp_path).iloc[:1]
+    deps = _dependencies({"classifier": 0, "regression": 0})
+    deps.classifier_predictor = deps.regression_predictor = None
+    deps.classifier = Model(1)
+    deps.regression_model = Model(1)
+    root = tmp_path / "run"
+    first = score_tile_manifest(manifest, run_root=root, dependencies=deps)
+    assert pd.read_csv(root / "candidate_pool.csv").iloc[0]["model_prediction"] == 1
+    same_state = score_tile_manifest(manifest, run_root=root, dependencies=deps)
+    assert same_state["counts"]["cache_hits"] == 1
+    setattr(deps, changed_model, Model(2))
+    changed = score_tile_manifest(manifest, run_root=root, dependencies=deps)
+    assert changed["counts"]["cache_hits"] == 0
+    assert changed["counts"]["scored_rows"] == 1
+    assert pd.read_csv(root / "candidate_pool.csv").iloc[0]["model_prediction"] == 2
+    identity_key = (
+        "classifier_checkpoint_sha256" if changed_model == "classifier"
+        else "regression_checkpoint_sha256"
+    )
+    assert changed["models"][identity_key] != first["models"][identity_key]
+
+
+def test_opaque_injected_models_require_content_identity(tmp_path):
+    deps = _dependencies({"classifier": 0, "regression": 0})
+    deps.classifier_predictor = None
+    deps.classifier_hash = None
+    deps.classifier = object()
+    with pytest.raises(ValueError, match="classifier requires a content hash or state_dict"):
+        score_tile_manifest(
+            _manifest(tmp_path).iloc[:1], run_root=tmp_path / "run", dependencies=deps
+        )
+
 
 
 def test_scoring_defaults_and_dry_run_create_no_artifacts(tmp_path: Path) -> None:
@@ -519,6 +570,26 @@ def test_resolve_active_regression_checkpoint_sha256_read_only_validation(
     with pytest.raises(ValueError, match="sha256 mismatch"):
         resolve_active_regression_checkpoint(registry_file)
 
+@pytest.mark.parametrize("with_hash", [False, True])
+def test_registry_relative_checkpoint_wins_over_cwd(tmp_path, monkeypatch, with_hash):
+    published = tmp_path / "published"
+    cwd = tmp_path / "cwd"
+    published.mkdir()
+    cwd.mkdir()
+    (published / "checkpoints").mkdir()
+    (cwd / "checkpoints").mkdir()
+    checkpoint = published / "checkpoints" / "model.pt"
+    checkpoint.write_bytes(b"published weights")
+    (cwd / "checkpoints" / "model.pt").write_bytes(b"unrelated CWD weights")
+    active = {"checkpoint": "checkpoints/model.pt"}
+    if with_hash:
+        active["sha256"] = sha256_file(checkpoint)
+    registry = published / "model_registry.json"
+    registry.write_text(json.dumps({"active": active}), encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    assert resolve_active_regression_checkpoint(registry) == checkpoint
+
+
 
 def test_water_scoring_classification_fresh_and_cache_hit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -886,18 +957,16 @@ def test_scoring_coast_requires_attribution_and_uses_land_only_features(tmp_path
     assert captured[0][0, 0] == captured[0][0, 1] == 0.0
 
 
-def _acquisition_manifest(root):
+def _acquisition_digest(value):
+    return hashlib.sha256(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
+    ).encode()).hexdigest()
+
+
+def _bind_acquisition_identity(manifest):
     from src.data_pipeline.source_contracts import compute_acquisition_tile_identity
 
-    manifest = _manifest(root).iloc[:1].copy()
-    manifest["provider"] = "naip"
-    manifest["satellite_source"] = "naip-visualization"
-    manifest["terrain_source"] = "usgs-3dep"
-    manifest["grid_sha256"] = "a" * 64
-    manifest["source_contract_sha256"] = "b" * 64
-    manifest["preprocessing_contract_sha256"] = "c" * 64
-    manifest["satellite_output_sha256"] = sha256_file(root / "sat-0.png")
-    manifest["terrain_output_sha256"] = sha256_file(root / "terrain-0.png")
     row = manifest.iloc[0]
     manifest["acquisition_tile_identity_sha256"] = compute_acquisition_tile_identity(
         z=int(row["z"]), x=int(row["x"]), y=int(row["y"]), region=row["region"],
@@ -908,6 +977,40 @@ def _acquisition_manifest(root):
         terrain_output_sha256=row["terrain_output_sha256"],
     ).sha256()
     return manifest
+
+
+def _acquisition_manifest(root):
+    manifest = _manifest(root).iloc[:1].copy()
+    manifest["provider"] = "naip"
+    manifest["satellite_source"] = "naip-visualization"
+    manifest["terrain_source"] = "usgs-3dep"
+    preprocessing = {
+        "zoom": 14, "tile_width": 4, "tile_height": 4, "target_crs": "EPSG:3857",
+        "satellite_resampling": "nearest", "terrain_resampling": "cubic",
+    }
+    contract = root / "source_contract.json"
+    contract.write_text(json.dumps({"preprocessing": preprocessing}), encoding="utf-8")
+    contract_hash = sha256_file(contract)
+    preprocessing_hash = _acquisition_digest(preprocessing)
+    (root / "execution_plan.json").write_text(json.dumps({
+        "zoom": 14,
+        "grid_contract": {"tile_width": 4, "tile_height": 4, "crs": "EPSG:3857"},
+        "inputs": {"source_contract_path": str(contract)},
+        "hashes": {
+            "source_contract_sha256": contract_hash,
+            "preprocessing_contract_sha256": preprocessing_hash,
+        },
+    }), encoding="utf-8")
+    row = manifest.iloc[0]
+    manifest["grid_sha256"] = _acquisition_digest({
+        "z": int(row["z"]), "x": int(row["x"]), "y": int(row["y"]),
+        "width": 4, "height": 4, "crs": "EPSG:3857",
+    })
+    manifest["source_contract_sha256"] = contract_hash
+    manifest["preprocessing_contract_sha256"] = preprocessing_hash
+    manifest["satellite_output_sha256"] = sha256_file(root / "sat-0.png")
+    manifest["terrain_output_sha256"] = sha256_file(root / "terrain-0.png")
+    return _bind_acquisition_identity(manifest)
 
 
 def test_canonical_scoring_requires_acquisition_provenance(tmp_path):
@@ -934,6 +1037,90 @@ def test_canonical_scoring_accepts_matching_acquisition(tmp_path):
     )
     assert result["counts"]["scored_rows"] == 1
     assert result["counts"]["error_rows"] == 0
+    assert result["grid"] == {
+        "zoom": 14, "width": 4, "height": 4, "crs": "EPSG:3857", "has_coords": True,
+    }
+    assert result["preprocessing"]["satellite_resampling"] == "nearest"
+    assert result["preprocessing"]["terrain_resampling"] == "cubic"
+    assert result["preprocessing"]["resample_alg"] is None
+
+
+@pytest.mark.parametrize("field,value,error", [
+    ("z", 13, "acquisition_zoom_mismatch"),
+    ("grid_sha256", "a" * 64, "acquisition_grid_mismatch"),
+    ("width", 5, "acquisition_width_mismatch"),
+    ("height", 5, "acquisition_height_mismatch"),
+    ("crs", "EPSG:4326", "acquisition_crs_mismatch"),
+    ("satellite_resampling", "average", "acquisition_satellite_resampling_mismatch"),
+    ("terrain_resampling", "bilinear", "acquisition_terrain_resampling_mismatch"),
+])
+def test_acquisition_metadata_mismatch_cannot_reuse_cache(tmp_path, field, value, error):
+    manifest = _acquisition_manifest(tmp_path)
+    counters = {"classifier": 0, "regression": 0}
+    deps = _dependencies(counters)
+    root = tmp_path / "run"
+    score_tile_manifest(manifest, run_root=root, dependencies=deps)
+    counters.update(classifier=0, regression=0)
+    manifest[field] = value
+    _bind_acquisition_identity(manifest)
+    result = score_tile_manifest(manifest, run_root=root, dependencies=deps)
+    assert result["counts"]["cache_hits"] == result["counts"]["scored_rows"] == 0
+    assert counters == {"classifier": 0, "regression": 0}
+    assert error in pd.read_csv(root / "candidate_pool.csv").iloc[0]["error"]
+
+
+def test_acquisition_dimensions_are_verified_against_png_bytes(tmp_path):
+    manifest = _acquisition_manifest(tmp_path)
+    for style in ("satellite", "terrain"):
+        path = tmp_path / manifest.iloc[0][f"{style}_path"]
+        Image.new("RGB", (5, 4), (40, 120, 70)).save(path)
+        manifest[f"{style}_output_sha256"] = sha256_file(path)
+    _bind_acquisition_identity(manifest)
+    counters = {"classifier": 0, "regression": 0}
+    result = score_tile_manifest(
+        manifest, run_root=tmp_path / "run", dependencies=_dependencies(counters),
+    )
+    assert result["counts"]["scored_rows"] == 0
+    assert counters == {"classifier": 0, "regression": 0}
+    row = pd.read_csv(tmp_path / "run" / "candidate_pool.csv").iloc[0]
+    assert "acquisition_dimensions_mismatch" in row["error"]
+
+
+@pytest.mark.parametrize("change", ["missing_plan", "modified_contract"])
+def test_acquisition_metadata_requires_hash_verified_contract(tmp_path, change):
+    manifest = _acquisition_manifest(tmp_path)
+    if change == "missing_plan":
+        (tmp_path / "execution_plan.json").unlink()
+        expected = "missing_acquisition_metadata"
+    else:
+        contract = tmp_path / "source_contract.json"
+        payload = json.loads(contract.read_text())
+        payload["preprocessing"]["terrain_resampling"] = "nearest"
+        contract.write_text(json.dumps(payload))
+        expected = "invalid_acquisition_metadata"
+    counters = {"classifier": 0, "regression": 0}
+    result = score_tile_manifest(
+        manifest, run_root=tmp_path / "run", dependencies=_dependencies(counters),
+    )
+    assert result["counts"]["scored_rows"] == 0
+    assert counters == {"classifier": 0, "regression": 0}
+    row = pd.read_csv(tmp_path / "run" / "candidate_pool.csv").iloc[0]
+    assert expected in row["error"]
+
+
+def test_legacy_grid_reports_observed_size_and_unknown_resampling(tmp_path):
+    manifest = _manifest(tmp_path).iloc[:1]
+    manifest["z"] = 13
+    result = score_tile_manifest(
+        manifest, run_root=tmp_path / "run",
+        dependencies=_dependencies({"classifier": 0, "regression": 0}),
+    )
+    assert result["counts"]["scored_rows"] == 1
+    assert result["grid"]["zoom"] == 13
+    assert (result["grid"]["width"], result["grid"]["height"]) == (4, 4)
+    assert result["preprocessing"]["satellite_resampling"] is None
+    assert result["preprocessing"]["terrain_resampling"] is None
+    assert result["preprocessing"]["resample_alg"] is None
 
 
 @pytest.mark.parametrize("style", ["satellite", "terrain"])

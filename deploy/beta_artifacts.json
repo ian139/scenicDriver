@@ -47,6 +47,13 @@
       "size_bytes": 86340224
     },
     {
+      "name": "graph.readiness",
+      "destination": "data/processed/road_graphs/new_england_north_full_bbox_v1/run.json",
+      "source_key": "data/processed/road_graphs/new_england_north_full_bbox_v1/run.json",
+      "sha256": "cd3306af27c38e9e99f3b6dfcd79bbedd433d4a9c1b49349efe38ac3e22131bd",
+      "size_bytes": 1373
+    },
+    {
       "name": "report",
       "destination": "data/processed/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report/report.json",
       "source_key": "data/processed/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report/report.json.gz",
@@ -119,6 +126,13 @@
       "source_key": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.score.a9fff23e89860bfc.z14.fbnull.nlinear-v1.bin",
       "sha256": "381a14525d4f6561b345acf2315f3d88e6a7bad31e731428f61f566e1366e8e9",
       "size_bytes": 533502928
+    },
+    {
+      "name": "expanded_graph.readiness",
+      "destination": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/run.json",
+      "source_key": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/run.json",
+      "sha256": "dcb2257e34555c66989b3bbbed66946bd5acc7d4b37f68fdefe38540c14fc654",
+      "size_bytes": 1397
     },
     {
       "name": "route.geojson",

@@ -591,7 +591,9 @@ def test_inventory_does_not_attribute_or_reuse_unproven_valid_tiles(
         "terrain_asset_ids": '["planned-3dep-asset"]',
     }
 
-    rows, counts = scan_tile_inventory([source], image_root=tmp_path)
+    rows, counts = scan_tile_inventory(
+        [source], image_root=tmp_path, expected_dimensions=(4, 4)
+    )
 
     row = rows[0]
     assert counts["complete_pairs"] == 1
@@ -649,7 +651,9 @@ def test_inventory_reuse_requires_matching_acquisition_and_output_hashes(
     elif changed == "identity":
         row["acquisition_tile_identity_sha256"] = "f" * 64
 
-    rows, counts = scan_tile_inventory([row], image_root=tmp_path)
+    rows, counts = scan_tile_inventory(
+        [row], image_root=tmp_path, expected_dimensions=(4, 4)
+    )
 
     if not changed:
         assert counts["reusable_pairs"] == 1

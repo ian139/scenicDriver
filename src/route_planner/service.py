@@ -544,6 +544,20 @@ def clear_route_response_cache() -> None:
         _ROUTE_RESPONSE_CACHE.clear()
 
 
+def _validate_report_scores(
+    score_map: Mapping[tuple[int, int, int], float],
+    fallback: float | None,
+    deadline: RoutingDeadline | None = None,
+) -> None:
+    """Reject nonfinite report values before graph or cache changes."""
+    for index, value in enumerate(score_map.values()):
+        _maybe_check_deadline(deadline, index)
+        if value is not None and not math.isfinite(float(value)):
+            raise ValueError("Present report scores must be finite")
+    if fallback is not None and not math.isfinite(float(fallback)):
+        raise ValueError("Report fallback score must be finite")
+
+
 def _apply_tile_scores_to_graph_native(
     graph: RoadGraph,
     score_map: Mapping[tuple[int, int, int], float],
@@ -562,6 +576,7 @@ def _apply_tile_scores_to_graph_native(
 
     if deadline is not None:
         deadline.check()
+    _validate_report_scores(score_map, fallback, deadline)
 
     matched = 0
     total = 0
@@ -755,7 +770,10 @@ def load_tile_scores(
         if x is None or y is None or z is None or scenic is None:
             continue
         z_i = int(z)
-        score_map[(z_i, int(x), int(y))] = float(scenic)
+        score = float(scenic)
+        if not math.isfinite(score):
+            raise ValueError("tile scenic scores must be finite")
+        score_map[(z_i, int(x), int(y))] = score
         zoom_counts[z_i] = zoom_counts.get(z_i, 0) + 1
     if not score_map:
         raise ValueError(f"No tile scores with x/y/z found in: {path}")
@@ -825,6 +843,7 @@ def _get_scored_graph(
 
     if deadline is not None:
         deadline.check()
+    _validate_report_scores(score_map, fallback, deadline)
 
     cache_key = (
         graph_key,
@@ -1343,6 +1362,8 @@ def apply_tile_scores_to_graph(
     The service request path uses the same native materialization routine on
     its exclusively owned graph variant.  This helper intentionally retains
     the historical mutating behavior for callers that opt into it.
+    All present report scores and the fallback must be finite; invalid inputs
+    are rejected before changing any edges.
     """
 
     return _apply_tile_scores_to_graph_native(

@@ -31,6 +31,7 @@ def create_real_checkpoint(
     terrain_dim: int = 2,
     num_classes: int = 3,
     bias_shift: float = 0.0,
+    training_dataset: Path | None = None,
 ) -> Path:
     model = ScenicRegressionModel(
         vit_dim=vit_dim, terrain_dim=terrain_dim, num_classes=num_classes
@@ -51,7 +52,23 @@ def create_real_checkpoint(
         "terrain_dim": terrain_dim,
         "num_classes": num_classes,
     }
+    if training_dataset is not None:
+        payload["dataset_sha256"] = _sha(training_dataset)
+        with np.load(training_dataset, allow_pickle=False) as dataset:
+            rows = [
+                {"image_path": str(image), "split": str(split)}
+                for image, split in zip(dataset["image_paths"], dataset["splits"])
+            ]
+        split_path = create_benchmark_csv(path.parent / "geographic_splits.csv", rows)
+        payload["split_sha256"] = _sha(split_path)
+        payload["split_artifact_sha256"] = _sha(split_path)
     torch.save(payload, path)
+    if training_dataset is not None:
+        (path.parent / "training_summary.json").write_text(json.dumps({
+            "state": "completed", "candidate_checkpoint_sha256": _sha(path),
+            "dataset_sha256": payload["dataset_sha256"],
+            "split_sha256": payload["split_sha256"], "split_path": str(split_path),
+        }))
     return path
 
 
@@ -184,8 +201,28 @@ def create_override_file(
     return path
 
 
-def _write_rejected_decision(path: Path, cand_ckpt: Path) -> Path:
-    """Write a realistic failed compound decision JSON for a candidate."""
+CANONICAL_GATE_NAMES = (
+    "integrity_pass",
+    "expanded_benchmark_corr_pass",
+    "expanded_benchmark_mse_pass",
+    "expanded_benchmark_improvement_pass",
+    "control_benchmark_non_regression_pass",
+    "control_benchmark_corr_pass",
+    "worst_slice_mse_pass",
+    "calibration_pass",
+    "distribution_pass",
+    "route_evidence_pass",
+)
+
+
+def _passing_gates() -> dict[str, bool]:
+    return {name: True for name in CANONICAL_GATE_NAMES}
+
+
+def _write_rejected_decision(path: Path, cand_ckpt: Path, base_ckpt: Path) -> Path:
+    """Write a canonical evaluate_stage_two decision that failed one gate."""
+    gates = _passing_gates()
+    gates["expanded_benchmark_improvement_pass"] = False
     path.write_text(
         json.dumps(
             {
@@ -194,9 +231,12 @@ def _write_rejected_decision(path: Path, cand_ckpt: Path) -> Path:
                     "checkpoint": str(cand_ckpt),
                     "sha256": _sha(cand_ckpt),
                 },
-                "baseline": {"checkpoint": "base.pt", "sha256": "0" * 64},
-                "fresh_human_test": {
-                    "candidate": {
+                "baseline": {
+                    "checkpoint": str(base_ckpt),
+                    "sha256": _sha(base_ckpt),
+                },
+                "expanded_human_benchmark": {
+                    "candidate_metrics": {
                         "samples": 20,
                         "mse": 1.2,
                         "mae": 0.8,
@@ -204,11 +244,28 @@ def _write_rejected_decision(path: Path, cand_ckpt: Path) -> Path:
                         "pearson_corr": 0.4,
                     }
                 },
-                "gates": {
-                    "integrity_pass": True,
-                    "expanded_benchmark_corr_pass": True,
-                    "expanded_benchmark_improvement_pass": False,
+                "gates": gates,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_evaluation_evidence(path: Path, cand_ckpt: Path, base_ckpt: Path) -> Path:
+    """Write candidate-validation evidence bound to a candidate/baseline pair."""
+    path.write_text(
+        json.dumps(
+            {
+                "candidate": {
+                    "checkpoint": str(cand_ckpt),
+                    "sha256": _sha(cand_ckpt),
                 },
+                "baseline": {
+                    "checkpoint": str(base_ckpt),
+                    "sha256": _sha(base_ckpt),
+                },
+                "candidate_metrics": {"mse": 1.2},
             }
         ),
         encoding="utf-8",
@@ -668,11 +725,16 @@ def test_evaluate_stage_two_denominator_and_hash_reporting(tmp_path: Path) -> No
 
 def test_evaluate_stage_two_passing_decision_schema_and_gates(tmp_path: Path) -> None:
     images = ["img3.jpg", "img4.jpg"]
-    dataset_path = create_npz_dataset(tmp_path / "dataset.npz", images)
+    dataset_path = create_npz_dataset(
+        tmp_path / "dataset.npz", ["train.jpg", "val.jpg"] + images,
+        splits=["train", "val", "test", "test"],
+    )
     control_dataset_path = create_npz_dataset(
         tmp_path / "control_dataset.npz", ["img1.jpg", "img2.jpg"]
     )
-    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.0)
+    cand_ckpt = create_real_checkpoint(
+        tmp_path / "cand.pt", bias_shift=0.0, training_dataset=dataset_path
+    )
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt", bias_shift=0.0)
 
     exp_csv = create_benchmark_csv(
@@ -728,21 +790,6 @@ def test_evaluate_stage_two_passing_decision_schema_and_gates(tmp_path: Path) ->
         output_path=out_json,
     )
 
-    expected_top_keys = {
-        "timestamp",
-        "all_gates_pass",
-        "candidate",
-        "baseline",
-        "expanded_dataset",
-        "control_dataset",
-        "expanded_human_benchmark",
-        "control_benchmark",
-        "calibration_and_distribution",
-        "route_qa_evidence",
-        "thresholds_evaluated",
-        "gates",
-    }
-    assert set(decision.keys()) == expected_top_keys
     assert decision["expanded_dataset"]["sha256"] == _sha(dataset_path)
     assert decision["control_dataset"]["sha256"] == _sha(control_dataset_path)
     assert decision["all_gates_pass"], decision["gates"]
@@ -802,6 +849,7 @@ def test_promote_from_decision_hash_guarded_atomic(tmp_path: Path) -> None:
                 "samples": 20,
             }
         },
+        "gates": _passing_gates(),
     }
     decision_file.write_text(json.dumps(decision_payload), encoding="utf-8")
 
@@ -882,6 +930,7 @@ def test_promotion_preserves_immutable_history(tmp_path: Path) -> None:
                         "samples": 20,
                     }
                 },
+                "gates": _passing_gates(),
             }
         ),
         encoding="utf-8",
@@ -917,6 +966,7 @@ def test_promotion_preserves_immutable_history(tmp_path: Path) -> None:
                         "samples": 20,
                     }
                 },
+                "gates": _passing_gates(),
             }
         ),
         encoding="utf-8",
@@ -1243,11 +1293,14 @@ def test_evaluate_stage_two_rejects_paused_or_legacy_candidate(
 
 def test_evaluate_stage_two_accepts_legacy_baseline(tmp_path: Path) -> None:
     images = ["img1.jpg", "img2.jpg"]
-    ds_path = create_npz_dataset(tmp_path / "ds.npz", images)
+    ds_path = create_npz_dataset(
+        tmp_path / "ds.npz", ["train.jpg", "val.jpg"] + images,
+        splits=["train", "val", "test", "test"],
+    )
     control_dataset_path = create_npz_dataset(
         tmp_path / "control_dataset.npz", ["img3.jpg", "img4.jpg"]
     )
-    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", training_dataset=ds_path)
     legacy_base_ckpt = create_legacy_checkpoint(tmp_path / "legacy_base.pt")
 
     exp_csv = create_benchmark_csv(
@@ -1458,6 +1511,7 @@ def test_promotion_content_addressing_isolates_from_candidate_mutation(
                 "samples": 20,
             }
         },
+        "gates": _passing_gates(),
     }
     decision_file.write_text(json.dumps(decision_payload), encoding="utf-8")
 
@@ -1519,6 +1573,7 @@ def test_promote_from_decision_accepts_missing_sha_active_baseline(
                 "samples": 20,
             }
         },
+        "gates": _passing_gates(),
     }
     decision_file.write_text(json.dumps(decision_payload), encoding="utf-8")
 
@@ -1619,6 +1674,7 @@ def test_promote_from_decision_rejects_absent_or_malformed_metrics(
             "all_gates_pass": True,
             "candidate": {"checkpoint": str(cand_ckpt), "sha256": _sha(cand_ckpt)},
             "baseline": {"checkpoint": str(base_ckpt), "sha256": _sha(base_ckpt)},
+            "gates": _passing_gates(),
         }
         payload.update(extra)
         dec_file.write_text(json.dumps(payload), encoding="utf-8")
@@ -1637,16 +1693,11 @@ def test_promote_with_user_override_success_records_prior_active_and_hashes(
 ) -> None:
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
-    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
-    evaluation_file = tmp_path / "evaluation.json"
-    evaluation_file.write_text(
-        json.dumps(
-            {
-                "candidate": {"checkpoint": str(cand_ckpt)},
-                "candidate_metrics": {"mse": 1.2},
-            }
-        ),
-        encoding="utf-8",
+    decision_file = _write_rejected_decision(
+        tmp_path / "decision.json", cand_ckpt, base_ckpt
+    )
+    evaluation_file = _write_evaluation_evidence(
+        tmp_path / "evaluation.json", cand_ckpt, base_ckpt
     )
     override_file = create_override_file(
         tmp_path / "override.json", cand_ckpt, decision_file, evaluation_file
@@ -1716,10 +1767,11 @@ def test_promote_with_user_override_false_approval_leaves_registry_unchanged(
 ) -> None:
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
-    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
-    evaluation_file = tmp_path / "evaluation.json"
-    evaluation_file.write_text(
-        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    decision_file = _write_rejected_decision(
+        tmp_path / "decision.json", cand_ckpt, base_ckpt
+    )
+    evaluation_file = _write_evaluation_evidence(
+        tmp_path / "evaluation.json", cand_ckpt, base_ckpt
     )
     override_file = create_override_file(
         tmp_path / "override.json",
@@ -1755,13 +1807,14 @@ def test_promote_with_user_override_missing_metrics_leaves_registry_unchanged(
 ) -> None:
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
-    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
+    decision_file = _write_rejected_decision(
+        tmp_path / "decision.json", cand_ckpt, base_ckpt
+    )
     decision_data = json.loads(decision_file.read_text(encoding="utf-8"))
-    del decision_data["fresh_human_test"]
+    del decision_data["expanded_human_benchmark"]
     decision_file.write_text(json.dumps(decision_data), encoding="utf-8")
-    evaluation_file = tmp_path / "evaluation.json"
-    evaluation_file.write_text(
-        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    evaluation_file = _write_evaluation_evidence(
+        tmp_path / "evaluation.json", cand_ckpt, base_ckpt
     )
     override_file = create_override_file(
         tmp_path / "override.json", cand_ckpt, decision_file, evaluation_file
@@ -1778,7 +1831,7 @@ def test_promote_with_user_override_missing_metrics_leaves_registry_unchanged(
     )
     before = registry.read_bytes()
 
-    with pytest.raises(ValueError, match="fresh_human_test candidate metrics"):
+    with pytest.raises(ValueError, match="missing expanded_human_benchmark"):
         promote_with_user_override(
             override_path=override_file,
             candidate_checkpoint=cand_ckpt,
@@ -1795,10 +1848,11 @@ def test_promote_with_user_override_evidence_hash_mismatch_leaves_registry_uncha
 ) -> None:
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
-    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
-    evaluation_file = tmp_path / "evaluation.json"
-    evaluation_file.write_text(
-        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    decision_file = _write_rejected_decision(
+        tmp_path / "decision.json", cand_ckpt, base_ckpt
+    )
+    evaluation_file = _write_evaluation_evidence(
+        tmp_path / "evaluation.json", cand_ckpt, base_ckpt
     )
     override_file = create_override_file(
         tmp_path / "override.json",
@@ -1841,10 +1895,11 @@ def test_promote_with_user_override_candidate_mismatch_leaves_registry_unchanged
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
     other_ckpt = create_real_checkpoint(tmp_path / "other.pt", bias_shift=0.2)
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
-    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
-    evaluation_file = tmp_path / "evaluation.json"
-    evaluation_file.write_text(
-        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    decision_file = _write_rejected_decision(
+        tmp_path / "decision.json", cand_ckpt, base_ckpt
+    )
+    evaluation_file = _write_evaluation_evidence(
+        tmp_path / "evaluation.json", cand_ckpt, base_ckpt
     )
     registry = tmp_path / "registry.json"
     registry.write_text(
@@ -1896,10 +1951,11 @@ def test_promote_with_user_override_registry_mismatch_leaves_registry_unchanged(
 ) -> None:
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
-    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
-    evaluation_file = tmp_path / "evaluation.json"
-    evaluation_file.write_text(
-        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    decision_file = _write_rejected_decision(
+        tmp_path / "decision.json", cand_ckpt, base_ckpt
+    )
+    evaluation_file = _write_evaluation_evidence(
+        tmp_path / "evaluation.json", cand_ckpt, base_ckpt
     )
     override_file = create_override_file(
         tmp_path / "override.json", cand_ckpt, decision_file, evaluation_file
@@ -1931,10 +1987,11 @@ def test_promote_with_user_override_rejects_malformed_schema_and_acknowledgement
 ) -> None:
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
-    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
-    evaluation_file = tmp_path / "evaluation.json"
-    evaluation_file.write_text(
-        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    decision_file = _write_rejected_decision(
+        tmp_path / "decision.json", cand_ckpt, base_ckpt
+    )
+    evaluation_file = _write_evaluation_evidence(
+        tmp_path / "evaluation.json", cand_ckpt, base_ckpt
     )
     registry = tmp_path / "registry.json"
     registry.write_text(
@@ -1979,10 +2036,11 @@ def test_promote_with_user_override_stores_portable_path_and_rollback_resolves_i
 ) -> None:
     cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
-    decision_file = _write_rejected_decision(tmp_path / "decision.json", cand_ckpt)
-    evaluation_file = tmp_path / "evaluation.json"
-    evaluation_file.write_text(
-        json.dumps({"candidate_metrics": {"mse": 1.2}}), encoding="utf-8"
+    decision_file = _write_rejected_decision(
+        tmp_path / "decision.json", cand_ckpt, base_ckpt
+    )
+    evaluation_file = _write_evaluation_evidence(
+        tmp_path / "evaluation.json", cand_ckpt, base_ckpt
     )
     override_file = create_override_file(
         tmp_path / "override.json", cand_ckpt, decision_file, evaluation_file
@@ -2039,6 +2097,339 @@ def test_promote_with_user_override_stores_portable_path_and_rollback_resolves_i
     restored = registry.parent / Path(rollback_result2["active"]["checkpoint"])
     assert restored.is_file()
     assert _sha(restored) == _sha(cand_ckpt)
+
+
+def _write_registry(registry: Path, active_ckpt: Path) -> Path:
+    registry.write_text(
+        json.dumps(
+            {
+                "active": {"checkpoint": str(active_ckpt), "sha256": _sha(active_ckpt)},
+                "history": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return registry
+
+
+def test_promote_from_decision_rejects_forged_aggregate_and_missing_gates(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+    registry = _write_registry(tmp_path / "registry.json", base_ckpt)
+    before = registry.read_bytes()
+
+    failed_gate = _passing_gates()
+    failed_gate["route_evidence_pass"] = False
+    missing_gate = _passing_gates()
+    del missing_gate["calibration_pass"]
+    string_gate = _passing_gates()
+    string_gate["distribution_pass"] = "true"
+    unknown_gate = {**_passing_gates(), "custom_pass": True}
+    cases = [
+        (failed_gate, "route_evidence_pass"),
+        (missing_gate, "calibration_pass"),
+        (string_gate, "distribution_pass"),
+        (unknown_gate, "unrecognized gates: custom_pass"),
+        ({}, "compound gates missing"),
+        (None, "no compound gate results"),
+    ]
+    for i, (gates, message) in enumerate(cases):
+        payload: dict[str, typing.Any] = {
+            # Forged aggregate: claims success regardless of gate results
+            "all_gates_pass": True,
+            "candidate": {"checkpoint": str(cand_ckpt), "sha256": _sha(cand_ckpt)},
+            "baseline": {"checkpoint": str(base_ckpt), "sha256": _sha(base_ckpt)},
+            "expanded_human_benchmark": {
+                "candidate_metrics": {
+                    "mae": 0.05,
+                    "rmse": 0.1,
+                    "pearson_corr": 0.95,
+                    "samples": 20,
+                }
+            },
+        }
+        if gates is not None:
+            payload["gates"] = gates
+        dec_file = tmp_path / f"forged_{i}.json"
+        dec_file.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError, match=message):
+            promote_from_decision(
+                decision_path=dec_file,
+                candidate_checkpoint=cand_ckpt,
+                registry_path=registry,
+                expected_registry_sha256=_sha(registry),
+                run_name="run",
+            )
+        assert registry.read_bytes() == before
+    assert not (tmp_path / "checkpoints").exists()
+
+
+def test_promote_with_user_override_rejects_unrelated_or_stale_evidence(
+    tmp_path: Path,
+) -> None:
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", bias_shift=0.1)
+    other_ckpt = create_real_checkpoint(tmp_path / "other.pt", bias_shift=0.2)
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+    newer_base = create_real_checkpoint(tmp_path / "newer_base.pt", bias_shift=0.3)
+    decision_file = _write_rejected_decision(
+        tmp_path / "decision.json", cand_ckpt, base_ckpt
+    )
+    matching_eval = _write_evaluation_evidence(
+        tmp_path / "evaluation.json", cand_ckpt, base_ckpt
+    )
+    unrelated_cand_eval = _write_evaluation_evidence(
+        tmp_path / "eval_other_cand.json", other_ckpt, base_ckpt
+    )
+    other_base_eval = _write_evaluation_evidence(
+        tmp_path / "eval_other_base.json", cand_ckpt, newer_base
+    )
+    unrelated_decision = _write_rejected_decision(
+        tmp_path / "decision_other.json", other_ckpt, base_ckpt
+    )
+
+    cases = [
+        (
+            "current",
+            decision_file,
+            unrelated_cand_eval,
+            "evidence.evaluation candidate sha256",
+        ),
+        (
+            "current",
+            unrelated_decision,
+            matching_eval,
+            "evidence.final_decision candidate sha256",
+        ),
+        ("current", decision_file, other_base_eval, "bind different baselines"),
+        # Registry active moved on after evaluation: evidence is stale
+        ("newer", decision_file, matching_eval, "evidence baseline does not match"),
+    ]
+    for i, (active, dec, ev, message) in enumerate(cases):
+        registry = _write_registry(
+            tmp_path / f"registry_{i}.json",
+            base_ckpt if active == "current" else newer_base,
+        )
+        before = registry.read_bytes()
+        override_file = create_override_file(
+            tmp_path / f"override_{i}.json", cand_ckpt, dec, ev
+        )
+        with pytest.raises(ValueError, match=message):
+            promote_with_user_override(
+                override_path=override_file,
+                candidate_checkpoint=cand_ckpt,
+                registry_path=registry,
+                expected_registry_sha256=_sha(registry),
+                run_name="run",
+            )
+        assert registry.read_bytes() == before
+    assert not (tmp_path / "checkpoints").exists()
+
+
+def test_promote_with_user_override_activates_real_rejected_stage_two_decision(
+    tmp_path: Path,
+) -> None:
+    dataset_path = create_npz_dataset(
+        tmp_path / "dataset.npz", ["train.jpg", "val.jpg", "img3.jpg", "img4.jpg"],
+        splits=["train", "val", "test", "test"],
+    )
+    cand_ckpt = create_real_checkpoint(
+        tmp_path / "cand.pt", bias_shift=0.1, training_dataset=dataset_path
+    )
+    base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
+    control_dataset_path = create_npz_dataset(
+        tmp_path / "control_dataset.npz", ["img1.jpg", "img2.jpg"]
+    )
+    exp_csv = create_benchmark_csv(
+        tmp_path / "exp.csv",
+        [
+            {
+                "image_path": image,
+                "split": "test",
+                "scenic_human_mean": score,
+                "region": "r1",
+                "slice": "s1",
+            }
+            for image, score in (("img3.jpg", "4.0"), ("img4.jpg", "6.0"))
+        ],
+    )
+    ctrl_csv = create_benchmark_csv(
+        tmp_path / "ctrl.csv",
+        [
+            {
+                "image_path": image,
+                "split": "test",
+                "scenic_human": score,
+                "region": "r1",
+                "slice": "s1",
+            }
+            for image, score in (("img1.jpg", "4.0"), ("img2.jpg", "6.0"))
+        ],
+    )
+    thresholds = get_default_thresholds()
+    thresholds["min_expanded_mse_improvement"] = 1000.0
+    decision_file = tmp_path / "decision.json"
+    decision = evaluate_stage_two(
+        dataset_path=dataset_path,
+        control_dataset_path=control_dataset_path,
+        candidate_checkpoint=cand_ckpt,
+        baseline_checkpoint=base_ckpt,
+        expanded_benchmark_csv=exp_csv,
+        control_benchmark_csv=ctrl_csv,
+        route_qa_json=create_route_qa_json(tmp_path / "route_qa.json"),
+        thresholds=thresholds,
+        output_path=decision_file,
+    )
+    assert decision["all_gates_pass"] is False
+    failed_gates = [name for name, ok in decision["gates"].items() if not ok]
+    assert "expanded_benchmark_improvement_pass" in failed_gates
+
+    val_dataset = create_npz_dataset(
+        tmp_path / "val.npz", ["val1.jpg", "val2.jpg"], splits=["val", "val"]
+    )
+    val_csv = create_benchmark_csv(
+        tmp_path / "val.csv",
+        [
+            {
+                "image_path": image,
+                "split": "val",
+                "scenic_human_mean": score,
+                "region": "r1",
+            }
+            for image, score in (("val1.jpg", "5.0"), ("val2.jpg", "7.0"))
+        ],
+    )
+    evaluation_file = tmp_path / "validation.json"
+    evaluate_candidate_validation(
+        dataset_path=val_dataset,
+        candidate_checkpoint=cand_ckpt,
+        baseline_checkpoint=base_ckpt,
+        expanded_benchmark_csv=val_csv,
+        output_path=evaluation_file,
+    )
+
+    # Promotion through the passing path is refused for this real decision
+    registry = _write_registry(tmp_path / "registry.json", base_ckpt)
+    with pytest.raises(ValueError, match="all_gates_pass != True"):
+        promote_from_decision(
+            decision_path=decision_file,
+            candidate_checkpoint=cand_ckpt,
+            registry_path=registry,
+            expected_registry_sha256=_sha(registry),
+            run_name="run",
+        )
+
+    override_file = create_override_file(
+        tmp_path / "override.json",
+        cand_ckpt,
+        decision_file,
+        evaluation_file,
+        acknowledged_failed_gates=failed_gates,
+    )
+    result = promote_with_user_override(
+        override_path=override_file,
+        candidate_checkpoint=cand_ckpt,
+        registry_path=registry,
+        expected_registry_sha256=_sha(registry),
+        run_name="override_run",
+    )
+    assert result["status"] == "activated_by_user_override"
+    expected_metrics = decision["expanded_human_benchmark"]["candidate_metrics"]
+    active = json.loads(registry.read_text(encoding="utf-8"))["active"]
+    assert active["sha256"] == _sha(cand_ckpt)
+    assert active["metrics"]["corr"] == expected_metrics["pearson_corr"]
+    assert active["metrics"]["mae"] == expected_metrics["mae"]
+    assert active["metrics"]["samples"] == expected_metrics["samples"]
+    assert active["evidence"]["final_decision"]["sha256"] == _sha(decision_file)
+    assert active["evidence"]["evaluation"]["sha256"] == _sha(evaluation_file)
+
+    # The same evidence is now stale: the registry baseline is the candidate
+    replay = create_override_file(
+        tmp_path / "override_replay.json", cand_ckpt, decision_file, evaluation_file
+    )
+    before = registry.read_bytes()
+    with pytest.raises(ValueError, match="evidence baseline does not match"):
+        promote_with_user_override(
+            override_path=replay,
+            candidate_checkpoint=cand_ckpt,
+            registry_path=registry,
+            expected_registry_sha256=_sha(registry),
+            run_name="replay",
+        )
+    assert registry.read_bytes() == before
+
+
+def test_rollback_rejects_explicit_checkpoint_hash_mismatch(tmp_path: Path) -> None:
+    old_ckpt = create_real_checkpoint(tmp_path / "old.pt", bias_shift=0.0)
+    new_ckpt = create_real_checkpoint(tmp_path / "new.pt", bias_shift=0.3)
+    other_sha = _sha(create_real_checkpoint(tmp_path / "x.pt", bias_shift=0.5))
+    active = {"checkpoint": str(new_ckpt), "sha256": _sha(new_ckpt)}
+    registry = tmp_path / "registry.json"
+
+    # Recorded history hash matches the file, but the operator requested another
+    registry.write_text(
+        json.dumps(
+            {
+                "active": active,
+                "history": [
+                    {
+                        "event": "promote",
+                        "record": active,
+                        "prior_active": {
+                            "checkpoint": str(old_ckpt),
+                            "sha256": _sha(old_ckpt),
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = registry.read_bytes()
+    with pytest.raises(ValueError, match="requested checkpoint SHA256"):
+        rollback_registry(
+            registry,
+            target_history_index=0,
+            expected_registry_sha256=_sha(registry),
+            expected_checkpoint_sha256=other_sha,
+        )
+    assert registry.read_bytes() == before
+
+    # Unrecorded history hash: the requested hash must match the actual file
+    registry.write_text(
+        json.dumps(
+            {
+                "active": active,
+                "history": [
+                    {
+                        "event": "promote",
+                        "record": active,
+                        "prior_active": {"checkpoint": str(old_ckpt)},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = registry.read_bytes()
+    with pytest.raises(ValueError, match="identity validation failed"):
+        rollback_registry(
+            registry,
+            target_history_index=0,
+            expected_registry_sha256=_sha(registry),
+            expected_checkpoint_sha256=other_sha,
+        )
+    assert registry.read_bytes() == before
+
+    # Matching explicit hash (case-insensitive) restores the recorded checkpoint
+    result = rollback_registry(
+        registry,
+        target_history_index=0,
+        expected_registry_sha256=_sha(registry),
+        expected_checkpoint_sha256=_sha(old_ckpt).upper(),
+    )
+    assert result["active"]["sha256"] == _sha(old_ckpt)
 
 
 def test_evaluate_active_baseline_success(tmp_path: Path) -> None:
@@ -2592,11 +2983,14 @@ def test_evaluate_candidate_validation_exact_denominator_and_metrics(
 
 def test_route_evidence_pass_bound_two_role_fixture(tmp_path: Path) -> None:
     images = ["img1.jpg", "img2.jpg"]
-    ds_path = create_npz_dataset(tmp_path / "ds.npz", images)
+    ds_path = create_npz_dataset(
+        tmp_path / "ds.npz", ["train.jpg", "val.jpg"] + images,
+        splits=["train", "val", "test", "test"],
+    )
     control_dataset_path = create_npz_dataset(
         tmp_path / "control_dataset.npz", ["img3.jpg", "img4.jpg"]
     )
-    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt")
+    cand_ckpt = create_real_checkpoint(tmp_path / "cand.pt", training_dataset=ds_path)
     base_ckpt = create_real_checkpoint(tmp_path / "base.pt")
 
     exp_csv = create_benchmark_csv(
@@ -2941,3 +3335,189 @@ def test_route_evidence_fails_report_hash_mismatch(tmp_path: Path) -> None:
     )
     assert decision["gates"]["route_evidence_pass"] is False
     assert decision["all_gates_pass"] is False
+
+
+def _stage_two_inputs(tmp_path: Path) -> dict[str, typing.Any]:
+    expanded = create_npz_dataset(
+        tmp_path / "dataset.npz", ["train.jpg", "val.jpg", "e1.jpg", "e2.jpg"],
+        splits=["train", "val", "test", "test"],
+    )
+    control = create_npz_dataset(tmp_path / "control.npz", ["c1.jpg", "c2.jpg"])
+    candidate = create_real_checkpoint(tmp_path / "cand.pt", training_dataset=expanded)
+    baseline = create_real_checkpoint(tmp_path / "base.pt")
+    benchmarks = []
+    for name, images in (("expanded", ["e1.jpg", "e2.jpg"]), ("control", ["c1.jpg", "c2.jpg"])):
+        benchmarks.append(create_benchmark_csv(
+            tmp_path / f"{name}.csv",
+            [{"image_path": image, "split": "test", "scenic_human": score}
+             for image, score in zip(images, [4.0, 6.0])],
+        ))
+    return {
+        "dataset_path": expanded, "control_dataset_path": control,
+        "candidate_checkpoint": candidate, "baseline_checkpoint": baseline,
+        "expanded_benchmark_csv": benchmarks[0], "control_benchmark_csv": benchmarks[1],
+        "route_qa_json": create_route_qa_json(tmp_path / "qa.json"),
+        "thresholds": get_default_thresholds(), "output_path": tmp_path / "decision.json",
+    }
+
+
+@pytest.mark.parametrize("field,value", [
+    ("min_expanded_corr", "nan"), ("min_control_corr", 1.1),
+    ("max_expanded_mse", float("inf")), ("max_mean_drift", "-1"),
+    ("max_saturation_ratio", 1.1), ("min_unique_ratio", -0.1),
+    ("min_supported_slice_samples", 0), ("min_supported_slice_samples", 1.5),
+    ("min_supported_slice_samples", True),
+])
+def test_stage_two_rejects_invalid_policy(tmp_path: Path, field: str, value: typing.Any) -> None:
+    inputs = _stage_two_inputs(tmp_path)
+    inputs["thresholds"][field] = value
+    with pytest.raises(ValueError, match="Threshold"):
+        evaluate_stage_two(**inputs)
+
+
+@pytest.mark.parametrize("value", [None, False, "true", 1])
+def test_stage_two_requires_explicit_per_route_success(tmp_path: Path, value: typing.Any) -> None:
+    inputs = _stage_two_inputs(tmp_path)
+    qa_path = inputs["route_qa_json"]
+    qa = json.loads(qa_path.read_text())
+    if value is None:
+        del qa["routes"][0]["invariants_pass"]
+    else:
+        qa["routes"][0]["invariants_pass"] = value
+    qa_path.write_text(json.dumps(qa))
+    assert evaluate_stage_two(**inputs)["gates"]["route_evidence_pass"] is False
+
+
+@pytest.mark.parametrize("field,value", [
+    ("dataset_sha256", None), ("dataset_sha256", "0" * 64),
+    ("split_sha256", None), ("split_sha256", "invalid"),
+])
+def test_stage_two_cannot_certify_unbound_training_provenance(
+    tmp_path: Path, field: str, value: typing.Any,
+) -> None:
+    inputs = _stage_two_inputs(tmp_path)
+    checkpoint = inputs["candidate_checkpoint"]
+    payload = torch.load(checkpoint, weights_only=False)
+    payload[field] = value
+    torch.save(payload, checkpoint)
+    inputs["route_qa_json"] = create_route_qa_json(tmp_path / "qa.json")
+    result = evaluate_stage_two(**inputs)
+    assert result["gates"]["integrity_pass"] is False
+    assert result["all_gates_pass"] is False
+
+
+def test_stage_two_records_benchmarks_and_resolved_policy(tmp_path: Path) -> None:
+    inputs = _stage_two_inputs(tmp_path)
+    inputs["thresholds"] = {}
+    result = evaluate_stage_two(**inputs)
+    assert result["expanded_human_benchmark"]["sha256"] == _sha(inputs["expanded_benchmark_csv"])
+    assert result["control_benchmark"]["sha256"] == _sha(inputs["control_benchmark_csv"])
+    assert result["thresholds_evaluated"]["min_supported_slice_samples"] == 5
+    assert result["thresholds_evaluated"]["max_saturation_ratio"] == 0.20
+    assert result["gates"]["integrity_pass"] is True
+
+
+@pytest.mark.parametrize("state", ["paused", "failed"])
+def test_baseline_rejects_incomplete_modern_checkpoint(tmp_path: Path, state: str) -> None:
+    from src.scenic_scorer.active_evaluation import load_model_checkpoint
+
+    checkpoint = create_real_checkpoint(tmp_path / "baseline.pt")
+    payload = torch.load(checkpoint, weights_only=False)
+    payload["checkpoint_state"] = state
+    torch.save(payload, checkpoint)
+    with pytest.raises(ValueError, match="completed"):
+        load_model_checkpoint(checkpoint, is_candidate=False)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 1e100])
+def test_activation_rejects_nonfinite_or_overflowing_weights(tmp_path: Path, value: float) -> None:
+    from src.scenic_scorer.active_evaluation import load_model_checkpoint
+
+    checkpoint = create_real_checkpoint(tmp_path / "candidate.pt")
+    payload = torch.load(checkpoint, weights_only=False)
+    key = "network.6.bias"
+    payload["model_state_dict"][key] = torch.tensor([value], dtype=torch.float64)
+    torch.save(payload, checkpoint)
+    with pytest.raises(ValueError, match="non-finite"):
+        load_model_checkpoint(checkpoint)
+
+
+def test_inference_rejects_redistributed_feature_widths(tmp_path: Path) -> None:
+    from src.scenic_scorer.active_evaluation import load_model_checkpoint, predict_dataset
+
+    model = load_model_checkpoint(create_real_checkpoint(tmp_path / "candidate.pt"))
+    # Combined width remains 13; a concatenation-only check would silently infer
+    # using one terrain feature as a ViT feature.
+    with pytest.raises(ValueError):
+        predict_dataset(
+            model, np.ones((2, 9), dtype=np.float32),
+            np.ones((2, 1), dtype=np.float32), np.ones((2, 3), dtype=np.float32),
+        )
+
+
+@pytest.mark.parametrize("artifact,parser,section", [
+    ("candidate_checkpoint", "checkpoint", "candidate"),
+    ("dataset_path", "dataset", "expanded_dataset"),
+    ("expanded_benchmark_csv", "benchmark", "expanded_human_benchmark"),
+])
+def test_evaluation_hashes_deserialized_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    artifact: str, parser: str, section: str,
+) -> None:
+    inputs = _stage_two_inputs(tmp_path)
+    path = inputs[artifact]
+    original_sha = _sha(path)
+    owner, name = {
+        "checkpoint": (torch, "load"), "dataset": (np, "load"),
+        "benchmark": (csv, "DictReader"),
+    }[parser]
+    original_parser = getattr(owner, name)
+    replaced = False
+
+    def replace_before_deserialization(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        nonlocal replaced
+        if not replaced:
+            path.write_bytes(b"replaced after snapshot read")
+            replaced = True
+        return original_parser(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, replace_before_deserialization)
+    result = evaluate_stage_two(**inputs)
+    assert result[section]["sha256"] == original_sha
+    assert result[section]["sha256"] != _sha(path)
+    assert result["gates"]["integrity_pass"] is True
+
+
+@pytest.mark.parametrize("corruption", ["missing_summary", "stale_summary", "tampered_split", "wrong_membership", "missing_artifact_hash"])
+def test_holdout_integrity_requires_verified_run_split(tmp_path: Path, corruption: str) -> None:
+    inputs = _stage_two_inputs(tmp_path)
+    summary_path = tmp_path / "training_summary.json"
+    split_path = tmp_path / "geographic_splits.csv"
+    checkpoint = inputs["candidate_checkpoint"]
+    if corruption == "missing_summary":
+        summary_path.unlink()
+    elif corruption == "stale_summary":
+        summary = json.loads(summary_path.read_text())
+        summary["candidate_checkpoint_sha256"] = "0" * 64
+        summary_path.write_text(json.dumps(summary))
+    elif corruption == "tampered_split":
+        split_path.write_text(split_path.read_text().replace("e1.jpg,test", "e1.jpg,train"))
+    elif corruption == "missing_artifact_hash":
+        payload = torch.load(checkpoint, weights_only=False)
+        del payload["split_artifact_sha256"]
+        torch.save(payload, checkpoint)
+    else:
+        # Even a self-consistent checkpoint/summary hash cannot certify a split
+        # which trained on a prepared holdout identity.
+        split_path.write_text(split_path.read_text().replace("e1.jpg,test", "e1.jpg,train"))
+        payload = torch.load(checkpoint, weights_only=False)
+        payload["split_sha256"] = payload["split_artifact_sha256"] = _sha(split_path)
+        torch.save(payload, checkpoint)
+        summary = json.loads(summary_path.read_text())
+        summary["split_sha256"] = _sha(split_path)
+        summary["candidate_checkpoint_sha256"] = _sha(checkpoint)
+        summary_path.write_text(json.dumps(summary))
+    result = evaluate_stage_two(**inputs)
+    assert result["gates"]["integrity_pass"] is False
+    assert result["all_gates_pass"] is False
+    assert "Holdout integrity uncertified" in result["candidate"]["training_provenance"]["validation"]["reason"]

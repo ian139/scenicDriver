@@ -11,6 +11,7 @@ from pathlib import Path
 import tempfile
 import numpy as np
 import pytest
+from PIL import Image
 import rasterio
 from rasterio.transform import from_bounds
 
@@ -28,6 +29,7 @@ from src.data_pipeline.raster_processing import (
     process_imagery,
     process_dem,
 )
+from src.data_pipeline.tile_inventory import scan_tile_inventory, validate_png_image
 
 
 def _create_georeferenced_tif(
@@ -427,3 +429,120 @@ def test_processed_land_cannot_collide_with_reserved_black_fill(tmp_path):
     )
     with pytest.raises(TerrainRGBRangeError):
         process_dem([dem_path], grid, np.ones((4, 4), dtype=bool))
+
+
+def test_imagery_per_dataset_mask_overrides_numeric_zero_nodata(tmp_path):
+    grid = TargetGrid.from_tile(z=10, x=100, y=200, width=4, height=4)
+    path = tmp_path / "masked.tif"
+    data = np.full((3, 4, 4), 100, dtype=np.uint8)
+    data[0, 1, 1] = 0  # genuine black red channel, declared valid by the mask
+    data[:, 3, 3] = 0
+    mask = np.full((4, 4), 255, dtype=np.uint8)
+    mask[3, 3] = 0
+    with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
+        with rasterio.open(
+            path,
+            "w",
+            driver="GTiff",
+            height=4,
+            width=4,
+            count=3,
+            dtype="uint8",
+            crs=grid.crs,
+            transform=from_bounds(*grid.bounds, 4, 4),
+            nodata=0,
+        ) as dst:
+            dst.write(data)
+            dst.write_mask(mask)
+    land = np.ones((4, 4), dtype=bool)
+    land[3, 3] = False
+
+    rgb, _mask, qc = process_imagery([path], grid, land, resampling="nearest")
+
+    assert rgb[:, 1, 1].tolist() == [0, 100, 100]
+    assert qc["valid_pixels"] == 15
+    with pytest.raises(NoDataOnLandError):
+        process_imagery([path], grid, np.ones((4, 4), dtype=bool), resampling="nearest")
+
+
+@pytest.mark.parametrize(
+    "scale,offset",
+    [(0.1, 0.0), (1.0, 5.0), (float("nan"), 0.0), (1.0, float("inf"))],
+)
+def test_dem_rejects_nonidentity_or_nonfinite_scale_offset(tmp_path, scale, offset):
+    grid = TargetGrid.from_tile(z=10, x=100, y=200, width=4, height=4)
+    path = _create_georeferenced_tif(
+        tmp_path / "scaled.tif", np.full((4, 4), 250.0), grid, is_float=True
+    )
+    with rasterio.open(path, "r+") as dst:
+        dst.scales = (scale,)
+        dst.offsets = (offset,)
+
+    with pytest.raises(ValueError, match="scale/offset"):
+        process_dem([path], grid, np.ones((4, 4), dtype=bool))
+
+
+def test_dem_accepts_explicit_identity_scale_offset(tmp_path):
+    grid = TargetGrid.from_tile(z=10, x=100, y=200, width=4, height=4)
+    path = _create_georeferenced_tif(
+        tmp_path / "identity.tif", np.full((4, 4), 250.0), grid, is_float=True
+    )
+    with rasterio.open(path, "r+") as dst:
+        dst.scales = (1.0,)
+        dst.offsets = (0.0,)
+
+    _rgb, dem, _mask, _qc = process_dem([path], grid, np.ones((4, 4), dtype=bool))
+
+    assert np.allclose(dem, 250.0)
+
+
+def _save_tile(path: Path, image: Image.Image, fmt: str = "PNG") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path, format=fmt)
+    return path
+
+
+@pytest.mark.parametrize(
+    "image,fmt,reason",
+    [
+        (Image.new("RGB", (8, 8), "green"), "JPEG", "not_png:JPEG"),
+        (Image.new("L", (8, 8), 120), "PNG", "unexpected_mode:L"),
+        (Image.new("RGBA", (8, 8), "green"), "PNG", "unexpected_mode:RGBA"),
+        (Image.new("RGB", (4, 8), "green"), "PNG", "unexpected_dimensions:4x8"),
+    ],
+)
+def test_png_validation_rejects_non_png_non_rgb_or_wrong_size(
+    tmp_path, image, fmt, reason
+):
+    path = _save_tile(tmp_path / "tile.png", image, fmt)
+
+    result = validate_png_image(path, (8, 8))
+
+    assert result["valid"] is False
+    assert result["reason"] == reason
+
+
+def test_png_validation_accepts_contract_sized_rgb_png(tmp_path):
+    path = _save_tile(tmp_path / "tile.png", Image.new("RGB", (8, 8), "green"))
+
+    result = validate_png_image(path, (8, 8))
+
+    assert result["valid"] is True
+    assert (result["width"], result["height"]) == (8, 8)
+
+
+def test_inventory_does_not_count_wrong_size_tiles_as_valid(tmp_path):
+    row = {"region": "fixture", "z": 14, "x": 1, "y": 2}
+    for style in ("satellite", "terrain"):
+        _save_tile(
+            tmp_path / style / "z14" / "fixture" / "1_2.png",
+            Image.new("RGB", (4, 4), "green"),
+        )
+
+    rows, counts = scan_tile_inventory(
+        [row], image_root=tmp_path, expected_dimensions=(8, 8)
+    )
+
+    assert counts["complete_pairs"] == 0
+    assert counts["invalid_files"] == 2
+    assert rows[0]["satellite_reason"] == "unexpected_dimensions:4x4"

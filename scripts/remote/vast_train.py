@@ -56,6 +56,7 @@ DEFAULT_S3_MODELS_PREFIX = "models/"
 DEFAULT_TRAIN_DATASET = "/workspace/data/processed/regression/train_features.npz"
 DEFAULT_REMOTE_DATA_ROOT = "/workspace/data/processed/regression"
 DEFAULT_REMOTE_MODELS_ROOT = "/workspace/models"
+REMOTE_BENCHMARK_SPLIT_CSV = "/workspace/data/benchmark/benchmark_split.csv"
 DEFAULT_VALIDATION_CHECKPOINT_KEY = "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt"
 
 REUSABLE_STATUSES = {"destroyed", "failed_destroyed"}
@@ -66,6 +67,7 @@ class VastTrainConfig:
     task_name: str
     run_id: str
     train_dataset_key: str
+    benchmark_split_key: str
     s3_bucket: str
     s3_data_prefix: str
     s3_models_prefix: str
@@ -162,6 +164,8 @@ export SCENIC_OUTPUT_ROOT={_quote(remote_output_root)}
 export SCENIC_LIFECYCLE_DIR={_quote(remote_lifecycle_dir)}
 export SCENIC_TRAIN_DATASET_KEY={_quote(config.train_dataset_key)}
 export SCENIC_TRAIN_DATASET={_quote(DEFAULT_TRAIN_DATASET)}
+export SCENIC_BENCHMARK_SPLIT_KEY={_quote(config.benchmark_split_key)}
+export SCENIC_BENCHMARK_SPLIT_CSV={_quote(REMOTE_BENCHMARK_SPLIT_CSV)}
 export SCENIC_DATASET_PATH={_quote(validation_dataset)}
 export SCENIC_VALIDATION_CHECKPOINT_KEY={_quote(config.validation_checkpoint_key)}
 export SCENIC_CHECKPOINT_PATH={_quote(validation_checkpoint)}
@@ -171,7 +175,7 @@ export SCENIC_TRAIN_BATCH_SIZE={_quote(config.batch_size)}
 export SCENIC_TRAIN_LR={_quote(config.lr)}
 export SCENIC_TRAIN_VAL_SPLIT={_quote(config.val_split)}
 export SCENIC_TRAIN_SEED={_quote(config.seed)}
-mkdir -p "$SCENIC_OUTPUT_ROOT" "$SCENIC_LIFECYCLE_DIR" "$(dirname "$SCENIC_TRAIN_DATASET")" "$(dirname "$SCENIC_DATASET_PATH")" "$(dirname "$SCENIC_CHECKPOINT_PATH")" "$(dirname "$SCENIC_TRAIN_OUTPUT")"
+mkdir -p "$SCENIC_OUTPUT_ROOT" "$SCENIC_LIFECYCLE_DIR" "$(dirname "$SCENIC_TRAIN_DATASET")" "$(dirname "$SCENIC_BENCHMARK_SPLIT_CSV")" "$(dirname "$SCENIC_DATASET_PATH")" "$(dirname "$SCENIC_CHECKPOINT_PATH")" "$(dirname "$SCENIC_TRAIN_OUTPUT")"
 ensure_torch_supports_gpu() {{
   set +e
   python - <<'PY'
@@ -257,6 +261,11 @@ set +e
     --key "$SCENIC_TRAIN_DATASET_KEY" \
     --dest "$SCENIC_TRAIN_DATASET" \
     --required
+  python -m src.data_pipeline.s3 download-file \
+    --bucket "$SCENIC_S3_BUCKET" \
+    --key "$SCENIC_BENCHMARK_SPLIT_KEY" \
+    --dest "$SCENIC_BENCHMARK_SPLIT_CSV" \
+    --required
   python scripts/remote/vast_train.py validate \
     --device cuda \
     --checkpoint "$SCENIC_CHECKPOINT_PATH" \
@@ -264,6 +273,7 @@ set +e
     --output "$SCENIC_OUTPUT_ROOT/validation_result.json"
   python scripts/modeling/train_regression_baseline.py \
     --dataset "$SCENIC_TRAIN_DATASET" \
+    --benchmark-split-csv "$SCENIC_BENCHMARK_SPLIT_CSV" \
     --output "$SCENIC_TRAIN_OUTPUT" \
     --epochs "$SCENIC_TRAIN_EPOCHS" \
     --batch-size "$SCENIC_TRAIN_BATCH_SIZE" \
@@ -322,10 +332,14 @@ def initial_state(config: VastTrainConfig, offer_id: int, instance_id: int) -> d
         "s3_output_prefix": config.s3_output_prefix,
         "train_dataset_key": config.train_dataset_key,
         "train_dataset": DEFAULT_TRAIN_DATASET,
+        "benchmark_split_key": config.benchmark_split_key,
+        "benchmark_split_csv": REMOTE_BENCHMARK_SPLIT_CSV,
         "train_output": _remote_train_output(config.run_id),
         "created_at": now,
         "updated_at": now,
         "timings_seconds": {},
+        "launch_attempted": False,
+        "launch_outcome": "pending",
         "status": "creating",
     }
 
@@ -392,6 +406,7 @@ def poll_remote_training(target: SshTarget, state: dict, *, poll_seconds: int, t
 
 
 def copy_training_artifacts(state: dict, *, required: bool) -> None:
+    """Copy the remote run output locally; raise when a required copy fails."""
     if not state.get("ssh_host") or not state.get("ssh_port"):
         message = "state has no SSH endpoint; cannot copy training artifacts"
         if required:
@@ -402,7 +417,9 @@ def copy_training_artifacts(state: dict, *, required: bool) -> None:
     task_name = str(state["task_name"])
     run_id = str(state["run_id"])
     local_dir = ARTIFACTS_DIR / task_name / "scenic_artifacts" / "vast" / run_id
-    copy_remote_path(target, str(state["remote_output_root"]).rstrip("/") + "/", local_dir, required=required)
+    remote_path = str(state["remote_output_root"]).rstrip("/") + "/"
+    if not copy_remote_path(target, remote_path, local_dir, required=required) and required:
+        raise RuntimeError(f"required training artifacts were not recovered from {remote_path}")
 
 
 def destroy_recorded_instance(state: dict) -> bool:
@@ -421,6 +438,7 @@ def _config_from_args(args: argparse.Namespace) -> VastTrainConfig:
         task_name=args.task_name,
         run_id=run_id,
         train_dataset_key=args.train_dataset_key,
+        benchmark_split_key=args.benchmark_split_key,
         s3_bucket=s3_bucket,
         s3_data_prefix=args.s3_data_prefix,
         s3_models_prefix=args.s3_models_prefix,
@@ -463,6 +481,8 @@ def _check_run_preconditions(config: VastTrainConfig) -> None:
         raise SystemExit("--s3-bucket or SCENIC_S3_BUCKET is required")
     if not config.train_dataset_key.strip():
         raise SystemExit("--train-dataset-key is required")
+    if not config.benchmark_split_key.strip():
+        raise SystemExit("--benchmark-split-key is required")
     if not config.validation_checkpoint_key.strip():
         raise SystemExit("--validation-checkpoint-key is required")
     if not config.validation_checkpoint_key.startswith(config.s3_models_prefix):
@@ -471,34 +491,150 @@ def _check_run_preconditions(config: VastTrainConfig) -> None:
         raise SystemExit("--train-dataset-key must be under --s3-data-prefix")
 
 
-def _handle_training_result(config: VastTrainConfig, state: dict, remote_status: str) -> int:
-    update_status(state, "copying_artifacts", remote_training_status=remote_status)
-    copy_training_artifacts(state, required=remote_status == "done")
-    if remote_status == "done":
-        if not config.destroy:
-            update_status(state, "completed_kept")
-            print(f"Training completed; instance kept for {config.task_name}")
-            print(f"Cleanup: python scripts/remote/vast_train.py cleanup {config.task_name} --copy-artifacts --destroy --yes")
-            return 0
-        update_status(state, "destroying")
-        if destroy_recorded_instance(state):
-            update_status(state, "destroyed")
-            print(f"Training completed and Vast instance destroyed: {config.task_name}")
-            return 0
-        update_status(state, "failed_kept", error="destroy failed after successful training")
-        print(f"Training completed but destroy failed; cleanup required for {config.task_name}", file=sys.stderr)
-        return 1
+def _cleanup_command(task_name: str) -> str:
+    return f"python scripts/remote/vast_train.py cleanup {task_name} --copy-artifacts --destroy --yes"
 
+
+def _close_failed_run(config: VastTrainConfig, state: dict, error: str) -> None:
+    """Recover what artifacts exist, then destroy or retain per --no-destroy/--keep-on-failure."""
+    update_status(state, "copying_artifacts", error=error)
+    try:
+        copy_training_artifacts(state, required=False)
+    except Exception as exc:  # noqa: BLE001 - best-effort recovery must not block the retention policy.
+        state["artifact_copy_error"] = str(exc)
+        write_state(state)
+        print(f"Warning: best-effort artifact copy failed: {exc}", file=sys.stderr)
     if config.destroy and not config.keep_on_failure:
         update_status(state, "destroying")
         if destroy_recorded_instance(state):
             update_status(state, "failed_destroyed")
-            print(f"Training failed; Vast instance destroyed: {config.task_name}", file=sys.stderr)
-            return 1
+            print(f"Training failed ({error}); Vast instance destroyed: {config.task_name}", file=sys.stderr)
+            return
     update_status(state, "failed_kept")
-    print(f"Training failed; instance kept for {config.task_name}", file=sys.stderr)
-    print(f"Cleanup: python scripts/remote/vast_train.py cleanup {config.task_name} --copy-artifacts --destroy --yes", file=sys.stderr)
+    print(f"Training failed ({error}); instance kept for {config.task_name}", file=sys.stderr)
+    print(f"Cleanup: {_cleanup_command(config.task_name)}", file=sys.stderr)
+
+
+def _handle_training_result(config: VastTrainConfig, state: dict, remote_status: str) -> int:
+    update_status(state, "copying_artifacts", remote_training_status=remote_status)
+    if remote_status != "done":
+        _close_failed_run(config, state, f"remote training {remote_status}")
+        return 1
+    try:
+        copy_training_artifacts(state, required=True)
+    except Exception as exc:  # noqa: BLE001 - any recovery failure must retain the sole copy of outputs.
+        # Never destroy the only host holding unrecovered outputs.
+        update_status(state, "failed_kept", error=f"required training artifact recovery failed: {exc}")
+        print(f"Training completed but artifact recovery failed; instance kept for {config.task_name}: {exc}", file=sys.stderr)
+        print(f"Cleanup: {_cleanup_command(config.task_name)}", file=sys.stderr)
+        return 1
+    if not config.destroy:
+        update_status(state, "completed_kept")
+        print(f"Training completed; instance kept for {config.task_name}")
+        print(f"Cleanup: {_cleanup_command(config.task_name)}")
+        return 0
+    update_status(state, "destroying")
+    if destroy_recorded_instance(state):
+        update_status(state, "destroyed")
+        print(f"Training completed and Vast instance destroyed: {config.task_name}")
+        return 0
+    update_status(state, "failed_kept", error="destroy failed after successful training")
+    print(f"Training completed but destroy failed; cleanup required for {config.task_name}", file=sys.stderr)
     return 1
+
+
+class LaunchOutcomeUnknown(RuntimeError):
+    """The remote training command may have been delivered; the launch outcome is unknown."""
+
+
+def _mark_launch_outcome_unknown(state: dict, error: str) -> None:
+    """Retain the host: training may be running, so never destroy or re-rent here."""
+    update_status(
+        state,
+        "failed_kept",
+        error=f"launch outcome unknown: {error}",
+        launch_outcome="unknown",
+    )
+    print(
+        f"Launch outcome unknown; training may be running, host kept for {state['task_name']}. "
+        f"Cleanup: {_cleanup_command(str(state['task_name']))}",
+        file=sys.stderr,
+    )
+
+
+def _abandon_unlaunched_allocation(state: dict | None, instance_id: int | None, error: str, *, retain: bool) -> None:
+    """Close an allocation confirmed to have never launched training; only a recorded instance may be retained."""
+    if state is not None:
+        state["error"] = error
+        write_state(state)
+        if retain:
+            update_status(state, "failed_kept")
+            print(f"Provisioning failed ({error}); instance kept for {state['task_name']}", file=sys.stderr)
+            print(f"Cleanup: {_cleanup_command(str(state['task_name']))}", file=sys.stderr)
+            return
+        update_status(state, "failed_destroyed" if destroy_recorded_instance(state) else "failed_kept")
+        return
+    if instance_id is None:
+        return
+    result = run_command(["vastai", "destroy", "instance", str(instance_id), "--yes"], check=False)
+    if result.returncode != 0:
+        print(
+            f"Warning: failed to destroy unrecorded Vast instance {instance_id}; run: vastai destroy instance {instance_id} --yes",
+            file=sys.stderr,
+        )
+
+
+def _provision_and_launch(config: VastTrainConfig, attempt: int) -> tuple[dict, SshTarget]:
+    state: dict | None = None
+    instance_id: int | None = None
+    try:
+        offer_id = int(config.offer_id) if config.offer_id is not None else select_offer_id_at(config.offer_query, attempt)
+        instance_id = create_instance(offer_id, config.image, config.disk_gb)
+        state = initial_state(config, offer_id, instance_id)
+        state["allocation_attempt"] = attempt + 1
+        write_state(state)
+        attach_ssh_key(instance_id, config.ssh_public_key)
+        update_status(state, "ssh_wait")
+        host, port = wait_for_instance_endpoint(instance_id, config.timeout_seconds)
+        state.update({"ssh_host": host, "ssh_port": port})
+        write_state(state)
+        reboot_instance(instance_id)
+        host, port = wait_for_instance_endpoint(instance_id, config.timeout_seconds)
+        state.update({"ssh_host": host, "ssh_port": port})
+        write_state(state)
+        target = SshTarget(host=host, port=port, user="root", identity_file=config.identity_file)
+        wait_for_ssh(target, config.timeout_seconds)
+        update_status(state, "provisioning")
+        copy_secrets(target, config.local_secrets_env_file, config.remote_env_file)
+        script = build_remote_training_script(config)
+        # From here the detached training may exist remotely even when the launch
+        # acknowledgement is lost: persist the boundary before firing.
+        state["launch_attempted"] = True
+        write_state(state)
+        launch_remote_training(target, state, script)
+        state["launch_outcome"] = "launched"
+        write_state(state)
+    except BaseException as exc:
+        interrupted = isinstance(exc, KeyboardInterrupt)
+        error = "interrupted during provisioning" if interrupted else str(exc)
+        if state is not None and state.get("launch_attempted"):
+            # Ambiguous boundary: the detached training may be running on this
+            # host. Retain it unconditionally; only explicit operator cleanup
+            # may destroy it. Never re-rent a replacement either.
+            _mark_launch_outcome_unknown(state, error)
+            if interrupted:
+                raise
+            raise LaunchOutcomeUnknown(error) from exc
+        # Confirmed-never-launched: bad hosts are destroyed before re-renting;
+        # an operator interrupt honors --no-destroy/--keep-on-failure.
+        _abandon_unlaunched_allocation(
+            state,
+            instance_id,
+            error,
+            retain=interrupted and (not config.destroy or config.keep_on_failure),
+        )
+        raise
+    return state, target
 
 
 def handle_run(args: argparse.Namespace) -> int:
@@ -511,92 +647,37 @@ def handle_run(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    max_attempts = max(1, config.allocation_attempts)
-    last_error: BaseException | None = None
-    for attempt in range(max_attempts):
-        state: dict | None = None
-        instance_id: int | None = None
-        target: SshTarget | None = None
-        launched = False
+    attempt = 0
+    while True:
         try:
-            offer_id = int(config.offer_id) if config.offer_id is not None else select_offer_id_at(config.offer_query, attempt)
-            instance_id = create_instance(offer_id, config.image, config.disk_gb)
-            state = initial_state(config, offer_id, instance_id)
-            state["allocation_attempt"] = attempt + 1
-            write_state(state)
-            attach_ssh_key(instance_id, config.ssh_public_key)
-            update_status(state, "ssh_wait")
-            host, port = wait_for_instance_endpoint(instance_id, config.timeout_seconds)
-            state.update({"ssh_host": host, "ssh_port": port})
-            write_state(state)
-            reboot_instance(instance_id)
-            host, port = wait_for_instance_endpoint(instance_id, config.timeout_seconds)
-            state.update({"ssh_host": host, "ssh_port": port})
-            write_state(state)
-            target = SshTarget(host=host, port=port, user="root", identity_file=config.identity_file)
-            wait_for_ssh(target, config.timeout_seconds)
-            update_status(state, "provisioning")
-            copy_secrets(target, config.local_secrets_env_file, config.remote_env_file)
-            launch_remote_training(target, state, build_remote_training_script(config))
-            launched = True
-            update_status(state, "training_running")
+            state, target = _provision_and_launch(config, attempt)
+            break
+        except LaunchOutcomeUnknown as exc:
+            # The retained host may be running training; never rent a replacement.
+            print(str(exc), file=sys.stderr)
+            return 1
         except Exception as exc:  # noqa: BLE001 - bad Vast hosts are common; rerent before training starts.
-            last_error = exc
-            if state is not None:
-                state["error"] = str(exc)
-                write_state(state)
-                if destroy_recorded_instance(state):
-                    update_status(state, "failed_destroyed")
-                else:
-                    update_status(state, "failed_kept")
-            elif instance_id is not None:
-                run_command(["vastai", "destroy", "instance", str(instance_id), "--yes"], check=False)
-            if launched:
-                break
-            if attempt + 1 < max_attempts:
-                print(f"Vast allocation attempt {attempt + 1} failed; retrying: {exc}", file=sys.stderr)
-                continue
-            print(str(exc), file=sys.stderr)
-            return 1
+            attempt += 1
+            if attempt >= config.allocation_attempts:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(f"Vast allocation attempt {attempt} failed; retrying: {exc}", file=sys.stderr)
 
-        if state is None or target is None:
-            last_error = RuntimeError("Vast allocation did not produce an SSH-ready host")
-            continue
-        try:
-            remote_status = poll_remote_training(
-                target,
-                state,
-                poll_seconds=config.poll_seconds,
-                timeout_seconds=config.timeout_seconds,
-            )
-            return _handle_training_result(config, state, remote_status)
-        except KeyboardInterrupt:
-            if config.destroy:
-                update_status(state, "copying_artifacts", error="interrupted")
-                copy_training_artifacts(state, required=False)
-                update_status(state, "destroying")
-                if destroy_recorded_instance(state):
-                    update_status(state, "failed_destroyed")
-                else:
-                    update_status(state, "failed_kept")
-            raise
-        except Exception as exc:  # noqa: BLE001 - copy logs and close by default on orchestrator failures.
-            state["error"] = str(exc)
-            write_state(state)
-            copy_training_artifacts(state, required=False)
-            if config.destroy and not config.keep_on_failure:
-                update_status(state, "destroying")
-                if destroy_recorded_instance(state):
-                    update_status(state, "failed_destroyed")
-                else:
-                    update_status(state, "failed_kept")
-            else:
-                update_status(state, "failed_kept")
-            print(str(exc), file=sys.stderr)
-            return 1
-    if last_error is not None:
-        print(str(last_error), file=sys.stderr)
-    return 1
+    try:
+        update_status(state, "training_running")
+        remote_status = poll_remote_training(
+            target,
+            state,
+            poll_seconds=config.poll_seconds,
+            timeout_seconds=config.timeout_seconds,
+        )
+        return _handle_training_result(config, state, remote_status)
+    except KeyboardInterrupt:
+        _close_failed_run(config, state, "interrupted")
+        raise
+    except Exception as exc:  # noqa: BLE001 - copy logs and apply retention policy on orchestrator failures.
+        _close_failed_run(config, state, str(exc))
+        return 1
 
 
 def handle_status(args: argparse.Namespace) -> int:
@@ -622,7 +703,11 @@ def handle_cleanup(args: argparse.Namespace) -> int:
     validate_task_name(args.task_name)
     state = load_state(args.task_name)
     if args.copy_artifacts:
-        copy_training_artifacts(state, required=False)
+        try:
+            copy_training_artifacts(state, required=True)
+        except RuntimeError as exc:
+            print(f"Artifact recovery failed for {args.task_name}; not destroying: {exc}", file=sys.stderr)
+            return 1
     if not (args.destroy and args.yes):
         print(f"Destroy command: vastai destroy instance {state['instance_id']} --yes")
         print("Not destroying without --destroy --yes")
@@ -663,7 +748,7 @@ def handle_validate(args: argparse.Namespace) -> int:
         checkpoint_payload = torch.load(
             checkpoint,
             map_location=args.device,
-            weights_only=False,
+            weights_only=True,
         )
     except Exception as exc:  # noqa: BLE001 - normalize corrupt artifact failures.
         raise ValueError(f"corrupt or unreadable checkpoint: {checkpoint}") from exc
@@ -757,6 +842,11 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="Start a Vast instance, train, copy artifacts, and destroy by default")
     run.add_argument("task_name")
     run.add_argument("--train-dataset-key", required=True)
+    run.add_argument(
+        "--benchmark-split-key",
+        required=True,
+        help="Exact S3 key of the benchmark split CSV whose val/test identities are excluded from training",
+    )
     run.add_argument("--s3-bucket")
     run.add_argument("--s3-data-prefix", default=DEFAULT_S3_DATA_PREFIX)
     run.add_argument("--s3-models-prefix", default=DEFAULT_S3_MODELS_PREFIX)

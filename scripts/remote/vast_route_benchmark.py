@@ -22,12 +22,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.remote.cmux_vast_host import (  # noqa: E402
     ARTIFACTS_DIR,
+    LifecycleDeadlineExceeded,
     SshTarget,
     VALID_STATUSES,
     attach_ssh_key,
     copy_remote_path,
     copy_secrets,
     create_instance,
+    lifecycle_deadline,
     make_overlay_tarball,
     require_commands,
     run_command,
@@ -57,6 +59,11 @@ DEFAULT_PER_WORKER_RAM_MB = 24_576
 DEFAULT_RESERVED_RAM_MB = 8_192
 DEFAULT_MAX_WORKERS = 32
 DEFAULT_CHECKPOINT_INTERVAL_SECONDS = 60
+# One cleanup probe (exit status or checkpoint presence) gets this SSH budget.
+EXIT_PROBE_TIMEOUT_SECONDS = 60
+# Local recovery names that must arrive before a launched host may be destroyed.
+COMPLETED_OUTPUTS = ("checkpoint.jsonl", "final.json")
+FAILED_OUTPUTS = ("benchmark.log",)
 
 
 @dataclass(frozen=True)
@@ -213,6 +220,25 @@ def derive_worker_count(
     return capacity
 
 
+def plan_workers(
+    config: VastRouteConfig, cpu_count: int, ram_mb: int
+) -> tuple[int, int]:
+    """Return (workers, group_size) validated against the probed host and config."""
+    budget = {
+        "per_worker_ram_mb": config.per_worker_ram_mb,
+        "reserved_ram_mb": config.reserved_ram_mb,
+        "max_workers": config.max_workers,
+    }
+    workers = derive_worker_count(
+        ram_mb, cpu_count, explicit_workers=config.workers, **budget
+    )
+    group_size = config.group_size or workers
+    validate_worker_overrides(
+        workers, group_size, cpu_count=cpu_count, ram_mb=ram_mb, **budget
+    )
+    return workers, group_size
+
+
 def remote_paths(config: VastRouteConfig) -> dict[str, str]:
     root = PurePosixPath(config.remote_repo_dir)
     output = root / config.output
@@ -229,6 +255,7 @@ def remote_paths(config: VastRouteConfig) -> dict[str, str]:
         "checkpoint": str(checkpoint),
         "log": str(run_root / "benchmark.log"),
         "script": str(run_root / "run.sh"),
+        "exit_status": str(run_root / "exit_status"),
         "checkpoint_s3": f"s3://{config.s3_bucket}/{checkpoint_key}",
         "final_s3": f"s3://{config.s3_bucket}/{final_key}",
     }
@@ -306,6 +333,16 @@ fi"""
     return (
         f"""#!/usr/bin/env bash
 set -Eeuo pipefail
+EXIT_STATUS={quote(paths["exit_status"])}
+mkdir -p "$(dirname "$EXIT_STATUS")"
+rm -f "$EXIT_STATUS"
+# Persist the definitive exit code (atomically) so the runner can tell a
+# finished benchmark from a running or vanished one.
+record_exit_status() {{
+  local rc=$?
+  printf '%s\\n' "$rc" > "$EXIT_STATUS.tmp" && mv -f "$EXIT_STATUS.tmp" "$EXIT_STATUS"
+}}
+trap record_exit_status EXIT
 # Probe raw host capacity before depending on the project, env, or uv.
 printf 'nproc='; nproc
 printf 'MemTotal_kB='; awk '/^MemTotal:/ {{print $2}}' /proc/meminfo
@@ -441,6 +478,7 @@ def build_initial_state(
         "remote_repo_dir": config.remote_repo_dir,
         "remote_script": paths["script"],
         "remote_log": paths["log"],
+        "exit_status_path": paths["exit_status"],
         "output_path": paths["output"],
         "checkpoint_path": paths["checkpoint"],
         "checkpoint_s3": paths["checkpoint_s3"],
@@ -538,17 +576,90 @@ def launch_remote_script(target: SshTarget, config: VastRouteConfig) -> int:
         raise RuntimeError("remote detached benchmark did not return a PID") from exc
 
 
-def recover_outputs(state: dict[str, Any], *, required: bool = False) -> list[Path]:
+def build_exit_probe(exit_status_path: str, pid: int | None) -> str:
+    marker = quote(exit_status_path)
+    # Without an acknowledged PID liveness is unknowable; only the marker decides.
+    liveness = (
+        f"elif kill -0 {int(pid)} 2>/dev/null; then echo running; else echo vanished; fi"
+        if pid is not None
+        else "else echo unknown; fi"
+    )
+    return (
+        f"if [ -f {marker} ]; then printf 'exit=%s\\n' \"$(cat {marker})\"; {liveness}"
+    )
+
+
+def probe_remote_exit(
+    target: SshTarget, exit_status_path: str, pid: int | None
+) -> tuple[int | None, str]:
+    """Run one exit probe; the caller bounds it with lifecycle_deadline().
+
+    Returns (exit_code, detail) with exit_code None while running or unknown.
+    Raises RuntimeError when the benchmark vanished without an exit status.
+    """
+    result = ssh(target, build_exit_probe(exit_status_path, pid), check=False)
+    lines = result.stdout.strip().splitlines()
+    report = lines[-1].strip() if result.returncode == 0 and lines else ""
+    if report.startswith("exit="):
+        try:
+            return int(report.removeprefix("exit=")), report
+        except ValueError as exc:
+            raise RuntimeError(f"malformed remote exit status: {report}") from exc
+    if report == "vanished":
+        raise RuntimeError("remote benchmark exited without recording an exit status")
+    return None, report or (result.stderr or result.stdout).strip() or "no probe output"
+
+
+def wait_for_remote_exit(
+    target: SshTarget,
+    exit_status_path: str,
+    pid: int | None,
+    *,
+    timeout_seconds: int,
+    poll_seconds: int,
+) -> int:
+    """Poll until the detached benchmark records its exit code.
+
+    Every probe subprocess and sleep is bounded by the remaining deadline.
+    Raises TimeoutError while the benchmark is still unresolved at the deadline
+    and RuntimeError when it vanished without a definitive exit status.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            with lifecycle_deadline(max(0.0, deadline - time.monotonic())):
+                exit_code, detail = probe_remote_exit(target, exit_status_path, pid)
+        except LifecycleDeadlineExceeded as exc:
+            raise TimeoutError(
+                f"remote benchmark unresolved after {timeout_seconds}s: {exc}"
+            ) from exc
+        if exit_code is not None:
+            return exit_code
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"remote benchmark unresolved after {timeout_seconds}s: {detail}"
+            )
+        time.sleep(min(poll_seconds, remaining))
+
+
+def ssh_target_from_state(state: dict[str, Any]) -> SshTarget | None:
     if not state.get("ssh_host") or not state.get("ssh_port"):
-        if required:
-            raise RuntimeError("state has no SSH endpoint")
-        return []
-    target = SshTarget(
+        return None
+    return SshTarget(
         host=str(state["ssh_host"]),
         port=int(state["ssh_port"]),
         user=str(state.get("ssh_user", "root")),
         identity_file=str(state["identity_file"]),
     )
+
+
+def recover_outputs(state: dict[str, Any], *, required: bool = False) -> list[Path]:
+    target = ssh_target_from_state(state)
+    if target is None:
+        if required:
+            raise RuntimeError("state has no SSH endpoint")
+        return []
     local_dir = ARTIFACTS_DIR / str(state["task_name"])
     local_dir.mkdir(parents=True, exist_ok=True)
     copied: list[Path] = []
@@ -566,15 +677,18 @@ def recover_outputs(state: dict[str, Any], *, required: bool = False) -> list[Pa
     return copied
 
 
-def destroy_instance(state: dict[str, Any]) -> bool:
+def destroy_instance(
+    state: dict[str, Any], *, destroyed_status: str = "destroyed"
+) -> bool:
     instance_id = state.get("instance_id")
     if instance_id is None:
         return False
+    update_state(state, status="destroying")
     result = run_command(
         ["vastai", "destroy", "instance", str(instance_id), "--yes"], check=False
     )
     if result.returncode == 0:
-        update_state(state, status="destroyed", destroyed_at=utc_now())
+        update_state(state, status=destroyed_status, destroyed_at=utc_now())
         return True
     update_state(
         state,
@@ -582,6 +696,96 @@ def destroy_instance(state: dict[str, Any]) -> bool:
         destroy_error=(result.stderr or result.stdout).strip(),
     )
     return False
+
+
+def cleanup_hint(task_name: str) -> str:
+    return f"python scripts/remote/vast_route_benchmark.py cleanup {task_name} --destroy --yes"
+
+
+def launch_attempted(state: dict[str, Any]) -> bool:
+    """True once the detached benchmark may exist remotely (even if unacknowledged)."""
+    return bool(state.get("launch_attempted")) or state.get("remote_pid") is not None
+
+
+def missing_required_outputs(state: dict[str, Any], names: tuple[str, ...]) -> list[str]:
+    """Copy remote outputs and return the required local names that did not arrive."""
+    try:
+        copied = set(recover_outputs(state, required=True))
+    except Exception as exc:
+        print(f"Recovery failed: {exc}", file=sys.stderr)
+        copied = set()
+    local_dir = ARTIFACTS_DIR / str(state["task_name"])
+    return [name for name in names if local_dir / name not in copied]
+
+
+def complete_and_destroy(
+    state: dict[str, Any], target: SshTarget, config: VastRouteConfig, pid: int
+) -> int:
+    """Destroy the host only after a definitive successful exit and full recovery.
+
+    Every other outcome keeps the host and state so nothing is lost.
+    """
+    task = config.task_name
+    try:
+        exit_code = wait_for_remote_exit(
+            target,
+            str(state["exit_status_path"]),
+            pid,
+            timeout_seconds=config.timeout_seconds,
+            poll_seconds=max(1, config.checkpoint_interval_seconds),
+        )
+    except TimeoutError as exc:
+        update_state(state, wait_error=str(exc))
+        print(
+            f"{exc}; benchmark left running, host kept. Cleanup: {cleanup_hint(task)}",
+            file=sys.stderr,
+        )
+        return 1
+    except Exception as exc:  # unknown remote outcome: fail closed
+        update_state(state, status="failed_kept", error=str(exc))
+        print(f"{exc}; host kept. Cleanup: {cleanup_hint(task)}", file=sys.stderr)
+        return 1
+    state["remote_exit_status"] = exit_code
+    if exit_code != 0:
+        try:
+            recover_outputs(state, required=False)
+        except Exception as exc:
+            print(f"Recovery warning: {exc}", file=sys.stderr)
+        update_state(
+            state,
+            status="failed_kept",
+            error=f"remote benchmark exited with status {exit_code}",
+        )
+        print(
+            f"Benchmark failed with status {exit_code}; host kept. Cleanup: {cleanup_hint(task)}",
+            file=sys.stderr,
+        )
+        return 1
+    update_state(state, status="copying_artifacts")
+    missing = missing_required_outputs(state, COMPLETED_OUTPUTS)
+    local_dir = ARTIFACTS_DIR / task
+    if missing:
+        update_state(
+            state,
+            status="failed_kept",
+            error=f"required outputs not recovered: {', '.join(missing)}",
+        )
+        print(
+            f"Benchmark completed but outputs were not recovered ({', '.join(missing)}); "
+            f"host kept. Cleanup: {cleanup_hint(task)}",
+            file=sys.stderr,
+        )
+        return 1
+    if not destroy_instance(state):
+        print(
+            f"Benchmark completed but destroy failed; cleanup required: {cleanup_hint(task)}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"Benchmark completed, outputs recovered to {local_dir}, Vast instance destroyed: {task}"
+    )
+    return 0
 
 
 def config_from_args(args: argparse.Namespace) -> VastRouteConfig:
@@ -685,6 +889,7 @@ def handle_run(args: argparse.Namespace) -> int:
             f"State exists: {existing}; use recover/cleanup or choose another task"
         )
     require_commands(["vastai", "ssh", "scp", "tar"])
+    task_name = config.task_name
     state: dict[str, Any] | None = None
     try:
         offer_id, instance_id = allocate_instance(config)
@@ -705,16 +910,7 @@ def handle_run(args: argparse.Namespace) -> int:
         bootstrap_remote_project(target, config)
         update_state(state, status="provisioning")
         cpu_count, ram_mb = remote_preflight(target, config)
-        workers = derive_worker_count(
-            ram_mb,
-            cpu_count,
-            per_worker_ram_mb=config.per_worker_ram_mb,
-            reserved_ram_mb=config.reserved_ram_mb,
-            max_workers=config.max_workers,
-            explicit_workers=config.workers,
-        )
-        group_size = config.group_size or workers
-        validate_worker_overrides(workers, group_size)
+        workers, group_size = plan_workers(config, cpu_count, ram_mb)
         state.update(
             cpu_count=cpu_count,
             ram_mb=ram_mb,
@@ -727,19 +923,48 @@ def handle_run(args: argparse.Namespace) -> int:
         write_state(state)
         script = build_remote_script(config, workers=workers, group_size=group_size)
         upload_remote_script(target, config, script)
+        # From here the benchmark may run remotely even if acknowledgement is lost.
+        update_state(state, launch_attempted=True)
         pid = launch_remote_script(target, config)
         state["run"] = {"id": config.run_id, "status": "training_running", "pid": pid}
         update_state(
             state, status="training_running", remote_pid=pid, launched_at=utc_now()
         )
-        print(f"Vast CPU benchmark launched: {config.task_name}")
-        print(f"State: {state_path(config.task_name)}")
-        return 0
     except Exception as exc:  # preserve state for recover/cleanup
-        if state is not None:
-            update_state(state, status="failed_kept", error=str(exc))
         print(str(exc), file=sys.stderr)
+        if state is None:
+            return 1
+        update_state(state, status="failed_kept", error=str(exc))
+        if launch_attempted(state):
+            print(
+                f"Launch outcome unknown; benchmark may be running, host kept. "
+                f"Cleanup: {cleanup_hint(task_name)}",
+                file=sys.stderr,
+            )
+            return 1
+        if config.destroy:
+            # Nothing was launched, so the runner still owns the host.
+            if destroy_instance(state, destroyed_status="failed_destroyed"):
+                print(
+                    f"Launch failed; Vast instance destroyed: {task_name}",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"Launch failed and destroy failed; cleanup required: {cleanup_hint(task_name)}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"Launch failed; instance kept. Cleanup: {cleanup_hint(task_name)}",
+            file=sys.stderr,
+        )
         return 1
+    print(f"Vast CPU benchmark launched: {task_name}")
+    print(f"State: {state_path(task_name)}")
+    if not config.destroy:
+        return 0
+    return complete_and_destroy(state, target, config, pid)
 
 
 def handle_status(args: argparse.Namespace) -> int:
@@ -760,18 +985,105 @@ def handle_recover(args: argparse.Namespace) -> int:
     return 0
 
 
+def remote_path_exists(target: SshTarget, remote_path: str) -> bool:
+    """Definitively report remote existence; raise when SSH cannot tell."""
+    result = ssh(
+        target,
+        f"if [ -e {quote(remote_path)} ]; then echo present; else echo absent; fi",
+        check=False,
+    )
+    report = result.stdout.strip() if result.returncode == 0 else ""
+    if report == "present":
+        return True
+    if report == "absent":
+        return False
+    detail = report or (result.stderr or result.stdout).strip() or "no probe output"
+    raise RuntimeError(f"cannot determine whether {remote_path} exists: {detail}")
+
+
+def destroy_launched(state: dict[str, Any], task: str) -> int:
+    """Destroy a launched host only after a definitive exit and required recovery.
+
+    A successful run must yield checkpoint and final outputs. A failed run must
+    yield its log, plus every checkpoint/final output that exists remotely: S3
+    uploads are best-effort or may have failed, so the host copy may be the only one.
+    Running, unknown, or unrecovered outcomes keep the host.
+    """
+    target = ssh_target_from_state(state)
+    exit_status_path = state.get("exit_status_path")
+    if target is None or not exit_status_path:
+        print(
+            "Refusing destroy: launched task has no SSH endpoint or exit-status path; host kept",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        with lifecycle_deadline(EXIT_PROBE_TIMEOUT_SECONDS):
+            exit_code, detail = probe_remote_exit(
+                target, str(exit_status_path), state.get("remote_pid")
+            )
+    except Exception as exc:  # vanished or unreachable: fail closed
+        print(f"Refusing destroy: {exc}; host kept", file=sys.stderr)
+        return 1
+    if exit_code is None:
+        print(
+            f"Refusing destroy: remote benchmark unresolved ({detail}); host kept",
+            file=sys.stderr,
+        )
+        return 1
+    state["remote_exit_status"] = exit_code
+    if exit_code == 0:
+        required = COMPLETED_OUTPUTS
+    else:
+        present: list[str] = []
+        try:
+            with lifecycle_deadline(EXIT_PROBE_TIMEOUT_SECONDS):
+                for field, name in (
+                    ("checkpoint_path", "checkpoint.jsonl"),
+                    ("output_path", "final.json"),
+                ):
+                    if remote_path_exists(target, str(state[field])):
+                        present.append(name)
+        except Exception as exc:  # unknown output presence: fail closed
+            print(f"Refusing destroy: {exc}; host kept", file=sys.stderr)
+            return 1
+        required = (*FAILED_OUTPUTS, *present)
+    missing = missing_required_outputs(state, required)
+    if missing:
+        update_state(
+            state,
+            status="failed_kept",
+            error=f"required outputs not recovered: {', '.join(missing)}",
+        )
+        print(
+            f"Refusing destroy: required outputs not recovered ({', '.join(missing)}); host kept",
+            file=sys.stderr,
+        )
+        return 1
+    destroyed_status = "destroyed" if exit_code == 0 else "failed_destroyed"
+    if not destroy_instance(state, destroyed_status=destroyed_status):
+        print(f"Destroy failed; cleanup required for {task}", file=sys.stderr)
+        return 1
+    print(f"Vast instance destroyed after remote exit {exit_code}: {task}")
+    return 0
+
+
 def handle_cleanup(args: argparse.Namespace) -> int:
     state = load_state(args.task_name)
+    destroying = args.destroy and args.yes
+    if destroying and launch_attempted(state):
+        return destroy_launched(state, args.task_name)
     # Recovery is intentionally first and never implies destruction.
     try:
         recover_outputs(state, required=False)
     except Exception as exc:
         print(f"Recovery warning: {exc}", file=sys.stderr)
     command = f"vastai destroy instance {state.get('instance_id')} --yes"
-    if not (args.destroy and args.yes):
+    if not destroying:
         print(f"Destroy command: {command}")
         print("Not destroying without --destroy --yes")
         return 0
+    # Never launched: no benchmark outputs can exist, so the host is disposable.
     return 0 if destroy_instance(state) else 1
 
 
@@ -829,7 +1141,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--case-timeout-seconds", type=float, default=10.0)
     run.add_argument("--strict-service-full", action="store_true")
     run.add_argument("--timeout-seconds", type=int, default=1800)
-    run.add_argument("--destroy", action="store_true")
+    run.add_argument(
+        "--destroy",
+        action="store_true",
+        help="wait for the benchmark to finish, recover its outputs, then destroy "
+        "the host; failures and timeouts keep the host. Also destroys the host "
+        "if provisioning fails before launch",
+    )
     run.set_defaults(func=handle_run)
     for name, handler, help_text in (
         ("status", handle_status, "print persisted state"),

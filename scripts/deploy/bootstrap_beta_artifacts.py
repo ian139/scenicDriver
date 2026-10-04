@@ -4,7 +4,8 @@
 The manifest deliberately keeps the destination path and S3-relative ``source_key``
 separate.  The object key is ``<prefix>/<source_key>`` (with a single slash),
 where ``prefix`` comes from ``--s3-prefix``/``SCENIC_S3_PREFIX``.  Gzip sources
-are decompressed into a temporary file before the final digest and size check.
+are decompressed into a temporary file under the manifest's uncompressed size
+bound before the final digest and exact size check.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ import gzip
 import hashlib
 import json
 import os
-import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -205,7 +205,18 @@ def bootstrap(
                 materialized_name = str(materialized_path)
                 try:
                     with gzip.open(download_path, "rb") as source, materialized_path.open("wb") as target:
-                        shutil.copyfileobj(source, target, length=1024 * 1024)
+                        remaining = spec.size_bytes
+                        while True:
+                            chunk = source.read(min(1024 * 1024, remaining + 1))
+                            if not chunk:
+                                break
+                            if len(chunk) > remaining:
+                                raise ArtifactBootstrapError(
+                                    f"downloaded artifact {spec.name} exceeds manifest size "
+                                    f"of {spec.size_bytes} bytes during gzip expansion"
+                                )
+                            target.write(chunk)
+                            remaining -= len(chunk)
                 except (OSError, gzip.BadGzipFile) as exc:
                     raise ArtifactBootstrapError(f"downloaded artifact {spec.name} is not valid gzip: {exc}") from exc
                 candidate = materialized_path

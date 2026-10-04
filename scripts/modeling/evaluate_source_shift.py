@@ -1,5 +1,8 @@
 """
 Evaluate source shift using paired human benchmark and model predictions.
+Latest per-annotator decisions control image admission before aggregation.
+Scores must be finite and in [0, 10]; the frozen batch hash, exact old/new
+pairs, and at least 100 bootstrap iterations are required before gating.
 
 Example:
   uv run python scripts/modeling/evaluate_source_shift.py \
@@ -158,12 +161,22 @@ def validate_human_annotations(path: Path) -> tuple[pd.DataFrame, str]:
             f"annotations_csv must have exact 7 columns: {STRICT_HUMAN_COLUMNS}, got {list(df.columns)}"
         )
 
-    df["image_path"] = df["image_path"].astype(str).str.strip()
+    df["image_path"] = df["image_path"].fillna("").astype(str).str.strip()
+    df["annotator_id"] = df["annotator_id"].fillna("").astype(str).str.strip()
     df["scenic_human"] = pd.to_numeric(df["scenic_human"], errors="coerce")
     df["skip"] = df["skip"].map(_to_bool)
-
-    # Filter out skipped or missing human scores
-    valid = df[~df["skip"] & df["scenic_human"].notna()].copy()
+    df["_timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    df["_row_id"] = range(len(df))
+    identities = (
+        df["image_path"].ne("") & df["image_path"].ne("nan")
+        & df["annotator_id"].ne("") & df["annotator_id"].ne("nan")
+    )
+    latest = df.loc[identities].sort_values(
+        ["_timestamp", "skip", "_row_id"]
+    ).drop_duplicates(["image_path", "annotator_id"], keep="last")
+    unusable = latest["skip"] | ~latest["scenic_human"].between(0.0, 10.0)
+    excluded_paths = set(latest.loc[unusable, "image_path"])
+    valid = latest.loc[~latest["image_path"].isin(excluded_paths)].copy()
 
     # Aggregate by image_path (mean scenic_human across annotators)
     grouped = (
@@ -204,10 +217,11 @@ def validate_predictions_csv(path: Path, label: str) -> tuple[pd.DataFrame, str,
             f"{label} predictions CSV missing prediction score column (scenic_score/predicted_score)"
         )
 
-    df[path_col] = df[path_col].astype(str).str.strip()
+    df[path_col] = df[path_col].fillna("").astype(str).str.strip()
     df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
-
-    valid = df[df[score_col].notna()].copy()
+    if not df[score_col].between(0.0, 10.0).all():
+        raise ValueError(f"{label} prediction scores must be finite and in [0, 10]")
+    valid = df.copy()
 
     # Reject duplicate conflicting predictions for exact same path
     dups = valid.groupby(path_col)[score_col].agg(["min", "max", "count"]).reset_index()
@@ -352,6 +366,8 @@ def compute_bootstrap_ci(
     n_bootstrap: int = 1000,
     seed: int = 42,
 ) -> dict[str, dict[str, float]]:
+    if isinstance(n_bootstrap, bool) or not isinstance(n_bootstrap, int) or n_bootstrap < 100:
+        raise ValueError("n_bootstrap must be an integer >= 100")
     n = len(h_old)
     rng = np.random.RandomState(seed)
 
@@ -392,11 +408,15 @@ def evaluate_source_shift(
     max_abs_delta_bias: float = 1.0,
     strict: bool = False,
 ) -> dict[str, Any]:
+    if isinstance(n_bootstrap, bool) or not isinstance(n_bootstrap, int) or n_bootstrap < 100:
+        raise ValueError("n_bootstrap must be an integer >= 100")
     if not batch_summary_json.exists():
         raise FileNotFoundError(f"Batch summary JSON not found: {batch_summary_json}")
 
     summary_sha256 = sha256_file(batch_summary_json)
     summary_data = json.loads(batch_summary_json.read_text(encoding="utf-8"))
+    if not isinstance(summary_data, dict):
+        raise ValueError("Batch summary must be a JSON object")
 
     batch_csv_path = (
         batch_csv_override
@@ -410,7 +430,13 @@ def evaluate_source_shift(
     batch_csv_sha256 = sha256_file(batch_csv_path)
 
     expected_batch_sha = summary_data.get("output_batch_csv_sha256")
-    if expected_batch_sha and expected_batch_sha.lower() != batch_csv_sha256.lower():
+    if (
+        not isinstance(expected_batch_sha, str)
+        or len(expected_batch_sha) != 64
+        or any(char not in "0123456789abcdef" for char in expected_batch_sha.lower())
+    ):
+        raise ValueError("Batch summary requires a frozen output_batch_csv_sha256")
+    if expected_batch_sha.lower() != batch_csv_sha256.lower():
         raise ValueError(
             f"Batch CSV SHA-256 mismatch: expected {expected_batch_sha}, got {batch_csv_sha256}"
         )
@@ -423,7 +449,19 @@ def evaluate_source_shift(
             f"Batch CSV missing required columns: {sorted(missing_batch_cols)}"
         )
 
-    batch_df["image_path"] = batch_df["image_path"].astype(str).str.strip()
+    for column in required_batch_cols:
+        batch_df[column] = batch_df[column].fillna("").astype(str).str.strip()
+        if batch_df[column].eq("").any():
+            raise ValueError(f"Batch corrupted: empty {column} identity")
+    if batch_df.empty:
+        raise ValueError("Batch corrupted: no source-shift pairs")
+    if batch_df["blinded_id"].duplicated().any() or batch_df["image_path"].duplicated().any():
+        raise ValueError("Batch corrupted: blinded IDs and image paths must be unique")
+    for pair_id, rows in batch_df.groupby("pair_id"):
+        if len(rows) != 2 or sorted(rows["source_variant"]) != ["new", "old"]:
+            raise ValueError(
+                f"Batch corrupted: pair {pair_id} must contain exactly one old and one new row"
+            )
 
     # Load and validate human annotations
     ann_df, ann_sha256 = validate_human_annotations(annotations_csv)
@@ -500,10 +538,6 @@ def evaluate_source_shift(
         old_row = pair_rows[pair_rows["source_variant"] == "old"]
         new_row = pair_rows[pair_rows["source_variant"] == "new"]
 
-        if old_row.empty or new_row.empty:
-            raise ValueError(
-                f"Batch corrupted: pair {pair_id} does not contain both old and new rows"
-            )
 
         old_path = old_row["image_path"].iloc[0]
         new_path = new_row["image_path"].iloc[0]

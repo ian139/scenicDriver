@@ -5,7 +5,7 @@ Creates a standard ``data/processed/heuristic_runs/<run_name>/`` run containing
 
 * a prepared feature pool NPZ (``embeddings``/``vit_embeddings``,
   ``terrain_features``, ``class_logits``, ``row_indices``),
-* a row-aligned metadata CSV (``image_path``, ``region``, ``z``, ``x``, ``y``,
+* original-order candidate metadata CSV (``image_path``, ``region``, ``z``, ``x``, ``y``,
   ``lat``, ``lon``, ``class_id``, ``embedding_row_index``), and
 * a trained regression checkpoint (loaded via the canonical
   ``active_evaluation`` helpers).
@@ -15,9 +15,9 @@ never assigns train/val/test splits. It is NOT promotion-gate evaluation
 evidence and must not be used to evaluate or promote a candidate checkpoint.
 
 All inputs are hash-bound: dataset, metadata CSV and checkpoint SHA-256 values
-are validated before anything is written. Rows are aligned strictly by
-``embedding_row_index`` (the NPZ ``row_indices`` are required to be contiguous
-``0..n-1`` and the metadata must provide exactly one row per index). Output is
+are validated before anything is written. NPZ ``row_indices`` select original
+metadata row positions; each selected row's ``embedding_row_index`` must match
+its dense feature-array position. Sparse original indices are allowed. Output is
 published atomically via a sibling temporary directory, and pre-existing run
 directories are rejected so a failure can never leave a partially written run.
 """
@@ -209,17 +209,14 @@ def _load_feature_pool(dataset_path: Path) -> dict[str, Any]:
         raise ValueError("Dataset NPZ contains non-finite feature values (NaN or Inf)")
 
     ri = row_indices.astype(np.int64, copy=False)
-    if ri[0] != 0 or ri[-1] != n - 1 or not bool((np.diff(ri) == 1).all()):
-        raise ValueError(
-            "row_indices must be exactly contiguous 0..n-1 "
-            f"(got min {int(ri.min())}, max {int(ri.max())}, "
-            f"{len(np.unique(ri))} unique of {n})"
-        )
+    if np.any(ri < 0) or len(np.unique(ri)) != n:
+        raise ValueError("row_indices must contain unique non-negative original-row indices")
     return {
         "embeddings": embeddings,
         "terrain": terrain,
         "class_logits": class_logits,
         "n": n,
+        "row_indices": ri,
     }
 
 
@@ -241,12 +238,10 @@ def _parse_float_field(row: dict[str, str], name: str, path: Path) -> float:
         ) from None
 
 
-def _load_metadata(metadata_path: Path, n: int) -> list[dict[str, Any]]:
-    """Load metadata rows and strictly align them to NPZ rows by index.
-
-    Returns a list where position ``i`` corresponds to NPZ row ``i``. Each
-    ``embedding_row_index`` in ``0..n-1`` must appear exactly once.
-    """
+def _load_metadata(metadata_path: Path, row_indices: np.ndarray) -> list[dict[str, Any]]:
+    """Select original metadata rows and verify their dense feature positions."""
+    n = len(row_indices)
+    feature_positions = {int(original): feature for feature, original in enumerate(row_indices)}
     rows_by_index: dict[int, dict[str, Any]] = {}
     with open(metadata_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -257,17 +252,20 @@ def _load_metadata(metadata_path: Path, n: int) -> list[dict[str, Any]]:
             raise ValueError(
                 f"Metadata CSV {metadata_path} missing required columns: {missing}"
             )
-        for row in reader:
+        for original_index, row in enumerate(reader):
+            if original_index not in feature_positions:
+                continue
             idx = _parse_int_field(row, "embedding_row_index", metadata_path)
             if idx in rows_by_index:
                 raise ValueError(
                     f"Metadata CSV {metadata_path} has duplicate "
                     f"embedding_row_index {idx}"
                 )
-            if idx < 0 or idx >= n:
+            if idx != feature_positions[original_index]:
                 raise ValueError(
                     f"Metadata CSV {metadata_path} embedding_row_index {idx} "
-                    f"out of range 0..{n - 1}"
+                    f"does not match feature position {feature_positions[original_index]} "
+                    f"for original row {original_index}"
                 )
             image_path = str(row["image_path"]).strip()
             match = IMAGE_PATH_RE.match(image_path)
@@ -715,7 +713,7 @@ def export_heatmap_run(
             )
 
     pool = _load_feature_pool(ds_path)
-    rows = _load_metadata(meta_path, pool["n"])
+    rows = _load_metadata(meta_path, pool["row_indices"])
     zoom = _validate_coverage(rows, pool["n"])
     _validate_class_ids(rows, pool["class_logits"])
     identity_contract, man_sha, man_path = _resolve_identity_contract(

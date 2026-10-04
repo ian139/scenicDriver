@@ -156,6 +156,9 @@ def _write_complete_stage1(
         tmp_path / "feature_embeddings.npz",
         embeddings=np.ones((len(names), 2), dtype=np.float32),
         row_indices=np.arange(len(names), dtype=np.int64),
+        terrain_features=np.ones((len(names), 6), dtype=np.float32),
+        class_logits=np.zeros((len(names), 2), dtype=np.float32),
+        class_probs=np.full((len(names), 2), 0.5, dtype=np.float32),
     )
     checkpoint = tmp_path / "baseline.pt"
     checkpoint.write_bytes(b"checkpoint")
@@ -277,6 +280,7 @@ def _write_complete_stage1(
                     "scored_rows": len(names),
                     "missing_rows": 0,
                     "error_rows": 0,
+                    "unusable_rows": 0,
                 },
                 "source": {
                     "tile_manifest": {
@@ -347,6 +351,114 @@ def test_finalizer_fails_closed_for_incomplete_run(tmp_path) -> None:
     assert handoff["ready_for_stage2"] is False
     assert handoff["blockers"]
     assert (tmp_path / "stage1_handoff.json").exists()
+
+
+def _finalize_fixture(root: Path, inputs: dict[str, Path]) -> dict:
+    return finalize_stage1(
+        root, run_name="fixture", annotations_csv=inputs["annotations"],
+        mixed_labels_csv=inputs["mixed_labels"], benchmark_csv=inputs["benchmark"],
+        registry_path=inputs["registry"], checkpoint_path=inputs["checkpoint"],
+    )
+
+
+@pytest.mark.parametrize("corruption", ["missing", "nonfinite", "shape", "probabilities"])
+def test_finalizer_rejects_incomplete_consuming_arrays(tmp_path: Path, corruption: str) -> None:
+    inputs = _write_complete_stage1(tmp_path)
+    feature_path = tmp_path / "feature_embeddings.npz"
+    with np.load(feature_path, allow_pickle=False) as stored:
+        arrays = {key: stored[key] for key in stored.files}
+    if corruption == "missing":
+        del arrays["terrain_features"]
+    elif corruption == "nonfinite":
+        arrays["class_logits"][0, 0] = np.nan
+    elif corruption == "shape":
+        arrays["class_probs"] = np.ones((2, 2), dtype=np.float32)
+    else:
+        arrays["class_probs"][0] = [0.9, 0.9]
+    np.savez_compressed(feature_path, **arrays)
+    manifest_path = tmp_path / "scoring_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["artifacts"]["feature_embeddings.npz"]["sha256"] = sha256_file(feature_path)
+    manifest_path.write_text(json.dumps(manifest))
+    result = _finalize_fixture(tmp_path, inputs)
+    assert result["ready_for_stage2"] is False
+    assert result["readiness"]["scoring_valid"] is False
+
+
+@pytest.mark.parametrize("corruption", ["nan", "range", "duplicate", "unknown", "missing", "weak_mismatch"])
+def test_finalizer_rejects_invalid_mixed_label_contract(tmp_path: Path, corruption: str) -> None:
+    inputs = _write_complete_stage1(tmp_path)
+    mixed = pd.read_csv(inputs["mixed_labels"])
+    if corruption == "nan":
+        mixed.loc[0, "scenic_score"] = np.nan
+    elif corruption == "range":
+        mixed.loc[0, "scenic_score"] = 11
+    elif corruption == "duplicate":
+        mixed = pd.concat([mixed, mixed.iloc[:1]], ignore_index=True)
+    elif corruption == "unknown":
+        mixed.loc[0, "image_path"] = "unknown.png"
+    elif corruption == "missing":
+        mixed = mixed.iloc[1:]
+    else:
+        mixed.loc[0, "label_source"] = "heuristic"
+        annotations = pd.read_csv(inputs["annotations"])
+        annotations = annotations.iloc[1:]
+        annotations.to_csv(inputs["annotations"], index=False)
+    mixed.to_csv(inputs["mixed_labels"], index=False)
+    result = _finalize_fixture(tmp_path, inputs)
+    assert result["ready_for_stage2"] is False
+    assert any("mixed" in blocker for blocker in result["blockers"])
+
+
+@pytest.mark.parametrize("bad_exclusion", [None, "error", "eligibility", "reason"])
+def test_finalizer_admits_only_explicit_successful_exclusions(
+    tmp_path: Path, bad_exclusion: str | None,
+) -> None:
+    inputs = _write_complete_stage1(tmp_path)
+    candidate_path = tmp_path / "candidate_pool.csv"
+    candidate = pd.read_csv(candidate_path)
+    excluded = candidate.iloc[-1].copy()
+    excluded["image_path"] = "excluded.png"
+    excluded["source_identity"] = "fixture/excluded.png"
+    excluded["score_status"] = "unusable"
+    excluded["selector_eligible"] = False
+    excluded["embedding_row_index"] = -1
+    excluded["availability_state"] = "unusable"
+    excluded["water_filter_status"] = "excessive_water"
+    excluded["unusable_reason"] = "excessive_water"
+    excluded["error"] = None
+    if bad_exclusion == "error":
+        excluded["error"] = "feature extraction failed"
+    elif bad_exclusion == "eligibility":
+        excluded["selector_eligible"] = True
+    elif bad_exclusion == "reason":
+        excluded["unusable_reason"] = ""
+    candidate = pd.concat([candidate, excluded.to_frame().T], ignore_index=True)
+    candidate.to_csv(candidate_path, index=False)
+    tile_path = tmp_path / "tile_manifest.csv"
+    tiles = pd.read_csv(tile_path)
+    tile = tiles.iloc[-1].copy()
+    tile["x"] = 100
+    tiles = pd.concat([tiles, tile.to_frame().T], ignore_index=True)
+    tiles.to_csv(tile_path, index=False)
+    scoring_path = tmp_path / "scoring_manifest.json"
+    scoring = json.loads(scoring_path.read_text())
+    scoring["counts"].update({"manifest_rows": 4, "unusable_rows": 1})
+    scoring["artifacts"]["candidate_pool.csv"]["sha256"] = sha256_file(candidate_path)
+    scoring["source"]["tile_manifest"]["sha256"] = sha256_file(tile_path)
+    scoring_path.write_text(json.dumps(scoring))
+    for name in ("batch_manifest.json", "selection_diagnostics.json"):
+        path = tmp_path / name
+        data = json.loads(path.read_text())
+        data["candidate_input"]["sha256"] = sha256_file(candidate_path)
+        path.write_text(json.dumps(data))
+    result = _finalize_fixture(tmp_path, inputs)
+    assert result["ready_for_stage2"] is (bad_exclusion is None), result["blockers"]
+    if bad_exclusion is not None:
+        assert result["readiness"]["scoring_valid"] is False
+    filtered = pd.read_csv(tmp_path / "filtered_index.csv")
+    assert filtered["image_path"].tolist() == ["a.png", "b.png", "c.png"]
+    assert filtered["candidate_row_index"].tolist() == [0, 1, 2]
 
 
 def test_finalizer_accepts_complete_validated_fixture(tmp_path: Path) -> None:
@@ -681,7 +793,6 @@ def test_resolve_registry_checkpoint_prefers_existing_and_reports_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from src.active_learning.finalize import (
-        _registry_checkpoint_candidates,
         _resolve_registry_checkpoint,
     )
 
@@ -696,6 +807,9 @@ def test_resolve_registry_checkpoint_prefers_existing_and_reports_missing(
     reg_ckpt = registry_dir / "checkpoints" / f"{sha}.pt"
     reg_ckpt.parent.mkdir(parents=True)
     reg_ckpt.write_bytes(b"checkpoint")
+    cwd_shadow = tmp_path / "checkpoints" / f"{sha}.pt"
+    cwd_shadow.parent.mkdir()
+    cwd_shadow.write_bytes(b"unrelated checkpoint")
     assert (
         _resolve_registry_checkpoint(registry, f"checkpoints/{sha}.pt").resolve()
         == reg_ckpt.resolve()
@@ -710,13 +824,9 @@ def test_resolve_registry_checkpoint_prefers_existing_and_reports_missing(
         == model_ckpt.resolve()
     )
 
-    # Missing checkpoint returns None and exposes every tried candidate
+    # Missing checkpoint fails resolution rather than using a guessed path.
     missing_value = "checkpoints/missing.pt"
     assert _resolve_registry_checkpoint(registry, missing_value) is None
-    tried = _registry_checkpoint_candidates(registry, missing_value)
-    assert tried[0] == Path(missing_value)
-    assert tried[1] == reg_ckpt.parent / "missing.pt"
-    assert tried[2] == tmp_path / missing_value
 
 
 def test_validate_registry_resolves_registry_relative_checkpoint(
@@ -1660,3 +1770,172 @@ def test_finalizer_rejects_blank_control_test_image_path(tmp_path: Path) -> None
     assert handoff["ready_for_stage2"] is False
     assert handoff["control_benchmark_valid"] is False
     assert "control benchmark record lacks image_path" in handoff["blockers"]
+
+
+def _spaced_selection_candidates(count: int) -> pd.DataFrame:
+    """Keep tiles in distinct blocks with no spatial-exclusion ambiguity."""
+    return pd.DataFrame(
+        {
+            "image_path": [f"z14/{index * 64}_100.png" for index in range(count)],
+            "z": 14,
+            "x": np.arange(count) * 64,
+            "y": 100,
+            "region": "fixture",
+            "class_id": "forest",
+            "model_score": np.linspace(0, 1, count),
+            "satellite_present": True,
+            "terrain_present": True,
+            "selector_eligible": True,
+            "score_status": "scored",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "fresh_count, quota, expected_fresh, expected_overlap",
+    [(0, 2, 0, 2), (1, 2, 1, 2), (6, 2, 4, 2), (6, 0, 6, 0), (1, 99, 0, 6)],
+)
+def test_selection_overlap_quota_does_not_fill_missing_fresh_rows(
+    fresh_count: int, quota: int, expected_fresh: int, expected_overlap: int
+) -> None:
+    candidates = _spaced_selection_candidates(fresh_count + 8)
+    candidates["already_annotated"] = candidates.index >= fresh_count
+    selected = select_candidates(
+        candidates,
+        batch_size=6,
+        seed=13,
+        adjacency_radius=0,
+        qa_overlap_count=quota,
+    )
+    assert int(selected["is_qa_overlap"].sum()) == expected_overlap
+    assert int((~selected["is_qa_overlap"]).sum()) == expected_fresh
+    assert len(selected) == expected_fresh + expected_overlap
+    assert selected["image_path"].is_unique
+
+
+def test_selection_overlap_fraction_stays_bounded_when_fresh_rows_are_blocked() -> None:
+    candidates = _spaced_selection_candidates(10)
+    candidates.loc[1, ["image_path", "x"]] = ["z14/1_100.png", 1]
+    candidates["already_annotated"] = candidates.index >= 2
+    selected = select_candidates(
+        candidates,
+        batch_size=10,
+        seed=13,
+        adjacency_radius=1,
+        qa_overlap_fraction=0.2,
+        random_control_count=99,
+    )
+    assert int(selected["is_qa_overlap"].sum()) == 2
+    assert int(selected["is_random_control"].sum()) == 1
+    assert len(selected) == 3
+    diagnostics = selected.attrs["diagnostics"]
+    assert diagnostics["requested_random_controls"] == 8
+    assert diagnostics["requested_overlap_rows"] == 2
+
+
+@pytest.mark.parametrize(
+    "val_fraction, test_fraction, expected_splits",
+    [
+        (0.0, 0.0, {"train"}),
+        (0.0, 0.25, {"train", "test"}),
+        (0.25, 0.0, {"train", "val"}),
+        (0.25, 0.25, {"train", "val", "test"}),
+    ],
+)
+def test_geographic_splits_allocate_only_positive_fractions(
+    val_fraction: float, test_fraction: float, expected_splits: set[str]
+) -> None:
+    from src.active_learning.selection import build_geographic_splits
+
+    candidates = _spaced_selection_candidates(24)
+    splits = build_geographic_splits(
+        candidates,
+        seed=17,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+        adjacency_radius=0,
+    )
+    reordered = build_geographic_splits(
+        candidates.iloc[::-1],
+        seed=17,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+        adjacency_radius=0,
+    )
+    assert set(splits["split"]) == expected_splits
+    assert set(splits["image_path"]) == set(candidates["image_path"])
+    pd.testing.assert_frame_equal(splits, reordered)
+    assert audit_geographic_leakage(splits, adjacency_radius=0)["valid"]
+
+
+@pytest.mark.parametrize(
+    "ineligible_fields",
+    [
+        {"satellite_present": False},
+        {"terrain_present": False},
+        {"selector_eligible": False},
+        {"score_status": "error"},
+        {"availability_state": "unusable"},
+        {"effective_water_fraction": 0.6},
+        {"unusable_reason": "excessive_water"},
+        {"water_filter_status": "excessive_water"},
+    ],
+)
+def test_selection_keeps_eligible_physical_tile_alias(
+    ineligible_fields: dict[str, object],
+) -> None:
+    candidates = _spaced_selection_candidates(1)
+    healthy = candidates.iloc[0].to_dict()
+    healthy["image_path"] = "z-healthy.png"
+    unusable = {**healthy, "image_path": "a-unusable.png", **ineligible_fields}
+    candidates = pd.DataFrame([unusable, healthy])
+    selected = select_candidates(candidates, batch_size=2, seed=23)
+    reordered = select_candidates(candidates.iloc[::-1], batch_size=2, seed=23)
+    assert selected["image_path"].tolist() == ["z-healthy.png"]
+    assert selected["selector_eligible"].tolist() == [True]
+    pd.testing.assert_frame_equal(selected, reordered)
+
+
+def test_random_control_uses_full_pool_before_stratum_score_shortlist() -> None:
+    import hashlib
+
+    candidates = _spaced_selection_candidates(5_001)
+    candidates["region"] = [f"stratum-{index:05d}" for index in candidates.index]
+    candidates["uncertainty"] = np.arange(1, len(candidates) + 1, dtype=float)
+    seed = 31
+    # The smallest seeded draw is deliberately low-scoring and the last stratum.
+    # With more strata than shortlist slots, its representative is not shortlisted.
+    control_index = min(
+        candidates.index,
+        key=lambda index: hashlib.sha256(
+            f"{seed}\0random-control\0z14/{index * 64}/100".encode()
+        ).digest()[:8],
+    )
+    candidates.loc[control_index, "region"] = "zz-control-stratum"
+    candidates.loc[control_index, "uncertainty"] = 0.0
+    best_index = int(candidates["uncertainty"].idxmax())
+    kwargs = {
+        "batch_size": 2,
+        "seed": seed,
+        "adjacency_radius": 0,
+        "random_control_count": 1,
+        "weights": {
+            "disagreement": 0,
+            "uncertainty": 1,
+            "diversity": 0,
+            "geographic": 0,
+            "underrepresented": 0,
+            "score_band": 0,
+            "random_control": 0,
+        },
+    }
+    selected = select_candidates(candidates, **kwargs)
+    reordered = select_candidates(candidates.iloc[::-1], **kwargs)
+    assert selected["image_path"].tolist() == candidates.loc[
+        [control_index, best_index], "image_path"
+    ].tolist()
+    assert selected["is_random_control"].tolist() == [True, False]
+    assert selected["is_qa_overlap"].tolist() == [False, False]
+    assert selected.attrs["diagnostics"]["eligible_rows"] == 5_001
+    assert selected.attrs["diagnostics"]["shortlist_rows"] == 5_000
+    pd.testing.assert_frame_equal(selected, reordered)

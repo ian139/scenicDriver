@@ -7,7 +7,7 @@ import hashlib
 import json
 import math
 import re
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
 FORBIDDEN_QUERY_PARAMS = {
@@ -65,16 +65,20 @@ def validate_canonical_uri(uri: str) -> None:
                 )
 
 
-def validate_sha256(val: str | None, name: str) -> None:
-    """Validate optional 64-character lowercase hex SHA-256 string."""
-    if val is None:
-        return
-    if not isinstance(val, str) or isinstance(val, bool):
+def validate_sha256(val: str, name: str) -> None:
+    """Validate a mandatory 64-character lowercase hex SHA-256 string."""
+    if not isinstance(val, str):
         raise ValueError(f"{name} must be a hex string, got {type(val).__name__}")
     if len(val) != 64 or not re.match(r"^[0-9a-f]{64}$", val):
         raise ValueError(
             f"{name} must be a 64-character lowercase hex SHA-256 string, got {val!r}"
         )
+
+
+def validate_optional_sha256(val: str | None, name: str) -> None:
+    """Validate an optional SHA-256 string; ``None`` means the hash is unknown."""
+    if val is not None:
+        validate_sha256(val, name)
 
 
 def validate_acquisition_year(year: int | None) -> None:
@@ -153,9 +157,77 @@ def _sha256_dict(d: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_json_bytes(d)).hexdigest()
 
 
+class _FrozenJSONObject(Mapping[str, Any]):
+    """Read-only, hashable, picklable JSON object snapshot."""
+
+    __slots__ = ("_items",)
+
+    def __init__(self, items: dict[str, Any]) -> None:
+        self._items = items
+
+    def __getitem__(self, key: str) -> Any:
+        return self._items[key]
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __hash__(self) -> int:
+        return hash(tuple(sorted(self._items.items())))
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self._items!r})"
+
+
+def _freeze_json(value: Any, name: str) -> Any:
+    """Return a detached, deeply immutable snapshot of a JSON-compatible value.
+
+    Objects become read-only mappings and arrays become tuples, so identity
+    state held by frozen dataclasses cannot be mutated through aliases.
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} contains a non-finite number: {value!r}")
+        return value
+    if isinstance(value, Mapping):
+        frozen: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{name} object keys must be strings, got {key!r}")
+            frozen[key] = _freeze_json(item, f"{name}.{key}")
+        return _FrozenJSONObject(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(
+            _freeze_json(item, f"{name}[{index}]") for index, item in enumerate(value)
+        )
+    raise ValueError(
+        f"{name} must contain only JSON values, got {type(value).__name__}"
+    )
+
+
+def _thaw_json(value: Any) -> Any:
+    """Return a fresh mutable JSON structure (dict/list) for a frozen snapshot."""
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class SourceAsset:
-    """Immutable representation of a single remote or local source raster asset."""
+    """Immutable representation of a single remote or local source raster asset.
+
+    ``band_contract`` is captured at construction as a detached, deeply
+    read-only snapshot (objects as read-only mappings, arrays as tuples) and
+    ``native_resolution`` sequences as tuples, so later caller mutation of the
+    inputs cannot alter the asset's identity. ``to_dict`` returns fresh
+    canonical JSON structures (dicts/lists) on every call.
+    """
 
     provider: str
     collection: str
@@ -170,7 +242,7 @@ class SourceAsset:
     horizontal_crs: str | None = None
     vertical_datum: str | None = None
     native_resolution: float | tuple[float, ...] | None = None
-    band_contract: dict[str, Any] | list[Any] | str | None = None
+    band_contract: Mapping[str, Any] | tuple[Any, ...] | str | None = None
     nodata: int | float | None = None
     etag: str | None = None
     version_id: str | None = None
@@ -182,6 +254,20 @@ class SourceAsset:
     footprint_geojson: str | None = None
 
     def __post_init__(self) -> None:
+        if self.band_contract is not None and not isinstance(
+            self.band_contract, (Mapping, list, tuple, str)
+        ):
+            raise ValueError(
+                "band_contract must be a JSON object, array, string, or None, "
+                f"got {type(self.band_contract).__name__}"
+            )
+        object.__setattr__(
+            self, "band_contract", _freeze_json(self.band_contract, "band_contract")
+        )
+        if isinstance(self.native_resolution, list):
+            object.__setattr__(
+                self, "native_resolution", tuple(self.native_resolution)
+            )
         self.validate()
 
     def validate(self) -> None:
@@ -195,8 +281,8 @@ class SourceAsset:
         validate_canonical_uri(self.canonical_uri)
         validate_acquisition_year(self.acquisition_year)
         validate_resolution(self.native_resolution, "native_resolution")
-        validate_sha256(self.checksum_sha256, "checksum_sha256")
-        validate_sha256(self.metadata_sha256, "metadata_sha256")
+        validate_optional_sha256(self.checksum_sha256, "checksum_sha256")
+        validate_optional_sha256(self.metadata_sha256, "metadata_sha256")
         validate_footprint_geojson(self.footprint_geojson)
         if self.object_size_bytes is not None and (
             isinstance(self.object_size_bytes, bool)
@@ -232,7 +318,7 @@ class SourceAsset:
             "native_resolution": list(self.native_resolution)
             if isinstance(self.native_resolution, tuple)
             else self.native_resolution,
-            "band_contract": self.band_contract,
+            "band_contract": _thaw_json(self.band_contract),
             "nodata": self.nodata,
             "etag": self.etag,
             "version_id": self.version_id,
@@ -254,10 +340,7 @@ class SourceAsset:
             raise ValueError(
                 f"Unknown extra fields for {cls.__name__}: {sorted(extra)}"
             )
-        data_copy = dict(data)
-        if isinstance(data_copy.get("native_resolution"), list):
-            data_copy["native_resolution"] = tuple(data_copy["native_resolution"])
-        return cls(**data_copy)
+        return cls(**data)
 
     def sha256(self) -> str:
         return _sha256_dict(self.to_dict())

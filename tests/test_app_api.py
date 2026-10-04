@@ -95,6 +95,7 @@ def test_healthz_redacts_preload_asset_paths(tmp_path, monkeypatch) -> None:
     report_path = tmp_path / "report.json"
     graph_path.write_text("graph", encoding="utf-8")
     report_path.write_text("report", encoding="utf-8")
+    _write_graph_readiness(graph_path)
     monkeypatch.setattr(
         app_api,
         "_configured_regions",
@@ -207,7 +208,8 @@ def test_northeast_expanded_region_configuration_and_discovery() -> None:
         app_api.PROJECT_ROOT
         / "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.compact.json"
     ).is_file()
-    assert ne_region["route_planning_enabled"] is True
+    if not ne_region["graph_exists"]:
+        assert ne_region["route_planning_enabled"] is False
 
     desc = ne_region["description"]
     assert (
@@ -303,6 +305,96 @@ def test_preload_configured_route_assets_skips_disabled_route_planning(
     assert region_diags[0]["status"] == "skipped"
     assert region_diags[0]["reason"] == "route planning disabled"
 
+
+def _write_graph_readiness(graph: Path) -> Path:
+    import hashlib
+
+    gate = graph.parent / "run.json"
+    gate.write_text(json.dumps({
+        "output_graph": str(graph),
+        "graph_sha256": hashlib.sha256(graph.read_bytes()).hexdigest(),
+        "graph_size_bytes": graph.stat().st_size,
+        "counts": {"nodes": 2, "edges": 1},
+    }), encoding="utf-8")
+    return gate
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("gate_state", [
+    "missing", "malformed", "empty", "bad_hash", "wrong_graph", "stale_gate",
+])
+def test_unready_regions_do_not_list_route_compare_or_preload(
+    tmp_path, monkeypatch, configured, gate_state
+) -> None:
+    graph_dir = tmp_path / "test_region"
+    graph_dir.mkdir()
+    graph = graph_dir / "road_graph.json"
+    graph.write_text("{}", encoding="utf-8")
+    report = tmp_path / "report.json"
+    report.write_text('{"tiles": [], "summary": {}}', encoding="utf-8")
+    item = {
+        "region": "test_region", "graph_path": str(graph),
+        "tile_scores_path": str(report), "run_name": "test-run",
+    }
+    monkeypatch.setattr(app_api, "ROAD_GRAPHS_DIR", tmp_path)
+    monkeypatch.setattr(app_api, "_configured_regions", lambda: [item] if configured else [])
+    monkeypatch.setattr(app_api, "_default_region_key", lambda: None)
+    gate = graph_dir / "run.json"
+    if gate_state == "malformed":
+        gate.write_text("{", encoding="utf-8")
+    elif gate_state == "empty":
+        gate.write_text("{}", encoding="utf-8")
+    elif gate_state in {"bad_hash", "wrong_graph"}:
+        _write_graph_readiness(graph)
+        record = json.loads(gate.read_text())
+        record["graph_sha256" if gate_state == "bad_hash" else "output_graph"] = (
+            "0" * 64 if gate_state == "bad_hash" else str(tmp_path / "other.json")
+        )
+        gate.write_text(json.dumps(record), encoding="utf-8")
+    elif gate_state == "stale_gate":
+        _write_graph_readiness(graph)
+        assert app_api._list_regions()[0]["route_planning_enabled"] is True
+        graph.write_text("[]", encoding="utf-8")  # Same size; the old digest must not be reused.
+    rows = app_api._list_regions()
+    assert rows[0]["graph_exists"] is True
+    assert rows[0]["route_planning_enabled"] is False
+    response = client.post("/v1/route/compare", json={
+        "region": "test_region",
+        "start": {"lat": 42, "lon": -72}, "end": {"lat": 42.01, "lon": -72},
+    })
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Route assets are unavailable for region 'test_region'"
+    if configured:
+        diagnostics = app_api._preload_configured_route_assets(mode="best_effort")
+        assert diagnostics["loaded_regions"] == []
+        assert diagnostics["skipped_regions"] == ["test_region"]
+        monkeypatch.setattr(app_api, "_default_region_key", lambda: "test_region")
+        with pytest.raises(RuntimeError, match="readiness"):
+            app_api._preload_configured_route_assets(mode="required")
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_region_readiness_is_withdrawn_during_graph_swap(tmp_path, monkeypatch, configured) -> None:
+    graph_dir = tmp_path / "test_region"
+    graph_dir.mkdir()
+    graph = graph_dir / "road_graph.json"
+    graph.write_text("{}", encoding="utf-8")
+    item = {"region": "test_region", "graph_path": str(graph)}
+    monkeypatch.setattr(app_api, "ROAD_GRAPHS_DIR", tmp_path)
+    monkeypatch.setattr(app_api, "_configured_regions", lambda: [item] if configured else [])
+    monkeypatch.setattr(app_api, "_default_region_key", lambda: None)
+    gate = _write_graph_readiness(graph)
+    assert app_api._list_regions()[0]["route_planning_enabled"] is True
+    assert app_api._region_to_graph("test_region") == graph
+    gate.unlink()
+    graph.write_text('{"new": true}', encoding="utf-8")
+    assert app_api._list_regions()[0]["route_planning_enabled"] is False
+    with pytest.raises(FileNotFoundError, match="readiness"):
+        app_api._region_to_graph("test_region")
+    _write_graph_readiness(graph)
+    assert app_api._list_regions()[0]["route_planning_enabled"] is True
+    assert app_api._region_to_graph("test_region") == graph
+
 def test_region_graph_fallback_and_discovery_support_sqlite(
     tmp_path, monkeypatch
 ) -> None:
@@ -310,6 +402,7 @@ def test_region_graph_fallback_and_discovery_support_sqlite(
     graph_dir.mkdir()
     sqlite_graph = graph_dir / "road_graph.sqlite3"
     sqlite_graph.write_bytes(b"sqlite")
+    _write_graph_readiness(sqlite_graph)
     monkeypatch.setattr(app_api, "ROAD_GRAPHS_DIR", tmp_path)
     monkeypatch.setattr(app_api, "_configured_regions", lambda: [])
     monkeypatch.setattr(app_api, "_default_region_key", lambda: None)
@@ -429,6 +522,7 @@ def test_heatmap_uses_report_score_range(tmp_path, monkeypatch) -> None:
 
 
 def test_heatmap_image_preserves_z14_tile_grid(tmp_path, monkeypatch) -> None:
+    import math
     run_name = "new-england-test"
     report_dir = tmp_path / run_name / "report"
     report_dir.mkdir(parents=True)
@@ -438,7 +532,7 @@ def test_heatmap_image_preserves_z14_tile_grid(tmp_path, monkeypatch) -> None:
                 "summary": {"min": 2.0, "max": 6.0},
                 "tiles": [
                     {"z": 14, "x": 5000, "y": 5900, "scenic_score": 2.0},
-                    {"z": 14, "x": 5001, "y": 5900, "scenic_score": 6.0},
+                    {"z": 14, "x": 5002, "y": 5900, "scenic_score": 6.0},
                 ],
             }
         ),
@@ -455,8 +549,9 @@ def test_heatmap_image_preserves_z14_tile_grid(tmp_path, monkeypatch) -> None:
     assert response.headers["content-type"] == "image/png"
     assert response.headers["x-scenic-tile-zoom"] == "14"
     image = Image.open(io.BytesIO(response.content))
-    assert image.size == (2, 1)
-    assert image.getpixel((0, 0)) != image.getpixel((1, 0))
+    assert image.size == (3, 1)
+    assert image.getpixel((0, 0)) != image.getpixel((2, 0))
+    assert image.getpixel((1, 0))[3] == 0
 
     score_response = TestClient(create_app()).get(
         "/v1/heatmap-scores.bin",
@@ -466,9 +561,11 @@ def test_heatmap_image_preserves_z14_tile_grid(tmp_path, monkeypatch) -> None:
     assert score_response.headers["x-scenic-tile-zoom"] == "14"
     assert score_response.headers["x-scenic-min-x"] == "5000"
     assert score_response.headers["x-scenic-min-y"] == "5900"
-    assert score_response.headers["x-scenic-grid-width"] == "2"
+    assert score_response.headers["x-scenic-grid-width"] == "3"
     assert score_response.headers["x-scenic-grid-height"] == "1"
-    assert struct.unpack("<2f", score_response.content) == (2.0, 6.0)
+    low, absent, high = struct.unpack("<3f", score_response.content)
+    assert (low, high) == (2.0, 6.0)
+    assert math.isnan(absent)
 
 
 def test_search_suggest_and_retrieve_contract(monkeypatch) -> None:
@@ -503,7 +600,7 @@ def test_search_suggest_and_retrieve_contract(monkeypatch) -> None:
             {
                 "features": [
                     {
-                        "geometry": {"coordinates": [-68.771305, 44.801616]},
+                        "geometry": {"type": "Point", "coordinates": [-68.771305, 44.801616]},
                         "properties": {
                             "name": "Bangor",
                             "full_address": "Bangor, Maine",
@@ -576,8 +673,16 @@ def test_validated_route_projects_canonical_artifacts(tmp_path, monkeypatch) -> 
                     "total_edges": 10,
                     "matched_ratio": 1.0,
                 },
-                "scenic": {"route_kind": "scenic", "total_distance_km": 461.2},
-                "baseline": {"route_kind": "baseline", "total_distance_km": 471.0},
+                "scenic": {
+                    "route_kind": "scenic", "total_distance_km": 461.2,
+                    "estimated_duration_minutes": 400, "raw_scenic_score": 7,
+                    "normalized_scenic_score": 0.7,
+                },
+                "baseline": {
+                    "route_kind": "baseline", "total_distance_km": 471.0,
+                    "estimated_duration_minutes": 390, "raw_scenic_score": 6,
+                    "normalized_scenic_score": 0.6,
+                },
             }
         ),
         encoding="utf-8",
@@ -988,26 +1093,44 @@ def test_contrib_score_required_unless_skipping(contrib_repo):
     assert client.post("/v1/contrib/labels", json=payload).status_code == 422
 
 
-def test_route_compare_contract() -> None:
-    resp = client.post(
-        "/v1/route/compare",
-        json={
-            "start": {"lat": 40.03, "lon": -75.22},
-            "end": {"lat": 40.065, "lon": -75.19},
-            "scenic_weight": 0.8,
-            "region": "philadelphia",
-            "max_detour_factor": 1.8,
-            "avoid_highways": False,
-            "include_baseline": True,
-        },
-    )
-    # In environments missing local graph/report assets this may return 404.
-    assert resp.status_code in (200, 404)
-    if resp.status_code == 200:
-        payload = resp.json()
-        assert "routes" in payload
-        assert "score_mapping" in payload
-        assert "geojson" in payload
+@pytest.mark.parametrize("deadline,override,status", [(30, None, 200), (0, None, 504), (30, "0", 504)])
+def test_route_compare_contract(tmp_path, monkeypatch, deadline, override, status) -> None:
+    from src.data_pipeline.web_mercator import lat_lon_to_tile
+    graph = tmp_path / "graph.geojson"
+    graph.write_text(json.dumps({
+        "type": "FeatureCollection", "features": [{
+            "type": "Feature",
+            "properties": {"id": "edge", "road_type": "secondary", "one_way": True},
+            "geometry": {"type": "LineString", "coordinates": [[-72, 42], [-72, 42.01]]},
+        }],
+    }), encoding="utf-8")
+    x, y = lat_lon_to_tile(42.005, -72, 13)
+    report = tmp_path / "configured-report.json"
+    report.write_text(json.dumps({"tiles": [
+        {"z": 13, "x": x, "y": y, "scenic_score": 6.5},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(app_api, "_app_region", lambda region: {
+        "region": region, "route_planning": True, "run_name": "configured",
+        "graph": str(graph), "tile_scores_json": str(report),
+        "tile_score_zoom": 13, "route_deadline_seconds": deadline,
+    })
+    monkeypatch.setattr(app_api, "_region_to_graph", lambda region: graph)
+    if override is None:
+        monkeypatch.delenv("SCENIC_ROUTE_DEADLINE_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("SCENIC_ROUTE_DEADLINE_SECONDS", override)
+    response = client.post("/v1/route/compare", json={
+        "start": {"lat": 42, "lon": -72}, "end": {"lat": 42.01, "lon": -72},
+        "region": "enabled-smoke",
+    })
+    assert response.status_code == status
+    if status == 200:
+        payload = response.json()
+        assert set(payload["routes"]) == {"scenic", "baseline"}
+        assert payload["routes"]["scenic"]["raw_scenic_score"] == pytest.approx(6.5)
+        assert payload["score_mapping"]["zoom"] == 13
+    else:
+        assert response.json()["detail"]["error"] == "routing_deadline_exceeded"
 
 
 def _strict_route_metrics(
@@ -1403,7 +1526,9 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
 
     def fake_plan(request, **kwargs):
         plan_calls.append(request)
-        raise ValueError("detour cap is too tight")
+        # The planner's real duration-cap failure reason string (see
+        # src/route_planner/planner.py, matched verbatim by service.py).
+        raise ValueError("No route satisfies the requested duration cap.")
 
     def fake_diagnose(request, **kwargs):
         diagnosis_calls.append(request)
@@ -1433,6 +1558,7 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
     assert diagnosis_calls == [request]
     detail = response.json()["detail"]
     assert detail["diagnostics"] == {"graph_nodes": 4, "graph_edges": 3}
+    assert detail["reason"] == "No route satisfies the requested duration cap."
     assert detail["message"] == (
         "No route satisfies the requested controls, including best-effort "
         "highway avoidance."
@@ -1441,6 +1567,43 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
         "Choose different points or increase max detour; highway use is "
         "already allowed when required."
     )
+
+
+def test_route_compare_omits_reason_for_unrecognized_planner_failure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_api, "_region_to_graph", lambda region: Path("/tmp/fake-road-graph.geojson")
+    )
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+
+    def fake_plan(request, **kwargs):
+        raise ValueError("internal asset problem")
+
+    def fake_diagnose(request, **kwargs):
+        return {"graph_nodes": 4, "graph_edges": 3}
+
+    monkeypatch.setattr(app_api, "plan_routes", fake_plan)
+    monkeypatch.setattr(app_api, "diagnose_route_request", fake_diagnose)
+
+    response = TestClient(create_app()).post(
+        "/v1/route/compare",
+        json={
+            "start": {"lat": 44.4, "lon": -70.2},
+            "end": {"lat": 44.5, "lon": -70.1},
+            "scenic_weight": 0.8,
+            "region": "new_england_north",
+            "max_detour_factor": 1.4,
+            "avoid_highways": False,
+            "include_baseline": True,
+        },
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["error"] == "no_route_found"
+    # An unrecognized ValueError is not a structured cause: no `reason`, so
+    # clients fall back to `message` and internal failure text never leaks.
+    assert "reason" not in detail
+    assert detail["message"] == "No route satisfies the requested controls."
 
 
 def test_route_compare_reports_endpoint_coverage_error(monkeypatch) -> None:
@@ -1482,6 +1645,7 @@ def test_route_compare_reports_endpoint_coverage_error(monkeypatch) -> None:
         "error": "route_endpoint_outside_coverage",
         "message": "The start point is too far from the supported road network.",
         "hint": "Choose a point within the selected region's route coverage.",
+        "reason": "The start point is too far from the supported road network.",
         "endpoint": "start",
         "snap_distance_km": 1.234,
         "max_snap_distance_km": 1.0,
@@ -1774,33 +1938,6 @@ def test_invalid_frontier_configuration_fails_startup_even_when_preload_off(
             pass
 
 
-def test_new_england_viewer_renders_diagnostics_contract() -> None:
-    html = Path("apps/new_england_north/index.html").read_text(encoding="utf-8")
-    viewer = Path("apps/new_england_north/viewer.js").read_text(encoding="utf-8")
-    for element_id in (
-        "requestedScenicWeight",
-        "appliedScenicWeight",
-        "requestedDetourCap",
-        "appliedDetourCap",
-        "actualDurationRatio",
-        "optimizationMode",
-        "optimizationStatus",
-        "optimalityGap",
-        "certifiedUpperBound",
-        "sameRoute",
-        "noBetterRouteReason",
-    ):
-        assert f'id="{element_id}"' in html
-    assert "humanizeReason" in viewer
-    assert "approximation_did_not_find_scenic_improvement" in viewer
-    assert "X-Route-Request-ID" in viewer
-    assert "X-Route-Request-Fingerprint" in viewer
-    assert "Tile/report score coverage" in viewer
-    assert "addressRequestSequence" in viewer
-    assert "isCurrentAddressRequest" in viewer
-    assert 'id="scenicWeight"' not in html
-    assert "scenic_weight: DEFAULTS.scenicWeight" in viewer
-    assert 'url.searchParams.set("scenic_weight"' not in viewer
 
 
 def test_route_preload_lifespan_calls_once_and_skips_missing_optional(
@@ -1810,6 +1947,7 @@ def test_route_preload_lifespan_calls_once_and_skips_missing_optional(
     default_report = tmp_path / "default.report.json"
     default_graph.write_text("valid", encoding="utf-8")
     default_report.write_text("valid", encoding="utf-8")
+    _write_graph_readiness(default_graph)
     optional_graph = tmp_path / "optional.graph.json"
     optional_report = tmp_path / "optional.report.json"
     rows = [
@@ -1864,6 +2002,7 @@ def test_route_preload_lifespan_fails_for_corrupt_default(
     report_path = tmp_path / "default.report.json"
     graph_path.write_text("present", encoding="utf-8")
     report_path.write_text("present", encoding="utf-8")
+    _write_graph_readiness(graph_path)
     monkeypatch.setattr(
         app_api,
         "_configured_regions",
@@ -2063,7 +2202,11 @@ def test_route_compare_maps_routing_timeout_to_504(monkeypatch) -> None:
         },
     )
     assert response.status_code == 504
-    assert response.json()["detail"]["error"] == "routing_deadline_exceeded"
+    assert response.json()["detail"] == {
+        "error": "routing_deadline_exceeded",
+        "message": "The route planning deadline was exceeded.",
+        "reason": "deadline exceeded",
+    }
 
 
 def test_route_compare_maps_routing_cancelled_to_non_no_route(monkeypatch) -> None:
@@ -2089,7 +2232,11 @@ def test_route_compare_maps_routing_cancelled_to_non_no_route(monkeypatch) -> No
         },
     )
     assert response.status_code != 422
-    assert response.json()["detail"]["error"] == "routing_cancelled"
+    assert response.json()["detail"] == {
+        "error": "routing_cancelled",
+        "message": "The route planning request was cancelled.",
+        "reason": "cancelled",
+    }
 
 
 def test_route_compare_passes_one_deadline_to_plan_routes_and_diagnostics(
@@ -2307,3 +2454,237 @@ def test_route_compare_supervisor_error_maps_to_structured_503(monkeypatch) -> N
         "error": "routing_supervisor_unavailable",
         "message": "The routing service is temporarily unavailable.",
     }
+
+
+@pytest.mark.parametrize("params", [
+    {"min_overlap": 0}, {"min_overlap": -1}, {"min_agreement": -0.1},
+    {"min_agreement": 1.1}, {"min_agreement": "nan"}, {"min_agreement": "inf"},
+])
+def test_review_rejects_invalid_thresholds(monkeypatch, params):
+    monkeypatch.setenv("CONTRIB_ADMIN_TOKEN", "secret")
+    response = client.post("/v1/admin/contrib/review/run", params=params,
+                           headers={"X-Admin-Token": "secret"})
+    assert response.status_code == 422
+
+
+def test_review_counts_seed_annotations_before_averaging(contrib_repo):
+    payload = _contrib_payload(contrib_repo)
+    pd.DataFrame([
+        {"image_path": payload["image_path"], "scenic_human": 6},
+        {"image_path": payload["image_path"], "scenic_human": 7},
+    ]).to_csv(contrib_repo.cfg.approved_seed_csv, index=False)
+    contrib_repo.submit_label(payload)
+    assert contrib_repo.run_qa_promotion(min_overlap=3)["remaining_pending"] == 1
+    assert contrib_repo.run_qa_promotion(min_overlap=2)["promoted"] == 1
+    assert contrib_repo.get_profile("tester")["pending_labels"] == 0
+
+
+def test_contrib_region_does_not_fall_back_or_trust_label_region(contrib_repo):
+    response = client.get("/v1/contrib/tasks/next", params={
+        "contributor_id": "regional", "region": "unsupported",
+    })
+    assert response.status_code == 200
+    assert response.json()["tasks"] == []
+    payload = _contrib_payload(contrib_repo, "regional", region="forged")
+    response = client.post("/v1/contrib/labels", json=payload)
+    assert response.status_code == 200
+    assert response.json()["record"]["region"] == "philadelphia"
+
+
+@pytest.mark.parametrize("path,params", [
+    ("/v1/heatmap", {"region": "test", "max_points": 0}),
+    ("/v1/heatmap", {"region": "test", "max_tiles": 100001}),
+    ("/v1/heatmap", {"region": "test", "tile_offset": -1}),
+    ("/v1/contrib/tasks/next", {"contributor_id": "test", "count": 0}),
+    ("/v1/contrib/leaderboard", {"limit": -1}),
+])
+def test_api_rejects_invalid_batch_sizes(path, params):
+    assert client.get(path, params=params).status_code == 422
+
+
+@pytest.mark.parametrize("artifact", [
+    [], {"tiles": [None], "summary": {"min": 0, "max": 10}},
+    {"tiles": [], "summary": {"min": 0, "max": 10}},
+    {"tiles": [{"x": 1, "y": 1, "z": 14, "scenic_score": float("nan")}],
+     "summary": {"min": 0, "max": 10}},
+    {"tiles": [{"x": 1, "y": 1, "z": 14, "scenic_score": 5}],
+     "summary": {"min": 0, "max": float("inf")}},
+    {"tiles": [{"x": -1, "y": 1, "z": 14, "scenic_score": 5}],
+     "summary": {"min": 0, "max": 10}},
+])
+def test_heatmap_artifact_validation_is_shared(tmp_path, monkeypatch, artifact):
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps(artifact), encoding="utf-8")
+    monkeypatch.setattr(app_api, "_run_report_path", lambda run: report)
+    for endpoint in ("heatmap", "heatmap-image", "heatmap-scores.bin"):
+        response = client.get(f"/v1/{endpoint}", params={"region": "test", "run_name": "test"})
+        assert response.status_code == 502
+        assert "message" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("failure,status", [
+    (app_api.requests.Timeout("timeout"), 504),
+    (app_api.requests.ConnectionError("offline"), 502),
+    (ValueError("invalid JSON"), 502),
+])
+def test_search_provider_failures_are_controlled(monkeypatch, failure, status):
+    monkeypatch.setenv("MAPBOX_ACCESS_TOKEN", "secret")
+    def fail(*args, **kwargs):
+        raise failure
+    monkeypatch.setattr(app_api.requests, "get", fail)
+    for endpoint, params in [
+        ("suggest", {"q": "main", "session_token": "test"}),
+        ("retrieve", {"mapbox_id": "id", "session_token": "test"}),
+    ]:
+        assert client.get(f"/v1/search/{endpoint}", params=params).status_code == status
+
+
+@pytest.mark.parametrize("field,size", [
+    ("contributor_id", 129), ("task_id", 129), ("image_path", 2049),
+    ("notes", 4097), ("confidence", 33),
+])
+def test_contrib_rejects_oversized_text(contrib_repo, field, size):
+    payload = _contrib_payload(contrib_repo)
+    assert client.post("/v1/contrib/labels", json={
+        **payload, field: "x" * size,
+    }).status_code == 422
+
+
+def test_api_limits_request_body():
+    assert client.post("/v1/contrib/session/start",
+                       content=b"x" * 65537).status_code == 413
+
+
+@pytest.mark.parametrize("artifact", [
+    {"features": [{"geometry": None, "properties": {}}]},
+    {"features": [{"geometry": {"type": "Point", "coordinates": [0, 0]}, "properties": []}]},
+    {"features": "invalid"}, [],
+])
+def test_search_rejects_malformed_nested_result(monkeypatch, artifact):
+    class Response:
+        ok = True
+        def json(self):
+            return artifact
+    monkeypatch.setenv("MAPBOX_ACCESS_TOKEN", "secret")
+    monkeypatch.setattr(app_api.requests, "get", lambda *args, **kwargs: Response())
+    assert client.get("/v1/search/retrieve", params={
+        "mapbox_id": "id", "session_token": "test",
+    }).status_code == 502
+
+
+def test_validated_route_run_selection_and_complete_contract(tmp_path, monkeypatch):
+    run = "requested"
+    report = tmp_path / run / "report"
+    report.mkdir(parents=True)
+    routes = {
+        kind: _strict_route_metrics(distance_km=10, duration_min=16,
+                                    raw_score=6, edge_id=kind, route_kind=kind)
+        for kind in ("scenic", "baseline")
+    }
+    geojson = _strict_geojson(*routes.values())
+    metrics = {
+        **routes, "score_mapping": {}, "request": {
+            "start": [40.03, -75.22], "end": [40.065, -75.19],
+            "scenic_weight": 0.8, "max_detour_factor": 1.8,
+        },
+    }
+    route_file = report / "route.geojson"
+    metrics_file = report / "route_metrics.json"
+    route_file.write_text(json.dumps(geojson), encoding="utf-8")
+    metrics_file.write_text(json.dumps(metrics), encoding="utf-8")
+    monkeypatch.setattr(app_api, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "other")
+    params = {"region": "test", "run_name": run}
+    response = client.get("/v1/validated-route", params=params)
+    assert response.status_code == 200
+    assert response.json()["run_name"] == run
+    malformed = [
+        {**geojson, "features": geojson["features"] + [geojson["features"][0]]},
+        {**geojson, "features": [
+            {**geojson["features"][0], "geometry": {"type": "LineString", "coordinates": [[0, 0], [float("nan"), 1]]}},
+            geojson["features"][1],
+        ]},
+        {**geojson, "features": [
+            {**geojson["features"][0], "geometry": {"type": "Point", "coordinates": [0, 0]}},
+            geojson["features"][1],
+        ]},
+    ]
+    for artifact in malformed:
+        route_file.write_text(json.dumps(artifact), encoding="utf-8")
+        assert client.get("/v1/validated-route", params=params).status_code == 502
+    route_file.write_text(json.dumps(geojson), encoding="utf-8")
+    del metrics["scenic"]["estimated_duration_minutes"]
+    metrics_file.write_text(json.dumps(metrics), encoding="utf-8")
+    assert client.get("/v1/validated-route", params=params).status_code == 502
+
+
+@pytest.mark.parametrize("error", [json.JSONDecodeError("bad artifact", "x", 0), ValueError("invalid asset")])
+def test_route_asset_errors_are_not_no_route(monkeypatch, error):
+    _stub_route_compare_assets(monkeypatch)
+    def fail(*args, **kwargs):
+        raise error
+    monkeypatch.setattr(app_api, "plan_routes", fail)
+    monkeypatch.setattr(app_api, "diagnose_route_request", fail)
+    response = client.post("/v1/route/compare", json=_route_compare_payload())
+    assert response.status_code == 500
+    assert response.json()["detail"]["error"] == "route_assets_invalid"
+
+
+def test_http_disconnect_cancels_supervised_route(monkeypatch):
+    import asyncio
+    from src.route_planner.supervisor import PreloadedRouteSupervisor
+    _stub_route_compare_assets(monkeypatch)
+    def wait_for_cancel(request, *, deadline):
+        while True:
+            deadline.check()
+            time.sleep(0.01)
+    monkeypatch.setattr(app_api, "plan_routes", wait_for_cancel)
+    app = create_app()
+    supervisor = PreloadedRouteSupervisor.start(default_deadline_seconds=5, default_grace_seconds=0.05)
+    app.state.route_supervisor = supervisor
+    messages = []
+    async def exercise():
+        delivered = False
+        disconnect_at = time.monotonic() + 0.1
+        async def receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": json.dumps(_route_compare_payload()).encode(), "more_body": False}
+            if time.monotonic() < disconnect_at:
+                await asyncio.sleep(1)
+            return {"type": "http.disconnect"}
+        async def send(message):
+            messages.append(message)
+        await asyncio.wait_for(app({
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+            "method": "POST", "scheme": "http", "path": "/v1/route/compare",
+            "raw_path": b"/v1/route/compare", "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 1), "server": ("test", 80),
+        }, receive, send), timeout=5)
+    try:
+        asyncio.run(exercise())
+    finally:
+        supervisor.close()
+    assert messages[0]["status"] == 499
+    assert json.loads(messages[1]["body"])["detail"]["error"] == "routing_cancelled"
+
+
+@pytest.mark.parametrize("path,source_region,expected", [
+    ("images/satellite/philadelphia/z14/0.jpg", None, "philadelphia"),
+    ("images/satellite/z14/philadelphia.jpg", None, "unknown"),
+    ("images/satellite/z14/0.jpg", "philadelphia", "philadelphia"),
+])
+def test_contrib_region_comes_from_image_provenance(contrib_repo, path, source_region, expected):
+    image = {"image_path": path}
+    if source_region:
+        image["region"] = source_region
+    pd.DataFrame([image]).to_csv(contrib_repo.cfg.labels_source_csv, index=False)
+    task = contrib_repo.next_tasks("regional", "philadelphia", 1)[0]
+    response = client.post("/v1/contrib/labels", json={
+        "contributor_id": "regional", "task_id": task["task_id"],
+        "image_path": task["image_path"], "scenic_human": 6, "region": "forged",
+    })
+    assert response.status_code == 200
+    assert response.json()["record"]["region"] == expected

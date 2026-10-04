@@ -1,7 +1,7 @@
 """Scenic-score regression from classifier and terrain features."""
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 import numpy as np
 
 import torch
@@ -55,6 +55,24 @@ class ScenicRegressionModel(nn.Module):
         return score
 
 
+def _finite_float32(values: np.ndarray, name: str, rank: int) -> np.ndarray:
+    """Return ``values`` as finite float32 with the required rank, or raise ``ValueError``."""
+    array = np.asarray(values)
+    if not np.issubdtype(array.dtype, np.number) or np.issubdtype(
+        array.dtype, np.complexfloating
+    ):
+        raise ValueError(f"{name} must be numeric, got dtype {array.dtype}")
+    if array.ndim != rank:
+        raise ValueError(f"{name} must be rank {rank}, got shape {array.shape}")
+    if rank == 2 and array.shape[1] == 0:
+        raise ValueError(f"{name} must have at least one feature column")
+    with np.errstate(over="ignore", invalid="ignore"):
+        converted = array.astype(np.float32)
+    if not np.isfinite(converted).all():
+        raise ValueError(f"{name} contains non-finite values after float32 conversion")
+    return converted
+
+
 class ScenicScoreDataset(torch.utils.data.Dataset):
     """
     Dataset for training the scenic regression model.
@@ -65,6 +83,10 @@ class ScenicScoreDataset(torch.utils.data.Dataset):
         - class_logits: Pre-extracted classification logits
         - scenic_score: Target score (formula-based or human-rated)
         - sample_weight: Training weight per sample (optional; defaults to 1.0)
+
+    Feature arrays must be numeric rank-2 ``[N, D]`` with ``D >= 1``; ``scenic_scores``
+    must be numeric rank-1 ``[N]``. All must share ``N`` and be finite after float32
+    conversion, otherwise ``ValueError`` is raised.
     """
 
     def __init__(self, data_path: Path):
@@ -78,13 +100,21 @@ class ScenicScoreDataset(torch.utils.data.Dataset):
         if missing:
             raise ValueError(f"Dataset missing required arrays: {missing}")
 
-        self.vit_embeddings = torch.from_numpy(data["vit_embeddings"]).float()
-        self.terrain_features = torch.from_numpy(data["terrain_features"]).float()
-        self.class_logits = torch.from_numpy(data["class_logits"]).float()
-        self.scenic_scores = torch.from_numpy(data["scenic_scores"]).float().unsqueeze(-1)
+        features = {
+            key: _finite_float32(data[key], key, rank=2)
+            for key in ("vit_embeddings", "terrain_features", "class_logits")
+        }
+        scores = _finite_float32(data["scenic_scores"], "scenic_scores", rank=1)
+        n = len(scores)
+        if any(len(values) != n for values in features.values()):
+            raise ValueError("Dataset arrays have inconsistent lengths")
+
+        self.vit_embeddings = torch.from_numpy(features["vit_embeddings"])
+        self.terrain_features = torch.from_numpy(features["terrain_features"])
+        self.class_logits = torch.from_numpy(features["class_logits"])
+        self.scenic_scores = torch.from_numpy(scores).unsqueeze(-1)
         raw_weights = data["sample_weights"] if "sample_weights" in data else None
 
-        n = len(self.scenic_scores)
         if raw_weights is None:
             weights = np.ones((n,), dtype=np.float32)
         else:
@@ -96,9 +126,6 @@ class ScenicScoreDataset(torch.utils.data.Dataset):
             if np.any(weights <= 0):
                 raise ValueError("sample_weights must be strictly positive")
         self.sample_weights = torch.from_numpy(weights).float().unsqueeze(-1)
-
-        if not (len(self.vit_embeddings) == len(self.terrain_features) == len(self.class_logits) == n):
-            raise ValueError("Dataset arrays have inconsistent lengths")
 
     def __len__(self) -> int:
         return len(self.scenic_scores)
@@ -114,7 +141,7 @@ class ScenicScoreDataset(torch.utils.data.Dataset):
 
 
 def resolve_device(device: str | None = None) -> str:
-    """Resolve compute device for scenic score regression model execution.
+    """Resolve the compute device shared by classifier and scenic-score workflows.
 
     Selection priority when device is None or 'auto': CUDA -> MPS -> CPU.
     Explicit device strings are passed through verbatim.
@@ -126,6 +153,28 @@ def resolve_device(device: str | None = None) -> str:
             return "mps"
         return "cpu"
     return device
+
+
+def validation_split_indices(
+    n: int, val_split: float, seed: int
+) -> Tuple[list[int], list[int]]:
+    """Return the deterministic ``(train, validation)`` membership for ``n`` rows.
+
+    This is the single train/validation split derivation for regression training
+    and evaluation. Both sides must consume the same membership so reported
+    validation metrics cover exactly the rows the model validated on.
+    """
+    if n < 1:
+        raise ValueError("validation split requires at least one row")
+    indices = np.arange(n)
+    np.random.RandomState(seed).shuffle(indices)
+    split = max(1, int(n * (1 - val_split)))
+    train_idx = indices[:split].tolist()
+    val_idx = indices[split:].tolist()
+    if len(val_idx) == 0:
+        val_idx = train_idx[-1:]
+        train_idx = train_idx[:-1]
+    return train_idx, val_idx
 
 
 def train_regression_model(
@@ -140,8 +189,16 @@ def train_regression_model(
     weight_decay: float = 1e-4,
     use_sample_weights: bool = True,
     num_workers: int = 4,
+    train_indices: Optional[Sequence[int]] = None,
+    val_indices: Optional[Sequence[int]] = None,
 ) -> float:
-    """Train the scenic-score regression model and return validation correlation."""
+    """Train the scenic-score regression model and return validation correlation.
+
+    ``train_indices``/``val_indices`` make the validation membership explicit and
+    must be provided together: a partition of the dataset rows. When omitted, the
+    membership is derived by :func:`validation_split_indices` from
+    ``val_split``/``seed``.
+    """
     device = resolve_device(device)
 
     torch.manual_seed(seed)
@@ -152,14 +209,20 @@ def train_regression_model(
     if n < 16:
         raise ValueError("Dataset too small for regression training.")
 
-    indices = np.arange(n)
-    np.random.shuffle(indices)
-    split = max(1, int(n * (1 - val_split)))
-    train_idx = indices[:split].tolist()
-    val_idx = indices[split:].tolist()
-    if len(val_idx) == 0:
-        val_idx = train_idx[-1:]
-        train_idx = train_idx[:-1]
+    if (train_indices is None) != (val_indices is None):
+        raise ValueError("train_indices and val_indices must be provided together")
+    if train_indices is None:
+        train_idx, val_idx = validation_split_indices(n, val_split, seed)
+    else:
+        train_idx = [int(i) for i in train_indices]
+        val_idx = [int(i) for i in val_indices]
+        if not train_idx or not val_idx:
+            raise ValueError("explicit split requires non-empty train and val indices")
+        if (
+            set(train_idx) & set(val_idx)
+            or set(train_idx) | set(val_idx) != set(range(n))
+        ):
+            raise ValueError("explicit train/val indices must partition the dataset rows")
 
     train_ds = torch.utils.data.Subset(dataset, train_idx)
     val_ds = torch.utils.data.Subset(dataset, val_idx)
@@ -221,7 +284,8 @@ def train_regression_model(
             train_losses.append(loss.item())
 
         model.eval()
-        val_losses = []
+        val_loss_sum = 0.0
+        val_weight_sum = 0.0
         preds = []
         targets = []
         with torch.inference_mode(), torch.amp.autocast("cuda", enabled=cuda):
@@ -230,17 +294,15 @@ def train_regression_model(
                     value.to(device, non_blocking=cuda) for value in batch
                 )
                 pred = model(vit_emb, terrain, logits)
-                per_sample_loss = criterion(pred, score)
-                if use_sample_weights:
-                    denom = torch.clamp(sample_weight.sum(), min=1e-8)
-                    loss = (per_sample_loss * sample_weight).sum() / denom
-                else:
-                    loss = per_sample_loss.mean()
-                val_losses.append(loss.item())
+                per_sample_loss = criterion(pred.float(), score)
+                val_weight = sample_weight if use_sample_weights else torch.ones_like(score)
+                val_loss_sum += float((per_sample_loss * val_weight).sum().item())
+                val_weight_sum += float(val_weight.sum().item())
                 preds.append(pred.float().cpu().numpy().reshape(-1))
                 targets.append(score.float().cpu().numpy().reshape(-1))
 
-        val_loss = float(np.mean(val_losses)) if val_losses else 0.0
+        # Aggregate over samples (weighted when enabled) so uneven final batches are not over-weighted.
+        val_loss = val_loss_sum / val_weight_sum if val_weight_sum > 0 else 0.0
         all_preds = np.concatenate(preds) if preds else np.array([0.0], dtype=np.float32)
         all_targets = np.concatenate(targets) if targets else np.array([0.0], dtype=np.float32)
         corr = float(np.corrcoef(all_preds, all_targets)[0, 1]) if len(all_preds) > 1 else 0.0

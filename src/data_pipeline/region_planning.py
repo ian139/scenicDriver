@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -50,10 +51,14 @@ def load_app_region_bounds(
     return regions
 
 
-def enumerate_bbox_tiles(
+def bbox_tile_range(
     min_lat: float, min_lon: float, max_lat: float, max_lon: float, zoom: int = 14
-) -> list[tuple[int, int]]:
-    """Enumerate all (x, y) tile coordinates covering the given bounding box at specified zoom."""
+) -> tuple[int, int, int, int]:
+    """Return inclusive ``(min_x, max_x, min_y, max_y)`` tile bounds covering a bbox.
+
+    Validates the bbox and zoom without materializing any tile coordinates, so
+    callers can size the grid before allocating it.
+    """
     if zoom < 0 or zoom > 22:
         raise ValueError(f"Unsupported zoom: {zoom}; expected 0..22.")
     if not all(math.isfinite(float(v)) for v in (min_lat, min_lon, max_lat, max_lon)):
@@ -72,14 +77,45 @@ def enumerate_bbox_tiles(
 
     nw_x, nw_y = lat_lon_to_tile(max_lat, min_lon, zoom)
     se_x, se_y = lat_lon_to_tile(min_lat, max_lon, zoom)
-    min_x, max_x = min(nw_x, se_x), max(nw_x, se_x)
-    min_y, max_y = min(nw_y, se_y), max(nw_y, se_y)
+    return min(nw_x, se_x), max(nw_x, se_x), min(nw_y, se_y), max(nw_y, se_y)
 
-    tiles = []
-    for x in range(min_x, max_x + 1):
-        for y in range(min_y, max_y + 1):
-            tiles.append((x, y))
-    return tiles
+
+def _tile_range_count(tile_range: tuple[int, int, int, int]) -> int:
+    min_x, max_x, min_y, max_y = tile_range
+    return (max_x - min_x + 1) * (max_y - min_y + 1)
+
+
+def count_bbox_tiles(
+    min_lat: float, min_lon: float, max_lat: float, max_lon: float, zoom: int = 14
+) -> int:
+    """Count the tiles ``enumerate_bbox_tiles`` would return, without allocating them."""
+    return _tile_range_count(bbox_tile_range(min_lat, min_lon, max_lat, max_lon, zoom))
+
+
+def enumerate_bbox_tiles(
+    min_lat: float,
+    min_lon: float,
+    max_lat: float,
+    max_lon: float,
+    zoom: int = 14,
+    max_tiles: int | None = None,
+) -> list[tuple[int, int]]:
+    """Enumerate all (x, y) tile coordinates covering the given bounding box at specified zoom.
+
+    Tiles are ordered x-major then y. When ``max_tiles`` is given, a grid larger
+    than the cap raises ``ValueError`` before any coordinate is allocated.
+    """
+    tile_range = bbox_tile_range(min_lat, min_lon, max_lat, max_lon, zoom)
+    count = _tile_range_count(tile_range)
+    if max_tiles is not None and count > max_tiles:
+        raise ValueError(
+            f"Bounding box tile count ({count:,}) exceeds hard budget cap "
+            f"of {max_tiles:,}."
+        )
+    min_x, max_x, min_y, max_y = tile_range
+    return [
+        (x, y) for x in range(min_x, max_x + 1) for y in range(min_y, max_y + 1)
+    ]
 
 
 _TO_EQUAL_AREA = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
@@ -291,6 +327,7 @@ def enumerate_land_tiles(
     land_geometry: Any,
     zoom: int = 14,
     threshold: float = 0.05,
+    max_tiles: int | None = None,
 ) -> list[dict[str, Any]]:
     """Admit tiles whose center is on land or whose land fraction reaches the threshold in EPSG:5070.
 
@@ -302,7 +339,12 @@ def enumerate_land_tiles(
     * every chunk's tile boxes are projected to EPSG:5070 in one pyproj array
       call and intersected with the equal-area land geometry using the same
       GEOS operations the scalar path used;
-    * only one chunk of tile geometries is materialized at a time;
+    * the bbox tile grid is streamed: only one chunk of tile coordinates and
+      tile geometries is materialized at a time, so a huge (even global)
+      bbox never allocates its full grid;
+    * when ``max_tiles`` is given, enumeration raises ``ValueError`` as soon
+      as the admitted count exceeds it, bounding both memory and work by the
+      caller's cap instead of by the geometry's bbox;
     * ``land_fraction`` is clamped to [0.0, 1.0] to neutralize EPSG:5070
       floating-point overflow (canonical preflight observed 1.0000000000000286);
       the threshold test uses the clamped value.
@@ -311,58 +353,20 @@ def enumerate_land_tiles(
         raise ValueError("Land fraction threshold must be between 0 and 1.")
     geometry_wgs84 = parse_geojson_geometry(land_geometry)
     geometry_equal_area = project_geometry_to_5070(geometry_wgs84)
-    # Prepare both geometries once: the center predicates and the disjoint
-    # pre-filter below then run against STRtree-indexed prepared geometries.
-    shapely.prepare(geometry_wgs84)
-    shapely.prepare(geometry_equal_area)
-
-    min_lon, min_lat, max_lon, max_lat = geometry_wgs84.bounds
-    tiles = enumerate_bbox_tiles(min_lat, min_lon, max_lat, max_lon, zoom=zoom)
     admitted: list[dict[str, Any]] = []
 
-    for start in range(0, len(tiles), _TILE_CHUNK_SIZE):
-        chunk = tiles[start : start + _TILE_CHUNK_SIZE]
-        xs = np.asarray([x for x, _ in chunk], dtype=np.float64)
-        ys = np.asarray([y for _, y in chunk], dtype=np.float64)
-
-        center_lon, center_lat = _tile_centers_xy(xs, ys, zoom)
-        # For a point against a (Multi)Polygon, covers == intersects: both hold
-        # exactly for interior and boundary points. intersects_xy avoids
-        # constructing 370k Point objects and uses the prepared geometry.
-        center_on_land = shapely.intersects_xy(geometry_wgs84, center_lon, center_lat)
-
-        min_lon_c, min_lat_c, max_lon_c, max_lat_c = _tile_box_corners_xy(xs, ys, zoom)
-        tile_quads_5070 = _project_tile_quads_5070(
-            min_lon_c, min_lat_c, max_lon_c, max_lat_c
-        )
-        tile_area = shapely.area(tile_quads_5070)
-
-        # Exact disjoint pre-filter: a quad with empty intersection with the
-        # land geometry contributes intersection_area == 0.0 (the scalar loop
-        # would produce exactly 0.0 from its empty overlay result), so it can
-        # skip the full GEOS overlay. The predicate and the overlay operate on
-        # the same bit-identical inputs with the same exact-arithmetic core.
-        intersects_land = shapely.intersects(geometry_equal_area, tile_quads_5070)
-        intersection_area = np.zeros(len(chunk), dtype=np.float64)
-        if np.any(intersects_land):
-            intersection_area[intersects_land] = shapely.area(
-                shapely.intersection(
-                    tile_quads_5070[intersects_land], geometry_equal_area
-                )
-            )
-
-        land_fraction = np.divide(
-            intersection_area,
-            tile_area,
-            out=np.zeros_like(intersection_area),
-            where=tile_area > 0.0,
-        )
-        np.clip(land_fraction, 0.0, 1.0, out=land_fraction)
-
+    for xs, ys, center_on_land, intersection_area, tile_area in _iter_land_tile_chunks(
+        geometry_wgs84, geometry_equal_area, zoom
+    ):
+        land_fraction = _clamped_land_fraction(intersection_area, tile_area)
         admitted_mask = center_on_land | (
             (intersection_area > 0.0) & (land_fraction >= threshold)
         )
         for idx in np.nonzero(admitted_mask)[0]:
+            if max_tiles is not None and len(admitted) >= max_tiles:
+                raise ValueError(
+                    f"Admitted land tile count exceeds hard budget cap of {max_tiles:,}."
+                )
             x_i, y_i = int(xs[idx]), int(ys[idx])
             admitted.append(
                 {
@@ -378,6 +382,71 @@ def enumerate_land_tiles(
     return admitted
 
 
+def _clamped_land_fraction(
+    intersection_area: np.ndarray, tile_area: np.ndarray
+) -> np.ndarray:
+    land_fraction = np.divide(
+        intersection_area,
+        tile_area,
+        out=np.zeros_like(intersection_area),
+        where=tile_area > 0.0,
+    )
+    np.clip(land_fraction, 0.0, 1.0, out=land_fraction)
+    return land_fraction
+
+
+def _iter_land_tile_chunks(
+    geometry_wgs84: BaseGeometry, geometry_equal_area: BaseGeometry, zoom: int
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Stream ``(xs, ys, center_on_land, intersection_area, tile_area)`` chunks.
+
+    Walks the geometry's bbox tile grid in x-major, then y order (the
+    ``enumerate_bbox_tiles`` order) one ``_TILE_CHUNK_SIZE`` chunk at a time.
+    """
+    # Prepare both geometries once: the center predicates and the disjoint
+    # pre-filter below then run against STRtree-indexed prepared geometries.
+    shapely.prepare(geometry_wgs84)
+    shapely.prepare(geometry_equal_area)
+
+    min_lon, min_lat, max_lon, max_lat = geometry_wgs84.bounds
+    min_x, _, min_y, max_y = tile_range = bbox_tile_range(
+        min_lat, min_lon, max_lat, max_lon, zoom=zoom
+    )
+    column_height = max_y - min_y + 1
+    total_tiles = _tile_range_count(tile_range)
+
+    for start in range(0, total_tiles, _TILE_CHUNK_SIZE):
+        linear = np.arange(
+            start, min(start + _TILE_CHUNK_SIZE, total_tiles), dtype=np.int64
+        )
+        xs = (min_x + linear // column_height).astype(np.float64)
+        ys = (min_y + linear % column_height).astype(np.float64)
+
+        center_lon, center_lat = _tile_centers_xy(xs, ys, zoom)
+        # For a point against a (Multi)Polygon, covers == intersects: both hold
+        # exactly for interior and boundary points. intersects_xy avoids
+        # constructing 370k Point objects and uses the prepared geometry.
+        center_on_land = shapely.intersects_xy(geometry_wgs84, center_lon, center_lat)
+
+        tile_quads_5070 = _project_tile_quads_5070(*_tile_box_corners_xy(xs, ys, zoom))
+        tile_area = shapely.area(tile_quads_5070)
+
+        # Exact disjoint pre-filter: a quad with empty intersection with the
+        # land geometry contributes intersection_area == 0.0 (the scalar loop
+        # would produce exactly 0.0 from its empty overlay result), so it can
+        # skip the full GEOS overlay. The predicate and the overlay operate on
+        # the same bit-identical inputs with the same exact-arithmetic core.
+        intersects_land = shapely.intersects(geometry_equal_area, tile_quads_5070)
+        intersection_area = np.zeros(len(xs), dtype=np.float64)
+        if np.any(intersects_land):
+            intersection_area[intersects_land] = shapely.area(
+                shapely.intersection(
+                    tile_quads_5070[intersects_land], geometry_equal_area
+                )
+            )
+        yield xs, ys, center_on_land, intersection_area, tile_area
+
+
 def enumerate_polygon_tiles(
     polygon: Any, zoom: int = 14, threshold: float = 0.05
 ) -> list[tuple[int, int]]:
@@ -386,6 +455,67 @@ def enumerate_polygon_tiles(
         record["coord"]
         for record in enumerate_land_tiles(polygon, zoom=zoom, threshold=threshold)
     ]
+
+
+def _enumerate_jurisdiction_land_tiles(
+    state_lands: list[tuple[str, BaseGeometry]],
+    zoom: int,
+    threshold: float,
+    max_tiles: int,
+) -> list[dict[str, Any]]:
+    """Admit the authorized land union before assigning one owner per tile.
+
+    Union admission streams bounded x-major/y chunks and stops before an
+    append would exceed ``max_tiles``. Ownership is computed only for the
+    capped admitted records, also in bounded chunks. The greatest EPSG:5070
+    state land share wins, with the first sorted state winning exact ties.
+    Only tiles with no positive state share fall back to a centre hit.
+    """
+    states_and_lands = sorted(state_lands, key=lambda entry: entry[0])
+    land_union = unary_union([land for _, land in states_and_lands])
+    admitted = enumerate_land_tiles(
+        land_union, zoom=zoom, threshold=threshold, max_tiles=max_tiles
+    )
+    lands_equal_area = [
+        project_geometry_to_5070(land) for _, land in states_and_lands
+    ]
+    for land in lands_equal_area:
+        shapely.prepare(land)
+
+    for start in range(0, len(admitted), _TILE_CHUNK_SIZE):
+        records = admitted[start : start + _TILE_CHUNK_SIZE]
+        xs = np.asarray([record["x"] for record in records], dtype=np.float64)
+        ys = np.asarray([record["y"] for record in records], dtype=np.float64)
+        quads = _project_tile_quads_5070(*_tile_box_corners_xy(xs, ys, zoom))
+        best_area = np.zeros(len(records), dtype=np.float64)
+        owner_cols = np.full(len(records), -1, dtype=np.int64)
+        for col, land in enumerate(lands_equal_area):
+            intersects_land = shapely.intersects(land, quads)
+            area = np.zeros(len(records), dtype=np.float64)
+            if np.any(intersects_land):
+                area[intersects_land] = shapely.area(
+                    shapely.intersection(quads[intersects_land], land)
+                )
+            larger_share = area > best_area
+            best_area[larger_share] = area[larger_share]
+            owner_cols[larger_share] = col
+
+        if np.any(owner_cols < 0):
+            center_lon, center_lat = _tile_centers_xy(xs, ys, zoom)
+            for col, (_, land) in enumerate(states_and_lands):
+                remaining = np.nonzero(owner_cols < 0)[0]
+                if not len(remaining):
+                    break
+                hits = shapely.intersects_xy(
+                    land, center_lon[remaining], center_lat[remaining]
+                )
+                owner_cols[remaining[hits]] = col
+
+        for record, owner_col in zip(records, owner_cols):
+            if owner_col < 0:
+                raise ValueError("Admitted jurisdiction tile has no land owner.")
+            record["state"] = states_and_lands[int(owner_col)][0]
+    return admitted
 
 
 def get_builtin_region_spec() -> dict[str, Any]:
@@ -522,15 +652,14 @@ def parse_and_validate_region_spec(
         )
 
     nen_bbox = app_bounds["new_england_north"]
-    nen_bbox_tiles = set(
-        enumerate_bbox_tiles(
-            nen_bbox["min_lat"],
-            nen_bbox["min_lon"],
-            nen_bbox["max_lat"],
-            nen_bbox["max_lon"],
-            zoom=zoom,
-        )
+    nen_bbox_args = (
+        nen_bbox["min_lat"],
+        nen_bbox["min_lon"],
+        nen_bbox["max_lat"],
+        nen_bbox["max_lon"],
     )
+    nen_tile_range = bbox_tile_range(*nen_bbox_args, zoom=zoom)
+    nen_min_x, nen_max_x, nen_min_y, nen_max_y = nen_tile_range
     geometry_source_hashes: dict[str, str] = {}
     baseline_land_path = spec_data.get("baseline_land_geometry_file")
     baseline_land_sha = spec_data.get("baseline_land_geometry_sha256")
@@ -566,10 +695,6 @@ def parse_and_validate_region_spec(
             baseline_land = baseline_land.intersection(
                 parse_geojson_geometry(baseline_jurisdiction_data)
             )
-        nen_min_x = min(x for x, _ in nen_bbox_tiles)
-        nen_max_x = max(x for x, _ in nen_bbox_tiles)
-        nen_min_y = min(y for _, y in nen_bbox_tiles)
-        nen_max_y = max(y for _, y in nen_bbox_tiles)
         nen_west, nen_south, _, _ = tile_bounds_wgs84(nen_min_x, nen_max_y, zoom)
         _, _, nen_east, nen_north = tile_bounds_wgs84(nen_max_x, nen_min_y, zoom)
         nen_land = baseline_land.intersection(
@@ -579,16 +704,20 @@ def parse_and_validate_region_spec(
         nen_tiles_set = {
             record["coord"]
             for record in enumerate_land_tiles(
-                nen_land, zoom=zoom, threshold=nen_threshold
+                nen_land,
+                zoom=zoom,
+                threshold=nen_threshold,
+                max_tiles=max_budget_coords,
             )
         }
         if not nen_tiles_set:
             raise ValueError("New England North baseline land geometry admits no tiles")
     else:
-        nen_tiles_set = nen_bbox_tiles
-
-    nen_max_x = max(x for x, _ in nen_bbox_tiles)
-    nen_min_y = min(y for _, y in nen_bbox_tiles)
+        # Every baseline bbox tile must be covered, so a grid above the budget
+        # can never pass the budget check; refuse it before allocating.
+        nen_tiles_set = set(
+            enumerate_bbox_tiles(*nen_bbox_args, zoom=zoom, max_tiles=max_budget_coords)
+        )
 
     # Process regions in order
     coord_to_region: dict[tuple[int, int], str] = {}
@@ -655,7 +784,7 @@ def parse_and_validate_region_spec(
             if not isinstance(included, list) or not included:
                 raise ValueError(f"{r_name} included_jurisdictions must be non-empty")
             included_values = {str(value) for value in included}
-            found_values: set[str] = set()
+            jurisdiction_parts: dict[str, list[BaseGeometry]] = {}
             threshold = float(r_entry.get("threshold", 0.05))
             for feature in features:
                 if not isinstance(feature, dict):
@@ -666,32 +795,39 @@ def parse_and_validate_region_spec(
                 state = str(properties[field])
                 if state not in included_values:
                     continue
-                found_values.add(state)
-                jurisdiction = parse_geojson_geometry(feature)
-                state_land = jurisdiction.intersection(land_geometry)
-                if state_land.is_empty:
-                    raise ValueError(
-                        f"{r_name} has no verified land for jurisdiction {state}"
-                    )
-                state_records = enumerate_land_tiles(
-                    state_land, zoom=zoom, threshold=threshold
+                jurisdiction_parts.setdefault(state, []).append(
+                    parse_geojson_geometry(feature)
                 )
-                for record in state_records:
-                    record["state"] = state
-                records.extend(state_records)
-                state_tile_counts[state] = len(state_records)
-                bounds = state_land.bounds
-                bbox_count = len(
-                    enumerate_bbox_tiles(
-                        bounds[1], bounds[0], bounds[3], bounds[2], zoom=zoom
-                    )
-                )
-                excluded_water_count += bbox_count - len(state_records)
-            missing = included_values - found_values
+            missing = included_values - jurisdiction_parts.keys()
             if missing:
                 raise ValueError(
                     f"{r_name} is missing jurisdictions: {sorted(missing)}"
                 )
+            state_lands: list[tuple[str, BaseGeometry]] = []
+            for state in sorted(jurisdiction_parts):
+                state_land = unary_union(jurisdiction_parts[state]).intersection(
+                    land_geometry
+                )
+                if state_land.is_empty:
+                    raise ValueError(
+                        f"{r_name} has no verified land for jurisdiction {state}"
+                    )
+                state_lands.append((state, parse_geojson_geometry(state_land)))
+                state_tile_counts.setdefault(state, 0)
+            records = _enumerate_jurisdiction_land_tiles(
+                state_lands,
+                zoom=zoom,
+                threshold=threshold,
+                max_tiles=max_budget_coords,
+            )
+            land_bounds = np.asarray([land.bounds for _, land in state_lands])
+            excluded_water_count += count_bbox_tiles(
+                float(land_bounds[:, 1].min()),
+                float(land_bounds[:, 0].min()),
+                float(land_bounds[:, 3].max()),
+                float(land_bounds[:, 2].max()),
+                zoom=zoom,
+            ) - len(records)
 
         elif is_geom_file:
             path_str = r_entry.get(geom_file_key) if geom_file_key else None
@@ -719,7 +855,12 @@ def parse_and_validate_region_spec(
                     )
                 )
             threshold = float(r_entry.get("threshold", 0.05))
-            records = enumerate_land_tiles(parsed_geom, zoom=zoom, threshold=threshold)
+            records = enumerate_land_tiles(
+                parsed_geom,
+                zoom=zoom,
+                threshold=threshold,
+                max_tiles=max_budget_coords,
+            )
 
         elif is_bbox:
             bbox = r_entry.get("bbox")
@@ -729,16 +870,22 @@ def parse_and_validate_region_spec(
                 raise ValueError(
                     f"Bbox region '{r_name}' requires min_lat, min_lon, max_lat, and max_lon."
                 )
+            bbox_args = (
+                bbox["min_lat"],
+                bbox["min_lon"],
+                bbox["max_lat"],
+                bbox["max_lon"],
+            )
             try:
-                b_tiles = enumerate_bbox_tiles(
-                    bbox["min_lat"],
-                    bbox["min_lon"],
-                    bbox["max_lat"],
-                    bbox["max_lon"],
-                    zoom=zoom,
-                )
+                b_count = count_bbox_tiles(*bbox_args, zoom=zoom)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"Invalid bbox for region '{r_name}': {exc}") from exc
+            if b_count > max_budget_coords:
+                raise ValueError(
+                    f"Bbox region '{r_name}' covers {b_count:,} tile coordinates, "
+                    f"which exceeds hard budget cap of {max_budget_coords:,}."
+                )
+            b_tiles = enumerate_bbox_tiles(*bbox_args, zoom=zoom)
             records = [
                 {
                     "coord": (x, y),
@@ -758,7 +905,12 @@ def parse_and_validate_region_spec(
                 )
             parsed_geom = parse_geojson_geometry(poly)
             threshold = float(r_entry.get("threshold", 0.05))
-            records = enumerate_land_tiles(parsed_geom, zoom=zoom, threshold=threshold)
+            records = enumerate_land_tiles(
+                parsed_geom,
+                zoom=zoom,
+                threshold=threshold,
+                max_tiles=max_budget_coords,
+            )
 
         else:
             raise ValueError(f"Unknown region type '{r_type}' for region '{r_name}'.")
@@ -767,6 +919,13 @@ def parse_and_validate_region_spec(
         for rec in records:
             coord = rec["coord"]
             if coord not in seen_coords:
+                if len(seen_coords) >= max_budget_coords:
+                    unique_count = len(seen_coords) + 1
+                    raise ValueError(
+                        f"Total unique tile coordinates ({unique_count:,}) exceeds "
+                        f"hard budget cap of {max_budget_coords:,} "
+                        f"({unique_count * 2:,} rasters > {max_budget_coords * 2:,})."
+                    )
                 seen_coords.add(coord)
                 ordered_coords.append(coord)
                 coord_to_region[coord] = r_name
@@ -775,6 +934,12 @@ def parse_and_validate_region_spec(
                 coord_to_state[coord] = rec.get("state")
                 admission_reason_counts[rec["admission_reason"]] += 1
                 admitted_land_fractions.append(float(rec["land_fraction"]))
+
+    # State counts follow the deduplicated ownership actually admitted, so they
+    # always partition the jurisdiction-owned coordinates.
+    for state in coord_to_state.values():
+        if state is not None:
+            state_tile_counts[state] += 1
 
     # 1. Check New England North Coverage
     missing_nen = nen_tiles_set - seen_coords
@@ -801,11 +966,6 @@ def parse_and_validate_region_spec(
     # 3. Check Budget Cap
     unique_count = len(seen_coords)
     total_rasters = unique_count * 2
-    if unique_count > max_budget_coords:
-        raise ValueError(
-            f"Total unique tile coordinates ({unique_count:,}) exceeds hard budget cap "
-            f"of {max_budget_coords:,} ({total_rasters:,} rasters > {max_budget_coords * 2:,})."
-        )
 
     geometry_digest = compute_geometry_digest(
         {
@@ -820,7 +980,7 @@ def parse_and_validate_region_spec(
         "unique_coordinates_count": unique_count,
         "total_rasters_count": total_rasters,
         "nen_tile_count": len(nen_tiles_set),
-        "nen_bbox_tile_count": len(nen_bbox_tiles),
+        "nen_bbox_tile_count": _tile_range_count(nen_tile_range),
         "coord_to_region": coord_to_region,
         "coord_to_land_fraction": coord_to_land_fraction,
         "coord_to_admission_reason": coord_to_admission_reason,

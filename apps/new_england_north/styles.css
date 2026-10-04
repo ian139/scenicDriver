@@ -181,6 +181,11 @@ input[type="range"]:focus {
   inset: 0;
 }
 
+#map .maplibregl-canvas:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -3px;
+}
+
 .maplibregl-ctrl-top-right {
   margin-top: 12px;
   margin-right: 12px;
@@ -637,8 +642,14 @@ h3 {
   overscroll-behavior: contain;
 }
 
-.control-panel:has(.address-suggestions.open) {
+.control-panel:not(:has(.dev-panel[open])):has(.address-suggestions.open) {
   overflow: visible;
+}
+
+/* Expanded diagnostics keep a single scroll context, including suggestions. */
+.control-panel:has(.dev-panel[open]) .address-suggestions {
+  position: static;
+  margin-top: 2px;
 }
 .output-stack {
   display: grid;

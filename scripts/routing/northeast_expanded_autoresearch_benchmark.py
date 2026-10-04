@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Benchmark exact uncached Northeast Expanded Burlington-to-Pittsburgh routing."""
+"""Benchmark exact uncached Northeast Expanded Burlington-to-Pittsburgh routing.
+
+Project-rooted artifacts are digest/size verified before timing, including
+compact payload dependencies. RSS checks stop execution at phase boundaries.
+The original pinned semantic oracle is required and is never self-seeded.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.route_planner.cancellation import RoutingDeadline  # noqa: E402
+from src.route_planner.graph import CompactRoadGraph  # noqa: E402
 from src.route_planner.service import (  # noqa: E402
     RouteRequest,
     clear_route_caches,
@@ -31,14 +37,14 @@ from src.route_planner.service import (  # noqa: E402
     preload_route_assets,
 )
 
-GRAPH_PATH = Path(
+GRAPH_PATH = PROJECT_ROOT / Path(
     "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.compact.json"
 )
-REPORT_PATH = Path(
+REPORT_PATH = PROJECT_ROOT / Path(
     "data/processed/heuristic_runs/"
     "prompt_two_candidate_exp02_expanded_20260810/report/report.json"
 )
-OUTPUT_DIR = Path("data/processed/routing_benchmarks/northeast_expanded_autoresearch")
+OUTPUT_DIR = PROJECT_ROOT / "data/processed/routing_benchmarks/northeast_expanded_autoresearch"
 ORACLE_PATH = OUTPUT_DIR / "baseline_oracle.json"
 LATEST_PATH = OUTPUT_DIR / "latest_result.json"
 DEADLINE_SECONDS = 120.0
@@ -207,6 +213,34 @@ def _artifact_identity() -> dict[str, dict[str, Any]]:
             "sha256": observed_sha256,
             "size_bytes": path.stat().st_size,
         }
+    manifest = json.loads(GRAPH_PATH.read_text(encoding="utf-8"))
+    dependencies = {
+        "compact_binary": (
+            GRAPH_PATH.parent / manifest["bin_path"],
+            manifest["bin_sha256"],
+            manifest["bin_size_bytes"],
+        ),
+        "compact_source": (
+            GRAPH_PATH.parent / manifest["source"]["path"],
+            manifest["source"]["sha256"],
+            manifest["source"]["size_bytes"],
+        ),
+    }
+    for name, (path, sha256, expected_size) in dependencies.items():
+        if type(expected_size) is not int or expected_size <= 0:
+            raise ValueError(f"{name} has invalid declared size")
+        size = path.stat().st_size
+        if size != expected_size:
+            raise ValueError(f"{name} size mismatch: expected {expected_size}, observed {size}")
+        identity[name] = {
+            "path": str(path.resolve()),
+            "sha256": sha256,
+            "size_bytes": size,
+        }
+    # The runtime verifier owns compact digest, layout, and topology admission.
+    # Run it outside every measured phase; never trust the manifest alone.
+    graph = CompactRoadGraph.load(GRAPH_PATH, verify=True)
+    graph.close()
     return identity
 
 
@@ -413,19 +447,30 @@ def run_benchmark(*, timed_runs: int, preload_runs: int) -> dict[str, Any]:
     if preload_runs < 1:
         raise ValueError("preload_runs must be positive")
 
+    _validate_rss(_peak_rss_bytes(), field="before artifact admission.peak_rss_bytes")
     artifact_identity = _artifact_identity()
     oracle, pinned_semantic = _load_pinned_oracle()
 
-    fresh_preloads = [_run_preload_worker() for _ in range(preload_runs)]
+    fresh_preloads = []
+    for index in range(preload_runs):
+        _validate_rss(_peak_rss_bytes(), field=f"before fresh preload {index + 1}.peak_rss_bytes")
+        record = _run_preload_worker()
+        _validate_rss(record["peak_rss_bytes"], field=f"fresh preload {index + 1}.peak_rss_bytes")
+        fresh_preloads.append(record)
     preload_wall_seconds = [float(record["wall_seconds"]) for record in fresh_preloads]
     preload_cpu_seconds = [float(record["cpu_seconds"]) for record in fresh_preloads]
 
     clear_route_caches()
+    _validate_rss(_peak_rss_bytes(), field="before session preload.peak_rss_bytes")
     session_preload = _measure_preload()
+    _validate_rss(session_preload["peak_rss_bytes"], field="session preload.peak_rss_bytes")
+    _validate_rss(_peak_rss_bytes(), field="after session preload.peak_rss_bytes")
     request = _request()
 
     clear_route_response_cache()
+    _validate_rss(_peak_rss_bytes(), field="before first uncached warm-up.peak_rss_bytes")
     first_response, first_wall_seconds, first_cpu_seconds = _timed_request(request)
+    _validate_rss(_peak_rss_bytes(), field="after first uncached warm-up.peak_rss_bytes")
     _assert_response_cache_state(
         first_response,
         expected_hit=False,
@@ -442,9 +487,11 @@ def run_benchmark(*, timed_runs: int, preload_runs: int) -> dict[str, Any]:
     cpu_seconds: list[float] = []
     fingerprints: list[str] = []
     for index in range(timed_runs):
-        clear_route_response_cache()
-        response, wall, cpu = _timed_request(request)
         context = f"timed uncached request {index + 1}"
+        clear_route_response_cache()
+        _validate_rss(_peak_rss_bytes(), field=f"before {context}.peak_rss_bytes")
+        response, wall, cpu = _timed_request(request)
+        _validate_rss(_peak_rss_bytes(), field=f"after {context}.peak_rss_bytes")
         _assert_response_cache_state(response, expected_hit=False, context=context)
         fingerprint = _validate_response_semantics(
             response,
@@ -456,7 +503,9 @@ def run_benchmark(*, timed_runs: int, preload_runs: int) -> dict[str, Any]:
         cpu_seconds.append(cpu)
         fingerprints.append(fingerprint)
 
+    _validate_rss(_peak_rss_bytes(), field="before warm response-cache control.peak_rss_bytes")
     warm_response, warm_wall_seconds, warm_cpu_seconds = _timed_request(request)
+    _validate_rss(_peak_rss_bytes(), field="after warm response-cache control.peak_rss_bytes")
     _assert_response_cache_state(
         warm_response,
         expected_hit=True,
@@ -537,8 +586,10 @@ def run_benchmark(*, timed_runs: int, preload_runs: int) -> dict[str, Any]:
 
 
 def _preload_worker_main() -> None:
+    _validate_rss(_peak_rss_bytes(), field="before worker artifact admission.peak_rss_bytes")
     _artifact_identity()
     clear_route_caches()
+    _validate_rss(_peak_rss_bytes(), field="before worker preload.peak_rss_bytes")
     record = _measure_preload()
     _validate_rss(record["peak_rss_bytes"], field="preload.peak_rss_bytes")
     print(

@@ -53,7 +53,11 @@ Every Stage-One run owns one ignored directory:
 `data/processed/active_learning/<run_name>/`. Its canonical artifacts are:
 
 - `region_manifest.json`, `tile_manifest.csv`, `inventory_report.json`, and
-  `acquisition_preflight.json` for bounded acquisition;
+  `acquisition_preflight.json` for bounded acquisition. The inventory validates
+  each paired satellite/terrain tile as a PNG in the source contract's expected
+  mode and `expected_dimensions` `(tile_width, tile_height)`; a size mismatch is
+  recorded on the row as `unexpected_dimensions:<width>x<height>` alongside the
+  other presence, checksum, and acquisition-provenance reasons;
 - `candidate_pool.csv`, `feature_embeddings.npz`, and
   `scoring_manifest.json` for resumable weak-label/model inference;
 - `annotation_batch.csv`, `batch_manifest.json`, `selection_diagnostics.json`,
@@ -67,7 +71,7 @@ Every Stage-One run owns one ignored directory:
 ### Cumulative vs. Per-Run Snapshot Semantics
 
 - `data/raw/labels_human.csv` is cumulative across runs and retains all historical manual annotations across runs.
-- Per-run builders (`build_mixed_labels.py` and `build_human_benchmark.py`) take cumulative annotations as input and filter them to the tile identities present in the run's fixed `geographic_splits.csv`.
+- Per-run builders (`build_mixed_labels.py` and `build_human_benchmark.py`) take cumulative annotations as input and both require `--geographic-splits-csv <path>`, the run's fixed `image_path`/`split` assignments. The flag is mandatory with no default; the builders never infer a split file. They validate it (non-empty `image_path` and `split` columns, `split` in `train`/`val`/`test`, one split per `image_path`, and one split per `geographic_block` when that column is present) and then retain only annotations whose `image_path` appears in it. A heuristic-label row absent from the split file is dropped rather than silently assigned.
 - The generated per-run artifacts (`mixed_labels.csv`, `benchmark_split.csv`, `benchmark_tiles.csv`, etc.) are per-run snapshots strictly aligned with that run's fixed geographic assignments.
 
 `candidate_pool.csv` contains scalar scores and identities only. Dense
@@ -93,16 +97,20 @@ deployed application regions:
 ## Configured and Deployed Regions
 
 The application region catalog is `config/app_regions.json`. It currently
-defines `new_england_north`, `masswhites`, `philadelphia`, and `pittsfield`;
-their graph paths and bounding boxes in that file are the source of truth for
-configured regions. Configuration alone does not mean that the corresponding
-artifacts are present or deployed.
+defines `new_england_north`, `masswhites`, `philadelphia`, `pittsfield`, and
+`northeast_expanded`; their graph paths and bounding boxes in that file are the
+source of truth for configured regions. `northeast_expanded` is the route-capable
+cross-region expansion: it carries its own `route_deadline_seconds` and
+`tile_scores_path`, and its graph is the compact
+`northeast_expanded_scored_tiles_v1` artifact set. Configuration alone does not
+mean that the corresponding artifacts are present or deployed.
 
-The hosted beta deployment is specifically the New England North release
-described in [`docs/setup/deployment.md`](../docs/setup/deployment.md). Its
-required graph, report, and model artifacts are listed in that runbook. The
-training/validation working sets above should not be interpreted as deployed
-regions; `amherst_ma`, in particular, is not an entry in the application
+The hosted beta deployment is the New England North release described in
+[`docs/setup/deployment.md`](../docs/setup/deployment.md), together with the
+Northeast Expanded graph, report, and route artifacts that the same release
+manifest ships. The runbook lists every required graph, report, and model
+artifact. The training/validation working sets above should not be interpreted as
+deployed regions; `amherst_ma`, in particular, is not an entry in the application
 region catalog.
 
 ## Regression Artifacts (Step 3)
@@ -172,6 +180,12 @@ hash-verified, and fsynced before the manifest is atomically replaced last.
 Cancellation or failure before the manifest swap leaves the previous generation
 loadable, even if the input SQLite file has changed. Retain old generation
 directories while their manifests or existing readers may still reference them.
+
+A deterministic per-report score sidecar sits beside the manifest as
+`<graph>.score.<report_signature>.z<zoom>.fb<fallback>.n<normalization>.json`
+plus its `.bin` payload, and stores clamped scenic costs keyed by canonical edge
+rank. It is generated on first use and bound to exactly one report signature; it
+is not part of the content-addressed generation directory.
 
 
 ## Git Policy

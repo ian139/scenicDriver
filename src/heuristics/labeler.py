@@ -235,12 +235,13 @@ def run_heuristic_labeling(
         water_fraction = float(water_mask.mean())
 
         if learned_model is not None:
-            class_id, class_name, class_score, class_logits, vit_embedding = _infer_classifier_outputs(
+            class_id, class_name, class_score, class_logits, vit_embedding = _infer_class(
                 sat_img=sat_img,
                 classifier=classifier,
                 clf_transform=clf_transform,
                 device=clf_device,
                 class_names=class_names,
+                with_features=True,
             )
             score = _predict_learned_score(
                 model=learned_model,
@@ -468,32 +469,28 @@ def _relative_paths_or_raise(
     s3_bucket: str | None,
     s3_only: bool,
 ) -> tuple[str, str]:
-    if s3_only:
-        if not s3_bucket:
-            raise ValueError("SCENIC_S3_BUCKET is required for S3-only mode.")
-        raw_prefix = "raw/"
-        sat_key = sat_path.key if isinstance(sat_path, S3ImageRef) else sat_path.as_posix()
-        terr_key = (
-            terrain_path.key if isinstance(terrain_path, S3ImageRef) else terrain_path.as_posix()
-        )
-        if not sat_key.startswith(raw_prefix) or not terr_key.startswith(raw_prefix):
-            raise ValueError("S3 tile keys must live under raw/ in the bucket.")
-        return sat_key[len(raw_prefix):], terr_key[len(raw_prefix):]
+    """Preserve raw-relative local paths and exact S3 keys in either storage mode."""
+    if s3_only and not s3_bucket:
+        raise ValueError("SCENIC_S3_BUCKET is required for S3-only mode.")
 
     raw_root = raw_root.resolve()
-    try:
-        sat_rel = Path(sat_path).resolve().relative_to(raw_root).as_posix()
-    except ValueError as exc:
-        raise ValueError(
-            f"Satellite path {sat_path} is not under raw_dir {raw_root}"
-        ) from exc
-    try:
-        terrain_rel = Path(terrain_path).resolve().relative_to(raw_root).as_posix()
-    except ValueError as exc:
-        raise ValueError(
-            f"Terrain path {terrain_path} is not under raw_dir {raw_root}"
-        ) from exc
-    return sat_rel, terrain_rel
+
+    def relative_path(path: Path | S3ImageRef, kind: str) -> str:
+        if isinstance(path, S3ImageRef):
+            if not s3_bucket:
+                raise ValueError("SCENIC_S3_BUCKET is required to load S3 tiles.")
+            key_path = PurePosixPath(path.key)
+            if not path.key.startswith("raw/") or path.key.startswith("raw//") or ".." in key_path.parts:
+                raise ValueError("S3 tile keys must live under raw/ in the bucket.")
+            return path.key[len("raw/"):]
+        try:
+            return path.resolve().relative_to(raw_root).as_posix()
+        except ValueError as exc:
+            raise ValueError(
+                f"{kind} path {path} is not under raw_dir {raw_root}"
+            ) from exc
+
+    return relative_path(sat_path, "Satellite"), relative_path(terrain_path, "Terrain")
 
 
 def _load_classifier(
@@ -513,12 +510,9 @@ def _load_classifier(
         if torch is None:
             device = "cpu"
         else:
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
+            from src.scenic_scorer.regression import resolve_device
+
+            device = resolve_device(device)
     elif device == "cuda" and torch is not None and not torch.cuda.is_available():
         warnings.append("CUDA requested but unavailable; falling back to CPU.")
         device = "cpu"
@@ -564,6 +558,7 @@ def _load_learned_regressor(
     device: str,
     warnings: list[str],
 ) -> Any | None:
+    """Restore the regression architecture declared by the checkpoint."""
     if learned_regression_ckpt is None:
         return None
 
@@ -592,11 +587,13 @@ def _load_learned_regressor(
             f"Invalid learned regression checkpoint '{ckpt_path}': missing keys {sorted(missing)}"
         )
 
-    model = ScenicRegressionModel(
-        vit_dim=int(ckpt["vit_dim"]),
-        terrain_dim=int(ckpt["terrain_dim"]),
-        num_classes=int(ckpt["num_classes"]),
-    ).to(device)
+    model_kwargs = {
+        name: int(ckpt[name]) for name in ("vit_dim", "terrain_dim", "num_classes")
+    }
+    if "hidden_dim" in ckpt:
+        model_kwargs["hidden_dim"] = int(ckpt["hidden_dim"])
+
+    model = ScenicRegressionModel(**model_kwargs).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     from src.heuristics.report import _extract_report_identities
@@ -604,37 +601,6 @@ def _load_learned_regressor(
     _, model.report_identity = _extract_report_identities(ckpt)
     warnings.append(f"Using learned regression checkpoint: {ckpt_path}")
     return model
-
-
-
-
-def _infer_classifier_outputs(
-    *,
-    sat_img: Image.Image,
-    classifier: Any,
-    clf_transform: Any,
-    device: str,
-    class_names: Optional[list[str]],
-) -> tuple[int, str, float, np.ndarray, np.ndarray]:
-    if classifier is None or clf_transform is None or class_names is None:
-        raise ValueError("Classifier is required for learned scoring outputs.")
-
-    import torch
-    from src.classifier.model import get_scenic_weight
-
-    input_tensor = clf_transform(sat_img).unsqueeze(0).to(device)
-    with torch.no_grad():
-        logits_t = classifier(input_tensor)
-        features_t = classifier.get_features(input_tensor)
-        probs = torch.softmax(logits_t, dim=-1).cpu().numpy()[0]
-
-    class_id = int(np.argmax(probs))
-    class_name = class_names[class_id]
-    class_score = float(get_scenic_weight(class_name))
-
-    class_logits = logits_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
-    vit_embedding = features_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
-    return class_id, class_name, class_score, class_logits, vit_embedding
 
 
 def _predict_learned_score(
@@ -663,19 +629,36 @@ def _infer_class(
     clf_transform: Any,
     device: str,
     class_names: Optional[list[str]],
-) -> tuple[int, str, float]:
+    with_features: bool = False,
+) -> tuple[int, str, float] | tuple[int, str, float, np.ndarray, np.ndarray]:
+    """Return a class prediction, or class ID -1 when no classifier is available.
+
+    With ``with_features=True`` the classifier is required and a single
+    ``forward_with_features`` pass additionally yields class logits and the ViT
+    embedding (both float32) appended to the returned tuple.
+    """
     if classifier is None or clf_transform is None or class_names is None:
-        return 0, "unknown", 0.3
+        if with_features:
+            raise ValueError("Classifier is required for learned scoring outputs.")
+        return -1, "unknown", 0.3
 
     import torch
     from src.classifier.model import get_scenic_weight
 
     input_tensor = clf_transform(sat_img).unsqueeze(0).to(device)
     with torch.no_grad():
-        logits = classifier(input_tensor)
+        if with_features:
+            logits, features = classifier.forward_with_features(input_tensor)
+        else:
+            logits = classifier(input_tensor)
         probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
 
     class_id = int(np.argmax(probs))
     class_name = class_names[class_id]
     class_score = float(get_scenic_weight(class_name))
-    return class_id, class_name, class_score
+    if not with_features:
+        return class_id, class_name, class_score
+
+    class_logits = logits.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    vit_embedding = features.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    return class_id, class_name, class_score, class_logits, vit_embedding

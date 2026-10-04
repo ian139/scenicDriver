@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the read-only artifacts required by the New England beta API."""
+"""Admit read-only beta graphs, coverage, usable reports, and learned model identities."""
 
 from __future__ import annotations
 
@@ -12,12 +12,15 @@ import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Mapping
+
+import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
 from src.route_planner._edge_projection import EdgeProjectionIndex, _SidecarError
+from src.heuristics.report import recover_report_run_info
 from src.route_planner.graph import (
     _COMPACT_DTYPE_ITEMSIZE,
     _COMPACT_FORMAT,
@@ -25,8 +28,11 @@ from src.route_planner.graph import (
     _COMPACT_SCHEMA_VERSION,
     _COMPACT_SECTION_NAMES,
     _COMPACT_SECTION_SPECS,
+    CompactRoadGraph,
+    RoadGraph,
     _compact_highway_road_types,
 )
+from src.route_planner.service import _load_graph, load_tile_scores
 CONFIG_PATH = Path("config/app_regions.json")
 REGISTRY_PATH = Path("data/processed/regression/model_registry.json")
 DEFAULT_GRAPH_PATH = Path(
@@ -131,7 +137,7 @@ def _resolve_active_checkpoint(
 def _configured_route_regions(
     root: Path, cli_graph: Path | None = None
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Resolve all configured route-enabled regions with graph paths.
+    """Resolve the default region and every route-enabled region without skipping defects.
 
     Returns a list of dicts, each describing a route region:
         - "region": region name (str)
@@ -220,24 +226,25 @@ def _configured_route_regions(
 
     for item in regions_raw:
         if not isinstance(item, dict):
+            issues.append(f"invalid: {CONFIG_PATH} (region entry is not a dict)")
             continue
         region_name = item.get("region")
         if not isinstance(region_name, str) or not region_name:
+            issues.append(f"invalid: {CONFIG_PATH} (region name is missing)")
             continue
 
-        is_default = region_name == default_region_name
+        is_default = region_name.strip().lower() == default_region_name.strip().lower()
         if is_default:
             found_default = True
+            if item.get("route_planning") is False:
+                issues.append(f"invalid: {CONFIG_PATH} ({region_name} default route planning is disabled)")
 
-        if item.get("route_planning") is False:
+        if item.get("route_planning") is False and not is_default:
             continue
 
-        raw_graph = item.get("graph")
-        if raw_graph is None or not str(raw_graph).strip():
-            if is_default:
-                issues.append(
-                    f"invalid: {CONFIG_PATH} ({region_name} graph is missing)"
-                )
+        raw_graph = item.get("graph_path") or item.get("graph")
+        if not isinstance(raw_graph, str) or not raw_graph.strip():
+            issues.append(f"invalid: {CONFIG_PATH} ({region_name} graph is missing)")
             continue
 
         if is_default and cli_graph is not None:
@@ -260,6 +267,11 @@ def _configured_route_regions(
             }
         )
 
+    if not found_default:
+        issues.append(
+            f"invalid: {CONFIG_PATH} ({default_region_name} is not configured)"
+        )
+
     if not route_regions:
         default_graph = (
             _project_path(root, cli_graph)
@@ -275,10 +287,6 @@ def _configured_route_regions(
                 "is_default": True,
             }
         )
-        if not found_default:
-            issues.append(
-                f"invalid: {CONFIG_PATH} ({default_region_name} is not configured)"
-            )
 
     return route_regions, issues
 
@@ -304,7 +312,7 @@ def _metadata_bbox_matches(metadata_bbox: Any, configured_bbox: Any) -> bool:
 def _validate_sqlite_graph(
     graph_path: Path, region: Mapping[str, Any] | None
 ) -> list[str]:
-    """Validate SQLite graph metadata and aggregate invariants without loading rows."""
+    """Validate SQLite schema, metadata, row values, and endpoint references read-only."""
 
     label = str(graph_path)
     if region is None:
@@ -391,6 +399,34 @@ def _validate_sqlite_graph(
                     f"invalid: {label} ({name} metadata count {value} "
                     f"does not match SQLite COUNT(*) {actual})"
                 ]
+
+        numeric = "('integer', 'real')"
+        invalid_nodes = connection.execute(f"""
+            SELECT 1 FROM nodes WHERE id IS NULL OR typeof(id) != 'text' OR trim(id) = ''
+                OR typeof(lat) NOT IN {numeric} OR NOT (lat BETWEEN -90 AND 90)
+                OR typeof(lon) NOT IN {numeric} OR NOT (lon BETWEEN -180 AND 180)
+            LIMIT 1
+        """).fetchone()
+        invalid_edges = connection.execute(f"""
+            SELECT 1 FROM edges e
+            LEFT JOIN nodes s ON s.id=e.start_node_id
+            LEFT JOIN nodes t ON t.id=e.end_node_id
+            WHERE e.id IS NULL OR typeof(e.id) != 'text' OR trim(e.id) = ''
+                OR s.id IS NULL OR t.id IS NULL
+                OR typeof(e.distance_km) NOT IN {numeric}
+                OR NOT (e.distance_km BETWEEN 0 AND 1.7976931348623157e308)
+                OR typeof(e.scenic_score) NOT IN {numeric}
+                OR NOT (e.scenic_score BETWEEN 0 AND 10)
+                OR typeof(e.road_type) != 'text' OR trim(e.road_type) = ''
+                OR (e.road_name IS NOT NULL AND typeof(e.road_name) != 'text')
+                OR (e.speed_limit_kmh IS NOT NULL AND
+                    (typeof(e.speed_limit_kmh) NOT IN {numeric}
+                     OR NOT (e.speed_limit_kmh > 0 AND e.speed_limit_kmh <= 1.7976931348623157e308)))
+                OR typeof(e.one_way) != 'integer' OR e.one_way NOT IN (0, 1)
+            LIMIT 1
+        """).fetchone()
+        if invalid_nodes or invalid_edges:
+            return [f"invalid: {label} (invalid graph rows or node references)"]
 
         max_snap = region.get("max_route_snap_km")
         if isinstance(max_snap, bool):
@@ -640,8 +676,10 @@ def _validate_compact_graph(
         if not isinstance(descriptor, Mapping):
             return [f"invalid: {label} (compact section {name} has no descriptor)"]
         dtype = descriptor.get("dtype")
-        if dtype not in _COMPACT_DTYPE_ITEMSIZE:
+        if not isinstance(dtype, str) or dtype not in _COMPACT_DTYPE_ITEMSIZE:
             return [f"invalid: {label} (compact section {name} has unknown dtype)"]
+        if dtype != dict(_COMPACT_SECTION_SPECS)[name]:
+            return [f"invalid: {label} (compact section {name} has incorrect dtype)"]
         offset_val = descriptor.get("offset")
         length_val = descriptor.get("length")
         count_val = descriptor.get("count")
@@ -725,11 +763,12 @@ def _validate_compact_graph(
         return [f"invalid: {sidecar_path} (projection sidecar SHA-256 mismatch)"]
 
     try:
-        EdgeProjectionIndex.load(sidecar_path, source_path, verify=True)
+        index = EdgeProjectionIndex.load(sidecar_path, source_path, verify=True)
+        index.close()
     except (_SidecarError, ValueError, OSError) as exc:
         return [f"invalid: {sidecar_path} ({exc})"]
 
-    return []
+    return _validate_admitted_graph(manifest_path, region)
 
 def _active_checkpoint(root: Path) -> tuple[Path, list[str]]:
     """Resolve the checkpoint named by the active model-registry record."""
@@ -759,6 +798,287 @@ def _active_checkpoint(root: Path) -> tuple[Path, list[str]]:
         issues.append(f"invalid: {REGISTRY_PATH} (active checkpoint is missing)")
     return checkpoint_path, issues
 
+
+def _score_report_path(root: Path, reg: Mapping[str, Any]) -> Path:
+    """Match API startup score-report override precedence."""
+    item = reg["region_dict"] or {}
+    configured = next(
+        (item.get(key) for key in ("tile_scores_json", "tile_scores_path", "report", "report_json")
+         if item.get(key)), None,
+    )
+    if configured is not None:
+        return _project_path(root, configured)
+    return root / "data/processed/heuristic_runs" / reg["run_name"] / "report/report.json"
+
+
+def _validate_report(path: Path, checkpoint: Path, *, heatmap: bool = True) -> list[str]:
+    """Validate consumed scores and canonical learned provenance/model association."""
+    from fastapi import HTTPException
+    from src.app_api.main import _parse_heatmap_artifact
+
+    try:
+        if heatmap:
+            payload = _parse_heatmap_artifact(str(path), path.stat().st_mtime_ns)
+        else:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or not isinstance(payload.get("tiles"), list):
+                raise ValueError("invalid score report")
+            load_tile_scores(path)
+        identity = recover_report_run_info(
+            payload, source=str(path), guidance="Regenerate the admitted learned report.",
+        )
+        if identity["scoring_mode"] != "learned":
+            raise ValueError("beta report must use learned scoring")
+        if checkpoint.is_file() and identity["regression_checkpoint_sha256"] != _sha256_file(checkpoint).hex():
+            raise ValueError("report regression checkpoint identity does not match configured model")
+    except HTTPException as exc:
+        return [f"invalid: {path} ({exc.detail})"]
+    except (OSError, UnicodeError, TypeError, ValueError, KeyError, AttributeError) as exc:
+        return [f"invalid: {path} ({exc})"]
+    return []
+
+
+def _validate_saved_routes(report_dir: Path) -> list[str]:
+    """Validate the saved geometry and finite metrics consumed by validated-route."""
+    try:
+        geojson = json.loads((report_dir / "route.geojson").read_text(encoding="utf-8"))
+        metrics = json.loads((report_dir / "route_metrics.json").read_text(encoding="utf-8"))
+        if not isinstance(geojson, dict) or geojson.get("type") != "FeatureCollection":
+            raise ValueError("route must be a FeatureCollection")
+        features = geojson.get("features")
+        if not isinstance(features, list) or len(features) != 2:
+            raise ValueError("route requires scenic and baseline features")
+
+        def finite(value: Any) -> bool:
+            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+        def coordinate(value: Any, *, latitude_first: bool = False) -> None:
+            if not isinstance(value, list) or len(value) != 2 or not all(map(finite, value)):
+                raise ValueError("invalid route coordinate")
+            lat, lon = value if latitude_first else value[::-1]
+            if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+                raise ValueError("route coordinate out of range")
+
+        kinds = set()
+        for feature in features:
+            kinds.add(feature["properties"]["route_kind"])
+            geometry = feature["geometry"]
+            if geometry.get("type") != "LineString" or len(geometry.get("coordinates", [])) < 2:
+                raise ValueError("route requires complete LineString geometry")
+            for point in geometry["coordinates"]:
+                coordinate(point)
+        if kinds != {"scenic", "baseline"} or not isinstance(metrics["score_mapping"], dict):
+            raise ValueError("invalid route kinds or score mapping")
+        for kind in kinds:
+            route = metrics[kind]
+            if route["route_kind"] != kind or not all(
+                finite(route.get(key)) for key in ("total_distance_km", "estimated_duration_minutes",
+                                                   "raw_scenic_score", "normalized_scenic_score")
+            ):
+                raise ValueError("missing finite route metrics")
+        request = metrics["request"]
+        for endpoint in ("start", "end"):
+            coordinate(request.get(endpoint), latitude_first=True)
+        if not all(finite(request.get(key)) for key in ("scenic_weight", "max_detour_factor")):
+            raise ValueError("missing finite route request")
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        return [f"invalid: {report_dir} (saved route artifacts: {exc})"]
+    return []
+
+
+def _validate_json_graph_rows(path: Path) -> None:
+    """Reject missing identities and boolean numerics before runtime normalization."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("graph payload must be a mapping")
+    if path.suffix.lower() == ".geojson":
+        if payload.get("type") != "FeatureCollection" or not isinstance(payload.get("features"), list):
+            raise ValueError("graph must be a FeatureCollection")
+        for feature in payload["features"]:
+            geometry = feature["geometry"]
+            if geometry.get("type") != "LineString" or len(geometry.get("coordinates", [])) < 2:
+                raise ValueError("road geometry must be a complete LineString")
+            for point in geometry["coordinates"]:
+                if not isinstance(point, list) or len(point) != 2 or any(
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) for value in point
+                ):
+                    raise ValueError("invalid road coordinates")
+                if not -180 <= point[0] <= 180 or not -90 <= point[1] <= 90:
+                    raise ValueError("road coordinates out of range")
+        return
+    for table, required, numeric in (
+        ("nodes", ("id", "lat", "lon"), ("lat", "lon")),
+        ("edges", ("id", "start", "end", "distance_km"),
+         ("distance_km", "scenic_score", "speed_limit_kmh")),
+    ):
+        rows = payload.get(table)
+        if not isinstance(rows, list):
+            raise ValueError(f"missing graph {table}")
+        for row in rows:
+            if not isinstance(row, dict) or any(row.get(key) is None for key in required):
+                raise ValueError(f"missing required {table} fields")
+            for key in ("id", "start", "end"):
+                if key in row and (isinstance(row[key], bool) or not str(row[key]).strip()):
+                    raise ValueError(f"invalid {table} identity")
+            if any(isinstance(row.get(key), bool) for key in numeric):
+                raise ValueError(f"invalid {table} numeric fields")
+
+
+def _validate_admitted_graph(path: Path, region: Mapping[str, Any] | None) -> list[str]:
+    """Probe admitted geometry, never trusting metadata or a source-graph sidecar.
+
+    Compact payloads reuse the runtime's type/cardinality/topology validator.
+    Coverage uses bounded projection chunks from the admitted endpoint arrays.
+    """
+    graph: RoadGraph | None = None
+    try:
+        if region is None:
+            raise ValueError("configured region is unavailable")
+        if path.suffix.lower() in {".json", ".geojson"} and not path.name.endswith(".compact.json"):
+            _validate_json_graph_rows(path)
+        graph = _load_graph(path)
+        if not graph.nodes or not graph.edges:
+            raise ValueError("graph must contain nodes and edges")
+        if isinstance(graph, CompactRoadGraph):
+            sections = graph._sections
+            for name, bound in (("node_lat", 90), ("node_lon", 180)):
+                if np.any(np.abs(sections[name]) > bound):
+                    raise ValueError("node coordinates out of range")
+            if np.any((sections["edge_scenic_score"] < 0) | (sections["edge_scenic_score"] > 10)):
+                raise ValueError("scenic scores out of range")
+        else:
+            for node in graph.nodes.values():
+                if not node.id.strip() or not math.isfinite(node.lat) or not -90 <= node.lat <= 90 or not math.isfinite(node.lon) or not -180 <= node.lon <= 180:
+                    raise ValueError("invalid node identity or coordinates")
+            for edge in graph.edges.values():
+                if not edge.id.strip() or not edge.road_type.strip() or edge.start_node_id not in graph.nodes or edge.end_node_id not in graph.nodes:
+                    raise ValueError("invalid edge identity or node references")
+                if not math.isfinite(edge.distance_km) or edge.distance_km < 0 or not math.isfinite(edge.scenic_score) or not 0 <= edge.scenic_score <= 10:
+                    raise ValueError("invalid edge numeric values")
+
+        probes = region.get("coverage_probes", {
+            name: {"lat": lat, "lon": lon}
+            for name, (lat, lon) in _CANONICAL_PROBE_COORDINATES.items()
+        })
+        max_snap = region.get("max_route_snap_km")
+        if isinstance(max_snap, bool) or not isinstance(max_snap, (int, float)) or not math.isfinite(max_snap) or max_snap < 0:
+            raise ValueError("invalid max_route_snap_km")
+        if not isinstance(probes, Mapping) or not probes:
+            raise ValueError("invalid coverage_probes")
+        queries = []
+        for name, probe in probes.items():
+            lat, lon = probe["lat"], probe["lon"]
+            if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in (lat, lon)) or not -90 <= lat <= 90 or not -180 <= lon <= 180:
+                raise ValueError(f"invalid coverage probe {name}")
+            queries.append((name, lat, lon))
+        nearest = [math.inf] * len(queries)
+
+        def project(start_lat: np.ndarray, start_lon: np.ndarray,
+                    end_lat: np.ndarray, end_lon: np.ndarray) -> None:
+            for index, (_, lat, lon) in enumerate(queries):
+                distances = EdgeProjectionIndex._project_edge_chunk(
+                    lat, lon, math.cos(math.radians(lat)), start_lat, start_lon,
+                    end_lat, end_lon, 0, len(start_lat),
+                )[3]
+                nearest[index] = min(nearest[index], float(np.min(distances)))
+
+        chunk_size = 65_536
+        if isinstance(graph, CompactRoadGraph):
+            for start in range(0, graph.edge_count, chunk_size):
+                stop = start + chunk_size
+                start_ranks = sections["edge_start_rank"][start:stop]
+                end_ranks = sections["edge_end_rank"][start:stop]
+                project(sections["node_lat"][start_ranks], sections["node_lon"][start_ranks],
+                        sections["node_lat"][end_ranks], sections["node_lon"][end_ranks])
+        else:
+            coordinates = []
+            for edge in graph.edges.values():
+                start_node = graph.nodes[edge.start_node_id]
+                end_node = graph.nodes[edge.end_node_id]
+                coordinates.append((start_node.lat, start_node.lon, end_node.lat, end_node.lon))
+                if len(coordinates) == chunk_size:
+                    project(*np.asarray(coordinates).T)
+                    coordinates.clear()
+            if coordinates:
+                project(*np.asarray(coordinates).T)
+        for (name, _, _), distance in zip(queries, nearest):
+            if not math.isfinite(distance) or distance > max_snap:
+                raise ValueError(f"coverage probe {name} on admitted graph exceeds max_route_snap_km ({distance} km)")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, OverflowError) as exc:
+        return [f"invalid: {path} ({exc})"]
+    finally:
+        if graph is not None:
+            graph.close()
+    return []
+
+def _validate_readiness_gate(root: Path, graph_path: Path) -> list[str]:
+    """Validate the builder's ``run.json`` publication gate for one admitted graph.
+
+    Mirrors the runtime gate in ``src.app_api.main._graph_readiness``: the
+    record must carry the shipped graph identity, project-root-relative paths,
+    and (when the admitted graph is the compact manifest) the compact identity.
+    A missing or stale gate means the API refuses to route the region, so
+    admission must fail the same deployment the runtime would treat as
+    not-ready.
+    """
+    gate = graph_path.parent / "run.json"
+    label = str(gate)
+    try:
+        record = json.loads(gate.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return [f"invalid: {label} (readiness gate: {exc})"]
+    if not isinstance(record, dict):
+        return [f"invalid: {label} (readiness gate is not a dict)"]
+
+    output = record.get("output_graph")
+    digest = record.get("graph_sha256")
+    size = record.get("graph_size_bytes")
+    if (
+        not isinstance(output, str) or not output
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or type(size) is not int or size < 0
+    ):
+        return [
+            f"invalid: {label} (readiness gate has invalid graph identity fields)"
+        ]
+    source = _project_path(root, output)
+    if not source.is_file():
+        return [
+            f"invalid: {label} (readiness gate output_graph is missing: {source})"
+        ]
+    if source.stat().st_size != size or _sha256_file(source).hex() != digest:
+        return [
+            f"invalid: {label} (readiness gate graph identity does not match {source})"
+        ]
+
+    if source.resolve() != graph_path.resolve():
+        compact = record.get("runtime_graph") or record.get("compact_graph")
+        compact_digest = record.get("compact_manifest_sha256")
+        if not isinstance(compact, str) or not compact:
+            return [
+                f"invalid: {label} (readiness gate does not name the admitted "
+                f"compact manifest {graph_path})"
+            ]
+        compact_path = _project_path(root, compact)
+        if compact_path.resolve() != graph_path.resolve():
+            return [
+                f"invalid: {label} (readiness gate runtime_graph resolves to "
+                f"{compact_path}, not {graph_path})"
+            ]
+        if (
+            not isinstance(compact_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", compact_digest) is None
+            or _sha256_file(graph_path).hex() != compact_digest
+        ):
+            return [
+                f"invalid: {label} (readiness gate compact manifest identity "
+                f"does not match {graph_path})"
+            ]
+    return []
+
+
 def check_artifacts(project_root: Path, graph: Path | None = None) -> int:
     root = project_root.resolve()
     regions, issues = _configured_route_regions(root, cli_graph=graph)
@@ -772,9 +1092,20 @@ def check_artifacts(project_root: Path, graph: Path | None = None) -> int:
 
     for reg in regions:
         graph_path = reg["graph_path"]
+        region_dict = reg["region_dict"] or {}
+        model_path = _project_path(root, region_dict["model_checkpoint"]) if region_dict.get("model_checkpoint") else checkpoint_path
+        reg["model_path"] = model_path
+        required_paths.append(model_path)
+        report_path = _score_report_path(root, reg)
+        reg["report_path"] = report_path
+        required_paths.append(report_path)
         run_name = reg["run_name"]
         if graph_path and graph_path not in required_paths:
             required_paths.append(graph_path)
+        if graph_path:
+            gate_path = graph_path.parent / "run.json"
+            if gate_path not in required_paths:
+                required_paths.append(gate_path)
         if run_name:
             report_dir = root / "data/processed/heuristic_runs" / run_name / "report"
             for name in ("report.json", "route.geojson", "route_metrics.json"):
@@ -794,21 +1125,40 @@ def check_artifacts(project_root: Path, graph: Path | None = None) -> int:
             continue
 
         if graph_path.suffix.lower() == ".sqlite3":
-            issues.extend(_validate_sqlite_graph(graph_path, region_dict))
+            graph_issues = _validate_sqlite_graph(graph_path, region_dict)
+            issues.extend(graph_issues)
+            if not graph_issues:
+                issues.extend(_validate_admitted_graph(graph_path, region_dict))
             compact_manifest = graph_path.with_name(f"{graph_path.stem}.compact.json")
             if compact_manifest.is_file():
                 issues.extend(_validate_compact_graph(compact_manifest, region_dict))
             sidecar_path = EdgeProjectionIndex.sidecar_path(graph_path)
             if sidecar_path.is_file() and not compact_manifest.is_file():
                 try:
-                    EdgeProjectionIndex.load(sidecar_path, graph_path, verify=True)
+                    index = EdgeProjectionIndex.load(sidecar_path, graph_path, verify=True)
+                    index.close()
                 except (_SidecarError, ValueError, OSError) as exc:
                     issues.append(f"invalid: {sidecar_path} ({exc})")
-        elif (
-            graph_path.name.endswith(".compact.json")
-            or graph_path.suffix.lower() == ".json"
-        ) and graph_path not in missing:
+        elif graph_path.name.endswith(".compact.json"):
             issues.extend(_validate_compact_graph(graph_path, region_dict))
+        elif graph_path.suffix.lower() in {".json", ".geojson"}:
+            issues.extend(_validate_admitted_graph(graph_path, region_dict))
+        else:
+            issues.append(f"invalid: {graph_path} (unsupported graph format)")
+        issues.extend(_validate_readiness_gate(root, graph_path))
+
+    for reg in regions:
+        report_path = reg["report_path"]
+        canonical_report = root / "data/processed/heuristic_runs" / reg["run_name"] / "report/report.json"
+        if report_path != canonical_report and report_path not in missing:
+            issues.extend(_validate_report(report_path, reg["model_path"], heatmap=False))
+        if reg["run_name"]:
+            report_dir = root / "data/processed/heuristic_runs" / reg["run_name"] / "report"
+            canonical_report = report_dir / "report.json"
+            if canonical_report not in missing:
+                issues.extend(_validate_report(canonical_report, reg["model_path"]))
+            if all((report_dir / name) not in missing for name in ("route.geojson", "route_metrics.json")):
+                issues.extend(_validate_saved_routes(report_dir))
 
     for path in missing:
         try:
@@ -827,7 +1177,7 @@ def main() -> int:
         "--graph",
         type=Path,
         default=None,
-        help="Optional candidate graph path overriding the configured graph",
+        help="Candidate graph overriding only the default region; all required regions remain admitted",
     )
     parser.add_argument(
         "--project-root",

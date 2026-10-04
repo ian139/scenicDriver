@@ -35,20 +35,20 @@ class RouteCompareRequest(BaseModel):
 
 
 class ContributorSessionStartRequest(BaseModel):
-    contributor_id: str
-    display_name: str | None = None
-    region: str = "pittsfield"
+    contributor_id: str = Field(min_length=1, max_length=128)
+    display_name: str | None = Field(default=None, max_length=128)
+    region: str = Field(default="pittsfield", min_length=1, max_length=128)
 
 
 class ContributorLabelRequest(BaseModel):
-    contributor_id: str
-    task_id: str
-    image_path: str
+    contributor_id: str = Field(min_length=1, max_length=128)
+    task_id: str = Field(min_length=1, max_length=128)
+    image_path: str = Field(min_length=1, max_length=2048)
     scenic_human: float | None = Field(default=None, ge=0.0, le=10.0, allow_inf_nan=False)
-    confidence: str = "medium"
+    confidence: str = Field(default="medium", max_length=32)
     skip: bool = False
-    notes: str = ""
-    region: str = "pittsfield"
+    notes: str = Field(default="", max_length=4096)
+    region: str = Field(default="pittsfield", min_length=1, max_length=128)
 
     @model_validator(mode="after")
     def require_score_unless_skipping(self) -> "ContributorLabelRequest":

@@ -13,6 +13,9 @@ Authorization boundaries (all fail closed, all atomic):
   ``acquisition_authorization_request.json`` (null caps, requester-pays false);
 - ``--execute-plan`` requires the plan path, its expected SHA-256, positive
   request/transfer/local/requester-pays-spend caps and ``--allow-requester-pays``.
+- metadata discovery alone may transition a discovery run to its hash-pinned
+  resolved contract; all non-catalog inputs remain immutable;
+- failed or cap-aborted acquisition prints its checkpoint summary and exits 1.
 
 No Mapbox acquisition path exists in this CLI.  The only admissible imagery
 source is ``naip-visualization`` and the only admissible terrain source is
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -211,17 +215,71 @@ def _check_plan_identity(
     pilot_budget: int | None,
     geometry_digest: str,
     repository_source_tree_digest: str | None = None,
-) -> None:
-    """Refuse to rewrite an existing run whose planning inputs drifted."""
+    contract: dict[str, Any],
+    contract_path: Path | str,
+    metadata_resolution: dict[str, Any] | None,
+    image_root: Path | str,
+    app_regions_sha: str,
+) -> dict[str, Any] | None:
+    """Allow only an explicit, validated metadata-discovery identity transition."""
     manifest_path = run_dir / "region_manifest.json"
     if not manifest_path.exists():
-        return
+        if metadata_resolution is not None:
+            raise ValueError("source resolution requires an existing discovery run")
+        return None
     with manifest_path.open(encoding="utf-8") as stream:
         existing = json.load(stream)
     inputs = existing.get("inputs", {})
+    transition = existing.get("source_contract_transition")
+    authorized_contract_sha = contract_sha
+    if metadata_resolution is not None:
+        if (
+            existing.get("stage_state") != "needs_discovery"
+            or existing.get("execution_plan_sha256") is not None
+            or (run_dir / "execution_plan.json").exists()
+        ):
+            raise ValueError("source resolution requires an unfrozen discovery run")
+        original, original_sha = load_source_contract(inputs["source_contract_path"])
+        if (
+            original_sha != inputs.get("source_contract_sha256")
+            or metadata_resolution.get("source_contract_sha256") != original_sha
+            or contract.get("resolved_from_source_contract_sha256") != original_sha
+            or metadata_resolution.get("resolved_contract_sha256") != contract_sha
+            or Path(metadata_resolution["resolved_contract_path"]).resolve()
+            != Path(contract_path).resolve()
+        ):
+            raise ValueError("unauthorized source contract resolution identity")
+        expected = json.loads(canonical_json_bytes(original))
+        for section in ("imagery", "terrain"):
+            observed_sha = metadata_resolution.get(f"{section}_catalog_sha256")
+            prior_sha = original[section].get("catalog_sha256")
+            if observed_sha is None:
+                observed_sha = prior_sha
+            if (
+                not isinstance(observed_sha, str)
+                or len(observed_sha) != 64
+                or any(char not in "0123456789abcdef" for char in observed_sha)
+                or (prior_sha is not None and prior_sha.lower() != observed_sha)
+                or file_sha256(Path(original[section]["catalog_snapshot"])) != observed_sha
+            ):
+                raise ValueError(f"unauthorized {section} catalog resolution")
+            expected[section]["catalog_sha256"] = observed_sha
+        expected["resolved_from_source_contract_sha256"] = original_sha
+        if expected != contract:
+            raise ValueError("source resolution changed non-catalog contract inputs")
+        authorized_contract_sha = original_sha
+        transition = {
+            "type": "authorized_metadata_discovery",
+            "from_sha256": original_sha,
+            "to_sha256": contract_sha,
+            "imagery_catalog_sha256": expected["imagery"]["catalog_sha256"],
+            "terrain_catalog_sha256": expected["terrain"]["catalog_sha256"],
+        }
     checks = {
         "region_spec_sha256": (inputs.get("region_spec_sha256"), spec_sha),
-        "source_contract_sha256": (inputs.get("source_contract_sha256"), contract_sha),
+        "source_contract_sha256": (
+            inputs.get("source_contract_sha256"), authorized_contract_sha
+        ),
         "zoom": (existing.get("zoom"), zoom),
         "tile_budget_coordinates": (existing.get("tile_budget_coordinates"), budget),
         "pilot_budget": (existing.get("pilot_budget"), pilot_budget),
@@ -231,10 +289,13 @@ def _check_plan_identity(
             or existing.get("repository_source_tree_digest"),
             repository_source_tree_digest,
         ),
+        "image_root": (inputs.get("image_root"), str(image_root)),
+        "app_regions_sha256": (inputs.get("app_regions_sha256"), app_regions_sha),
     }
     for name, (old, new) in checks.items():
-        if old is not None and old != new:
+        if old != new:
             raise ValueError(f"existing run identity drift: {name}")
+    return transition
 
 
 def _compact_json(value: Any) -> str:
@@ -369,12 +430,15 @@ def plan_run(
     budget: int = MAX_COORDINATES,
     pilot_budget: int | None = None,
     max_runtime_minutes: int | None = None,
+    metadata_resolution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate geometry, catalogs, and contracts; compute the exact plan.
 
     Never touches the network.  Missing catalogs produce a discovery
     authorization request; a complete plan without execution caps produces the
     immutable execution plan plus an acquisition authorization request.
+    ``metadata_resolution`` is the successful authorized discovery result, not
+    a hash bypass: only catalog hash bindings and the origin marker may change.
     """
     run_name = validate_run_name(run_name)
     validate_imagery_source(imagery_source)
@@ -409,6 +473,10 @@ def plan_run(
         raise ValueError("max_runtime_minutes must be a positive int or None")
 
     contract, contract_sha = load_source_contract(source_contract_path)
+    expected_dimensions = (
+        int(contract["preprocessing"]["tile_width"]),
+        int(contract["preprocessing"]["tile_height"]),
+    )
     region_spec = spec if spec is not None else _load_spec(spec_path)
     planned = parse_and_validate_region_spec(
         region_spec,
@@ -435,7 +503,7 @@ def plan_run(
 
     run_dir = Path(output_root) / run_name
     tree_digest = repository_source_tree_digest()
-    _check_plan_identity(
+    source_contract_transition = _check_plan_identity(
         run_dir,
         spec_sha=spec_sha,
         contract_sha=contract_sha,
@@ -444,6 +512,11 @@ def plan_run(
         pilot_budget=pilot_budget,
         geometry_digest=str(planned["geometry_digest"]),
         repository_source_tree_digest=tree_digest,
+        contract=contract,
+        contract_path=source_contract_path,
+        metadata_resolution=metadata_resolution,
+        image_root=image_root,
+        app_regions_sha=file_sha256(Path(config_path)),
     )
 
     if pilot_budget is not None:
@@ -455,6 +528,7 @@ def plan_run(
     else:
         ordered_coords = list(planned["ordered_coords"])
         pilot_frame_sha = None
+    coordinate_order = {coord: index for index, coord in enumerate(ordered_coords)}
     tile_planning = dict(planned)
     tile_planning["ordered_coords"] = ordered_coords
     tile_planning["coord_to_region"] = {
@@ -487,7 +561,10 @@ def plan_run(
         tile_plans=None,
         tree_digest=tree_digest,
     )
-    rows, counts = scan_tile_inventory(rows, image_root=image_root)
+    rows, counts = scan_tile_inventory(
+        rows, image_root=image_root, expected_dimensions=expected_dimensions
+    )
+    rows.sort(key=lambda row: coordinate_order[(int(row["x"]), int(row["y"]))])
     water_counts = _assess_water_inventory(rows)
 
     missing_catalogs: list[str] = []
@@ -520,7 +597,10 @@ def plan_run(
             tile_plans=tile_plans_result["tile_plans"],
             tree_digest=tree_digest,
         )
-        rows, counts = scan_tile_inventory(rows, image_root=image_root)
+        rows, counts = scan_tile_inventory(
+            rows, image_root=image_root, expected_dimensions=expected_dimensions
+        )
+        rows.sort(key=lambda row: coordinate_order[(int(row["x"]), int(row["y"]))])
         water_counts = _assess_water_inventory(rows)
 
         write_manifest_csv(run_dir / "tile_manifest.csv", rows)
@@ -601,6 +681,20 @@ def plan_run(
             target_bbox=target_bbox,
             resume_command="",
             repository_source_tree_digest=tree_digest,
+            planning_options={
+                "run_name": run_name,
+                "region_spec": spec_path,
+                "source_contract": str(source_contract_path),
+                "image_root": str(image_root),
+                "output_root": str(output_root),
+                "region_source": str(config_path),
+                "imagery_source": imagery_source,
+                "terrain_source": terrain_source,
+                "zoom": zoom,
+                "budget": budget,
+                "pilot_budget": pilot_budget,
+                "max_runtime_minutes": max_runtime_minutes,
+            },
         )
         req_auth = authorization["required_authorization"]
         authorization_path = run_dir / "discovery_authorization_request.json"
@@ -608,30 +702,29 @@ def plan_run(
         # the artifact can carry its own digest without a circular self-hash).
         authorization_sha = authorization_payload_digest(authorization)
 
-        resume_cmd = (
-            "uv run python scripts/ingest/plan_active_learning_region.py "
-            f"--run-name {run_name} "
-            f"--discover-raw-catalogs "
-            f"--discovery-request {authorization_path} "
-            f"--expected-discovery-request-sha256 {authorization_sha} "
-            f"--source-contract {source_contract_path} "
-            f"--imagery-source {imagery_source} --terrain-source {terrain_source} "
-            f"--image-root {image_root} --output-root {output_root} "
-            f"--budget {budget}"
-            + (f" --pilot-budget {pilot_budget}" if pilot_budget is not None else "")
-            + (f" --region-spec {spec_path}" if spec_path else "")
-            + (f" --region-source {config_path}" if config_path else "")
-            + (
-                f" --max-runtime-minutes {max_runtime_minutes}"
-                if max_runtime_minutes is not None
-                else ""
-            )
-            + " --allow-requester-pays "
-            f"--max-source-requests {req_auth['max_requests']} "
-            f"--max-transfer-bytes {req_auth['max_transfer_bytes']} "
-            f"--max-local-bytes {req_auth['max_local_bytes']} "
-            f"--max-requester-pays-usd {req_auth['max_spend_usd']}"
-        )
+        resume_argv = [
+            "uv", "run", "python", "scripts/ingest/plan_active_learning_region.py",
+            "--run-name", run_name, "--discover-raw-catalogs",
+            "--discovery-request", str(authorization_path),
+            "--expected-discovery-request-sha256", authorization_sha,
+            "--source-contract", str(source_contract_path),
+            "--imagery-source", imagery_source, "--terrain-source", terrain_source,
+            "--image-root", str(image_root), "--output-root", str(output_root),
+            "--region-source", str(config_path), "--zoom", str(zoom),
+            "--budget", str(budget), "--allow-requester-pays",
+            "--max-source-requests", str(req_auth["max_requests"]),
+            "--max-transfer-bytes", str(req_auth["max_transfer_bytes"]),
+            "--max-local-bytes", str(req_auth["max_local_bytes"]),
+            "--max-requester-pays-usd", str(req_auth["max_spend_usd"]),
+        ]
+        for flag, value in (
+            ("--pilot-budget", pilot_budget),
+            ("--region-spec", spec_path),
+            ("--max-runtime-minutes", max_runtime_minutes),
+        ):
+            if value is not None:
+                resume_argv.extend([flag, str(value)])
+        resume_cmd = shlex.join(resume_argv)
         authorization["resume_command"] = resume_cmd
         atomic_write_json(authorization_path, authorization)
 
@@ -688,6 +781,7 @@ def plan_run(
     manifest = {
         "schema_version": PLANNING_SCHEMA_VERSION,
         "run_name": run_name,
+        "zoom": zoom,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "repository_revision": _repository_revision(),
         "repository_source_tree_digest": tree_digest,
@@ -731,6 +825,7 @@ def plan_run(
             "region_spec_sha256": spec_sha,
             "region_spec_path": spec_path,
             "source_contract_sha256": contract_sha,
+            "image_root": str(image_root),
             "source_contract_path": str(source_contract_path),
             "repository_source_tree_digest": tree_digest,
             "terrain_catalog_sha256": terrain_catalog_sha,
@@ -833,6 +928,7 @@ def plan_run(
             "note": "acquisition requires --execute-plan, --expected-plan-sha256, positive caps and --allow-requester-pays",
         },
         "execution_plan_sha256": plan_sha256,
+        "source_contract_transition": source_contract_transition,
         "stage_state": "needs_discovery" if missing_catalogs else "planned",
         "ready_for_selection": False,
     }
@@ -1059,6 +1155,7 @@ def main() -> None:
             budget=args.budget,
             pilot_budget=args.pilot_budget,
             max_runtime_minutes=args.max_runtime_minutes,
+            metadata_resolution=meta_result,
         )
         print(
             json.dumps(
@@ -1139,6 +1236,8 @@ def main() -> None:
                 sort_keys=True,
             )
         )
+        if result["state"] in {"failed", "aborted_cap"}:
+            raise SystemExit(1)
         return
 
     if not args.run_name:

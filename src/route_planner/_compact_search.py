@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 import ctypes
 import math
@@ -110,22 +109,6 @@ def _ensure_compiled_library() -> Optional[ctypes.CDLL]:
             + ranked_argtypes[2:]
         )
         lib.compact_bidirectional_search_alloc_ranked_edge_scores.restype = ctypes.c_int32
-        lib.compact_bidirectional_search_alloc.argtypes = [
-            ctypes.POINTER(_CompactGraphSpec),
-            ctypes.POINTER(_CostSpec),
-            ctypes.POINTER(ctypes.c_int32),
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.c_int32,
-            ctypes.POINTER(ctypes.c_int32),
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.c_int32,
-            ctypes.POINTER(ctypes.POINTER(ctypes.c_int64)),
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_int32),
-            ctypes.POINTER(ctypes.c_int32),
-            ctypes.c_double,
-        ]
-        lib.compact_bidirectional_search_alloc.restype = ctypes.c_int32
         lib.compact_bidirectional_search_alloc_ranked.argtypes = ranked_argtypes
         lib.compact_bidirectional_search_alloc_ranked.restype = ctypes.c_int32
         lib.compact_free_positions.argtypes = [ctypes.POINTER(ctypes.c_int64)]
@@ -378,17 +361,23 @@ def run_compact_bidirectional_search(
             native_deadline_seconds,
         )
 
-    if res == -2:
-        raise RoutingTimeout("compiled compact search deadline exceeded")
-    if res == -3:
-        raise ValueError("cumulative calculated cost must be finite and non-negative")
-    if res < 0 or out_fwd_idx.value < 0 or out_rev_idx.value < 0:
-        return None
-
     try:
+        if res == -2:
+            raise RoutingTimeout("compiled compact search deadline exceeded")
+        if res == -3:
+            raise ValueError(
+                "cumulative calculated cost must be finite and non-negative"
+            )
+        if res == -4:
+            raise ValueError("compact score sidecar contains non-finite scenic scores")
+        if res < 0 or out_fwd_idx.value < 0 or out_rev_idx.value < 0:
+            return None
         positions = [int(out_pos_ptr[i]) for i in range(res)]
     finally:
-        lib.compact_free_positions(out_pos_ptr)
+        # The native call only hands back a buffer on success, but free any
+        # non-NULL pointer unconditionally so no result path can leak it.
+        if out_pos_ptr:
+            lib.compact_free_positions(out_pos_ptr)
     return (
         positions,
         float(out_cost.value),

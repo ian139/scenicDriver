@@ -19,7 +19,7 @@
 <rect x="592.0" y="180.0" width="212.0" height="120.0" rx="6.0" fill="#f7f5ef" stroke="#b85c38" />
 <rect x="592.0" y="180.0" width="9.0" height="120.0" rx="0.0" fill="#b85c38" stroke="none" />
 <text x="618.0" y="228.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:18px;font-weight:bold;fill:#1f2933;">Native search</text>
-<text x="618.0" y="257.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">four multiplier searches</text>
+<text x="618.0" y="257.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:normal;fill:#52616b;">4 multiplier searches</text>
 <rect x="848.0" y="180.0" width="212.0" height="120.0" rx="6.0" fill="#f7f5ef" stroke="#9b6c16" />
 <rect x="848.0" y="180.0" width="9.0" height="120.0" rx="0.0" fill="#9b6c16" stroke="none" />
 <text x="874.0" y="228.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:18px;font-weight:bold;fill:#1f2933;">Semantic oracle</text>

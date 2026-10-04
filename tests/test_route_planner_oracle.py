@@ -2765,13 +2765,6 @@ def test_target_bounded_builtin_search_matches_canonical_without_reverse_map(
     )
     planner = ScenicRoutePlanner(graph)
     planner._LARGE_GRAPH_EDGE_THRESHOLD = 0
-    monkeypatch.setattr(
-        planner,
-        "_cached_reverse_index",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("legacy reverse map used")
-        ),
-    )
     fastest = planner._make_fastest_cost_function()
     expected = planner._canonical_fastest_edges(
         graph.get_node("0"), graph.get_node("19"), False

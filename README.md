@@ -132,11 +132,23 @@ uv run python scripts/ingest/plan_active_learning_region.py \
   --workers 8
 uv run python scripts/modeling/score_active_learning_pool.py --manifest data/processed/active_learning/<run_name>/tile_manifest.csv --run-name <run_name>
 uv run python scripts/annotation/select_active_learning.py --candidate-input data/processed/active_learning/<run_name>/candidate_pool.csv --prior-annotations data/raw/labels_human.csv --run-name <run_name>
-uv run python scripts/annotation/annotate_scenic_web.py --batch-csv data/processed/active_learning/<run_name>/annotation_batch.csv --annotations-csv data/raw/labels_human.csv
-uv run python scripts/modeling/build_mixed_labels.py --heuristic-labels data/processed/active_learning/<run_name>/candidate_pool.csv --annotations-csv data/raw/labels_human.csv --output data/processed/active_learning/<run_name>/mixed_labels.csv
+uv run python scripts/annotation/annotate_scenic_web.py --batch-csv data/processed/active_learning/<run_name>/annotation_batch.csv --annotations-csv data/raw/labels_human.csv --raw-dir data/raw/sources/naip_3dep_v1
+uv run python scripts/modeling/build_mixed_labels.py --heuristic-labels data/processed/active_learning/<run_name>/candidate_pool.csv --annotations-csv data/raw/labels_human.csv --geographic-splits-csv data/processed/active_learning/<run_name>/geographic_splits.csv --output data/processed/active_learning/<run_name>/mixed_labels.csv
 uv run python scripts/annotation/build_human_benchmark.py --annotations-csv data/raw/labels_human.csv --geographic-splits-csv data/processed/active_learning/<run_name>/geographic_splits.csv --output-dir data/processed/active_learning --run-name <run_name>
 uv run python scripts/annotation/finalize_stage1.py --run-root data/processed/active_learning/<run_name> --run-name <run_name>
 ```
+
+`scripts/annotation/annotate_scenic_web.py` accepts repeatable
+`--trusted-authority <host[:port]>` values in addition to its loopback default.
+Public DNS names, wildcard binds, and reverse-proxy deployments must list every
+served authority explicitly or the annotator rejects the request as
+`untrusted_host`.
+
+`scripts/annotation/build_source_shift_batch.py` accepts `--image-root <dir>`,
+the directory both sources' satellite tiles live under. `image_path` is emitted
+relative to it and the summary records it as `image_root`; point the annotator's
+`raw_dir` at exactly that root so one annotator serves both sources. It defaults
+to the deepest common directory of the sampled satellite tiles.
 
 Train one bounded deterministic Stage-Two candidate from an admitted handoff:
 
@@ -147,22 +159,26 @@ uv run python scripts/modeling/train_active_scenic.py \
   --epochs 20 --batch-size 64 --max-steps 200 --max-seconds 1800 --device auto
 ```
 
-The guarded autoresearch launcher is opt-in. It validates the Stage-One handoff,
-active baseline, human benchmarks, route QA, and bounded experiment ladder
-before starting work:
+The Stage-Two autoresearch orchestrator validates the Stage-One handoff, the
+control dataset, both human benchmarks, route QA, and the decision thresholds
+before starting work. `--control-dataset` must be a control feature dataset NPZ
+that is disjoint from the expanded prepared dataset, and `--thresholds-json` is
+required for every non-dry execution:
 
 ```bash
-OMP_RUN_AUTORESEARCH=1 bash autoresearch.sh \
+uv run python scripts/modeling/run_active_scenic_autoresearch.py \
   --handoff data/processed/active_learning/<run_name>/stage1_handoff.json \
   --run-name <run_name> \
   --expanded-benchmark-csv data/processed/active_learning/<run_name>/expanded_human_benchmark.csv \
   --control-benchmark-csv data/processed/active_learning/<run_name>/control_benchmark.csv \
+  --control-dataset <control_feature_dataset.npz> \
   --route-qa-json data/processed/active_learning/<run_name>/route_qa.json \
+  --thresholds-json <decision_thresholds.json> \
   --max-experiments 3 --max-steps 200 --max-seconds 1800 --device auto
 ```
 
-Omit `OMP_RUN_AUTORESEARCH=1` to keep the launcher inert. Use `--dry-run` to
-validate inputs and persist only the planned experiment ladder.
+Use `--dry-run` to validate inputs and persist only the planned experiment
+ladder.
 
 
 The finalizer fails closed unless acquisition, scoring, human annotation,
@@ -179,6 +195,7 @@ uv run python scripts/annotation/build_source_shift_batch.py \
   --new-manifest data/processed/active_learning/<run_name>/tile_manifest.csv \
   --old-source-identity <mapbox_source_contract_sha256> \
   --new-source-identity <naip_3dep_source_contract_sha256> \
+  --image-root <shared_satellite_tile_root> \
   --output-batch-csv data/processed/active_learning/<run_name>/source_shift_batch.csv \
   --output-summary-json data/processed/active_learning/<run_name>/source_shift_batch.summary.json \
   --sample-size 200 --seed 42
@@ -207,6 +224,43 @@ uv run python scripts/modeling/export_prediction_heatmap.py \
   --run-name <experimental_run_name>
 ```
 
+## Additional CLI contracts
+
+Several modeling, report, and remote-training commands gained required or
+newly-documented inputs:
+
+- `scripts/modeling/build_mixed_labels.py` and
+  `scripts/modeling/run_regression_pipeline.py` require
+  `--geographic-splits-csv <path>`, the run's fixed `image_path`/`split`
+  assignments. Mixed labels are only ever built against that fixed snapshot, and
+  the builder drops rows outside it.
+- `scripts/modeling/train_regression_baseline.py` requires
+  `--benchmark-split-csv <path>`, the fixed benchmark split whose validation and
+  test identities are excluded from training before the internal split. The
+  trainer receives its validation membership explicitly and persists it as a
+  split artifact (`--split-artifact`, default `<output stem>.split.json`).
+- `scripts/modeling/evaluate_regression_baseline.py` requires
+  `--split-artifact <path>`, the split artifact written during training. It
+  reproduces exactly the trained model's validation membership through the
+  shared derivation in `scripts/modeling/regression_split.py` and fails on any
+  drift; it never derives a validation split from the dataset alone.
+- `scripts/modeling/run_regression_pipeline.py` requires
+  `--baseline-checkpoint <path>` in addition to `--benchmark-split-csv`, so the
+  candidate is compared against an explicit baseline rather than an inferred one.
+- `scripts/reports/heuristic_report.py` accepts `--learned-run-json <path>`,
+  attested learned run metadata that supplies missing checkpoint identities.
+  Declared identities must match the loaded artifacts; the report never infers
+  them.
+- `scripts/remote/vast_train.py run` requires `--benchmark-split-key <s3-key>`,
+  the exact S3 object key of the benchmark split CSV whose validation and test
+  identities are excluded from training. See the
+  [Vast.ai runbook](docs/setup/vast-training.md).
+- `notebooks/learned_scoring.mo.py` requires the per-run
+  `cfg.benchmark_split_csv` configuration value (no default): set it to the run's
+  benchmark split CSV, which the notebook passes on as `--benchmark-split-csv`.
+  It passes `cfg.split_artifact` to both training and evaluation, and evaluation
+  fails when the artifact is absent.
+
 ## Documentation
 
 - [Architecture](docs/architecture/infrastructure.md) — current offline and online system boundaries
@@ -219,6 +273,7 @@ uv run python scripts/modeling/export_prediction_heatmap.py \
 - [Nationwide streaming score-map proposal](docs/research/nationwide-streaming-score-map.md) — proposed score-only CONUS architecture, cost hypothesis, and required gates
 - [Routing performance research](docs/research/routing-performance-autoresearch.md) — current conclusions, benchmark evidence, rejected experiments, and reproducible figures
 - [Archive manifest](archive/archive.md) — historical, non-primary material
+- [Changelog](CHANGELOG.md) — user-visible contract changes
 
 ## Tests
 

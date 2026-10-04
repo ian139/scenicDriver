@@ -1,4 +1,4 @@
-"""Safe, dependency-light localhost web UI for absolute scenic annotation."""
+"""Safe scenic annotation UI; wildcard/proxy access needs --trusted-authority host:port."""
 
 from __future__ import annotations
 
@@ -409,6 +409,8 @@ def _sample_stratified(frame: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
     chunks: list[pd.DataFrame] = []
     remaining = min(n, len(frame))
     for index, class_id in enumerate(groups):
+        if remaining <= 0:
+            break
         group = frame[frame["class_id"] == class_id]
         take = min(len(group), max(1, remaining // max(1, len(groups) - index)))
         chunks.append(group.sample(n=take, random_state=seed))
@@ -487,6 +489,24 @@ def _serve_image_bytes(
     return body, mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
 
+def _scope_token(batch_id: str, annotator_id: str, annotations_csv: str) -> str:
+    """Bind a save to one batch/annotator/destination identity.
+
+    Deterministic so two clients that loaded the same scope share a token,
+    while any batch switch rotates it.
+    """
+    canonical = json.dumps(
+        {
+            "batch_id": batch_id,
+            "annotator_id": annotator_id,
+            "annotations_csv": annotations_csv,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
 class AnnotatorState:
     def __init__(
         self, config: AnnotatorConfig, *, path_policy: PathPolicy | None = None
@@ -497,6 +517,7 @@ class AnnotatorState:
         self.batch: list[dict[str, Any]] = []
         self.batch_id = ""
         self.batch_source = ""
+        self.scope_token = ""
         self.started_at = time.monotonic()
 
     @property
@@ -756,6 +777,9 @@ class AnnotatorState:
             raise ApiError(404, "labels_not_found", "labels_csv was not found")
 
         batch_id = self._source_id(candidates, config, source)
+        scope_token = _scope_token(
+            batch_id, config.annotator_id, str(config.annotations_csv)
+        )
         annotations_path = Path(config.annotations_csv)
         progress_path = annotations_path.with_name(
             f"{annotations_path.stem}.annotation_progress.json"
@@ -809,6 +833,7 @@ class AnnotatorState:
             self.batch_id = batch_id
             self.batch_source = source
             self.batch = public_batch
+            self.scope_token = scope_token
         counts = self._annotation_counts()
         cursor = min(
             max(int(saved_progress.get("cursor", 0)), 0), max(0, len(public_batch) - 1)
@@ -817,6 +842,7 @@ class AnnotatorState:
             "schema_version": SCHEMA_VERSION,
             "config": self.public_config(),
             "batch_id": batch_id,
+            "scope_token": scope_token,
             "batch_source": source,
             "batch_size": len(public_batch),
             "candidate_pool": len(candidates),
@@ -868,9 +894,43 @@ class AnnotatorState:
         record["notes"] = user_notes
         return {"found": True, "record": record, "unusable_reason": unusable_reason}
 
-    def save_annotation(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _assert_scope(self, payload: dict[str, Any], *, require_scope: bool) -> None:
+        claimed = payload.get("scope_token")
+        if claimed in (None, ""):
+            if require_scope:
+                raise ApiError(
+                    400,
+                    "scope_required",
+                    "Save is missing its batch scope token; reload the batch and try again",
+                )
+            return
+        if not self.scope_token or str(claimed) != self.scope_token:
+            raise ApiError(
+                409,
+                "scope_mismatch",
+                "This save belongs to a different batch; reload the batch before saving",
+            )
+
+    def save_annotation(
+        self, payload: dict[str, Any], *, require_scope: bool = False
+    ) -> dict[str, Any]:
+        """Persist one decision, bound to the batch scope it was made under.
+
+        Browser saves carry the ``scope_token`` returned by ``load_batch``
+        (enforced with ``require_scope=True`` at the HTTP boundary). The whole
+        validate-and-write sequence runs under the state lock so a concurrent
+        batch switch cannot interleave: a save whose token no longer matches
+        the active scope is refused before any write instead of cross-persisting
+        into another batch's annotations file.
+        """
         if not isinstance(payload, dict):
             raise ApiError(400, "invalid_payload", "Request body must be an object")
+        with self._lock:
+            return self._save_annotation_locked(payload, require_scope=require_scope)
+
+    def _save_annotation_locked(
+        self, payload: dict[str, Any], *, require_scope: bool
+    ) -> dict[str, Any]:
         with self._lock:
             config = self.config
             batch_id = self.batch_id
@@ -880,6 +940,7 @@ class AnnotatorState:
             raise ApiError(
                 409, "batch_not_loaded", "Load a batch before updating progress"
             )
+        self._assert_scope(payload, require_scope=require_scope)
         claimed_identity = payload.get("annotator_id")
         if (
             claimed_identity is not None
@@ -975,16 +1036,23 @@ class AnnotatorState:
             "progress": self._annotation_counts(),
         }
 
-    def save_progress(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def save_progress(
+        self, payload: dict[str, Any], *, require_scope: bool = False
+    ) -> dict[str, Any]:
         with self._lock:
+            self._assert_scope(payload, require_scope=require_scope)
             size = len(self.batch)
-        try:
-            cursor = int(payload.get("cursor", 0))
-        except (TypeError, ValueError) as exc:
-            raise ApiError(400, "invalid_cursor", "cursor must be an integer") from exc
-        if size and not 0 <= cursor < size:
-            raise ApiError(400, "invalid_cursor", "cursor is outside the active batch")
-        state = self._update_progress({"cursor": cursor})
+            try:
+                cursor = int(payload.get("cursor", 0))
+            except (TypeError, ValueError) as exc:
+                raise ApiError(
+                    400, "invalid_cursor", "cursor must be an integer"
+                ) from exc
+            if size and not 0 <= cursor < size:
+                raise ApiError(
+                    400, "invalid_cursor", "cursor is outside the active batch"
+                )
+            state = self._update_progress({"cursor": cursor})
         return {"saved": True, "cursor": int(state["cursor"])}
 
     def _annotation_counts(self) -> dict[str, Any]:
@@ -1075,15 +1143,61 @@ class AnnotatorState:
         return _serve_image_bytes(raw_dir, safe, s3_client=s3_client)
 
 
+def _canonical_authority(authority: str) -> tuple[str, int | None]:
+    """Parse a bare HTTP authority without accepting URL or credential syntax."""
+    parsed = urlparse(f"//{authority}")
+    if (
+        not authority
+        or any(char.isspace() for char in authority)
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.hostname
+        or authority.endswith(":")
+    ):
+        raise ValueError("Expected a bare host[:port] authority")
+    port = parsed.port
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Invalid authority port")
+    return parsed.hostname.lower(), port
+
+
 def make_handler(
     state: AnnotatorState,
     s3_client: Any | None = None,
     *,
     remote: bool = False,
     session_token: str = "",
+    trusted_authorities: Sequence[str] = (),
 ) -> type[BaseHTTPRequestHandler]:
+    default_port = 443 if remote else 80
+    configured_authorities = {
+        (host, port if port is not None else default_port)
+        for host, port in map(_canonical_authority, trusted_authorities)
+    }
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "ScenicAnnotator/1"
+
+        def _validate_host(self) -> None:
+            """Pin request authorities independently of attacker-controlled Origin."""
+            hosts = self.headers.get_all("Host", [])
+            try:
+                if len(hosts) != 1:
+                    raise ValueError("Exactly one Host header is required")
+                host, port = _canonical_authority(hosts[0])
+            except ValueError as exc:
+                raise ApiError(403, "untrusted_host", "Untrusted request authority") from exc
+            bound_host, bound_port = self.server.server_address[:2]
+            allowed = set(configured_authorities)
+            if not ipaddress.ip_address(bound_host).is_unspecified:
+                allowed.add((bound_host.lower(), bound_port))
+                if _is_loopback_host(bound_host):
+                    allowed.add(("localhost", bound_port))
+            if (host, port if port is not None else default_port) not in allowed:
+                raise ApiError(403, "untrusted_host", "Untrusted request authority")
 
         def _require_remote_auth(self) -> None:
             """Reject unauthenticated requests when the server is reachable remotely."""
@@ -1177,6 +1291,7 @@ def make_handler(
             return value
 
         def _route(self, method: str) -> None:
+            self._validate_host()
             parsed = urlparse(self.path)
             if method == "GET" and parsed.path == "/api/session":
                 if not remote or not session_token:
@@ -1258,10 +1373,10 @@ def make_handler(
                     self._send_json(state.load_batch(payload.get("config", {})))
                     return
                 if parsed.path == "/api/save-annotation":
-                    self._send_json(state.save_annotation(payload))
+                    self._send_json(state.save_annotation(payload, require_scope=True))
                     return
                 if parsed.path == "/api/progress":
-                    self._send_json(state.save_progress(payload))
+                    self._send_json(state.save_progress(payload, require_scope=True))
                     return
             raise ApiError(404, "not_found", "The requested endpoint does not exist")
 
@@ -1354,7 +1469,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=[],
         help="Credential-free s3://bucket/prefix root approved for image reads (repeatable)",
     )
+    parser.add_argument(
+        "--trusted-authority",
+        action="append",
+        default=[],
+        help=(
+            "Additional trusted Host authority (host[:port], repeatable); "
+            "required for public DNS names, wildcard binds, or reverse proxies"
+        ),
+    )
     args = parser.parse_args(argv)
+    try:
+        for authority in args.trusted_authority:
+            _canonical_authority(authority)
+    except ValueError as exc:
+        parser.error(f"invalid --trusted-authority: {exc}")
     is_remote = args.allow_remote or not _is_loopback_host(args.host)
     if is_remote:
         if not _is_loopback_host(args.host) and not args.allow_remote:
@@ -1399,6 +1528,7 @@ def main() -> None:
             s3_client,
             remote=remote,
             session_token=session_token,
+            trusted_authorities=args.trusted_authority,
         ),
     )
     if remote:

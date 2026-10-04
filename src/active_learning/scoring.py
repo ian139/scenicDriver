@@ -169,6 +169,10 @@ class ScoringDependencies:
     those keys for one batch.  ``regression_predictor`` accepts float32 NumPy
     arrays ``(embeddings, terrain_features, class_logits)`` and returns one
     prediction per row.
+    Injected model objects with ``state_dict`` are fingerprinted from their
+    current state, including when an explicit identity is supplied. Opaque
+    objects and predictor callables require a content-bound ``*_hash`` (or
+    an object checkpoint); callers must change it when prediction state changes.
     """
 
     classifier: Any | None = None
@@ -632,6 +636,67 @@ def _requires_acquisition_provenance(row: Mapping[str, Any]) -> bool:
     raise ValueError("missing_source_attribution: tile source cannot be attributed")
 
 
+def _acquisition_digest(value: Any) -> str:
+    """Match the acquisition producer's canonical JSON identity."""
+    return sha256_bytes(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8"))
+
+
+def _acquisition_preprocessing(
+    *, manifest_dir: Path, run_root: Path
+) -> tuple[dict[str, Any], str, str]:
+    """Read the existing execution-plan contract; verify bytes and metadata hashes."""
+    plan_path = _resolve_local_path(
+        "execution_plan.json", manifest_dir=manifest_dir, run_root=run_root
+    )
+    if plan_path is None:
+        raise ValueError("missing_acquisition_metadata: execution_plan.json is required")
+    try:
+        plan = json.loads(plan_path.read_bytes())
+        contract_path = _resolve_local_path(
+            plan["inputs"]["source_contract_path"],
+            manifest_dir=plan_path.parent, run_root=run_root,
+        )
+        if contract_path is None:
+            raise ValueError("missing source contract")
+        raw = contract_path.read_bytes()
+        contract = json.loads(raw)
+        preprocessing = contract["preprocessing"]
+        source_hash = sha256_bytes(raw)
+        preprocessing_hash = _acquisition_digest(preprocessing)
+        if (
+            plan["hashes"]["source_contract_sha256"] != source_hash
+            or plan["hashes"]["preprocessing_contract_sha256"] != preprocessing_hash
+        ):
+            raise ValueError("source/preprocessing contract hash mismatch")
+        for field in ("zoom", "tile_width", "tile_height"):
+            value = preprocessing[field]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{field} must be an integer")
+        if not 0 <= preprocessing["zoom"] <= 22:
+            raise ValueError("zoom must be between 0 and 22")
+        if min(preprocessing["tile_width"], preprocessing["tile_height"]) <= 0:
+            raise ValueError("tile dimensions must be positive")
+        if preprocessing["target_crs"] != "EPSG:3857":
+            raise ValueError("target_crs must be EPSG:3857 for slippy tiles")
+        for field in ("satellite_resampling", "terrain_resampling"):
+            if not isinstance(preprocessing[field], str) or not preprocessing[field].strip():
+                raise ValueError(f"{field} is required")
+        grid = plan["grid_contract"]
+        if (
+            plan["zoom"] != preprocessing["zoom"]
+            or grid["tile_width"] != preprocessing["tile_width"]
+            or grid["tile_height"] != preprocessing["tile_height"]
+            or grid["crs"] != preprocessing["target_crs"]
+        ):
+            raise ValueError("execution-plan grid differs from source contract")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError(f"invalid_acquisition_metadata: {exc}") from exc
+    return preprocessing, source_hash, preprocessing_hash
+
+
 class _ScoringDataset:
     """Decode, transform, and derive terrain features in DataLoader workers."""
 
@@ -764,15 +829,52 @@ def _heuristic_components(
     return components
 
 
-def _model_identity(label: str, value: Any, explicit: str | None = None) -> str:
+def _model_identity(
+    label: str,
+    value: Any,
+    explicit: str | None = None,
+    checkpoint: Path | None = None,
+) -> str:
+    """Bind injected identities to current state, never merely the model class."""
+    state_dict = getattr(value, "state_dict", None)
+    if callable(state_dict):
+        state = state_dict()
+        if not isinstance(state, Mapping):
+            raise ValueError(f"injected {label} state_dict must be a mapping")
+        digest = hashlib.sha256()
+        cls = type(value)
+        digest.update(f"{label}:{cls.__module__}.{cls.__qualname__}".encode())
+        digest.update(str(explicit or "").encode())
+        for key in sorted(state):
+            item = state[key]
+            if not isinstance(key, str):
+                raise ValueError(f"injected {label} state keys must be strings")
+            if isinstance(item, np.ndarray):
+                array = np.ascontiguousarray(item)
+                if array.dtype.hasobject:
+                    raise ValueError(f"injected {label} requires a content hash")
+                header = [key, str(array.dtype), list(array.shape)]
+                data = memoryview(array).cast("B")
+            else:
+                import torch
+
+                if not isinstance(item, torch.Tensor) or item.layout != torch.strided:
+                    raise ValueError(f"injected {label} requires a content hash")
+                tensor = item.detach().cpu().contiguous()
+                header = [key, str(tensor.dtype), list(tensor.shape)]
+                data = memoryview(tensor.reshape(-1).view(torch.uint8).numpy())
+            digest.update(json.dumps(header, separators=(",", ":")).encode())
+            digest.update(data)
+        return digest.hexdigest()
     if explicit:
         return str(explicit)
+    if checkpoint is not None:
+        return sha256_file(checkpoint)
+    if isinstance(value, (str, Path)) and Path(value).is_file():
+        return sha256_file(value)
     if value is None:
         return f"{label}:none"
-    if isinstance(value, (str, Path)) and Path(value).exists():
-        return sha256_file(value)
-    cls = type(value)
-    return sha256_bytes(f"{label}:{cls.__module__}.{cls.__qualname__}".encode("utf-8"))
+    raise ValueError(f"injected {label} requires a content hash or state_dict")
 
 
 def _device_name(device: str) -> str:
@@ -808,7 +910,7 @@ def _torch_load(path: Path, *, map_location: str) -> Any:
 def resolve_active_regression_checkpoint(
     registry_path: str | Path = "data/processed/regression/model_registry.json",
 ) -> Path:
-    """Resolve active registry checkpoint and fail closed on malformed data."""
+    """Resolve relative checkpoints beside the registry before project/CWD paths."""
     registry_file = Path(registry_path)
     try:
         payload = json.loads(registry_file.read_text(encoding="utf-8"))
@@ -832,12 +934,11 @@ def resolve_active_regression_checkpoint(
             "malformed active regression registry: active checkpoint is missing"
         )
     checkpoint_value = Path(raw_checkpoint).expanduser()
-    candidates = [checkpoint_value]
-    if not checkpoint_value.is_absolute():
-        candidates += [
-            registry_file.parent / checkpoint_value,
-            Path.cwd() / checkpoint_value,
-        ]
+    candidates = (
+        [checkpoint_value]
+        if checkpoint_value.is_absolute()
+        else [registry_file.parent / checkpoint_value, Path.cwd() / checkpoint_value]
+    )
     found_candidate: Path | None = None
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
@@ -1487,6 +1588,10 @@ def score_tile_manifest(
     Cache reuse is keyed by source content SHA-256 plus both model identities;
     ``max_rows`` is a deterministic prefix in the input order.  Models are
     loaded once and classifier inference is batched by ``batch_size``.
+    Canonical acquisition rows require the existing execution-plan/source-contract
+    sidecars. Grid metadata and separate resamplers are hash-verified, and PNG
+    dimensions are checked before inference or cache reuse. Legacy Mapbox inputs
+    report measured dimensions and unknown acquisition resampling.
     """
     root = Path(run_root)
     root.mkdir(parents=True, exist_ok=True)
@@ -1522,6 +1627,7 @@ def score_tile_manifest(
     if isinstance(num_workers, bool) or int(num_workers) < 0:
         raise ValueError("num_workers must be non-negative")
 
+    models_loaded = dependencies is None
     if dependencies is None:
         dependencies = _dependencies_from_loaded(
             load_scoring_models(
@@ -1554,10 +1660,16 @@ def score_tile_manifest(
     ):
         dependencies.s3_client = _default_s3_client()
     classifier_hash = _model_identity(
-        "classifier", dependencies.classifier, dependencies.classifier_hash
+        "classifier",
+        None if models_loaded else dependencies.classifier,
+        dependencies.classifier_hash,
+        dependencies.classifier_checkpoint,
     )
     regression_hash = _model_identity(
-        "regression", dependencies.regression_model, dependencies.regression_hash
+        "regression",
+        None if models_loaded else dependencies.regression_model,
+        dependencies.regression_hash,
+        dependencies.regression_checkpoint,
     )
     preprocessing = _preprocessing_contract(dependencies, classifier_use_resisc45_stats)
     cache = _read_cache(root, pipeline_identity=preprocessing["pipeline_sha256"])
@@ -1572,6 +1684,8 @@ def score_tile_manifest(
     pending_inputs: list[_ScoringInput] = []
     vector_by_index, logits_by_index, probs_by_index, terrain_by_index = {}, {}, {}, {}
     errors: list[dict[str, Any]] = []
+    acquisition_contract: tuple[dict[str, Any], str, str] | None = None
+    acquisition_metadata: dict[str, Any] | None = None
 
     def record_error(index: int, message: str, *, missing: bool = False) -> None:
         result = results[index]
@@ -1782,6 +1896,25 @@ def score_tile_manifest(
                 reason = acquisition_provenance_reason(row)
                 if reason is not None:
                     raise ValueError(reason)
+                if acquisition_contract is None:
+                    acquisition_contract = _acquisition_preprocessing(
+                        manifest_dir=manifest_dir, run_root=root
+                    )
+                contract, contract_hash, preprocessing_hash = acquisition_contract
+                if (
+                    _clean_text(row.get("source_contract_sha256")) != contract_hash
+                    or _clean_text(row.get("preprocessing_contract_sha256")) != preprocessing_hash
+                ):
+                    raise ValueError("acquisition_contract_hash_mismatch")
+                if _finite(row.get("z")) != contract["zoom"]:
+                    raise ValueError("acquisition_zoom_mismatch")
+                grid_hash = _acquisition_digest({
+                    "z": int(row["z"]), "x": int(row["x"]), "y": int(row["y"]),
+                    "width": contract["tile_width"], "height": contract["tile_height"],
+                    "crs": contract["target_crs"],
+                })
+                if _clean_text(row.get("grid_sha256")) != grid_hash:
+                    raise ValueError("acquisition_grid_mismatch")
         except Exception as exc:
             record_error(index, f"{type(exc).__name__}: {exc}")
             continue
@@ -1822,6 +1955,35 @@ def score_tile_manifest(
                 for style, source in (("satellite", satellite), ("terrain", terrain)):
                     if source.content_hash != _clean_text(row.get(f"{style}_output_sha256")):
                         raise ValueError(f"{style}_output_sha256_mismatch")
+            dimensions = []
+            for source in (satellite, terrain):
+                with Image.open(io.BytesIO(source.payload)) as image:
+                    dimensions.append(image.size)
+            if dimensions[0] != dimensions[1]:
+                raise ValueError("satellite and terrain imagery must have matching dimensions")
+            width, height = dimensions[0]
+            if requires_provenance:
+                assert acquisition_contract is not None
+                contract = acquisition_contract[0]
+                if (width, height) != (contract["tile_width"], contract["tile_height"]):
+                    raise ValueError("acquisition_dimensions_mismatch")
+            else:
+                contract = {}
+            zoom = _finite(row.get("z"))
+            if zoom is None or zoom != int(zoom) or not 0 <= zoom <= 22:
+                raise ValueError("invalid_acquisition_zoom")
+            metadata = {
+                "zoom": int(zoom), "width": width, "height": height,
+                "crs": contract.get("target_crs", "EPSG:3857"),
+                "satellite_resampling": contract.get("satellite_resampling"),
+                "terrain_resampling": contract.get("terrain_resampling"),
+            }
+            for field, expected in metadata.items():
+                if field in row and _clean_text(row[field]) and _clean_text(row[field]) != _clean_text(expected):
+                    raise ValueError(f"acquisition_{field}_mismatch")
+            if acquisition_metadata is not None and metadata != acquisition_metadata:
+                raise ValueError("mixed_acquisition_metadata")
+            acquisition_metadata = metadata
             result["satellite_content_sha256"] = satellite.content_hash
             result["terrain_content_sha256"] = terrain.content_hash
             cached_row = cache.rows.get(result["source_identity"]) if cache else None
@@ -2077,17 +2239,20 @@ def score_tile_manifest(
             "object_hashes": artifact_hashes,
         },
         "grid": {
-            "zoom": 14,
-            "width": 512,
-            "height": 512,
-            "crs": "EPSG:3857",
-            "has_coords": True,
+            **{
+                field: acquisition_metadata.get(field) if acquisition_metadata else None
+                for field in ("zoom", "width", "height", "crs")
+            },
+            "has_coords": all(
+                _finite(row.get("lat")) is not None and _finite(row.get("lon")) is not None
+                for row in results
+            ),
         },
         "mosaic": {
             "mosaic_order": "deterministic",
         },
         "datum": {
-            "horizontal_crs": "EPSG:3857",
+            "horizontal_crs": acquisition_metadata.get("crs") if acquisition_metadata else None,
             "vertical_datum": "NAVD88",
         },
         "nodata": {
@@ -2113,7 +2278,14 @@ def score_tile_manifest(
         "preprocessing": {
             **preprocessing,
             "preprocess_sha256": preprocessing.get("pipeline_sha256"),
-            "resample_alg": "bilinear",
+            "satellite_resampling": acquisition_metadata.get("satellite_resampling") if acquisition_metadata else None,
+            "terrain_resampling": acquisition_metadata.get("terrain_resampling") if acquisition_metadata else None,
+            "resample_alg": (
+                acquisition_metadata["satellite_resampling"]
+                if acquisition_metadata
+                and acquisition_metadata["satellite_resampling"] == acquisition_metadata["terrain_resampling"]
+                else None
+            ),
             "batch_size": int(batch_size),
             "num_workers": int(effective_num_workers),
             "requested_num_workers": int(num_workers),

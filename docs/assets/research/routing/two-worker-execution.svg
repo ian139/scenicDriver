@@ -6,7 +6,7 @@
 <rect x="0.0" y="0.0" width="1200.0" height="720.0" rx="0.0" fill="#fffdf8" stroke="none" />
 <g aria-label="Research figure">
 <text x="64.0" y="66.0" text-anchor="start" style="font-family:Georgia, 'Times New Roman', serif;font-size:29px;font-weight:bold;fill:#1f2933;">Retained bounded two-worker execution</text>
-<text x="64.0" y="96.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:15px;font-weight:normal;fill:#52616b;">Concurrency is deliberately bounded: four independent searches, at most two executing together.</text>
+<text x="64.0" y="96.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:15px;font-weight:normal;fill:#52616b;">Concurrency is deliberately bounded: 4 independent searches, at most 2 executing together.</text>
 <line x1="64.0" y1="116.0" x2="1136.0" y2="116.0" stroke="#c8c4ba" stroke-width="1.5"/>
 <text x="64.0" y="180.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:17px;font-weight:bold;fill:#1f2933;">Planner</text>
 <text x="230.0" y="153.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:16px;font-weight:bold;fill:#1f2933;">Worker 1</text>
@@ -29,7 +29,7 @@
 <line x1="160.0" y1="364.0" x2="186.0" y2="364.0" stroke="#287271" stroke-width="2.0" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
 <path d="M160,210 V175 H430 L446,229" fill="none" stroke="#287271" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
 <path d="M160,382 V415 H430 L446,364" fill="none" stroke="#287271" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
-<text x="64.0" y="445.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:bold;fill:#287271;">ContextVar copied into all four submitted tasks</text>
+<text x="64.0" y="445.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:13px;font-weight:bold;fill:#287271;">ContextVar copied into all 4 submitted tasks</text>
 <line x1="310.0" y1="229.0" x2="704.0" y2="258.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
 <line x1="570.0" y1="229.0" x2="704.0" y2="258.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
 <line x1="310.0" y1="364.0" x2="704.0" y2="292.0" stroke="#1f2933" stroke-width="2.0" marker-end="url(#arrow)"/>
@@ -43,8 +43,8 @@
 <text x="1026.0" y="280.0" text-anchor="middle" style="font-family:Arial, Helvetica, sans-serif;font-size:14px;font-weight:normal;fill:#fffdf8;">or failure</text>
 <rect x="64.0" y="470.0" width="1022.0" height="112.0" rx="6.0" fill="#f7f5ef" stroke="#c8c4ba" />
 <text x="88.0" y="505.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:15px;font-weight:bold;fill:#287271;">Measured isolated result</text>
-<text x="88.0" y="535.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:18px;font-weight:normal;fill:#1f2933;">62.682 s median vs 76.47 s baseline (18.03% lower; n=3 each).</text>
-<text x="88.0" y="562.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:14px;font-weight:normal;fill:#52616b;">Workers join on success or failure; three and four workers were rejected under host contention.</text>
+<text x="88.0" y="535.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:18px;font-weight:normal;fill:#1f2933;">62.682 s median vs 76.47 s baseline (18.03% lower; n=3 candidate, n=3 baseline).</text>
+<text x="88.0" y="562.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:14px;font-weight:normal;fill:#52616b;">Workers join on success or failure and restore the original multiplier order.</text>
 <rect x="64.0" y="650.0" width="1072.0" height="42.0" rx="4.0" fill="#f7f5ef" stroke="#c8c4ba" />
 <text x="80.0" y="675.0" text-anchor="start" style="font-family:Arial, Helvetica, sans-serif;font-size:12px;font-weight:normal;fill:#52616b;">Source: docs/research/routing-performance-autoresearch.md (uncached_distributions).</text>
 <text x="1120.0" y="675.0" text-anchor="end" style="font-family:Arial, Helvetica, sans-serif;font-size:12px;font-weight:normal;fill:#52616b;">Apple M2 Max; 12 logical CPUs; 32 GiB RAM</text>

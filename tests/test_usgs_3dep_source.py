@@ -122,6 +122,59 @@ def test_mutable_weak_identity_rejection():
         validate_3dep_record(rec_mut)
 
 
+_NESTED_KEY = "StagedProducts/Elevation/13/TIFF/current/n42w072/USGS_13_n42w072.tif"
+_CANONICAL_NESTED = f"s3://prd-tnm/{_NESTED_KEY}"
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        _CANONICAL_NESTED,
+        f"https://prd-tnm.s3.amazonaws.com/{_NESTED_KEY}",
+        f"https://prd-tnm.s3.us-west-2.amazonaws.com/{_NESTED_KEY}",
+        f"https://s3.amazonaws.com/prd-tnm/{_NESTED_KEY}",
+        f"https://s3.us-west-2.amazonaws.com/prd-tnm/{_NESTED_KEY}",
+        f"prd-tnm/{_NESTED_KEY}",
+        _NESTED_KEY,
+    ],
+)
+def test_supported_uri_forms_keep_full_nested_s3_key(uri: str):
+    """Every supported prd-tnm form normalizes to the exact S3 key, tile directory included."""
+    rec = _make_valid_record()
+    rec["canonical_uri"] = uri
+    assert validate_3dep_record(rec).canonical_uri == _CANONICAL_NESTED
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        f"https://evil.example.com/prd-tnm/{_NESTED_KEY}",
+        f"https://evil.example.com/{_NESTED_KEY}",
+        f"https://prd-tnm.s3.amazonaws.com.evil.example.com/{_NESTED_KEY}",
+        f"https://other-bucket.s3.amazonaws.com/{_NESTED_KEY}",
+        f"https://s3.amazonaws.com/other-bucket/{_NESTED_KEY}",
+        f"https://s3.amazonaws.com/other-bucket/prd-tnm/{_NESTED_KEY}",
+        f"s3://other-bucket/{_NESTED_KEY}",
+        f"s3://other-bucket/prd-tnm/{_NESTED_KEY}",
+        f"s3://{_NESTED_KEY}",
+        f"http://prd-tnm.s3.amazonaws.com/{_NESTED_KEY}",
+        f"https://user@prd-tnm.s3.amazonaws.com/{_NESTED_KEY}",
+        f"https://prd-tnm.s3.amazonaws.com:8443/{_NESTED_KEY}",
+        f"https://prd-tnm.s3.amazonaws.com/{_NESTED_KEY}?versionId=x",
+        f"https://prd-tnm.s3.amazonaws.com/{_NESTED_KEY}#frag",
+        "s3://prd-tnm/StagedProducts/Elevation/13/TIFF/current/../USGS_13_n42w072.tif",
+        "s3://prd-tnm/StagedProducts/Elevation/13/TIFF/current//USGS_13_n42w072.tif",
+        f"mirror/prd-tnm/{_NESTED_KEY}",
+    ],
+)
+def test_untrusted_or_wrong_bucket_uri_rejected(uri: str):
+    """Wrong host/bucket, embedded prd-tnm substrings, and URL decorations fail closed."""
+    rec = _make_valid_record()
+    rec["canonical_uri"] = uri
+    with pytest.raises(WeakIdentityError, match="does not match official 3DEP"):
+        validate_3dep_record(rec)
+
+
 def test_missing_crs_datum_nodata_units_rejection():
     """Test rejection when horizontal CRS, vertical datum, units, nodata, or metadata SHA are missing/invalid."""
     # Invalid CRS

@@ -208,13 +208,43 @@ def tile_transform_web_mercator(
     return a, b, c, d, e, f
 
 
+def _validate_derived_values(
+    name: str, values: Any, size: int, computed: Tuple[float, ...]
+) -> None:
+    """Require a supplied bounds/affine to be exactly ``size`` finite reals matching ``computed``."""
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(
+            f"Provided {name} must be a tuple or list of {size} floats, got {values!r}"
+        )
+    if len(values) != size:
+        raise ValueError(f"Provided {name} must have {size} elements, got {values!r}")
+    for value in values:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ValueError(
+                f"Provided {name} elements must be finite numbers, got {value!r}"
+            )
+    if not all(
+        math.isclose(v, c, rel_tol=1e-9, abs_tol=1e-9)
+        for v, c in zip(values, computed)
+    ):
+        raise ValueError(
+            f"Provided {name} {tuple(values)} does not match computed {name} {computed}"
+        )
+
+
 @dataclass(frozen=True)
 class TargetGrid:
     """
     Target grid definition for Web Mercator tile rasters.
 
     Stores z/x/y/width/height/crs/bounds/affine coefficients and provides
-    deterministic serialization.
+    deterministic serialization. ``bounds`` and ``affine`` are derived from the
+    tile; when supplied they must be finite real sequences of length 4 and 6
+    that match the derived values, and empty means "compute".
     """
 
     z: int
@@ -246,52 +276,16 @@ class TargetGrid:
             raise ValueError(f"crs must be '{EPSG3857_CRS}', got {self.crs}")
 
         computed_bounds = tile_bounds_web_mercator(self.x, self.y, self.z)
-        if not self.bounds:
-            object.__setattr__(self, "bounds", computed_bounds)
-        else:
-            if isinstance(self.bounds, (list, tuple)):
-                bounds_tuple = tuple(float(b) for b in self.bounds)
-            else:
-                raise ValueError(
-                    f"Provided bounds must be a tuple or list of 4 floats, got {self.bounds}"
-                )
-            if len(bounds_tuple) != 4:
-                raise ValueError(
-                    f"Provided bounds must have 4 elements, got {self.bounds}"
-                )
-            if not all(
-                math.isclose(b, c, rel_tol=1e-9, abs_tol=1e-9)
-                for b, c in zip(bounds_tuple, computed_bounds)
-            ):
-                raise ValueError(
-                    f"Provided bounds {self.bounds} do not match computed bounds {computed_bounds}"
-                )
-            object.__setattr__(self, "bounds", computed_bounds)
+        if not (isinstance(self.bounds, (list, tuple)) and len(self.bounds) == 0):
+            _validate_derived_values("bounds", self.bounds, 4, computed_bounds)
+        object.__setattr__(self, "bounds", computed_bounds)
 
         computed_affine = tile_transform_web_mercator(
             self.x, self.y, self.z, self.width, self.height
         )
-        if not self.affine:
-            object.__setattr__(self, "affine", computed_affine)
-        else:
-            if isinstance(self.affine, (list, tuple)):
-                affine_tuple = tuple(float(a) for a in self.affine)
-            else:
-                raise ValueError(
-                    f"Provided affine must be a tuple or list of 6 floats, got {self.affine}"
-                )
-            if len(affine_tuple) != 6:
-                raise ValueError(
-                    f"Provided affine must have 6 elements, got {self.affine}"
-                )
-            if not all(
-                math.isclose(a, c, rel_tol=1e-9, abs_tol=1e-9)
-                for a, c in zip(affine_tuple, computed_affine)
-            ):
-                raise ValueError(
-                    f"Provided affine {self.affine} does not match computed affine {computed_affine}"
-                )
-            object.__setattr__(self, "affine", computed_affine)
+        if not (isinstance(self.affine, (list, tuple)) and len(self.affine) == 0):
+            _validate_derived_values("affine", self.affine, 6, computed_affine)
+        object.__setattr__(self, "affine", computed_affine)
 
     @classmethod
     def from_tile(
@@ -336,7 +330,12 @@ class TargetGrid:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TargetGrid:
-        """Reconstruct TargetGrid from a dictionary."""
+        """Reconstruct TargetGrid from a dictionary.
+
+        Coordinates and dimensions must be serialized as integers (not bools,
+        floats, or strings). ``bounds``/``affine`` may be omitted and are then
+        recomputed; when present they must be valid and match the tile.
+        """
         if not isinstance(data, dict):
             raise ValueError(
                 f"Expected dict for TargetGrid.from_dict, got {type(data)}"
@@ -344,23 +343,30 @@ class TargetGrid:
         for k in ("z", "x", "y"):
             if k not in data:
                 raise ValueError(f"TargetGrid dictionary missing required key '{k}'")
-        raw_bounds = data.get("bounds")
-        raw_affine = data.get("affine")
-        bounds = (
-            tuple(raw_bounds) if raw_bounds is not None and len(raw_bounds) == 4 else ()
-        )
-        affine = (
-            tuple(raw_affine) if raw_affine is not None and len(raw_affine) == 6 else ()
-        )
+        for k in ("z", "x", "y", "width", "height"):
+            if k in data and (
+                isinstance(data[k], bool) or not isinstance(data[k], int)
+            ):
+                raise ValueError(
+                    f"TargetGrid '{k}' must be serialized as an integer, got {data[k]!r}"
+                )
+        derived: dict[str, Any] = {}
+        for name, size in (("bounds", 4), ("affine", 6)):
+            if name in data:
+                value = data[name]
+                if not isinstance(value, (list, tuple)) or len(value) != size:
+                    raise ValueError(
+                        f"TargetGrid '{name}' must be a list of {size} numbers, got {value!r}"
+                    )
+                derived[name] = tuple(value)
         return cls(
-            z=int(data["z"]),
-            x=int(data["x"]),
-            y=int(data["y"]),
-            width=int(data.get("width", 256)),
-            height=int(data.get("height", 256)),
-            crs=str(data.get("crs", EPSG3857_CRS)),
-            bounds=bounds,
-            affine=affine,
+            z=data["z"],
+            x=data["x"],
+            y=data["y"],
+            width=data.get("width", 256),
+            height=data.get("height", 256),
+            crs=data.get("crs", EPSG3857_CRS),
+            **derived,
         )
 
     def sha256(self) -> str:

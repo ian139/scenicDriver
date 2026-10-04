@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import math
+import mmap
 import random
 import struct
+import sys
 from pathlib import Path
 
 import pytest
@@ -793,3 +796,256 @@ def test_edge_projection_index_load_failure_closes_resources(
 
     with pytest.raises(edge_projection_module._SidecarTruncatedError):
         EdgeProjectionIndex.load(sidecar_path, path)
+
+
+def _called_from(function_name: str) -> bool:
+    frame = sys._getframe(1)
+    try:
+        while frame is not None:
+            if frame.f_code.co_name == function_name:
+                return True
+            frame = frame.f_back
+        return False
+    finally:
+        del frame
+
+
+@pytest.mark.parametrize("stage", ["section_hash", "after_all_sections_loaded"])
+def test_sidecar_load_cancellation_closes_mmap_and_file_with_retained_traceback(
+    stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    graph = _basic_graph()
+    path = tmp_path / "g.sqlite3"
+    graph.save(path)
+    graph.persist_edge_projection_index(path)
+    sidecar = _sidecar_path(path)
+
+    # Dry run: locate a cancellation check inside per-section hashing, while
+    # mmap-backed arrays and the hashed payload view are live, and the final
+    # check after every section is loaded and the tree is validated.
+    hash_flags: list[bool] = []
+
+    def record() -> None:
+        hash_flags.append(_called_from("_sha256_buffer"))
+
+    EdgeProjectionIndex.load(sidecar, path, check_cancelled=record).close()
+    hash_calls = [call for call, in_hash in enumerate(hash_flags, 1) if in_hash]
+    assert hash_calls, "section hashing no longer polls cancellation"
+    if stage == "section_hash":
+        target_call = hash_calls[-1]
+    else:
+        target_call = len(hash_flags)
+        assert not hash_flags[-1]
+
+    opened: list[object] = []
+    mapped: list[mmap.mmap] = []
+    real_mmap = mmap.mmap
+
+    def tracking_open(file: object, *args: object, **kwargs: object) -> object:
+        handle = open(file, *args, **kwargs)  # noqa: SIM115
+        if Path(file) == sidecar:
+            opened.append(handle)
+        return handle
+
+    def tracking_mmap(*args: object, **kwargs: object) -> mmap.mmap:
+        mapping = real_mmap(*args, **kwargs)
+        mapped.append(mapping)
+        return mapping
+
+    monkeypatch.setattr(edge_projection_module, "open", tracking_open, raising=False)
+    monkeypatch.setattr(mmap, "mmap", tracking_mmap)
+
+    sentinel = InterruptedError("cancel mmap-backed sidecar parse")
+    calls = 0
+
+    def cancel() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == target_call:
+            raise sentinel
+
+    with pytest.raises(edge_projection_module._SidecarCancellation) as raised:
+        EdgeProjectionIndex.load(sidecar, path, check_cancelled=cancel)
+
+    # Hold both the wrapper and the sentinel tracebacks so cleanup cannot rely
+    # on garbage collection of the parsing frames.
+    retained = raised.value
+    retained_traceback = retained.__traceback__
+    sentinel_traceback = sentinel.__traceback__
+    assert retained.error is sentinel
+    assert retained_traceback is not None
+    assert sentinel_traceback is not None
+    assert calls == target_call
+    assert len(opened) == 1
+    assert len(mapped) == 1
+    assert mapped[0].closed
+    assert opened[0].closed  # type: ignore[attr-defined]
+
+
+def _near_leaf_graph() -> RoadGraph:
+    graph = RoadGraph()
+    graph.add_node(Node(id="near-a", lat=0.0, lon=0.0))
+    graph.add_node(Node(id="near-b", lat=0.0, lon=5.0))
+    graph.add_edge(
+        Edge(
+            id="near",
+            start_node_id="near-a",
+            end_node_id="near-b",
+            distance_km=556.0,
+            scenic_score=0.0,
+        )
+    )
+    for index in range(127):
+        longitude = -0.5 + index / 126.0
+        graph.add_node(Node(id=f"d{index}-a", lat=1.0, lon=longitude))
+        graph.add_node(Node(id=f"d{index}-b", lat=1.0, lon=longitude + 0.001))
+        graph.add_edge(
+            Edge(
+                id=f"distractor-{index}",
+                start_node_id=f"d{index}-a",
+                end_node_id=f"d{index}-b",
+                distance_km=0.1,
+                scenic_score=0.0,
+            )
+        )
+    return graph
+
+
+def _overwrite_section_value(
+    data: bytearray, section: int, position: int, value: float
+) -> None:
+    descriptor = _EPI_HEADER_SIZE + section * _EPI_SECTION_DESCRIPTOR_SIZE
+    offset, size, _count, _dtype, _sha = struct.unpack_from(
+        "<QQQB7x32s", data, descriptor
+    )
+    struct.pack_into("<d", data, offset + position * 8, value)
+    # Refresh the section checksum so the file stays self-consistent.
+    data[descriptor + 32 : descriptor + 64] = hashlib.sha256(
+        bytes(data[offset : offset + size])
+    ).digest()
+
+
+def test_sidecar_leaf_bounds_excluding_segment_endpoints_are_corrupt(
+    tmp_path: Path,
+) -> None:
+    graph = _near_leaf_graph()
+    path = tmp_path / "g.sqlite3"
+    graph.save(path)
+    graph.persist_edge_projection_index(path)
+    sidecar = _sidecar_path(path)
+
+    index = EdgeProjectionIndex.load(sidecar, path)
+    try:
+        near_position = int(
+            np.flatnonzero(
+                (index.start_latitudes == 0.0)
+                & (index.start_longitudes == 0.0)
+                & (index.end_longitudes == 5.0)
+            )[0]
+        )
+        leaves = np.flatnonzero((index.bvh_left == -1) & (index.bvh_right == -1))
+        assert len(leaves) > 1
+        near_leaf = next(
+            int(leaf)
+            for leaf in leaves
+            if int(index.bvh_start[leaf]) <= near_position < int(index.bvh_stop[leaf])
+        )
+    finally:
+        index.close()
+
+    # Collapse the near segment's leaf to the segment midpoint: the box stays
+    # finite, ordered, and inside its parent, but excludes both endpoints.
+    data = bytearray(sidecar.read_bytes())
+    for section, value in (
+        (edge_projection_module._SECTION_BVH_MIN_LAT, 0.0),
+        (edge_projection_module._SECTION_BVH_MAX_LAT, 0.0),
+        (edge_projection_module._SECTION_BVH_MIN_LON, 2.5),
+        (edge_projection_module._SECTION_BVH_MAX_LON, 2.5),
+    ):
+        _overwrite_section_value(data, section, near_leaf, value)
+    sidecar.write_bytes(bytes(data))
+
+    for verify in (True, False):
+        with pytest.raises(edge_projection_module._SidecarCorruptError):
+            EdgeProjectionIndex.load(sidecar, path, verify=verify)
+
+    loaded = RoadGraph.load(path)
+    assert loaded.edge_projection_index_status["state"] == "invalid"
+    projections, distance = loaded.find_nearest_edge_positions_with_distance(
+        0.0, 0.0
+    )
+    assert [projection.edge.id for projection in projections] == ["near"]
+    assert distance == pytest.approx(0.0, abs=1e-9)
+    assert loaded.edge_projection_index_status["state"] == "rebuilt"
+
+
+def _unit_vector(lat: float, lon: float) -> tuple[float, float, float]:
+    phi = math.radians(lat)
+    lam = math.radians(lon)
+    return (
+        math.cos(phi) * math.cos(lam),
+        math.cos(phi) * math.sin(lam),
+        math.sin(phi),
+    )
+
+
+def _central_angle_oracle_km(
+    a: tuple[float, float], b: tuple[float, float]
+) -> float:
+    ua = _unit_vector(*a)
+    ub = _unit_vector(*b)
+    dot = sum(x * y for x, y in zip(ua, ub))
+    return edge_projection_module._EARTH_RADIUS_KM * math.acos(
+        max(-1.0, min(1.0, dot))
+    )
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "expected_fraction"),
+    [((0.0, 0.0), (60.0, 0.0), 1.0), ((60.0, 0.0), (0.0, 0.0), 0.0)],
+)
+def test_long_segment_projection_is_never_farther_than_nearest_endpoint(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    expected_fraction: float,
+) -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="s", lat=start[0], lon=start[1]))
+    graph.add_node(Node(id="e", lat=end[0], lon=end[1]))
+    graph.add_edge(
+        Edge(
+            id="meridian",
+            start_node_id="s",
+            end_node_id="e",
+            distance_km=6672.0,
+            scenic_score=0.0,
+        )
+    )
+    query = (30.0, 90.0)
+    # The local-planar foot (30, 0) is ~75.52 degrees away; the (60, 0)
+    # endpoint is ~64.34 degrees away and is strictly closer.
+    endpoint_distances = (
+        _central_angle_oracle_km(query, start),
+        _central_angle_oracle_km(query, end),
+    )
+    nearest_endpoint_km = _central_angle_oracle_km(query, (60.0, 0.0))
+    assert math.degrees(
+        nearest_endpoint_km / edge_projection_module._EARTH_RADIUS_KM
+    ) == pytest.approx(64.34, abs=0.01)
+    assert _central_angle_oracle_km(query, (30.0, 0.0)) > nearest_endpoint_km
+
+    projections, distance = graph.find_nearest_edge_positions_with_distance(*query)
+
+    assert [projection.edge.id for projection in projections] == ["meridian"]
+    projection = projections[0]
+    assert projection.fraction == expected_fraction
+    assert projection.lat == pytest.approx(60.0, abs=1e-9)
+    assert projection.lon == pytest.approx(0.0, abs=1e-9)
+    assert distance <= min(endpoint_distances) * (1.0 + 1e-12)
+    assert distance == pytest.approx(nearest_endpoint_km, rel=1e-9)
+    assert projection.snap_distance_km == pytest.approx(
+        _central_angle_oracle_km(query, (projection.lat, projection.lon)),
+        rel=1e-9,
+    )

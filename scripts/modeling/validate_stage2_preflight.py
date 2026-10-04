@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Fail-closed validation for a Stage One handoff before Stage Two work.
 
-The handoff-only path is unchanged. When supplemental annotations and a
+The handoff-only path requires every expanded benchmark row to hold its fixed
+geographic split membership with train/val/test support; benchmark size is
+not pinned. When supplemental annotations and a
 supplemental benchmark are supplied, they are validated as supplemental
 evaluation evidence: the benchmark must be exactly reconstructible from the
 non-skipped finite annotations that hold immutable fixed split membership in
@@ -89,9 +91,9 @@ def valid_annotation_count(path: Path) -> int:
     return count
 
 
-def benchmark_identities(path: Path) -> tuple[dict[str, int], set[str]]:
-    counts: dict[str, int] = {}
-    identities: set[str] = set()
+def benchmark_identities(path: Path) -> dict[str, str]:
+    """Return benchmark identity -> normalized split for a unique-identity table."""
+    splits: dict[str, str] = {}
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         required = {"image_path", "split"}
@@ -101,17 +103,15 @@ def benchmark_identities(path: Path) -> tuple[dict[str, int], set[str]]:
             )
         for row in reader:
             identity = (row.get("image_path") or "").strip()
-            split = (row.get("split") or "").strip().lower()
-            if not identity or split not in {"train", "val", "validation", "test"}:
+            split = _normalise_split(row.get("split"))
+            if not identity or split not in {"train", "val", "test"}:
                 raise ValueError(
                     f"benchmark contains invalid identity or split: {path}"
                 )
-            if identity in identities:
+            if identity in splits:
                 raise ValueError(f"benchmark contains duplicate image_path: {identity}")
-            identities.add(identity)
-            normalized = "val" if split == "validation" else split
-            counts[normalized] = counts.get(normalized, 0) + 1
-    return counts, identities
+            splits[identity] = split
+    return splits
 
 
 def _normalise_split(value: str | None) -> str:
@@ -402,10 +402,27 @@ def validate_handoff(handoff_path: Path) -> dict[str, int]:
     if audit_file != leakage:
         raise ValueError("embedded leakage audit differs from hashed artifact")
 
-    expanded_splits, expanded_ids = benchmark_identities(resolved["benchmark"])
-    _, control_ids = benchmark_identities(resolved["control_benchmark"])
-    if expanded_splits != {"train": 19, "val": 1, "test": 4}:
-        raise ValueError(f"expanded benchmark split changed: {expanded_splits}")
+    expanded = benchmark_identities(resolved["benchmark"])
+    control_ids = set(benchmark_identities(resolved["control_benchmark"]))
+    assignments = split_assignments(resolved["geographic_splits"], set(expanded))
+    expanded_splits: dict[str, int] = {}
+    for identity, split in expanded.items():
+        if identity not in assignments:
+            raise ValueError(
+                f"expanded benchmark tile lacks fixed split membership: {identity}"
+            )
+        assigned_split = assignments[identity][0]
+        if assigned_split != split:
+            raise ValueError(
+                f"expanded benchmark split mismatch for {identity}: "
+                f"{split} != assigned {assigned_split}"
+            )
+        expanded_splits[split] = expanded_splits.get(split, 0) + 1
+    if set(expanded_splits) != {"train", "val", "test"}:
+        raise ValueError(
+            f"expanded benchmark lacks train/val/test support: {expanded_splits}"
+        )
+    expanded_ids = set(expanded)
     if expanded_ids & control_ids:
         raise ValueError("expanded and control benchmarks overlap")
 
@@ -515,7 +532,7 @@ def validate_supplemental(
 
     _check_benchmark_adjacency(assignments, set(benchmark))
 
-    _, control_identities = benchmark_identities(control_path)
+    control_identities = set(benchmark_identities(control_path))
     test_identities = {
         identity for identity, (split, _) in benchmark.items() if split == "test"
     }

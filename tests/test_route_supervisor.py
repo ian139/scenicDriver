@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import _thread
+import ctypes
 import multiprocessing
 import os
 import pickle
+import select
 import signal
 import socket
+import struct
 import threading
 import time
 from typing import Any, Callable
@@ -719,6 +723,598 @@ def _is_process_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+_PID_RECORD = struct.Struct("!q")
+_LOSS_EXIT_TIMEOUT_SECONDS = 5.0
+# Larger than any pipe buffer, so a blocking write(2) of it never completes.
+_NATIVE_BLOCK_BYTES = 4 * 1024 * 1024
+
+
+def _report_pid(fd: int, pid: int) -> None:
+    os.write(fd, _PID_RECORD.pack(pid))
+
+
+def _read_pids(fd: int, count: int, timeout: float = 10.0) -> list[int]:
+    """Read ``count`` PID records from a readiness pipe within ``timeout``."""
+    stop_at = time.monotonic() + timeout
+    data = b""
+    while len(data) < count * _PID_RECORD.size:
+        remaining = stop_at - time.monotonic()
+        if remaining <= 0.0:
+            raise AssertionError(f"readiness pipe produced {data!r} within {timeout}s")
+        readable, _, _ = select.select([fd], [], [], remaining)
+        if readable:
+            chunk = os.read(fd, count * _PID_RECORD.size - len(data))
+            if not chunk:
+                raise AssertionError(f"readiness pipe closed after {data!r}")
+            data += chunk
+    return [
+        _PID_RECORD.unpack_from(data, offset)[0]
+        for offset in range(0, len(data), _PID_RECORD.size)
+    ]
+
+
+class _Readiness:
+    """Pipes through which a blocking job proves it is running and where.
+
+    ``pid`` carries PID records.  ``block`` is never drained: a native job
+    writes ``_NATIVE_BLOCK_BYTES`` into it from one GIL-holding ``write(2)``
+    call, so the first byte becoming readable proves that call has started,
+    and it cannot return while this test holds the read end.
+    """
+
+    def __init__(self) -> None:
+        self.pid_read, self.pid_write = os.pipe()
+        self.block_read, self.block_write = os.pipe()
+
+    def read(self, count: int, mode: str, timeout: float = 10.0) -> list[int]:
+        pids = _read_pids(self.pid_read, count, timeout)
+        if mode == "native":
+            readable, _, _ = select.select([self.block_read], [], [], timeout)
+            if not readable:
+                raise AssertionError(f"native job did not block within {timeout}s")
+        return pids
+
+    def close(self) -> None:
+        for fd in (self.pid_read, self.pid_write, self.block_read, self.block_write):
+            os.close(fd)
+
+
+def _kill_recorded(pids: list[int]) -> None:
+    """Cleanup by recorded PID only; never by process group or pgrep."""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _children(pid: int) -> list[int]:
+    if os.path.isdir("/proc/self"):
+        children = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat") as stat:
+                    fields = stat.read().rsplit(")", 1)[1].split()
+            except OSError:
+                continue
+            if int(fields[1]) == pid:
+                children.append(int(entry))
+        return children
+    import subprocess
+
+    try:
+        output = subprocess.check_output(
+            ["pgrep", "-P", str(pid)], text=True, stderr=subprocess.DEVNULL
+        )
+    except subprocess.CalledProcessError:
+        return []
+    return [int(line) for line in output.split()]
+
+
+def _snapshot_tree(*roots: int) -> list[int]:
+    """Roots plus their descendants, captured while nothing is reparented yet.
+
+    Taken at readiness and before any kill, so helpers the implementation forks
+    (watchdogs, guardians) are tracked by PID once they are reparented.
+    """
+    seen = list(dict.fromkeys(roots))
+    frontier = list(seen)
+    while frontier:
+        for child in _children(frontier.pop()):
+            if child not in seen:
+                seen.append(child)
+                frontier.append(child)
+    return seen
+
+
+def _process_state(pid: int) -> str:
+    """``gone`` once reaped, ``zombie`` if exited but unreaped, else ``running``."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "running"
+    if os.path.isdir("/proc/self"):
+        try:
+            with open(f"/proc/{pid}/stat") as stat:
+                state = stat.read().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            return "gone"
+    else:
+        import subprocess
+
+        try:
+            state = subprocess.check_output(
+                ["ps", "-o", "stat=", "-p", str(pid)], text=True
+            ).strip()
+        except subprocess.CalledProcessError:
+            return "gone"
+    return "zombie" if state.startswith("Z") else "running"
+
+
+def _wait_for_all_exit(
+    pids: list[int], *, reaped: bool, timeout: float = _LOSS_EXIT_TIMEOUT_SECONDS
+) -> None:
+    """Wait until every PID has exited; with ``reaped`` it must also be reaped.
+
+    ``reaped`` asserts a surviving owner waited for the process.  Without it,
+    a zombie counts as exited: after its ancestors are lost, reaping belongs
+    to whatever adopted it.
+    """
+    accepted = {"gone"} if reaped else {"gone", "zombie"}
+    stop_at = time.monotonic() + timeout
+    while True:
+        states = {pid: _process_state(pid) for pid in pids}
+        if all(state in accepted for state in states.values()):
+            return
+        if time.monotonic() >= stop_at:
+            raise AssertionError(f"recorded processes not finished: {states}")
+        time.sleep(0.02)
+
+
+def _job_report_pid_and_block(deadline, pid_fd: int, block_fd: int, mode: str) -> None:
+    """Ignore SIGTERM, announce this worker's PID, then never return.
+
+    ``native`` blocks inside one ``write(2)`` called through ``PyDLL``, which
+    keeps holding the GIL, so no Python thread in the worker can run.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    _report_pid(pid_fd, os.getpid())
+    if mode == "native":
+        libc = ctypes.PyDLL(None)
+        libc.write.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+        buffer = ctypes.create_string_buffer(_NATIVE_BLOCK_BYTES)
+        while True:
+            libc.write(block_fd, buffer, _NATIVE_BLOCK_BYTES)
+    while True:
+        time.sleep(0.05)
+
+
+def _job_exit_with_code(deadline, code: int) -> None:
+    os._exit(code)
+
+
+def _job_sigkill_self(deadline) -> None:
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _sigterm_when_restored_in(target_pid: int) -> str:
+    if os.getpid() == target_pid:
+        os.kill(target_pid, signal.SIGTERM)
+    return "restored"
+
+
+class _SigtermOnRestore:
+    """Unpickling this inside ``target_pid`` delivers SIGTERM to that process."""
+
+    def __init__(self, target_pid: int) -> None:
+        self.target_pid = target_pid
+
+    def __reduce__(self):
+        return _sigterm_when_restored_in, (self.target_pid,)
+
+
+def _job_raise_sigterm_on_restore(deadline, target_pid: int) -> None:
+    raise ValueError(_SigtermOnRestore(target_pid))
+
+
+def _caller_entry(pid_fd: int, block_fd: int, phase: str, mode: str) -> None:
+    """Intermediate caller: owns a supervisor, reports PIDs, then is SIGKILLed."""
+    sup = PreloadedRouteSupervisor.start(default_deadline_seconds=None)
+    _report_pid(pid_fd, sup._process.pid)
+    if phase == "active":
+        sup.run_job(_job_report_pid_and_block, pid_fd, block_fd, mode)
+    else:
+        _report_pid(pid_fd, sup.run_job(_job_return_pid))
+    while True:
+        time.sleep(1.0)
+
+
+@pytest.mark.parametrize(
+    ("phase", "mode"),
+    [("active", "python"), ("active", "native"), ("idle", "python")],
+)
+def test_abrupt_caller_loss_leaves_no_supervisor_or_worker(phase: str, mode: str) -> None:
+    ready = _Readiness()
+    caller = multiprocessing.get_context("fork").Process(
+        target=_caller_entry,
+        args=(ready.pid_write, ready.block_write, phase, mode),
+        daemon=False,
+    )
+    recorded: list[int] = []
+    try:
+        caller.start()
+        supervisor_pid, worker_pid = ready.read(2, mode if phase == "active" else "python")
+        recorded = _snapshot_tree(supervisor_pid, worker_pid)
+        assert caller.pid not in recorded and supervisor_pid != worker_pid
+
+        os.kill(caller.pid, signal.SIGKILL)
+        caller.join(timeout=5.0)
+        assert caller.exitcode == -signal.SIGKILL
+
+        # The tree was reparented away from this process, so its exit is
+        # observed by the PIDs recorded at readiness, not by the process tree.
+        _wait_for_all_exit(recorded, reaped=False)
+    finally:
+        _kill_recorded(recorded)
+        if caller.is_alive():
+            caller.kill()
+        caller.join(timeout=5.0)
+        ready.close()
+
+
+@pytest.mark.parametrize("mode", ["python", "native"])
+def test_supervisor_killed_during_unbounded_job_leaves_no_worker(mode: str) -> None:
+    ready = _Readiness()
+    sup = PreloadedRouteSupervisor.start(default_deadline_seconds=None)
+    supervisor_pid = sup._process.pid
+    recorded = [supervisor_pid]
+    outcome: dict[str, BaseException] = {}
+
+    def call() -> None:
+        try:
+            sup.run_job(_job_report_pid_and_block, ready.pid_write, ready.block_write, mode)
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the test
+            outcome["error"] = exc
+
+    caller = threading.Thread(target=call, daemon=True)
+    try:
+        caller.start()
+        (worker_pid,) = ready.read(1, mode)
+        recorded = _snapshot_tree(supervisor_pid, worker_pid)
+
+        os.kill(supervisor_pid, signal.SIGKILL)
+        caller.join(timeout=5.0)
+        assert not caller.is_alive(), "caller wedged after supervisor loss"
+        assert isinstance(outcome.get("error"), SupervisorError)
+        _wait_for_all_exit(recorded, reaped=False)
+    finally:
+        _kill_recorded(recorded)
+        sup.close(timeout=1.0)
+        ready.close()
+
+
+def test_supervisor_killed_while_worker_idle_leaves_no_worker() -> None:
+    sup = PreloadedRouteSupervisor.start(default_deadline_seconds=None)
+    supervisor_pid = sup._process.pid
+    recorded = [supervisor_pid]
+    try:
+        worker_pid = sup.run_job(_job_return_pid)
+        recorded = _snapshot_tree(supervisor_pid, worker_pid)
+
+        os.kill(supervisor_pid, signal.SIGKILL)
+        _wait_for_all_exit(
+            [pid for pid in recorded if pid != supervisor_pid], reaped=False
+        )
+        with pytest.raises(SupervisorError):
+            sup.run_job(_job_return_pid)
+    finally:
+        _kill_recorded(recorded)
+        sup.close(timeout=1.0)
+
+
+@pytest.mark.parametrize("mode", ["python", "native"])
+def test_forced_close_after_interrupted_job_reaps_supervisor_and_worker(mode: str) -> None:
+    ready = _Readiness()
+    sup = PreloadedRouteSupervisor.start(default_deadline_seconds=None)
+    recorded = [sup._process.pid]
+    worker_pids: list[int] = []
+
+    def interrupt_when_worker_ready() -> None:
+        try:
+            worker_pids.extend(ready.read(1, mode))
+        finally:
+            # Always unblock the main thread, even if readiness never came.
+            _thread.interrupt_main()
+
+    interrupter = threading.Thread(target=interrupt_when_worker_ready, daemon=True)
+    try:
+        interrupter.start()
+        with pytest.raises(KeyboardInterrupt):
+            sup.run_job(_job_report_pid_and_block, ready.pid_write, ready.block_write, mode)
+        interrupter.join(timeout=5.0)
+        assert len(worker_pids) == 1, "worker never reported readiness"
+        recorded = _snapshot_tree(recorded[0], worker_pids[0])
+
+        # The supervisor is still busy with the abandoned job, so close() must
+        # escalate; the escalation may not orphan the planning worker.
+        sup.close(timeout=0.5)
+        assert not sup._process.is_alive()
+        _wait_for_all_exit(recorded, reaped=True)
+    finally:
+        _kill_recorded(recorded)
+        sup.close(timeout=1.0)
+        ready.close()
+
+
+@pytest.mark.parametrize("boundary", ["job-decoding", "error-reconstruction"])
+def test_sigterm_inside_supervisor_unpickling_stops_and_reaps(boundary: str) -> None:
+    """SIGTERM landing inside a contained unpickle must still shut the supervisor down.
+
+    The reducer signals only when restored in the supervisor process, either
+    while it decodes the caller's job or while it rebuilds a worker error.
+    """
+    sup = PreloadedRouteSupervisor.start()
+    supervisor_pid = sup._process.pid
+    recorded = [supervisor_pid]
+    try:
+        worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+        recorded = _snapshot_tree(supervisor_pid, worker_pid)
+
+        with pytest.raises(SupervisorError):
+            if boundary == "job-decoding":
+                sup.run_job(_job_success, _SigtermOnRestore(supervisor_pid), deadline_seconds=5.0)
+            else:
+                sup.run_job(_job_raise_sigterm_on_restore, supervisor_pid, deadline_seconds=5.0)
+
+        # Not resumed with SIGTERM ignored: the supervisor is gone and it
+        # killed and reaped everything it owned on the way out.
+        sup._process.join(timeout=_LOSS_EXIT_TIMEOUT_SECONDS)
+        assert sup._process.exitcode is not None, "supervisor kept serving after SIGTERM"
+        _wait_for_all_exit(recorded, reaped=True)
+    finally:
+        _kill_recorded(recorded)
+        sup.close(timeout=1.0)
+
+
+_KILL_RECORD = struct.Struct("!qq")
+
+
+class _GuardianFaults:
+    """Fault injection inherited by every process the supervisor forks.
+
+    Installed in this process before ``start``.  It logs every ``os.kill``
+    made by the supervisor (the only child of this process), and can SIGSTOP
+    a guardian around its single worker-exit status record: right after
+    sending it, or instead of sending it once the worker is already reaped.
+    ``exit-report-delayed`` instead holds the reaped worker's report for
+    ``delay_seconds`` with SIGTERM ignored, then sends it and exits normally.
+    """
+
+    def __init__(
+        self, monkeypatch: pytest.MonkeyPatch, stall: str, delay_seconds: float = 0.0
+    ) -> None:
+        self.kill_read, self.kill_write = os.pipe()
+        self.fired_read, self.fired_write = os.pipe()
+        os.set_blocking(self.kill_read, False)
+        test_pid = os.getpid()
+        real_kill = os.kill
+        kill_write, fired_write = self.kill_write, self.fired_write
+
+        def recording_kill(pid: int, sig: int) -> None:
+            if os.getpid() != test_pid and os.getppid() == test_pid:
+                os.write(kill_write, _KILL_RECORD.pack(pid, int(sig)))
+            real_kill(pid, sig)
+
+        monkeypatch.setattr(os, "kill", recording_kill)
+        if stall not in ("after-exit-report", "exit-report-lost", "exit-report-delayed"):
+            return
+        real_sendall = socket.socket.sendall
+        exit_tag = supervisor_module._STATUS_WORKER_EXIT
+        record_size = supervisor_module._GUARDIAN_STATUS.size
+
+        def stalling_sendall(sock: socket.socket, data: Any, *args: Any) -> None:
+            if not (
+                os.getpid() != test_pid
+                and len(data) == record_size
+                and bytes(data[:1]) == exit_tag
+            ):
+                return real_sendall(sock, data, *args)
+            os.write(fired_write, _PID_RECORD.pack(os.getpid()))
+            if stall == "exit-report-delayed":
+                previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                time.sleep(delay_seconds)
+                signal.signal(signal.SIGTERM, previous)
+                return real_sendall(sock, data, *args)
+            if stall == "after-exit-report":
+                real_sendall(sock, data, *args)
+            real_kill(os.getpid(), signal.SIGSTOP)
+            return None
+
+        monkeypatch.setattr(socket.socket, "sendall", stalling_sendall)
+
+    def supervisor_kills(self) -> list[tuple[int, int]]:
+        data = b""
+        while True:
+            try:
+                chunk = os.read(self.kill_read, 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            data += chunk
+        return [
+            _KILL_RECORD.unpack_from(data, offset)
+            for offset in range(0, len(data), _KILL_RECORD.size)
+        ]
+
+    def close(self) -> None:
+        for fd in (self.kill_read, self.kill_write, self.fired_read, self.fired_write):
+            os.close(fd)
+
+
+@pytest.mark.parametrize("stop", ["deadline-hard-kill", "close"])
+@pytest.mark.parametrize("stall", ["stopped-before-kill", "after-exit-report", "exit-report-lost"])
+def test_controlled_stop_reaps_stalled_guardian_and_worker(
+    monkeypatch: pytest.MonkeyPatch, stall: str, stop: str
+) -> None:
+    """A stalled worker helper never costs reaping or a foreign-PID signal.
+
+    The helper (guardian) is SIGSTOPped before the stop, right after it
+    reports the worker's exit, or instead of reporting an exit it already
+    reaped.  With the caller and supervisor alive, a controlled stop must
+    leave every recorded PID reaped, and the supervisor must never signal
+    the planning worker's PID itself: once reaped, that PID may be reused.
+    """
+    faults = _GuardianFaults(monkeypatch, stall)
+    sup = PreloadedRouteSupervisor.start()
+    supervisor_pid = sup._process.pid
+    recorded = [supervisor_pid]
+    try:
+        worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+        recorded = _snapshot_tree(supervisor_pid, worker_pid)
+        helpers = [pid for pid in recorded if pid not in (supervisor_pid, worker_pid)]
+        assert helpers, "expected the worker's guardian among the recorded descendants"
+        if stall == "stopped-before-kill":
+            for pid in helpers:
+                os.kill(pid, signal.SIGSTOP)
+
+        if stop == "deadline-hard-kill":
+            with pytest.raises(RoutingTimeout, match="deadline exceeded"):
+                sup.run_job(_job_uncooperative, deadline_seconds=0.05, grace_seconds=0.1)
+            _wait_for_all_exit(helpers + [worker_pid], reaped=True)
+            assert sup.health()["alive"]
+            replacement_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+            assert replacement_pid != worker_pid
+            recorded += _snapshot_tree(supervisor_pid, replacement_pid)[1:]
+        sup.close()
+
+        assert sup._process.exitcode is not None
+        _wait_for_all_exit(recorded, reaped=True)
+        if stall != "stopped-before-kill":
+            (stalled_pid,) = _read_pids(faults.fired_read, 1, timeout=1.0)
+            assert stalled_pid in helpers, "fault injection did not stall the guardian"
+        signalled = [target for target, _ in faults.supervisor_kills()]
+        assert worker_pid not in signalled
+    finally:
+        _kill_recorded(recorded)
+        sup.close(timeout=1.0)
+        faults.close()
+
+
+def test_guardian_reporting_after_cleanup_gave_up_is_reaped_while_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A guardian that reports only after every cleanup wait is still reaped.
+
+    The guardian reaps the killed worker, then holds its exit report longer
+    than the supervisor's whole escalation (each guardian response wait plus
+    the guardian join).  The supervisor is then left idle: no further job
+    or process start may be needed for the late guardian to be reaped.
+    """
+    escalation = 3 * supervisor_module._GUARDIAN_RESPONSE_SECONDS + 2.0
+    delay = escalation + 1.0
+    faults = _GuardianFaults(monkeypatch, "exit-report-delayed", delay_seconds=delay)
+    sup = PreloadedRouteSupervisor.start()
+    supervisor_pid = sup._process.pid
+    recorded = [supervisor_pid]
+    try:
+        worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+        recorded = _snapshot_tree(supervisor_pid, worker_pid)
+        helpers = [pid for pid in recorded if pid not in (supervisor_pid, worker_pid)]
+        assert helpers, "expected the worker's guardian among the recorded descendants"
+
+        with pytest.raises(RoutingTimeout, match="deadline exceeded"):
+            sup.run_job(_job_uncooperative, deadline_seconds=0.05, grace_seconds=0.1)
+        (stalled_pid,) = _read_pids(faults.fired_read, 1, timeout=5.0)
+        assert stalled_pid in helpers, "fault injection did not delay the guardian"
+
+        # Idle from here on: the late guardian must be collected without help.
+        _wait_for_all_exit(
+            helpers + [worker_pid],
+            reaped=True,
+            timeout=delay + _LOSS_EXIT_TIMEOUT_SECONDS,
+        )
+        assert sup.health()["alive"]
+        assert worker_pid not in [target for target, _ in faults.supervisor_kills()]
+    finally:
+        _kill_recorded(recorded)
+        sup.close(timeout=1.0)
+        faults.close()
+
+
+@pytest.mark.parametrize("budget", ["deadline", "grace"])
+def test_next_job_waits_out_a_late_guardian_reap(
+    monkeypatch: pytest.MonkeyPatch, budget: str
+) -> None:
+    """A slow guardian reap delays the next job within budget instead of failing it.
+
+    The guardian holds the killed worker's exit report longer than every
+    guardian response wait.  A job with a deadline must wait that reap out
+    and run on a fresh worker; one without a deadline gives up only after
+    the bounded reap grace, never waiting indefinitely.
+    """
+    delay = 3.5
+    faults = _GuardianFaults(monkeypatch, "exit-report-delayed", delay_seconds=delay)
+    sup = PreloadedRouteSupervisor.start()
+    supervisor_pid = sup._process.pid
+    recorded = [supervisor_pid]
+    try:
+        worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+        recorded = _snapshot_tree(supervisor_pid, worker_pid)
+        helpers = [pid for pid in recorded if pid not in (supervisor_pid, worker_pid)]
+        assert helpers, "expected the worker's guardian among the recorded descendants"
+
+        with pytest.raises(RoutingTimeout, match="deadline exceeded"):
+            sup.run_job(_job_uncooperative, deadline_seconds=0.05, grace_seconds=0.1)
+        (stalled_pid,) = _read_pids(faults.fired_read, 1, timeout=5.0)
+        assert stalled_pid in helpers, "fault injection did not delay the guardian"
+
+        if budget == "deadline":
+            replacement_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+            assert replacement_pid != worker_pid
+        else:
+            start = time.monotonic()
+            with pytest.raises(SupervisorError, match="still being reaped"):
+                sup.run_job(_job_return_pid, deadline=RoutingDeadline())
+            waited = time.monotonic() - start
+            assert waited >= supervisor_module._UNRESOLVED_REAP_GRACE_SECONDS
+            assert waited < delay
+        assert sup.health()["alive"]
+    finally:
+        _kill_recorded(recorded)
+        sup.close(timeout=1.0)
+        faults.close()
+
+
+@pytest.mark.parametrize(
+    ("job", "args", "exitcode"),
+    [(_job_exit_with_code, (7,), 7), (_job_sigkill_self, (), -signal.SIGKILL)],
+)
+def test_early_worker_exit_before_deadline_reports_pid_and_exitcode(
+    job: Callable[..., Any], args: tuple[Any, ...], exitcode: int
+) -> None:
+    with PreloadedRouteSupervisor.start() as sup:
+        worker_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+        start = time.monotonic()
+        with pytest.raises(SupervisorError) as exc_info:
+            sup.run_job(job, *args, deadline_seconds=5.0)
+        elapsed = time.monotonic() - start
+        replacement_pid = sup.run_job(_job_return_pid, deadline_seconds=5.0)
+
+    # Well before expiry, so this is a crash rather than a timeout.
+    assert elapsed < 2.0
+    error = exc_info.value
+    assert getattr(error, "worker_pid", None) == worker_pid
+    assert getattr(error, "worker_exitcode", None) == exitcode
+    assert f"worker pid {worker_pid}, exitcode {exitcode}" in str(error)
+    assert replacement_pid != worker_pid
+    _wait_for_process_exit(worker_pid)
 
 
 def test_explicit_platform_boundary_on_non_posix(monkeypatch) -> None:

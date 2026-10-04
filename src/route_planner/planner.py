@@ -32,7 +32,6 @@ from .cost import (
     ScenicCostFunction,
     SCENIC_NORMALIZATION_VERSION,
     clamp_scenic_score,
-    distance_weighted_scenic_score,
     evaluate_path,
     duration_component,
     is_better_path,
@@ -366,7 +365,6 @@ class ScenicRoutePlanner:
     _MINIMUM_COST_CACHE_CAPACITY = 8
     _FASTEST_PATH_CACHE_CAPACITY = 8
     _CSR_DATA_CACHE_CAPACITY = 8
-    _REVERSE_INDEX_CACHE_CAPACITY = 2
     _ENDPOINT_OVERLAY_MAX_NODES = 2_000
     _REVERSE_PREPROCESS_EDGE_THRESHOLD = 256
     _LARGE_GRAPH_EDGE_THRESHOLD = 100_000
@@ -384,16 +382,15 @@ class ScenicRoutePlanner:
     _CORRIDOR_WARM_START_ITERATIONS = 24
     _CORRIDOR_OVERLAP_PENALTY = 0.08
     _CORRIDOR_DURATION_COEFFICIENT_DIVISOR = 8.0
+    # Lookup, invalidation, LRU promotion, and eviction share one boundary.
+    # Graph scans/searches run outside it; publication rechecks graph identity.
+    _SHARED_CACHE_LOCK = RLock()
     _ELIGIBLE_REACHABILITY_CACHE_CAPACITY = 32
     _ELIGIBLE_REACHABILITY_SHARED_CACHE: OrderedDict[
         Tuple[RoadGraph, object, str, str, bool, float], bool
     ] = OrderedDict()
     _ELIGIBLE_REACHABILITY_SHARED_GRAPH: Optional[RoadGraph] = None
     _ELIGIBLE_REACHABILITY_SHARED_STAMP: object = None
-    _REVERSE_INDEX_CACHE: OrderedDict[
-        Tuple[int, object, bool, float],
-        Tuple[RoadGraph, Dict[str, List[Tuple[str, str, bool]]]],
-    ] = OrderedDict()
     # CSR state is shared by planner instances because the service constructs
     # a short-lived planner for each request.  The active topology reference
     # bounds this cache to one production graph and one mutation epoch.
@@ -415,16 +412,16 @@ class ScenicRoutePlanner:
     def clear_shared_caches(cls) -> None:
         """Release graph-backed process caches used across planner instances."""
 
-        cls._ELIGIBLE_REACHABILITY_SHARED_CACHE.clear()
-        cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH = None
-        cls._ELIGIBLE_REACHABILITY_SHARED_STAMP = None
-        cls._REVERSE_INDEX_CACHE.clear()
-        cls._CSR_TOPOLOGY_CACHE = None
-        cls._CSR_DATA_CACHE.clear()
-        cls._FASTEST_PATH_SHARED_CACHE.clear()
-        cls._FASTEST_PATH_SHARED_GRAPH = None
-        cls._FASTEST_PATH_SHARED_STAMP = None
-        cls._ENDPOINT_GEODESIC_SPEED_SHARED_CACHE.clear()
+        with cls._SHARED_CACHE_LOCK:
+            cls._ELIGIBLE_REACHABILITY_SHARED_CACHE.clear()
+            cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH = None
+            cls._ELIGIBLE_REACHABILITY_SHARED_STAMP = None
+            cls._CSR_TOPOLOGY_CACHE = None
+            cls._CSR_DATA_CACHE.clear()
+            cls._FASTEST_PATH_SHARED_CACHE.clear()
+            cls._FASTEST_PATH_SHARED_GRAPH = None
+            cls._FASTEST_PATH_SHARED_STAMP = None
+            cls._ENDPOINT_GEODESIC_SPEED_SHARED_CACHE.clear()
 
     @classmethod
     def validate_frontier_time_limit_seconds(cls, value: object) -> float:
@@ -485,16 +482,6 @@ class ScenicRoutePlanner:
         self._last_endpoint_access_request: Optional[
             _EndpointAccessRequest
         ] = None
-    def _make_cost_function(self, scenic_weight: float) -> ScenicCostFunction:
-        strict = bool(self.cost_function.strict_highways)
-        preference = float(self.cost_function.highway_preference)
-        return ScenicCostFunction(
-            scenic_weight=scenic_weight,
-            strict_highways=strict,
-            highway_preference=preference,
-            weights=self.cost_function.weights,
-        )
-
     def _make_fastest_cost_function(self) -> ScenicCostFunction:
         # Fastest routing is always the true travel-duration objective.  Do
         # not inherit user scenic/custom weights, which could otherwise alter
@@ -835,22 +822,29 @@ class ScenicRoutePlanner:
             return None
         stamp = graph._heuristic_cache_stamp()
         cls = type(self)
-        cached = cls._CSR_TOPOLOGY_CACHE
-        if cached is not None:
-            if cached.graph is graph and cached.stamp == stamp:
-                if graph._heuristic_cache_stamp() == stamp:
-                    self._csr_topology_cache = cached
-                    self._csr_data_cache = cls._CSR_DATA_CACHE
-                    return cached
-            cls._CSR_TOPOLOGY_CACHE = None
-            cls._CSR_DATA_CACHE.clear()
-            self._csr_topology_cache = None
-            self._csr_data_cache = cls._CSR_DATA_CACHE
+        with cls._SHARED_CACHE_LOCK:
+            cached = cls._CSR_TOPOLOGY_CACHE
+            if cached is not None:
+                if cached.graph is graph and cached.stamp == stamp:
+                    if graph._heuristic_cache_stamp() == stamp:
+                        self._csr_topology_cache = cached
+                        self._csr_data_cache = cls._CSR_DATA_CACHE
+                        return cached
+                cls._CSR_TOPOLOGY_CACHE = None
+                cls._CSR_DATA_CACHE.clear()
+                self._csr_topology_cache = None
+                self._csr_data_cache = cls._CSR_DATA_CACHE
         topology = self._build_csr_topology(owner=graph)
-        if topology is not None:
-            cls._CSR_TOPOLOGY_CACHE = topology
-            self._csr_topology_cache = topology
-        self._csr_data_cache = cls._CSR_DATA_CACHE
+        with cls._SHARED_CACHE_LOCK:
+            if topology is not None:
+                cached = cls._CSR_TOPOLOGY_CACHE
+                if cached is not None and cached.graph is graph and cached.stamp == topology.stamp:
+                    topology = cached
+                else:
+                    cls._CSR_DATA_CACHE.clear()
+                    cls._CSR_TOPOLOGY_CACHE = topology
+                self._csr_topology_cache = topology
+            self._csr_data_cache = cls._CSR_DATA_CACHE
         return topology
 
     @staticmethod
@@ -919,7 +913,7 @@ class ScenicRoutePlanner:
                 raw = base + adjustment
             weights = np.where(
                 np.isfinite(raw),
-                np.maximum(raw, 1e-6),
+                raw,
                 np.finfo(np.float64).max,
             )
         weights = np.asarray(weights, dtype=np.float64)
@@ -940,18 +934,20 @@ class ScenicRoutePlanner:
         stamp = topology.stamp
         owner = topology.graph
         key = (id(owner), stamp, signature)
-        data_cache = type(self)._CSR_DATA_CACHE
-        self._csr_data_cache = data_cache
-        cached = data_cache.get(key)
-        if cached is not None:
-            if (
-                cached.topology is topology
-                and owner._heuristic_cache_stamp() == stamp
-                and self._built_in_cost_signature(cost_function) == signature
-            ):
-                data_cache.move_to_end(key)
-                return cached
-            data_cache.pop(key, None)
+        cls = type(self)
+        with cls._SHARED_CACHE_LOCK:
+            data_cache = cls._CSR_DATA_CACHE
+            self._csr_data_cache = data_cache
+            cached = data_cache.get(key)
+            if cached is not None:
+                if (
+                    cached.topology is topology
+                    and owner._heuristic_cache_stamp() == stamp
+                    and self._built_in_cost_signature(cost_function) == signature
+                ):
+                    data_cache.move_to_end(key)
+                    return cached
+                data_cache.pop(key, None)
 
         weight_array = self._vectorized_builtin_weights(topology, signature)
         if weight_array is None:
@@ -978,11 +974,13 @@ class ScenicRoutePlanner:
             or self._built_in_cost_signature(cost_function) != signature
         ):
             return None
-        data_cache[key] = result
-        data_cache.move_to_end(key)
-        while len(data_cache) > self._CSR_DATA_CACHE_CAPACITY:
-            data_cache.popitem(last=False)
-        self._csr_data_cache = data_cache
+        with cls._SHARED_CACHE_LOCK:
+            if cls._CSR_TOPOLOGY_CACHE is topology:
+                data_cache[key] = result
+                data_cache.move_to_end(key)
+                while len(data_cache) > self._CSR_DATA_CACHE_CAPACITY:
+                    data_cache.popitem(last=False)
+            self._csr_data_cache = data_cache
         return result
 
     def _compiled_duration_tie_path(
@@ -1093,27 +1091,23 @@ class ScenicRoutePlanner:
             return None
         stamp = graph._heuristic_cache_stamp()
         cls = type(self)
-        if (
-            cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH is not graph
-            or cls._ELIGIBLE_REACHABILITY_SHARED_STAMP != stamp
-        ):
-            cls._ELIGIBLE_REACHABILITY_SHARED_CACHE.clear()
-            cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH = graph
-            cls._ELIGIBLE_REACHABILITY_SHARED_STAMP = stamp
-        cache = cls._ELIGIBLE_REACHABILITY_SHARED_CACHE
-        result = cache.get(
-            self._compiled_reachability_cache_key(
+        with cls._SHARED_CACHE_LOCK:
+            if (
+                cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH is not graph
+                or cls._ELIGIBLE_REACHABILITY_SHARED_STAMP != stamp
+            ):
+                cls._ELIGIBLE_REACHABILITY_SHARED_CACHE.clear()
+                cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH = graph
+                cls._ELIGIBLE_REACHABILITY_SHARED_STAMP = stamp
+            cache = cls._ELIGIBLE_REACHABILITY_SHARED_CACHE
+            key = self._compiled_reachability_cache_key(
                 start, goal, cost_function, stamp
             )
-        )
-        if result is not None:
-            cache.move_to_end(
-                self._compiled_reachability_cache_key(
-                    start, goal, cost_function, stamp
-                )
-            )
-            return bool(result)
-        return None
+            result = cache.get(key)
+            if result is not None:
+                cache.move_to_end(key)
+                return bool(result)
+            return None
 
     def _record_compiled_reachability(
         self,
@@ -1127,21 +1121,22 @@ class ScenicRoutePlanner:
         if graph is None or graph._heuristic_cache_stamp() != stamp:
             return
         cls = type(self)
-        if (
-            cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH is not graph
-            or cls._ELIGIBLE_REACHABILITY_SHARED_STAMP != stamp
-        ):
-            cls._ELIGIBLE_REACHABILITY_SHARED_CACHE.clear()
-            cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH = graph
-            cls._ELIGIBLE_REACHABILITY_SHARED_STAMP = stamp
-        cache = cls._ELIGIBLE_REACHABILITY_SHARED_CACHE
-        key = self._compiled_reachability_cache_key(
-            start, goal, cost_function, stamp
-        )
-        cache[key] = bool(reachable)
-        cache.move_to_end(key)
-        while len(cache) > self._ELIGIBLE_REACHABILITY_CACHE_CAPACITY:
-            cache.popitem(last=False)
+        with cls._SHARED_CACHE_LOCK:
+            if (
+                cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH is not graph
+                or cls._ELIGIBLE_REACHABILITY_SHARED_STAMP != stamp
+            ):
+                cls._ELIGIBLE_REACHABILITY_SHARED_CACHE.clear()
+                cls._ELIGIBLE_REACHABILITY_SHARED_GRAPH = graph
+                cls._ELIGIBLE_REACHABILITY_SHARED_STAMP = stamp
+            cache = cls._ELIGIBLE_REACHABILITY_SHARED_CACHE
+            key = self._compiled_reachability_cache_key(
+                start, goal, cost_function, stamp
+            )
+            cache[key] = bool(reachable)
+            cache.move_to_end(key)
+            while len(cache) > self._ELIGIBLE_REACHABILITY_CACHE_CAPACITY:
+                cache.popitem(last=False)
 
     def _compiled_builtin_path(
         self,
@@ -1263,14 +1258,6 @@ class ScenicRoutePlanner:
         assert graph is not None
         stamp = graph._heuristic_cache_stamp()
         cls = type(self)
-        if (
-            cls._FASTEST_PATH_SHARED_GRAPH is not graph
-            or cls._FASTEST_PATH_SHARED_STAMP != stamp
-        ):
-            cls._FASTEST_PATH_SHARED_CACHE.clear()
-            cls._FASTEST_PATH_SHARED_GRAPH = graph
-            cls._FASTEST_PATH_SHARED_STAMP = stamp
-        self._fastest_path_cache = cls._FASTEST_PATH_SHARED_CACHE
         key = (
             graph,
             stamp,
@@ -1279,15 +1266,24 @@ class ScenicRoutePlanner:
             bool(avoid_highways),
             float(highway_preference),
         )
-        cached = self._fastest_path_cache.get(key)
-        if cached is not None:
+        with cls._SHARED_CACHE_LOCK:
             if (
-                graph is self.graph
-                and graph._heuristic_cache_stamp() == stamp
+                cls._FASTEST_PATH_SHARED_GRAPH is not graph
+                or cls._FASTEST_PATH_SHARED_STAMP != stamp
             ):
-                self._fastest_path_cache.move_to_end(key)
-                return list(cached)
-            self._fastest_path_cache.pop(key, None)
+                cls._FASTEST_PATH_SHARED_CACHE.clear()
+                cls._FASTEST_PATH_SHARED_GRAPH = graph
+                cls._FASTEST_PATH_SHARED_STAMP = stamp
+            self._fastest_path_cache = cls._FASTEST_PATH_SHARED_CACHE
+            cached = self._fastest_path_cache.get(key)
+            if cached is not None:
+                if (
+                    graph is self.graph
+                    and graph._heuristic_cache_stamp() == stamp
+                ):
+                    self._fastest_path_cache.move_to_end(key)
+                    return list(cached)
+                self._fastest_path_cache.pop(key, None)
 
         shortest_edges = self._a_star(
             start,
@@ -1301,10 +1297,18 @@ class ScenicRoutePlanner:
             or graph._heuristic_cache_stamp() != stamp
         ):
             raise RuntimeError("road graph changed during fastest-path search")
-        self._fastest_path_cache[key] = tuple(shortest_edges)
-        self._fastest_path_cache.move_to_end(key)
-        while len(self._fastest_path_cache) > self._FASTEST_PATH_CACHE_CAPACITY:
-            self._fastest_path_cache.popitem(last=False)
+        with cls._SHARED_CACHE_LOCK:
+            if (
+                cls._FASTEST_PATH_SHARED_GRAPH is not graph
+                or cls._FASTEST_PATH_SHARED_STAMP != stamp
+            ):
+                cls._FASTEST_PATH_SHARED_CACHE.clear()
+                cls._FASTEST_PATH_SHARED_GRAPH = graph
+                cls._FASTEST_PATH_SHARED_STAMP = stamp
+            self._fastest_path_cache[key] = tuple(shortest_edges)
+            self._fastest_path_cache.move_to_end(key)
+            while len(self._fastest_path_cache) > self._FASTEST_PATH_CACHE_CAPACITY:
+                self._fastest_path_cache.popitem(last=False)
         return list(shortest_edges)
 
     def _iter_edges(self, node_id: str):
@@ -1312,65 +1316,6 @@ class ScenicRoutePlanner:
         graph = self.graph
         assert graph is not None
         return graph.iter_edges(node_id)
-
-    def _cached_reverse_index(
-        self, cost_function: ScenicCostFunction
-    ) -> Optional[Dict[str, List[Tuple[str, str, bool]]]]:
-        """Return a reusable incoming-traversal index for the active graph."""
-        graph = self.graph
-        assert graph is not None
-        stamp = graph._heuristic_cache_stamp()
-        avoid_highways = self._avoids_highways(cost_function)
-        highway_preference = float(cost_function.highway_preference)
-        key = (id(graph), stamp, avoid_highways, highway_preference)
-        cached = self._REVERSE_INDEX_CACHE.get(key)
-        if cached is not None:
-            cached_graph, predecessors = cached
-            if (
-                cached_graph is graph
-                and graph is self.graph
-                and graph._heuristic_cache_stamp() == stamp
-            ):
-                self._REVERSE_INDEX_CACHE.move_to_end(key)
-                return predecessors
-            self._REVERSE_INDEX_CACHE.pop(key, None)
-
-        try:
-            adjacency = graph.adjacency
-            edges = graph.edges
-        except AttributeError:
-            return None
-        predecessors: Dict[str, List[Tuple[str, str, bool]]] = {}
-        try:
-            for source_index, (source_id, traversals) in enumerate(
-                adjacency.items()
-            ):
-                _check_active_deadline_at(source_index)
-                for edge_id, reverse in traversals:
-                    edge = edges[edge_id]
-                    if avoid_highways and is_highway_road_type(
-                        edge.road_type
-                    ):
-                        continue
-                    target_id = (
-                        edge.start_node_id if reverse else edge.end_node_id
-                    )
-                    predecessors.setdefault(target_id, []).append(
-                        (str(source_id), str(edge_id), bool(reverse))
-                    )
-        except (AttributeError, KeyError, TypeError, ValueError):
-            return None
-        _check_active_deadline()
-        if (
-            graph is not self.graph
-            or graph._heuristic_cache_stamp() != stamp
-        ):
-            return None
-        self._REVERSE_INDEX_CACHE[key] = (graph, predecessors)
-        self._REVERSE_INDEX_CACHE.move_to_end(key)
-        while len(self._REVERSE_INDEX_CACHE) > self._REVERSE_INDEX_CACHE_CAPACITY:
-            self._REVERSE_INDEX_CACHE.popitem(last=False)
-        return predecessors
 
     def _edge_from_reverse_index(
         self, edge_id: str, reverse: bool
@@ -4954,11 +4899,12 @@ class ScenicRoutePlanner:
                 lagrangian_multiplier=multiplier if isinstance(base, CompactRoadGraph) else 0.0,
             )
             check_graph()
-            if result is None:
-                return None
-            path, rank_key = result
-            best = (self._path_duration_minutes(path), path, rank_key)
-            best_metric = sum(scalar_edge_cost(edge) for edge in path)
+            best = None
+            best_metric = float("inf")
+            if result is not None:
+                path, rank_key = result
+                best = (self._path_duration_minutes(path), path, rank_key)
+                best_metric = sum(scalar_edge_cost(edge) for edge in path)
             for start_index, end_index, direction, edge in request.direct_candidates:
                 _check_active_deadline_at(start_index + end_index)
                 if self._avoids_highways(scenic_cost) and is_highway_road_type(
@@ -4968,9 +4914,11 @@ class ScenicRoutePlanner:
                 duration = self._path_duration_minutes([edge])
                 metric = scalar_edge_cost(edge)
                 direct_rank_key = (start_index, end_index, 2, direction, ())
-                if (metric, direct_rank_key) < (best_metric, best[2]):
+                if (metric, direct_rank_key) < (best_metric, best[2] if best else ()):
                     best = (duration, [edge], direct_rank_key)
                     best_metric = metric
+            if best is None:
+                return None
             duration, best_path, _rank_key = best
             if not self._duration_within_cap(
                 duration, duration_cap_minutes
@@ -5086,6 +5034,8 @@ class ScenicRoutePlanner:
                 raise RuntimeError("road graph changed during fastest-path search")
             render_graph = RoadGraph()
             for node_id in (request.start_node_id, request.end_node_id):
+                if node_id in render_graph.nodes:
+                    continue
                 render_graph.add_node(request.overlay.nodes[node_id])
             for edge in best_edges:
                 for node_id in (str(edge.start_node_id), str(edge.end_node_id)):
@@ -5392,7 +5342,7 @@ class ScenicRoutePlanner:
                 search_diagnostics=search_diagnostics,
                 algorithm="compiled-lagrangian-endpoint-search",
                 zero_improvement_reason=(
-                    "no_feasible_scenic_improvement"
+                    "no_scenic_improvement_found"
                     if no_scenic_improvement
                     else None
                 ),
@@ -5494,7 +5444,11 @@ class ScenicRoutePlanner:
             search_diagnostics=search_diagnostics,
             algorithm="production-multilabel-frontier",
             zero_improvement_reason=(
-                "no_feasible_scenic_improvement"
+                (
+                    "no_feasible_scenic_improvement"
+                    if exact or certified_upper_bound <= float(getattr(best_evaluation, "objective"))
+                    else "no_scenic_improvement_found"
+                )
                 if no_scenic_improvement
                 else None
             ),
@@ -5848,28 +5802,30 @@ class ScenicRoutePlanner:
         stamp = graph._heuristic_cache_stamp()
         cache = type(self)._ENDPOINT_GEODESIC_SPEED_SHARED_CACHE
         cache_key = (graph, stamp, bool(avoid_highways))
-        if cache_key in cache:
-            cache.move_to_end(cache_key)
-            if graph._heuristic_cache_stamp() == stamp:
-                return cache[cache_key]
-            del cache[cache_key]
+        with type(self)._SHARED_CACHE_LOCK:
+            if cache_key in cache:
+                cache.move_to_end(cache_key)
+                if graph._heuristic_cache_stamp() == stamp:
+                    return cache[cache_key]
+                del cache[cache_key]
 
         if isinstance(graph, CompactRoadGraph):
             result = graph.endpoint_geodesic_bound_speed(bool(avoid_highways))
             final_stamp = graph._heuristic_cache_stamp()
             if final_stamp != stamp:
                 return None
-            cache[cache_key] = result
-            cache.move_to_end(cache_key)
-            if not avoid_highways:
-                highway_key = (graph, stamp, True)
-                cache[highway_key] = result
-                cache.move_to_end(highway_key)
-            while (
-                len(cache)
-                > type(self)._ENDPOINT_GEODESIC_SPEED_CACHE_CAPACITY
-            ):
-                cache.popitem(last=False)
+            with type(self)._SHARED_CACHE_LOCK:
+                cache[cache_key] = result
+                cache.move_to_end(cache_key)
+                if not avoid_highways:
+                    highway_key = (graph, stamp, True)
+                    cache[highway_key] = result
+                    cache.move_to_end(highway_key)
+                while (
+                    len(cache)
+                    > type(self)._ENDPOINT_GEODESIC_SPEED_CACHE_CAPACITY
+                ):
+                    cache.popitem(last=False)
             return result
 
         maximum_speed = 1.0
@@ -5908,17 +5864,18 @@ class ScenicRoutePlanner:
         if final_stamp != stamp:
             return None
         result = maximum_speed if valid else None
-        cache[cache_key] = result
-        cache.move_to_end(cache_key)
-        if not avoid_highways:
-            highway_key = (graph, stamp, True)
-            cache[highway_key] = result
-            cache.move_to_end(highway_key)
-        while (
-            len(cache)
-            > type(self)._ENDPOINT_GEODESIC_SPEED_CACHE_CAPACITY
-        ):
-            cache.popitem(last=False)
+        with type(self)._SHARED_CACHE_LOCK:
+            cache[cache_key] = result
+            cache.move_to_end(cache_key)
+            if not avoid_highways:
+                highway_key = (graph, stamp, True)
+                cache[highway_key] = result
+                cache.move_to_end(highway_key)
+            while (
+                len(cache)
+                > type(self)._ENDPOINT_GEODESIC_SPEED_CACHE_CAPACITY
+            ):
+                cache.popitem(last=False)
         return result
 
     def _edge_distances_are_geodesic_lower_bounds(self) -> bool:
@@ -6746,10 +6703,6 @@ class ScenicRoutePlanner:
     @classmethod
     def _path_duration_minutes(cls, edges: List[Edge]) -> float:
         return float(sum(cls._edge_duration_minutes(edge) for edge in edges))
-
-    @staticmethod
-    def _path_distance_km(edges: List[Edge]) -> float:
-        return float(sum(edge.distance_km for edge in edges))
 
     def _reconstruct_path(
         self, came_from: Dict[str, Tuple[str, Edge]], goal_id: str

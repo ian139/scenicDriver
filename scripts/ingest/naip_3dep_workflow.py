@@ -20,6 +20,8 @@ Fail-closed authorization boundaries (zero network by default):
    ``acquisition_authorization_request.json`` (null caps).
 3. ``execute_plan()`` requires the plan path, its expected SHA-256, positive
    request/transfer/local/requester-pays-spend caps and ``allow_requester_pays``.
+   Printed acquisition resume commands bind the frozen plan path and digest;
+   discovery resume commands retain the hash-bound planning settings.
 """
 
 from __future__ import annotations
@@ -34,6 +36,8 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
+import sys
 import tempfile
 import threading
 import time
@@ -41,6 +45,10 @@ from typing import Any, Callable, Mapping, Sequence
 import xml.etree.ElementTree as ET
 
 import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data_pipeline.metered_transport import (
     Boto3MeteredTransport,
@@ -824,23 +832,34 @@ def discover_raw_catalogs(
         ),
         resume_command="",
         repository_source_tree_digest=current_source_digest,
+        planning_options=request.get("planning_options"),
     )
     meta_auth_sha = authorization_payload_digest(meta_auth)
     meta_auth_path = run_p / "catalog_metadata_authorization_request.json"
     req_auth = meta_auth["required_authorization"]
-    meta_resume_cmd = (
-        "uv run python scripts/ingest/plan_active_learning_region.py "
-        f"--run-name {run_p.name} "
-        f"--discover-catalog-metadata "
-        f"--metadata-request {meta_auth_path} "
-        f"--expected-metadata-request-sha256 {meta_auth_sha} "
-        f"--source-contract {contract_path} "
-        " --allow-requester-pays "
-        f"--max-source-requests {req_auth['max_requests']} "
-        f"--max-transfer-bytes {req_auth['max_transfer_bytes']} "
-        f"--max-local-bytes {req_auth['max_local_bytes']} "
-        f"--max-requester-pays-usd {req_auth['max_spend_usd']}"
+    # Carry the authorized planning inputs across discovery boundaries. Paths
+    # here describe the actual artifacts, never a new default-root run.
+    planning_options = dict(request.get("planning_options") or {})
+    planning_options.update(
+        run_name=run_p.name,
+        source_contract=str(contract_path),
+        output_root=str(run_p.parent),
     )
+    meta_argv = ["uv", "run", "python", "scripts/ingest/plan_active_learning_region.py"]
+    for name, value in planning_options.items():
+        if value is not None:
+            meta_argv.extend([f"--{name.replace('_', '-')}", str(value)])
+    meta_argv.extend([
+        "--discover-catalog-metadata",
+        "--metadata-request", str(meta_auth_path),
+        "--expected-metadata-request-sha256", meta_auth_sha,
+        "--allow-requester-pays",
+        "--max-source-requests", str(req_auth["max_requests"]),
+        "--max-transfer-bytes", str(req_auth["max_transfer_bytes"]),
+        "--max-local-bytes", str(req_auth["max_local_bytes"]),
+        "--max-requester-pays-usd", str(req_auth["max_spend_usd"]),
+    ])
+    meta_resume_cmd = shlex.join(meta_argv)
     meta_auth["resume_command"] = meta_resume_cmd
     atomic_write_json(meta_auth_path, meta_auth)
 
@@ -862,6 +881,7 @@ def build_catalog_metadata_authorization_request(
     raw_3dep_listing_sha256: str | None,
     resume_command: str,
     repository_source_tree_digest: str | None = None,
+    planning_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Boundary 2 authorization request artifact.
 
@@ -871,8 +891,8 @@ def build_catalog_metadata_authorization_request(
     (etag-bound, size-capped) per tile candidate, and one explicit GET per
     companion metadata object (3DEP per-quad XML) that the raw listing
     preserved.  Also binds the exact immutable source-contract SHA and the raw
-    artifact hashes the normalized catalogs will reference.  Producing this
-    document makes no network call.
+    artifact hashes and planning settings the normalized catalogs will reference.
+    Producing this document makes no network call.
     """
     repository_source_tree_digest = _resolve_repository_source_digest(
         repository_source_tree_digest
@@ -1041,6 +1061,7 @@ def build_catalog_metadata_authorization_request(
             "repository_source_tree_digest": repository_source_tree_digest,
         },
         "has_secrets": False,
+        "planning_options": dict(planning_options or {}),
         "resume_command": resume_command,
     }
     payload["authorization_digest"] = authorization_payload_digest(payload)
@@ -2464,11 +2485,13 @@ def build_discovery_authorization_request(
     missing: Sequence[str],
     target_bbox: tuple[float, float, float, float] | None,
     repository_source_tree_digest: str | None = None,
+    planning_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Unified discovery-authorization artifact for missing catalog snapshots.
 
     Provides exact catalog discovery operations, per-operation request and byte caps,
     and aggregate caps sufficient for discovery based on the source contract.
+    Planning options are hash-bound for subsequent metadata discovery and planning.
     No network call is made by this document or by producing it.
     """
     repository_source_tree_digest = _resolve_repository_source_digest(
@@ -2739,6 +2762,7 @@ def build_discovery_authorization_request(
             "repository_source_tree_digest": repository_source_tree_digest,
         },
         "has_secrets": False,
+        "planning_options": dict(planning_options or {}),
         "resume_command": resume_command,
     }
     payload["authorization_digest"] = authorization_payload_digest(payload)
@@ -3242,38 +3266,6 @@ def select_pilot_frame(
 # ---------------------------------------------------------------------------
 
 
-def _resume_command(
-    *,
-    run_name: str,
-    spec_path: str | None,
-    contract_path: str | Path,
-    image_root: str | Path,
-    output_root: str | Path,
-    budget: int,
-    pilot_budget: int | None,
-    config_path: str | Path,
-    imagery_source: str,
-    terrain_source: str,
-) -> str:
-    parts = [
-        "uv run python scripts/ingest/plan_active_learning_region.py",
-        f"--run-name {run_name}",
-        f"--imagery-source {imagery_source}",
-        f"--terrain-source {terrain_source}",
-        f"--source-contract {contract_path}",
-        f"--image-root {image_root}",
-        f"--output-root {output_root}",
-        f"--budget {budget}",
-    ]
-    if pilot_budget is not None:
-        parts.append(f"--pilot-budget {pilot_budget}")
-    if spec_path:
-        parts.append(f"--region-spec {spec_path}")
-    if config_path != "config/app_regions.json":
-        parts.append(f"--region-source {config_path}")
-    return " \\\n  ".join(parts)
-
-
 def build_execution_plan(
     *,
     run_name: str,
@@ -3416,18 +3408,6 @@ def build_execution_plan(
             "mosaic_tile_count": tile_plans_result["mosaic_tile_count"],
         },
         "deadline": {"max_runtime_minutes": max_runtime_minutes},
-        "resume_command": _resume_command(
-            run_name=run_name,
-            spec_path=spec_path,
-            contract_path=contract_path,
-            image_root=image_root,
-            output_root=output_root,
-            budget=budget,
-            pilot_budget=pilot_budget,
-            config_path=config_path,
-            imagery_source=imagery_source,
-            terrain_source=terrain_source,
-        ),
         "determinism_note": (
             "recomputed from identical inputs and compared byte-for-byte at execution; "
             "no wall-clock fields are part of this plan"
@@ -3491,7 +3471,9 @@ def build_acquisition_authorization_request(
 
     Lists the exact proposed operations (HEAD/GET per unique asset, per-tile
     local processing) with null byte/request/local/spend caps and a false
-    requester-pays policy: nothing here authorizes network spend.
+    requester-pays policy: nothing here authorizes network spend. The resume
+    command executes this exact plan and digest; planning options stay frozen
+    inside the plan rather than being interpreted by another planning pass.
     """
     repository_source_tree_digest = _resolve_repository_source_digest(
         repository_source_tree_digest
@@ -3562,12 +3544,13 @@ def build_acquisition_authorization_request(
             "reserved_bytes": None,
         }
     )
+    plan_path = Path(plan["inputs"]["output_root"]) / run_name / "execution_plan.json"
 
     return {
         "schema_version": AUTHORIZATION_SCHEMA_VERSION,
         "authorization_type": "acquisition_authorization_request",
         "run_name": run_name,
-        "execution_plan_path": "execution_plan.json",
+        "execution_plan_path": str(plan_path),
         "execution_plan_sha256": plan_sha,
         "proposed_operations": proposed_operations,
         "per_operation_byte_reservation": None,
@@ -3594,7 +3577,11 @@ def build_acquisition_authorization_request(
             ),
         },
         "has_secrets": False,
-        "resume_command": plan["resume_command"],
+        "resume_command": shlex.join([
+            "uv", "run", "python", "scripts/ingest/plan_active_learning_region.py",
+            "--execute-plan", str(plan_path),
+            "--expected-plan-sha256", plan_sha,
+        ]),
     }
 
 
@@ -4909,10 +4896,23 @@ def execute_plan(
     # Re-inventory and re-assess water so the manifest is truthful.
     from src.data_pipeline.tile_inventory import scan_tile_inventory
 
+    bound_row_order = {
+        (row["region"], int(row["z"]), int(row["x"]), int(row["y"])): index
+        for index, row in enumerate(rows)
+    }
     rows, counts = scan_tile_inventory(
-        rows, image_root=image_root, expected_dimensions=(512, 512)
+        rows,
+        image_root=image_root,
+        expected_dimensions=(
+            int(contract["preprocessing"]["tile_width"]),
+            int(contract["preprocessing"]["tile_height"]),
+        ),
     )
-    rows.sort(key=lambda r: (r["region"], int(r["z"]), int(r["x"]), int(r["y"])))
+    # Inventory reports in canonical order; the execution manifest must retain
+    # the ordering already bound by the immutable plan's coordinate digest.
+    rows.sort(key=lambda row: bound_row_order[
+        (row["region"], int(row["z"]), int(row["x"]), int(row["y"]))
+    ])
     write_manifest_csv(run_dir / "tile_manifest.csv", rows)
 
     counters = shared_budget.counters()

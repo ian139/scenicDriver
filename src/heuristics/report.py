@@ -17,60 +17,65 @@ def union_report_tiles(
 ) -> list[dict[str, Any]]:
     """Deterministic additive union of report tiles keyed by (z, x, y, image_path).
 
-    Rejects coordinate disagreement within rows and preserves dataset origin columns.
+    Rejects coordinate disagreement within and across rows, preserving unknowns
+    and dataset origin columns.
     """
-    merged: dict[tuple[int, int, int, str], dict[str, Any]] = {}
+    from src.heuristics.labeler import parse_tile_coords
+
+    merged: dict[tuple[int | None, int | None, int | None, str], dict[str, Any]] = {}
+    coords_by_image: dict[str, dict[str, Any]] = {}
 
     for group in tile_groups:
         for tile in group:
             img_path = str(tile.get("image_path") or "").strip()
-            z = tile.get("z")
-            x = tile.get("x")
-            y = tile.get("y")
-            if z is None or x is None or y is None:
-                m = re.search(
+            parsed = parse_tile_coords(img_path)
+            if parsed is None:
+                match = re.search(
                     r"z(\d+)[/_-]+(?:x)?(\d+)[/_-]+(?:y)?(\d+)",
                     img_path,
                     re.IGNORECASE,
                 )
-                if m:
-                    z = int(m.group(1))
-                    x = int(m.group(2))
-                    y = int(m.group(3))
-                else:
-                    m2 = re.search(r"(\d+)[_-](\d+)", Path(img_path).stem)
-                    if m2:
-                        z = z if z is not None else 14
-                        x = int(m2.group(1))
-                        y = int(m2.group(2))
+                if match:
+                    parsed = tuple(int(value) for value in match.groups())
+            inferred = dict(zip(("z", "x", "y"), parsed)) if parsed else {}
+            if not inferred:
+                match = re.fullmatch(r"(\d+)[_-](\d+)", Path(img_path).stem)
+                if match:
+                    inferred.update(zip(("x", "y"), map(int, match.groups())))
+            row_copy = dict(tile)
+            for coord_col in ("z", "x", "y"):
+                supplied = tile.get(coord_col)
+                value = int(supplied) if supplied is not None else inferred.get(coord_col)
+                if supplied is not None and coord_col in inferred and value != inferred[coord_col]:
+                    raise ValueError(
+                        f"Coordinate disagreement for column {coord_col!r} "
+                        f"in image {img_path!r}: {value} != {inferred[coord_col]}"
+                    )
+                row_copy[coord_col] = value
+            row_copy["image_path"] = img_path
 
-            z_val = int(z) if z is not None else 0
-            x_val = int(x) if x is not None else 0
-            y_val = int(y) if y is not None else 0
+            # The image identity must agree even if differing coordinates would
+            # otherwise put rows under different union keys.
+            known_coords = coords_by_image.setdefault(img_path, {})
+            for coord_col in ("lat", "lon", "x", "y", "z"):
+                value = row_copy.get(coord_col)
+                existing_value = known_coords.get(coord_col)
+                if value is not None and existing_value is not None:
+                    try:
+                        agrees = abs(float(existing_value) - float(value)) <= 1e-5
+                    except (TypeError, ValueError):
+                        agrees = str(existing_value).strip() == str(value).strip()
+                    if not agrees:
+                        raise ValueError(
+                            f"Coordinate disagreement for column {coord_col!r} "
+                            f"in image {img_path!r}: {existing_value!r} != {value!r}"
+                        )
+                if value is not None:
+                    known_coords[coord_col] = value
 
-            key = (z_val, x_val, y_val, img_path)
-
+            key = (row_copy["z"], row_copy["x"], row_copy["y"], img_path)
             if key in merged:
                 existing = merged[key]
-                # Reject coordinate disagreement within rows
-                for coord_col in ("lat", "lon", "x", "y", "z"):
-                    v1 = existing.get(coord_col)
-                    v2 = tile.get(coord_col)
-                    if v1 is not None and v2 is not None:
-                        try:
-                            f1 = float(v1)
-                            f2 = float(v2)
-                            if abs(f1 - f2) > 1e-5:
-                                raise ValueError(
-                                    f"Coordinate disagreement for column {coord_col!r} "
-                                    f"in tile key {key}: {f1} != {f2}"
-                                )
-                        except (TypeError, ValueError):
-                            if str(v1).strip() != str(v2).strip():
-                                raise ValueError(
-                                    f"Coordinate disagreement for column {coord_col!r} "
-                                    f"in tile key {key}: {v1!r} != {v2!r}"
-                                )
                 # Preserve dataset origin columns
                 for origin_col in (
                     "dataset_origin",
@@ -94,14 +99,11 @@ def union_report_tiles(
                                 f"{existing[origin_col]},{tile[origin_col]}"
                             )
             else:
-                row_copy = dict(tile)
-                row_copy["z"] = z_val
-                row_copy["x"] = x_val
-                row_copy["y"] = y_val
-                row_copy["image_path"] = img_path
                 merged[key] = row_copy
 
-    sorted_keys = sorted(merged.keys())
+    sorted_keys = sorted(
+        merged, key=lambda key: (tuple((v is not None, v or 0) for v in key[:3]), key[3])
+    )
     result_tiles = [merged[k] for k in sorted_keys]
     for idx, tile in enumerate(result_tiles):
         tile["index"] = idx
@@ -450,11 +452,7 @@ def union_reports(
             run_info=merged_run_info,
             include_thumbs=include_thumbs,
         )
-    scores = (
-        np.array([float(t["scenic_score"]) for t in unified_tiles], dtype=np.float32)
-        if unified_tiles
-        else np.array([0.0], dtype=np.float32)
-    )
+    scores = np.array([float(t["scenic_score"]) for t in unified_tiles], dtype=np.float32)
     hist_counts, hist_edges = np.histogram(scores, bins=20, range=(0.0, 10.0))
     summary = {
         "total_tiles": int(len(unified_tiles)),
@@ -510,11 +508,11 @@ def build_report(
 
     summary = {
         "total_tiles": int(len(tiles)),
-        "mean": float(scores.mean()),
-        "median": float(np.median(scores)),
-        "std": float(scores.std()),
-        "min": float(scores.min()),
-        "max": float(scores.max()),
+        "mean": float(scores.mean()) if tiles else 0.0,
+        "median": float(np.median(scores)) if tiles else 0.0,
+        "std": float(scores.std()) if tiles else 0.0,
+        "min": float(scores.min()) if tiles else 0.0,
+        "max": float(scores.max()) if tiles else 0.0,
     }
 
     grid = _build_grid_mapping(tiles)
@@ -549,11 +547,12 @@ def _attach_thumbnails(
     thumbs_dir: Path,
     thumb_size: int,
 ) -> None:
+    """Prefer local images and fetch missing fallback tiles from the raw/ S3 root."""
     raw_dir_str = str(raw_dir)
     raw_root = Path(raw_dir_str)
 
     s3_bucket = os.getenv("SCENIC_S3_BUCKET")
-    s3_prefix = None
+    s3_prefix = "raw"
     s3_only = False
     if raw_dir_str.startswith("s3://"):
         s3_parts = raw_dir_str.replace("s3://", "", 1).split("/", 1)
@@ -580,7 +579,11 @@ def _attach_thumbnails(
         thumb_name = f"{idx:05d}.jpg"
         thumb_path = thumbs_dir / thumb_name
 
-        if s3_only:
+        if s3_only or (s3_bucket and not image_path.exists()):
+            if s3 is None:
+                import boto3
+
+                s3 = boto3.client("s3")
             key = (
                 f"{s3_prefix}/{tile['image_path']}" if s3_prefix else tile["image_path"]
             )
@@ -596,8 +599,11 @@ def _attach_thumbnails(
 
 
 def _build_grid_mapping(tiles: list[dict[str, Any]]) -> dict[str, Any]:
+    zooms = {int(t["z"]) for t in tiles if t.get("z") is not None}
+    if len(zooms) > 1:
+        raise ValueError(f"Mixed-zoom report grids are not supported: {sorted(zooms)}")
     coords = [(t.get("x"), t.get("y"), t.get("z")) for t in tiles]
-    has_coords = all(
+    has_coords = bool(coords) and all(
         x is not None and y is not None and z is not None for x, y, z in coords
     )
     if not has_coords:
@@ -605,8 +611,7 @@ def _build_grid_mapping(tiles: list[dict[str, Any]]) -> dict[str, Any]:
 
     xs = [int(t["x"]) for t in tiles]
     ys = [int(t["y"]) for t in tiles]
-    zs = [int(t["z"]) for t in tiles]
-    zoom = zs[0] if len(set(zs)) == 1 else None
+    zoom = next(iter(zooms))
 
     index_by_coord = {f"{t['x']},{t['y']}": int(t["index"]) for t in tiles}
 
@@ -879,7 +884,8 @@ def _render_index_html() -> str:
           <button id="next-tile">Next</button>
           <div class="pill" id="tile-id">Select a tile</div>
         </div>
-        <img id="tile-thumb" class="tile-preview" src="" alt="tile thumbnail" />
+        <img id="tile-thumb" class="tile-preview" alt="tile thumbnail" hidden />
+        <div id="tile-no-thumb" class="muted" hidden>No thumbnail available.</div>
         <div id="tile-score"></div>
         <div class="breakdown" id="tile-breakdown"></div>
         <div class="muted" id="tile-path"></div>
@@ -903,6 +909,7 @@ def _render_index_html() -> str:
       const routeStatsNote = document.getElementById("route-stats-note");
       const tileIdEl = document.getElementById("tile-id");
       const tileThumbEl = document.getElementById("tile-thumb");
+      const tileNoThumbEl = document.getElementById("tile-no-thumb");
       const tileScoreEl = document.getElementById("tile-score");
       const tileBreakdownEl = document.getElementById("tile-breakdown");
       const tilePathEl = document.getElementById("tile-path");
@@ -1172,6 +1179,7 @@ def _render_index_html() -> str:
       }
 
       function renderSummary(summary, runInfo) {
+        runInfo = runInfo || {};
         const scoringMode = inferScoringMode(runInfo);
         const items = [
           ["Total Tiles", summary.total_tiles],
@@ -1181,9 +1189,9 @@ def _render_index_html() -> str:
           ["Min Score", summary.min.toFixed(2)],
           ["Max Score", summary.max.toFixed(2)],
           ["Scoring Mode", scoringMode],
-          ["Classifier", runInfo.used_classifier ? "on" : "off"],
-          ["Device", runInfo.device],
-          ["Missing Pairs", runInfo.counts.missing_pairs],
+          ["Classifier", runInfo.used_classifier == null ? "n/a" : (runInfo.used_classifier ? "on" : "off")],
+          ["Device", runInfo.device || "n/a"],
+          ["Missing Pairs", runInfo.counts?.missing_pairs ?? "n/a"],
         ];
         summaryEl.innerHTML = items
           .map(([label, value]) => {
@@ -1568,12 +1576,22 @@ def _render_index_html() -> str:
       function setTile(tile) {
         currentIndex = tile.index;
         tileIdEl.textContent = `Tile ${tile.index + 1} / ${tiles.length}`;
-        tileThumbEl.src = tile.thumb_url || tile.thumb || "";
+        const thumbnail = tile.thumb_url || tile.thumb;
+        tileThumbEl.hidden = !thumbnail;
+        tileNoThumbEl.hidden = !!thumbnail;
+        if (thumbnail) {
+          tileThumbEl.src = thumbnail;
+        } else {
+          tileThumbEl.removeAttribute("src");
+        }
+        const classScore = tile.class_score == null
+          ? "n/a"
+          : _formatNumber(tile.class_score, 2);
         tileScoreEl.innerHTML = `<strong>Score:</strong> ${tile.scenic_score.toFixed(
           2
         )} <span class="muted">(class: ${
           tile.class_name || "unknown"
-        }, class score: ${Number(tile.class_score).toFixed(2)})</span>`;
+        }, class score: ${classScore})</span>`;
 
         const breakdown = [
           ["Relief (m)", tile.relief],

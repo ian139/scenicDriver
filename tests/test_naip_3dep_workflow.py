@@ -8,6 +8,8 @@ import math
 import hashlib
 import json
 import threading
+import shlex
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -51,6 +53,21 @@ from tests.naip3dep_fixtures import (
     tnm_record,
     write_contract_with_catalogs,
 )
+
+
+@pytest.fixture(autouse=True)
+def stable_repository_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate local workflow fixtures from concurrent edits to the checkout."""
+    from scripts.ingest import plan_active_learning_region as cli
+
+    compute_digest = wf.repository_source_tree_digest
+    source_digest = compute_digest()
+
+    def digest(root=None):
+        return compute_digest(root) if root is not None else source_digest
+
+    monkeypatch.setattr(wf, "repository_source_tree_digest", digest)
+    monkeypatch.setattr(cli, "repository_source_tree_digest", digest)
 
 
 def _plan_and_execute(
@@ -182,6 +199,106 @@ def _plan_and_execute(
     (run_dir / "execution_plan.sha256").write_text(plan_sha + "\n")
     wf.write_manifest_csv(run_dir / "tile_manifest.csv", rows)
     return plan, plan_sha, plan_path
+
+
+def test_acquisition_resume_executes_frozen_plan_with_spaced_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.ingest import plan_active_learning_region as cli
+
+    root = tmp_path / "custom output and images"
+    root.mkdir()
+    plan, plan_sha, plan_path = _plan_and_execute(root, run_name="frozen")
+    contract, _ = load_source_contract(plan["inputs"]["source_contract_path"])
+    auth = wf.build_acquisition_authorization_request(
+        run_name="frozen", plan=plan, plan_sha=plan_sha, contract=contract
+    )
+    argv = shlex.split(auth["resume_command"])
+    monkeypatch.setattr(sys, "argv", argv[3:] + [
+        "--allow-requester-pays",
+        "--max-source-requests", "200",
+        "--max-transfer-bytes", "100000000",
+        "--max-local-bytes", "100000000",
+        "--max-requester-pays-usd", "500",
+    ])
+    args = cli.parse_args()
+    assert args.execute_plan == str(plan_path)
+    assert args.expected_plan_sha256 == plan_sha
+    assert args.run_name is None
+
+    def forbid_replanning(**kwargs):
+        pytest.fail("acquisition resume must execute the frozen plan, not replan")
+
+    def offline_execute(*args, **kwargs):
+        return execute_plan(
+            *args, **kwargs,
+            transport_factory=make_transport_factory(build_fixture_objects()),
+        )
+
+    monkeypatch.setattr(cli, "plan_run", forbid_replanning)
+    monkeypatch.setattr(cli, "execute_plan", offline_execute)
+    cli.main()
+    checkpoint = json.loads((plan_path.parent / "checkpoint.json").read_text())
+    assert checkpoint["state"] == "acquired"
+    assert load_and_verify_plan(plan_path, plan_sha) == plan
+
+
+def test_pilot_manifest_preserves_bound_order_through_execution_and_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.ingest import plan_active_learning_region as cli
+
+    setup = tmp_path / "setup"
+    setup.mkdir()
+    base_plan, _, _ = _plan_and_execute(setup)
+    planned = fake_planned_dict()
+    frame = list(reversed(TILE_COORDS))
+    frame_sha = wf.identity_digest({"coords": frame})
+    monkeypatch.setattr(cli, "parse_and_validate_region_spec", lambda *a, **k: planned)
+    monkeypatch.setattr(cli, "select_pilot_frame", lambda *a, **k: (frame, frame_sha))
+    result = cli.plan_run(
+        run_name="ordered_pilot",
+        spec={"regions": [{
+            "type": "jurisdiction_land_intersection",
+            "land_geometry_file": base_plan["inputs"]["land_geometry_path"],
+        }]},
+        source_contract_path=base_plan["inputs"]["source_contract_path"],
+        output_root=tmp_path / "custom runs",
+        image_root=tmp_path / "custom images",
+        pilot_budget=2,
+        budget=10,
+        max_runtime_minutes=7,
+    )
+    plan_path = Path(result["execution_plan_path"])
+    plan_sha = result["execution_plan_sha256"]
+    plan = load_and_verify_plan(plan_path, plan_sha)
+    assert plan["inputs"]["budget"] == 10
+    assert plan["inputs"]["pilot_budget"] == 2
+    assert plan["deadline"]["max_runtime_minutes"] == 7
+    pilot = json.loads((plan_path.parent / "pilot_frame.json").read_text())
+    assert pilot["coordinates"] == [list(coord) for coord in frame]
+
+    for _ in range(2):
+        with (plan_path.parent / "tile_manifest.csv").open(newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        assert [(int(row["x"]), int(row["y"])) for row in rows] == frame
+        assert wf.identity_digest([
+            (row["region"], int(row["z"]), int(row["x"]), int(row["y"]))
+            for row in rows
+        ]) == plan["hashes"]["coordinate_list_sha256"]
+        outcome = execute_plan(
+            plan_path,
+            expected_plan_sha256=plan_sha,
+            allow_requester_pays=True,
+            max_source_requests=200,
+            max_transfer_bytes=100_000_000,
+            max_local_bytes=100_000_000,
+            max_requester_pays_usd=Decimal("500"),
+            workers=1,
+            transport_factory=make_transport_factory(build_fixture_objects()),
+        )
+        assert outcome["state"] == "acquired"
+        assert load_and_verify_plan(plan_path, plan_sha) == plan
 
 
 def test_source_contract_rejects_unknown_collections(tmp_path: Path) -> None:
@@ -958,30 +1075,53 @@ def test_discovery_request_source_tree_drift_fails_before_network(
 
 
 def test_discover_raw_catalogs_emits_metadata_authorization_and_no_strict_catalog(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from scripts.ingest import plan_active_learning_region as cli
+
+    root = tmp_path / "planning paths with spaces"
+    root.mkdir()
     contract_path = write_contract_with_catalogs(
-        tmp_path, imagery_catalog=None, terrain_records=None
+        root, imagery_catalog=None, terrain_records=None
     )
-    contract, contract_sha = load_source_contract(contract_path)
-    planned = fake_planned_dict()
-    auth = wf.build_discovery_authorization_request(
-        run_name="raw_disc",
-        contract=contract,
-        contract_sha=contract_sha,
-        region_spec_sha="a" * 64,
-        geometry_digest=planned["geometry_digest"],
-        coordinate_count=len(TILE_COORDS),
-        jurisdictions=["Connecticut"],
-        missing=["imagery", "terrain"],
-        target_bbox=None,
-        resume_command="resume",
+    contract, _ = load_source_contract(contract_path)
+    spec_path = root / "region spec.json"
+    spec_path.write_text(json.dumps({"regions": [], "included_jurisdictions": ["Connecticut"]}))
+    config_path = root / "app regions.json"
+    config_path.write_text("{}")
+    monkeypatch.setattr(cli, "parse_and_validate_region_spec", lambda *a, **k: fake_planned_dict())
+    planning_options = {
+        "run_name": "raw_disc",
+        "region_spec": str(spec_path),
+        "source_contract": str(contract_path),
+        "image_root": str(root / "custom images"),
+        "output_root": str(root / "custom runs"),
+        "region_source": str(config_path),
+        "imagery_source": wf.SUPPORTED_IMAGERY_SOURCE,
+        "terrain_source": wf.SUPPORTED_TERRAIN_SOURCE,
+        "zoom": 14,
+        "budget": 10,
+        "pilot_budget": 2,
+        "max_runtime_minutes": 9,
+    }
+    result = cli.plan_run(
+        run_name=planning_options["run_name"],
+        spec_path=planning_options["region_spec"],
+        source_contract_path=planning_options["source_contract"],
+        image_root=planning_options["image_root"],
+        output_root=planning_options["output_root"],
+        config_path=planning_options["region_source"],
+        budget=10, pilot_budget=2, max_runtime_minutes=9,
     )
-    run_dir = tmp_path / "runs" / "raw_disc"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    auth_path = run_dir / "discovery_authorization_request.json"
-    atomic_write_json(auth_path, auth)
+    run_dir = Path(result["run_dir"])
+    auth_path = Path(result["authorization_path"])
+    auth = json.loads(auth_path.read_text())
     auth_sha = auth["authorization_digest"]
+    monkeypatch.setattr(sys, "argv", shlex.split(auth["resume_command"])[3:])
+    raw_args = cli.parse_args()
+    assert raw_args.discover_raw_catalogs
+    for name, value in planning_options.items():
+        assert getattr(raw_args, name) == value
 
     objects = build_fixture_objects()
     transport_factory = make_transport_factory(objects)
@@ -1007,6 +1147,16 @@ def test_discover_raw_catalogs_emits_metadata_authorization_and_no_strict_catalo
     assert res["state"] == "needs_metadata_discovery"
     meta_path = Path(res["metadata_authorization_path"])
     assert meta_path.is_file()
+    metadata_auth = json.loads(meta_path.read_text())
+    assert metadata_auth["planning_options"] == planning_options
+    assert wf.authorization_payload_digest(metadata_auth) == res["metadata_authorization_sha256"]
+    monkeypatch.setattr(sys, "argv", shlex.split(metadata_auth["resume_command"])[3:])
+    metadata_args = cli.parse_args()
+    assert metadata_args.discover_catalog_metadata
+    assert metadata_args.metadata_request == str(meta_path)
+    assert metadata_args.expected_metadata_request_sha256 == res["metadata_authorization_sha256"]
+    for name, value in planning_options.items():
+        assert getattr(metadata_args, name) == value
 
     assert (run_dir / "raw_naip_manifest.txt").is_file()
     assert (run_dir / "raw_3dep_listing.json").is_file()

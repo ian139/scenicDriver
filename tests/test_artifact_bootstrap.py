@@ -117,6 +117,51 @@ def test_gzip_download_is_decompressed_before_verification(tmp_path: Path) -> No
     assert client.calls[0][:2] == ("example-bucket", "objects/artifact.bin.gz")
 
 
+def test_gzip_expansion_stops_at_manifest_bound_and_preserves_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = b"expected"
+    manifest = tmp_path / "manifest.json"
+    _manifest(manifest, payload=expected, compression="gzip")
+    destination = tmp_path / "runtime/artifact.bin"
+    destination.parent.mkdir()
+    destination.write_bytes(b"existing local artifact")
+    client = FakeS3(gzip.compress(b"x" * (4 * 1024 * 1024)))
+    original_open = gzip.open
+    expanded_bytes = 0
+
+    class BoundedSource:
+        def __init__(self, *args, **kwargs):
+            self.stream = original_open(*args, **kwargs)
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def read(self, size=-1):
+            nonlocal expanded_bytes
+            chunk = self.stream.read(size)
+            expanded_bytes += len(chunk)
+            return chunk
+
+    monkeypatch.setattr(gzip, "open", BoundedSource)
+    with pytest.raises(ArtifactBootstrapError, match="exceeds manifest size"):
+        bootstrap(
+            manifest,
+            project_root=tmp_path,
+            bucket="example-bucket",
+            s3_client=client,
+        )
+
+    # Read only the declared bytes plus one overflow sentinel, not the bomb.
+    assert expanded_bytes == len(expected) + 1
+    assert destination.read_bytes() == b"existing local artifact"
+    assert list(destination.parent.iterdir()) == [destination]
+
+
 def test_mismatched_download_is_refused_and_existing_file_is_preserved(tmp_path: Path) -> None:
     expected = b"expected"
     manifest = tmp_path / "manifest.json"

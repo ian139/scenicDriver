@@ -3,6 +3,8 @@
 The benchmark includes bounded exact-oracle cases and a deterministic
 production-frontier stress case. Every score and invariant is recomputed from
 the returned route segments before a metric is emitted.
+Duration caps and ratios use the unrestricted fastest route; highway-avoiding
+cases compare scenic uplift against the fastest highway-free route.
 """
 from __future__ import annotations
 
@@ -152,8 +154,8 @@ def build_competing_scenic_detours_graph() -> RoadGraph:
             "G": (43.0300, -72.0000),
         },
     )
-    # The highway is faster in the unconstrained graph, while the benchmark
-    # asks for avoid_highways=True so the secondary-edge baseline is used.
+    # Highway avoidance restricts the scenic-score comparator, while the
+    # duration budget remains relative to the unrestricted fastest route.
     _add_edge(graph, "highway-shortcut", "S", "G", 8.0, 0.0, 80, road_type="motorway")
     _add_edge(graph, "eligible-fast", "S", "G", 10.0, 1.0, 100)
     _add_edge(graph, "detour-a-1", "S", "A", 3.0, 7.0, 30)
@@ -532,15 +534,24 @@ def _run_case(case: BenchmarkCase) -> tuple[float, float, float]:
     fastest_route = planner.find_fastest_route(
         case.start,
         case.end,
-        avoid_highways=case.avoid_highways,
+        avoid_highways=False,
     )
     fastest = recompute_route_metrics(
         case.graph,
         fastest_route,
         case.start,
         case.end,
-        avoid_highways=case.avoid_highways,
+        avoid_highways=False,
     )
+    comparator = fastest
+    if case.avoid_highways:
+        comparator_route = planner.find_fastest_route(
+            case.start, case.end, avoid_highways=True,
+        )
+        comparator = recompute_route_metrics(
+            case.graph, comparator_route, case.start, case.end,
+            avoid_highways=True,
+        )
     scenic_route = planner.find_scenic_route(
         case.start,
         case.end,
@@ -566,12 +577,12 @@ def _run_case(case: BenchmarkCase) -> tuple[float, float, float]:
         raise ValueError(f"{case.name} fastest route exceeds its own duration cap")
     if scenic.duration_minutes > duration_cap + _TOLERANCE:
         raise ValueError(f"{case.name} scenic route exceeds its duration cap")
-    if scenic.normalized_scenic_score + _TOLERANCE < fastest.normalized_scenic_score:
-        raise ValueError(f"{case.name} scenic route is less scenic than fastest route")
+    if scenic.normalized_scenic_score + _TOLERANCE < comparator.normalized_scenic_score:
+        raise ValueError(f"{case.name} scenic route is less scenic than eligible fastest route")
 
     return (
         scenic.normalized_scenic_score,
-        scenic.normalized_scenic_score - fastest.normalized_scenic_score,
+        scenic.normalized_scenic_score - comparator.normalized_scenic_score,
         scenic.duration_minutes / fastest.duration_minutes,
     )
 

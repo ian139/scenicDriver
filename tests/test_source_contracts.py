@@ -1,6 +1,9 @@
 """Tests for source contracts, validation, secret rejection, and layered identities."""
 
+import copy
+import hashlib
 import json
+import pickle
 
 import pytest
 
@@ -296,3 +299,159 @@ def test_prediction_identity_distinguishes_calibration_config_and_artifact():
     changed_artifact = sample_report(embedding, calibration_artifact_sha256="c" * 64)
     assert report.sha256() != changed_config.sha256()
     assert report.sha256() != changed_artifact.sha256()
+
+
+def _canonical_sha256(payload: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def test_source_asset_band_contract_is_a_detached_immutable_snapshot():
+    band_contract = {"bands": ["R", "G", "B"], "meta": {"order": [1, 2, 3]}}
+    asset = SourceAsset(
+        provider="USDA",
+        collection="NAIP",
+        asset_id="a1",
+        canonical_uri="https://example.com/a.tif",
+        band_contract=band_contract,
+    )
+    expected = copy.deepcopy(asset.to_dict())
+    expected_sha = asset.sha256()
+    assert expected["band_contract"] == {
+        "bands": ["R", "G", "B"],
+        "meta": {"order": [1, 2, 3]},
+    }
+    assert expected_sha == _canonical_sha256(expected)
+
+    # Caller mutation after construction does not leak into the identity.
+    band_contract["bands"].append("NIR")
+    band_contract["meta"]["order"].append(4)
+    band_contract["extra"] = True
+    assert asset.to_dict() == expected
+    assert asset.sha256() == expected_sha
+
+    # Mutating a serialized dict does not leak back into the asset.
+    serialized = asset.to_dict()
+    serialized["band_contract"]["bands"].clear()
+    serialized["band_contract"]["meta"]["order"].append(99)
+    assert asset.to_dict() == expected
+    assert asset.sha256() == expected_sha
+
+    # The stored snapshot itself cannot be mutated in place.
+    with pytest.raises(TypeError):
+        asset.band_contract["bands"] = ["X"]
+    with pytest.raises((TypeError, AttributeError)):
+        asset.band_contract["bands"].append("X")
+    assert asset.sha256() == expected_sha
+
+    # from_dict input mutation after construction does not leak either.
+    payload = asset.to_dict()
+    restored = SourceAsset.from_dict(payload)
+    payload["band_contract"]["bands"].append("NIR")
+    payload["band_contract"]["meta"]["order"].clear()
+    assert restored == asset
+    assert restored.to_dict() == expected
+    assert restored.sha256() == expected_sha
+
+    # Snapshots stay copyable/picklable like the previous plain-dict field.
+    for clone in (copy.deepcopy(asset), pickle.loads(pickle.dumps(asset))):
+        assert clone == asset
+        assert clone.sha256() == expected_sha
+
+
+def test_source_asset_list_band_contract_and_resolution_serialize_canonically():
+    bands = ["red", "green", "blue"]
+    resolution = [0.6, 0.6]
+    asset = SourceAsset(
+        provider="USDA",
+        collection="NAIP",
+        asset_id="a1",
+        canonical_uri="https://example.com/a.tif",
+        native_resolution=resolution,
+        band_contract=bands,
+    )
+    bands.append("nir")
+    resolution.append(9.0)
+    data = asset.to_dict()
+    assert data["band_contract"] == ["red", "green", "blue"]
+    assert data["native_resolution"] == [0.6, 0.6]
+    assert asset.sha256() == _canonical_sha256(data)
+    assert SourceAsset.from_dict(data) == asset
+
+
+@pytest.mark.parametrize(
+    "band_contract",
+    [
+        {"bands"},
+        {"scale": float("nan")},
+        [float("inf")],
+        {1: "red"},
+        {"bands": object()},
+        b"rgb",
+        42,
+    ],
+)
+def test_source_asset_rejects_non_canonical_json_band_contract(band_contract):
+    with pytest.raises(ValueError, match="band_contract"):
+        SourceAsset(
+            provider="USDA",
+            collection="NAIP",
+            asset_id="a1",
+            canonical_uri="https://example.com/a.tif",
+            band_contract=band_contract,
+        )
+
+
+@pytest.mark.parametrize(
+    "factory,field_name",
+    [
+        (sample_acquisition, "target_grid_sha256"),
+        (sample_acquisition, "satellite_output_sha256"),
+        (sample_acquisition, "terrain_output_sha256"),
+        (sample_acquisition, "source_contract_sha256"),
+        (sample_acquisition, "preprocessing_contract_sha256"),
+        (sample_embedding, "classifier_preprocessing_sha256"),
+        (sample_embedding, "classifier_checkpoint_sha256"),
+        (sample_report, "regression_checkpoint_sha256"),
+        (sample_report, "calibration_config_sha256"),
+        (sample_report, "calibration_artifact_sha256"),
+    ],
+)
+def test_mandatory_identity_hashes_reject_none(factory, field_name):
+    with pytest.raises(ValueError, match=field_name):
+        factory(**{field_name: None})
+
+
+@pytest.mark.parametrize(
+    "identity_cls,sample,field_name",
+    [
+        (EmbeddingFeatureIdentity, sample_embedding, "acquisition_tile_sha256"),
+        (PredictionReportIdentity, sample_report, "embedding_feature_sha256"),
+        (AcquisitionTileIdentity, sample_acquisition, "source_contract_sha256"),
+    ],
+)
+def test_mandatory_identity_hashes_reject_none_from_dict(
+    identity_cls, sample, field_name
+):
+    data = sample().to_dict()
+    data[field_name] = None
+    with pytest.raises(ValueError, match=field_name):
+        identity_cls.from_dict(data)
+
+
+def test_optional_source_asset_hashes_still_accept_none():
+    asset = SourceAsset(
+        provider="USDA",
+        collection="NAIP",
+        asset_id="a1",
+        canonical_uri="https://example.com/a.tif",
+        checksum_sha256=None,
+        metadata_sha256=None,
+    )
+    data = asset.to_dict()
+    assert data["checksum_sha256"] is None
+    assert data["metadata_sha256"] is None
+    assert SourceAsset.from_dict(data) == asset

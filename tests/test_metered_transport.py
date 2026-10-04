@@ -9,11 +9,21 @@ import io
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from decimal import Decimal
+from http.client import IncompleteRead as HttpIncompleteRead
 from pathlib import Path
 
 import pytest
-from botocore.exceptions import ChecksumError, ClientError, NoCredentialsError
+from botocore.exceptions import (
+    ChecksumError,
+    ClientError,
+    NoCredentialsError,
+    ReadTimeoutError,
+    ResponseStreamingError,
+)
+from urllib3.exceptions import IncompleteRead as Urllib3IncompleteRead
+from urllib3.exceptions import ProtocolError
 
 from src.data_pipeline.metered_transport import (
     AuthenticationError,
@@ -127,11 +137,62 @@ def list_resp(
     return resp(200, headers, **body)
 
 
-def client_error(code: str, status: int) -> ClientError:
+def client_error(code: str, status: int, operation: str = "GetObject") -> ClientError:
+    """Botocore-shaped ClientError: HTTP status lives in ResponseMetadata."""
     return ClientError(
-        {"Error": {"Code": code, "HTTPStatusCode": status}, "ResponseMetadata": {}},
-        "GetObject",
+        {
+            "Error": {"Code": code, "Message": "fixture"},
+            "ResponseMetadata": {"HTTPStatusCode": status, "HTTPHeaders": {}},
+        },
+        operation,
     )
+
+
+class ScriptedBody:
+    """Streaming body that serves scripted reads and records every request."""
+
+    def __init__(self, script: list[object]) -> None:
+        self._script = list(script)
+        self.requested: list[int | None] = []
+        self.closed = False
+
+    def read(self, amt: int | None = None) -> bytes:
+        self.requested.append(amt)
+        if not self._script:
+            return b""
+        step = self._script.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        assert isinstance(step, bytes)
+        assert amt is not None and len(step) <= amt
+        return step
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class StreamBody(io.BytesIO):
+    """In-memory body recording read sizes, delivered bytes, and closing."""
+
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.requested: list[int | None] = []
+        self.delivered = 0
+        self.was_closed = False
+
+    def read(self, amt: int | None = -1) -> bytes:  # type: ignore[override]
+        self.requested.append(amt)
+        chunk = super().read(amt)
+        self.delivered += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        self.was_closed = True
+        super().close()
+
+
+def settles(ledger: MeteredLedger) -> list[dict]:
+    return [r for r in ledger.records() if r["event"] == "settle"]
 
 
 def make_ledger(tmp_path: Path) -> MeteredLedger:
@@ -424,9 +485,11 @@ def test_retries_count_separately_and_reconcile_cost(tmp_path: Path) -> None:
     assert len(client.calls) == 3  # each retry is a separate dispatch
     counters = transport.counters()
     assert counters.requests == 3
-    assert counters.transfer_bytes == 10
-    # failed attempts cost the per-request fee; only actual bytes are billed
-    assert counters.cost_usd == RATE.request_cost_usd * 2 + RATE.cost_for(10)
+    # failed attempts observed no consumption, so each retains its 10-byte
+    # reservation as a conservative upper bound instead of refunding it
+    assert counters.transfer_bytes == 30
+    assert counters.local_bytes == 30
+    assert counters.cost_usd == RATE.cost_for(10) * 3
     events = [(r["event"], r.get("outcome"), r["attempt"]) for r in ledger.records()]
     assert events == [
         ("reserve", None, 1),
@@ -458,7 +521,9 @@ def test_transient_retries_exhausted(tmp_path: Path) -> None:
     assert sleeps == [0.25, 0.25, 0.25]
     counters = transport.counters()
     assert counters.requests == 4
-    assert counters.transfer_bytes == 0
+    # every failed attempt retained its 10-byte reservation; none was
+    # refunded as a measured zero
+    assert counters.transfer_bytes == 40
     settles = [r for r in ledger.records() if r["event"] == "settle"]
     assert [r["outcome"] for r in settles] == ["retry", "retry", "retry", "error"]
     assert settles[-1]["error_category"] == "transient"
@@ -757,20 +822,103 @@ def test_list_objects_returns_meta_and_counts_bytes(tmp_path: Path) -> None:
     assert records[1]["actual_transfer_bytes"] == 321
 
 
-def test_list_objects_bytes_fallback_is_deterministic(tmp_path: Path) -> None:
+def test_list_without_content_length_retains_reservation_for_datetime_page(
+    tmp_path: Path,
+) -> None:
+    # Botocore parses LastModified into datetime; with no content-length and
+    # no SDK wire observation the transport must not crash serializing it nor
+    # claim a fabricated measured size: it retains the reservation, flagged.
     client = FakeS3Client()
-    response = list_resp([("a.tif", 10, '"e1"')])  # no content-length header
+    modified = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    response = resp(
+        200,
+        Contents=[
+            {"Key": "a.tif", "Size": 10, "ETag": '"e1"', "LastModified": modified}
+        ],
+        IsTruncated=False,
+    )
     client.plan("list_objects_v2", response)
-    transport = make_transport(
-        client,
-        NetworkCaps(max_requests=1, max_transfer_bytes=10_000, max_local_bytes=10_000),
-        make_ledger(tmp_path),
+    ledger = make_ledger(tmp_path)
+    transport = make_transport(client, base_caps(), ledger)
+    result = transport.list_objects("prefix/", max_response_bytes=2000)
+    assert result.objects[0].last_modified == "2026-01-02T03:04:05+00:00"
+    counters = transport.counters()
+    assert counters.transfer_bytes == 2000
+    assert counters.local_bytes == 0
+    (settle,) = settles(ledger)
+    assert settle["usage_basis"] == "reserved_upper_bound"
+    assert settle["actual_transfer_bytes"] == 2000
+
+
+def test_list_measures_sdk_wire_bytes_without_content_length(tmp_path: Path) -> None:
+    import boto3
+    from botocore.awsrequest import AWSResponse
+
+    xml = (
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        b"<Name>bucket</Name><Prefix>p/</Prefix><KeyCount>1</KeyCount>"
+        b"<MaxKeys>1000</MaxKeys><IsTruncated>true</IsTruncated>"
+        b"<NextContinuationToken>next-page</NextContinuationToken>"
+        b"<Contents><Key>p/a.tif</Key>"
+        b"<LastModified>2026-01-02T03:04:05.000Z</LastModified>"
+        b"<ETag>&quot;e1&quot;</ETag><Size>10</Size>"
+        b"<StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>"
     )
-    transport.list_objects("prefix/", max_response_bytes=2000)
-    expected = len(
-        json.dumps(response, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    class RawStream:
+        def stream(self, **_kwargs: object):
+            yield xml
+
+    client = boto3.client(
+        "s3",
+        region_name="us-east-1",
+        aws_access_key_id="fixture",
+        aws_secret_access_key="fixture",
     )
-    assert transport.counters().transfer_bytes == expected
+    client.meta.events.register(
+        "before-send.s3.ListObjectsV2",
+        lambda request, **_kwargs: AWSResponse(request.url, 200, {}, RawStream()),
+    )
+    ledger = make_ledger(tmp_path)
+    transport = Boto3MeteredTransport(
+        "bucket", client=client, caps=base_caps(), ledger=ledger, rate_card=RATE
+    )
+    result = transport.list_objects("p/", max_response_bytes=5000)
+    assert [o.key for o in result.objects] == ["p/a.tif"]
+    assert result.objects[0].last_modified == "2026-01-02T03:04:05+00:00"
+    assert result.is_truncated is True
+    assert result.next_continuation_token == "next-page"
+    assert transport.counters().transfer_bytes == len(xml)
+    (settle,) = settles(ledger)
+    assert settle["usage_basis"] == "measured"
+    assert settle["actual_transfer_bytes"] == len(xml)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"IsTruncated": True},
+        {"IsTruncated": True, "NextContinuationToken": ""},
+        {"IsTruncated": True, "NextContinuationToken": 7},
+        {"IsTruncated": False, "NextContinuationToken": "tok"},
+        {"IsTruncated": "true", "NextContinuationToken": "tok"},
+        {},
+    ],
+)
+def test_list_rejects_unpaired_truncation_and_token(
+    tmp_path: Path, fields: dict
+) -> None:
+    client = FakeS3Client()
+    client.plan("list_objects_v2", resp(200, {"content-length": "40"}, **fields))
+    ledger = make_ledger(tmp_path)
+    transport = make_transport(client, base_caps(), ledger)
+    with pytest.raises(MalformedResponseError):
+        transport.list_objects("p", max_response_bytes=1000)
+    assert len(client.calls) == 1
+    (settle,) = settles(ledger)
+    assert settle["actual_transfer_bytes"] == 40
+    assert settle["usage_basis"] == "measured"
 
 
 def test_list_objects_continuation_passed_through(tmp_path: Path) -> None:
@@ -807,6 +955,278 @@ def test_list_objects_requires_max_response_bytes(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="max_response_bytes"):
         transport.list_objects("prefix")
     assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Bounded GET streaming and incurred-usage settlement
+# ---------------------------------------------------------------------------
+
+
+def test_get_streams_sized_reads_within_reservation_and_closes(tmp_path: Path) -> None:
+    client = FakeS3Client()
+    body = StreamBody(b"0123456789")
+    client.plan("get_object", resp(200, Body=body, ContentLength=10))
+    ledger = make_ledger(tmp_path)
+    transport = make_transport(client, base_caps(), ledger)
+    assert transport.get_object("k", max_response_bytes=10) == b"0123456789"
+    assert body.requested and all(
+        isinstance(n, int) and 0 < n <= 11 for n in body.requested
+    )
+    assert body.delivered == 10
+    assert body.was_closed
+    (settle,) = settles(ledger)
+    assert settle["usage_basis"] == "measured"
+    assert settle["actual_transfer_bytes"] == 10
+
+
+def test_oversized_body_reads_only_overflow_sentinel(tmp_path: Path) -> None:
+    client = FakeS3Client()
+    body = StreamBody(b"x" * 50)
+    client.plan("get_object", resp(200, Body=body, ContentLength=50))
+    ledger = make_ledger(tmp_path)
+    transport = make_transport(client, base_caps(), ledger)
+    with pytest.raises(MalformedResponseError):
+        transport.get_range("k", max_response_bytes=10)
+    assert body.delivered == 11
+    assert body.was_closed
+    counters = transport.counters()
+    assert counters.transfer_bytes == 11
+    assert counters.local_bytes == 11
+    (settle,) = settles(ledger)
+    assert settle["actual_transfer_bytes"] == 11
+    assert settle["cap_exceeded"] is None
+
+
+def test_incurred_overrun_beyond_cap_is_settled_before_cap_error(
+    tmp_path: Path,
+) -> None:
+    client = FakeS3Client()
+    body = StreamBody(b"abcdef")
+    client.plan("get_object", resp(200, Body=body, ContentLength=6))
+    ledger = make_ledger(tmp_path)
+    transport = make_transport(
+        client,
+        NetworkCaps(max_requests=1, max_transfer_bytes=4, max_local_bytes=4),
+        ledger,
+    )
+    with pytest.raises(CapExceededError) as excinfo:
+        transport.get_range("k", max_response_bytes=4)
+    assert excinfo.value.cap == "transfer_bytes"
+    assert isinstance(excinfo.value.__context__, MalformedResponseError)
+    assert body.delivered == 5
+    assert body.was_closed
+    counters = transport.counters()
+    assert counters.requests == 1
+    assert counters.transfer_bytes == 5
+    assert counters.local_bytes == 5
+    assert counters.cost_usd == RATE.cost_for(5)
+    (settle,) = settles(ledger)
+    assert settle["outcome"] == "error"
+    assert settle["error_type"] == "MalformedResponseError"
+    assert settle["actual_transfer_bytes"] == 5
+    assert settle["actual_local_bytes"] == 5
+    assert settle["actual_cost_usd"] == str(RATE.cost_for(5))
+    assert settle["cap_exceeded"] == "transfer_bytes"
+
+
+def test_ledger_settle_failure_keeps_incurred_counters(tmp_path: Path) -> None:
+    class FailingSettleLedger(MeteredLedger):
+        def append(self, record: dict) -> None:
+            if record.get("event") == "settle":
+                raise OSError("ledger disk full")
+            super().append(record)
+
+    client = FakeS3Client()
+    client.plan("get_object", resp(200, Body=StreamBody(b"x" * 50), ContentLength=50))
+    transport = make_transport(
+        client,
+        base_caps(),
+        FailingSettleLedger(tmp_path / "ledger.jsonl", clock=FIXED_CLOCK),
+    )
+    with pytest.raises(OSError):
+        transport.get_range("k", max_response_bytes=10)
+    counters = transport.counters()
+    assert counters.transfer_bytes == 11
+    assert counters.local_bytes == 11
+
+
+def _chained_http_incomplete_read() -> ResponseStreamingError:
+    try:
+        raise HttpIncompleteRead(b"xyz")
+    except HttpIncompleteRead as inner:
+        try:
+            raise ResponseStreamingError(error="stream broke") from inner
+        except ResponseStreamingError as outer:
+            return outer
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_bytes"),
+    [
+        # urllib3 reports the cumulative body bytes read from the connection.
+        (
+            ResponseStreamingError(
+                error=ProtocolError("Connection broken", Urllib3IncompleteRead(7, 3))
+            ),
+            7,
+        ),
+        # http.client reports the bytes delivered by the failing read itself.
+        (
+            ResponseStreamingError(
+                error=ProtocolError("Connection broken", HttpIncompleteRead(b"xy"))
+            ),
+            6,
+        ),
+        (_chained_http_incomplete_read(), 7),
+    ],
+)
+def test_stream_failure_counts_chunks_and_known_partial_bytes(
+    tmp_path: Path, failure: Exception, expected_bytes: int
+) -> None:
+    client = FakeS3Client()
+    body = ScriptedBody([b"abcd", failure])
+    client.plan(
+        "get_object",
+        resp(206, Body=body, ContentRange="bytes 0-9/10", ContentLength=10),
+    )
+    ledger = make_ledger(tmp_path)
+    transport = make_transport(client, base_caps(), ledger, max_attempts=1)
+    with pytest.raises(RetriesExhaustedError):
+        transport.get_range("k", start=0, end=9)
+    assert body.closed
+    assert transport.counters().transfer_bytes == expected_bytes
+    (settle,) = settles(ledger)
+    assert settle["actual_transfer_bytes"] == expected_bytes
+    assert settle["usage_basis"] == "measured"
+
+
+def test_stream_failure_with_unknown_consumption_retains_reservation(
+    tmp_path: Path,
+) -> None:
+    client = FakeS3Client()
+    failing = ScriptedBody([b"abcd", ReadTimeoutError(endpoint_url="https://s3.test")])
+    client.plan(
+        "get_object",
+        resp(206, Body=failing, ContentRange="bytes 0-9/10", ContentLength=10),
+        range_resp(b"0123456789", start=0, end=9, total=10),
+    )
+    ledger = make_ledger(tmp_path)
+    transport = make_transport(client, base_caps(), ledger)
+    assert transport.get_range("k", start=0, end=9).content == b"0123456789"
+    assert failing.closed
+    first, second = settles(ledger)
+    assert first["outcome"] == "retry"
+    assert first["usage_basis"] == "reserved_upper_bound"
+    assert first["actual_transfer_bytes"] >= 10  # never refunded below reservation
+    assert second["usage_basis"] == "measured"
+    assert transport.counters().transfer_bytes == first["actual_transfer_bytes"] + 10
+
+
+def test_failed_dispatch_without_observation_retains_reservation(
+    tmp_path: Path,
+) -> None:
+    # A dispatch that fails before anything is observable must retain its
+    # whole reservation as a conservative upper bound; it is never settled as
+    # a measured zero that refunds the reservation.
+    client = FakeS3Client()
+    client.plan("get_object", client_error("NoSuchKey", 404))
+    ledger = make_ledger(tmp_path)
+    transport = make_transport(client, base_caps(), ledger)
+    with pytest.raises(NotFoundError):
+        transport.get_range("k", start=0, end=9)
+    reserve, settle = ledger.records()
+    assert reserve["reserved_transfer_bytes"] == 10
+    assert reserve["reserved_local_bytes"] == 10
+    assert settle["outcome"] == "error"
+    assert settle["usage_basis"] == "reserved_upper_bound"
+    assert settle["actual_transfer_bytes"] == 10
+    assert settle["actual_local_bytes"] == 10
+    counters = transport.counters()
+    assert counters.transfer_bytes == 10
+    assert counters.local_bytes == 10
+    assert counters.cost_usd == RATE.cost_for(10)
+
+
+def test_failed_list_with_observed_wire_bytes_records_lower_bound(
+    tmp_path: Path,
+) -> None:
+    # A failed LIST can still have received a response body that the
+    # after-call hook observed; those bytes are recorded as an observed lower
+    # bound on the attempt's consumption instead of settling a measured zero
+    # and refunding the reservation.
+    import boto3
+    from botocore.awsrequest import AWSResponse
+
+    error_xml = (
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b"<Error><Code>AccessDenied</Code><Message>fixture</Message></Error>"
+    )
+
+    class RawStream:
+        def stream(self, **_kwargs: object):
+            yield error_xml
+
+    client = boto3.client(
+        "s3",
+        region_name="us-east-1",
+        aws_access_key_id="fixture",
+        aws_secret_access_key="fixture",
+    )
+    client.meta.events.register(
+        "before-send.s3.ListObjectsV2",
+        lambda request, **_kwargs: AWSResponse(request.url, 403, {}, RawStream()),
+    )
+    ledger = make_ledger(tmp_path)
+    transport = Boto3MeteredTransport(
+        "bucket", client=client, caps=base_caps(), ledger=ledger, rate_card=RATE
+    )
+    with pytest.raises(AuthenticationError):
+        transport.list_objects("p/", max_response_bytes=5000)
+    reserve, settle = ledger.records()
+    assert reserve["reserved_transfer_bytes"] == 5000
+    assert settle["outcome"] == "error"
+    assert settle["usage_basis"] == "measured"
+    assert settle["actual_transfer_bytes"] == len(error_xml)
+    assert settle["actual_transfer_bytes"] < reserve["reserved_transfer_bytes"]
+    assert transport.counters().transfer_bytes == len(error_xml)
+
+
+# ---------------------------------------------------------------------------
+# Botocore-shaped ClientError classification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("code", "status", "expected"),
+    [
+        ("404", 404, NotFoundError),
+        ("403", 403, AuthenticationError),
+        ("400", 400, MalformedResponseError),
+    ],
+)
+def test_head_status_only_client_errors_classified_from_response_metadata(
+    tmp_path: Path, code: str, status: int, expected: type[Exception]
+) -> None:
+    client = FakeS3Client()
+    client.plan("head_object", client_error(code, status, "HeadObject"))
+    transport = make_transport(client, base_caps(), make_ledger(tmp_path))
+    with pytest.raises(expected, match=f"HTTP {status} code={code}"):
+        transport.head_object("k")
+    assert len(client.calls) == 1
+
+
+def test_head_status_only_503_is_retried(tmp_path: Path) -> None:
+    client = FakeS3Client()
+    client.plan(
+        "head_object",
+        client_error("503", 503, "HeadObject"),
+        resp(200, ContentLength=5, ETag='"e"'),
+    )
+    ledger = make_ledger(tmp_path)
+    transport = make_transport(client, base_caps(), ledger)
+    assert transport.head_object("k").size == 5
+    assert len(client.calls) == 2
+    assert [s["outcome"] for s in settles(ledger)] == ["retry", "ok"]
 
 
 # ---------------------------------------------------------------------------

@@ -79,8 +79,8 @@ def _read_annotations(path: Path) -> pd.DataFrame:
     if missing:
         raise ValueError(f"annotations CSV missing required columns: {sorted(missing)}")
     ann = ann.copy()
-    ann["image_path"] = ann["image_path"].astype(str).str.strip()
-    ann["annotator_id"] = ann["annotator_id"].astype(str).str.strip()
+    ann["image_path"] = ann["image_path"].fillna("").astype(str).str.strip()
+    ann["annotator_id"] = ann["annotator_id"].fillna("").astype(str).str.strip()
     ann["scenic_human"] = pd.to_numeric(ann["scenic_human"], errors="coerce")
     if "skip" in ann.columns:
         ann["skip"] = ann["skip"].map(_to_bool)
@@ -95,6 +95,7 @@ def _read_annotations(path: Path) -> pd.DataFrame:
     ann = ann.loc[
         ann["image_path"].ne("")
         & ann["annotator_id"].ne("")
+        & ann["annotator_id"].str.lower().ne("nan")
         & ann["scenic_human"].notna()
         & ~ann["skip"]
     ].copy()
@@ -158,7 +159,7 @@ def _handled_paths(path: Path, target_annotator: str) -> set[str]:
     raw = pd.read_csv(path, usecols=["image_path", "annotator_id"])
     return set(
         raw.loc[
-            raw["annotator_id"].astype(str).str.strip().eq(target_annotator),
+            raw["annotator_id"].fillna("").astype(str).str.strip().eq(target_annotator),
             "image_path",
         ]
         .dropna()

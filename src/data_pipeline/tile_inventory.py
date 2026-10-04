@@ -80,8 +80,13 @@ def _clear_unproven_attribution(row: dict[str, Any], style: str) -> None:
 
 
 def validate_png_image(
-    path: Path | str, expected_dimensions: tuple[int, int] | None = None
+    path: Path | str, expected_dimensions: tuple[int, int]
 ) -> dict[str, Any]:
+    """Validate that ``path`` holds intact PNG bytes, RGB mode, exact dimensions.
+
+    ``expected_dimensions`` is the source contract ``(tile_width, tile_height)``;
+    extension-only, grayscale, alpha, or differently sized tiles are invalid.
+    """
     path = Path(path)
     result: dict[str, Any] = {
         "path": str(path),
@@ -98,11 +103,18 @@ def validate_png_image(
         with Image.open(path) as image:
             image.verify()
         with Image.open(path) as image:
+            if image.format != "PNG":
+                result["reason"] = f"not_png:{image.format}"
+                return result
             width, height = image.size
             result["width"], result["height"] = width, height
-            if expected_dimensions and (width, height) != expected_dimensions:
+            if image.mode != "RGB":
+                result["reason"] = f"unexpected_mode:{image.mode}"
+                return result
+            if (width, height) != tuple(expected_dimensions):
                 result["reason"] = f"unexpected_dimensions:{width}x{height}"
                 return result
+            image.load()
         result["valid"] = True
     except Exception as exc:
         result["reason"] = f"invalid_png:{type(exc).__name__}"
@@ -113,9 +125,13 @@ def scan_tile_inventory(
     rows: Iterable[dict[str, Any]],
     *,
     image_root: Path | str = "data/raw/images",
-    expected_dimensions: tuple[int, int] | None = None,
+    expected_dimensions: tuple[int, int],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Validate file bytes and acquisition provenance before admitting local tiles."""
+    """Validate file bytes and acquisition provenance before admitting local tiles.
+
+    ``expected_dimensions`` must be the source contract's
+    ``(preprocessing.tile_width, preprocessing.tile_height)``.
+    """
     root = Path(image_root)
     output: list[dict[str, Any]] = []
     counts = {

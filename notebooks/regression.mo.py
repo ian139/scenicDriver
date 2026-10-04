@@ -167,6 +167,16 @@ def _(DataLoader, Dataset, Image, Path, cfg, np, pd, torch, transforms):
     train_loader = None
     val_loader = None
     test_loader = None
+    terrain_enabled = False
+    _feat_cols = [
+        "slope_variation",
+        "elevation_change",
+        "water_proximity",
+        "vegetation_density",
+        "coastal",
+        "has_lake",
+        "has_river",
+    ]
     if not _labels_path.exists():
         print(f"Missing labels file: {_labels_path}")
     else:
@@ -174,50 +184,47 @@ def _(DataLoader, Dataset, Image, Path, cfg, np, pd, torch, transforms):
         if _df.empty:
             raise ValueError("labels.csv is empty.")
 
-        if cfg.use_terrain_features and cfg.terrain_features_csv:
-            _feat_path = Path(cfg.terrain_features_csv)
-            if not _feat_path.exists():
-                print(f"Terrain features CSV not found: {_feat_path}")
-            else:
-                _feat_df = pd.read_csv(_feat_path)
-                if "image_path" not in _feat_df.columns:
-                    if "satellite_path" in _feat_df.columns:
-                        _base = Path(cfg.satellite_dir)
-                        _raw = Path(cfg.raw_dir)
-                        _rel_base = _base.resolve().relative_to(_raw.resolve()).as_posix()
-                        _feat_df["image_path"] = _feat_df["satellite_path"].apply(
-                            lambda p: f"{_rel_base}/{p}" if isinstance(p, str) and p else ""
-                        )
-                _feat_cols = [
-                    "slope_variation",
-                    "elevation_change",
-                    "water_proximity",
-                    "vegetation_density",
-                    "coastal",
-                    "has_lake",
-                    "has_river",
-                ]
-                _feat_df = _feat_df[["image_path"] + _feat_cols].copy()
-                _df = _df.merge(_feat_df, on="image_path", how="left")
-                _missing_feats = _df["slope_variation"].isna().sum()
-                if _missing_feats:
-                    print(
-                        f"Missing terrain features for {int(_missing_feats)} rows; filling defaults."
+        _feat_df = None
+        if not cfg.use_terrain_features:
+            pass
+        elif not cfg.terrain_features_csv:
+            print("Terrain features enabled but cfg.terrain_features_csv is unset; training RGB-only.")
+        elif not Path(cfg.terrain_features_csv).exists():
+            print(f"Terrain features CSV not found: {cfg.terrain_features_csv}; training RGB-only.")
+        else:
+            _feat_df = pd.read_csv(Path(cfg.terrain_features_csv))
+            if "image_path" not in _feat_df.columns and "satellite_path" in _feat_df.columns:
+                try:
+                    _rel_base = (
+                        Path(cfg.satellite_dir).resolve().relative_to(Path(cfg.raw_dir).resolve()).as_posix()
                     )
-                for _col in _feat_cols:
-                    if _col in _df.columns:
-                        _df[_col] = _df[_col].fillna(0.0)
+                except ValueError:
+                    _rel_base = None
+                if _rel_base is None:
+                    print("cfg.satellite_dir is not under cfg.raw_dir; cannot map satellite_path to image_path.")
+                else:
+                    _feat_df["image_path"] = _feat_df["satellite_path"].apply(
+                        lambda p: f"{_rel_base}/{p}" if isinstance(p, str) and p else ""
+                    )
+            _absent_cols = [c for c in ["image_path"] + _feat_cols if c not in _feat_df.columns]
+            if _absent_cols:
+                print(f"Terrain features CSV lacks columns {_absent_cols}; training RGB-only.")
+                _feat_df = None
 
-        if cfg.use_terrain_features:
-            _feat_summary_cols = [
-                "slope_variation",
-                "elevation_change",
-                "water_proximity",
-                "vegetation_density",
-            ]
-            if all(c in _df.columns for c in _feat_summary_cols):
+        if _feat_df is not None:
+            _df = _df.merge(_feat_df[["image_path"] + _feat_cols], on="image_path", how="left")
+            _missing_feats = int(_df["slope_variation"].isna().sum())
+            if _missing_feats == len(_df):
+                print("No labels rows matched the terrain features CSV; training RGB-only.")
+                _df = _df.drop(columns=_feat_cols)
+            else:
+                terrain_enabled = True
+                if _missing_feats:
+                    print(f"Missing terrain features for {_missing_feats} rows; filling defaults.")
+                for _col in _feat_cols:
+                    _df[_col] = _df[_col].fillna(0.0)
                 print("Terrain feature summary:")
-                print(_df[_feat_summary_cols].describe().round(4))
+                print(_df[_feat_cols[:4]].describe().round(4))
 
         _missing_paths = []
         _image_root = Path(cfg.raw_dir)
@@ -306,19 +313,19 @@ def _(DataLoader, Dataset, Image, Path, cfg, np, pd, torch, transforms):
             _df.iloc[_train_idx],
             _image_root,
             _train_tf,
-            cfg.use_terrain_features,
+            terrain_enabled,
         )
         _val_ds = ScenicDataset(
             _df.iloc[_val_idx],
             _image_root,
             _eval_tf,
-            cfg.use_terrain_features,
+            terrain_enabled,
         )
         _test_ds = ScenicDataset(
             _df.iloc[_test_idx],
             _image_root,
             _eval_tf,
-            cfg.use_terrain_features,
+            terrain_enabled,
         )
 
         _loader_kwargs = dict(
@@ -332,10 +339,11 @@ def _(DataLoader, Dataset, Image, Path, cfg, np, pd, torch, transforms):
 
         train_loader, val_loader, test_loader
     train_loader, val_loader
+    return terrain_enabled, train_loader, val_loader
 
 
 @app.cell
-def _(cfg, nn, timm, torch):
+def _(cfg, nn, terrain_enabled, timm, torch):
     """Model scaffold (ViT backbone + regression + classification)."""
     class ScenicMultiTask(nn.Module):
         def __init__(self, num_classes: int, terrain_dim: int = 0):
@@ -373,7 +381,7 @@ def _(cfg, nn, timm, torch):
             return scenic, logits
 
     _device = "cuda" if torch.cuda.is_available() else "cpu"
-    _terrain_dim = 6 if cfg.use_terrain_features else 0
+    _terrain_dim = 6 if terrain_enabled else 0
     model = ScenicMultiTask(cfg.num_classes, terrain_dim=_terrain_dim).to(_device)
     if cfg.resume_from:
         model.load_state_dict(torch.load(cfg.resume_from, map_location=_device))
@@ -389,6 +397,7 @@ def _(
     json,
     model,
     nn,
+    terrain_enabled,
     torch,
     tqdm,
     train_loader,
@@ -513,8 +522,8 @@ def _(
                 "loss_weights": cfg.loss_weights,
                 "run_name": cfg.run_name,
                 "resume_from": cfg.resume_from,
-                "use_terrain_features": cfg.use_terrain_features,
-                "terrain_features_csv": cfg.terrain_features_csv,
+                "use_terrain_features": terrain_enabled,
+                "terrain_features_csv": cfg.terrain_features_csv if terrain_enabled else "",
             },
             "best_val_loss": _best_val,
             "metrics": _metrics,

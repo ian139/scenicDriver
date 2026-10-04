@@ -29,6 +29,15 @@ def _():
         1. Export regression features (`scripts/modeling/export_regression_dataset.py`)
         2. Train baseline regressor (`scripts/modeling/train_regression_baseline.py`)
         3. Evaluate baseline (`scripts/modeling/evaluate_regression_baseline.py`)
+
+        Training requires `cfg.benchmark_split_csv`: set it per run to the benchmark
+        split CSV whose held-out identities must be excluded from training. It has no
+        default; with `cfg.run_train` enabled the notebook fails before any step runs
+        when it is unset.
+
+        Training writes the validation-membership split artifact `cfg.split_artifact`,
+        and evaluation consumes that artifact to score exactly the rows the trained
+        model validated on — evaluation derives nothing from `cfg.dataset_npz` alone.
         """
     )
     return
@@ -43,6 +52,8 @@ def _(Path, dataclass, os):
         dataset_npz: str = "data/processed/regression/features_v1.npz"
         checkpoint: str = "models/scenic_regression_baseline.pt"
         metrics_json: str = "data/processed/regression/baseline_metrics.json"
+        split_artifact: str = "models/scenic_regression_baseline.split.json"
+        benchmark_split_csv: str | None = None
 
         skip_missing: bool = True
         max_samples: int | None = None
@@ -73,6 +84,7 @@ def _(Path, dataclass, os):
 
     Path(cfg.dataset_npz).parent.mkdir(parents=True, exist_ok=True)
     Path(cfg.checkpoint).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.split_artifact).parent.mkdir(parents=True, exist_ok=True)
     Path(cfg.metrics_json).parent.mkdir(parents=True, exist_ok=True)
     cfg
     return (cfg,)
@@ -80,6 +92,15 @@ def _(Path, dataclass, os):
 
 @app.cell
 def _(Path, cfg, shlex, subprocess, sys):
+    if cfg.run_train:
+        if not cfg.benchmark_split_csv:
+            raise ValueError(
+                "cfg.benchmark_split_csv is required for training: set it to this run's "
+                "benchmark split CSV (passed as --benchmark-split-csv)."
+            )
+        if not Path(cfg.benchmark_split_csv).is_file():
+            raise FileNotFoundError(f"Benchmark split CSV not found: {cfg.benchmark_split_csv}")
+
     def _run(cmd: list[str]) -> None:
         print("$", " ".join(shlex.quote(p) for p in cmd))
         subprocess.run(cmd, check=True)
@@ -121,8 +142,12 @@ def _(Path, cfg, shlex, subprocess, sys):
         "scripts/modeling/train_regression_baseline.py",
         "--dataset",
         cfg.dataset_npz,
+        "--benchmark-split-csv",
+        str(cfg.benchmark_split_csv),
         "--output",
         cfg.checkpoint,
+        "--split-artifact",
+        cfg.split_artifact,
         "--epochs",
         str(cfg.epochs),
         "--batch-size",
@@ -148,10 +173,8 @@ def _(Path, cfg, shlex, subprocess, sys):
         cfg.dataset_npz,
         "--checkpoint",
         cfg.checkpoint,
-        "--val-split",
-        str(cfg.val_split),
-        "--seed",
-        str(cfg.seed),
+        "--split-artifact",
+        cfg.split_artifact,
         "--batch-size",
         str(cfg.batch_size),
         "--device",
@@ -175,21 +198,33 @@ def _(Path, cfg, shlex, subprocess, sys):
     if cfg.run_eval:
         if not Path(cfg.checkpoint).exists():
             raise FileNotFoundError(f"Checkpoint not found: {cfg.checkpoint}")
+        if not Path(cfg.split_artifact).exists():
+            raise FileNotFoundError(
+                f"Split artifact not found: {cfg.split_artifact}. Evaluation scores "
+                "exactly the trained model's validation membership and cannot run "
+                "without the artifact training writes (run the train step first)."
+            )
         _run(eval_cmd)
     else:
         print("Skipping eval step (cfg.run_eval=False)")
 
-    return
+    pipeline_run = {
+        "evaluated": bool(cfg.run_eval),
+        "metrics_json": cfg.metrics_json,
+    }
+    return (pipeline_run,)
 
 
 @app.cell
-def _(Path, cfg, json):
-    metrics_path = Path(cfg.metrics_json)
-    if metrics_path.exists():
+def _(Path, json, pipeline_run):
+    metrics_path = Path(pipeline_run["metrics_json"])
+    if not pipeline_run["evaluated"]:
+        print(f"Evaluation did not run in this pipeline run; not displaying {metrics_path}")
+    elif metrics_path.exists():
         print(f"Metrics: {metrics_path}")
         print(json.dumps(json.loads(metrics_path.read_text(encoding='utf-8')), indent=2))
     else:
-        print(f"No metrics file yet: {metrics_path}")
+        print(f"Evaluation finished without writing metrics: {metrics_path}")
     return
 
 

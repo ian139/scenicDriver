@@ -17,6 +17,7 @@ import json
 import math
 from pathlib import Path
 import re
+import shlex
 import signal
 import sys
 import time
@@ -62,6 +63,8 @@ except (ImportError, SyntaxError):
         validate_supplemental = getattr(_mod, "validate_supplemental", None)
     else:
         raise
+
+import torch  # noqa: E402
 
 from src.scenic_scorer.active_training import (  # noqa: E402
     ActiveTrainingConfig,
@@ -187,6 +190,56 @@ def sanitize_command(cmd: str | List[str]) -> str:
         r"(?i)(--?(?:api[-_]?key|token|secret|password|auth))(?:=|\s+)(['\"]?)([^'\"\s]+)\2",
         r"\1=[REDACTED]",
         cmd_str,
+    )
+
+
+ORCHESTRATOR_SCRIPT = "scripts/modeling/run_active_scenic_autoresearch.py"
+
+
+def execution_command(argv: List[str]) -> str:
+    """Return the runnable orchestrator command that executes a dry-run plan.
+
+    The command replays the invocation's arguments without ``--dry-run`` or
+    ``--resume``; running it from the repository root supersedes the plan-only
+    run directory and executes the planned ladder through this workflow.
+    """
+    replay = [arg for arg in argv if arg not in ("--dry-run", "--resume")]
+    return sanitize_command(
+        shlex.join(["uv", "run", "python", ORCHESTRATOR_SCRIPT, *replay])
+    )
+
+
+def is_dry_run_plan_only(run_dir: Path) -> bool:
+    """True when ``run_dir`` holds only an unexecuted dry-run plan.
+
+    Requires a dry-run manifest, no execution artifacts, and an experiments
+    ledger (if present) containing only ``planned`` records.
+    """
+    manifest_path = run_dir / "run_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(manifest, dict) or manifest.get("dry_run") is not True:
+        return False
+    execution_artifacts = (
+        "promotion_decision.json",
+        "final_summary.json",
+        "prepared_dataset.npz",
+        "prepared_dataset_manifest.json",
+    )
+    if any((run_dir / name).exists() for name in execution_artifacts):
+        return False
+    ledger = run_dir / "experiments.jsonl"
+    if not ledger.exists():
+        return True
+    try:
+        lines = ledger.read_text(encoding="utf-8").splitlines()
+        records = [json.loads(line) for line in lines if line.strip()]
+    except (OSError, ValueError):
+        return False
+    return all(
+        isinstance(rec, dict) and rec.get("status") == "planned" for rec in records
     )
 
 
@@ -396,19 +449,62 @@ def create_active_training_config(**kwargs: Any) -> ActiveTrainingConfig:
     return ActiveTrainingConfig(**valid_kwargs)
 
 
+def admitted_checkpoint_hidden_dim(
+    checkpoint_path: str | Path, checkpoint_sha256: str
+) -> int:
+    """Return the hidden capacity of the admitted active checkpoint.
+
+    The checkpoint bytes must still match the admitted SHA-256. Capacity is
+    read from the first regression layer of the stored model state; a declared
+    ``hidden_dim`` must agree with it.
+    """
+    path = Path(checkpoint_path)
+    if compute_sha256(path) != checkpoint_sha256:
+        raise ValueError(f"Admitted active checkpoint SHA-256 changed: {path}")
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as err:
+        raise ValueError(f"Admitted active checkpoint is unreadable: {path}: {err}")
+    state = payload.get("model_state_dict") if isinstance(payload, dict) else None
+    weight = state.get("network.0.weight") if isinstance(state, dict) else None
+    if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+        raise ValueError(
+            f"Admitted active checkpoint lacks a regression input layer: {path}"
+        )
+    hidden_dim = int(weight.shape[0])
+    declared = payload.get("hidden_dim")
+    if declared is not None and (
+        isinstance(declared, bool)
+        or not isinstance(declared, int)
+        or declared != hidden_dim
+    ):
+        raise ValueError(
+            f"Admitted active checkpoint hidden_dim {declared!r} disagrees with "
+            f"its model state ({hidden_dim}): {path}"
+        )
+    return hidden_dim
+
+
 def build_human_finetune_candidate_ladder(
     baseline_checkpoint_path: str | Path,
     baseline_checkpoint_sha256: str,
+    hidden_dim: int,
     max_experiments: int = 4,
     seed: int = 42,
     device: str = "cpu",
     max_steps: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """Generate deterministic 4-candidate ladder for human-only fine-tuning."""
+    """Generate deterministic 4-candidate ladder for human-only fine-tuning.
+
+    ``hidden_dim`` must be the capacity of the admitted initial checkpoint
+    (see ``admitted_checkpoint_hidden_dim``) so every candidate fine-tunes the
+    exact architecture it is initialized from.
+    """
     base_kwargs = {
         "human_only_training": True,
         "batch_size": 32,
         "epochs": 20,
+        "hidden_dim": hidden_dim,
         "seed": seed,
         "device": device,
         "max_steps": max_steps,
@@ -500,22 +596,23 @@ def _preparation_evidence(dataset_info: Dict[str, Any]) -> Dict[str, Any]:
 def write_prepared_dataset_manifest(
     prepared_manifest_path: Path,
     *,
+    mode: str,
     run_name: str,
     handoff_sha256: str,
-    supplemental_benchmark_sha256: str,
+    supplemental_benchmark_sha256: Optional[str],
     dataset_info: Dict[str, Any],
 ) -> None:
-    """Persist the human_finetune prepared-dataset provenance record.
+    """Persist the prepared-dataset provenance record for any run mode.
 
     The manifest binds the current invocation (mode, run name, Stage-One
-    handoff SHA, supplemental benchmark SHA) to the materialized prepared
-    dataset and split files (paths + SHA-256) plus the merged/train identity
-    evidence returned by preparation, so resume never trusts files by
-    presence alone.
+    handoff SHA, supplemental benchmark SHA or ``None`` when no supplemental
+    benchmark was admitted) to the materialized prepared dataset and split
+    files (paths + SHA-256) plus the merged/train identity evidence returned
+    by preparation, so resume never trusts files by presence alone.
     """
     manifest = {
         "schema_version": PREPARED_DATASET_MANIFEST_SCHEMA_VERSION,
-        "mode": "human_finetune",
+        "mode": mode,
         "run_name": run_name,
         "prepared_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "stage1_handoff_sha256": handoff_sha256,
@@ -534,17 +631,20 @@ def write_prepared_dataset_manifest(
 def validate_prepared_dataset_manifest(
     prepared_manifest_path: Path,
     *,
+    mode: str,
     run_name: str,
     handoff_sha256: str,
-    supplemental_benchmark_sha256: str,
+    supplemental_benchmark_sha256: Optional[str],
     expected_dataset_path: Path,
     run_dir: Path,
 ) -> Dict[str, Any]:
-    """Verify a human_finetune prepared-dataset manifest against the invocation.
+    """Verify a prepared-dataset manifest against the current invocation.
 
-    Fails closed on missing/malformed/mismatched records or files. Returns the
-    trusted dataset info (dataset_path, split_path, dataset_sha256,
-    split_sha256) with every path and hash re-verified against the real files.
+    Fails closed on missing/malformed/mismatched records or files, including a
+    supplemental benchmark admitted at preparation that the invocation does
+    not admit (or vice versa). Returns the trusted dataset info
+    (dataset_path, split_path, dataset_sha256, split_sha256) with every path
+    and hash re-verified against the real files.
     """
     mismatches = []
     if not prepared_manifest_path.is_file():
@@ -570,7 +670,7 @@ def validate_prepared_dataset_manifest(
             f"expected={PREPARED_DATASET_MANIFEST_SCHEMA_VERSION}"
         )
     for key, current in (
-        ("mode", "human_finetune"),
+        ("mode", mode),
         ("run_name", run_name),
         ("stage1_handoff_sha256", handoff_sha256),
         ("supplemental_benchmark_sha256", supplemental_benchmark_sha256),
@@ -610,7 +710,13 @@ def validate_prepared_dataset_manifest(
                 f"current={handoff_sha256}"
             )
         supp = evidence.get("supplemental_benchmark")
-        if (
+        if supplemental_benchmark_sha256 is None:
+            if supp is not None:
+                mismatches.append(
+                    "preparation_evidence.supplemental_benchmark present but the "
+                    "current invocation admits no supplemental benchmark"
+                )
+        elif (
             not isinstance(supp, dict)
             or supp.get("sha256") != supplemental_benchmark_sha256
         ):
@@ -696,6 +802,39 @@ def _write_confirmation_summary(summary_path: Path, payload: Dict[str, Any]) -> 
         "evaluated_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     )
     summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def validation_artifact_mse_improvement(val_data: Dict[str, Any]) -> Optional[float]:
+    """Return a validation decision's MSE improvement bound to its own metrics.
+
+    The artifact's ``mse_improvement`` must be finite and exactly equal
+    ``baseline_metrics.mse - candidate_metrics.mse`` (the formula
+    ``evaluate_candidate_validation`` records). Returns ``None`` when the
+    improvement is missing, non-finite, or not derived from the artifact's
+    own metrics, so resumed improvement claims can never drift from evidence.
+    """
+    raw = val_data.get("mse_improvement")
+    candidate = val_data.get("candidate_metrics")
+    baseline = val_data.get("baseline_metrics")
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, (int, float))
+        or not math.isfinite(float(raw))
+        or not isinstance(candidate, dict)
+        or not isinstance(baseline, dict)
+    ):
+        return None
+    cand_mse, base_mse = candidate.get("mse"), baseline.get("mse")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in (cand_mse, base_mse)
+    ):
+        return None
+    if float(raw) != float(base_mse - cand_mse):
+        return None
+    return float(raw)
 
 
 def validate_confirmation_summary(
@@ -844,6 +983,15 @@ def validate_confirmation_summary(
                             "validation decision metrics do not match "
                             "confirmation summary"
                         )
+                    artifact_imp = validation_artifact_mse_improvement(val_data)
+                    summary_imp = (
+                        float(raw_imp) if isinstance(raw_imp, (int, float)) else None
+                    )
+                    if artifact_imp is None or summary_imp != artifact_imp:
+                        mismatches.append(
+                            "validation decision mse_improvement does not match "
+                            "confirmation summary or its own baseline/candidate MSE"
+                        )
                     val_base = val_data.get("baseline")
                     if (
                         not isinstance(val_base, dict)
@@ -935,38 +1083,33 @@ def _run_confirmation_experiment(
     if remaining is not None and remaining <= 0:
         return _incomplete("deadline_exceeded_before_training")
 
-    candidate_ckpt = get_completed_candidate_checkpoint(exp_dir) if resume else None
-    if candidate_ckpt is None:
-        remaining = (deadline - time.time()) if deadline is not None else None
-        if remaining is not None and remaining <= 0:
-            return _incomplete("deadline_exceeded_before_training")
-        if not dataclasses.is_dataclass(source_config):
-            raise TypeError(
-                "confirmation source config must be an ActiveTrainingConfig dataclass"
-            )
-        experiment_config = dataclasses.replace(
-            source_config,
-            seed=seed,
-            max_seconds=(
-                remaining if remaining is not None else source_config.max_seconds
-            ),
+    # A completed confirmation candidate is reused only through
+    # train_active_model(resume=True), which validates its training provenance.
+    if not dataclasses.is_dataclass(source_config):
+        raise TypeError(
+            "confirmation source config must be an ActiveTrainingConfig dataclass"
         )
-        try:
-            with deadline_guard(remaining):
-                train_result = train_active_model(
-                    dataset_path=dataset_path,
-                    split_csv=split_csv_path,
-                    output_dir=exp_dir,
-                    config=experiment_config,
-                    resume=resume and is_valid_resumable_experiment(exp_dir),
-                )
-        except DeadlineExceededError:
-            return _incomplete("deadline_exceeded_during_training")
-        if train_result.get("state") != "completed":
-            return _incomplete(
-                f"training_not_completed_{train_result.get('state', 'unknown')}"
+    experiment_config = dataclasses.replace(
+        source_config,
+        seed=seed,
+        max_seconds=(remaining if remaining is not None else source_config.max_seconds),
+    )
+    try:
+        with deadline_guard(remaining):
+            train_result = train_active_model(
+                dataset_path=dataset_path,
+                split_csv=split_csv_path,
+                output_dir=exp_dir,
+                config=experiment_config,
+                resume=resume and is_valid_resumable_experiment(exp_dir),
             )
-        candidate_ckpt = train_result["candidate_checkpoint"]
+    except DeadlineExceededError:
+        return _incomplete("deadline_exceeded_during_training")
+    if train_result.get("state") != "completed":
+        return _incomplete(
+            f"training_not_completed_{train_result.get('state', 'unknown')}"
+        )
+    candidate_ckpt = train_result["candidate_checkpoint"]
 
     cand_sha256 = compute_sha256(candidate_ckpt)
     remaining = (deadline - time.time()) if deadline is not None else None
@@ -1177,6 +1320,19 @@ def validate_experiment_record(
         if float(artifact_value) != float(validation_metrics[metric_key]):
             return False
 
+    # A resumed improvement claim must be the artifact's own improvement,
+    # itself derived from the artifact's baseline/candidate MSE.
+    if rec.get("mse_improvement") is not None:
+        rec_imp = rec["mse_improvement"]
+        artifact_imp = validation_artifact_mse_improvement(val_data)
+        if (
+            isinstance(rec_imp, bool)
+            or not isinstance(rec_imp, (int, float))
+            or artifact_imp is None
+            or float(rec_imp) != artifact_imp
+        ):
+            return False
+
     if status == "completed":
         eval_dec_str = rec.get("eval_decision_path")
         if not eval_dec_str:
@@ -1321,46 +1477,78 @@ def determine_aggregate_run_state(
 
 
 def is_valid_resumable_experiment(exp_dir: Path) -> bool:
-    """Check if experiment directory contains a valid paused continuation or completed summary state for resume."""
+    """Return whether ``train_active_model(resume=True)`` should own ``exp_dir``.
+
+    ``resume.pt`` is the authoritative commit point of a training generation;
+    ``training_summary.json`` is a sidecar republished from it and may be
+    missing or stale after a hard kill. Eligibility therefore holds when
+    ``resume.pt`` exists, or when no ``resume.pt`` exists but a completed
+    sidecar and ``candidate.pt`` do. This is eligibility only:
+    ``train_active_model`` validates the generation and sidecar run identity,
+    rejects same-run failures, and performs every input-hash, configuration,
+    initial-checkpoint, and architecture validation. An obsolete sidecar
+    must never cause the authoritative checkpoint to be overwritten fresh.
+    """
+    if (exp_dir / "resume.pt").is_file():
+        return True
     summary_path = exp_dir / "training_summary.json"
-    if not summary_path.is_file():
+    summary_state: Optional[str] = None
+    if summary_path.is_file():
+        try:
+            data = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("state"), str):
+            summary_state = data["state"]
+    return summary_state == "completed" and (exp_dir / "candidate.pt").is_file()
+
+
+def verify_reused_candidate(
+    rec: Dict[str, Any],
+    *,
+    exp_dir: Path,
+    config: ActiveTrainingConfig,
+    dataset_path: str | Path,
+    split_csv_path: str | Path,
+) -> bool:
+    """Prove a reused record's candidate was trained from the current sources.
+
+    The candidate is re-admitted only through ``train_active_model`` with
+    ``resume=True`` on its experiment directory, which reuses a completed
+    candidate without training only after validating the current prepared
+    dataset and split hashes, material configuration (including capacity),
+    initial checkpoint identity, architecture, and the candidate checkpoint
+    bytes. The admitted candidate must be the record's exact checkpoint.
+    """
+    if not is_valid_resumable_experiment(exp_dir):
         return False
     try:
-        data = json.loads(summary_path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
+        result = train_active_model(
+            dataset_path=dataset_path,
+            split_csv=split_csv_path,
+            output_dir=exp_dir,
+            config=dataclasses.replace(config, max_steps=0),
+            resume=True,
+        )
+    except Exception as err:
+        print(
+            f"WARNING: Reused candidate provenance rejected for "
+            f"{rec.get('exp_id')}: {err}",
+            file=sys.stderr,
+        )
+        return False
+    if result.get("state") != "completed":
+        return False
+    admitted = result.get("candidate_checkpoint")
+    recorded = rec.get("candidate_checkpoint")
+    if not isinstance(admitted, str) or not isinstance(recorded, str):
+        return False
+    try:
+        if Path(admitted).resolve() != Path(recorded).resolve():
             return False
-        state = data.get("state")
-        if state == "paused":
-            return (exp_dir / "resume.pt").is_file()
-        if state == "completed":
-            return (exp_dir / "candidate.pt").is_file()
+        return compute_sha256(admitted) == compute_sha256(recorded)
+    except (OSError, FileNotFoundError):
         return False
-    except Exception:
-        return False
-
-
-def get_completed_candidate_checkpoint(exp_dir: Path) -> Optional[str]:
-    """
-    Return the candidate checkpoint path when training finished a completed candidate.
-
-    Used on resume to reuse already-trained candidate checkpoints without retraining
-    (e.g. legacy records lacking validated evidence, or runs interrupted between
-    training completion and validation). Returns None when no completed candidate
-    checkpoint exists.
-    """
-    summary_path = exp_dir / "training_summary.json"
-    if not summary_path.is_file():
-        return None
-    try:
-        data = json.loads(summary_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(data, dict) or data.get("state") != "completed":
-        return None
-    ckpt_path = exp_dir / "candidate.pt"
-    if not ckpt_path.is_file():
-        return None
-    return str(ckpt_path.resolve())
 
 
 EXPOSURE_REJECTION_REASON = "heldout_test_exposure_before_finalist_selection"
@@ -1855,10 +2043,20 @@ def main() -> None:
             artifacts_exist = True
 
     if artifacts_exist and not args.resume and not args.status:
-        raise FileExistsError(
-            f"Run directory '{run_dir}' already exists with run artifacts. "
-            "Pass --resume to resume or use a new --run-name."
-        )
+        if (
+            args.dry_run
+            or not args.thresholds_json
+            or not is_dry_run_plan_only(run_dir)
+        ):
+            raise FileExistsError(
+                f"Run directory '{run_dir}' already exists with run artifacts. "
+                "Pass --resume to resume or use a new --run-name."
+            )
+        # The plan's published execution command supersedes the dry-run plan;
+        # nothing executed, so no evidence is discarded.
+        (run_dir / "experiments.jsonl").unlink(missing_ok=True)
+        (run_dir / "run_manifest.json").unlink()
+        print("METRIC dry_run_plan_superseded=1")
     if (
         not args.dry_run
         and not args.status
@@ -2124,6 +2322,9 @@ def main() -> None:
         ladder = build_human_finetune_candidate_ladder(
             baseline_checkpoint_path=baseline_checkpoint_path,
             baseline_checkpoint_sha256=baseline_checkpoint_sha256,
+            hidden_dim=admitted_checkpoint_hidden_dim(
+                baseline_checkpoint_path, baseline_checkpoint_sha256
+            ),
             max_experiments=min(args.max_experiments, 4),
             seed=args.seed,
             device=args.device,
@@ -2184,7 +2385,13 @@ def main() -> None:
                     "exp_id": exp_id,
                     "hypothesis": exp["hypothesis"],
                     "status": "planned",
-                    "command": sanitize_command(f"train_active_model --exp {exp_id}"),
+                    # Execution requires --thresholds-json; without it no
+                    # runnable command exists, so none is published.
+                    "command": (
+                        execution_command(sys.argv[1:])
+                        if args.thresholds_json
+                        else None
+                    ),
                     "config": dataclasses.asdict(exp["config"])
                     if dataclasses.is_dataclass(exp["config"])
                     else str(exp["config"]),
@@ -2200,60 +2407,42 @@ def main() -> None:
         print("Dry run plan written successfully. No mutations performed.")
         sys.exit(0)
 
-    prepared_split_path = prepared_dataset_path.with_suffix(".filtered_index.csv")
     prepared_manifest_path = run_dir / "prepared_dataset_manifest.json"
-    if args.mode == "human_finetune":
-        if args.resume:
-            dataset_info = validate_prepared_dataset_manifest(
-                prepared_manifest_path,
-                run_name=args.run_name,
-                handoff_sha256=handoff_sha256,
-                supplemental_benchmark_sha256=args.supplemental_benchmark_sha256,
-                expected_dataset_path=prepared_dataset_path,
-                run_dir=run_dir,
-            )
-            print(
-                f"METRIC prepared_dataset=reused "
-                f"dataset_sha256={dataset_info['dataset_sha256']}"
-            )
-        else:
-            remaining_prep = global_deadline - time.time()
-            try:
-                with deadline_guard(remaining_prep):
-                    dataset_info = prepare_active_dataset(
-                        handoff_path,
-                        prepared_dataset_path,
-                        supplemental_benchmark_path=args.expanded_benchmark_csv,
-                        supplemental_benchmark_sha256=args.supplemental_benchmark_sha256,
-                    )
-            except DeadlineExceededError:
-                print(
-                    f"Time budget of {args.max_seconds}s reached during dataset preparation.",
-                    file=sys.stderr,
-                )
-                sys.exit(0)
-            write_prepared_dataset_manifest(
-                prepared_manifest_path,
-                run_name=args.run_name,
-                handoff_sha256=handoff_sha256,
-                supplemental_benchmark_sha256=args.supplemental_benchmark_sha256,
-                dataset_info=dataset_info,
-            )
-    elif (
-        args.resume
-        and prepared_dataset_path.is_file()
-        and prepared_split_path.is_file()
+    # Only human_finetune admits the supplemental benchmark into preparation;
+    # the manifest binds exactly the sources preparation consumed.
+    prepared_supplemental_sha256 = (
+        args.supplemental_benchmark_sha256 if args.mode == "human_finetune" else None
+    )
+    if args.resume and (
+        prepared_manifest_path.exists() or prepared_dataset_path.exists()
     ):
-        dataset_info = {
-            "dataset_path": str(prepared_dataset_path),
-            "split_path": str(prepared_split_path),
-        }
+        dataset_info = validate_prepared_dataset_manifest(
+            prepared_manifest_path,
+            mode=args.mode,
+            run_name=args.run_name,
+            handoff_sha256=handoff_sha256,
+            supplemental_benchmark_sha256=prepared_supplemental_sha256,
+            expected_dataset_path=prepared_dataset_path,
+            run_dir=run_dir,
+        )
+        print(
+            f"METRIC prepared_dataset=reused "
+            f"dataset_sha256={dataset_info['dataset_sha256']}"
+        )
     else:
+        supplemental_kwargs = (
+            {
+                "supplemental_benchmark_path": args.expanded_benchmark_csv,
+                "supplemental_benchmark_sha256": prepared_supplemental_sha256,
+            }
+            if prepared_supplemental_sha256 is not None
+            else {}
+        )
         remaining_prep = global_deadline - time.time()
         try:
             with deadline_guard(remaining_prep):
                 dataset_info = prepare_active_dataset(
-                    handoff_path, prepared_dataset_path
+                    handoff_path, prepared_dataset_path, **supplemental_kwargs
                 )
         except DeadlineExceededError:
             print(
@@ -2261,6 +2450,14 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(0)
+        write_prepared_dataset_manifest(
+            prepared_manifest_path,
+            mode=args.mode,
+            run_name=args.run_name,
+            handoff_sha256=handoff_sha256,
+            supplemental_benchmark_sha256=prepared_supplemental_sha256,
+            dataset_info=dataset_info,
+        )
 
     dataset_path = dataset_info["dataset_path"]
     split_csv_path = dataset_info["split_path"]
@@ -2332,61 +2529,58 @@ def main() -> None:
             )
             break
 
-        # Reuse completed experiment if resuming
+        exp_dir = run_dir / exp_id
+        # Reuse a completed experiment record only after its candidate is
+        # re-admitted against the current training sources and configuration.
         if args.resume and exp_id in completed_map:
-            print(f"METRIC exp_id={exp_id} status=reused")
-            evaluated_records.append(completed_map[exp_id])
-            continue
+            if verify_reused_candidate(
+                completed_map[exp_id],
+                exp_dir=exp_dir,
+                config=exp["config"],
+                dataset_path=dataset_path,
+                split_csv_path=split_csv_path,
+            ):
+                print(f"METRIC exp_id={exp_id} status=reused")
+                evaluated_records.append(completed_map[exp_id])
+                continue
+            print(f"METRIC exp_id={exp_id} status=reuse_rejected")
 
         print(f"METRIC exp_id={exp_id} status=starting")
-        exp_dir = run_dir / exp_id
         exp_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            # On resume, reuse an already-completed training checkpoint without
-            # retraining (legacy records lacking validated evidence, or runs
-            # interrupted between training completion and validation).
-            completed_candidate_ckpt = (
-                get_completed_candidate_checkpoint(exp_dir) if args.resume else None
+            # On resume, train_active_model owns any authoritative training
+            # state: it reuses a completed candidate only after validating its
+            # provenance and otherwise continues the committed generation.
+            experiment_config = dataclasses.replace(
+                exp["config"], max_seconds=remaining_seconds
             )
-            if completed_candidate_ckpt is not None:
-                candidate_ckpt = completed_candidate_ckpt
-                train_result = {
-                    "state": "completed",
-                    "candidate_checkpoint": candidate_ckpt,
-                }
-                print(f"METRIC exp_id={exp_id} status=training_reused")
-            else:
-                experiment_config = dataclasses.replace(
-                    exp["config"], max_seconds=remaining_seconds
-                )
-                try:
-                    with deadline_guard(remaining_seconds):
-                        train_result = train_active_model(
-                            dataset_path=dataset_path,
-                            split_csv=split_csv_path,
-                            output_dir=exp_dir,
-                            config=experiment_config,
-                            resume=args.resume
-                            and is_valid_resumable_experiment(exp_dir),
-                        )
-                except DeadlineExceededError:
-                    print(
-                        f"Time budget of {args.max_seconds}s reached during training of {exp_id}. "
-                        "Stopping autoresearch loop.",
-                        file=sys.stderr,
+            try:
+                with deadline_guard(remaining_seconds):
+                    train_result = train_active_model(
+                        dataset_path=dataset_path,
+                        split_csv=split_csv_path,
+                        output_dir=exp_dir,
+                        config=experiment_config,
+                        resume=args.resume and is_valid_resumable_experiment(exp_dir),
                     )
-                    exp_record = {
-                        "exp_id": exp_id,
-                        "hypothesis": exp["hypothesis"],
-                        "status": "stopped",
-                        "reason": "deadline_exceeded_during_training",
-                        "input_digest": exp_digest,
-                    }
-                    evaluated_records.append(exp_record)
-                    with experiments_jsonl.open("a", encoding="utf-8") as f:
-                        f.write(json.dumps(exp_record) + "\n")
-                    break
+            except DeadlineExceededError:
+                print(
+                    f"Time budget of {args.max_seconds}s reached during training of {exp_id}. "
+                    "Stopping autoresearch loop.",
+                    file=sys.stderr,
+                )
+                exp_record = {
+                    "exp_id": exp_id,
+                    "hypothesis": exp["hypothesis"],
+                    "status": "stopped",
+                    "reason": "deadline_exceeded_during_training",
+                    "input_digest": exp_digest,
+                }
+                evaluated_records.append(exp_record)
+                with experiments_jsonl.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(exp_record) + "\n")
+                break
 
             if train_result.get("state") != "completed":
                 exp_record = {
@@ -2620,6 +2814,22 @@ def main() -> None:
                         deadline=global_deadline,
                     )
                 else:
+                    if confirmation.get(
+                        "candidate_checkpoint"
+                    ) is not None and not verify_reused_candidate(
+                        confirmation,
+                        exp_dir=run_dir / conf_exp_id,
+                        config=dataclasses.replace(
+                            source_entry["config"], seed=confirmation_seed
+                        ),
+                        dataset_path=dataset_path,
+                        split_csv_path=split_csv_path,
+                    ):
+                        raise ValueError(
+                            "Confirmation summary validation failed:\n"
+                            "confirmation candidate training provenance does not "
+                            "match the current sources and configuration"
+                        )
                     print(
                         f"METRIC confirmation_seed={confirmation_seed} "
                         f"status=reused state={confirmation.get('state')}"

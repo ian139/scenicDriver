@@ -2,6 +2,10 @@
 Compare two regression checkpoints on the deterministic human benchmark split.
 
 Writes a single summary JSON with per-model metrics and deltas on the test split.
+Feature selection uses the NPZ's unique exported image_paths, not label row order.
+Every fixed test identity must be covered exactly once and have an explicit
+scenic_human_mean or scenic_human target in [0, 10]; weak scenic_score is never
+an evaluation target. Both checkpoints receive the same ordered population.
 """
 
 from __future__ import annotations
@@ -37,6 +41,88 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     return parser.parse_args()
+
+
+def load_benchmark_split(path: Path) -> pd.DataFrame:
+    """Read unique exact image identities and their fixed split assignments."""
+    frame = pd.read_csv(path)
+    if not {"image_path", "split"}.issubset(frame.columns):
+        raise ValueError("benchmark split CSV must contain image_path and split columns")
+    _validate_image_paths(frame["image_path"].to_numpy(), "benchmark split CSV")
+    splits = frame["split"].astype(str).str.strip().str.lower().replace({"validation": "val"})
+    if not splits.isin(["train", "val", "test"]).all():
+        raise ValueError("benchmark split CSV has invalid split assignments")
+    frame["split"] = splits
+    return frame.set_index("image_path", drop=False)
+
+
+def _validate_image_paths(values: np.ndarray, name: str) -> list[str]:
+    if values.ndim != 1:
+        raise ValueError(f"{name} image_paths must be one-dimensional")
+    paths = [p.decode("utf-8") if isinstance(p, bytes) else p for p in values]
+    if any(not isinstance(p, str) or not p or p != p.strip() for p in paths):
+        raise ValueError(f"{name} requires non-empty exact image_paths")
+    if len(paths) != len(set(paths)):
+        raise ValueError(f"{name} contains duplicate image_paths")
+    return paths
+
+
+def load_exported_image_paths(data: np.lib.npyio.NpzFile) -> list[str]:
+    """Require the exporter-owned identities, never infer them from label positions."""
+    if "image_paths" not in data.files:
+        raise ValueError("dataset must contain exported image_paths")
+    paths = _validate_image_paths(data["image_paths"], "dataset")
+    if len(paths) != len(data["scenic_scores"]):
+        raise ValueError("dataset image_paths length does not match scenic_scores")
+    return paths
+
+
+def benchmark_dataset(
+    dataset_path: Path, labels_path: Path, split_path: Path
+) -> torch.utils.data.Subset:
+    """Join a complete unique test population to features and explicit human targets."""
+    split = load_benchmark_split(split_path)
+    test = split.loc[split["split"] == "test"]
+    if test.empty:
+        raise ValueError("No test rows found in benchmark split CSV")
+    dataset = ScenicScoreDataset(dataset_path)
+    with np.load(dataset_path, allow_pickle=False) as data:
+        paths = load_exported_image_paths(data)
+        if "splits" in data.files:
+            embedded = data["splits"]
+            if embedded.ndim != 1 or len(embedded) != len(paths):
+                raise ValueError("dataset splits must align with image_paths")
+            for path, assignment in zip(paths, embedded, strict=True):
+                assignment = assignment.decode("utf-8") if isinstance(assignment, bytes) else str(assignment)
+                if path in split.index and assignment.strip().lower().replace("validation", "val") != split.at[path, "split"]:
+                    raise ValueError(f"benchmark split conflicts with dataset split for {path}")
+    positions = {path: i for i, path in enumerate(paths)}
+    missing = set(test.index) - set(positions)
+    if missing:
+        raise ValueError(f"Benchmark has {len(missing)} test paths absent from dataset")
+    labels = pd.read_csv(labels_path)
+    if "image_path" not in labels.columns:
+        raise ValueError("labels CSV must contain image_path column")
+    _validate_image_paths(labels["image_path"].to_numpy(), "labels CSV")
+    labels = labels.set_index("image_path")
+    targets = []
+    indices = []
+    for path, record in test.iterrows():
+        target = None
+        for source in (record, labels.loc[path] if path in labels.index else {}):
+            for column in ("scenic_human_mean", "scenic_human"):
+                value = source.get(column)
+                if value is not None and not pd.isna(value):
+                    target = float(value)
+                    break
+            if target is not None:
+                break
+        if target is None or not np.isfinite(target) or not 0 <= target <= 10:
+            raise ValueError(f"Benchmark target for {path} must be finite human score in [0, 10]")
+        indices.append(positions[path])
+        targets.append(target)
+    dataset.scenic_scores[indices] = torch.tensor(targets, dtype=torch.float32).unsqueeze(-1)
+    return torch.utils.data.Subset(dataset, indices)
 
 
 def _safe_corr(preds: np.ndarray, targets: np.ndarray) -> float:
@@ -91,30 +177,7 @@ def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
 
-    split_df = pd.read_csv(args.benchmark_split_csv)
-    if "image_path" not in split_df.columns or "split" not in split_df.columns:
-        raise ValueError("benchmark split CSV must contain image_path and split columns")
-    test_paths = set(
-        split_df.loc[split_df["split"].astype(str).str.lower() == "test", "image_path"].astype(str).tolist()
-    )
-    if not test_paths:
-        raise ValueError("No test rows found in benchmark split CSV")
-
-    labels_df = pd.read_csv(args.labels_csv)
-    if "image_path" not in labels_df.columns:
-        raise ValueError("labels CSV must contain image_path column")
-    dataset = ScenicScoreDataset(args.dataset)
-    dataset_paths = labels_df["image_path"].astype(str).tolist()
-    if len(dataset_paths) != len(dataset):
-        raise ValueError(
-            "labels CSV row count must match dataset row count. "
-            f"labels={len(dataset_paths)} dataset={len(dataset)}"
-        )
-    test_idx = [i for i, p in enumerate(dataset_paths) if p in test_paths]
-    if not test_idx:
-        raise ValueError("No benchmark test rows matched dataset image_paths")
-
-    test_ds = torch.utils.data.Subset(dataset, test_idx)
+    test_ds = benchmark_dataset(args.dataset, args.labels_csv, args.benchmark_split_csv)
     test_loader = torch.utils.data.DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
 
     baseline_model = _load_model(args.baseline_checkpoint, device)

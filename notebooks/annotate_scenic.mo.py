@@ -8,14 +8,38 @@ app = marimo.App(width="medium")
 def _():
     import marimo as mo
     import os
+    import sys as _sys
     from dataclasses import dataclass
-    from datetime import datetime, timezone
     from pathlib import Path
 
     import pandas as pd
     from PIL import Image
 
-    return Image, Path, dataclass, datetime, mo, os, pd, timezone
+    _project_root = Path.cwd()
+    if str(_project_root) not in _sys.path:
+        _sys.path.insert(0, str(_project_root))
+
+    from scripts.annotation.annotate_scenic_web import (
+        AnnotatorConfig as WebAnnotatorConfig,
+        AnnotatorState,
+        ApiError,
+        _safe_image_path as safe_image_path,
+        _sample_stratified as sample_stratified,
+    )
+
+    return (
+        AnnotatorState,
+        ApiError,
+        Image,
+        Path,
+        WebAnnotatorConfig,
+        dataclass,
+        mo,
+        os,
+        pd,
+        safe_image_path,
+        sample_stratified,
+    )
 
 
 @app.cell
@@ -23,6 +47,11 @@ def _(mo):
     mo.md("""
     # Manual Scenic Annotation
     Annotate tiles with human scenic ratings (0-10) for calibration and benchmark evaluation.
+    Nothing is read until **Load Annotation Batch** is submitted. The whole labels CSV is
+    registered with the shared web-annotator store as the approved batch; the notebook then
+    samples **Sample Size** tiles the selected Annotator ID has not annotated yet. Saves go
+    through that store (sidecar-locked, atomic CSV writes; one row per tile and annotator),
+    and completion counts only rows saved under the selected Annotator ID.
     """)
     return
 
@@ -71,98 +100,70 @@ def _(cfg, mo):
 
 
 @app.cell
-def _(Path, pd, ui_config_form):
-    if ui_config_form.value is None:
-        print("Submit 'Load Annotation Batch' to start.")
-        config = {
-            "labels_csv": "data/raw/labels.csv",
-            "raw_dir": "data/raw",
-            "annotations_csv": "data/raw/labels_human.csv",
-            "sample_size": 500,
-            "seed": 42,
-            "stratify_by_class": True,
-            "annotator_id": "annotator",
-        }
-    else:
-        config = ui_config_form.value
-    labels_path = Path(config["labels_csv"])
-    if not labels_path.exists():
-        raise FileNotFoundError(f"labels.csv not found: {labels_path}")
-
-    labels_df = pd.read_csv(labels_path)
-    if labels_df.empty:
-        raise ValueError("labels.csv is empty")
-    if "image_path" not in labels_df.columns:
-        raise ValueError("labels.csv must contain 'image_path'")
-
-    labels_df = labels_df.dropna(subset=["image_path"]).copy()
-    labels_df["image_path"] = labels_df["image_path"].astype(str)
-
-    ann_path = Path(config["annotations_csv"])
-    if ann_path.exists():
-        ann_df = pd.read_csv(ann_path)
-    else:
-        ann_df = pd.DataFrame(
-            columns=[
-                "image_path",
-                "scenic_human",
-                "confidence",
-                "skip",
-                "annotator_id",
-                "timestamp",
-                "notes",
-            ]
+def _(AnnotatorState, ApiError, WebAnnotatorConfig, mo, ui_config_form):
+    mo.stop(
+        ui_config_form.value is None,
+        mo.md("Submit **Load Annotation Batch** to start."),
+    )
+    config = dict(ui_config_form.value)
+    config["annotator_id"] = str(config["annotator_id"]).strip() or "annotator"
+    config["batch_csv"] = str(config["labels_csv"])
+    try:
+        annotator_state = AnnotatorState(
+            WebAnnotatorConfig(
+                labels_csv=str(config["labels_csv"]),
+                batch_csv=config["batch_csv"],
+                raw_dir=str(config["raw_dir"]),
+                annotations_csv=str(config["annotations_csv"]),
+                sample_size=int(config["sample_size"]),
+                seed=int(config["seed"]),
+                stratify_by_class=bool(config["stratify_by_class"]),
+                annotator_id=config["annotator_id"],
+            )
         )
-    return ann_df, config, labels_df
+        # The full labels pool is the approved save membership; display sampling happens below.
+        loaded_batch = annotator_state.load_batch(config)
+    except ApiError as _exc:
+        mo.stop(True, mo.callout(f"Could not load batch: {_exc.message}", kind="danger"))
+    return annotator_state, config, loaded_batch
 
 
 @app.cell
-def _(ann_df, config, labels_df, pd):
-    def sample_stratified(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
-        if n <= 0:
-            return df.iloc[0:0].copy()
-        if "class_id" not in df.columns or df["class_id"].isna().all():
-            return df.sample(n=min(n, len(df)), random_state=seed).reset_index(drop=True)
+def _(Path, annotator_state, config, loaded_batch, pd, safe_image_path, sample_stratified):
+    annotator_id = annotator_state.config.annotator_id
+    _ann_path = Path(annotator_state.config.annotations_csv)
+    _ann = pd.read_csv(_ann_path) if _ann_path.exists() and _ann_path.stat().st_size else pd.DataFrame()
+    if _ann.empty or "annotator_id" not in _ann.columns:
+        done_paths = set()
+    else:
+        _own = _ann["annotator_id"].notna() & (_ann["annotator_id"].astype(str) == annotator_id)
+        done_paths = set(_ann.loc[_own, "image_path"].astype(str))
 
-        classes = sorted(df["class_id"].dropna().unique().tolist())
-        per_class = max(1, n // max(1, len(classes)))
-        chunks = []
-        for class_id in classes:
-            class_df = df[df["class_id"] == class_id]
-            if class_df.empty:
-                continue
-            take = min(per_class, len(class_df))
-            chunks.append(class_df.sample(n=take, random_state=seed))
+    # Same rows load_batch approved, keeping every source column (scorer metadata included).
+    labels_df = pd.read_csv(annotator_state.config.batch_csv).dropna(subset=["image_path"])
+    labels_df["image_path"] = labels_df["image_path"].astype(str).map(safe_image_path)
+    labels_df = labels_df.drop_duplicates(subset=["image_path"], keep="first")
+    _approved = {str(row["image_path"]) for row in loaded_batch["batch"]}
+    labels_df = labels_df.loc[labels_df["image_path"].isin(_approved)]
 
-        sampled = pd.concat(chunks, ignore_index=True) if chunks else df.iloc[0:0].copy()
-        needed = min(n, len(df)) - len(sampled)
-        if needed > 0:
-            remainder = df.loc[~df["image_path"].isin(sampled["image_path"])]
-            if not remainder.empty:
-                sampled = pd.concat(
-                    [sampled, remainder.sample(n=min(needed, len(remainder)), random_state=seed)],
-                    ignore_index=True,
-                )
-        return sampled.drop_duplicates(subset=["image_path"]).reset_index(drop=True)
-
-    n = int(config["sample_size"])
-    seed = int(config["seed"])
-    stratify = bool(config["stratify_by_class"])
-
-    done_paths = set(ann_df["image_path"].astype(str).tolist()) if not ann_df.empty else set()
+    _n = int(config["sample_size"])
+    _seed = int(config["seed"])
     unlabeled_df = labels_df.loc[~labels_df["image_path"].isin(done_paths)].copy()
     if unlabeled_df.empty:
-        batch_df = unlabeled_df
-    elif stratify:
-        batch_df = sample_stratified(unlabeled_df, n=n, seed=seed)
+        batch_df = unlabeled_df.reset_index(drop=True)
+    elif bool(config["stratify_by_class"]):
+        batch_df = sample_stratified(unlabeled_df, _n, _seed)
     else:
-        batch_df = unlabeled_df.sample(n=min(n, len(unlabeled_df)), random_state=seed).reset_index(drop=True)
-    return batch_df, done_paths
+        batch_df = unlabeled_df.sample(n=min(_n, len(unlabeled_df)), random_state=_seed).reset_index(drop=True)
+    return annotator_id, batch_df, done_paths, labels_df
 
 
 @app.cell
-def _(batch_df, done_paths, mo):
-    mo.md(f"Loaded batch: **{len(batch_df)}** unlabeled | Existing annotations: **{len(done_paths)}**")
+def _(annotator_id, batch_df, done_paths, labels_df, mo):
+    mo.md(
+        f"Labels pool: **{len(labels_df)}** tiles | Sampled pending for `{annotator_id}`: "
+        f"**{len(batch_df)}** | Annotated by `{annotator_id}` (any batch): **{len(done_paths)}**"
+    )
     if batch_df.empty:
         mo.callout("No unlabeled samples found for this config.", kind="warn")
 
@@ -223,7 +224,7 @@ def _(batch_df, done_paths, mo):
 
 
 @app.cell
-def _(Image, Path, batch_df, config, current_index, mo):
+def _(Image, Path, annotator_state, batch_df, current_index, mo):
     image_path = ""
     if batch_df.empty:
         _panel_current = mo.callout("No samples to annotate.", kind="warn")
@@ -232,7 +233,7 @@ def _(Image, Path, batch_df, config, current_index, mo):
         i = min(max(0, i), len(batch_df) - 1)
         row = batch_df.iloc[i]
         image_path = str(row["image_path"])
-        image_abs = Path(config["raw_dir"]) / image_path
+        image_abs = Path(annotator_state.config.raw_dir) / image_path
 
         meta = [f"Index: {i}/{len(batch_df)-1}", f"image_path: {image_path}"]
         for k in ["scenic_score", "class_id", "lat", "lon"]:
@@ -252,73 +253,72 @@ def _(Image, Path, batch_df, config, current_index, mo):
 
 @app.cell
 def _(
-    Path,
-    config,
-    datetime,
+    ApiError,
+    annotator_state,
     image_path,
-    pd,
-    timezone,
+    mo,
     ui_conf,
     ui_notes,
     ui_save_click,
     ui_score,
     ui_skip,
 ):
-    save_clicked = ui_save_click.value() if callable(ui_save_click.value) else ui_save_click.value
-    if bool(save_clicked) and image_path:
-        out_path = Path(config["annotations_csv"])
-        if out_path.exists():
-            updated = pd.read_csv(out_path)
-        else:
-            updated = pd.DataFrame(
-                columns=[
-                    "image_path",
-                    "scenic_human",
-                    "confidence",
-                    "skip",
-                    "annotator_id",
-                    "timestamp",
-                    "notes",
-                ]
+    def _value(widget):
+        return widget.value() if callable(widget.value) else widget.value
+
+    save_result = None
+    if bool(_value(ui_save_click)) and image_path:
+        try:
+            save_result = annotator_state.save_annotation(
+                {
+                    "image_path": image_path,
+                    "scenic_human": float(_value(ui_score)),
+                    "confidence": str(_value(ui_conf)),
+                    "skip": bool(_value(ui_skip)),
+                    "notes": str(_value(ui_notes)),
+                }
             )
-        record = {
-            "image_path": image_path,
-            "scenic_human": float(ui_score.value() if callable(ui_score.value) else ui_score.value),
-            "confidence": str(ui_conf.value() if callable(ui_conf.value) else ui_conf.value),
-            "skip": bool(ui_skip.value() if callable(ui_skip.value) else ui_skip.value),
-            "annotator_id": str(config["annotator_id"]),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "notes": str(ui_notes.value() if callable(ui_notes.value) else ui_notes.value),
-        }
-        if not updated.empty:
-            mask = (updated["image_path"].astype(str) == record["image_path"]) & (
-                updated["annotator_id"].astype(str) == record["annotator_id"]
-            )
-            updated = updated.loc[~mask].copy()
-        updated = pd.concat([updated, pd.DataFrame([record])], ignore_index=True)
-        updated.to_csv(out_path, index=False)
-        print(f"Saved annotation to {out_path} (rows={len(updated)})")
-    return
+        except ApiError as _exc:
+            save_result = {"saved": False, "error": _exc.message}
+    if save_result is None:
+        _panel_save = None
+    elif save_result["saved"]:
+        _panel_save = mo.callout(
+            f"Saved {image_path} to {annotator_state.config.annotations_csv} (rows={save_result['row_count']})",
+            kind="success",
+        )
+    else:
+        _panel_save = mo.callout(f"Save failed: {save_result['error']}", kind="danger")
+    _panel_save
+    return (save_result,)
 
 
 @app.cell
-def _(Path, config, mo, pd):
-    _ann_path = Path(config["annotations_csv"])
+def _(Path, annotator_id, annotator_state, mo, pd, save_result):
+    _ = save_result  # re-render after every save
+    _ann_path = Path(annotator_state.config.annotations_csv)
+    _progress = annotator_state.summary()
+    _completion = mo.md(
+        f"### Completion for `{annotator_id}`\n"
+        f"**{_progress['completed']}** / {_progress['batch_size']} labels-pool tiles "
+        f"(skipped: {_progress['skipped']}, remaining: {_progress['remaining']})"
+    )
     if not _ann_path.exists():
-        _panel_summary = mo.callout(f"No annotations file yet: {_ann_path}", kind="warn")
+        _panel_summary = mo.vstack(
+            [_completion, mo.callout(f"No annotations file yet: {_ann_path}", kind="warn")]
+        )
     else:
         ann = pd.read_csv(_ann_path)
         if ann.empty:
-            _panel_summary = mo.callout("Annotation file exists but has no rows yet.", kind="warn")
+            _panel_summary = mo.vstack(
+                [_completion, mo.callout("Annotation file exists but has no rows yet.", kind="warn")]
+            )
         else:
             summary = pd.DataFrame(
                 [
                     {"metric": "total_rows", "value": int(len(ann))},
                     {"metric": "unique_tiles", "value": int(ann["image_path"].nunique())},
-                    {
-                        "metric": "annotators",
-                        "value": int(ann["annotator_id"].nunique()) if "annotator_id" in ann.columns else 0,
-                    },
+                    {"metric": "annotators", "value": int(ann["annotator_id"].nunique())},
                 ]
             )
             by_annotator = (
@@ -326,14 +326,13 @@ def _(Path, config, mo, pd):
                 .size()
                 .reset_index(name="count")
                 .sort_values("count", ascending=False)
-                if "annotator_id" in ann.columns
-                else pd.DataFrame()
             )
             recent = ann.tail(20)
 
             _panel_summary = mo.vstack(
                 [
                     mo.md("## Annotation Summary"),
+                    _completion,
                     mo.md("### Totals"),
                     summary,
                     mo.md("### By Annotator"),

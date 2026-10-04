@@ -50,6 +50,33 @@ def test_duration_component_handles_kappa_one_and_endpoints() -> None:
     assert combined_utility(1.0, 2.0, 20.0, 10.0, 0.75) == pytest.approx(0.75)
 
 
+@pytest.mark.parametrize(
+    ("duration", "fastest", "kappa", "expected"),
+    [
+        (1e-320, 1e-320, 1.0000000000000002, 1.0),
+        (1.5e-320, 1e-320, 2.0, 0.5),
+        (2e-320, 1e-320, 2.0, 0.0),
+        (1.0, 1e-320, 2.0, 0.0),
+    ],
+)
+def test_duration_utility_is_stable_for_subnormal_baselines(
+    duration: float, fastest: float, kappa: float, expected: float
+) -> None:
+    assert duration_component(duration, fastest, kappa) == pytest.approx(
+        expected, abs=0.001
+    )
+
+
+def test_highway_preference_normalizes_before_multiplying() -> None:
+    path = [edge("highway", 1e200, 0.0, road_type="motorway")]
+    evaluation = evaluate_path(
+        path, q=0.5, kappa=1.0, fastest_duration_minutes=1e200,
+        highway_preference=1e200,
+    )
+    assert evaluation.highway_cost == pytest.approx(1e200)
+    assert evaluation.objective == pytest.approx(-1e200)
+
+
 def test_invalid_objective_inputs_are_rejected() -> None:
     with pytest.raises(ValueError):
         normalize_scenic_score(float("nan"))

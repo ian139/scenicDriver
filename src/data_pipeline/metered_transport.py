@@ -17,8 +17,23 @@ request is dispatched without that authorization.
 
 All accounting is written to a ``MeteredLedger`` as deterministic,
 secret-free JSONL records (one ``reserve`` plus one ``settle`` record per
-attempt), so the ledger alone proves how many requests, bytes, and dollars a
-run consumed, including failed and retried attempts.
+attempt), so the ledger alone bounds how many requests, bytes, and dollars a
+run consumed, including failed and retried attempts. Each ``settle`` record
+states its ``usage_basis``: ``"measured"`` means the actual byte counts were
+observed (body bytes consumed by the transport, a known partial-read count,
+the response ``content-length``, or the SDK's received wire body), while
+``"reserved_upper_bound"`` means the true consumption could not be observed
+and the attempt conservatively retains its reservation instead of claiming a
+measured value. Failed attempts settle the same way: any bytes they observed
+are recorded as an observed lower bound on their consumption, and a failed
+attempt whose consumption could not be observed retains its whole reservation
+rather than settling a measured zero and refunding the reservation.
+
+GET bodies are streamed in sized reads that never request more than the
+declared reservation plus one overflow-sentinel byte, and the body is always
+closed. Usage already incurred is always settled and recorded, even when it
+overruns an authorized cap; the cap violation is raised after the settlement
+is recorded. Reservation checks remain strictly pre-dispatch.
 """
 
 from __future__ import annotations
@@ -31,15 +46,8 @@ import time as _time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from http.client import IncompleteRead as _IncompleteRead
+from http.client import IncompleteRead as _HttpIncompleteRead
 from pathlib import Path
-
-# ``http.client`` named this class ``IncompleteRead`` before Python 3.12 and
-# ``IncompleteReadError`` from 3.12 on; accept either name.
-try:
-    from http.client import IncompleteReadError as _IncompleteReadError
-except ImportError:  # pragma: no cover - Python < 3.12
-    _IncompleteReadError = _IncompleteRead
 from typing import Any, Callable, Protocol
 
 import botocore.exceptions as _boto_exc
@@ -137,9 +145,12 @@ class MeteredTransportError(Exception):
 
 
 class CapExceededError(MeteredTransportError):
-    """A reservation would exceed one of the ``NetworkCaps`` limits.
+    """Usage would exceed, or has exceeded, one of the ``NetworkCaps`` limits.
 
-    Raised before dispatch: the attempt is never sent to the network.
+    Raised before dispatch when a reservation does not fit: that attempt is
+    never sent to the network. Also raised after settlement when an attempt's
+    already-incurred usage overran a cap; in that case the incurred usage has
+    already been applied to the counters and recorded in the ledger.
     """
 
     def __init__(
@@ -322,44 +333,15 @@ class SharedMeteredBudget:
         requester_pays: bool = False,
     ) -> None:
         with self.lock:
-            values = (
-                ("requests", self.requests, requests, self.caps.max_requests),
-                (
-                    "transfer_bytes",
-                    self.transfer_bytes,
-                    transfer_bytes,
-                    self.caps.max_transfer_bytes,
-                ),
-                (
-                    "local_bytes",
-                    self.local_bytes,
-                    local_bytes,
-                    self.caps.max_local_bytes,
-                ),
-                *(
-                    (
-                        (
-                            "requester_pays_usd",
-                            self.requester_pays_cost_usd,
-                            cost_usd,
-                            self.caps.max_requester_pays_usd,
-                        ),
-                    )
-                    if requester_pays
-                    else ()
-                ),
+            rows = self._cap_rows(
+                requests, transfer_bytes, local_bytes, cost_usd, requester_pays
             )
-            for name, used, requested, limit in values:
+            for name, used, requested, limit in rows:
                 if requested < 0:
                     raise ValueError(f"{name} reservation must be non-negative")
                 if used + requested > limit:
                     raise CapExceededError(name, used, requested, limit)
-            self.requests += requests
-            self.transfer_bytes += transfer_bytes
-            self.local_bytes += local_bytes
-            self.cost_usd += cost_usd
-            if requester_pays:
-                self.requester_pays_cost_usd += cost_usd
+            self._apply(requests, transfer_bytes, local_bytes, cost_usd, requester_pays)
 
     def adjust(
         self,
@@ -371,46 +353,100 @@ class SharedMeteredBudget:
         requester_pays: bool = False,
     ) -> None:
         with self.lock:
-            values = (
-                ("requests", self.requests, requests, self.caps.max_requests),
-                (
-                    "transfer_bytes",
-                    self.transfer_bytes,
-                    transfer_bytes,
-                    self.caps.max_transfer_bytes,
-                ),
-                (
-                    "local_bytes",
-                    self.local_bytes,
-                    local_bytes,
-                    self.caps.max_local_bytes,
-                ),
-                *(
-                    (
-                        (
-                            "requester_pays_usd",
-                            self.requester_pays_cost_usd,
-                            cost_usd,
-                            self.caps.max_requester_pays_usd,
-                        ),
-                    )
-                    if requester_pays
-                    else ()
-                ),
+            rows = self._cap_rows(
+                requests, transfer_bytes, local_bytes, cost_usd, requester_pays
             )
-            for name, used, delta, limit in values:
+            for name, used, delta, limit in rows:
                 if delta > 0 and used + delta > limit:
                     raise CapExceededError(name, used, delta, limit)
-                if used + delta < 0:
-                    raise RuntimeError(f"metered budget accounting underflow: {name}")
-            if self.cost_usd + cost_usd < 0:
-                raise RuntimeError("metered budget accounting underflow: cost_usd")
-            self.requests += requests
-            self.transfer_bytes += transfer_bytes
-            self.local_bytes += local_bytes
-            self.cost_usd += cost_usd
-            if requester_pays:
-                self.requester_pays_cost_usd += cost_usd
+            self._check_underflow(rows, cost_usd)
+            self._apply(requests, transfer_bytes, local_bytes, cost_usd, requester_pays)
+
+    def settle_incurred(
+        self,
+        *,
+        transfer_bytes: int,
+        local_bytes: int,
+        cost_usd: Decimal,
+        requester_pays: bool = False,
+    ) -> CapExceededError | None:
+        """Apply settlement deltas for usage that has already been incurred.
+
+        Unlike ``adjust``, caps never block this update: incurred usage is
+        always counted. When the result overruns a cap, the corresponding
+        ``CapExceededError`` is returned (not raised) so the caller can record
+        the settlement before raising it.
+        """
+        with self.lock:
+            rows = self._cap_rows(
+                0, transfer_bytes, local_bytes, cost_usd, requester_pays
+            )
+            self._check_underflow(rows, cost_usd)
+            overrun = next(
+                (
+                    CapExceededError(name, used, delta, limit)
+                    for name, used, delta, limit in rows
+                    if delta > 0 and used + delta > limit
+                ),
+                None,
+            )
+            self._apply(0, transfer_bytes, local_bytes, cost_usd, requester_pays)
+            return overrun
+
+    def _cap_rows(
+        self,
+        requests: int,
+        transfer_bytes: int,
+        local_bytes: int,
+        cost_usd: Decimal,
+        requester_pays: bool,
+    ) -> list[tuple[str, int | Decimal, int | Decimal, int | Decimal]]:
+        rows: list[tuple[str, int | Decimal, int | Decimal, int | Decimal]] = [
+            ("requests", self.requests, requests, self.caps.max_requests),
+            (
+                "transfer_bytes",
+                self.transfer_bytes,
+                transfer_bytes,
+                self.caps.max_transfer_bytes,
+            ),
+            ("local_bytes", self.local_bytes, local_bytes, self.caps.max_local_bytes),
+        ]
+        if requester_pays:
+            rows.append(
+                (
+                    "requester_pays_usd",
+                    self.requester_pays_cost_usd,
+                    cost_usd,
+                    self.caps.max_requester_pays_usd,
+                )
+            )
+        return rows
+
+    def _check_underflow(
+        self,
+        rows: list[tuple[str, int | Decimal, int | Decimal, int | Decimal]],
+        cost_usd: Decimal,
+    ) -> None:
+        for name, used, delta, _limit in rows:
+            if used + delta < 0:
+                raise RuntimeError(f"metered budget accounting underflow: {name}")
+        if self.cost_usd + cost_usd < 0:
+            raise RuntimeError("metered budget accounting underflow: cost_usd")
+
+    def _apply(
+        self,
+        requests: int,
+        transfer_bytes: int,
+        local_bytes: int,
+        cost_usd: Decimal,
+        requester_pays: bool,
+    ) -> None:
+        self.requests += requests
+        self.transfer_bytes += transfer_bytes
+        self.local_bytes += local_bytes
+        self.cost_usd += cost_usd
+        if requester_pays:
+            self.requester_pays_cost_usd += cost_usd
 
 
 @dataclass(frozen=True)
@@ -663,9 +699,7 @@ def _classify_error(exc: Exception) -> str | None:
     if isinstance(exc, RetriesExhaustedError):
         return "transient"
     if isinstance(exc, _boto_exc.ClientError):
-        error = exc.response.get("Error", {}) if isinstance(exc.response, dict) else {}
-        code = str(error.get("Code", ""))
-        status = error.get("HTTPStatusCode")
+        code, status = _client_error_code_status(exc)
         if code in _TRANSIENT_ERROR_CODES:
             return "transient"
         if code in _AUTH_ERROR_CODES:
@@ -690,18 +724,31 @@ def _classify_error(exc: Exception) -> str | None:
     if isinstance(exc, _boto_exc.ResponseStreamingError):
         # The HTTP stream broke mid-read; the transfer did not complete.
         return "transient"
-    if isinstance(exc, _IncompleteReadError):
+    if isinstance(exc, _HttpIncompleteRead):
         return "transient"
     return None
+
+
+def _client_error_code_status(exc: _boto_exc.ClientError) -> tuple[str, Any]:
+    """Error code from ``Error.Code`` and HTTP status from ``ResponseMetadata``.
+
+    Botocore reports the HTTP status of a failed call only in
+    ``ResponseMetadata.HTTPStatusCode``; the ``Error`` element carries the
+    service error code and message.
+    """
+    response = exc.response if isinstance(exc.response, dict) else {}
+    error = response.get("Error")
+    meta = response.get("ResponseMetadata")
+    code = str(error.get("Code", "")) if isinstance(error, dict) else ""
+    status = meta.get("HTTPStatusCode") if isinstance(meta, dict) else None
+    return code, status
 
 
 def _describe_error(exc: Exception) -> str:
     """A secret-free description of an error for messages and records."""
     if isinstance(exc, _boto_exc.ClientError):
-        error = exc.response.get("Error", {}) if isinstance(exc.response, dict) else {}
-        return (
-            f"client error HTTP {error.get('HTTPStatusCode')} code={error.get('Code')}"
-        )
+        code, status = _client_error_code_status(exc)
+        return f"client error HTTP {status} code={code}"
     return type(exc).__name__
 
 
@@ -756,35 +803,165 @@ def _to_iso(value: Any) -> str | None:
     return str(value)
 
 
-def _partial_bytes(exc: Exception) -> int:
-    if isinstance(exc, _IncompleteReadError):
-        return len(exc.partial)
-    cause = exc.args[0] if exc.args else None
-    if isinstance(cause, _IncompleteReadError):
-        return len(cause.partial)
-    return 0
+def _is_byte_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def _list_response_bytes(response: dict[str, Any]) -> int:
-    """Bytes actually read from a LIST response.
+def _known_consumed_after_failed_read(
+    exc: BaseException, consumed: int, requested: int
+) -> int | None:
+    """Total body bytes consumed once a ``read(requested)`` call failed.
 
-    Uses the response ``content-length`` header when present; otherwise falls
-    back to the byte length of the canonical compact JSON serialization of the
-    parsed response, which is the data this transport actually consumed.
+    ``consumed`` is the byte count of earlier successful reads. Recognized
+    partial-read evidence is searched recursively through exception args,
+    botocore ``kwargs``, ``__cause__``, and ``__context__``:
+
+    * ``http.client.IncompleteRead`` with a ``bytes`` partial reports bytes
+      delivered by the failing read itself (bounded by ``requested``);
+    * urllib3's ``IncompleteRead`` (an ``int`` partial) and botocore's
+      ``IncompleteReadError`` (``actual_bytes``) report the cumulative body
+      bytes read from the connection so far.
+
+    Returns ``None`` when no recognized evidence exists, meaning the bytes
+    consumed by the failing read are unknown.
     """
-    headers = response.get("ResponseMetadata", {}).get("HTTPHeaders")
+    seen: set[int] = set()
+    pending: list[Any] = [exc]
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, (tuple, list)):
+            pending.extend(item)
+            continue
+        if not isinstance(item, BaseException):
+            continue
+        if isinstance(item, _HttpIncompleteRead):
+            partial = item.partial
+            if isinstance(partial, (bytes, bytearray)):
+                return consumed + min(len(partial), requested)
+            if _is_byte_count(partial):
+                return max(consumed, partial)
+        kwargs = getattr(item, "kwargs", None)
+        if isinstance(item, _boto_exc.IncompleteReadError) and isinstance(kwargs, dict):
+            actual = kwargs.get("actual_bytes")
+            if _is_byte_count(actual):
+                return max(consumed, actual)
+        pending.extend(item.args)
+        if isinstance(kwargs, dict):
+            pending.extend(kwargs.values())
+        for linked in (item.__cause__, item.__context__):
+            if linked is not None:
+                pending.append(linked)
+    return None
+
+
+def _list_content_length(response: dict[str, Any]) -> int | None:
+    """The LIST response ``content-length`` header, or ``None`` if absent."""
+    meta = response.get("ResponseMetadata")
+    headers = meta.get("HTTPHeaders") if isinstance(meta, dict) else None
     if isinstance(headers, dict):
         for name, value in headers.items():
             if str(name).lower() == "content-length":
                 try:
-                    return int(value)
+                    length = int(value)
                 except (TypeError, ValueError):
-                    break
-    return len(
-        json.dumps(
-            response, sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode("utf-8")
-    )
+                    return None
+                return length if length >= 0 else None
+    return None
+
+
+_USAGE_MEASURED = "measured"
+_USAGE_RESERVED_UPPER_BOUND = "reserved_upper_bound"
+
+# Largest single ``Body.read`` request; every read is further bounded by the
+# remaining reservation plus one overflow-sentinel byte.
+_GET_READ_CHUNK_BYTES = 1 << 16
+
+
+@dataclass
+class _AttemptUsage:
+    """Usage incurred by one attempt, filled in as the attempt progresses.
+
+    ``basis`` is ``"measured"`` when the counts were observed (on a failed
+    attempt an observed count is a lower bound on the attempt's true
+    consumption) and ``"reserved_upper_bound"`` when consumption could not be
+    observed and the attempt conservatively retains (at least) its
+    reservation. ``filled`` marks whether any count was recorded at all, so a
+    failed attempt that recorded nothing retains its reservation instead of
+    settling the default zero counts as a measured refund.
+    """
+
+    transfer: int = 0
+    local: int = 0
+    basis: str = _USAGE_MEASURED
+    filled: bool = False
+
+    def record_measured(self, *, transfer: int, local: int) -> None:
+        self.transfer = transfer
+        self.local = local
+        self.basis = _USAGE_MEASURED
+        self.filled = True
+
+    def retain_upper_bound(self, *, transfer: int, local: int) -> None:
+        self.transfer = transfer
+        self.local = local
+        self.basis = _USAGE_RESERVED_UPPER_BOUND
+        self.filled = True
+
+
+def _read_body_bounded(body: Any, reservation: int, usage: _AttemptUsage) -> bytes:
+    """Stream ``body`` with sized reads bounded to ``reservation + 1`` bytes.
+
+    The single byte beyond the reservation is an overflow sentinel: a result
+    longer than ``reservation`` proves the server sent more than declared
+    without reading the rest. Successful chunks are counted as they arrive;
+    a failing read adds recognized partial-read bytes, or, when the failing
+    read's consumption is unknown, retains at least the whole reservation as
+    a conservative upper bound. The body is closed on every path.
+    """
+    limit = reservation + 1
+    chunks: list[bytes] = []
+    consumed = 0
+    try:
+        while consumed < limit:
+            requested = min(_GET_READ_CHUNK_BYTES, limit - consumed)
+            try:
+                chunk = body.read(requested)
+            except Exception as exc:
+                known = _known_consumed_after_failed_read(exc, consumed, requested)
+                if known is None:
+                    bound = max(reservation, consumed + requested)
+                    usage.retain_upper_bound(transfer=bound, local=bound)
+                else:
+                    usage.record_measured(transfer=known, local=known)
+                raise
+            if not isinstance(chunk, (bytes, bytearray)):
+                bound = max(reservation, consumed + requested)
+                usage.retain_upper_bound(transfer=bound, local=bound)
+                raise MalformedResponseError(
+                    f"get_object Body.read returned {type(chunk).__name__}, not bytes"
+                )
+            if not chunk:
+                break
+            consumed += len(chunk)
+            usage.record_measured(transfer=consumed, local=consumed)
+            if len(chunk) > requested:
+                raise MalformedResponseError(
+                    f"get_object Body.read({requested}) returned {len(chunk)} bytes"
+                )
+            chunks.append(bytes(chunk))
+    finally:
+        close = getattr(body, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                # Every consumed byte is already counted; failing to release
+                # the connection cannot change the data or its accounting.
+                pass
+    return b"".join(chunks)
 
 
 def _parse_object_meta(item: dict[str, Any]) -> ObjectMeta:
@@ -1072,6 +1249,15 @@ class Boto3MeteredTransport:
             if client is not None
             else self._build_client(connect_timeout, read_timeout)
         )
+        # LIST responses are parsed by the SDK before this transport sees
+        # them; observe the received wire body size per thread so LIST usage
+        # is measured even when no ``content-length`` header is reported.
+        self._list_wire = threading.local()
+        events = getattr(getattr(self._client, "meta", None), "events", None)
+        if callable(getattr(events, "register", None)):
+            events.register(
+                "after-call.s3.ListObjectsV2", self._observe_list_wire_bytes
+            )
 
     # -- public read-only surface -------------------------------------------
 
@@ -1089,6 +1275,14 @@ class Boto3MeteredTransport:
 
     def counters(self) -> Counters:
         return self._budget.counters()
+
+    def _observe_list_wire_bytes(
+        self, http_response: Any = None, **_kwargs: Any
+    ) -> None:
+        """Botocore ``after-call`` hook: record the received LIST body size."""
+        content = getattr(http_response, "content", None)
+        if isinstance(content, (bytes, bytearray)):
+            self._list_wire.received_bytes = len(content)
 
     # -- client construction ------------------------------------------------
 
@@ -1191,14 +1385,22 @@ class Boto3MeteredTransport:
         reserved_transfer: int,
         reserved_local: int,
         estimated: Decimal,
-        actual_transfer: int,
-        actual_local: int,
+        usage: _AttemptUsage,
         outcome: str,
         error_type: str | None = None,
         error_category: str | None = None,
     ) -> None:
+        """Apply and record one attempt's incurred usage.
+
+        Incurred usage is always applied to the counters, even when it
+        overruns a cap, and it stays applied if the ledger append fails. A
+        cap overrun is recorded in the settle record and raised as
+        ``CapExceededError`` only after the record is written.
+        """
+        actual_transfer = usage.transfer
+        actual_local = usage.local
         actual_cost = self._cost_for(actual_transfer)
-        self._budget.adjust(
+        overrun = self._budget.settle_incurred(
             transfer_bytes=actual_transfer - reserved_transfer,
             local_bytes=actual_local - reserved_local,
             cost_usd=actual_cost - estimated,
@@ -1219,17 +1421,12 @@ class Boto3MeteredTransport:
             "actual_transfer_bytes": actual_transfer,
             "actual_local_bytes": actual_local,
             "actual_cost_usd": str(actual_cost),
+            "usage_basis": usage.basis,
+            "cap_exceeded": overrun.cap if overrun is not None else None,
         }
-        try:
-            self.ledger.append(record)
-        except Exception:
-            self._budget.adjust(
-                transfer_bytes=reserved_transfer - actual_transfer,
-                local_bytes=reserved_local - actual_local,
-                cost_usd=estimated - actual_cost,
-                requester_pays=self._requester_pays,
-            )
-            raise
+        self.ledger.append(record)
+        if overrun is not None:
+            raise overrun
 
     # -- retry loop ----------------------------------------------------------
 
@@ -1243,7 +1440,7 @@ class Boto3MeteredTransport:
         range_end: int | None = None,
         reserve_transfer: int,
         reserve_local: int,
-        run: Callable[[dict[str, int]], Any],
+        run: Callable[[_AttemptUsage], Any],
     ) -> Any:
         if self._requester_pays:
             self._check_requester_pays_allowed()
@@ -1260,94 +1457,64 @@ class Boto3MeteredTransport:
                 reserve_transfer=reserve_transfer,
                 reserve_local=reserve_local,
             )
-            state: dict[str, int] = {"transfer": 0, "local": 0}
+            usage = _AttemptUsage()
+
+            def settle(
+                outcome: str,
+                error_type: str | None = None,
+                error_category: str | None = None,
+            ) -> None:
+                self._settle(
+                    operation=operation,
+                    key=key,
+                    prefix=prefix,
+                    range_start=range_start,
+                    range_end=range_end,
+                    attempt=attempt,
+                    reserved_transfer=reserve_transfer,
+                    reserved_local=reserve_local,
+                    estimated=estimated,
+                    usage=usage,
+                    outcome=outcome,
+                    error_type=error_type,
+                    error_category=error_category,
+                )
+
             try:
-                payload = run(state)
+                payload = run(usage)
             except Exception as exc:
-                actual_transfer = state["transfer"]
-                actual_local = state["local"]
+                if not usage.filled:
+                    # Nothing about this attempt's consumption could be
+                    # observed: retain the whole reservation as a
+                    # conservative upper bound rather than settle the
+                    # default zero counts as a measured refund.
+                    usage.retain_upper_bound(
+                        transfer=reserve_transfer, local=reserve_local
+                    )
                 category = _classify_error(exc)
                 if category == "transient" and attempt < self._max_attempts:
-                    self._settle(
-                        operation=operation,
-                        key=key,
-                        prefix=prefix,
-                        range_start=range_start,
-                        range_end=range_end,
-                        attempt=attempt,
-                        reserved_transfer=reserve_transfer,
-                        reserved_local=reserve_local,
-                        estimated=estimated,
-                        actual_transfer=actual_transfer,
-                        actual_local=actual_local,
-                        outcome="retry",
-                        error_type=type(exc).__name__,
-                        error_category="transient",
-                    )
+                    settle("retry", type(exc).__name__, "transient")
                     self._sleep(self._backoff(attempt))
                     continue
                 if category == "transient":
-                    error = RetriesExhaustedError(
+                    settle("error", "RetriesExhaustedError", "transient")
+                    raise RetriesExhaustedError(
                         f"transient failure after {attempt} attempt(s): "
                         f"{_describe_error(exc)}",
                         attempts=attempt,
                         last_error=exc,
-                    )
-                    self._settle(
-                        operation=operation,
-                        key=key,
-                        prefix=prefix,
-                        range_start=range_start,
-                        range_end=range_end,
-                        attempt=attempt,
-                        reserved_transfer=reserve_transfer,
-                        reserved_local=reserve_local,
-                        estimated=estimated,
-                        actual_transfer=actual_transfer,
-                        actual_local=actual_local,
-                        outcome="error",
-                        error_type="RetriesExhaustedError",
-                        error_category="transient",
-                    )
-                    raise error from exc
+                    ) from exc
                 domain = _raise_domain(category, exc)
-                self._settle(
-                    operation=operation,
-                    key=key,
-                    prefix=prefix,
-                    range_start=range_start,
-                    range_end=range_end,
-                    attempt=attempt,
-                    reserved_transfer=reserve_transfer,
-                    reserved_local=reserve_local,
-                    estimated=estimated,
-                    actual_transfer=actual_transfer,
-                    actual_local=actual_local,
-                    outcome="error",
-                    error_type=type(domain).__name__,
-                    error_category=category if category is not None else "unknown",
+                settle(
+                    "error",
+                    type(domain).__name__,
+                    category if category is not None else "unknown",
                 )
                 if domain is exc:
                     raise
                 raise domain from exc
-            else:
-                actual_transfer = state["transfer"]
-                actual_local = state["local"]
-                self._settle(
-                    operation=operation,
-                    key=key,
-                    prefix=prefix,
-                    range_start=range_start,
-                    range_end=range_end,
-                    attempt=attempt,
-                    reserved_transfer=reserve_transfer,
-                    reserved_local=reserve_local,
-                    estimated=estimated,
-                    actual_transfer=actual_transfer,
-                    actual_local=actual_local,
-                    outcome="ok",
-                )
-                return payload
+            settle("ok")
+            return payload
 
     # -- operations ----------------------------------------------------------
 
@@ -1381,7 +1548,7 @@ class Boto3MeteredTransport:
             )
         reservation = max_response_bytes
 
-        def run(state: dict[str, int]) -> ListObjectsResult:
+        def run(usage: _AttemptUsage) -> ListObjectsResult:
             params: dict[str, Any] = {
                 "Bucket": self.bucket,
                 "Prefix": prefix,
@@ -1391,7 +1558,28 @@ class Boto3MeteredTransport:
                 params["ContinuationToken"] = continuation_token
             if self._requester_pays:
                 params["RequestPayer"] = "requester"
-            response = self._client.list_objects_v2(**params)
+            self._list_wire.received_bytes = None
+            try:
+                response = self._client.list_objects_v2(**params)
+            except Exception:
+                # The after-call hook may have observed the failed response's
+                # body; record those bytes as an observed lower bound on the
+                # attempt's consumption instead of settling a measured zero.
+                observed = getattr(self._list_wire, "received_bytes", None)
+                if _is_byte_count(observed) and observed > 0:
+                    usage.record_measured(transfer=observed, local=0)
+                raise
+            measured = (
+                _list_content_length(response) if isinstance(response, dict) else None
+            )
+            if measured is None:
+                measured = getattr(self._list_wire, "received_bytes", None)
+            if measured is None:
+                # Wire usage was not observable: retain the full reservation
+                # rather than inventing a measured byte count.
+                usage.retain_upper_bound(transfer=reservation, local=0)
+            else:
+                usage.record_measured(transfer=measured, local=0)
             if not isinstance(response, dict):
                 raise MalformedResponseError(
                     "list_objects_v2 returned a non-dict response"
@@ -1400,8 +1588,6 @@ class Boto3MeteredTransport:
                 raise MalformedResponseError(
                     f"list_objects_v2 unexpected HTTP status {_http_status(response)}"
                 )
-            actual = _list_response_bytes(response)
-            state["transfer"] = actual
             contents = response.get("Contents")
             if contents is None:
                 contents = []
@@ -1416,15 +1602,30 @@ class Boto3MeteredTransport:
                     f"list_objects_v2 returned {len(contents)} objects for "
                     f"max_keys={max_keys}"
                 )
-            if actual > reservation:
+            if measured is not None and measured > reservation:
                 raise MalformedResponseError(
-                    f"list_objects_v2 response of {actual} bytes exceeds declared "
+                    f"list_objects_v2 response of {measured} bytes exceeds declared "
                     f"max_response_bytes {reservation}"
+                )
+            is_truncated = response.get("IsTruncated")
+            next_token = response.get("NextContinuationToken")
+            if not isinstance(is_truncated, bool):
+                raise MalformedResponseError(
+                    "list_objects_v2 IsTruncated must be a boolean"
+                )
+            if is_truncated and (not isinstance(next_token, str) or not next_token):
+                raise MalformedResponseError(
+                    "truncated list_objects_v2 page lacks a non-empty "
+                    "NextContinuationToken"
+                )
+            if not is_truncated and next_token is not None:
+                raise MalformedResponseError(
+                    "untruncated list_objects_v2 page carries a NextContinuationToken"
                 )
             return ListObjectsResult(
                 objects=tuple(_parse_object_meta(item) for item in contents),
-                is_truncated=bool(response.get("IsTruncated", False)),
-                next_continuation_token=response.get("NextContinuationToken"),
+                is_truncated=is_truncated,
+                next_continuation_token=next_token,
             )
 
         return self._call(
@@ -1442,7 +1643,7 @@ class Boto3MeteredTransport:
         expected_etag: str | None = None,
         expected_version_id: str | None = None,
     ) -> HeadObjectResult:
-        def run(state: dict[str, int]) -> HeadObjectResult:
+        def run(usage: _AttemptUsage) -> HeadObjectResult:
             params: dict[str, Any] = {"Bucket": self.bucket, "Key": key}
             if expected_version_id is not None:
                 params["VersionId"] = expected_version_id
@@ -1527,7 +1728,7 @@ class Boto3MeteredTransport:
         else:
             range_header = None
 
-        def run(state: dict[str, int]) -> RangeResult:
+        def run(usage: _AttemptUsage) -> RangeResult:
             params: dict[str, Any] = {"Bucket": self.bucket, "Key": key}
             if range_header is not None:
                 params["Range"] = range_header
@@ -1545,12 +1746,7 @@ class Boto3MeteredTransport:
                 raise MalformedResponseError(
                     "get_object response missing a readable Body"
                 )
-            try:
-                content = body.read()
-            except Exception as exc:
-                state["transfer"] = state["local"] = _partial_bytes(exc)
-                raise
-            state["transfer"] = state["local"] = len(content)
+            content = _read_body_bounded(body, reservation, usage)
             _validate_get_response(
                 response,
                 content,

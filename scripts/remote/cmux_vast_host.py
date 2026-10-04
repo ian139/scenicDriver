@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+import fcntl
 import json
 from pathlib import Path
 import re
@@ -30,6 +34,20 @@ DEFAULT_VALIDATION_CHECKPOINT_KEY = (
     "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt"
 )
 DEFAULT_CMUX_WORKSPACE_CWD = str(PROJECT_ROOT)
+# Every subprocess is bounded: by the active lifecycle_deadline() when a
+# lifecycle phase is running, otherwise by this per-command default.
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 3600
+DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS = 3600
+TEARDOWN_TIMEOUT_SECONDS = 3600
+DESTROY_CONFIRM_TIMEOUT_SECONDS = 600
+DESTROY_CONFIRM_POLL_SECONDS = 10
+# Phases whose completion makes a remote artifact mandatory before teardown.
+# State files without a completed_phases record are treated as having
+# completed every phase, so unknown history never relaxes a requirement.
+PHASE_BOOTSTRAP = "bootstrap"
+PHASE_CONTAINER_VALIDATION = "container_validation"
+PHASE_WORKSPACE_HANDOFF = "workspace_handoff"
+ALL_PHASES = (PHASE_BOOTSTRAP, PHASE_CONTAINER_VALIDATION, PHASE_WORKSPACE_HANDOFF)
 VALID_STATUSES = {
     "creating",
     "ssh_wait",
@@ -69,6 +87,52 @@ class SshTarget:
     port: int
     user: str
     identity_file: str
+
+
+class LifecycleDeadlineExceeded(RuntimeError):
+    """A subprocess or wait outlived its lifecycle phase deadline."""
+
+
+class TaskLockedError(RuntimeError):
+    """Another process holds the interprocess claim on a task's state."""
+
+
+_LIFECYCLE_DEADLINE: ContextVar[float | None] = ContextVar("cmux_vast_lifecycle_deadline", default=None)
+
+
+@contextmanager
+def lifecycle_deadline(seconds: float) -> Iterator[None]:
+    """Bound every subprocess started inside the block by one phase deadline.
+
+    The deadline replaces any outer one so cleanup phases (e.g. destroy after
+    an allocation timeout) get their own budget instead of inheriting an
+    already-expired deadline.
+    """
+    token = _LIFECYCLE_DEADLINE.set(time.monotonic() + seconds)
+    try:
+        yield
+    finally:
+        _LIFECYCLE_DEADLINE.reset(token)
+
+
+def lifecycle_remaining_seconds() -> float | None:
+    deadline = _LIFECYCLE_DEADLINE.get()
+    return None if deadline is None else deadline - time.monotonic()
+
+
+@contextmanager
+def task_lock(task_name: str) -> Iterator[None]:
+    """Hold an exclusive, non-blocking interprocess claim on one task's state."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with (STATE_DIR / f"{task_name}.lock").open("a+b") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise TaskLockedError(f"Task {task_name} is claimed by another cmux_vast_host process") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def utc_now() -> str:
@@ -139,7 +203,14 @@ def require_commands(commands: list[str]) -> None:
 
 
 def run_command(command: list[str], *, check: bool = True, input_text: str | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(command, input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=str(cwd) if cwd else None)
+    remaining = lifecycle_remaining_seconds()
+    timeout = DEFAULT_COMMAND_TIMEOUT_SECONDS if remaining is None else remaining
+    if timeout <= 0:
+        raise LifecycleDeadlineExceeded(f"Lifecycle deadline expired before: {shlex.join(command)}")
+    try:
+        result = subprocess.run(command, input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=str(cwd) if cwd else None, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise LifecycleDeadlineExceeded(f"Command exceeded {timeout:.0f}s deadline: {shlex.join(command)}") from exc
     if check and result.returncode != 0:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
@@ -260,6 +331,8 @@ def wait_for_instance_endpoint(instance_id: int, timeout_seconds: int) -> tuple[
         try:
             payload = show_instance(instance_id)
             endpoint = ssh_url_for_instance(instance_id) or host_port_from_show(payload)
+        except LifecycleDeadlineExceeded:
+            raise
         except Exception as exc:  # noqa: BLE001 - preserve retries around Vast API flakiness.
             last_error = str(exc)
         else:
@@ -279,37 +352,44 @@ def wait_for_instance_endpoint(instance_id: int, timeout_seconds: int) -> tuple[
     raise RuntimeError(f"Timed out waiting for Vast SSH endpoint: {last_error}")
 
 
-def ssh_base(target: SshTarget) -> list[str]:
+HOST_KEY_FAILURE_MARKERS = ("Host key verification failed", "REMOTE HOST IDENTIFICATION HAS CHANGED")
+
+
+class HostKeyUntrustedError(RuntimeError):
+    """The SSH host key is unknown to, or conflicts with, trusted known_hosts."""
+
+
+def ssh_security_options(target: SshTarget) -> list[str]:
+    """OpenSSH options shared by every ssh/scp invocation.
+
+    Host authentication is strict: only hosts whose keys are already present in
+    the operator's trusted OpenSSH known_hosts files are accepted, and unknown
+    or changed keys fail closed. Keys are never accepted on first use, so no
+    command (including credential transfer) reaches an unauthenticated host.
+    Connect and keepalive timeouts stop a dead peer from hanging a phase.
+    """
     return [
-        "ssh",
         "-i",
         target.identity_file,
-        "-p",
-        str(target.port),
         "-o",
         "IdentitiesOnly=yes",
         "-o",
-        "StrictHostKeyChecking=no",
+        "StrictHostKeyChecking=yes",
         "-o",
-        "UserKnownHostsFile=/dev/null",
-        f"{target.user}@{target.host}",
+        "ConnectTimeout=30",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=4",
     ]
+
+
+def ssh_base(target: SshTarget) -> list[str]:
+    return ["ssh", *ssh_security_options(target), "-p", str(target.port), f"{target.user}@{target.host}"]
 
 
 def scp_base(target: SshTarget) -> list[str]:
-    return [
-        "scp",
-        "-i",
-        target.identity_file,
-        "-P",
-        str(target.port),
-        "-o",
-        "IdentitiesOnly=yes",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-    ]
+    return ["scp", *ssh_security_options(target), "-P", str(target.port)]
 
 
 def ssh(target: SshTarget, remote_command: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -324,6 +404,11 @@ def wait_for_ssh(target: SshTarget, timeout_seconds: int) -> None:
         if result.returncode == 0 and "vast-ssh-ok" in result.stdout:
             return
         last_error = (result.stderr or result.stdout).strip()
+        if any(marker in last_error for marker in HOST_KEY_FAILURE_MARKERS):
+            raise HostKeyUntrustedError(
+                f"SSH host key for [{target.host}]:{target.port} is not trusted; add the verified host key "
+                f"to your OpenSSH known_hosts before retrying: {last_error}"
+            )
         time.sleep(10)
     raise RuntimeError(f"Timed out waiting for SSH: {last_error}")
 
@@ -341,6 +426,8 @@ def copy_secrets(target: SshTarget, local_path: str, remote_path: str) -> None:
     if not local.exists():
         raise RuntimeError(f"Local secrets env file not found: {local_path}")
     remote_parent = str(Path(remote_path).parent)
+    # This strictly host-authenticated command must succeed before any secret
+    # bytes are sent; a failed host key check raises here and nothing is copied.
     ssh(target, f"mkdir -p {remote_quote(remote_parent)} /workspace")
     run_command([*scp_base(target), str(local), f"{target.user}@{target.host}:{remote_path}"])
 
@@ -367,17 +454,35 @@ def should_exclude(tar_info: tarfile.TarInfo) -> bool:
     return False
 
 
-def make_overlay_tarball(source: Path) -> Path:
-    temp = tempfile.NamedTemporaryFile(prefix="scenic-drive-overlay-", suffix=".tar.gz", delete=False)
-    temp_path = Path(temp.name)
-    temp.close()
-    with tarfile.open(temp_path, "w:gz") as archive:
-        def tar_filter(tar_info: tarfile.TarInfo) -> tarfile.TarInfo | None:
-            if should_exclude(tar_info):
-                return None
-            return tar_info
+def exclusion_filter(tar_info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    return None if should_exclude(tar_info) else tar_info
 
-        archive.add(source, arcname=".", filter=tar_filter)
+
+def temp_tarball_path(prefix: str) -> Path:
+    temp = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".tar.gz", delete=False)
+    temp.close()
+    return Path(temp.name)
+
+
+def overlay_source_paths(source: Path) -> list[str]:
+    """List tracked and untracked-but-not-ignored files under ``source``.
+
+    Git ignore rules are the credential boundary: ignored files (local env
+    files, keys, caches) are never archived even when present on disk.
+    """
+    result = run_command(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=source)
+    return sorted({path for path in result.stdout.split("\0") if path})
+
+
+def make_overlay_tarball(source: Path) -> Path:
+    paths = overlay_source_paths(source)
+    temp_path = temp_tarball_path("scenic-drive-overlay-")
+    with tarfile.open(temp_path, "w:gz") as archive:
+        for rel in paths:
+            path = source / rel
+            if not path.exists() and not path.is_symlink():
+                continue  # tracked file deleted from the working tree
+            archive.add(path, arcname=rel, recursive=False, filter=exclusion_filter)
     return temp_path
 
 
@@ -392,16 +497,9 @@ def make_repo_tarball(branch: str) -> Path:
                 archive.extractall(clone_dir)
         finally:
             overlay.unlink(missing_ok=True)
-        temp = tempfile.NamedTemporaryFile(prefix="scenic-drive-src-", suffix=".tar.gz", delete=False)
-        temp_path = Path(temp.name)
-        temp.close()
+        temp_path = temp_tarball_path("scenic-drive-src-")
         with tarfile.open(temp_path, "w:gz") as archive:
-            def tar_filter(tar_info: tarfile.TarInfo) -> tarfile.TarInfo | None:
-                if should_exclude(tar_info):
-                    return None
-                return tar_info
-
-            archive.add(clone_dir, arcname="scenic-drive", filter=tar_filter)
+            archive.add(clone_dir, arcname="scenic-drive", filter=exclusion_filter)
         return temp_path
 
 
@@ -522,10 +620,34 @@ def build_initial_state(args: argparse.Namespace, offer_id: int, instance_id: in
         "cmux_workspace_name": None,
         "cmux_agent": None,
         "workspace_cwd": str(getattr(args, "workspace_cwd", DEFAULT_CMUX_WORKSPACE_CWD)),
+        "completed_phases": [],
         "created_at": now,
         "updated_at": now,
         "status": "creating",
     }
+
+
+def mark_phase_completed(state: dict, phase: str) -> None:
+    phases = state.get("completed_phases")
+    if not isinstance(phases, list):
+        return  # unknown history already requires every phase's artifacts
+    if phase not in phases:
+        state["completed_phases"] = [*phases, phase]
+        write_state(state)
+
+
+def completed_phases(state: dict) -> frozenset[str]:
+    phases = state.get("completed_phases")
+    if not isinstance(phases, list):
+        return frozenset(ALL_PHASES)
+    return frozenset(phase for phase in phases if isinstance(phase, str))
+
+
+def lifecycle_seconds_left() -> float:
+    remaining = lifecycle_remaining_seconds()
+    if remaining is None:
+        raise RuntimeError("lifecycle_seconds_left() requires an active lifecycle_deadline()")
+    return max(0.0, remaining)
 
 
 def check_up_preconditions(args: argparse.Namespace) -> None:
@@ -555,22 +677,25 @@ def do_up(args: argparse.Namespace) -> dict:
         state = None
         target = None
         try:
-            offer_id = int(args.offer_id) if args.offer_id is not None else select_offer_id_at(args.offer_query, attempt)
-            instance_id = create_instance(offer_id, args.image, args.disk_gb)
-            state = build_initial_state(args, offer_id, instance_id)
-            state["allocation_attempt"] = attempt + 1
-            write_state(state)
-            attach_ssh_key(instance_id, public_key)
-            update_status(state, "ssh_wait")
-            host, port = wait_for_instance_endpoint(instance_id, args.timeout_seconds)
-            state.update({"ssh_host": host, "ssh_port": port})
-            write_state(state)
-            reboot_instance(instance_id)
-            host, port = wait_for_instance_endpoint(instance_id, args.timeout_seconds)
-            state.update({"ssh_host": host, "ssh_port": port})
-            write_state(state)
-            target = SshTarget(host=host, port=port, user="root", identity_file=identity_file)
-            wait_for_ssh(target, args.timeout_seconds)
+            # One deadline bounds the whole allocation attempt, including every
+            # Vast/SSH subprocess, rather than granting each wait a fresh budget.
+            with lifecycle_deadline(args.timeout_seconds):
+                offer_id = int(args.offer_id) if args.offer_id is not None else select_offer_id_at(args.offer_query, attempt)
+                instance_id = create_instance(offer_id, args.image, args.disk_gb)
+                state = build_initial_state(args, offer_id, instance_id)
+                state["allocation_attempt"] = attempt + 1
+                write_state(state)
+                attach_ssh_key(instance_id, public_key)
+                update_status(state, "ssh_wait")
+                host, port = wait_for_instance_endpoint(instance_id, lifecycle_seconds_left())
+                state.update({"ssh_host": host, "ssh_port": port})
+                write_state(state)
+                reboot_instance(instance_id)
+                host, port = wait_for_instance_endpoint(instance_id, lifecycle_seconds_left())
+                state.update({"ssh_host": host, "ssh_port": port})
+                write_state(state)
+                target = SshTarget(host=host, port=port, user="root", identity_file=identity_file)
+                wait_for_ssh(target, lifecycle_seconds_left())
             record_startup_timing(state, "vast_allocation", allocation_started)
             break
         except Exception as exc:  # noqa: BLE001 - bad Vast hosts are common; rerent before bootstrapping.
@@ -578,15 +703,24 @@ def do_up(args: argparse.Namespace) -> dict:
                 state["error"] = str(exc)
                 write_state(state)
             if instance_id is not None:
-                run_command(["vastai", "destroy", "instance", str(instance_id), "--yes"], check=False)
+                try:
+                    destroy_instance_confirmed(instance_id)
+                except Exception as destroy_exc:  # noqa: BLE001 - never rent a replacement for an unconfirmed destroy.
+                    error = f"{exc}; destroy of instance {instance_id} unconfirmed: {destroy_exc}"
+                    if state is not None:
+                        update_status(state, "failed_kept", error=error)
+                    raise RuntimeError(f"Not allocating a replacement host: {error}") from exc
                 if state is not None:
                     update_status(state, "destroyed")
-            if attempt + 1 >= max_attempts:
+            elif isinstance(exc, LifecycleDeadlineExceeded):
+                # A timed-out create may still have rented an unknown instance.
+                raise
+            if isinstance(exc, HostKeyUntrustedError) or attempt + 1 >= max_attempts:
                 raise
             if instance_id is None:
                 print(f"Vast allocation attempt {attempt + 1} failed before instance creation; retrying", file=sys.stderr)
             else:
-                print(f"Vast allocation attempt {attempt + 1} failed; destroyed instance {instance_id}; retrying", file=sys.stderr)
+                print(f"Vast allocation attempt {attempt + 1} failed; confirmed destroy of instance {instance_id}; retrying", file=sys.stderr)
     if state is None or target is None:
         raise RuntimeError("Vast allocation did not produce an SSH-ready host")
     try:
@@ -596,26 +730,29 @@ def do_up(args: argparse.Namespace) -> dict:
             return state
 
         update_status(state, "bootstrapping")
-        copy_secrets(target, args.local_secrets_env_file, DEFAULT_REMOTE_ENV_FILE)
+        with lifecycle_deadline(args.bootstrap_timeout_seconds):
+            copy_secrets(target, args.local_secrets_env_file, DEFAULT_REMOTE_ENV_FILE)
 
-        phase_started = time.monotonic()
-        try:
-            upload_repo(target, args.remote_repo_dir, args.branch)
-        finally:
-            record_startup_timing(state, "repo_upload", phase_started)
+            phase_started = time.monotonic()
+            try:
+                upload_repo(target, args.remote_repo_dir, args.branch)
+            finally:
+                record_startup_timing(state, "repo_upload", phase_started)
 
-        phase_started = time.monotonic()
-        try:
-            bootstrap_remote(target, args.remote_repo_dir, DEFAULT_REMOTE_ENV_FILE)
-        finally:
-            record_startup_timing(state, "uv_sync_bootstrap", phase_started)
+            phase_started = time.monotonic()
+            try:
+                bootstrap_remote(target, args.remote_repo_dir, DEFAULT_REMOTE_ENV_FILE)
+            finally:
+                record_startup_timing(state, "uv_sync_bootstrap", phase_started)
+            mark_phase_completed(state, PHASE_BOOTSTRAP)
 
-        phase_started = time.monotonic()
-        try:
-            run_remote_container_validation(target, args.remote_repo_dir, DEFAULT_REMOTE_ENV_FILE)
-            verify_remote_validation(target)
-        finally:
-            record_startup_timing(state, "container_validation", phase_started)
+            phase_started = time.monotonic()
+            try:
+                run_remote_container_validation(target, args.remote_repo_dir, DEFAULT_REMOTE_ENV_FILE)
+                verify_remote_validation(target)
+            finally:
+                record_startup_timing(state, "container_validation", phase_started)
+            mark_phase_completed(state, PHASE_CONTAINER_VALIDATION)
 
         update_status(state, "ready", ssh_host=target.host, ssh_port=target.port)
         return state
@@ -625,8 +762,10 @@ def do_up(args: argparse.Namespace) -> dict:
 
 
 def handle_up(args: argparse.Namespace) -> int:
+    validate_task_name(args.task_name)
     try:
-        state = do_up(args)
+        with task_lock(args.task_name):
+            state = do_up(args)
     except Exception as exc:  # noqa: BLE001
         print(str(exc), file=sys.stderr)
         return 1
@@ -652,6 +791,7 @@ def add_up_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--workspace-cwd", default=DEFAULT_CMUX_WORKSPACE_CWD)
     parser.add_argument("--timeout-seconds", type=int, default=1200)
     parser.add_argument("--bootstrap", default="full", choices=("full", "none"), help="full: install dependencies and smoke test; none: stop after SSH ready.")
+    parser.add_argument("--bootstrap-timeout-seconds", type=int, default=DEFAULT_BOOTSTRAP_TIMEOUT_SECONDS, help="Deadline for secrets copy, repo upload, dependency bootstrap, and container validation.")
 
 
 def build_cmux_workspace_command(name: str, cwd: str) -> list[str]:
@@ -734,6 +874,15 @@ def register_cmux_workspace(name: str, cwd: str) -> tuple[str, str]:
 
 def handle_start_task(args: argparse.Namespace) -> int:
     validate_task_name(args.task_name)
+    try:
+        with task_lock(args.task_name):
+            return start_task_locked(args)
+    except TaskLockedError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+def start_task_locked(args: argparse.Namespace) -> int:
     state = maybe_load_state(args.task_name)
     if state is None or state.get("status") == "destroyed":
         try:
@@ -797,6 +946,9 @@ def handle_start_task(args: argparse.Namespace) -> int:
         return 0
 
     try:
+        # The handoff phase makes scenic_artifacts/ mandatory at teardown, so
+        # create it before registering and mark the phase only on success.
+        prepare_workspace_artifacts(state)
         workspace_ref, workspace_id = register_cmux_workspace(name, cwd)
     except Exception as exc:  # noqa: BLE001 - registration must remain retryable.
         update_status(
@@ -812,6 +964,7 @@ def handle_start_task(args: argparse.Namespace) -> int:
         print(f"CMUX workspace registration failed; task remains pending: {exc}", file=sys.stderr)
         return 1
 
+    mark_phase_completed(state, PHASE_WORKSPACE_HANDOFF)
     update_status(
         state,
         "workspace_pending",
@@ -824,6 +977,11 @@ def handle_start_task(args: argparse.Namespace) -> int:
     print(f"CMUX workspace registered: ref={workspace_ref} id={workspace_id}")
     print("Watch state with: python scripts/remote/cmux_vast_host.py watch --once")
     return 0
+
+
+def prepare_workspace_artifacts(state: dict) -> None:
+    remote_root = str(state["remote_repo_dir"]).strip().rstrip("/")
+    ssh(target_from_state(state), f"mkdir -p {remote_quote(remote_root + '/scenic_artifacts')}")
 
 
 def remote_file_exists(target: SshTarget, remote_path: str) -> bool:
@@ -850,6 +1008,16 @@ def copy_remote_path(target: SshTarget, remote_path: str, local_path: Path, *, r
 
 
 def copy_artifacts(state: dict) -> bool:
+    """Copy remote artifacts; return False if any phase-required artifact is missing.
+
+    An artifact is required only once the phase that produces it has completed,
+    so hosts that failed or stopped early can still be torn down.
+    """
+    phases = completed_phases(state)
+    bootstrap_done = PHASE_BOOTSTRAP in phases
+    validation_done = PHASE_CONTAINER_VALIDATION in phases
+    handoff_done = PHASE_WORKSPACE_HANDOFF in phases
+    anything_required = bootstrap_done or validation_done or handoff_done
     remote_root = state.get("remote_repo_dir")
     if (
         not isinstance(remote_root, str)
@@ -858,25 +1026,25 @@ def copy_artifacts(state: dict) -> bool:
         or not remote_root.strip().strip("/")
     ):
         print("Warning: state has no valid remote_repo_dir; cannot copy artifacts", file=sys.stderr)
-        return False
+        return not anything_required
     if not state.get("ssh_host") or not state.get("ssh_port"):
         print("Warning: state has no SSH endpoint; cannot copy artifacts", file=sys.stderr)
-        return False
+        return not anything_required
     try:
         target = target_from_state(state)
         task_name = str(state["task_name"])
     except (KeyError, TypeError, ValueError) as exc:
         print(f"Warning: invalid state for artifact copy: {exc}", file=sys.stderr)
-        return False
+        return not anything_required
 
     remote_root = remote_root.strip().rstrip("/")
     artifact_dir = ARTIFACTS_DIR / task_name
     required_ok = True
     copy_requests = (
-        (f"{remote_root}/data/processed/regression/", artifact_dir / "data" / "processed" / "regression", True),
+        (f"{remote_root}/data/processed/regression/", artifact_dir / "data" / "processed" / "regression", bootstrap_done),
         (f"{remote_root}/models/", artifact_dir / "models", False),
-        (f"{remote_root}/scenic_artifacts/", artifact_dir / "scenic_artifacts", True),
-        ("/tmp/scenic_container_validation.json", artifact_dir / "scenic_container_validation.json", False),
+        (f"{remote_root}/scenic_artifacts/", artifact_dir / "scenic_artifacts", handoff_done),
+        ("/tmp/scenic_container_validation.json", artifact_dir / "scenic_container_validation.json", validation_done),
     )
     for remote_path, local_path, required in copy_requests:
         try:
@@ -975,19 +1143,50 @@ def workspace_closed(state: dict) -> bool:
         in recorded_values
     )
 
+def listed_instance_ids() -> set[int]:
+    result = run_command(["vastai", "show", "instances", "--raw"])
+    payload = parse_json_output(result, "vastai show instances")
+    if not isinstance(payload, list):
+        raise RuntimeError("vastai show instances returned unexpected JSON")
+    ids: set[int] = set()
+    for entry in payload:
+        if not isinstance(entry, dict) or entry.get("id") is None:
+            raise RuntimeError("vastai show instances returned an entry without an id")
+        ids.add(int(entry["id"]))
+    return ids
+
+
+def destroy_instance_confirmed(instance_id: int) -> None:
+    """Destroy an instance and return only after the account listing omits it.
+
+    A successful destroy command is not proof of release; callers may rent a
+    replacement or record ``destroyed`` only after this returns.
+    """
+    with lifecycle_deadline(DESTROY_CONFIRM_TIMEOUT_SECONDS):
+        run_command(["vastai", "destroy", "instance", str(instance_id), "--yes"])
+        while True:
+            try:
+                if instance_id not in listed_instance_ids():
+                    return
+                last_error = "instance still listed"
+            except LifecycleDeadlineExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a failed listing is not confirmation.
+                last_error = str(exc)
+            remaining = lifecycle_seconds_left()
+            if remaining <= DESTROY_CONFIRM_POLL_SECONDS:
+                raise RuntimeError(f"Destroy of Vast instance {instance_id} not confirmed: {last_error}")
+            time.sleep(DESTROY_CONFIRM_POLL_SECONDS)
+
+
 def destroy_instance(state: dict) -> None:
     try:
-        result = run_command(["vastai", "destroy", "instance", str(state["instance_id"]), "--yes"])
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or "command returned non-zero"
-            raise RuntimeError(detail)
+        destroy_instance_confirmed(int(state["instance_id"]))
     except Exception as exc:  # noqa: BLE001 - preserve a terminal cleanup state.
         error = f"destroy failed: {exc}"
         update_status(state, "failed_kept", error=error)
         raise RuntimeError(error) from exc
     update_status(state, "destroyed")
-
-
 
 
 def process_watch_state(state: dict, *, destroy: bool, yes: bool) -> None:
@@ -1017,28 +1216,42 @@ def process_watch_state(state: dict, *, destroy: bool, yes: bool) -> None:
         print(f"Task is closed; destroy with python scripts/remote/cmux_vast_host.py down {task_name} --destroy --yes")
 
 
-def states_to_watch(task_name: str | None) -> list[dict]:
+def task_names_to_watch(task_name: str | None) -> list[str]:
     if task_name:
         validate_task_name(task_name)
-        return [load_state(task_name)]
-    states: list[dict] = []
+        return [task_name]
     if not STATE_DIR.exists():
-        return states
-    for path in sorted(STATE_DIR.glob("*.json")):
-        with path.open() as handle:
-            state = json.load(handle)
-        if state.get("status") in VALID_STATUSES:
-            states.append(state)
-    return states
+        return []
+    return [path.stem for path in sorted(STATE_DIR.glob("*.json"))]
+
+
+def load_watchable_state(task_name: str, *, explicit: bool) -> dict | None:
+    if explicit:
+        return load_state(task_name)
+    path = state_path(task_name)
+    if not path.exists():
+        return None
+    with path.open() as handle:
+        state = json.load(handle)
+    return state if state.get("status") in VALID_STATUSES else None
 
 
 def handle_watch(args: argparse.Namespace) -> int:
     while True:
-        for state in states_to_watch(args.task_name):
+        for task_name in task_names_to_watch(args.task_name):
             try:
-                process_watch_state(state, destroy=args.destroy, yes=args.yes)
+                # State is (re)loaded under the claim so a concurrent
+                # start-task/down cannot race this teardown decision.
+                with task_lock(task_name):
+                    state = load_watchable_state(task_name, explicit=bool(args.task_name))
+                    if state is None:
+                        continue
+                    with lifecycle_deadline(TEARDOWN_TIMEOUT_SECONDS):
+                        process_watch_state(state, destroy=args.destroy, yes=args.yes)
+            except TaskLockedError as exc:
+                print(f"Skipping watch: {exc}", file=sys.stderr)
             except Exception as exc:  # noqa: BLE001
-                print(f"Watch failed for {state.get('task_name')}: {exc}", file=sys.stderr)
+                print(f"Watch failed for {task_name}: {exc}", file=sys.stderr)
                 if args.once:
                     return 1
         if args.once:
@@ -1048,15 +1261,31 @@ def handle_watch(args: argparse.Namespace) -> int:
 
 def handle_down(args: argparse.Namespace) -> int:
     validate_task_name(args.task_name)
+    try:
+        with task_lock(args.task_name), lifecycle_deadline(TEARDOWN_TIMEOUT_SECONDS):
+            return down_locked(args)
+    except TaskLockedError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+def down_locked(args: argparse.Namespace) -> int:
     state = load_state(args.task_name)
+    destroying = args.destroy and args.yes
     artifacts_ok = True
-    if args.copy_artifacts or state["status"] in {"workspace_pending", "done", "failed"}:
+    # Every destroy copies first so phase-required artifacts gate teardown
+    # regardless of status or --copy-artifacts.
+    if (
+        (destroying and state["status"] != "destroyed")
+        or args.copy_artifacts
+        or state["status"] in {"workspace_pending", "done", "failed"}
+    ):
         try:
             artifacts_ok = copy_artifacts(state)
         except Exception as exc:  # noqa: BLE001 - never destroy after a failed copy.
             print(f"Warning: artifact copy failed for {args.task_name}: {exc}", file=sys.stderr)
             artifacts_ok = False
-    if not (args.destroy and args.yes):
+    if not destroying:
         print(f"Destroy command: vastai destroy instance {state['instance_id']}")
         print("Not destroying without --destroy --yes")
         return 0

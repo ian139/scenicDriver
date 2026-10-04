@@ -5,6 +5,7 @@ Active model evaluation, atomic promotion, and rollback module for Stage-Two sce
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -38,8 +39,10 @@ def _load_model_checkpoint(
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
+    checkpoint_bytes = ckpt_path.read_bytes()
+    checkpoint_sha256 = hashlib.sha256(checkpoint_bytes).hexdigest()
     try:
-        payload = torch.load(ckpt_path, map_location=device, weights_only=False)
+        payload = torch.load(io.BytesIO(checkpoint_bytes), map_location=device, weights_only=False)
     except Exception as exc:
         raise ValueError(
             f"Corrupt or invalid PyTorch checkpoint at {ckpt_path}: {exc}"
@@ -50,7 +53,10 @@ def _load_model_checkpoint(
             f"Invalid checkpoint structure in {ckpt_path}: expected dictionary mapping"
         )
 
-    if is_candidate:
+    modern_checkpoint = (
+        "checkpoint_schema_version" in payload or "checkpoint_state" in payload
+    )
+    if is_candidate or modern_checkpoint:
         required = {
             "checkpoint_schema_version",
             "checkpoint_state",
@@ -66,7 +72,7 @@ def _load_model_checkpoint(
     if missing:
         raise ValueError(f"Checkpoint {ckpt_path} missing required keys: {missing}")
 
-    if is_candidate:
+    if is_candidate or modern_checkpoint:
         schema_ver = payload.get("checkpoint_schema_version")
         if schema_ver != 1 or isinstance(schema_ver, bool):
             raise ValueError(
@@ -83,6 +89,15 @@ def _load_model_checkpoint(
         raise ValueError(
             f"Checkpoint {ckpt_path} model_state_dict must be a dictionary mapping"
         )
+    for key, value in model_state.items():
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(
+                f"Checkpoint {ckpt_path} model state {key!r} must be a tensor"
+            )
+        if not torch.isfinite(value).all().item():
+            raise ValueError(
+                f"Checkpoint {ckpt_path} model state {key!r} contains non-finite values"
+            )
 
     dimension_values = {
         "vit_dim": payload["vit_dim"],
@@ -110,26 +125,50 @@ def _load_model_checkpoint(
         raise ValueError(
             f"Checkpoint {ckpt_path} model state is incompatible with its architecture"
         ) from exc
+    if any(
+        not torch.isfinite(value).all().item() for value in model.state_dict().values()
+    ):
+        raise ValueError(
+            f"Checkpoint {ckpt_path} model state contains non-finite values after loading"
+        )
+    model.checkpoint_sha256 = checkpoint_sha256
+    model.feature_dimensions = {
+        key: dims[key] for key in ("vit_dim", "terrain_dim", "num_classes")
+    }
+    model.training_provenance = {
+        key: payload[key]
+        for key in (
+            "dataset_sha256",
+            "split_sha256",
+            "split_artifact_sha256",
+            "counts",
+            "initial_checkpoint_sha256",
+            "config_hash",
+        )
+        if key in payload
+    }
     model.eval()
     return model
 
 
-def _read_benchmark_csv(csv_path: str | Path) -> list[dict[str, Any]]:
-    """Read human benchmark CSV into list of dicts with normalized keys."""
+def _read_benchmark_csv(
+    csv_path: str | Path,
+) -> tuple[list[dict[str, Any]], str]:
+    """Read benchmark records and hash the exact CSV bytes being parsed."""
     path = Path(csv_path)
     if not path.exists():
         raise FileNotFoundError(f"Benchmark CSV not found: {path}")
 
     import csv
 
-    records = []
-    with open(path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            records.append(dict(row))
+    csv_bytes = path.read_bytes()
+    records = [
+        dict(row)
+        for row in csv.DictReader(io.StringIO(csv_bytes.decode("utf-8"), newline=""))
+    ]
     if not records:
         raise ValueError(f"Benchmark CSV is empty: {path}")
-    return records
+    return records, hashlib.sha256(csv_bytes).hexdigest()
 
 
 def _predict_dataset(
@@ -141,6 +180,20 @@ def _predict_dataset(
     device: str | None = None,
 ) -> np.ndarray:
     """Run model inference over dataset arrays in batches."""
+    arrays = (
+        ("vit_embeddings", vit_embeddings, "vit_dim"),
+        ("terrain_features", terrain_features, "terrain_dim"),
+        ("class_logits", class_logits, "num_classes"),
+    )
+    for name, values, dimension in arrays:
+        expected_width = model.feature_dimensions[dimension]
+        if values.ndim != 2 or values.shape[1] != expected_width:
+            raise ValueError(
+                f"Dataset {name} must have shape (samples, {expected_width}) "
+                f"matching checkpoint {dimension}; got {values.shape}"
+            )
+    if len({len(values) for _, values, _ in arrays}) != 1:
+        raise ValueError("Dataset feature arrays length mismatch")
     resolved_device = resolve_device(device)
     model = model.to(resolved_device)
     n_samples = len(vit_embeddings)
@@ -230,30 +283,56 @@ def _load_dataset_npz(
     ds_path: Path, *, require_embedded_splits: bool
 ) -> dict[str, Any]:
     """Load and validate a feature NPZ and its optional embedded split contract."""
-    data_npz = np.load(ds_path, allow_pickle=False)
-    required_npz_keys = {
-        "vit_embeddings",
-        "terrain_features",
-        "class_logits",
-        "scenic_scores",
-        "sample_weights",
-        "image_paths",
-    }
-    missing_npz = sorted(required_npz_keys - set(data_npz.files))
-    if missing_npz:
-        raise ValueError(
-            f"Dataset NPZ {ds_path} missing required fields: {missing_npz}"
-        )
+    dataset_bytes = ds_path.read_bytes()
+    with np.load(io.BytesIO(dataset_bytes), allow_pickle=False) as data_npz:
+        required_npz_keys = {
+            "vit_embeddings",
+            "terrain_features",
+            "class_logits",
+            "scenic_scores",
+            "sample_weights",
+            "image_paths",
+        }
+        missing_npz = sorted(required_npz_keys - set(data_npz.files))
+        if missing_npz:
+            raise ValueError(
+                f"Dataset NPZ {ds_path} missing required fields: {missing_npz}"
+            )
 
-    vit = data_npz["vit_embeddings"]
-    terr = data_npz["terrain_features"]
-    cls_logits = data_npz["class_logits"]
-    npz_scores = data_npz["scenic_scores"]
-    sample_weights = data_npz["sample_weights"]
-    image_paths_raw = data_npz["image_paths"]
-    if require_embedded_splits and "splits" not in data_npz.files:
-        raise ValueError(f"Dataset NPZ {ds_path} lacks required embedded splits")
-    splits_raw = data_npz["splits"] if "splits" in data_npz.files else None
+        vit = data_npz["vit_embeddings"]
+        terr = data_npz["terrain_features"]
+        cls_logits = data_npz["class_logits"]
+        npz_scores = data_npz["scenic_scores"]
+        sample_weights = data_npz["sample_weights"]
+        image_paths_raw = data_npz["image_paths"]
+        if require_embedded_splits and "splits" not in data_npz.files:
+            raise ValueError(f"Dataset NPZ {ds_path} lacks required embedded splits")
+        splits_raw = data_npz["splits"] if "splits" in data_npz.files else None
+
+    for name, values in (
+        ("vit_embeddings", vit),
+        ("terrain_features", terr),
+        ("class_logits", cls_logits),
+    ):
+        if values.ndim != 2 or values.shape[1] < 1:
+            raise ValueError(f"NPZ {name} must be a two-dimensional feature matrix")
+    for name, values in (
+        ("scenic_scores", npz_scores),
+        ("sample_weights", sample_weights),
+        ("image_paths", image_paths_raw),
+        ("splits", splits_raw),
+    ):
+        if values is not None and values.ndim != 1:
+            raise ValueError(f"NPZ {name} must be a one-dimensional sample array")
+    for name, values in (
+        ("vit_embeddings", vit),
+        ("terrain_features", terr),
+        ("class_logits", cls_logits),
+        ("scenic_scores", npz_scores),
+        ("sample_weights", sample_weights),
+    ):
+        if not np.issubdtype(values.dtype, np.number) or np.iscomplexobj(values):
+            raise ValueError(f"NPZ {name} must contain real numeric values")
 
     n_samples = len(vit)
     lengths_match = (
@@ -302,6 +381,7 @@ def _load_dataset_npz(
 
     return {
         "path": ds_path,
+        "sha256": hashlib.sha256(dataset_bytes).hexdigest(),
         "vit": vit,
         "terr": terr,
         "cls_logits": cls_logits,
@@ -353,15 +433,11 @@ def evaluate_active_baseline(
         if not p.exists():
             raise FileNotFoundError(f"{name} not found: {p}")
 
-    ds_sha256 = file_sha256(ds_path)
-    ctrl_ds_sha256 = file_sha256(ctrl_ds_path)
-    ckpt_sha256 = file_sha256(ckpt_path)
-    exp_sha256 = file_sha256(exp_csv_path)
-    ctrl_sha256 = file_sha256(ctrl_csv_path)
-
     # 1. Load and validate the expanded and control NPZ datasets independently
     expanded = _load_dataset_npz(ds_path, require_embedded_splits=True)
     control = _load_dataset_npz(ctrl_ds_path, require_embedded_splits=False)
+    ds_sha256 = expanded["sha256"]
+    ctrl_ds_sha256 = control["sha256"]
 
     dataset_overlap = set(expanded["image_paths"]) & set(control["image_paths"])
     if dataset_overlap:
@@ -372,6 +448,7 @@ def evaluate_active_baseline(
 
     # 2. Load model and run double CPU inference for determinism check on both datasets
     model = _load_model_checkpoint(ckpt_path, device="cpu", is_candidate=False)
+    ckpt_sha256 = model.checkpoint_sha256
 
     preds_run1 = _predict_dataset(
         model, expanded["vit"], expanded["terr"], expanded["cls_logits"], device="cpu"
@@ -409,7 +486,7 @@ def evaluate_active_baseline(
         split_map: dict[str, str],
         dataset_pred_map: dict[str, float],
     ) -> dict[str, Any]:
-        records = _read_benchmark_csv(csv_path)
+        records, benchmark_sha256 = _read_benchmark_csv(csv_path)
         if any("split" not in record for record in records):
             raise ValueError(f"Benchmark {name} requires an explicit split column")
         test_records = [
@@ -507,6 +584,7 @@ def evaluate_active_baseline(
                 }
 
         return {
+            "sha256": benchmark_sha256,
             "records": matched_records,
             "metrics": metrics,
             "sliced_metrics": sliced_results,
@@ -528,6 +606,8 @@ def evaluate_active_baseline(
         control["split_map"],
         ctrl_pred_map,
     )
+    exp_sha256 = exp_res["sha256"]
+    ctrl_sha256 = ctrl_res["sha256"]
 
     exp_test_paths = {r["image_path"] for r in exp_res["records"]}
     ctrl_test_paths = {r["image_path"] for r in ctrl_res["records"]}
@@ -632,6 +712,61 @@ def evaluate_active_baseline(
 reproduce_active_baseline = evaluate_active_baseline
 
 
+def _verify_training_provenance(
+    model: ScenicRegressionModel, checkpoint: str | Path, expanded: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Verify the run summary and exact split artifact before certifying holdout."""
+    evidence: dict[str, Any] = {"pass": False}
+    try:
+        provenance = model.training_provenance
+        if provenance.get("dataset_sha256") != expanded["sha256"]:
+            raise ValueError("candidate training dataset does not match expanded dataset")
+        split_sha = provenance.get("split_sha256")
+        artifact_sha = provenance.get("split_artifact_sha256")
+        if (
+            not isinstance(split_sha, str)
+            or len(split_sha) != 64
+            or any(char not in "0123456789abcdef" for char in split_sha.lower())
+            or artifact_sha != split_sha
+        ):
+            raise ValueError("candidate requires matching split_sha256 and split_artifact_sha256")
+        summary_path = Path(checkpoint).parent / "training_summary.json"
+        summary_bytes = summary_path.read_bytes()
+        summary = json.loads(summary_bytes)
+        if not isinstance(summary, dict) or summary.get("state") != "completed":
+            raise ValueError("candidate requires a completed training_summary.json")
+        for key, expected in (
+            ("candidate_checkpoint_sha256", model.checkpoint_sha256),
+            ("dataset_sha256", expanded["sha256"]),
+            ("split_sha256", split_sha),
+        ):
+            if summary.get(key) != expected:
+                raise ValueError(f"training summary {key} does not match candidate evidence")
+        raw_path = summary.get("split_path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError("training summary requires the exact training split_path")
+        split_path = Path(raw_path)
+        if not split_path.is_absolute():
+            split_path = summary_path.parent / split_path
+        split_bytes = split_path.read_bytes()
+        actual_split_sha = hashlib.sha256(split_bytes).hexdigest()
+        if actual_split_sha != artifact_sha:
+            raise ValueError("training split artifact hash mismatch")
+        from src.scenic_scorer.active_training import _load_training_splits
+
+        _load_training_splits(
+            io.BytesIO(split_bytes), expanded["image_paths"], expanded["splits"]
+        )
+        evidence.update({
+            "pass": True,
+            "summary": {"path": str(summary_path), "sha256": hashlib.sha256(summary_bytes).hexdigest()},
+            "split_artifact": {"path": str(split_path), "sha256": actual_split_sha},
+        })
+    except (OSError, ValueError, TypeError, UnicodeDecodeError) as exc:
+        evidence["reason"] = f"Holdout integrity uncertified: {exc}. Supply the candidate run's completed training summary and exact split artifact."
+    return evidence
+
+
 def evaluate_stage_two(
     dataset_path: str | Path,
     control_dataset_path: str | Path,
@@ -649,8 +784,10 @@ def evaluate_stage_two(
 
     Loads and infers the immutable expanded prepared NPZ and the canonical control
     dataset NPZ independently; each benchmark is evaluated only against its own
-    dataset identity map. Produces machine-readable compound decision JSON written
-    to output_path.
+    dataset identity map. Holdout integrity requires candidate dataset binding,
+    a completed candidate-bound training summary, and the exact split artifact
+    with matching prepared membership. The decision records exact benchmark
+    identities, training evidence, and the fully resolved numeric policy.
     """
     dataset_path = Path(dataset_path)
     control_dataset_path = Path(control_dataset_path)
@@ -665,17 +802,50 @@ def evaluate_stage_two(
         thresh_dict = json.loads(t_path.read_text(encoding="utf-8"))
     else:
         thresh_dict = dict(thresholds)
-    min_expanded_corr = float(thresh_dict.get("min_expanded_corr", 0.80))
-    max_expanded_mse = float(thresh_dict.get("max_expanded_mse", 2.0))
-    min_expanded_mse_improvement = float(
-        thresh_dict.get("min_expanded_mse_improvement", 0.0)
-    )
-    max_control_mse_regression = float(
-        thresh_dict.get("max_control_mse_regression", 0.05)
-    )
-    min_control_corr = float(thresh_dict.get("min_control_corr", 0.75))
-    max_worst_slice_mse = float(thresh_dict.get("max_worst_slice_mse", 2.5))
-    max_calibration_error = float(thresh_dict.get("max_calibration_error", 1.5))
+    if not isinstance(thresh_dict, dict):
+        raise ValueError("Thresholds must be a dictionary")
+    defaults = {
+        "min_expanded_corr": 0.80,
+        "max_expanded_mse": 2.0,
+        "min_expanded_mse_improvement": 0.0,
+        "max_control_mse_regression": 0.05,
+        "min_control_corr": 0.75,
+        "max_worst_slice_mse": 2.5,
+        "max_calibration_error": 1.5,
+        "min_supported_slice_samples": 5,
+        "min_spread_ratio": 0.15,
+        "max_mean_drift": 2.0,
+        "max_saturation_ratio": 0.20,
+        "min_unique_ratio": 0.05,
+    }
+    resolved_policy: dict[str, float | int] = {}
+    for key, default in defaults.items():
+        raw = thresh_dict.get(key, default)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Threshold {key!r} must be numeric") from exc
+        if isinstance(raw, (bool, np.bool_)) or not math.isfinite(value):
+            raise ValueError(f"Threshold {key!r} must be finite and non-boolean")
+        lower, upper = 0.0, math.inf
+        if key in {"min_expanded_corr", "min_control_corr"}:
+            lower, upper = -1.0, 1.0
+        elif key in {"max_saturation_ratio", "min_unique_ratio"}:
+            upper = 1.0
+        elif key == "min_supported_slice_samples":
+            lower = 1.0
+            if not value.is_integer():
+                raise ValueError(f"Threshold {key!r} must be a positive integer")
+        if not lower <= value <= upper:
+            raise ValueError(f"Threshold {key!r} must be in [{lower}, {upper}]")
+        resolved_policy[key] = int(value) if key == "min_supported_slice_samples" else value
+    min_expanded_corr = resolved_policy["min_expanded_corr"]
+    max_expanded_mse = resolved_policy["max_expanded_mse"]
+    min_expanded_mse_improvement = resolved_policy["min_expanded_mse_improvement"]
+    max_control_mse_regression = resolved_policy["max_control_mse_regression"]
+    min_control_corr = resolved_policy["min_control_corr"]
+    max_worst_slice_mse = resolved_policy["max_worst_slice_mse"]
+    max_calibration_error = resolved_policy["max_calibration_error"]
     # Route, stability, and complexity gates consume structured boolean evidence.
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset NPZ not found: {dataset_path}")
@@ -683,8 +853,6 @@ def evaluate_stage_two(
         raise FileNotFoundError(
             f"Control dataset NPZ not found: {control_dataset_path}"
         )
-    if any(float(v) < 0 for v in thresh_dict.values() if isinstance(v, (int, float))):
-        raise ValueError("Thresholds must not contain negative numeric values")
 
     # Load and validate the expanded and control NPZ datasets independently
     expanded = _load_dataset_npz(dataset_path, require_embedded_splits=True)
@@ -697,7 +865,7 @@ def evaluate_stage_two(
             f"{sorted(dataset_overlap)}"
         )
 
-    min_supported_slice_samples = int(thresh_dict.get("min_supported_slice_samples", 5))
+    min_supported_slice_samples = int(resolved_policy["min_supported_slice_samples"])
     resolved_device = resolve_device(device)
 
     # 2. Load models
@@ -708,10 +876,10 @@ def evaluate_stage_two(
         baseline_checkpoint, device=resolved_device, is_candidate=False
     )
 
-    candidate_sha256 = file_sha256(candidate_checkpoint)
-    baseline_sha256 = file_sha256(baseline_checkpoint)
-    dataset_sha256 = file_sha256(dataset_path)
-    control_dataset_sha256 = file_sha256(control_dataset_path)
+    candidate_sha256 = candidate_model.checkpoint_sha256
+    baseline_sha256 = baseline_model.checkpoint_sha256
+    dataset_sha256 = expanded["sha256"]
+    control_dataset_sha256 = control["sha256"]
 
     # 3. Model inference on both datasets independently
     cand_npz_preds = _predict_dataset(
@@ -765,7 +933,7 @@ def evaluate_stage_two(
         cand_map: dict[str, float],
         base_map: dict[str, float],
     ) -> dict[str, Any]:
-        records = _read_benchmark_csv(csv_path)
+        records, benchmark_sha256 = _read_benchmark_csv(csv_path)
         if any("split" not in record for record in records):
             raise ValueError(f"Benchmark {name} requires an explicit split column")
         test_records = [
@@ -875,6 +1043,7 @@ def evaluate_stage_two(
             worst_slice_mse = cand_metrics["mse"]
 
         return {
+            "sha256": benchmark_sha256,
             "records": matched_records,
             "candidate_metrics": cand_metrics,
             "baseline_metrics": base_metrics,
@@ -939,10 +1108,10 @@ def evaluate_stage_two(
     unique_vals = len(np.unique(np.round(exp_yc, 4)))
     unique_ratio = float(unique_vals / len(exp_yc))
 
-    min_spread_ratio = float(thresh_dict.get("min_spread_ratio", 0.15))
-    max_mean_drift = float(thresh_dict.get("max_mean_drift", 2.0))
-    max_saturation_ratio = float(thresh_dict.get("max_saturation_ratio", 0.20))
-    min_unique_ratio = float(thresh_dict.get("min_unique_ratio", 0.05))
+    min_spread_ratio = resolved_policy["min_spread_ratio"]
+    max_mean_drift = resolved_policy["max_mean_drift"]
+    max_saturation_ratio = resolved_policy["max_saturation_ratio"]
+    min_unique_ratio = resolved_policy["min_unique_ratio"]
 
     pred_range_pass = bool(
         np.isfinite(exp_yc).all()
@@ -1112,11 +1281,7 @@ def evaluate_stage_two(
                 break
 
             # Route invariants check
-            r_inv_pass = (
-                r.get("invariants_pass") is not False
-                and r.get("invariants_passed") is not False
-                and r.get("pass") is not False
-            )
+            r_inv_pass = r.get("invariants_pass") is True
             if not r_inv_pass:
                 routes_valid = False
                 break
@@ -1143,8 +1308,13 @@ def evaluate_stage_two(
     exp_mse_improvement = exp_base_mse - exp_cand_mse
     ctrl_mse_delta = ctrl_cand_mse - ctrl_base_mse
     worst_slice_mse = max(exp_res["worst_slice_mse"], ctrl_res["worst_slice_mse"])
+    provenance = dict(candidate_model.training_provenance)
+    provenance["validation"] = _verify_training_provenance(
+        candidate_model, candidate_checkpoint, expanded
+    )
+    training_provenance_pass = provenance["validation"]["pass"]
     gates = {
-        "integrity_pass": bool(candidate_sha256 and baseline_sha256),
+        "integrity_pass": training_provenance_pass,
         "expanded_benchmark_corr_pass": bool(exp_cand_corr >= min_expanded_corr),
         "expanded_benchmark_mse_pass": bool(exp_cand_mse <= max_expanded_mse),
         "expanded_benchmark_improvement_pass": bool(
@@ -1168,6 +1338,7 @@ def evaluate_stage_two(
         "candidate": {
             "checkpoint": str(candidate_checkpoint),
             "sha256": candidate_sha256,
+            "training_provenance": provenance,
         },
         "baseline": {
             "checkpoint": str(baseline_checkpoint),
@@ -1182,6 +1353,8 @@ def evaluate_stage_two(
             "sha256": control_dataset_sha256,
         },
         "expanded_human_benchmark": {
+            "path": str(expanded_benchmark_csv),
+            "sha256": exp_res["sha256"],
             "region_metrics": exp_res["region_metrics"],
             "candidate_metrics": exp_res["candidate_metrics"],
             "baseline_metrics": exp_res["baseline_metrics"],
@@ -1190,6 +1363,8 @@ def evaluate_stage_two(
             "mse_improvement": exp_mse_improvement,
         },
         "control_benchmark": {
+            "path": str(control_benchmark_csv),
+            "sha256": ctrl_res["sha256"],
             "candidate_metrics": ctrl_res["candidate_metrics"],
             "baseline_metrics": ctrl_res["baseline_metrics"],
             "sliced_metrics": ctrl_res["sliced_metrics"],
@@ -1204,7 +1379,7 @@ def evaluate_stage_two(
             "complexity_accepted": complexity_accepted,
             "details": route_qa_data,
         },
-        "thresholds_evaluated": thresh_dict,
+        "thresholds_evaluated": resolved_policy,
         "gates": gates,
     }
 
@@ -1245,13 +1420,9 @@ def evaluate_candidate_validation(
         if not p.exists():
             raise FileNotFoundError(f"{name} not found: {p}")
 
-    candidate_sha256 = file_sha256(cand_ckpt_path)
-    baseline_sha256 = file_sha256(base_ckpt_path)
-    dataset_sha256 = file_sha256(ds_path)
-    benchmark_sha256 = file_sha256(exp_csv_path)
-
     # 1. Load and validate NPZ dataset requiring embedded splits
     expanded = _load_dataset_npz(ds_path, require_embedded_splits=True)
+    dataset_sha256 = expanded["sha256"]
 
     resolved_device = resolve_device(device)
 
@@ -1262,6 +1433,8 @@ def evaluate_candidate_validation(
     baseline_model = _load_model_checkpoint(
         base_ckpt_path, device=resolved_device, is_candidate=False
     )
+    candidate_sha256 = candidate_model.checkpoint_sha256
+    baseline_sha256 = baseline_model.checkpoint_sha256
 
     # 3. Model inference over dataset arrays
     cand_npz_preds = _predict_dataset(
@@ -1287,7 +1460,7 @@ def evaluate_candidate_validation(
     }
 
     # 4. Read and validate expanded benchmark CSV filtering ONLY split=val rows
-    records = _read_benchmark_csv(exp_csv_path)
+    records, benchmark_sha256 = _read_benchmark_csv(exp_csv_path)
     if any("split" not in record for record in records):
         raise ValueError(
             "Benchmark expanded_validation_benchmark requires an explicit split column"
@@ -1533,6 +1706,78 @@ def _publish_checkpoint(cand_path: Path, cand_sha: str, ckpt_dir: Path) -> Path:
     return published_ckpt_path
 
 
+# Canonical compound gates emitted by evaluate_stage_two; promotion requires each
+# to be exactly True and the decision gate set to match exactly.
+_COMPOUND_DECISION_GATES = (
+    "integrity_pass",
+    "expanded_benchmark_corr_pass",
+    "expanded_benchmark_mse_pass",
+    "expanded_benchmark_improvement_pass",
+    "control_benchmark_non_regression_pass",
+    "control_benchmark_corr_pass",
+    "worst_slice_mse_pass",
+    "calibration_pass",
+    "distribution_pass",
+    "route_evidence_pass",
+)
+
+
+def _validated_candidate_metrics(
+    decision: Mapping[str, Any], prefix: str
+) -> dict[str, Any]:
+    """Extract finite expanded_human_benchmark candidate metrics from a decision."""
+    exp_bm = decision.get("expanded_human_benchmark")
+    if not isinstance(exp_bm, dict):
+        raise ValueError(
+            f"{prefix}: candidate metrics are missing expanded_human_benchmark"
+        )
+    raw_metrics = exp_bm.get("candidate_metrics")
+    if not isinstance(raw_metrics, dict):
+        raise ValueError(f"{prefix}: candidate metrics dictionary is missing")
+    corr_val = raw_metrics.get("corr")
+    if corr_val is None:
+        corr_val = raw_metrics.get("pearson_corr")
+    mae_val = raw_metrics.get("mae")
+    rmse_val = raw_metrics.get("rmse")
+    samples_val = raw_metrics.get("samples")
+    for name, val in (("corr", corr_val), ("mae", mae_val), ("rmse", rmse_val)):
+        if (
+            val is None
+            or isinstance(val, bool)
+            or not isinstance(val, (int, float, np.integer, np.floating))
+            or not math.isfinite(float(val))
+        ):
+            raise ValueError(
+                f"{prefix}: candidate metric {name!r} is missing or non-finite"
+            )
+    if (
+        samples_val is None
+        or isinstance(samples_val, bool)
+        or not isinstance(samples_val, (int, np.integer))
+        or int(samples_val) < 1
+    ):
+        raise ValueError(
+            f"{prefix}: candidate metric 'samples' is missing or not a positive integer"
+        )
+    formatted = dict(raw_metrics)
+    formatted["corr"] = float(corr_val)
+    formatted["mae"] = float(mae_val)
+    formatted["rmse"] = float(rmse_val)
+    formatted["samples"] = int(samples_val)
+    return formatted
+
+
+def _evidence_identity_sha(evidence: Mapping[str, Any], role: str) -> str | None:
+    """Return the lowercase checkpoint SHA-256 an evidence file binds for a role."""
+    entry = evidence.get(role)
+    if not isinstance(entry, dict):
+        return None
+    sha = entry.get("sha256")
+    if not isinstance(sha, str) or not sha.strip():
+        return None
+    return sha.strip().lower()
+
+
 def promote_from_decision(
     decision_path: str | Path,
     candidate_checkpoint: str | Path,
@@ -1564,52 +1809,36 @@ def promote_from_decision(
         raise ValueError(
             f"Promotion rejected: decision at {dec_path} has all_gates_pass != True"
         )
-    dec_sha = decision_data.get("candidate", {}).get("sha256")
+    gates = decision_data.get("gates")
+    if not isinstance(gates, dict):
+        raise ValueError("Promotion rejected: decision has no compound gate results")
+    unknown_gates = sorted(set(gates) - set(_COMPOUND_DECISION_GATES))
+    if unknown_gates:
+        raise ValueError(
+            "Promotion rejected: decision has unrecognized gates: "
+            + ", ".join(unknown_gates)
+        )
+    failing_gates = [
+        name for name in _COMPOUND_DECISION_GATES if gates.get(name) is not True
+    ]
+    if failing_gates:
+        raise ValueError(
+            "Promotion rejected: compound gates missing or not passing: "
+            + ", ".join(failing_gates)
+        )
+    decision_candidate = decision_data.get("candidate")
+    dec_sha = (
+        decision_candidate.get("sha256")
+        if isinstance(decision_candidate, dict)
+        else None
+    )
     cand_sha = file_sha256(cand_path)
-    if not isinstance(dec_sha, str) or dec_sha != cand_sha:
+    if not isinstance(dec_sha, str) or dec_sha.strip().lower() != cand_sha:
         raise ValueError("Candidate SHA256 mismatch or missing decision evidence")
     _load_model_checkpoint(cand_path, is_candidate=True)
-    exp_bm = decision_data.get("expanded_human_benchmark")
-    if not isinstance(exp_bm, dict):
-        raise ValueError(
-            "Promotion rejected: candidate metrics are missing expanded_human_benchmark"
-        )
-    raw_metrics = exp_bm.get("candidate_metrics")
-    if not isinstance(raw_metrics, dict):
-        raise ValueError("Promotion rejected: candidate metrics dictionary is missing")
-
-    corr_val = raw_metrics.get("corr")
-    if corr_val is None:
-        corr_val = raw_metrics.get("pearson_corr")
-    mae_val = raw_metrics.get("mae")
-    rmse_val = raw_metrics.get("rmse")
-    samples_val = raw_metrics.get("samples")
-    for name, val in [("corr", corr_val), ("mae", mae_val), ("rmse", rmse_val)]:
-        if (
-            val is None
-            or isinstance(val, bool)
-            or not isinstance(val, (int, float, np.integer, np.floating))
-            or not math.isfinite(float(val))
-        ):
-            raise ValueError(
-                f"Promotion rejected: candidate metric {name!r} is missing or non-finite"
-            )
-
-    if (
-        samples_val is None
-        or isinstance(samples_val, bool)
-        or not isinstance(samples_val, (int, np.integer))
-        or int(samples_val) < 1
-    ):
-        raise ValueError(
-            "Promotion rejected: candidate metric 'samples' is missing or not a positive integer"
-        )
-
-    formatted_metrics = dict(raw_metrics)
-    formatted_metrics["corr"] = float(corr_val)
-    formatted_metrics["mae"] = float(mae_val)
-    formatted_metrics["rmse"] = float(rmse_val)
-    formatted_metrics["samples"] = int(samples_val)
+    formatted_metrics = _validated_candidate_metrics(
+        decision_data, "Promotion rejected"
+    )
     lock = _locked_registry(reg_path)
     try:
         actual = file_sha256(reg_path)
@@ -1698,7 +1927,10 @@ def promote_with_user_override(
     'activate_rejected_candidate', activation_approved exactly True, the candidate
     checkpoint path and SHA-256, hash bindings to the existing final decision and
     evaluation evidence files, and nonempty acknowledged failed-gates and risk
-    lists. Every mismatch fails before any registry mutation. On success the
+    lists. Both evidence files must bind candidate.sha256 to this candidate and
+    baseline.sha256 to the locked registry-active checkpoint; candidate metrics
+    come from the decision's expanded_human_benchmark.candidate_metrics.
+    Every mismatch fails before any registry mutation. On success the
     candidate is atomically activated under the registry lock, the event
     'promote_user_override' is appended binding the override file/hash and
     evidence, and prior_active is preserved with its verified checkpoint SHA.
@@ -1780,11 +2012,14 @@ def promote_with_user_override(
             "Override rejected: acknowledged_risks must be a nonempty list of strings"
         )
 
-    # 4. Evidence bindings to the existing final decision/evaluation files
+    # 4. Evidence bindings: hash and parse the exact same bytes, then require
+    # each file to bind this candidate and one common baseline identity.
     evidence = override_data.get("evidence")
     if not isinstance(evidence, dict):
         raise ValueError("Override rejected: evidence is missing")
     bound_files: dict[str, tuple[Path, str]] = {}
+    bound_data: dict[str, dict[str, Any]] = {}
+    evidence_baseline_sha: str | None = None
     for key in ("final_decision", "evaluation"):
         binding = evidence.get(key)
         if not isinstance(binding, dict):
@@ -1800,59 +2035,44 @@ def promote_with_user_override(
             raise FileNotFoundError(
                 f"Override rejected: evidence file not found: {ev_file}"
             )
-        actual_sha = file_sha256(ev_file)
-        if ev_sha_val.lower() != actual_sha.lower():
+        ev_bytes = ev_file.read_bytes()
+        actual_sha = hashlib.sha256(ev_bytes).hexdigest()
+        if ev_sha_val.strip().lower() != actual_sha:
             raise ValueError(
                 f"Override rejected: evidence.{key} SHA256 mismatch at {ev_file}"
             )
-        bound_files[key] = (ev_file, ev_sha_val)
-
-    try:
-        decision_evidence = json.loads(
-            bound_files["final_decision"][0].read_text(encoding="utf-8")
-        )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            "Override rejected: final decision evidence is not valid JSON"
-        ) from exc
-    if not isinstance(decision_evidence, dict):
-        raise ValueError("Override rejected: final decision evidence is not an object")
-    fresh_human_test = decision_evidence.get("fresh_human_test")
-    if not isinstance(fresh_human_test, dict) or not isinstance(
-        fresh_human_test.get("candidate"), dict
-    ):
-        raise ValueError(
-            "Override rejected: final decision lacks fresh_human_test candidate metrics"
-        )
-    raw_metrics = fresh_human_test["candidate"]
-    corr_val = raw_metrics.get("corr", raw_metrics.get("pearson_corr"))
-    mae_val = raw_metrics.get("mae")
-    rmse_val = raw_metrics.get("rmse")
-    samples_val = raw_metrics.get("samples")
-    for name, value in (("corr", corr_val), ("mae", mae_val), ("rmse", rmse_val)):
+        try:
+            ev_data = json.loads(ev_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Override rejected: evidence.{key} is not valid JSON"
+            ) from exc
+        if not isinstance(ev_data, dict):
+            raise ValueError(f"Override rejected: evidence.{key} is not an object")
+        if _evidence_identity_sha(ev_data, "candidate") != cand_sha:
+            raise ValueError(
+                f"Override rejected: evidence.{key} candidate sha256 does not "
+                "match the candidate checkpoint"
+            )
+        ev_baseline_sha = _evidence_identity_sha(ev_data, "baseline")
+        if ev_baseline_sha is None:
+            raise ValueError(
+                f"Override rejected: evidence.{key} baseline sha256 is missing"
+            )
         if (
-            value is None
-            or isinstance(value, bool)
-            or not isinstance(value, (int, float, np.integer, np.floating))
-            or not math.isfinite(float(value))
+            evidence_baseline_sha is not None
+            and ev_baseline_sha != evidence_baseline_sha
         ):
             raise ValueError(
-                f"Override rejected: candidate metric {name!r} is missing or non-finite"
+                "Override rejected: evidence files bind different baselines"
             )
-    if (
-        samples_val is None
-        or isinstance(samples_val, bool)
-        or not isinstance(samples_val, (int, np.integer))
-        or int(samples_val) < 1
-    ):
-        raise ValueError(
-            "Override rejected: candidate metric 'samples' is missing or not a positive integer"
-        )
-    candidate_metrics = dict(raw_metrics)
-    candidate_metrics["corr"] = float(corr_val)
-    candidate_metrics["mae"] = float(mae_val)
-    candidate_metrics["rmse"] = float(rmse_val)
-    candidate_metrics["samples"] = int(samples_val)
+        evidence_baseline_sha = ev_baseline_sha
+        bound_files[key] = (ev_file, actual_sha)
+        bound_data[key] = ev_data
+
+    candidate_metrics = _validated_candidate_metrics(
+        bound_data["final_decision"], "Override rejected"
+    )
 
     # 5. Candidate must be a valid canonical checkpoint
     _load_model_checkpoint(cand_path, is_candidate=True)
@@ -1887,6 +2107,11 @@ def promote_with_user_override(
                 raise ValueError(
                     "Override rejected: registry-active checkpoint hash mismatch"
                 )
+        if evidence_baseline_sha != actual_active_sha:
+            raise ValueError(
+                "Override rejected: evidence baseline does not match the "
+                "registry-active checkpoint"
+            )
         # Preserve prior active bound to its verified checkpoint SHA
         prior_active["sha256"] = actual_active_sha
 
@@ -1953,6 +2178,14 @@ def rollback_registry(
         raise ValueError("target_history_index must be a non-negative integer")
     if int(target_history_index) < 0:
         raise ValueError("target_history_index must be a non-negative integer")
+    requested_sha: str | None = None
+    if expected_checkpoint_sha256 is not None:
+        if (
+            not isinstance(expected_checkpoint_sha256, str)
+            or not expected_checkpoint_sha256.strip()
+        ):
+            raise ValueError("expected_checkpoint_sha256 must be a nonempty string")
+        requested_sha = expected_checkpoint_sha256.strip().lower()
     lock = _locked_registry(reg_path)
     try:
         actual = file_sha256(reg_path)
@@ -1986,16 +2219,18 @@ def rollback_registry(
             if cand.is_file():
                 checkpoint = cand
         recorded_sha = new_active.get("sha256")
-        target_sha = (
-            recorded_sha
-            if isinstance(recorded_sha, str)
-            else expected_checkpoint_sha256
-        )
-        if (
-            not checkpoint.is_file()
-            or not isinstance(target_sha, str)
-            or file_sha256(checkpoint) != target_sha
-        ):
+        if isinstance(recorded_sha, str) and recorded_sha.strip():
+            target_sha = recorded_sha.strip().lower()
+            if requested_sha is not None and requested_sha != target_sha:
+                raise ValueError(
+                    "Rollback rejected: requested checkpoint SHA256 does not "
+                    "match the historical record"
+                )
+        elif requested_sha is not None:
+            target_sha = requested_sha
+        else:
+            raise ValueError("Historical checkpoint identity validation failed")
+        if not checkpoint.is_file() or file_sha256(checkpoint) != target_sha:
             raise ValueError("Historical checkpoint identity validation failed")
         new_active["sha256"] = target_sha
         _load_model_checkpoint(checkpoint, is_candidate=False)

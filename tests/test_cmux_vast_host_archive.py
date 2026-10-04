@@ -23,9 +23,20 @@ def path_components(name: str) -> set[str]:
     return {part for part in name.split("/") if part}
 
 
+def git(source: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=source, check=True, capture_output=True, text=True)
+
+
+def init_repo(source: Path) -> None:
+    source.mkdir(parents=True, exist_ok=True)
+    git(source, "init", "-b", "test-branch")
+    git(source, "config", "user.email", "test@example.com")
+    git(source, "config", "user.name", "Test User")
+
+
 def test_make_overlay_tarball_excludes_git_and_generated_paths(tmp_path: Path) -> None:
     source = tmp_path / "source"
-    write_file(source / ".git/objects/pack/big.pack")
+    init_repo(source)
     write_file(source / "pkg/.git/objects/pack/nested.pack")
     write_file(source / "data/processed/regression/out.json")
     write_file(source / "models/model.bin")
@@ -61,18 +72,54 @@ def test_make_overlay_tarball_excludes_git_and_generated_paths(tmp_path: Path) -
     assert any(name.endswith("ordinary/project_file.py") for name in names)
 
 
+def test_make_overlay_tarball_excludes_gitignored_credentials_present_on_disk(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    init_repo(source)
+    write_file(source / ".gitignore", "*.env\ncredentials/\n")
+    write_file(source / "ordinary/tracked.py")
+    git(source, "add", ".gitignore", "ordinary/tracked.py")
+    git(source, "commit", "-m", "initial")
+    write_file(source / "config/aws.env", "AWS_SECRET_ACCESS_KEY=leak")
+    write_file(source / "credentials/token.json", '{"token": "leak"}')
+    write_file(source / "ordinary/untracked.py")
+
+    tarball = cmux_vast_host.make_overlay_tarball(source)
+    try:
+        names = tar_names(tarball)
+        with tarfile.open(tarball, "r:gz") as archive:
+            payload = b"".join(
+                archive.extractfile(member).read() for member in archive.getmembers() if member.isfile()
+            )
+    finally:
+        tarball.unlink(missing_ok=True)
+
+    assert (source / "config/aws.env").exists()
+    assert not any(name.endswith("aws.env") for name in names)
+    assert not any("credentials" in path_components(name) for name in names)
+    assert b"leak" not in payload
+    assert "ordinary/tracked.py" in names
+    assert "ordinary/untracked.py" in names
+
+
+def test_make_overlay_tarball_refuses_source_without_git_ignore_rules(tmp_path: Path) -> None:
+    source = tmp_path / "plain"
+    write_file(source / "config/aws.env", "AWS_SECRET_ACCESS_KEY=leak")
+
+    with pytest.raises(RuntimeError, match="git ls-files"):
+        cmux_vast_host.make_overlay_tarball(source)
+
+
 def test_make_repo_tarball_excludes_clone_git_and_preserves_project_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "repo"
-    source.mkdir()
-    subprocess.run(["git", "init", "-b", "test-branch"], cwd=source, check=True, capture_output=True, text=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=source, check=True)
-    subprocess.run(["git", "config", "user.name", "Test User"], cwd=source, check=True)
+    init_repo(source)
+    write_file(source / ".gitignore", "*.env\n")
     write_file(source / "ordinary/project_file.py")
-    subprocess.run(["git", "add", "ordinary/project_file.py"], cwd=source, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=source, check=True, capture_output=True, text=True)
+    git(source, "add", ".gitignore", "ordinary/project_file.py")
+    git(source, "commit", "-m", "initial")
     write_file(source / "ordinary/uncommitted.py")
+    write_file(source / "ordinary/local.env", "AWS_SECRET_ACCESS_KEY=leak")
     write_file(source / ".git/objects/pack/big.pack")
     monkeypatch.setattr(cmux_vast_host, "PROJECT_ROOT", source)
 
@@ -87,6 +134,7 @@ def test_make_repo_tarball_excludes_clone_git_and_preserves_project_files(
     assert not any(name.endswith("big.pack") for name in names)
     assert "scenic-drive/ordinary/project_file.py" in names
     assert "scenic-drive/ordinary/uncommitted.py" in names
+    assert "scenic-drive/ordinary/local.env" not in names
 
 
 def test_record_startup_timing_writes_elapsed_seconds(monkeypatch: pytest.MonkeyPatch) -> None:

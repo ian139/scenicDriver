@@ -71,6 +71,10 @@ class Node:
     _coordinate_mutation_epoch: ClassVar[int] = 0
 
     def __setattr__(self, name: str, value: Any) -> None:
+        if name == "id" and "id" in self.__dict__:
+            raise AttributeError(
+                "Node.id is immutable; replace the node through RoadGraph"
+            )
         coordinate_was_present = name in ("lat", "lon") and name in self.__dict__
         object.__setattr__(self, name, value)
         if coordinate_was_present:
@@ -91,21 +95,28 @@ class Edge:
     scenic_score: float
     road_name: Optional[str] = None
     road_type: str = "secondary"
-    speed_limit_kmh: int = 50
+    speed_limit_kmh: float = 50
     one_way: bool = False
     _mutation_epoch: ClassVar[int] = 0
     _projection_epoch: ClassVar[int] = 0
+    # Adjacency is derived from these fields, so changing them in place would
+    # leave every owning graph's traversal lists stale.  Replace the edge
+    # through ``RoadGraph.edges`` instead; score/attribute fields stay mutable.
+    _TOPOLOGY_FIELDS: ClassVar[frozenset] = frozenset(
+        ("id", "start_node_id", "end_node_id", "one_way")
+    )
 
     def __setattr__(self, name: str, value: Any) -> None:
         public_field_was_present = not name.startswith("_") and name in self.__dict__
-        projection_field_was_present = (
-            public_field_was_present and name in ("start_node_id", "end_node_id", "road_type")
-        )
+        if public_field_was_present and name in Edge._TOPOLOGY_FIELDS:
+            raise AttributeError(
+                f"Edge.{name} is immutable; replace the edge through RoadGraph.edges"
+            )
         object.__setattr__(self, name, value)
         if public_field_was_present:
             Edge._mutation_epoch += 1
-        if projection_field_was_present:
-            Edge._projection_epoch += 1
+            if name == "road_type":
+                Edge._projection_epoch += 1
 
     @property
     def travel_time_minutes(self) -> float:
@@ -162,7 +173,7 @@ class _ReverseEdgeView:
         return self._edge.road_type
 
     @property
-    def speed_limit_kmh(self) -> int:
+    def speed_limit_kmh(self) -> float:
         return self._edge.speed_limit_kmh
 
     @property
@@ -177,107 +188,136 @@ class _ReverseEdgeView:
         return getattr(self._edge, name)
 
 
-class _NodeMapping(dict[str, Node]):
-    """Dictionary facade that keeps the nearest-node index synchronized."""
+_V = TypeVar("_V")
+
+
+class _GraphOwnedMapping(dict[str, _V], Generic[_V]):
+    """Dictionary facade routing every mutation through graph-owned hooks.
+
+    Subclasses implement ``_store``/``_discard``/``_clear`` so that derived
+    graph state (adjacency, spatial index, cache epochs) changes in the same
+    step as the mapping and invalid topology is rejected before mutation.
+    """
 
     def __init__(self, owner: Any) -> None:
         super().__init__()
         self._owner = owner
+
+    def _store(self, key: str, value: _V) -> None:
+        raise NotImplementedError
+
+    def _discard(self, key: str) -> None:
+        raise NotImplementedError
+
+    def _clear(self) -> None:
+        raise NotImplementedError
+
+    def __setitem__(self, key: str, value: _V) -> None:
+        self._store(key, value)
+
+    def __delitem__(self, key: str) -> None:
+        if key not in self:
+            raise KeyError(key)
+        self._discard(key)
+
+    def update(self, *args: Any, **kwargs: _V) -> None:
+        values = dict(*args, **kwargs)
+        for key, value in values.items():
+            self[key] = value
+
+    def setdefault(self, key: str, default: Optional[_V] = None) -> _V:
+        if key in self:
+            return self[key]
+        self[key] = default  # type: ignore[assignment]
+        return default  # type: ignore[return-value]
+
+    def pop(self, key: str, *args: Any) -> _V:
+        if key not in self:
+            return super().pop(key, *args)
+        value = self[key]
+        self._discard(key)
+        return value
+
+    def popitem(self) -> Tuple[str, _V]:
+        if not self:
+            raise KeyError("popitem(): dictionary is empty")
+        key = next(reversed(self))
+        value = self[key]
+        self._discard(key)
+        return key, value
+
+    def clear(self) -> None:
+        if self:
+            self._clear()
+
+    def __ior__(self, other: Any) -> "_GraphOwnedMapping[_V]":
+        self.update(other)
+        return self
+
+
+class _NodeMapping(_GraphOwnedMapping[Node]):
+    """Node mapping that keeps adjacency and the nearest-node index in sync.
+
+    Replacing a node under its own id is allowed (coordinates may change);
+    deleting a node that any edge still references is rejected.
+    """
 
     def _changed(self) -> None:
         self._owner._invalidate_nearest_spatial_index()
         self._owner._advance_heuristic_epoch()
 
-    def __setitem__(self, key: str, node: Node) -> None:
-        super().__setitem__(key, node)
+    def _store(self, key: str, node: Node) -> None:
+        if key != node.id:
+            raise ValueError(f"Node key {key!r} does not match node id {node.id!r}")
+        dict.__setitem__(self, key, node)
+        self._owner.adjacency.setdefault(key, [])
         self._changed()
 
-    def __delitem__(self, key: str) -> None:
-        super().__delitem__(key)
+    def _discard(self, key: str) -> None:
+        self._owner._ensure_node_unreferenced(key)
+        dict.__delitem__(self, key)
+        self._owner.adjacency.pop(key, None)
         self._changed()
 
-    def update(self, *args: Any, **kwargs: Node) -> None:
-        values = dict(*args, **kwargs)
-        for key, node in values.items():
-            self[key] = node
-
-    def setdefault(self, key: str, default: Optional[Node] = None) -> Node:
-        if key in self:
-            return self[key]
-        self[key] = default  # type: ignore[assignment]
-        return default  # type: ignore[return-value]
-
-    def pop(self, key: str, *args: Any) -> Node:
-        if key not in self:
-            return super().pop(key, *args)
-        value = super().pop(key, *args)
+    def _clear(self) -> None:
+        if self._owner.edges:
+            raise ValueError("Cannot clear nodes referenced by edges")
+        dict.clear(self)
+        self._owner.adjacency.clear()
         self._changed()
-        return value
-
-    def popitem(self) -> Tuple[str, Node]:
-        value = super().popitem()
-        self._changed()
-        return value
-
-    def clear(self) -> None:
-        if self:
-            super().clear()
-            self._changed()
-
-    def __ior__(self, other: Any) -> "_NodeMapping":
-        self.update(other)
-        return self
 
 
-class _EdgeMapping(dict[str, Edge]):
-    """Dictionary facade that advances the graph heuristic epoch on mutation."""
-
-    def __init__(self, owner: Any) -> None:
-        super().__init__()
-        self._owner = owner
+class _EdgeMapping(_GraphOwnedMapping[Edge]):
+    """Edge mapping whose insert/replace/delete maintain graph adjacency."""
 
     def _changed(self) -> None:
         self._owner._advance_heuristic_epoch()
 
-    def __setitem__(self, key: str, edge: Edge) -> None:
-        super().__setitem__(key, edge)
+    def _store(self, key: str, edge: Edge) -> None:
+        if key != edge.id:
+            raise ValueError(f"Edge key {key!r} does not match edge id {edge.id!r}")
+        nodes = self._owner.nodes
+        if edge.start_node_id not in nodes:
+            raise ValueError(f"Unknown start node: {edge.start_node_id}")
+        if edge.end_node_id not in nodes:
+            raise ValueError(f"Unknown end node: {edge.end_node_id}")
+        previous = self.get(key)
+        if previous is not None:
+            self._owner._unlink_edge(previous)
+        dict.__setitem__(self, key, edge)
+        self._owner._link_edge(edge)
         self._changed()
 
-    def __delitem__(self, key: str) -> None:
-        super().__delitem__(key)
+    def _discard(self, key: str) -> None:
+        self._owner._unlink_edge(self[key])
+        dict.__delitem__(self, key)
         self._changed()
 
-    def update(self, *args: Any, **kwargs: Edge) -> None:
-        values = dict(*args, **kwargs)
-        for key, edge in values.items():
-            self[key] = edge
-
-    def setdefault(self, key: str, default: Optional[Edge] = None) -> Edge:
-        if key in self:
-            return self[key]
-        self[key] = default  # type: ignore[assignment]
-        return default  # type: ignore[return-value]
-
-    def pop(self, key: str, *args: Any) -> Edge:
-        if key not in self:
-            return super().pop(key, *args)
-        value = super().pop(key, *args)
+    def _clear(self) -> None:
+        dict.clear(self)
+        for refs in self._owner.adjacency.values():
+            refs.clear()
         self._changed()
-        return value
-
-    def popitem(self) -> Tuple[str, Edge]:
-        value = super().popitem()
-        self._changed()
-        return value
-
-    def clear(self) -> None:
-        if self:
-            super().clear()
-            self._changed()
-
-    def __ior__(self, other: Any) -> "_EdgeMapping":
-        self.update(other)
-        return self
 
 
 class RoadGraph:
@@ -490,8 +530,14 @@ class RoadGraph:
         return self._edge_projection_index_status
 
     def add_node(self, node: Node) -> None:
+        """Insert a node, rejecting a duplicate of an existing node id.
+
+        Coordinate updates go through ``nodes[node.id] = node``, which keeps
+        the node's topology; every admission path rejects duplicate ids.
+        """
+        if node.id in self.nodes:
+            raise ValueError(f"Duplicate node id: {node.id}")
         self.nodes[node.id] = node
-        self.adjacency.setdefault(node.id, [])
 
     @property
     def edge_projection_index_status(self) -> Mapping[str, Any]:
@@ -644,33 +690,48 @@ class RoadGraph:
 
 
     def add_edge(self, edge: Edge) -> None:
-        if edge.start_node_id not in self.nodes:
-            raise ValueError(f"Unknown start node: {edge.start_node_id}")
-        if edge.end_node_id not in self.nodes:
-            raise ValueError(f"Unknown end node: {edge.end_node_id}")
         if edge.id in self.edges:
             raise ValueError(f"Duplicate edge id: {edge.id}")
-
         self.edges[edge.id] = edge
+
+    def _link_edge(self, edge: Edge) -> None:
         self.adjacency.setdefault(edge.start_node_id, []).append((edge.id, False))
         if not edge.one_way:
             self.adjacency.setdefault(edge.end_node_id, []).append((edge.id, True))
+
+    def _unlink_edge(self, edge: Edge) -> None:
+        self.adjacency[edge.start_node_id].remove((edge.id, False))
+        if not edge.one_way:
+            self.adjacency[edge.end_node_id].remove((edge.id, True))
+
+    def _ensure_node_unreferenced(self, node_id: str) -> None:
+        # Outgoing and two-way incident edges are listed in the node's own
+        # adjacency; only one-way edges ending here need the edge scan.
+        if self.adjacency.get(node_id) or any(
+            edge.end_node_id == node_id for edge in self.edges.values()
+        ):
+            raise ValueError(f"Node {node_id!r} is referenced by edges")
+
     def _bulk_load(
         self,
         nodes: Iterable[_NodeRow],
         edges: Iterable[_EdgeRow],
         *,
+        legacy_speed_text: bool = False,
         check_cancelled: Callable[[], None] | None = None,
     ) -> tuple[bool, bool]:
-        """Populate rows without firing mapping mutation hooks per item."""
+        """Populate rows without firing mapping mutation hooks per item.
+
+        ``legacy_speed_text`` admits historical JSON speed strings such as
+        ``"35 mph"``; canonical numeric speeds are always preserved exactly.
+        """
         if check_cancelled is not None:
             check_cancelled()
         saw_nodes = False
         saw_edges = False
         # The graph is private to ``load`` until this method returns, so
         # normalize and insert directly.  Base-dict calls bypass per-row
-        # nearest-index/heuristic hooks while preserving normal dict order and
-        # add_node's duplicate overwrite behavior.
+        # nearest-index/heuristic hooks while preserving normal dict order.
         for node_index, row in enumerate(nodes):
             if (
                 check_cancelled is not None
@@ -679,6 +740,8 @@ class RoadGraph:
                 check_cancelled()
             saw_nodes = True
             node_id = str(row.id)
+            if node_id in self.nodes:
+                raise ValueError(f"Duplicate node id: {node_id}")
             dict.__setitem__(
                 self.nodes,
                 node_id,
@@ -688,7 +751,7 @@ class RoadGraph:
                     lon=float(row.lon),
                 ),
             )
-            self.adjacency.setdefault(node_id, [])
+            self.adjacency[node_id] = []
 
         if check_cancelled is not None:
             check_cancelled()
@@ -698,6 +761,7 @@ class RoadGraph:
                 and edge_index & (_CANCELLATION_CHECK_INTERVAL - 1) == 0
             ):
                 check_cancelled()
+            saw_edges = True
             edge_id = str(row.id)
             start_node_id = str(row.start_node_id)
             end_node_id = str(row.end_node_id)
@@ -716,16 +780,15 @@ class RoadGraph:
                 scenic_score=float(row.scenic_score),
                 road_name=row.road_name,
                 road_type=road_type,
-                speed_limit_kmh=_parse_speed_limit_kmh(
+                speed_limit_kmh=_persisted_speed_limit_kmh(
                     row.speed_limit_kmh,
                     road_type,
+                    legacy_text=legacy_speed_text,
                 ),
                 one_way=_parse_one_way(row.one_way, default=True),
             )
             dict.__setitem__(self.edges, edge_id, edge)
-            self.adjacency.setdefault(start_node_id, []).append((edge_id, False))
-            if not edge.one_way:
-                self.adjacency.setdefault(end_node_id, []).append((edge_id, True))
+            self._link_edge(edge)
 
         if check_cancelled is not None:
             check_cancelled()
@@ -1005,7 +1068,12 @@ class RoadGraph:
         if check_cancelled is not None:
             check_cancelled()
         graph = cls()
-        graph._bulk_load(rows.nodes, rows.edges, check_cancelled=check_cancelled)
+        graph._bulk_load(
+            rows.nodes,
+            rows.edges,
+            legacy_speed_text=True,
+            check_cancelled=check_cancelled,
+        )
         if check_cancelled is not None:
             check_cancelled()
         return graph
@@ -1057,10 +1125,17 @@ class RoadGraph:
             road_name = props.get("road_name")
             road_type = _normalize_road_type(props.get("road_type", "secondary"))
             scenic_score = float(props.get("scenic_score", 5.0))
-            speed_limit = _parse_speed_limit_kmh(props.get("speed_limit_kmh"), road_type)
-            one_way = _parse_one_way(props.get("one_way", props.get("oneway")), default=True)
+            speed_limit = _persisted_speed_limit_kmh(
+                props.get("speed_limit_kmh"), road_type, legacy_text=True
+            )
+            one_way, reverse_direction = _parse_osm_one_way(
+                props.get("one_way", props.get("oneway")), default=True
+            )
             if "bidirectional" in props:
                 one_way = not _parse_bool(props.get("bidirectional"), default=False)
+            if one_way and reverse_direction:
+                # oneway=-1: travel runs against the digitized direction.
+                coords = list(reversed(coords))
             for segment_index, idx in enumerate(range(len(coords) - 1)):
                 if (
                     check_cancelled is not None
@@ -1368,6 +1443,53 @@ def _iter_osmnx_edge_triples(
     yield from rows
 
 
+def _osm_geometry_coords(geometry: Any) -> list[tuple[float, float]]:
+    """Return ``(x, y)`` coordinates from a shapely LineString or raw list."""
+    if geometry is None:
+        return []
+    try:
+        raw_coords = list(geometry.coords)
+    except (AttributeError, NotImplementedError, TypeError):
+        raw_coords = geometry if isinstance(geometry, (list, tuple)) else []
+    return [
+        (float(point[0]), float(point[1]))
+        for point in raw_coords
+        if len(point) >= 2
+    ]
+
+
+def _has_reciprocal_osm_edge(
+    G: Any, u: Any, v: Any, key: Any, data: Mapping[str, Any]
+) -> bool:
+    """Whether ``v -> u`` holds the other half of this same two-way road.
+
+    A reciprocal must share the OSM way identity (``osmid``), be two-way
+    itself, and carry the exact reversed geometry; an unrelated road that
+    merely connects the same nodes in the opposite direction does not count.
+    When neither ``osmid`` nor geometry identifies the road, the parallel-edge
+    key must also match so distinct parallel roads are not paired.
+    """
+    reciprocal = G.get_edge_data(v, u)
+    if not reciprocal:
+        return False
+    candidates = reciprocal.items() if G.is_multigraph() else ((None, reciprocal),)
+    osmid = data.get("osmid")
+    reversed_geometry = _osm_geometry_coords(data.get("geometry"))[::-1]
+    requires_key_match = osmid is None and not reversed_geometry
+    for other_key, other in candidates:
+        if u == v and other_key == key:
+            continue
+        if requires_key_match and other_key != key:
+            continue
+        if _parse_osm_one_way(other.get("oneway"), default=True)[0]:
+            continue
+        if other.get("osmid") != osmid:
+            continue
+        if _osm_geometry_coords(other.get("geometry")) == reversed_geometry:
+            return True
+    return False
+
+
 def _convert_osmnx_edge(
     G: Any,
     node_data: Mapping[Any, Any],
@@ -1385,14 +1507,19 @@ def _convert_osmnx_edge(
         road_name = str(road_name)
     road_type = _normalize_road_type(data.get("highway", "secondary"))
     speed_kmh = _parse_speed_limit_kmh(data.get("maxspeed"), road_type)
-    one_way = _parse_one_way(data.get("oneway"), default=True)
-    if not one_way and G.has_edge(v, u):
+    one_way, reverse_direction = _parse_osm_one_way(data.get("oneway"), default=True)
+    if not one_way and _has_reciprocal_osm_edge(G, u, v, key, data):
+        # OSMnx encodes a two-way road as a matched u->v / v->u pair; keep
+        # each half directed so the road is not traversable twice per way.
         one_way = True
 
-    start_id = str(u)
-    end_id = str(v)
-    start_data = node_data[u]
-    end_data = node_data[v]
+    # oneway=-1 travels against the OSM digitization: u/v keep naming the
+    # identity, but the emitted edge (and its geometry) runs v -> u.
+    start_key, end_key = (v, u) if one_way and reverse_direction else (u, v)
+    start_id = str(start_key)
+    end_id = str(end_key)
+    start_data = node_data[start_key]
+    end_data = node_data[end_key]
     start_node = Node(
         id=start_id,
         lat=float(start_data.get("y")),
@@ -1404,16 +1531,7 @@ def _convert_osmnx_edge(
         lon=float(end_data.get("x")),
     )
 
-    geometry = data.get("geometry")
-    geometry_coords: list[tuple[float, float]] = []
-    if geometry is not None:
-        try:
-            raw_coords = list(geometry.coords)
-        except (AttributeError, NotImplementedError, TypeError):
-            raw_coords = geometry if isinstance(geometry, (list, tuple)) else []
-        for point in raw_coords:
-            if len(point) >= 2:
-                geometry_coords.append((float(point[0]), float(point[1])))
+    geometry_coords = _osm_geometry_coords(data.get("geometry"))
 
     if len(geometry_coords) >= 2:
         start_xy = (start_node.lon, start_node.lat)
@@ -1664,6 +1782,9 @@ def _write_sqlite_graph(
                 raise ValueError(f"SQLite integrity check failed: {integrity!r}")
             connection.commit()
         os.replace(temporary_path, destination)
+    except sqlite3.IntegrityError as exc:
+        temporary_path.unlink(missing_ok=True)
+        raise ValueError(f"Duplicate graph row id: {exc}") from exc
     except Exception:
         temporary_path.unlink(missing_ok=True)
         raise
@@ -1872,6 +1993,8 @@ def _graph_from_osmnx(G: Any, scenic_scores: Dict[str, float]) -> RoadGraph:
     graph = RoadGraph()
     for kind, row in _iter_osmnx_graph_rows(G, scenic_scores):
         if kind == "node":
+            if row.id in graph.nodes:  # type: ignore[union-attr]
+                raise ValueError(f"Duplicate node id: {row.id}")  # type: ignore[union-attr]
             graph.add_node(row)  # type: ignore[arg-type]
         else:
             graph.add_edge(row)  # type: ignore[arg-type]
@@ -2136,6 +2259,9 @@ def write_compact_graph(
     objects.  Binary, source, and projection dependencies are hash-verified and
     fsynced in an immutable content-addressed generation. The manifest is swapped
     atomically last; previous generations remain intact for existing readers.
+    The source must be checkpointed (no nonempty WAL). One read transaction
+    pins its rows; identity checks reject replacement or in-place changes
+    through hashing and dependency publication, before the manifest is swapped.
     """
     if array("q").itemsize != 8 or array("i").itemsize != 4:
         raise RuntimeError("compact artifact requires 64-bit array support")
@@ -2146,6 +2272,10 @@ def write_compact_graph(
     if check_cancelled is not None:
         check_cancelled()
     resolved_source = sqlite_path.expanduser().resolve()
+    source_identity = _path_identity(resolved_source)
+    wal_path = resolved_source.with_name(resolved_source.name + "-wal")
+    if wal_path.is_file() and wal_path.stat().st_size:
+        raise ValueError("Compact conversion requires a checkpointed SQLite source")
     uri = f"file:{quote(str(resolved_source), safe='/')}?mode=ro"
     try:
         connection = sqlite3.connect(uri, uri=True)
@@ -2154,6 +2284,7 @@ def write_compact_graph(
     temporary_bin: Path | None = None
     try:
         connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
         metadata = _sqlite_metadata(connection, check_cancelled=check_cancelled)
         if check_cancelled is not None:
             check_cancelled()
@@ -2282,11 +2413,7 @@ def write_compact_graph(
                 raise ValueError(f"Edge {_edge_id!r} has non-finite scenic score")
             one_way_value = _parse_one_way(one_way, default=True)
             road_type_value = str(road_type)
-            speed_value = int(
-                _parse_speed_limit_kmh(speed, road_type_value)
-            )
-            if speed_value <= 0:
-                raise ValueError(f"Edge {_edge_id!r} has invalid speed limit")
+            speed_value = _validate_speed_limit_kmh(speed)
             edge_start_rank.append(start_rank)
             edge_end_rank.append(end_rank)
             edge_distance_km.append(distance_value)
@@ -2407,7 +2534,7 @@ def write_compact_graph(
             one_way_value = _parse_one_way(one_way, default=True)
             road_type_value = str(road_type)
             distance_value = float(distance)
-            speed_value = int(_parse_speed_limit_kmh(speed, road_type_value))
+            speed_value = _validate_speed_limit_kmh(speed)
             duration_value = (distance_value / max(speed_value, 1.0)) * 60.0
             if not math.isfinite(duration_value) or duration_value < 0.0:
                 raise ValueError(f"Edge {_edge_id!r} has invalid duration")
@@ -2528,6 +2655,11 @@ def write_compact_graph(
         source_sha256 = _sha256_file(
             resolved_source, check_cancelled=check_cancelled
         )
+        if (
+            _path_identity(resolved_source) != source_identity
+            or (wal_path.is_file() and wal_path.stat().st_size)
+        ):
+            raise ValueError("SQLite source changed during compact conversion")
         if check_cancelled is not None:
             check_cancelled()
 
@@ -2600,6 +2732,11 @@ def write_compact_graph(
         generation_path = _publish_compact_generation(
             manifest_path, dependencies, check_cancelled=check_cancelled
         )
+        if (
+            _path_identity(resolved_source) != source_identity
+            or (wal_path.is_file() and wal_path.stat().st_size)
+        ):
+            raise ValueError("SQLite source changed during compact conversion")
         bin_path = generation_path / bin_path.name
         published_source = generation_path / resolved_source.name
         projection_info["path"] = (
@@ -2859,6 +2996,8 @@ class _RankProjectionIndex(EdgeProjectionIndex):
             if self._canonical_keys_owner != owner:
                 raise ValueError("Edge projection index is attached to another graph")
             return
+        if graph.edge_count != self.total_edge_count:
+            raise ValueError("Graph edge count does not match sidecar total edge count")
         self._canonical_keys = _CompactEdgeKeySequence(graph)
         self._canonical_keys_owner = owner
 
@@ -3032,6 +3171,142 @@ class CompactRoadGraph(RoadGraph):
 
     # -- sections ----------------------------------------------------------
 
+    def _validate_sections(
+        self, *, check_cancelled: Callable[[], None] | None = None
+    ) -> None:
+        """Admit only complete, internally consistent native-search inputs."""
+        sections = self._sections
+        n, e, t = self.node_count, self.edge_count, self.traversal_count
+
+        def check(index: int = 0) -> None:
+            if check_cancelled is not None and index & 1023 == 0:
+                check_cancelled()
+
+        def require(condition: bool, name: str) -> None:
+            if not condition:
+                raise ValueError(f"Invalid compact section invariant: {name}")
+
+        counts = {
+            "node_lat": n, "node_lon": n,
+            "node_id_offsets": n + 1, "edge_id_offsets": e + 1,
+            "edge_road_name_offsets": e + 1,
+            "forward_indptr": n + 1, "reverse_indptr": n + 1,
+            "forward_indices": t, "reverse_indices": t, "reverse_positions": t,
+        }
+        for kind, count in (("node", n), ("edge", e)):
+            counts[f"{kind}_hash_keys"] = _compact_hash_slots(count)
+            counts[f"{kind}_hash_values"] = _compact_hash_slots(count)
+        for name, dtype in _COMPACT_SECTION_SPECS:
+            check()
+            if dtype == "raw" or name in counts or name == "road_type_offsets":
+                continue
+            counts[name] = t if name.startswith("trav_") else e
+        for name, count in counts.items():
+            require(len(sections[name]) == count, name + " count")
+        road_types: list[str] = []
+        for prefix in ("node_id", "edge_id", "edge_road_name", "road_type"):
+            offsets = sections[prefix + "_offsets"]
+            strings = sections[prefix + "_strings"]
+            require(len(offsets) > 0, prefix + " offsets")
+            require(
+                int(offsets[0]) == 0 and int(offsets[-1]) == len(strings)
+                and bool(np.all(offsets[1:] >= offsets[:-1])),
+                prefix + " string bounds",
+            )
+            for rank in range(len(offsets) - 1):
+                check(rank)
+                try:
+                    value = self._string_at(strings, offsets, rank)
+                except UnicodeError as exc:
+                    raise ValueError(f"Invalid compact UTF-8: {prefix}") from exc
+                if prefix == "road_type":
+                    road_types.append(value.lower())
+        for kind, count in (("node", n), ("edge", e)):
+            keys, values = sections[kind + "_hash_keys"], sections[kind + "_hash_values"]
+            occupied = keys != 0
+            require(int(np.count_nonzero(occupied)) == count, kind + " hash occupancy")
+            require(bool(np.all(values[~occupied] == -1)), kind + " empty hash ranks")
+            require(bool(np.all((values[occupied] >= 0) & (values[occupied] < count))),
+                    kind + " hash ranks")
+            seen = np.zeros(count, dtype=np.bool_)
+            resolver = self._node_id_at_rank if kind == "node" else self._edge_id_at_rank
+            for slot in range(len(keys)):
+                check(slot)
+                if int(keys[slot]) == 0:
+                    continue
+                rank = int(values[slot])
+                require(not bool(seen[rank]), kind + " duplicate hash rank")
+                seen[rank] = True
+                value = resolver(rank)
+                require(int(keys[slot]) == _compact_id_hash(value.encode("utf-8")),
+                        kind + " hash key")
+                require(self._rank_for_id(value, kind) == rank,
+                        kind + " unreachable or duplicate id")
+        for name in ("node_lat", "node_lon", "edge_distance_km", "edge_scenic_score",
+                     "edge_speed_limit_kmh", "trav_distance_km",
+                     "trav_travel_time_minutes", "trav_scenic_score"):
+            check()
+            require(bool(np.all(np.isfinite(sections[name]))), name + " finite values")
+        for name in ("edge_distance_km", "trav_distance_km", "trav_travel_time_minutes"):
+            require(bool(np.all(sections[name] >= 0)), name + " nonnegative values")
+        require(bool(np.all(sections["edge_speed_limit_kmh"] > 0)), "positive speeds")
+        for name in ("edge_one_way", "trav_reverse", "trav_highway_mask",
+                     "trav_scenic_byway_mask"):
+            require(bool(np.all(sections[name] <= 1)), name + " boolean values")
+        for name, bound in (("edge_start_rank", n), ("edge_end_rank", n),
+                            ("forward_indices", n), ("reverse_indices", n),
+                            ("trav_edge_rank", e), ("reverse_positions", t),
+                            ("edge_road_type_codes", len(road_types))):
+            values = sections[name]
+            require(bool(np.all((values >= 0) & (values < bound))), name + " ranks")
+        for direction in ("forward", "reverse"):
+            indptr = sections[direction + "_indptr"]
+            require(int(indptr[0]) == 0 and int(indptr[-1]) == t
+                    and bool(np.all(indptr[1:] >= indptr[:-1])),
+                    direction + " CSR bounds")
+        seen_traversals = np.zeros(e, dtype=np.uint8)
+        seen_reverse = np.zeros(t, dtype=np.bool_)
+        highway_types = _compact_highway_road_types()
+        for source in range(n):
+            check(source)
+            for pos in range(int(sections["forward_indptr"][source]),
+                             int(sections["forward_indptr"][source + 1])):
+                check(pos)
+                rank = int(sections["trav_edge_rank"][pos])
+                reverse = bool(sections["trav_reverse"][pos])
+                start = int(sections["edge_start_rank"][rank])
+                end = int(sections["edge_end_rank"][rank])
+                bit = 2 if reverse else 1
+                require(not int(seen_traversals[rank]) & bit, "duplicate traversal")
+                seen_traversals[rank] |= bit
+                require(source == (end if reverse else start)
+                        and int(sections["forward_indices"][pos]) == (start if reverse else end)
+                        and not (reverse and sections["edge_one_way"][rank]),
+                        "traversal endpoints")
+                road_type = road_types[int(sections["edge_road_type_codes"][rank])]
+                require(bool(sections["trav_highway_mask"][pos]) == (road_type in highway_types)
+                        and bool(sections["trav_scenic_byway_mask"][pos])
+                        == (road_type == _COMPACT_SCENIC_BYWAY_ROAD_TYPE), "road masks")
+                distance = float(sections["edge_distance_km"][rank])
+                duration = distance / max(float(sections["edge_speed_limit_kmh"][rank]), 1.0) * 60
+                require(float(sections["trav_distance_km"][pos]) == distance
+                        and float(sections["trav_travel_time_minutes"][pos]) == duration
+                        and float(sections["trav_scenic_score"][pos])
+                        == float(sections["edge_scenic_score"][rank]), "traversal weights")
+            for pos in range(int(sections["reverse_indptr"][source]),
+                             int(sections["reverse_indptr"][source + 1])):
+                check(pos)
+                forward_pos = int(sections["reverse_positions"][pos])
+                origin = int(sections["reverse_indices"][pos])
+                require(not bool(seen_reverse[forward_pos]), "duplicate reverse position")
+                seen_reverse[forward_pos] = True
+                require(int(sections["forward_indices"][forward_pos]) == source
+                        and int(sections["forward_indptr"][origin]) <= forward_pos
+                        < int(sections["forward_indptr"][origin + 1]), "reverse CSR linkage")
+        require(bool(np.all(seen_traversals == np.where(sections["edge_one_way"], 1, 3))),
+                "missing traversal")
+        check()
+
     def _section(self, name: str) -> np.ndarray | memoryview:
         return self._sections[name]
 
@@ -3124,7 +3399,7 @@ class CompactRoadGraph(RoadGraph):
             scenic_score=self._scenic_at_rank(rank),
             road_name=self._road_name_at_rank(rank),
             road_type=self._road_type_at_rank(rank),
-            speed_limit_kmh=int(self._sections["edge_speed_limit_kmh"][rank]),
+            speed_limit_kmh=float(self._sections["edge_speed_limit_kmh"][rank]),
             one_way=bool(self._sections["edge_one_way"][rank]),
         )
 
@@ -3140,11 +3415,7 @@ class CompactRoadGraph(RoadGraph):
         # alter geometry, so the projection index stays valid for the graph
         # lifetime.  The CSR heuristic stamp still changes with score
         # sidecars, which is what drives weight/topology cache rebuilds.
-        return (
-            0,
-            Node._coordinate_mutation_epoch,
-            Edge._projection_epoch,
-        )
+        return (id(self), 0, 0)
 
     # -- immutability --------------------------------------------------------
 
@@ -3398,6 +3669,11 @@ class CompactRoadGraph(RoadGraph):
         and is generated deterministically on first use.  Activating it bumps
         the structure epoch so every planner cache rebuilds for the report.
         """
+        for value in score_map.values():
+            if value is not None and not math.isfinite(float(value)):
+                raise ValueError("Present report scores must be finite")
+        if fallback is not None and not math.isfinite(float(fallback)):
+            raise ValueError("Report fallback score must be finite")
         json_path, bin_path = self._score_sidecar_paths(
             report_signature, zoom, fallback, normalization
         )
@@ -3425,6 +3701,9 @@ class CompactRoadGraph(RoadGraph):
         try:
             mm = mmap.mmap(file_obj.fileno(), 0, access=mmap.ACCESS_READ)
             values = np.frombuffer(mm, dtype="<f8", count=self.edge_count)
+            if not np.all(np.isfinite(values)):
+                values = None
+                raise ValueError("Present report scores must be finite")
             values.flags.writeable = False
             sidecar = _ScoreSidecar(
                 path=bin_path,
@@ -3494,10 +3773,16 @@ class CompactRoadGraph(RoadGraph):
         graph_counts = manifest.get("graph")
         if not isinstance(graph_counts, Mapping):
             raise ValueError("Compact manifest is missing graph counts")
+        for name in ("node_count", "edge_count", "traversal_count"):
+            if type(graph_counts.get(name)) is not int:
+                raise ValueError("Compact manifest has invalid graph counts")
         node_count = int(graph_counts.get("node_count", -1))
         edge_count = int(graph_counts.get("edge_count", -1))
         traversal_count = int(graph_counts.get("traversal_count", -1))
-        if node_count < 0 or edge_count < 0 or traversal_count < 0:
+        if (
+            node_count < 0 or edge_count < 0 or traversal_count < 0
+            or node_count >= 2**31 or edge_count >= 2**31
+        ):
             raise ValueError("Compact manifest has invalid graph counts")
         source = manifest.get("source")
         if not isinstance(source, Mapping):
@@ -3560,8 +3845,11 @@ class CompactRoadGraph(RoadGraph):
             if not isinstance(descriptor, Mapping):
                 raise ValueError(f"Compact section {name} has no descriptor")
             dtype = descriptor.get("dtype")
-            if dtype not in _COMPACT_DTYPE_ITEMSIZE:
-                raise ValueError(f"Compact section {name} has unknown dtype")
+            if dtype != dict(_COMPACT_SECTION_SPECS)[name]:
+                raise ValueError(f"Compact section {name} has incorrect dtype")
+            if any(type(descriptor.get(field)) is not int
+                   for field in ("offset", "length", "count")):
+                raise ValueError(f"Compact section {name} has invalid bounds")
             offset = int(descriptor.get("offset", -1))
             length = int(descriptor.get("length", -1))
             count = int(descriptor.get("count", -1))
@@ -3576,7 +3864,6 @@ class CompactRoadGraph(RoadGraph):
                 raise ValueError(f"Compact section {name} size/count mismatch")
             if offset + length > int(manifest.get("bin_size_bytes", -1)):
                 raise ValueError(f"Compact section {name} extends past payload")
-        section_names = list(_COMPACT_SECTION_SPECS)
         previous_end = 0
         for name, _dtype in _COMPACT_SECTION_SPECS:
             descriptor = expected_sections[name]
@@ -3641,6 +3928,7 @@ class CompactRoadGraph(RoadGraph):
                 manifest_path,
                 source_path,
             )
+            graph._validate_sections(check_cancelled=check_cancelled)
             if check_cancelled is not None:
                 check_cancelled()
             try:
@@ -3883,21 +4171,74 @@ def _parse_bool(raw: Any, default: bool) -> bool:
     return default
 
 
-def _parse_one_way(raw: Any, default: bool) -> bool:
+def _parse_osm_one_way(raw: Any, default: bool) -> tuple[bool, bool]:
     """
-    Parse one-way flags from OSM/GeoJSON-style values.
+    Parse OSM/GeoJSON one-way tags into ``(one_way, reverse_direction)``.
 
-    OSM may encode oneway as yes/no/1/0/-1.
+    OSM may encode oneway as yes/no/1/0/-1; ``-1``/``reverse`` means the road
+    is one-way against its digitized direction, so callers must swap the
+    endpoints and geometry.
     """
     if isinstance(raw, list):
         raw = raw[0] if raw else None
     if raw is None:
-        return default
+        return default, False
 
     text = str(raw).strip().lower()
     if text in {"-1", "reverse"}:
-        return True
-    return _parse_bool(raw, default=default)
+        return True, True
+    return _parse_bool(raw, default=default), False
+
+
+def _parse_one_way(raw: Any, default: bool) -> bool:
+    """Parse a canonical persisted one-way flag (already start -> end).
+
+    Reverse (``-1``) tags cannot be represented without swapping endpoints,
+    so they are rejected here; raw OSM tags go through ``_parse_osm_one_way``.
+    """
+    one_way, reverse_direction = _parse_osm_one_way(raw, default)
+    if reverse_direction:
+        raise ValueError(
+            f"Reverse one-way value {raw!r} is not a canonical edge direction"
+        )
+    return one_way
+
+
+def _validate_speed_limit_kmh(raw: Any) -> float:
+    """Return a canonical persisted speed limit exactly, as a positive float.
+
+    Persisted speeds were already parsed from OSM ``maxspeed``; they are not
+    re-clamped or rounded.  Booleans, non-numeric text, non-finite, and
+    non-positive values are rejected.
+    """
+    if isinstance(raw, bool):
+        raise ValueError(f"Invalid speed limit: {raw!r}")
+    if isinstance(raw, (int, float, np.integer, np.floating, str)):
+        try:
+            speed = float(raw)
+        except ValueError:
+            speed = math.nan
+        if math.isfinite(speed) and speed > 0.0:
+            return speed
+    raise ValueError(f"Invalid speed limit: {raw!r}")
+
+
+def _persisted_speed_limit_kmh(
+    raw: Any, road_type: str, *, legacy_text: bool
+) -> float:
+    """Resolve a stored edge speed, defaulting only when it was omitted.
+
+    ``legacy_text`` admits historical non-numeric strings (``"35 mph"``) via
+    the OSM ``maxspeed`` parser; numeric values are always kept exactly.
+    """
+    if raw is None:
+        return float(_ROAD_TYPE_SPEED_KMH.get(road_type, 50))
+    if legacy_text and isinstance(raw, str):
+        try:
+            float(raw)
+        except ValueError:
+            return float(_parse_speed_limit_kmh(raw, road_type))
+    return _validate_speed_limit_kmh(raw)
 
 
 def _parse_speed_limit_kmh(raw_speed: Any, road_type: str) -> int:

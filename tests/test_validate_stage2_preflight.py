@@ -66,22 +66,33 @@ def _write_handoff(
     root: Path,
     supplemental_split_rows: list[dict] | None = None,
     control_extra_identities: list[str] | None = None,
+    expanded_splits: list[str] | None = None,
+    benchmark_split_overrides: dict[int, str] | None = None,
+    unassigned_expanded: set[int] | None = None,
 ) -> Path:
     """Write a fully self-consistent synthetic stage-one handoff.
 
-    The expanded benchmark is 24 rows (19 train / 1 val / 4 test) to satisfy
-    the validator's hard-coded expanded-split contract; every other declared
-    count matches the artifact it names.
+    The expanded benchmark defaults to 24 rows (19 train / 1 val / 4 test),
+    each with fixed geographic split membership. ``expanded_splits`` changes
+    its size and composition; ``benchmark_split_overrides`` relabels a
+    benchmark row away from its fixed assignment; ``unassigned_expanded``
+    drops rows from the geographic splits. Every declared count matches the
+    artifact it names.
     """
     run = root / "run"
     run.mkdir(parents=True, exist_ok=True)
 
+    if expanded_splits is None:
+        expanded_splits = ["train"] * 19 + ["val"] + ["test"] * 4
+    overrides = benchmark_split_overrides or {}
+    unassigned = unassigned_expanded or set()
     expanded = []
     split_rows = []
-    for index in range(24):
-        split = "train" if index < 19 else ("val" if index == 19 else "test")
+    for index, split in enumerate(expanded_splits):
         identity = f"images/satellite/z14/expanded/exp{index:03d}.png"
-        expanded.append({"image_path": identity, "split": split})
+        expanded.append({"image_path": identity, "split": overrides.get(index, split)})
+        if index in unassigned:
+            continue
         split_rows.append(
             {"image_path": identity, "split": split, "z": 14, "x": 2000 + index, "y": 5000}
         )
@@ -382,6 +393,38 @@ def test_handoff_only_metrics_byte_compatible(
         "METRIC control_rows=6",
         "METRIC leakage_violations=0",
     ]
+
+
+def test_handoff_admits_expanded_benchmark_beyond_pilot_size(tmp_path: Path) -> None:
+    # Membership, not the obsolete 19/1/4 pilot composition, decides admission.
+    splits = ["train"] * 40 + ["val"] * 7 + ["test"] * 11
+    metrics = validate_handoff(_write_handoff(tmp_path, expanded_splits=splits))
+    assert metrics["expanded_rows"] == 58
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        (
+            {"benchmark_split_overrides": {19: "test"}},
+            "expanded benchmark split mismatch",
+        ),
+        (
+            {"unassigned_expanded": {3}},
+            "lacks fixed split membership",
+        ),
+        (
+            {"expanded_splits": ["train"] * 20 + ["test"] * 4},
+            "lacks train/val/test support",
+        ),
+    ],
+)
+def test_handoff_rejects_expanded_benchmark_membership_violations(
+    tmp_path: Path, kwargs: dict, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        validate_handoff(_write_handoff(tmp_path, **kwargs))
+
 
 
 def test_supplemental_requires_all_paired_args(

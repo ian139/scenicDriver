@@ -20,6 +20,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import tempfile
 import time
 from numbers import Integral
@@ -55,6 +56,7 @@ _FILTERED_INDEX_NAMES = (
     "filtered_index_artifact",
     "filtered_index_csv",
 )
+_TILE_IDENTITY_COORDS = re.compile(r"(?:^|/)z(-?\d+)/x(-?\d+)/y(-?\d+)$")
 
 
 @dataclass(frozen=True)
@@ -245,9 +247,11 @@ def _atomic_torch(path: Path, value: Mapping[str, Any]) -> None:
     fd, temporary = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
-    os.close(fd)
     try:
-        torch.save(dict(value), temporary)
+        with os.fdopen(fd, "wb") as handle:
+            torch.save(dict(value), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
     except BaseException:
         try:
@@ -474,6 +478,48 @@ def _resolve_baseline_checkpoint(
     return checkpoint.resolve(), actual
 
 
+def _bind_registry_active_checkpoint(
+    registry_path: Path,
+    active: Mapping[str, Any],
+    baseline_checkpoint: Path,
+    baseline_hash: str,
+) -> None:
+    """Require the handoff baseline to be the registry's active checkpoint.
+
+    ``active["checkpoint"]`` follows the registry convention: absolute paths
+    are used as-is; relative paths resolve against the registry directory, then
+    the working directory. The resolved file must be the handoff baseline file,
+    its bytes must hash to the baseline hash, and any recorded
+    ``active["sha256"]`` must equal that hash.
+    """
+
+    raw = _clean_text(active.get("checkpoint"))
+    if not raw:
+        raise ActiveTrainingError("registry-active checkpoint is not declared")
+    raw_path = Path(raw).expanduser()
+    candidates = (
+        [raw_path]
+        if raw_path.is_absolute()
+        else [registry_path.parent / raw_path, Path.cwd() / raw_path]
+    )
+    active_checkpoint = next(
+        (item for item in candidates if item.exists() and item.is_file()), None
+    )
+    if active_checkpoint is None:
+        raise ActiveTrainingError(f"registry-active checkpoint is missing: {raw}")
+    active_hash = _sha256_file(active_checkpoint).lower()
+    recorded = active.get("sha256")
+    if recorded is not None and _clean_text(recorded).lower() != active_hash:
+        raise ActiveTrainingError("registry-active checkpoint hash mismatch")
+    if (
+        active_checkpoint.resolve() != baseline_checkpoint.resolve()
+        or active_hash != baseline_hash.lower()
+    ):
+        raise ActiveTrainingError(
+            "baseline checkpoint is not the registry-active checkpoint"
+        )
+
+
 def _validate_handoff(
     handoff_path: str | Path,
 ) -> tuple[dict[str, Any], Path, dict[str, tuple[Path, str]]]:
@@ -543,6 +589,9 @@ def _validate_handoff(
     active = registry.get("active")
     if not isinstance(active, Mapping) or dict(active) != dict(baseline["active"]):
         raise ActiveTrainingError("baseline active record does not match registry")
+    _bind_registry_active_checkpoint(
+        registry_path, active, baseline_checkpoint, checkpoint_hash
+    )
     resolved["baseline_checkpoint"] = (baseline_checkpoint, checkpoint_hash)
 
     leakage = _artifact_entry(handoff, ("leakage_audit", "leakage_audit.json"))
@@ -694,34 +743,72 @@ def _split_values(frame: pd.DataFrame) -> dict[str, str]:
     return result
 
 
-def _geo_key(row: Mapping[str, Any]) -> str | None:
-    tile = _clean_text(row.get("tile_identity"))
-    if tile:
-        return f"tile:{tile}"
-    parts = [_clean_text(row.get(name)) for name in ("region", "z", "x", "y")]
-    if all(parts):
+def _physical_tile(row: Mapping[str, Any]) -> tuple[int, int, int] | None:
+    """Return a row's region-independent physical ``(z, x, y)`` tile.
+
+    Integer ``z``/``x``/``y`` columns are authoritative. A supplied
+    region-qualified ``tile_identity`` (``<region>/z<z>/x<x>/y<y>``) only
+    contributes its trailing coordinates and must agree with the columns; the
+    region prefix never distinguishes physical tiles.
+    """
+
+    texts = [_clean_text(row.get(name)) for name in ("z", "x", "y")]
+    coords: tuple[int, int, int] | None = None
+    if all(texts):
         try:
-            parts[1:] = [str(int(float(value))) for value in parts[1:]]
-        except (TypeError, ValueError):
-            pass
-        return "tile:" + "/".join(parts)
-    return None
+            numbers = [float(text) for text in texts]
+        except ValueError as exc:
+            raise ActiveTrainingError("candidate z/x/y must be integers") from exc
+        if any(not math.isfinite(value) or value != int(value) for value in numbers):
+            raise ActiveTrainingError("candidate z/x/y must be integers")
+        coords = (int(numbers[0]), int(numbers[1]), int(numbers[2]))
+    match = _TILE_IDENTITY_COORDS.search(_clean_text(row.get("tile_identity")))
+    parsed = (
+        (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        if match
+        else None
+    )
+    if coords is not None and parsed is not None and coords != parsed:
+        raise ActiveTrainingError(
+            f"tile_identity disagrees with z/x/y for {_clean_text(row.get('image_path'))}"
+        )
+    return coords if coords is not None else parsed
 
 
 def _validate_geographic_leakage(
     candidate: pd.DataFrame, selected: Sequence[int], splits: Mapping[str, str]
 ) -> None:
+    """Reject split leakage by physical tile, adjacency, or declared group.
+
+    Physical identity ignores region names, so the same or an adjacent z/x/y
+    tile cannot appear in different splits under different regions. Rows
+    without coordinates fall back to their exact ``tile_identity`` text.
+    """
+
     rows = candidate.iloc[list(selected)]
-    by_key: dict[str, str] = {}
+    coords: dict[tuple[int, int, int], str] = {}
+    by_identity: dict[str, str] = {}
     for _, row in rows.iterrows():
         image_path = _clean_text(row.get("image_path"))
         split = splits[image_path]
-        key = _geo_key(row)
-        if key is not None:
-            prior = by_key.get(key)
+        physical = _physical_tile(row)
+        if physical is not None:
+            prior = coords.get(physical)
             if prior is not None and prior != split:
-                raise ActiveTrainingError(f"geographic leakage across splits for {key}")
-            by_key[key] = split
+                raise ActiveTrainingError(
+                    "geographic leakage across splits for physical tile "
+                    f"z{physical[0]}/x{physical[1]}/y{physical[2]}"
+                )
+            coords[physical] = split
+            continue
+        identity = _clean_text(row.get("tile_identity"))
+        if identity:
+            prior = by_identity.get(identity)
+            if prior is not None and prior != split:
+                raise ActiveTrainingError(
+                    f"geographic leakage across splits for tile:{identity}"
+                )
+            by_identity[identity] = split
     for column in ("geographic_group", "geo_group", "block", "group"):
         if column not in rows.columns:
             continue
@@ -738,35 +825,41 @@ def _validate_geographic_leakage(
                     f"geographic leakage across splits for {column}={group}"
                 )
             groups[group] = split
-    if not {"region", "z", "x", "y"}.issubset(rows.columns):
-        return
-    coords: dict[tuple[str, int, int, int], str] = {}
-    for _, row in rows.iterrows():
-        try:
-            key = (
-                _clean_text(row["region"]),
-                int(float(row["z"])),
-                int(float(row["x"])),
-                int(float(row["y"])),
-            )
-        except (TypeError, ValueError):
-            continue
-        image_path = _clean_text(row["image_path"])
-        split = splits[image_path]
-        prior = coords.get(key)
-        if prior is not None and prior != split:
-            raise ActiveTrainingError(f"geographic leakage across splits for {key}")
-        coords[key] = split
-    for (region, z, x, y), split in coords.items():
+    for (z, x, y), split in coords.items():
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 if dx == 0 and dy == 0:
                     continue
-                adjacent_split = coords.get((region, z, x + dx, y + dy))
+                adjacent_split = coords.get((z, x + dx, y + dy))
                 if adjacent_split is not None and adjacent_split != split:
                     raise ActiveTrainingError(
                         "adjacent geographic tiles leak across splits"
                     )
+
+
+def _deduplicate_physical_tiles(
+    candidate: pd.DataFrame, selected: Sequence[int], labels: Sequence[str]
+) -> list[int]:
+    """Return positions keeping one row per physical tile.
+
+    Leakage validation has already proven duplicates share a split. A human
+    label wins over a weak one; otherwise the first row in prepared order is
+    kept. Rows without physical coordinates are always kept.
+    """
+
+    tiles = [_physical_tile(candidate.iloc[index]) for index in selected]
+    chosen: dict[tuple[int, int, int], int] = {}
+    for position, physical in enumerate(tiles):
+        if physical is None:
+            continue
+        prior = chosen.get(physical)
+        if prior is None or (labels[prior] != "human" and labels[position] == "human"):
+            chosen[physical] = position
+    return [
+        position
+        for position, physical in enumerate(tiles)
+        if physical is None or chosen[physical] == position
+    ]
 
 
 def _validate_splits_for_selected(
@@ -1013,6 +1106,11 @@ def prepare_active_dataset(
     means in [0, 10], and nonempty train rows. Only ``split=train`` identities
     merge into the output targets with base weight 4 and ``label_source``
     ``"human"``; val/test output rows are never rewritten.
+
+    Geographic leakage is checked on region-independent physical z/x/y tiles,
+    including adjacent tiles. Rows sharing one physical tile (necessarily in
+    the same split) collapse to one prepared row, preferring a human label and
+    then prepared order; ``dropped_physical_duplicates`` counts the removals.
     """
 
     handoff, source, resolved = _validate_handoff(handoff_path)
@@ -1183,6 +1281,14 @@ def prepare_active_dataset(
             weights[index] = 4.0
             labels[index] = "human"
             changed_rows += 1
+    kept_positions = _deduplicate_physical_tiles(candidate, selected, labels)
+    dropped_physical_duplicates = len(selected) - len(kept_positions)
+    selected = [selected[position] for position in kept_positions]
+    feature_rows = [feature_rows[position] for position in kept_positions]
+    candidate_paths = [candidate_paths[position] for position in kept_positions]
+    targets = [targets[position] for position in kept_positions]
+    weights = [weights[position] for position in kept_positions]
+    labels = [labels[position] for position in kept_positions]
     regions = [
         _clean_text(candidate.iloc[index].get("region")) or "unknown"
         for index in selected
@@ -1264,6 +1370,7 @@ def prepare_active_dataset(
             "object_hashes": handoff.get("object_hashes"),
             "counts": counts,
             "dropped_without_split": dropped_without_split,
+            "dropped_physical_duplicates": dropped_physical_duplicates,
             "changed_rows": changed_rows,
             "supplemental_benchmark": (
                 {
@@ -1542,6 +1649,7 @@ def _checkpoint_payload(
         "global_step": int(global_step),
         "dataset_sha256": dataset_hash,
         "split_sha256": split_hash,
+        "split_artifact_sha256": split_hash,
         "config_hash": config_hash,
         "initial_checkpoint_sha256": initial_checkpoint_sha256,
         "human_sample_weight_multiplier": float(human_sample_weight_multiplier),
@@ -1559,8 +1667,10 @@ def _metrics(
     indices: np.ndarray,
     device: str,
     use_sample_weights: bool,
+    batch_size: int = 256,
 ) -> dict[str, float]:
-    model.eval()
+    """Evaluate in bounded device batches without changing the caller's mode."""
+    was_training = model.training
     use_cuda = str(device).startswith("cuda")
 
     def move(values: np.ndarray) -> torch.Tensor:
@@ -1569,17 +1679,26 @@ def _metrics(
             tensor = tensor.pin_memory()
         return tensor.to(device, non_blocking=use_cuda)
 
-    with torch.inference_mode(), torch.autocast(device_type="cuda", enabled=use_cuda):
-        vit = move(np.asarray(arrays["vit_embeddings"])[indices])
-        terrain = move(np.asarray(arrays["terrain_features"])[indices])
-        logits = move(np.asarray(arrays["class_logits"])[indices])
-        target = np.asarray(arrays["scenic_scores"])[indices].astype(
-            np.float32, copy=False
-        )
-        weight = np.asarray(arrays["sample_weights"])[indices].astype(
-            np.float32, copy=False
-        )
-        prediction = model(vit, terrain, logits).float().cpu().numpy().reshape(-1)
+    target = np.asarray(arrays["scenic_scores"])[indices].astype(
+        np.float32, copy=False
+    )
+    weight = np.asarray(arrays["sample_weights"])[indices].astype(
+        np.float32, copy=False
+    )
+    prediction = np.empty(len(indices), dtype=np.float32)
+    model.eval()
+    try:
+        with torch.inference_mode(), torch.autocast(device_type="cuda", enabled=use_cuda):
+            for start in range(0, len(indices), batch_size):
+                batch_indices = indices[start : start + batch_size]
+                vit = move(np.asarray(arrays["vit_embeddings"])[batch_indices])
+                terrain = move(np.asarray(arrays["terrain_features"])[batch_indices])
+                logits = move(np.asarray(arrays["class_logits"])[batch_indices])
+                prediction[start : start + len(batch_indices)] = (
+                    model(vit, terrain, logits).float().cpu().numpy().reshape(-1)
+                )
+    finally:
+        model.train(was_training)
     error = prediction - target
     metric_weight = weight if use_sample_weights else np.ones_like(weight)
     denominator = float(metric_weight.sum())
@@ -1811,6 +1930,119 @@ def _resume_counter(
     return parsed
 
 
+def _resume_bundle_identity(bundle: Mapping[str, Any]) -> tuple[str, int]:
+    """Return the run id and monotonically increasing generation of ``resume.pt``."""
+
+    run_id = bundle.get("run_id")
+    generation = bundle.get("resume_generation")
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or isinstance(generation, (bool, np.bool_))
+        or not isinstance(generation, Integral)
+        or int(generation) < 1
+    ):
+        raise ActiveTrainingError("resume checkpoint generation identity is invalid")
+    return run_id, int(generation)
+
+
+def _bundle_summary_record(
+    bundle: Mapping[str, Any], state: str
+) -> Mapping[str, Any]:
+    run_id, generation = _resume_bundle_identity(bundle)
+    record = bundle.get("summary_record")
+    if (
+        not isinstance(record, Mapping)
+        or record.get("run_id") != run_id
+        or record.get("resume_generation") != generation
+        or record.get("state") != state
+        or bundle.get("checkpoint_state") != state
+    ):
+        raise ActiveTrainingError("resume checkpoint summary record is invalid")
+    return record
+
+
+def _publish_summary(
+    summary_path: Path, resume_path: Path, record: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Publish the summary sidecar for the generation committed in ``resume_path``.
+
+    ``resume.pt`` is the single commit point. The sidecar is derived from the
+    record embedded in that generation plus the hash of the committed file, so
+    a crash between the two writes is repaired by republishing on resume.
+    """
+
+    resume_sha = _sha256_file(resume_path)
+    summary = dict(record)
+    hashes = summary.get("hashes")
+    summary["hashes"] = {
+        **(dict(hashes) if isinstance(hashes, Mapping) else {}),
+        "resume_checkpoint": resume_sha,
+    }
+    summary["resume_checkpoint_sha256"] = resume_sha
+    published = _jsonable(summary)
+    _atomic_json(summary_path, published)
+    return published
+
+
+def _admit_resume_generation(
+    summary_path: Path, resume_path: Path, device: str
+) -> tuple[Mapping[str, Any] | None, dict[str, Any] | None]:
+    """Load the authoritative resume generation and its matching summary.
+
+    Returns ``(bundle, summary)``. ``summary`` is ``None`` when it is absent,
+    belongs to a superseded run, or publishes an older generation of the same
+    run (a crash after the generation commit and before sidecar publication).
+    When ``resume.pt`` is absent the raw summary is returned for completed
+    reuse. A same-run summary that is ahead of the checkpoint, or a failed
+    same-run summary, fails closed.
+    """
+
+    summary = (
+        _load_json(summary_path, "training summary") if summary_path.exists() else None
+    )
+    if not resume_path.exists():
+        return None, summary
+    bundle = _torch_load(resume_path, device)
+    run_id, generation = _resume_bundle_identity(bundle)
+    if summary is None or summary.get("run_id") != run_id:
+        return bundle, None
+    if summary.get("state") == "failed":
+        raise ActiveTrainingError("failed training run is not resumable")
+    summary_generation = summary.get("resume_generation")
+    if isinstance(summary_generation, (bool, np.bool_)) or not isinstance(
+        summary_generation, Integral
+    ):
+        raise ActiveTrainingError("training summary resume_generation is invalid")
+    if int(summary_generation) > generation:
+        raise ActiveTrainingError(
+            "training summary is ahead of the resume checkpoint generation"
+        )
+    if int(summary_generation) < generation:
+        return bundle, None
+    return bundle, summary
+
+
+def _recover_completed_publication(
+    summary_path: Path,
+    resume_path: Path,
+    candidate_path: Path,
+    bundle: Mapping[str, Any],
+) -> dict[str, Any]:
+    record = _bundle_summary_record(bundle, "completed")
+    expected = bundle.get("candidate_checkpoint_sha256")
+    if (
+        not isinstance(expected, str)
+        or record.get("candidate_checkpoint_sha256") != expected
+        or not candidate_path.exists()
+        or _sha256_file(candidate_path) != expected
+    ):
+        raise ActiveTrainingError(
+            "completed resume checkpoint does not match the candidate checkpoint"
+        )
+    return _publish_summary(summary_path, resume_path, record)
+
+
 def train_active_model(
     dataset_path: str | Path,
     split_csv: str | Path,
@@ -1878,13 +2110,21 @@ def train_active_model(
         "hidden_dim": int(config.hidden_dim),
     }
 
+    resume_bundle: Mapping[str, Any] | None = None
+    summary_data: dict[str, Any] | None = None
     if resume:
-        if not summary_path.exists():
-            raise ActiveTrainingError(
-                "resume requested but training summary does not exist"
+        resume_bundle, summary_data = _admit_resume_generation(
+            summary_path, resume_path, device
+        )
+        if (
+            summary_data is None
+            and resume_bundle is not None
+            and resume_bundle.get("checkpoint_state") == "completed"
+        ):
+            summary_data = _recover_completed_publication(
+                summary_path, resume_path, candidate_path, resume_bundle
             )
-        summary_data = _load_json(summary_path, "training summary")
-        summary_state = summary_data.get("state")
+        summary_state = summary_data.get("state") if summary_data else None
         if summary_state == "completed" and candidate_path.exists():
             return _load_completed_summary(
                 summary_path,
@@ -1897,36 +2137,35 @@ def train_active_model(
                 human_sample_weight_multiplier=human_weight_multiplier,
                 human_only_training=human_only_training,
             )
-        if summary_state == "failed":
-            raise ActiveTrainingError("failed training run is not resumable")
-        if summary_state != "paused":
-            raise ActiveTrainingError("training summary is not in paused state")
-        if summary_data.get("schema_version") != DATASET_SCHEMA_VERSION:
-            raise ActiveTrainingError("training summary schema version mismatch")
-        if (
-            summary_data.get("dataset_sha256") != dataset_hash
-            or summary_data.get("split_sha256") != split_hash
-            or summary_data.get("config_hash") != config_hash
-        ):
-            raise ActiveTrainingError("training summary input hash mismatch")
-        if not resume_path.exists():
+        if resume_bundle is None:
             raise ActiveTrainingError(
                 "resume requested but no continuation checkpoint exists"
             )
-        hashes_obj = summary_data.get("hashes")
-        expected_resume_hash = _clean_text(
-            summary_data.get("resume_checkpoint_sha256")
-            or (
-                hashes_obj.get("resume_checkpoint")
-                if isinstance(hashes_obj, Mapping)
-                else None
-            )
-        ).lower()
-        actual_resume_hash = _sha256_file(resume_path).lower()
-        if not expected_resume_hash or actual_resume_hash != expected_resume_hash:
-            raise ActiveTrainingError(
-                "resume checkpoint hash mismatch against training summary"
-            )
+        if summary_data is not None:
+            if summary_state != "paused":
+                raise ActiveTrainingError("training summary is not in paused state")
+            if summary_data.get("schema_version") != DATASET_SCHEMA_VERSION:
+                raise ActiveTrainingError("training summary schema version mismatch")
+            if (
+                summary_data.get("dataset_sha256") != dataset_hash
+                or summary_data.get("split_sha256") != split_hash
+                or summary_data.get("config_hash") != config_hash
+            ):
+                raise ActiveTrainingError("training summary input hash mismatch")
+            hashes_obj = summary_data.get("hashes")
+            expected_resume_hash = _clean_text(
+                summary_data.get("resume_checkpoint_sha256")
+                or (
+                    hashes_obj.get("resume_checkpoint")
+                    if isinstance(hashes_obj, Mapping)
+                    else None
+                )
+            ).lower()
+            actual_resume_hash = _sha256_file(resume_path).lower()
+            if not expected_resume_hash or actual_resume_hash != expected_resume_hash:
+                raise ActiveTrainingError(
+                    "resume checkpoint hash mismatch against training summary"
+                )
     splits_counts = {key: int(len(value)) for key, value in splits.items()}
     metric_splits = (
         ("train", "val", "test")
@@ -1998,9 +2237,11 @@ def train_active_model(
     scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
     history: list[dict[str, Any]] = []
     next_epoch = next_batch = global_step = 0
+    num_train_batches = math.ceil(len(splits["train"]) / int(config.batch_size))
+    run_id, generation = os.urandom(16).hex(), 0
 
-    if resume:
-        checkpoint = _torch_load(resume_path, device)
+    if resume_bundle is not None:
+        checkpoint = resume_bundle
         required = {
             "checkpoint_schema_version",
             "checkpoint_state",
@@ -2075,42 +2316,85 @@ def train_active_model(
             raise ActiveTrainingError(
                 "resume checkpoint model or optimizer state is invalid"
             ) from exc
-        num_train_batches = math.ceil(len(splits["train"]) / int(config.batch_size))
-        next_epoch = _resume_counter(checkpoint, "next_epoch", int(config.epochs))
+        next_epoch = _resume_counter(
+            checkpoint, "next_epoch", int(config.epochs), inclusive=True
+        )
         next_batch = _resume_counter(
             checkpoint, "next_batch", num_train_batches, inclusive=True
         )
+        if next_epoch == int(config.epochs) and next_batch != 0:
+            raise ActiveTrainingError(
+                "resume checkpoint final epoch cursor must have next_batch 0"
+            )
         global_step = _resume_counter(checkpoint, "global_step", None)
         expected_global_step = next_epoch * num_train_batches + next_batch
         if global_step != expected_global_step:
             raise ActiveTrainingError(
                 "resume checkpoint global_step is inconsistent with epoch and batch cursors"
             )
-        history = [dict(item) for item in checkpoint.get("history", [])]
+        raw_history = checkpoint.get("history")
+        if (
+            not isinstance(raw_history, list)
+            or len(raw_history) != next_epoch
+            or not all(isinstance(item, Mapping) for item in raw_history)
+        ):
+            raise ActiveTrainingError(
+                "resume checkpoint history is inconsistent with the epoch cursor"
+            )
+        history = [dict(item) for item in raw_history]
         _restore_rng_state(checkpoint["rng_state"])
+        run_id, generation = _resume_bundle_identity(checkpoint)
+        if summary_data is None and checkpoint.get("summary_record") is not None:
+            _publish_summary(
+                summary_path,
+                resume_path,
+                _bundle_summary_record(checkpoint, "paused"),
+            )
     starting_global_step = global_step
-    if not resume:
+
+    def current_payload(checkpoint_state: str) -> dict[str, Any]:
+        return _checkpoint_payload(
+            model,
+            optimizer,
+            scaler=scaler,
+            state=checkpoint_state,
+            next_epoch=next_epoch,
+            next_batch=next_batch,
+            global_step=global_step,
+            dataset_hash=dataset_hash,
+            split_hash=split_hash,
+            config_hash=config_hash,
+            architecture=architecture,
+            counts=splits_counts,
+            history=history,
+            initial_checkpoint_sha256=initial_checkpoint_sha256,
+            human_sample_weight_multiplier=human_weight_multiplier,
+            human_only_training=human_only_training,
+        )
+
+    def commit(
+        payload: Mapping[str, Any],
+        *,
+        summary_record: Mapping[str, Any] | None = None,
+        candidate_sha256: str | None = None,
+    ) -> None:
+        """Atomically publish the next resume generation as the commit point."""
+
+        nonlocal generation
         _atomic_torch(
             resume_path,
-            _checkpoint_payload(
-                model,
-                optimizer,
-                scaler=scaler,
-                state="paused",
-                next_epoch=next_epoch,
-                next_batch=next_batch,
-                global_step=global_step,
-                dataset_hash=dataset_hash,
-                split_hash=split_hash,
-                config_hash=config_hash,
-                architecture=architecture,
-                counts=splits_counts,
-                history=history,
-                initial_checkpoint_sha256=initial_checkpoint_sha256,
-                human_sample_weight_multiplier=human_weight_multiplier,
-                human_only_training=human_only_training,
-            ),
+            {
+                **payload,
+                "run_id": run_id,
+                "resume_generation": generation + 1,
+                "summary_record": summary_record,
+                "candidate_checkpoint_sha256": candidate_sha256,
+            },
         )
+        generation += 1
+
+    if resume_bundle is None:
+        commit(current_payload("paused"))
 
     started = time.monotonic()
     steps_this_invocation = 0
@@ -2118,11 +2402,7 @@ def train_active_model(
     try:
         while next_epoch < int(config.epochs):
             train_indices = splits["train"]
-            batch_start = next_batch * int(config.batch_size)
-            if batch_start >= len(train_indices):
-                next_epoch, next_batch = next_epoch + 1, 0
-                continue
-            while batch_start < len(train_indices):
+            while next_batch < num_train_batches:
                 if config.max_steps is not None and steps_this_invocation >= int(
                     config.max_steps
                 ):
@@ -2133,6 +2413,7 @@ def train_active_model(
                 ) >= float(config.max_seconds):
                     state, stop_reason = "paused", "max_seconds"
                     break
+                batch_start = next_batch * int(config.batch_size)
                 batch_indices = train_indices[
                     batch_start : batch_start + int(config.batch_size)
                 ]
@@ -2150,6 +2431,10 @@ def train_active_model(
                     np.asarray(arrays["scenic_scores"])[batch_indices]
                 ).reshape(-1, 1)
                 weights = move(training_weights[batch_indices]).reshape(-1, 1)
+                # Resumed runs rebuild the model in train mode; pin the same mode
+                # on every step so continuous and resumed runs draw identical
+                # dropout masks from the restored RNG state.
+                model.train()
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type="cuda", enabled=use_cuda):
                     prediction = model(vit, terrain, logits)
@@ -2173,41 +2458,7 @@ def train_active_model(
                     steps_this_invocation + 1,
                     next_batch + 1,
                 )
-                batch_start += len(batch_indices)
-                _atomic_torch(
-                    resume_path,
-                    _checkpoint_payload(
-                        model,
-                        optimizer,
-                        scaler=scaler,
-                        state="paused",
-                        next_epoch=next_epoch,
-                        next_batch=next_batch,
-                        global_step=global_step,
-                        dataset_hash=dataset_hash,
-                        split_hash=split_hash,
-                        config_hash=config_hash,
-                        architecture=architecture,
-                        counts=splits_counts,
-                        history=history,
-                        initial_checkpoint_sha256=initial_checkpoint_sha256,
-                        human_sample_weight_multiplier=human_weight_multiplier,
-                        human_only_training=human_only_training,
-                    ),
-                )
-                if next_batch * int(config.batch_size) >= len(train_indices):
-                    next_epoch, next_batch = next_epoch + 1, 0
-                    break
-                if config.max_steps is not None and steps_this_invocation >= int(
-                    config.max_steps
-                ):
-                    state, stop_reason = "paused", "max_steps"
-                    break
-                if config.max_seconds is not None and (
-                    time.monotonic() - started
-                ) >= float(config.max_seconds):
-                    state, stop_reason = "paused", "max_seconds"
-                    break
+                commit(current_payload("paused"))
             if state == "paused":
                 break
             if config.max_seconds is not None and (time.monotonic() - started) >= float(
@@ -2225,14 +2476,28 @@ def train_active_model(
                             splits[split],
                             device,
                             config.use_sample_weights,
+                            batch_size=int(config.batch_size),
                         )
                         for split in metric_splits
                     },
                 }
             )
+            next_epoch, next_batch = next_epoch + 1, 0
+            commit(current_payload("paused"))
         if next_epoch < int(config.epochs):
             state = "paused"
             stop_reason = stop_reason or "budget"
+        metrics = (
+            {
+                split: _metrics(
+                    model, arrays, splits[split], device, config.use_sample_weights,
+                    batch_size=int(config.batch_size),
+                )
+                for split in metric_splits
+            }
+            if state == "completed"
+            else {}
+        )
     except (TimeoutError, KeyboardInterrupt) as exc:
         committed = _torch_load(resume_path, device)
         try:
@@ -2250,9 +2515,11 @@ def train_active_model(
             raise ActiveTrainingError(
                 "last committed resume checkpoint cannot be restored after interruption"
             ) from restore_exc
+        _, generation = _resume_bundle_identity(committed)
         steps_this_invocation = global_step - starting_global_step
         state = "paused"
         stop_reason = f"interrupted: {type(exc).__name__}"
+        metrics = {}
     except Exception as exc:
         state, stop_reason = "failed", f"{type(exc).__name__}: {exc}"
         _atomic_json(
@@ -2268,21 +2535,13 @@ def train_active_model(
                     "human_only_training": human_only_training,
                     "counts": splits_counts,
                     "global_step": global_step,
+                    "run_id": run_id,
+                    "resume_generation": generation,
                     "hashes": {"dataset": dataset_hash, "split": split_hash},
                 }
             ),
         )
         raise
-    metrics = (
-        {
-            split: _metrics(
-                model, arrays, splits[split], device, config.use_sample_weights
-            )
-            for split in metric_splits
-        }
-        if state == "completed"
-        else {}
-    )
     summary: dict[str, Any] = {
         "schema_version": DATASET_SCHEMA_VERSION,
         "state": state,
@@ -2328,67 +2587,23 @@ def train_active_model(
         ],
     }
     if state == "completed":
-        payload = _checkpoint_payload(
-            model,
-            optimizer,
-            scaler=scaler,
-            state="completed",
-            next_epoch=next_epoch,
-            next_batch=next_batch,
-            global_step=global_step,
-            dataset_hash=dataset_hash,
-            split_hash=split_hash,
-            config_hash=config_hash,
-            architecture=architecture,
-            counts=splits_counts,
-            history=history,
-            initial_checkpoint_sha256=initial_checkpoint_sha256,
-            human_sample_weight_multiplier=human_weight_multiplier,
-            human_only_training=human_only_training,
-        )
+        payload = current_payload("completed")
         _atomic_torch(candidate_path, payload)
-        _atomic_torch(resume_path, payload)
-        summary["candidate_checkpoint_sha256"], summary["resume_checkpoint_sha256"] = (
-            _sha256_file(candidate_path),
-            _sha256_file(resume_path),
-        )
+        candidate_sha256: str | None = _sha256_file(candidate_path)
         summary["hashes"] = {
             "dataset": dataset_hash,
             "split": split_hash,
-            "candidate_checkpoint": summary["candidate_checkpoint_sha256"],
-            "resume_checkpoint": summary["resume_checkpoint_sha256"],
+            "candidate_checkpoint": candidate_sha256,
         }
     else:
-        _atomic_torch(
-            resume_path,
-            _checkpoint_payload(
-                model,
-                optimizer,
-                scaler=scaler,
-                state="paused",
-                next_epoch=next_epoch,
-                next_batch=next_batch,
-                global_step=global_step,
-                dataset_hash=dataset_hash,
-                split_hash=split_hash,
-                config_hash=config_hash,
-                architecture=architecture,
-                counts=splits_counts,
-                history=history,
-                initial_checkpoint_sha256=initial_checkpoint_sha256,
-                human_sample_weight_multiplier=human_weight_multiplier,
-                human_only_training=human_only_training,
-            ),
-        )
-        summary["candidate_checkpoint_sha256"] = None
-        summary["resume_checkpoint_sha256"] = _sha256_file(resume_path)
-        summary["hashes"] = {
-            "dataset": dataset_hash,
-            "split": split_hash,
-            "resume_checkpoint": summary["resume_checkpoint_sha256"],
-        }
-    _atomic_json(summary_path, _jsonable(summary))
-    return _jsonable(summary)
+        payload = current_payload("paused")
+        candidate_sha256 = None
+        summary["hashes"] = {"dataset": dataset_hash, "split": split_hash}
+    summary["candidate_checkpoint_sha256"] = candidate_sha256
+    summary["run_id"], summary["resume_generation"] = run_id, generation + 1
+    record = _jsonable(summary)
+    commit(payload, summary_record=record, candidate_sha256=candidate_sha256)
+    return _publish_summary(summary_path, resume_path, record)
 
 
 def _parse_args() -> argparse.Namespace:

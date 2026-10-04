@@ -82,12 +82,7 @@ def _write_metadata(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 def _make_pool(tmp_path: Path) -> dict[str, object]:
-    """Synthetic feature pool with shuffled metadata order.
-
-    The metadata CSV rows are emitted in a shuffled embedding_row_index order
-    while the NPZ row_indices stay contiguous 0..n-1, so any positional
-    (non-index) row alignment fails the strict-alignment test.
-    """
+    """Synthetic feature pool using canonical original metadata row order."""
     rng = np.random.default_rng(7)
     embeddings = rng.standard_normal((N_TILES, VIT_DIM)).astype(np.float32)
     terrain = rng.standard_normal((N_TILES, TERRAIN_DIM)).astype(np.float32)
@@ -105,10 +100,8 @@ def _make_pool(tmp_path: Path) -> dict[str, object]:
     ckpt_path = tmp_path / "candidate.pt"
     _save_checkpoint(ckpt_path)
 
-    shuffled = list(range(N_TILES))
-    rng.shuffle(shuffled)
     rows: list[dict[str, object]] = []
-    for idx in shuffled:
+    for idx in range(N_TILES):
         region = REGIONS[idx % 2]
         x = 4800 + idx // 100
         y = 5700 + idx
@@ -295,7 +288,7 @@ def test_export_writes_standard_outputs(
 
 
 def test_row_mapping_strict_alignment(pool: dict[str, object], tmp_path: Path) -> None:
-    """Predictions must follow embedding_row_index, not CSV row position."""
+    """Predictions must follow the original-row/dense-feature index contract."""
     from src.scenic_scorer.active_evaluation import (
         load_model_checkpoint,
         predict_dataset,
@@ -414,7 +407,7 @@ def test_class_id_mismatch_fails_closed(
 def test_missing_row_index_fails_closed(
     pool: dict[str, object], tmp_path: Path
 ) -> None:
-    rows = [dict(r) for r in pool["rows"]][1:]  # drop embedding_row_index 0
+    rows = [dict(r) for r in pool["rows"]][:-1]  # drop the final original row
     meta_path = tmp_path / "missing_idx.csv"
     _write_metadata(meta_path, rows)
     with pytest.raises(ValueError, match="expected exactly"):
@@ -715,3 +708,270 @@ def test_export_union_compatibility(pool: dict[str, object], tmp_path: Path) -> 
     with pytest.raises(ValueError, match="'classifier_checkpoint'"):
         union_reports([out_root / "run_a", out_root / "run_c"])
     assert res["summary"]["total_tiles"] == N_TILES
+
+
+def test_sparse_original_rows_map_predictions(pool: dict[str, object], tmp_path: Path) -> None:
+    from src.scenic_scorer.active_evaluation import load_model_checkpoint, predict_dataset
+
+    originals = np.array([19, 3, 22, 8], dtype=np.int64)
+    rows = [dict(row) for row in pool["rows"]]
+    for row in rows:
+        row["embedding_row_index"] = -1
+    for feature, original in enumerate(originals):
+        rows[original]["embedding_row_index"] = feature
+    _write_metadata(pool["meta"], rows)
+    np.savez(
+        pool["npz"],
+        embeddings=pool["embeddings"][originals],
+        terrain_features=pool["terrain"][originals],
+        class_logits=pool["class_logits"][originals],
+        row_indices=originals,
+    )
+    result = _export(pool, tmp_path / "runs")
+    labels = _read_labels(Path(result["run_dir"]) / "labels.csv")
+    model = load_model_checkpoint(pool["ckpt"], device="cpu", is_candidate=True)
+    predictions = predict_dataset(
+        model, pool["embeddings"][originals], pool["terrain"][originals],
+        pool["class_logits"][originals], batch_size=7, device="cpu",
+    )
+    assert [row["image_path"] for row in labels] == [rows[i]["image_path"] for i in originals]
+    np.testing.assert_allclose([float(row["scenic_score"]) for row in labels], predictions)
+
+
+@pytest.mark.parametrize("indices", [[0, 0], [-1, 1], [0, N_TILES]])
+def test_invalid_original_rows_fail_closed(pool, tmp_path, indices) -> None:
+    np.savez(
+        pool["npz"], embeddings=pool["embeddings"][:2],
+        terrain_features=pool["terrain"][:2], class_logits=pool["class_logits"][:2],
+        row_indices=np.array(indices, dtype=np.int64),
+    )
+    with pytest.raises(ValueError, match="row_indices|expected exactly"):
+        _export(pool, tmp_path / "runs")
+    assert not (tmp_path / "runs" / "test_run").exists()
+
+
+def _regression_export(tmp_path, paths=("train", "test-b", "test-a", "validation")):
+    path = tmp_path / "regression.npz"
+    n = len(paths)
+    np.savez(
+        path, vit_embeddings=np.arange(n, dtype=np.float32).reshape(n, 1),
+        terrain_features=np.zeros((n, 1), dtype=np.float32),
+        class_logits=np.zeros((n, 1), dtype=np.float32),
+        scenic_scores=np.full(n, 5, dtype=np.float32),
+        image_paths=np.array(paths),
+    )
+    return path
+
+
+def _benchmark_files(tmp_path):
+    import pandas as pd
+
+    split_path = tmp_path / "benchmark.csv"
+    labels_path = tmp_path / "mixed.csv"
+    pd.DataFrame({
+        "image_path": ["test-a", "validation", "train", "test-b"],
+        "split": ["test", "validation", "train", "test"],
+    }).to_csv(split_path, index=False)
+    pd.DataFrame({
+        "image_path": ["validation", "test-a", "train", "test-b", "skipped-export"],
+        "scenic_score": [5, 5, 5, 5, 5],
+        "scenic_human": [6, 2, np.nan, 8, np.nan],
+    }).to_csv(labels_path, index=False)
+    return labels_path, split_path
+
+
+def test_baseline_excludes_fixed_heldout_by_exact_export_identity(tmp_path) -> None:
+    from scripts.modeling.train_regression_baseline import training_arrays
+
+    dataset = _regression_export(tmp_path, ("train", "test-b", "test-a", "validation", "other/test-a"))
+    _, split = _benchmark_files(tmp_path)
+    arrays = training_arrays(dataset, split)
+    assert arrays["image_paths"].tolist() == ["train", "other/test-a"]
+    assert arrays["vit_embeddings"].ravel().tolist() == [0, 4]
+
+
+def test_benchmark_uses_human_targets_with_reordered_and_skipped_exports(tmp_path) -> None:
+    from scripts.modeling.compare_regression_on_benchmark import benchmark_dataset
+
+    dataset = _regression_export(tmp_path)
+    labels, split = _benchmark_files(tmp_path)
+    selected = benchmark_dataset(dataset, labels, split)
+    assert [float(selected[i][0][0]) for i in range(len(selected))] == [2, 1]
+    assert [float(selected[i][3][0]) for i in range(len(selected))] == [2, 8]
+
+
+@pytest.mark.parametrize("problem", ["missing", "duplicate", "weak-only", "nan", "out-of-range", "duplicate-split"])
+def test_benchmark_rejects_incomplete_or_nonhuman_population(tmp_path, problem) -> None:
+    import pandas as pd
+    from scripts.modeling.compare_regression_on_benchmark import benchmark_dataset
+
+    paths = ("train", "test-a", "validation") if problem == "missing" else (
+        ("train", "test-a", "test-a", "test-b") if problem == "duplicate"
+        else ("train", "test-b", "test-a", "validation")
+    )
+    dataset = _regression_export(tmp_path, paths)
+    labels, split = _benchmark_files(tmp_path)
+    frame = pd.read_csv(labels)
+    if problem == "weak-only":
+        frame = frame.drop(columns="scenic_human")
+    elif problem in {"nan", "out-of-range"}:
+        frame.loc[frame["image_path"] == "test-a", "scenic_human"] = (
+            np.nan if problem == "nan" else 11
+        )
+    frame.to_csv(labels, index=False)
+    if problem == "duplicate-split":
+        frame = pd.read_csv(split)
+        pd.concat([frame, frame.iloc[:1]]).to_csv(split, index=False)
+    with pytest.raises(ValueError, match="absent|duplicate|human score"):
+        benchmark_dataset(dataset, labels, split)
+
+
+def test_comparison_measures_both_checkpoints_on_same_human_population(tmp_path, monkeypatch) -> None:
+    from scripts.modeling.compare_regression_on_benchmark import main
+    from src.scenic_scorer.regression import ScenicRegressionModel
+
+    dataset = _regression_export(tmp_path)
+    labels, split = _benchmark_files(tmp_path)
+    checkpoints = []
+    for name, prediction in (("baseline", 5), ("candidate", 7)):
+        model = ScenicRegressionModel(vit_dim=1, terrain_dim=1, num_classes=1)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.zero_()
+            model.network[-2].bias.fill_(math.log(prediction / (10 - prediction)))
+        checkpoint = tmp_path / f"{name}.pt"
+        torch.save({
+            "model_state_dict": model.state_dict(), "vit_dim": 1,
+            "terrain_dim": 1, "num_classes": 1,
+        }, checkpoint)
+        checkpoints.append(checkpoint)
+    output = tmp_path / "comparison.json"
+    monkeypatch.setattr(sys, "argv", [
+        "compare", "--dataset", str(dataset), "--labels-csv", str(labels),
+        "--benchmark-split-csv", str(split), "--baseline-checkpoint", str(checkpoints[0]),
+        "--candidate-checkpoint", str(checkpoints[1]), "--output-json", str(output),
+        "--device", "cpu",
+    ])
+    main()
+    summary = json.loads(output.read_text())
+    assert summary["baseline"]["samples"] == summary["candidate"]["samples"] == 2
+    assert summary["baseline"]["mae"] == pytest.approx(3)
+    assert summary["baseline"]["rmse"] == pytest.approx(3)
+    assert summary["candidate"]["mae"] == pytest.approx(3)
+    assert summary["candidate"]["rmse"] == pytest.approx(math.sqrt(13))
+
+
+@pytest.mark.parametrize("epochs", ["0", "-1"])
+def test_zero_epoch_baseline_rejected_before_saved_claim(tmp_path, monkeypatch, capsys, epochs) -> None:
+    from scripts.modeling.train_regression_baseline import main
+
+    output = tmp_path / "checkpoint.pt"
+    monkeypatch.setattr(sys, "argv", [
+        "train", "--dataset", str(tmp_path / "absent.npz"),
+        "--benchmark-split-csv", str(tmp_path / "absent.csv"),
+        "--output", str(output), "--epochs", epochs,
+    ])
+    with pytest.raises(SystemExit):
+        main()
+    captured = capsys.readouterr()
+    assert "--epochs must be >= 1" in captured.err
+    assert "Saved checkpoint" not in captured.out
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("code", ["NoSuchKey", "NotFound", "404", "AccessDenied", "NoSuchBucket", "SlowDown"])
+def test_s3_export_skip_missing_only_for_missing_objects(code) -> None:
+    from botocore.exceptions import ClientError
+    from scripts.modeling.export_regression_dataset import _open_image
+
+    error = ClientError({"Error": {"Code": code}}, "GetObject")
+
+    class Client:
+        def get_object(self, **kwargs):
+            raise error
+
+    if code in {"NoSuchKey", "NotFound", "404"}:
+        with pytest.raises(FileNotFoundError, match="s3://bucket/raw/tile.png"):
+            _open_image("tile.png", "s3://bucket/raw", Client())
+    else:
+        with pytest.raises(ClientError) as caught:
+            _open_image("tile.png", "s3://bucket/raw", Client())
+        assert caught.value is error
+
+
+def test_s3_export_propagates_network_and_invalid_imagery() -> None:
+    from io import BytesIO
+    from botocore.exceptions import EndpointConnectionError
+    from PIL import UnidentifiedImageError
+    from scripts.modeling.export_regression_dataset import _open_image
+
+    class OfflineClient:
+        def get_object(self, **kwargs):
+            raise EndpointConnectionError(endpoint_url="https://example.invalid")
+
+    class InvalidImageClient:
+        def get_object(self, **kwargs):
+            return {"Body": BytesIO(b"not an image")}
+
+    with pytest.raises(EndpointConnectionError):
+        _open_image("tile.png", "s3://bucket/raw", OfflineClient())
+    with pytest.raises(UnidentifiedImageError):
+        _open_image("tile.png", "s3://bucket/raw", InvalidImageClient())
+
+
+def test_heatmap_rejects_conflicting_original_and_dense_indices(pool, tmp_path) -> None:
+    rows = [dict(row) for row in pool["rows"]]
+    rows[0]["embedding_row_index"], rows[1]["embedding_row_index"] = 1, 0
+    _write_metadata(pool["meta"], rows)
+    with pytest.raises(ValueError, match="does not match feature position"):
+        _export(pool, tmp_path / "runs")
+    assert not (tmp_path / "runs" / "test_run").exists()
+
+
+@pytest.mark.parametrize("consumer", ["training", "benchmark"])
+@pytest.mark.parametrize("problem", ["missing-identities", "conflicting-split"])
+def test_regression_consumers_fail_closed_on_identity_contract(tmp_path, consumer, problem) -> None:
+    from scripts.modeling.compare_regression_on_benchmark import benchmark_dataset
+    from scripts.modeling.train_regression_baseline import training_arrays
+
+    dataset = _regression_export(tmp_path)
+    labels, split = _benchmark_files(tmp_path)
+    with np.load(dataset, allow_pickle=False) as data:
+        arrays = {key: data[key] for key in data.files}
+    if problem == "missing-identities":
+        del arrays["image_paths"]
+    else:
+        arrays["splits"] = np.array(["train", "train", "test", "val"])
+    np.savez(dataset, **arrays)
+    with pytest.raises(ValueError, match="exported image_paths|conflicts"):
+        if consumer == "training":
+            training_arrays(dataset, split)
+        else:
+            benchmark_dataset(dataset, labels, split)
+
+
+def test_training_excludes_embedded_heldout_not_in_benchmark(tmp_path) -> None:
+    from scripts.modeling.train_regression_baseline import training_arrays
+
+    dataset = _regression_export(tmp_path, ("train", "test-b", "test-a", "validation", "other"))
+    _, split = _benchmark_files(tmp_path)
+    with np.load(dataset, allow_pickle=False) as data:
+        arrays = {key: data[key] for key in data.files}
+    arrays["splits"] = np.array(["train", "test", "test", "val", "test"])
+    np.savez(dataset, **arrays)
+    result = training_arrays(dataset, split)
+    assert result["image_paths"].tolist() == ["train"]
+    assert result["vit_embeddings"].ravel().tolist() == [0]
+
+
+def test_benchmark_prefers_explicit_benchmark_human_mean(tmp_path) -> None:
+    import pandas as pd
+    from scripts.modeling.compare_regression_on_benchmark import benchmark_dataset
+
+    dataset = _regression_export(tmp_path)
+    labels, split = _benchmark_files(tmp_path)
+    frame = pd.read_csv(split)
+    frame["scenic_human_mean"] = [4, np.nan, np.nan, 9]
+    frame.to_csv(split, index=False)
+    selected = benchmark_dataset(dataset, labels, split)
+    assert [float(selected[i][3][0]) for i in range(len(selected))] == [4, 9]

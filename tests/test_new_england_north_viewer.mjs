@@ -647,14 +647,241 @@ test("rendering snapped endpoints removes stale connector source and layer", () 
   assert.equal(harness.sources.has("route-endpoint-source"), false);
   assert.equal(harness.layers.has("route-endpoint-connectors"), false);
 });
-test("pending renders retain their request and clear removes both route sources", () => {
-  assert.match(
-    viewerSource,
-    /pendingRouteRender = \{ requestId, geojson: routeGeojson, request: payload\.request \}/
+function makeLifecycleHarness() {
+  const harness = makeRouteHarness();
+  const { context } = harness;
+  const events = new Map();
+  let styleLoaded = false;
+  context.map.on = (event, callback) => events.set(event, callback);
+  context.map.isStyleLoaded = () => styleLoaded;
+  context.routeRequestSequence = 0;
+  context.pendingRouteRender = null;
+  context.activeRouteRequest = null;
+  context.latestRoutePayload = null;
+  context.displayedRouteRequest = null;
+  context.mapReady = false;
+  context.CONFIG = { sourceRegion: "test-region", workingRun: "test-run" };
+  context.DEFAULTS = { scenicWeight: 0.8 };
+  context.AbortController = AbortController;
+  context.URL = URL;
+  context.setTimeout = setTimeout;
+  context.clearTimeout = clearTimeout;
+  context.el = {
+    startInput: new FakeElement("input"),
+    endInput: new FakeElement("input"),
+    detourFactor: new FakeElement("input"),
+    avoidHighways: new FakeElement("input"),
+    submitRoute: new FakeElement("button"),
+    shareRouteBtn: new FakeElement("button"),
+  };
+  context.el.startInput.value = "40.03,-75.22";
+  context.el.endInput.value = "40.065,-75.19";
+  context.el.detourFactor.value = "1.8";
+  context.el.avoidHighways.checked = true;
+  context.selectedRoutePoints = { start: null, end: null };
+  context.parsePoint = (text) => {
+    const [lat, lon] = text.split(",").map(Number);
+    return { lat, lon };
+  };
+  context.api = (path) => path;
+  context.setRouteOutput = (title, message) => { harness.output = { title, message }; };
+  context.setApiStatus = () => {};
+  context.syncZoomElasticity = () => {};
+  context.routePlanningAvailable = () => true;
+  context.routeOutputMarkup = () => "Routes shown";
+  context.renderRouteComparison = () => {};
+  context.escapeHtml = (text) => String(text).replaceAll("<", "&lt;");
+  context.window = {
+    location: new URL("https://test.local/nested/viewer"),
+    setTimeout: () => {},
+  };
+  context.navigator = { clipboard: { writeText: async (text) => { harness.shared = text; } } };
+  const pending = [];
+  context.fetch = (_url, options) => new Promise((resolve) => pending.push({ resolve, options }));
+  const lifecycleStart = viewerSource.indexOf("function drainPendingRouteRender");
+  const lifecycleEnd = viewerSource.indexOf("\nfunction signedNumber", lifecycleStart);
+  const planStart = viewerSource.indexOf("async function planRoute");
+  const planEnd = viewerSource.indexOf("\nfunction initBindings", planStart);
+  vm.runInNewContext(
+    `${failureSource}
+${viewerSource.slice(lifecycleStart, lifecycleEnd)}
+${viewerSource.slice(planStart, planEnd)}
+globalThis.installRouteRenderLifecycle = installRouteRenderLifecycle;
+globalThis.clearRoute = clearRoute;
+globalThis.planRoute = planRoute;
+globalThis.copyShareUrl = copyShareUrl;`,
+    context
   );
-  assert.match(viewerSource, /renderRoute\(pending\.geojson, pending\.request\)/);
-  assert.match(viewerSource, /removeLayer\(ROUTE_ENDPOINT_CONNECTORS\)/);
-  assert.match(viewerSource, /removeSource\(ROUTE_ENDPOINT_SOURCE\)/);
+  context.installRouteRenderLifecycle();
+  return Object.assign(harness, {
+    pending,
+    emit: (event) => events.get(event)?.(),
+    setStyleLoaded: (value) => { styleLoaded = value; },
+  });
+}
+
+test("deferred route drains after load, shares its request, and clear cancels pending routes", async () => {
+  const harness = makeLifecycleHarness();
+  const { context } = harness;
+  harness.setStyleLoaded(true);
+  harness.emit("load");
+  harness.setStyleLoaded(false); // Tiles started loading after the one-time load.
+  const planning = context.planRoute({ preventDefault() {} });
+  harness.pending[0].resolve(response({ geojson: makeRouteGeojson() }));
+  await planning;
+  assert.equal(harness.fitted.length, 0);
+  harness.emit("idle");
+  assert.equal(harness.fitted.length, 0);
+  harness.setStyleLoaded(true);
+  harness.emit("idle");
+  assert.equal(harness.fitted.length, 1);
+  assert.ok(harness.sources.has("route-endpoint-source"));
+  harness.emit("idle");
+  assert.equal(harness.fitted.length, 1);
+
+  context.el.startInput.value = "1,2";
+  context.el.detourFactor.value = "3";
+  context.el.avoidHighways.checked = false;
+  await context.copyShareUrl();
+  const shared = new URL(harness.shared);
+  assert.equal(shared.searchParams.get("start"), "40.03,-75.22");
+  assert.equal(shared.searchParams.get("max_detour"), "1.8");
+  assert.equal(shared.searchParams.get("avoid_highways"), "true");
+
+  harness.setStyleLoaded(false);
+  const next = context.planRoute({ preventDefault() {} });
+  await context.copyShareUrl();
+  assert.equal(harness.shared, shared.toString());
+  harness.pending[1].resolve(response({ geojson: makeRouteGeojson() }));
+  await next;
+  context.clearRoute();
+  harness.setStyleLoaded(true);
+  harness.emit("idle");
+  assert.equal(harness.fitted.length, 1);
+  assert.equal(harness.sources.has("route-source"), false);
+  assert.equal(harness.sources.has("route-endpoint-source"), false);
+  assert.equal(harness.layers.has("route-endpoint-connectors"), false);
+  harness.shared = null;
+  await context.copyShareUrl();
+  assert.equal(harness.shared, null);
+});
+
+test("pre-load responses wait for readiness and superseded requests cannot publish", async () => {
+  const harness = makeLifecycleHarness();
+  const { context } = harness;
+  const old = context.planRoute({ preventDefault() {} });
+  context.el.startInput.value = "1,2";
+  const current = context.planRoute({ preventDefault() {} });
+  harness.pending[1].resolve(response({ geojson: makeRouteGeojson() }));
+  await current;
+  harness.pending[0].resolve(response({ geojson: makeRouteGeojson() }));
+  await old;
+  harness.setStyleLoaded(true);
+  harness.emit("idle");
+  assert.equal(harness.fitted.length, 0);
+  harness.emit("load");
+  assert.equal(harness.fitted.length, 1);
+  await context.copyShareUrl();
+  assert.equal(new URL(harness.shared).searchParams.get("start"), "1,2");
+});
+
+test("structured route failures render the server's reason without emitting markup", async () => {
+  // Failure-detail dicts exactly as the FastAPI /v1/route/compare error path
+  // emits them (src/app_api/main.py, mirrored by tests/test_app_api.py) — not
+  // invented payloads.  `reason` carries the structured cause's internal
+  // reason string; the viewer renders it and falls back to `message` when the
+  // server omits it.
+  const noRouteDetail = {
+    error: "no_route_found",
+    message: "No route satisfies the requested controls.",
+    hint: "Try different points in region 'new_england_north' or increase max detour.",
+    diagnostics: {
+      graph_nodes: 4,
+      graph_edges: 3,
+      start_snap_km: null,
+      end_snap_km: null,
+      start_all_road_snap_km: null,
+      end_all_road_snap_km: null,
+      start_node_id: null,
+      end_node_id: null,
+    },
+    reason: "No route found between the given coordinates.",
+  };
+  const coverageDetail = {
+    error: "route_endpoint_outside_coverage",
+    message: "The start point is too far from the supported road network.",
+    hint: "Choose a point within the selected region's route coverage.",
+    reason: "The start point is too far from the supported road network.",
+    endpoint: "start",
+    snap_distance_km: 1.234,
+    max_snap_distance_km: 1.0,
+  };
+  const supervisorDetail = {
+    error: "routing_supervisor_unavailable",
+    message: "The routing service is temporarily unavailable.",
+  };
+
+  const harness = makeLifecycleHarness();
+  const failing = (detail) => ({
+    ok: false,
+    status: 422,
+    statusText: "Unprocessable Entity",
+    json: async () => ({ detail }),
+  });
+
+  const noRoute = harness.context.planRoute({ preventDefault() {} });
+  harness.pending[0].resolve(failing(noRouteDetail));
+  await noRoute;
+  assert.equal(harness.output.title, "No route found");
+  assert.equal(
+    harness.output.message,
+    "No route satisfies the requested controls. — No route found between the given coordinates. — Try different points in region 'new_england_north' or increase max detour."
+  );
+
+  const coverage = harness.context.planRoute({ preventDefault() {} });
+  harness.pending[1].resolve(failing(coverageDetail));
+  await coverage;
+  assert.equal(harness.output.title, "Outside route coverage");
+  // The coverage cause only restates the message, so it is not repeated.
+  assert.equal(
+    harness.output.message,
+    "The start point is too far from the supported road network. — Choose a point within the selected region's route coverage."
+  );
+
+  const supervisor = harness.context.planRoute({ preventDefault() {} });
+  harness.pending[2].resolve(failing(supervisorDetail));
+  await supervisor;
+  assert.equal(harness.output.title, "Route failed");
+  // No reason: the message carries the text instead.
+  assert.equal(
+    harness.output.message,
+    "The routing service is temporarily unavailable."
+  );
+
+  // Same real shape with hostile field content, to prove every rendered field
+  // stays escaped rather than becoming markup.
+  const hostile = harness.context.planRoute({ preventDefault() {} });
+  harness.pending[3].resolve(
+    failing({
+      ...noRouteDetail,
+      hint: "Try different points in region '<img>' or increase max detour.",
+    })
+  );
+  await hostile;
+  assert.equal(harness.output.title, "No route found");
+  assert.equal(
+    harness.output.message,
+    "No route satisfies the requested controls. — No route found between the given coordinates. — Try different points in region '&lt;img>' or increase max detour."
+  );
+});
+
+test("local assets resolve at the root even for a nested app-shell URL", () => {
+  const html = fs.readFileSync(new URL("../apps/new_england_north/index.html", import.meta.url), "utf8");
+  const localAssets = [...html.matchAll(/(?:src|href)="([^"]+\.(?:js|css)\?[^"]+)"/g)]
+    .map((match) => match[1]);
+  for (const base of ["https://test.local/route/deep", "https://test.local/route/deep/"]) {
+    assert.deepEqual(localAssets.map((asset) => new URL(asset, base).pathname), ["/styles.css", "/viewer.js"]);
+  }
 });
 
 
@@ -731,4 +958,98 @@ test("address suggest/retrieve guards reject stale responses and close invalidat
   delayed.resolve(response({ suggestions: [{ mapbox_id: "late", name: "Late" }] }));
   await tick(0);
   assert.equal(suggestions.children.length, 0);
+});
+
+test("refocusing address search cancels delayed blur closure", async () => {
+  const { input, suggestions, pending } = makeHarness();
+  input.value = "Boston";
+  input.dispatch("input");
+  await tick();
+  pending[0].resolve(response({ suggestions: [{ mapbox_id: "bos", name: "Boston" }] }));
+  await tick(0);
+  input.dispatch("blur");
+  input.dispatch("focus");
+  await tick(140);
+  assert.equal(input.attributes.get("aria-expanded"), "true");
+  assert.equal(suggestions.children[0].children[0].textContent, "Boston");
+  input.dispatch("blur");
+  await tick(140);
+  assert.equal(input.attributes.get("aria-expanded"), "false");
+});
+
+test("heatmap metadata and keyboard navigation work without a summary or pointer input", async () => {
+  const canvas = new FakeElement("canvas");
+  const inspector = new FakeElement();
+  const inspectorScore = new FakeElement();
+  const inspectorCoords = new FakeElement();
+  const events = new Map();
+  let center = { lng: 1, lat: 2 };
+  const context = {
+    el: { inspector, inspectorScore, inspectorCoords },
+    document: { activeElement: null },
+    map: {
+      getCanvas: () => canvas,
+      getCenter: () => center,
+      on: (event, callback) => events.set(event, callback),
+      unproject: ([x, y]) => ({ lng: x, lat: y }),
+    },
+    lngLatToTile: (lng) => ({ x: lng, y: 2 }),
+    setText: (node, text) => { node.textContent = text; },
+  };
+  context.CONFIG = { sourceRegion: "test", workingRun: "test-run" };
+  context.api = (path) => `https://test.local${path}`;
+  context.URL = class extends URL {
+    static createObjectURL() { return "blob:test"; }
+  };
+  context.validHeatmapMetadata = () => true;
+  context.setApiStatus = () => {};
+  context.latestHeatmap = null;
+  const start = viewerSource.indexOf("function installHeatmapInspector");
+  const end = viewerSource.indexOf("\nasync function main", start);
+  const heatmapStart = viewerSource.indexOf("async function loadHeatmap");
+  const heatmapEnd = viewerSource.indexOf("\nasync function checkApiHealth", heatmapStart);
+  vm.runInNewContext(
+    `${viewerSource.slice(heatmapStart, heatmapEnd)}
+${viewerSource.slice(start, end)}
+globalThis.installHeatmapInspector = installHeatmapInspector;
+globalThis.loadHeatmap = loadHeatmap;`, context);
+  const values = new DataView(new ArrayBuffer(8));
+  values.setFloat32(0, 0.75, true);
+  values.setFloat32(4, 0.25, true);
+  context.fetch = async (url) => {
+    const path = new URL(url).pathname;
+    if (path === "/v1/heatmap") {
+      return response({ total_tiles: 2, summary: null, tile_zoom: 14, bounds: {} });
+    }
+    if (path === "/v1/heatmap-image") {
+      return { ok: true, blob: async () => ({}) };
+    }
+    return {
+      ok: true,
+      headers: new Map([
+        ["X-Scenic-Tile-Zoom", "14"], ["X-Scenic-Min-X", "1"], ["X-Scenic-Min-Y", "2"],
+        ["X-Scenic-Grid-Width", "2"], ["X-Scenic-Grid-Height", "1"],
+      ]),
+      arrayBuffer: async () => values.buffer,
+    };
+  };
+  context.installHeatmapInspector(await context.loadHeatmap());
+  assert.equal(inspectorScore.textContent, "2 tiles");
+  context.document.activeElement = canvas;
+  canvas.dispatch("focus");
+  assert.equal(inspectorScore.textContent, "0.75");
+  assert.equal(inspector.attributes.get("aria-live"), "polite");
+  center = { lng: 2, lat: 2 };
+  events.get("moveend")();
+  assert.equal(inspectorScore.textContent, "0.25");
+  canvas.dispatch("pointerleave");
+  assert.equal(inspectorScore.textContent, "0.25");
+  canvas.dispatch("blur");
+  context.document.activeElement = null;
+  center = { lng: 3, lat: 2 };
+  events.get("moveend")();
+  assert.equal(inspectorScore.textContent, "0.25");
+  canvas.dispatch("pointermove", { offsetX: 3, offsetY: 2 });
+  assert.equal(inspectorScore.textContent, "--");
+  assert.equal(inspectorCoords.textContent, "No learned score for this tile");
 });

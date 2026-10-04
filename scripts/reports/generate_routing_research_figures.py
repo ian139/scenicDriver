@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
+from statistics import median
 from typing import Any
 from xml.sax.saxutils import escape
 
@@ -52,36 +54,173 @@ def load_data(path: Path = DATA_PATH) -> dict[str, Any]:
     return data
 
 
+def _number(value: Any, label: str, *, positive: bool = False) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or (value <= 0 if positive else value < 0)
+    ):
+        raise ValueError(f"{label} must be a finite {'positive' if positive else 'nonnegative'} number")
+    return value
+
+
+def _count(value: Any, label: str, *, positive: bool = True) -> int:
+    if type(value) is not int or value < (1 if positive else 0):
+        raise ValueError(f"{label} must be a {'positive' if positive else 'nonnegative'} integer")
+    return value
+
+
+def _series(data: dict[str, Any], class_name: str) -> dict[str, Any]:
+    return next(
+        item for item in data["figures"]["latency-distributions"]["series"]
+        if item["class"] == class_name
+    )
+
+
+def _results(data: dict[str, Any]) -> tuple[float, float, float]:
+    baseline = median(_series(data, "uncached")["values"])
+    candidate = median(_series(data, "accepted_candidate")["values"])
+    return baseline, candidate, 100 * (baseline - candidate) / baseline
+
+
+def _change_label(percent: float) -> str:
+    direction = "lower" if percent >= 0 else "higher"
+    return f"{_fmt(abs(percent), 2)}% {direction}"
+
+
+def _axis_step(maximum: float) -> int:
+    return max(20, math.ceil(maximum / 120) * 20)
+
+
+def _target_label(data: dict[str, Any]) -> str:
+    met = median(_series(data, "final_confirmation")["values"]) < data["study"]["target"]["threshold_seconds"]
+    return "met" if met else "not met"
+
+
 def validate_data(data: dict[str, Any]) -> None:
-    """Reject incomplete or misleading research figure data."""
-    if data.get("schema_version") != 1:
+    """Validate counts, finite measurements and rounded summaries against samples.
+
+    The four-search/two-worker layout is fixed; unsupported layouts are rejected.
+    Target attainment uses final uncached confirmation, never the cache-hit sample.
+    """
+    if not isinstance(data, dict) or type(data.get("schema_version")) is not int or data["schema_version"] != 1:
         raise ValueError("figure data must declare schema_version 1")
-    evidence = data.get("source", {}).get("evidence")
-    if not isinstance(evidence, dict) or not evidence:
+    try:
+        _validate_data(data)
+    except (KeyError, TypeError, AttributeError, OverflowError) as error:
+        raise ValueError(f"incomplete or malformed figure data: {error}") from error
+
+
+def _validate_data(data: dict[str, Any]) -> None:
+    evidence = data["source"]["evidence"]
+    if not isinstance(evidence, dict) or not evidence or any(
+        not isinstance(value, str) or not value.strip() for value in evidence.values()
+    ):
         raise ValueError("figure data must contain source evidence references")
-    figures = data.get("figures")
+    figures = data["figures"]
     expected = {name.removesuffix(".svg") for name in CANONICAL_FILENAMES}
     if not isinstance(figures, dict) or set(figures) != expected:
         raise ValueError("figure data must define every canonical figure exactly once")
     for name, figure in figures.items():
-        if not figure.get("title") or not figure.get("description"):
+        if any(
+            not isinstance(figure[key], str) or not figure[key].strip()
+            for key in ("title", "description")
+        ):
             raise ValueError(f"{name} must have a title and description")
-        reference = figure.get("evidence")
-        if reference not in evidence:
-            raise ValueError(f"{name} references unknown evidence {reference!r}")
+        if figure["evidence"] not in evidence:
+            raise ValueError(f"{name} references unknown evidence")
+    study = data["study"]
     for key in ("target", "request", "cache_policy", "host"):
-        reference = data["study"][key].get("evidence")
-        if reference not in evidence:
+        if study[key]["evidence"] not in evidence:
             raise ValueError(f"study {key} lacks a valid evidence reference")
-    experiments = figures["experiment-outcomes"]["experiments"]
-    if any(item["status"] == "timeout" and "median_seconds" in item for item in experiments):
-        raise ValueError("timeouts must be categorical, not measured latency values")
-    classes = {item["class"] for item in figures["latency-distributions"]["series"]}
+    threshold = _number(study["target"]["threshold_seconds"], "target threshold", positive=True)
+    _number(study["request"]["deadline_seconds"], "request deadline", positive=True)
+    for value in study["host"]["final_load_averages"]:
+        _number(value, "host load average")
+    if len(study["host"]["final_load_averages"]) != 3:
+        raise ValueError("host load averages must contain three observations")
+    series = figures["latency-distributions"]["series"]
     required_classes = {"uncached", "accepted_candidate", "final_confirmation", "response_cache_hit"}
-    if not required_classes.issubset(classes):
-        raise ValueError("latency evidence must distinguish cache and confirmation contexts")
-    if data["study"]["target"]["met"]:
-        raise ValueError("the documented uncached target was not met")
+    if not isinstance(series, list) or len(series) != 4 or {item["class"] for item in series} != required_classes:
+        raise ValueError("latency evidence must distinguish cache and confirmation contexts exactly once")
+    for item in series:
+        values = item["values"]
+        if not isinstance(values, list) or not values:
+            raise ValueError("latency samples must be a nonempty list")
+        if _count(item["n"], "latency sample count") != len(values):
+            raise ValueError("latency sample count must equal the number of values")
+        for value in values:
+            _number(value, "latency sample", positive=True)
+    target_met = study["target"]["met"]
+    if type(target_met) is not bool or target_met != (median(_series(data, "final_confirmation")["values"]) < threshold):
+        raise ValueError("target met must match the final uncached confirmation median")
+    loop = figures["autoresearch-loop"]
+    baseline_count = _count(loop["baseline_count"], "baseline count")
+    cap = _count(loop["candidate_cap"], "candidate cap")
+    experiments = figures["experiment-outcomes"]["experiments"]
+    if not isinstance(experiments, list) or not experiments:
+        raise ValueError("experiments must be a nonempty list")
+    runs: set[int] = set()
+    baselines = []
+    retained = []
+    for item in experiments:
+        run = _count(item["run"], "experiment run")
+        if run in runs:
+            raise ValueError("experiment run identifiers must be unique")
+        runs.add(run)
+        status = item["status"]
+        if status not in {"baseline", "retain", "reject", "timeout"}:
+            raise ValueError("unknown experiment status")
+        if status == "timeout":
+            if "median_seconds" in item:
+                raise ValueError("timeouts must be categorical, not measured latency values")
+        else:
+            _number(item["median_seconds"], "experiment median", positive=True)
+        if status == "baseline":
+            baselines.append(item)
+        elif status == "retain":
+            retained.append(item)
+    if baseline_count != 1 or len(baselines) != baseline_count or len(retained) != 1:
+        raise ValueError("the isolated comparison requires one baseline and one retained candidate")
+    if len(experiments) - baseline_count > cap:
+        raise ValueError("experiment candidate count exceeds the cap")
+    baseline, candidate, improvement = _results(data)
+    two_worker = figures["two-worker-execution"]
+    for value, expected_value, label, tolerance in (
+        (baselines[0]["median_seconds"], baseline, "baseline experiment median", 0.0005),
+        (retained[0]["median_seconds"], candidate, "retained experiment median", 0.0005),
+        (two_worker["isolated_baseline_median_seconds"], baseline, "isolated baseline median", 0.0005),
+        (two_worker["isolated_candidate_median_seconds"], candidate, "isolated candidate median", 0.0005),
+        (two_worker["isolated_improvement_percent"], improvement, "isolated improvement percent", 0.005),
+        (loop["acceptance_improvement_percent"], improvement, "acceptance improvement percent", 0.005),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not math.isclose(value, expected_value, rel_tol=0, abs_tol=tolerance):
+            raise ValueError(f"{label} must agree with supplied latency samples")
+    if _count(figures["system-boundary"]["search_count"], "search count") != 4 or _count(two_worker["multiplier_searches"], "multiplier searches") != 4 or _count(two_worker["max_workers"], "max workers") != 2:
+        raise ValueError("the execution diagram requires four searches and two workers")
+    observations = figures["profile-bottlenecks"]["observations"]
+    if not isinstance(observations, list) or len(observations) != 2:
+        raise ValueError("profile must contain native search and heap-pop observations")
+    if [item["label"] for item in observations] != ["Native compact search", "Heap pop"]:
+        raise ValueError("profile observations must identify native search and its heap-pop component")
+    shares = [_number(item["percent"], "profile share") for item in observations]
+    if not 0 <= shares[1] <= shares[0] <= 100:
+        raise ValueError("profile shares must be within 0–100 and heap pop cannot exceed native search")
+    production = data["production_context"]
+    if production["evidence"] not in evidence:
+        raise ValueError("production context lacks a valid evidence reference")
+    cases = _count(production["cases"], "production cases")
+    _count(production["workers"], "production workers")
+    _number(production["case_timeout_seconds"], "production timeout", positive=True)
+    for prefix in ("baseline", "candidate"):
+        timeouts = _count(production[f"{prefix}_timeouts"], "production timeouts", positive=False)
+        if timeouts > cases:
+            raise ValueError("production timeouts cannot exceed cases")
+        central = _number(production[f"{prefix}_median_ms"], "production median", positive=True)
+        tail = _number(production[f"{prefix}_p95_ms"], "production p95", positive=True)
+        if tail < central:
+            raise ValueError("production p95 cannot be below the median")
 
 
 def _fmt(value: float, digits: int = 3) -> str:
@@ -141,7 +280,8 @@ def _notes(data: dict[str, Any], figure: dict[str, Any]) -> list[str]:
     ]
 
 
-def _svg(filename: str, figure: dict[str, Any], body: list[str], data: dict[str, Any]) -> str:
+def _svg(filename: str, figure: dict[str, Any], body: list[str], data: dict[str, Any],
+         *, description: str | None = None) -> str:
     title_id = f"{filename}-title"
     description_id = f"{filename}-desc"
     defs = (
@@ -156,7 +296,7 @@ def _svg(filename: str, figure: dict[str, Any], body: list[str], data: dict[str,
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{HEIGHT}" viewBox="0 0 {WIDTH} {HEIGHT}" role="img" aria-labelledby="{title_id} {description_id}">',
         f"<title id=\"{title_id}\">{escape(figure['title'])}</title>",
-        f"<desc id=\"{description_id}\">{escape(figure['description'])}</desc>",
+        f"<desc id=\"{description_id}\">{escape(description if description is not None else figure['description'])}</desc>",
         defs,
         _rect(0, 0, WIDTH, HEIGHT, fill=COLORS["panel"]),
         '<g aria-label="Research figure">',
@@ -175,7 +315,7 @@ def render_system_boundary(data: dict[str, Any]) -> str:
     boxes = [
         (80, 180, 212, 120, "Request", "Burlington → Pittsburgh", COLORS["navy"]),
         (336, 180, 212, 120, "Service planner", "normal scenic + baseline path", COLORS["teal"]),
-        (592, 180, 212, 120, "Native search", "four multiplier searches", COLORS["orange"]),
+        (592, 180, 212, 120, "Native search", f"{figure['search_count']} multiplier searches", COLORS["orange"]),
         (848, 180, 212, 120, "Semantic oracle", "complete response comparison", COLORS["gold"]),
     ]
     for x, y, w, h, label, detail, color in boxes:
@@ -187,7 +327,7 @@ def render_system_boundary(data: dict[str, Any]) -> str:
         _rect(80, 356, 700, 156, fill="#eef4f2", stroke=COLORS["teal"], radius=6),
         _text(104, 392, "UNCACHED SEARCH EVIDENCE", size=14, fill=COLORS["teal"], weight="bold"),
         _text(104, 425, "Complete response cache cleared before every run", size=21, weight="bold"),
-        _text(104, 455, f"Target: median complete plan_routes request < {_fmt(study['target']['threshold_seconds'])} s — not met", size=16, fill=COLORS["orange"]),
+        _text(104, 455, f"Target: median complete plan_routes request < {_fmt(study['target']['threshold_seconds'])} s — {_target_label(data)}", size=16, fill=COLORS["orange"]),
         _text(104, 485, f"Deadline: {_fmt(study['request']['deadline_seconds'])} s; preload is measured separately", size=14, fill=COLORS["muted"]),
         _rect(816, 356, 244, 156, fill=COLORS["paper"], stroke=COLORS["gray"], radius=6),
         _text(840, 392, "EXCLUDED FROM CLAIM", size=14, fill=COLORS["gray"], weight="bold"),
@@ -202,13 +342,18 @@ def render_system_boundary(data: dict[str, Any]) -> str:
 
 def render_autoresearch_loop(data: dict[str, Any]) -> str:
     figure = data["figures"]["autoresearch-loop"]
-    body = _title_block(figure["title"], "One immutable baseline, eleven measured candidates, and a fixed stop condition.")
+    baseline, candidate, improvement = _results(data)
+    experiments = data["figures"]["experiment-outcomes"]["experiments"]
+    retained = next(item for item in experiments if item["status"] == "retain")
+    candidate_count = len(experiments) - figure["baseline_count"]
+    cap_reached = candidate_count == figure["candidate_cap"]
+    body = _title_block(figure["title"], f"{figure['baseline_count']} immutable baseline, {candidate_count} measured candidates, and a cap of {figure['candidate_cap']}.")
     steps = [
         (84, "Immutable baseline", "cache-empty", COLORS["navy"]),
         (302, "One hypothesis", "one candidate", COLORS["orange"]),
         (520, "Semantic oracle", "complete response", COLORS["teal"]),
         (738, "Measured decision", "retain or reject", COLORS["gold"]),
-        (956, "Cap reached", "stop and document", COLORS["gray"]),
+        (956, "Cap reached" if cap_reached else "Within cap", "stop and document" if cap_reached else "budget remains", COLORS["gray"]),
     ]
     for index, (x, label, detail, color) in enumerate(steps):
         body.extend([_circle(x + 72, 260, 50, fill=COLORS["paper"], stroke=color, extra='stroke-width="4"'),
@@ -221,13 +366,13 @@ def render_autoresearch_loop(data: dict[str, Any]) -> str:
         _rect(150, 430, 900, 150, fill=COLORS["paper"], stroke=COLORS["line"], radius=6),
         _line(730, 448, 730, 562, stroke=COLORS["line"]),
         _text(180, 463, "ACCEPTANCE RECORD", size=13, weight="bold", fill=COLORS["teal"]),
-        _text(180, 496, "Retained: two native workers, 62.682 s isolated median", size=17, weight="bold"),
-        _text(180, 524, "18.03% below the fresh 76.470 s baseline", size=15),
-        _text(180, 552, "Timeouts are deadline outcomes; rejected source was removed.", size=13, fill=COLORS["muted"]),
+        _text(180, 496, f"Retained: {retained['label']}, {_fmt(candidate)} s isolated median", size=17, weight="bold"),
+        _text(180, 524, f"{_change_label(improvement)} than the fresh {_fmt(baseline)} s baseline", size=15),
+        _text(180, 552, "Timeouts are deadline outcomes, not measured latencies.", size=13, fill=COLORS["muted"]),
         _text(1020, 463, "STOP CONDITION", size=13, weight="bold", fill=COLORS["orange"], anchor="end"),
-        _text(1020, 496, "1 baseline + 11 candidates", size=17, weight="bold", anchor="end"),
-        _text(1020, 524, "uncached median target < 20 s", size=13, fill=COLORS["muted"], anchor="end"),
-        _text(1020, 550, "not met", size=15, fill=COLORS["orange"], weight="bold", anchor="end"),
+        _text(1020, 496, f"{figure['baseline_count']} baseline + {candidate_count} candidates", size=17, weight="bold", anchor="end"),
+        _text(1020, 524, f"uncached median target < {_fmt(data['study']['target']['threshold_seconds'])} s", size=13, fill=COLORS["muted"], anchor="end"),
+        _text(1020, 550, _target_label(data), size=15, fill=COLORS["orange"], weight="bold", anchor="end"),
     ])
     return _svg("autoresearch-loop", figure, body, data)
 
@@ -236,12 +381,13 @@ def render_experiment_outcomes(data: dict[str, Any]) -> str:
     figure = data["figures"]["experiment-outcomes"]
     experiments = figure["experiments"]
     body = _title_block(figure["title"], "Median wall times for measured candidates; deadline outcomes are categorical.")
-    x0, y0, chart_w, chart_h, max_value = 360, 150, 700, 410, 120
+    step = _axis_step(max(item.get("median_seconds", 0) for item in experiments))
+    x0, y0, chart_w, chart_h, max_value = 360, 150, 700, 410, step * 6
     body.extend([_text(64, 162, "Run / hypothesis", size=14, weight="bold"), _text(x0, 142, "median seconds", size=13, fill=COLORS["muted"])])
-    for tick in range(0, 121, 20):
+    for tick in range(0, max_value + 1, step):
         x = x0 + chart_w * tick / max_value
         body.extend([_line(x, y0, x, y0 + chart_h, stroke=COLORS["grid"]), _text(x, y0 + chart_h + 22, str(tick), size=12, fill=COLORS["muted"], anchor="middle")])
-    row_h = 32
+    row_h = min(32, chart_h / len(experiments))
     styles = {"baseline": (COLORS["navy"], "circle"), "retain": (COLORS["teal"], "square"), "reject": (COLORS["orange"], "diamond")}
     for index, item in enumerate(experiments):
         y = y0 + 18 + index * row_h
@@ -250,7 +396,7 @@ def render_experiment_outcomes(data: dict[str, Any]) -> str:
         body.append(_text(64, y + 5, f"{item['run']}  {item['label']}", size=13))
         if item["status"] == "timeout":
             body.extend([_rect(x0 + 10, y - 10, 18, 18, fill="url(#diagonal-hatch)", stroke=COLORS["red"]),
-                         _text(x0 + 42, y + 5, "TIMEOUT — warm-up exceeded deadline", size=13, fill=COLORS["red"], weight="bold")])
+                         _text(x0 + 42, y + 5, "TIMEOUT — deadline outcome", size=13, fill=COLORS["red"], weight="bold")])
             continue
         value = item["median_seconds"]
         color, shape = styles[item["status"]]
@@ -267,25 +413,35 @@ def render_experiment_outcomes(data: dict[str, Any]) -> str:
                  _rect(180, 592, 12, 12, fill=COLORS["teal"]), _text(200, 603, "retained", size=12),
                  f'<path d="M300,592 L306,598 L300,604 L294,598 Z" fill="{COLORS["orange"]}"/>', _text(314, 603, "rejected", size=12),
                  _rect(410, 592, 12, 12, fill="url(#diagonal-hatch)", stroke=COLORS["red"]), _text(430, 603, "timeout (categorical)", size=12)])
-    return _svg("experiment-outcomes", figure, body, data)
+    return _svg(
+        "experiment-outcomes", figure, body, data,
+        description="Measured candidate medians in seconds; timeouts are categorical deadline outcomes, not successful timings.",
+    )
 
 
 def render_latency_distributions(data: dict[str, Any]) -> str:
     figure = data["figures"]["latency-distributions"]
     series = figure["series"]
     body = _title_block(figure["title"], "Cache-empty distributions and the separate response-cache-hit observation share an honest zero-based axis.")
-    x0, y0, chart_w, chart_h, maximum = 190, 155, 860, 340, 120
-    for tick in range(0, 121, 20):
+    threshold = data["study"]["target"]["threshold_seconds"]
+    step = _axis_step(max(threshold, *(value for item in series for value in item["values"])))
+    x0, y0, chart_w, chart_h, maximum = 190, 155, 860, 340, step * 6
+    for tick in range(0, maximum + 1, step):
         x = x0 + chart_w * tick / maximum
         body.extend([_line(x, y0, x, y0 + chart_h, stroke=COLORS["grid"]), _text(x, y0 + chart_h + 23, str(tick), size=12, fill=COLORS["muted"], anchor="middle")])
     body.append(_text(x0 + chart_w / 2, y0 + chart_h + 50, "wall time (seconds)", size=14, fill=COLORS["muted"], anchor="middle"))
-    target_x = x0 + chart_w * data["study"]["target"]["threshold_seconds"] / maximum
+    target_x = x0 + chart_w * threshold / maximum
     body.extend([_line(target_x, y0 - 8, target_x, y0 + chart_h, stroke=COLORS["red"], width=2, dash="6 5"),
-                 _text(target_x, y0 - 16, "20 s research target", size=12, fill=COLORS["red"], anchor="middle")])
-    colors = [COLORS["navy"], COLORS["teal"], COLORS["orange"], COLORS["gray"]]
-    shapes = ["circle", "square", "diamond", "cross"]
+                 _text(target_x, y0 - 16, f"{_fmt(threshold)} s research target", size=12, fill=COLORS["red"], anchor="middle")])
+    styles = {
+        "uncached": (COLORS["navy"], "circle"),
+        "accepted_candidate": (COLORS["teal"], "square"),
+        "final_confirmation": (COLORS["orange"], "diamond"),
+        "response_cache_hit": (COLORS["gray"], "cross"),
+    }
     row_positions = [195, 275, 355, 435]
-    for index, (item, color, shape, y) in enumerate(zip(series, colors, shapes, row_positions, strict=True)):
+    for item, y in zip(series, row_positions, strict=True):
+        color, shape = styles[item["class"]]
         body.append(_text(64, y - 8, item["label"], size=14, weight="bold"))
         body.append(_text(64, y + 12, f"n={item['n']}", size=12, fill=COLORS["muted"]))
         values = item["values"]
@@ -306,14 +462,15 @@ def render_latency_distributions(data: dict[str, Any]) -> str:
     body.extend([_rect(64, 535, 996, 76, fill=COLORS["paper"], stroke=COLORS["line"], radius=5),
                  _text(84, 564, "Interpretation boundary", size=14, weight="bold", fill=COLORS["orange"]),
                  _text(84, 589, data["study"]["host"]["caveat"], size=13, fill=COLORS["muted"]),
-                 _text(84, 608, "Response-cache hit (0.2663 s) is operational evidence only, not an uncached-search improvement.", size=13, fill=COLORS["muted"])])
-    return _svg("latency-distributions", figure, body, data)
+                 _text(84, 608, f"Response-cache hit median ({_fmt(median(_series(data, 'response_cache_hit')['values']), 4)} s) is operational evidence only.", size=13, fill=COLORS["muted"])])
+    description = f"Separate uncached, candidate, final-confirmation and cache-hit samples; target < {_fmt(threshold)} s is {_target_label(data)}."
+    return _svg("latency-distributions", figure, body, data, description=description)
 
 
 def render_profile_bottlenecks(data: dict[str, Any]) -> str:
     figure = data["figures"]["profile-bottlenecks"]
     observations = figure["observations"]
-    body = _title_block(figure["title"], "Observed sample shares identify where further uncached-search research must begin.")
+    body = _title_block(figure["title"], "Observed sample shares, not an additive decomposition of request work.")
     x0, y0, chart_w, chart_h = 310, 180, 700, 230
     for tick in range(0, 101, 20):
         x = x0 + chart_w * tick / 100
@@ -325,19 +482,19 @@ def render_profile_bottlenecks(data: dict[str, Any]) -> str:
         body.extend([_text(64, y - 14, item["label"], size=19, weight="bold"),
                      _text(64, y + 10, "observed share", size=13, fill=COLORS["muted"]),
                      _rect(x0, y - 35, width, 50, fill=color, radius=3),
-                     _rect(x0 + width - 5, y - 35, 5, 50, fill="url(#diagonal-hatch)"),
+                     _rect(x0 + max(0, width - 5), y - 35, min(5, width), 50, fill="url(#diagonal-hatch)"),
                      _text(x0 + width + 14, y - 2, f"{_fmt(item['percent'], 1)}%", size=22, weight="bold", fill=color)])
     body.extend([_rect(64, 480, 970, 104, fill=COLORS["paper"], stroke=COLORS["line"], radius=6),
                  _text(88, 513, "Do not add these shares", size=16, weight="bold"),
-                 _text(88, 541, "Heap pop is a component of native compact search; these are sampled attributions, not a partition of all work.", size=14, fill=COLORS["muted"]),
-                 _text(88, 568, "No remaining non-artifact method had measured evidence for a repeatable 5% gain when the cap fired.", size=14, fill=COLORS["muted"])])
-    return _svg("profile-bottlenecks", figure, body, data)
+                 _text(88, 541, "Heap pop is a component of native compact search; these are sampled attributions, not a partition of all work.", size=14, fill=COLORS["muted"])])
+    description = "; ".join(f"{item['label']}: {_fmt(item['percent'], 1)}% of request samples" for item in observations)
+    return _svg("profile-bottlenecks", figure, body, data, description=description)
 
 
 def render_two_worker_execution(data: dict[str, Any]) -> str:
     figure = data["figures"]["two-worker-execution"]
-    two_worker = figure
-    body = _title_block(figure["title"], "Concurrency is deliberately bounded: four independent searches, at most two executing together.")
+    baseline, candidate, improvement = _results(data)
+    body = _title_block(figure["title"], f"Concurrency is deliberately bounded: {figure['multiplier_searches']} independent searches, at most {figure['max_workers']} executing together.")
     body.extend([_text(64, 180, "Planner", size=17, weight="bold"), _text(230, 153, "Worker 1", size=16, weight="bold", anchor="middle"), _text(490, 153, "Worker 2", size=16, weight="bold", anchor="middle"), _text(790, 153, "Ordered join", size=16, weight="bold", anchor="middle")])
     searches = [(190, 195, "λ1"), (450, 195, "λ2"), (190, 330, "λ3"), (450, 330, "λ4")]
     for x, y, label in searches:
@@ -352,7 +509,7 @@ def render_two_worker_execution(data: dict[str, Any]) -> str:
         _line(160, 364, 186, 364, stroke=COLORS["teal"], width=2, dash="5 4", marker="arrow"),
         f'<path d="M160,210 V175 H430 L446,229" fill="none" stroke="{COLORS["teal"]}" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow)"/>',
         f'<path d="M160,382 V415 H430 L446,364" fill="none" stroke="{COLORS["teal"]}" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arrow)"/>',
-        _text(64, 445, "ContextVar copied into all four submitted tasks", size=13, fill=COLORS["teal"], weight="bold"),
+        _text(64, 445, f"ContextVar copied into all {figure['multiplier_searches']} submitted tasks", size=13, fill=COLORS["teal"], weight="bold"),
         _line(310, 229, 704, 258, stroke=COLORS["ink"], width=2, marker="arrow"),
         _line(570, 229, 704, 258, stroke=COLORS["ink"], width=2, marker="arrow"),
         _line(310, 364, 704, 292, stroke=COLORS["ink"], width=2, marker="arrow"),
@@ -367,8 +524,8 @@ def render_two_worker_execution(data: dict[str, Any]) -> str:
     ])
     body.extend([_rect(64, 470, 1022, 112, fill=COLORS["paper"], stroke=COLORS["line"], radius=6),
                  _text(88, 505, "Measured isolated result", size=15, weight="bold", fill=COLORS["teal"]),
-                 _text(88, 535, f"{_fmt(two_worker['isolated_candidate_median_seconds'])} s median vs {_fmt(two_worker['isolated_baseline_median_seconds'])} s baseline ({_fmt(two_worker['isolated_improvement_percent'], 2)}% lower; n=3 each).", size=18),
-                 _text(88, 562, "Workers join on success or failure; three and four workers were rejected under host contention.", size=14, fill=COLORS["muted"])])
+                 _text(88, 535, f"{_fmt(candidate)} s median vs {_fmt(baseline)} s baseline ({_change_label(improvement)}; n={_series(data, 'accepted_candidate')['n']} candidate, n={_series(data, 'uncached')['n']} baseline).", size=18),
+                 _text(88, 562, "Workers join on success or failure and restore the original multiplier order.", size=14, fill=COLORS["muted"])])
     return _svg("two-worker-execution", figure, body, data)
 
 

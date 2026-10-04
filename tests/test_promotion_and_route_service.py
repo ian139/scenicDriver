@@ -73,6 +73,18 @@ def test_promote_regression_model_smoke(tmp_path: Path) -> None:
     reg_sha = sha256_file(registry_json)
     decision_payload = {
         "all_gates_pass": True,
+        "gates": {
+            "integrity_pass": True,
+            "expanded_benchmark_corr_pass": True,
+            "expanded_benchmark_mse_pass": True,
+            "expanded_benchmark_improvement_pass": True,
+            "control_benchmark_non_regression_pass": True,
+            "control_benchmark_corr_pass": True,
+            "worst_slice_mse_pass": True,
+            "calibration_pass": True,
+            "distribution_pass": True,
+            "route_evidence_pass": True,
+        },
         "reason": "Test promotion",
         "baseline": {"sha256": cand_sha},
         "candidate": {"sha256": cand_sha},
@@ -1086,6 +1098,106 @@ def test_scored_graph_default_clone_and_exclusive_source_modes(
     assert scored_graph is exclusive_graph
     assert next(iter(exclusive_graph.edges.values())).scenic_score == pytest.approx(8.0)
     route_service.clear_route_caches()
+
+
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize(
+    "invalid_target",
+    ["matched_report", "unused_report", "fallback", "unmatched_fallback"],
+)
+def test_apply_tile_scores_rejects_nonfinite_inputs_before_mutation(
+    tmp_path: Path, score: float, invalid_target: str
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+    graph = route_service._load_graph(graph_path)
+    tile = lat_lon_to_tile(42.05, -72.0, 14)
+    tile_key = (14, tile[0], tile[1])
+    score_map = {tile_key: 8.0}
+    fallback = None
+    if invalid_target == "matched_report":
+        score_map[tile_key] = score
+    elif invalid_target == "unused_report":
+        score_map[(14, tile[0] + 1, tile[1])] = score
+    else:
+        fallback = score
+        if invalid_target == "unmatched_fallback":
+            score_map.clear()
+
+    with pytest.raises(ValueError):
+        route_service.apply_tile_scores_to_graph(
+            graph, score_map, zoom=14, fallback=fallback
+        )
+
+    assert next(iter(graph.edges.values())).scenic_score == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize(
+    "invalid_target",
+    ["matched_report", "unused_report", "fallback", "unmatched_fallback"],
+)
+@pytest.mark.parametrize("mode", ["clone", "exclusive", "cached"])
+def test_scored_graph_rejects_nonfinite_inputs_before_cache_or_source_changes(
+    tmp_path: Path, score: float, invalid_target: str, mode: str
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+    graph = route_service._load_graph(graph_path)
+    graph_key = (
+        route_service._resolved_path_key(graph_path),
+        route_service._file_signature(graph_path),
+    )
+    report_key = ("tiles", (1, 2, 3, 4, 5))
+    tile = lat_lon_to_tile(42.05, -72.0, 14)
+    tile_key = (14, tile[0], tile[1])
+    score_map = {tile_key: 8.0}
+    route_service.clear_route_caches()
+    try:
+        cached_graph = None
+        if mode == "cached":
+            cached_graph, *_ = route_service._get_scored_graph(
+                graph,
+                graph_key=graph_key,
+                tile_key=report_key,
+                score_map=score_map,
+                zoom=14,
+                fallback=None,
+            )
+        graph_cache = dict(route_service._GRAPH_CACHE)
+        scored_cache = dict(route_service._SCORED_GRAPH_CACHE)
+        active_variants = dict(route_service._ACTIVE_GRAPH_VARIANT_KEYS)
+        fallback = None
+        if invalid_target == "matched_report":
+            score_map[tile_key] = score
+        elif invalid_target == "unused_report":
+            score_map[(14, tile[0] + 1, tile[1])] = score
+        else:
+            fallback = score
+            if invalid_target == "unmatched_fallback":
+                score_map.clear()
+
+        with pytest.raises(ValueError):
+            route_service._get_scored_graph(
+                graph,
+                graph_key=graph_key,
+                tile_key=report_key,
+                score_map=score_map,
+                zoom=14,
+                fallback=fallback,
+                exclusive_source=mode == "exclusive",
+            )
+
+        assert next(iter(graph.edges.values())).scenic_score == pytest.approx(1.0)
+        assert dict(route_service._GRAPH_CACHE) == graph_cache
+        assert dict(route_service._SCORED_GRAPH_CACHE) == scored_cache
+        assert dict(route_service._ACTIVE_GRAPH_VARIANT_KEYS) == active_variants
+        if cached_graph is not None:
+            assert next(iter(cached_graph.edges.values())).scenic_score == pytest.approx(
+                8.0
+            )
+    finally:
+        route_service.clear_route_caches()
 
 
 def test_plan_routes_accepts_snap_limit_boundary_and_rejects_coverage(

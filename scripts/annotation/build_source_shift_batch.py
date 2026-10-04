@@ -8,7 +8,12 @@ Example:
     --output-batch-csv data/processed/annotation/source_shift_batch.csv \
     --output-summary-json data/processed/annotation/source_shift_batch.summary.json \
     --sample-size 200 \
-    --seed 42
+    --seed 42 \
+    --image-root data/raw/sources
+
+Emitted image_path values are canonical paths relative to --image-root (default:
+the deepest directory containing every sampled old and new satellite tile), so
+one annotator raw_dir set to that root serves both sources.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -91,6 +97,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable checking file existence on disk for tile paths",
     )
+    parser.add_argument(
+        "--image-root",
+        type=Path,
+        default=None,
+        help=(
+            "Directory that both sources' satellite tiles live under; image_path is "
+            "emitted relative to it (use it as the annotator raw_dir). Defaults to "
+            "the deepest common directory of the sampled satellite tiles."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -136,6 +152,32 @@ def _compute_tile_sha256(path_str: str, check_files: bool) -> tuple[str, str]:
     else:
         digest = hashlib.sha256(path_str.encode("utf-8")).hexdigest()
     return str(path), digest
+
+
+def _resolve_image_root(image_root: Path | None, satellite_paths: list[str]) -> Path:
+    """Return the directory every emitted image_path is relative to."""
+    if image_root is not None:
+        return Path(image_root).resolve(strict=False)
+    resolved = [str(Path(path).resolve(strict=False)) for path in satellite_paths]
+    return Path(os.path.commonpath(resolved))
+
+
+def _relative_image_identity(path_str: str, image_root: Path) -> str:
+    """Map one satellite tile to the annotator's relative canonical image_path."""
+    resolved = Path(path_str).resolve(strict=False)
+    try:
+        relative = resolved.relative_to(image_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Satellite tile {path_str!r} is outside image root {str(image_root)!r}"
+        ) from exc
+    identity = relative.as_posix()
+    if identity in {"", "."}:
+        raise ValueError(
+            f"Satellite tile {path_str!r} has no relative path under image root "
+            f"{str(image_root)!r}"
+        )
+    return identity
 
 
 def validate_manifest(
@@ -200,6 +242,7 @@ def build_source_shift_batch(
     old_source_identity: str | None = None,
     new_source_identity: str | None = None,
     check_files: bool = True,
+    image_root: Path | None = None,
 ) -> dict[str, Any]:
     """Build a deterministic matched-source human benchmark batch."""
     if not (100 <= sample_size <= 300):
@@ -297,6 +340,27 @@ def build_source_shift_batch(
         .reset_index(drop=True)
     )
 
+    resolved_image_root = _resolve_image_root(
+        image_root,
+        sampled_pairs["sat_old_path"].tolist() + sampled_pairs["sat_new_path"].tolist(),
+    )
+    sampled_pairs["old_image_path"] = [
+        _relative_image_identity(path, resolved_image_root)
+        for path in sampled_pairs["sat_old_path"]
+    ]
+    sampled_pairs["new_image_path"] = [
+        _relative_image_identity(path, resolved_image_root)
+        for path in sampled_pairs["sat_new_path"]
+    ]
+    identities = pd.concat(
+        [sampled_pairs["old_image_path"], sampled_pairs["new_image_path"]]
+    )
+    if identities.duplicated().any():
+        examples = identities[identities.duplicated(keep=False)].head(3).tolist()
+        raise ValueError(
+            f"Old and new satellite tiles must have distinct image paths: {examples}"
+        )
+
     rows: list[dict[str, Any]] = []
     pair_unblinding: dict[str, Any] = {}
 
@@ -308,9 +372,9 @@ def build_source_shift_batch(
             "z": int(row["z"]),
             "x": int(row["x"]),
             "y": int(row["y"]),
-            "old_image_path": row["sat_old_path"],
+            "old_image_path": row["old_image_path"],
             "old_content_sha256": row["old_content_sha"],
-            "new_image_path": row["sat_new_path"],
+            "new_image_path": row["new_image_path"],
             "new_content_sha256": row["new_content_sha"],
         }
 
@@ -324,7 +388,7 @@ def build_source_shift_batch(
                 "z": int(row["z"]),
                 "x": int(row["x"]),
                 "y": int(row["y"]),
-                "image_path": row["sat_old_path"],
+                "image_path": row["old_image_path"],
                 "satellite_path": row["sat_old_path"],
                 "terrain_path": row["terr_old_path"],
                 "satellite_sha256": row["sat_old_sha"],
@@ -343,7 +407,7 @@ def build_source_shift_batch(
                 "z": int(row["z"]),
                 "x": int(row["x"]),
                 "y": int(row["y"]),
-                "image_path": row["sat_new_path"],
+                "image_path": row["new_image_path"],
                 "satellite_path": row["sat_new_path"],
                 "terrain_path": row["terr_new_path"],
                 "satellite_sha256": row["sat_new_sha"],
@@ -386,6 +450,7 @@ def build_source_shift_batch(
         "new_manifest_path": new_path_str,
         "new_manifest_sha256": new_file_sha,
         "new_source_identity": new_identity,
+        "image_root": str(resolved_image_root),
         "output_batch_csv_path": str(output_batch_csv),
         "output_batch_csv_sha256": batch_csv_sha256,
         "pair_unblinding": pair_unblinding,
@@ -411,6 +476,7 @@ def main() -> None:
         old_source_identity=args.old_source_identity,
         new_source_identity=args.new_source_identity,
         check_files=not args.no_check_files,
+        image_root=args.image_root,
     )
     print(
         f"Built source-shift batch: Pairs={summary['sample_size_pairs']} | "

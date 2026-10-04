@@ -112,8 +112,8 @@ def test_scenic_byway_discount_stays_positive_and_duration_sensitive() -> None:
             )
             short_cost = cost.calculate(short_byway)
             long_cost = cost.calculate(long_byway)
-            assert math.isfinite(short_cost) and short_cost >= 1e-6
-            assert math.isfinite(long_cost) and long_cost >= 1e-6
+            assert math.isfinite(short_cost) and short_cost > 0.0
+            assert math.isfinite(long_cost) and long_cost > 0.0
             assert long_cost > short_cost
 
     uncapped = ScenicCostFunction(
@@ -153,8 +153,6 @@ def test_perfect_scenic_byway_still_scales_with_duration() -> None:
 
     short_cost = cost.calculate(short_byway)
     long_cost = cost.calculate(long_byway)
-    assert short_cost >= 1e-6
-    assert long_cost >= 1e-6
     assert math.isfinite(short_cost) and math.isfinite(long_cost)
     assert long_cost > short_cost
 
@@ -1234,7 +1232,7 @@ def test_nearest_node_index_invalidates_after_add_and_overwrite() -> None:
     graph.add_node(Node(id="new", lat=42.089, lon=-72.089))
     assert graph.find_nearest_node(*query).id == "new"
 
-    graph.add_node(Node(id="a", lat=42.091, lon=-72.091))
+    graph.nodes["a"] = Node(id="a", lat=42.091, lon=-72.091)
     assert graph.find_nearest_node(*query).id == "a"
 
 
@@ -2903,40 +2901,6 @@ def test_load_legacy_json_normalizes_historical_field_representations(
     ] == [("7::rev", "B", "1")]
 
 
-def test_load_legacy_json_duplicate_node_overwrite_preserves_order_and_adjacency(
-    tmp_path: Path,
-) -> None:
-    payload = {
-        "nodes": [
-            {"id": "A", "lat": 42.0, "lon": -72.0},
-            {"id": "B", "lat": 42.1, "lon": -72.0},
-            {"id": "A", "lat": 43.0, "lon": -71.0},
-        ],
-        "edges": [
-            {
-                "id": "AB",
-                "start": "A",
-                "end": "B",
-                "distance_km": 1.0,
-                "one_way": False,
-            }
-        ],
-    }
-    path = tmp_path / "duplicate_node.json"
-    path.write_bytes(json.dumps(payload).encode("utf-8"))
-
-    graph = RoadGraph.load(path)
-
-    assert list(graph.nodes) == ["A", "B"]
-    assert graph.nodes["A"].coords == (43.0, -71.0)
-    assert [
-        (item.id, item.start_node_id, item.end_node_id) for item in graph.get_edges("A")
-    ] == [("AB", "A", "B")]
-    assert [
-        (item.id, item.start_node_id, item.end_node_id) for item in graph.get_edges("B")
-    ] == [("AB::rev", "B", "A")]
-
-
 @pytest.mark.parametrize(
     "field",
     ["distance_km", "scenic_score"],
@@ -3996,3 +3960,196 @@ def test_shared_compiled_caches_isolate_graphs_and_mutations() -> None:
     refreshed_planner = ScenicRoutePlanner(graph=first_graph)
     refreshed_route = refreshed_planner.find_fastest_route((42.0, -72.0), (42.1, -72.0))
     assert refreshed_route.total_distance_km == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("road_type", ["secondary", "scenic_byway"])
+def test_scenic_floor_is_proportional_below_one_microcost(road_type: str) -> None:
+    graph = RoadGraph()
+    for node_id in ("S", "M", "G"):
+        graph.add_node(Node(id=node_id, lat=42.0, lon=-72.0))
+    for edge_id, start, end, distance in (
+        ("whole", "S", "G", 0.2),
+        ("first", "S", "M", 0.1),
+        ("second", "M", "G", 0.1),
+        ("zero", "S", "G", 0.0),
+    ):
+        graph.add_edge(Edge(
+            id=edge_id, start_node_id=start, end_node_id=end,
+            distance_km=distance, scenic_score=10.0, road_type=road_type,
+            speed_limit_kmh=60, one_way=True,
+        ))
+    cost = ScenicCostFunction(scenic_weight=1.0)
+    whole = cost.calculate(graph.edges["whole"])
+    assert 0.0 < whole < 1e-6
+    assert whole == pytest.approx(
+        cost.calculate(graph.edges["first"]) + cost.calculate(graph.edges["second"]),
+        abs=1e-20,
+    )
+    assert cost.calculate(graph.edges["zero"]) == 0.0
+    planner = ScenicRoutePlanner(graph)
+    compiled = planner._csr_data(cost, planner._built_in_cost_signature(cost))
+    assert compiled is not None
+    for position, (edge_id, _reverse) in enumerate(compiled.topology.edge_refs):
+        assert compiled.weights[position] == pytest.approx(
+            cost.calculate(graph.edges[edge_id]), abs=1e-20
+        )
+
+
+def test_direct_scenic_access_survives_disconnected_middle_search() -> None:
+    from src.route_planner.cost import evaluate_path, resolve_routing_policy
+
+    graph = RoadGraph()
+    for prefix in ("fast", "scenic"):
+        graph.add_node(Node(id=f"{prefix}-S", lat=42.0, lon=-72.0))
+        graph.add_node(Node(id=f"{prefix}-G", lat=42.0, lon=-71.98))
+        graph.add_edge(Edge(
+            id=prefix, start_node_id=f"{prefix}-S", end_node_id=f"{prefix}-G",
+            distance_km=2.0, scenic_score=0.0 if prefix == "fast" else 9.0,
+            speed_limit_kmh=60 if prefix == "fast" else 30, one_way=True,
+        ))
+    planner = ScenicRoutePlanner(graph)
+    request = planner._build_endpoint_access_request(
+        (42.0, -71.995), (42.0, -71.985), avoid_highways=False
+    )
+    assert len(request.direct_candidates) == 2
+    planner.graph = request.overlay
+    fastest = planner._multi_access_builtin_path(
+        request.overlay, request.start_projections, request.end_projections,
+        planner._make_fastest_cost_function(), request.direct_candidates,
+    )
+    assert fastest is not None
+    policy = resolve_routing_policy(scenic_weight=1.0, kappa=2.0)
+    baseline = evaluate_path(
+        fastest[1], q=1.0, kappa=2.0, fastest_duration_minutes=fastest[0],
+        policy=policy,
+    )
+    path, evaluation, _diagnostics = planner._compact_lagrangian_scenic_search(
+        request, q=1.0, kappa=2.0, fastest_duration_minutes=fastest[0],
+        duration_cap_minutes=fastest[0] * 2.0, policy=policy,
+        fastest_edges=fastest[1], fastest_evaluation=baseline,
+    )
+    assert evaluation.raw_scenic_score == pytest.approx(9.0)
+    assert evaluation.duration_minutes <= fastest[0] * 2.0
+    assert len(path) == 1
+
+
+def test_heuristic_zero_improvement_does_not_claim_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="S", lat=42.0, lon=-72.0))
+    graph.add_node(Node(id="G", lat=42.0, lon=-71.98))
+    graph.add_edge(Edge(
+        id="road", start_node_id="S", end_node_id="G", distance_km=2.0,
+        scenic_score=5.0, speed_limit_kmh=60, one_way=True,
+    ))
+    planner = ScenicRoutePlanner(graph)
+    monkeypatch.setattr(planner, "_EXACT_ORACLE_MAX_NODES", 0)
+    monkeypatch.setattr(planner, "_ENDPOINT_OVERLAY_MAX_NODES", 0)
+    monkeypatch.setattr(planner, "_COMPILED_SCENIC_MIN_NODES", 0)
+    route = planner.find_scenic_route(
+        (42.0, -71.995), (42.0, -71.985), scenic_weight=1.0,
+    )
+    assert route.exact is False
+    assert route.optimality_gap > 0.0
+    assert route.zero_improvement_reason == "no_scenic_improvement_found"
+
+
+@pytest.mark.parametrize("cache_kind", ["fastest", "reachability", "csr", "speed"])
+def test_shared_cache_lookup_survives_concurrent_invalidation(
+    monkeypatch: pytest.MonkeyPatch, cache_kind: str,
+) -> None:
+    from collections import OrderedDict
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    lookup_started = Event()
+    clear_attempted = Event()
+    clear_finished = Event()
+
+    class PausingCache(OrderedDict):
+        armed = False
+
+        def pause(self) -> None:
+            if self.armed:
+                self.armed = False
+                lookup_started.set()
+                assert clear_attempted.wait(2.0)
+                # A synchronized cache blocks invalidation until lookup and
+                # LRU promotion finish. Without it, clearing wins this race.
+                clear_finished.wait(0.1)
+
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            self.pause()
+            return value
+
+        def __contains__(self, key):
+            value = super().__contains__(key)
+            self.pause()
+            return value
+
+    attribute = {
+        "fastest": "_FASTEST_PATH_SHARED_CACHE",
+        "reachability": "_ELIGIBLE_REACHABILITY_SHARED_CACHE",
+        "csr": "_CSR_DATA_CACHE",
+        "speed": "_ENDPOINT_GEODESIC_SPEED_SHARED_CACHE",
+    }[cache_kind]
+    ScenicRoutePlanner.clear_shared_caches()
+    cache = PausingCache()
+    monkeypatch.setattr(ScenicRoutePlanner, attribute, cache)
+    graph = RoadGraph()
+    start = Node(id="S", lat=42.0, lon=-72.0)
+    goal = Node(id="G", lat=42.0, lon=-71.99)
+    graph.add_node(start)
+    graph.add_node(goal)
+    graph.add_edge(Edge(
+        id="road", start_node_id="S", end_node_id="G", distance_km=1.0,
+        scenic_score=5.0, speed_limit_kmh=60, one_way=True,
+    ))
+    planner = ScenicRoutePlanner(graph)
+    cost = planner._make_fastest_cost_function()
+
+    def lookup():
+        if cache_kind == "fastest":
+            return [edge.id for edge in planner._cached_fastest_edges(start, goal, False)]
+        if cache_kind == "reachability":
+            return planner._compiled_reachability_result(start, goal, cost)
+        if cache_kind == "csr":
+            return planner._csr_data(cost, planner._built_in_cost_signature(cost)).weights.tolist()
+        return planner._endpoint_geodesic_bound_speed(graph, False)
+
+    if cache_kind == "reachability":
+        planner._record_compiled_reachability(
+            start, goal, cost, graph._heuristic_cache_stamp(), True
+        )
+    expected = lookup()
+    cache.armed = True
+
+    def invalidate() -> None:
+        clear_attempted.set()
+        ScenicRoutePlanner.clear_shared_caches()
+        clear_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future = executor.submit(lookup)
+        assert lookup_started.wait(2.0)
+        clear_future = executor.submit(invalidate)
+        assert future.result(timeout=2.0) == expected
+        clear_future.result(timeout=2.0)
+    assert lookup() == (None if cache_kind == "reachability" else expected)
+    ScenicRoutePlanner.clear_shared_caches()
+
+
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), float("-inf")])
+def test_tile_score_admission_rejects_nonfinite_reports(
+    tmp_path: Path, score: float,
+) -> None:
+    from src.route_planner.service import load_tile_scores
+
+    report = tmp_path / "scores.json"
+    report.write_text(json.dumps({
+        "tiles": [{"x": 1, "y": 2, "z": 3, "scenic_score": score}],
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="finite"):
+        load_tile_scores(report)

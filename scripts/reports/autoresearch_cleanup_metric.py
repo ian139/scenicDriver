@@ -1,4 +1,10 @@
-"""Emit deterministic repository-maintenance metrics for autoresearch cleanup."""
+"""Emit maintenance lines + 10,000 per Ruff violation over tracked source.
+
+The Git index defines file membership; current working-tree contents define line
+counts. Untracked outputs do not affect the objective. Tests remain a separate
+reported metric, not maintenance lines. Native and shell sources count alongside
+Python, app, configuration and documentation text in the existing roots.
+"""
 
 from __future__ import annotations
 
@@ -32,23 +38,42 @@ ROOT_FILES = (
     ".dockerignore",
 )
 TEXT_SUFFIXES = {
+    ".bash",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
     ".css",
     ".html",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
     ".js",
     ".json",
     ".md",
     ".mjs",
     ".py",
+    ".rs",
+    ".sh",
     ".toml",
     ".yaml",
     ".yml",
+    ".zsh",
 }
 EXCLUDED_PARTS = {"__marimo__", "__pycache__"}
 
 
-def _ruff_violation_count() -> int:
+def _ruff_violation_count(tracked: list[Path]) -> int:
+    targets = [
+        path.relative_to(ROOT).as_posix() for path in tracked
+        if path.suffix in {".py", ".pyi", ".ipynb"}
+        and any(path.relative_to(ROOT).is_relative_to(root) for root in RUFF_TARGETS)
+    ]
+    if not targets:
+        return 0
     result = subprocess.run(
-        ["ruff", "check", *RUFF_TARGETS, "--output-format", "json"],
+        ["ruff", "check", "--force-exclude", *targets, "--output-format", "json"],
         cwd=ROOT,
         check=False,
         capture_output=True,
@@ -62,24 +87,38 @@ def _ruff_violation_count() -> int:
     return len(violations)
 
 
-def _text_files() -> list[Path]:
-    files: set[Path] = set()
-    for relative_root in MAINTENANCE_ROOTS:
-        root = ROOT / relative_root
-        if not root.exists():
+def _tracked_files() -> list[Path]:
+    result = subprocess.run(
+        ["git", "ls-files", "--cached", "-z"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git tracked-file inventory failed")
+    return sorted({
+        ROOT / name
+        for name in result.stdout.split("\0")
+        if name and (ROOT / name).is_file()
+    })
+
+
+def _text_files(tracked: list[Path]) -> list[Path]:
+    files = []
+    for path in tracked:
+        relative = path.relative_to(ROOT)
+        if EXCLUDED_PARTS.intersection(relative.parts):
             continue
-        for path in root.rglob("*"):
-            if (
-                path.is_file()
-                and path.suffix in TEXT_SUFFIXES
-                and not EXCLUDED_PARTS.intersection(path.parts)
-            ):
-                files.add(path)
-    for relative_path in ROOT_FILES:
-        path = ROOT / relative_path
-        if path.is_file():
-            files.add(path)
-    return sorted(files)
+        if relative.as_posix() in ROOT_FILES or (
+            path.suffix in TEXT_SUFFIXES
+            and (
+                any(relative.is_relative_to(root) for root in MAINTENANCE_ROOTS)
+                or (len(relative.parts) == 1 and path.suffix in {".sh", ".bash", ".zsh"})
+            )
+        ):
+            files.append(path)
+    return files
 
 
 def _line_count(paths: list[Path]) -> int:
@@ -87,11 +126,15 @@ def _line_count(paths: list[Path]) -> int:
 
 
 def main() -> None:
-    files = _text_files()
+    tracked = _tracked_files()
+    files = _text_files(tracked)
     maintenance_lines = _line_count(files)
-    test_files = sorted((ROOT / "tests").glob("test_*"))
-    test_lines = _line_count([path for path in test_files if path.is_file()])
-    ruff_violations = _ruff_violation_count()
+    test_files = [
+        path for path in tracked
+        if path.parent == ROOT / "tests" and path.name.startswith("test_")
+    ]
+    test_lines = _line_count(test_files)
+    ruff_violations = _ruff_violation_count(tracked)
     maintenance_debt = maintenance_lines + 10_000 * ruff_violations
 
     print(f"METRIC maintenance_debt={maintenance_debt}")

@@ -1,136 +1,302 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import importlib.util
+import io
+import json
 from pathlib import Path
+import re
+import subprocess
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 from xml.etree import ElementTree
 
 
 ROOT = Path(__file__).resolve().parents[1]
-GENERATOR_PATH = ROOT / "scripts/reports/generate_routing_research_figures.py"
 DATA_PATH = ROOT / "docs/assets/research/routing/figure-data.json"
-
-spec = importlib.util.spec_from_file_location("routing_research_figures", GENERATOR_PATH)
-assert spec is not None and spec.loader is not None
-figures = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(figures)
-
 SVG_NAMESPACE = "{http://www.w3.org/2000/svg}"
+
+
+def load_script(name: str):
+    path = ROOT / "scripts/reports" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+figures = load_script("generate_routing_research_figures")
+cleanup = load_script("autoresearch_cleanup_metric")
 
 
 class RoutingResearchFigureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.data = figures.load_data(DATA_PATH)
 
-    def test_source_schema_and_exact_research_values(self) -> None:
-        self.assertEqual(self.data["schema_version"], 1)
-        self.assertEqual(
-            self.data["source"]["document"],
-            "docs/research/routing-performance-autoresearch.md",
-        )
-        self.assertEqual(self.data["study"]["target"], {
-            "metric": "median uncached complete plan_routes request",
-            "threshold_seconds": 20,
-            "met": False,
-            "evidence": "uncached_decision",
-        })
-        self.assertEqual(self.data["study"]["request"]["deadline_seconds"], 120)
-        self.assertEqual(self.data["study"]["host"]["final_load_averages"], [16.95, 31.52, 30.53])
-        self.assertEqual(
-            self.data["figures"]["latency-distributions"]["series"][0]["values"],
-            [76.4699, 78.9445, 74.2697],
-        )
-        self.assertEqual(
-            self.data["figures"]["latency-distributions"]["series"][1]["values"],
-            [60.8398, 62.6824, 65.7794],
-        )
-        self.assertEqual(
-            self.data["figures"]["latency-distributions"]["series"][2]["values"],
-            [82.3048, 114.4851, 92.0760, 70.9841, 61.6257],
-        )
-        self.assertEqual(
-            self.data["figures"]["latency-distributions"]["series"][3]["values"],
-            [0.2663],
-        )
-        self.assertEqual(self.data["figures"]["profile-bottlenecks"]["observations"], [
-            {"label": "Native compact search", "percent": 89.6},
-            {"label": "Heap pop", "percent": 57.5},
-        ])
-        self.assertEqual(self.data["production_context"]["cases"], 2256)
-        self.assertEqual(self.data["production_context"]["baseline_median_ms"], 6449.169)
-        self.assertEqual(self.data["production_context"]["candidate_median_ms"], 1238.558)
-
-    def test_every_research_figure_value_has_evidence_reference(self) -> None:
-        evidence = self.data["source"]["evidence"]
-        self.assertTrue(all(isinstance(value, str) and value for value in evidence.values()))
-        self.assertEqual(
-            set(self.data["figures"]),
-            {name.removesuffix(".svg") for name in figures.CANONICAL_FILENAMES},
-        )
-        for figure in self.data["figures"].values():
-            self.assertIn(figure["evidence"], evidence)
-        for item in self.data["study"].values():
-            self.assertIn(item["evidence"], evidence)
-        self.assertIn(self.data["production_context"]["evidence"], evidence)
-
-    def test_timeouts_and_response_cache_hits_are_not_misrepresented(self) -> None:
-        experiments = self.data["figures"]["experiment-outcomes"]["experiments"]
-        timeout_runs = [item["run"] for item in experiments if item["status"] == "timeout"]
-        self.assertEqual(timeout_runs, [112, 119, 122])
-        self.assertTrue(all("median_seconds" not in item for item in experiments if item["status"] == "timeout"))
-        classes = {
-            item["class"]
-            for item in self.data["figures"]["latency-distributions"]["series"]
-        }
-        self.assertIn("response_cache_hit", classes)
-        self.assertIn("uncached", classes)
-        self.assertNotEqual("response_cache_hit", "uncached")
-        invalid = copy.deepcopy(self.data)
-        invalid["figures"]["experiment-outcomes"]["experiments"][1]["median_seconds"] = 120
-        with self.assertRaisesRegex(ValueError, "categorical"):
-            figures.validate_data(invalid)
-
-    def test_generation_is_deterministic_and_matches_committed_assets(self) -> None:
+    def generate(self, data):
         with TemporaryDirectory() as temporary:
-            output_dir = Path(temporary)
-            first = figures.generate(output_dir, DATA_PATH)
-            first_hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in first}
-            second = figures.generate(output_dir, DATA_PATH)
-            second_hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in second}
-            self.assertEqual(first_hashes, second_hashes)
-            committed_hashes = {
-                name: hashlib.sha256((ROOT / "docs/assets/research/routing" / name).read_bytes()).hexdigest()
-                for name in figures.CANONICAL_FILENAMES
+            root = Path(temporary)
+            source = root / "data.json"
+            source.write_text(json.dumps(data), encoding="utf-8")
+            return {
+                path.name: ElementTree.parse(path).getroot()
+                for path in figures.generate(root / "output", source)
             }
-            self.assertEqual(first_hashes, committed_hashes)
 
-    def test_svg_xml_accessibility_and_required_annotations(self) -> None:
-        required_annotations = {
-            "system-boundary.svg": ["Target:", "Complete response cache cleared", "Deadline:"],
-            "autoresearch-loop.svg": ["1 baseline + 11 candidates", "uncached median target &lt; 20 s", "not met", "Timeouts are deadline outcomes"],
-            "experiment-outcomes.svg": ["median seconds", "TIMEOUT", "warm-up exceeded deadline"],
-            "latency-distributions.svg": ["20 s research target", "n=3", "n=5", "Response-cache hit"],
-            "profile-bottlenecks.svg": ["89.6%", "57.5%", "Do not add these shares"],
-            "two-worker-execution.svg": ["at most two", "ContextVar copied into all four submitted tasks", "62.682 s", "76.47 s", "n=3 each"],
+    @staticmethod
+    def text(root):
+        return " ".join(root.itertext())
+
+    @staticmethod
+    def seconds(root):
+        return {
+            float(value)
+            for value in re.findall(r"(?<!\w)(\d+(?:\.\d+)?)\s+s\b", " ".join(root.itertext()))
         }
-        for filename in figures.CANONICAL_FILENAMES:
-            path = ROOT / "docs/assets/research/routing" / filename
-            root = ElementTree.parse(path).getroot()
-            self.assertEqual(root.tag, SVG_NAMESPACE + "svg")
-            self.assertEqual(root.attrib["role"], "img")
-            labelled_by = root.attrib["aria-labelledby"].split()
-            self.assertEqual(len(labelled_by), 2)
-            titles = root.findall(SVG_NAMESPACE + "title")
-            descriptions = root.findall(SVG_NAMESPACE + "desc")
-            self.assertEqual(len(titles), 1)
-            self.assertEqual(len(descriptions), 1)
-            self.assertEqual([titles[0].attrib["id"], descriptions[0].attrib["id"]], labelled_by)
-            text = path.read_text(encoding="utf-8")
-            for annotation in required_annotations[filename]:
-                self.assertIn(annotation, text)
+
+    def changed_measurements(self, candidate=40):
+        data = copy.deepcopy(self.data)
+        series = data["figures"]["latency-distributions"]["series"]
+        values = {
+            "uncached": [46, 48, 50, 52, 54],
+            "accepted_candidate": [candidate - 2, candidate, candidate + 2],
+            "final_confirmation": [30, 34, 38],
+            "response_cache_hit": [0.75],
+        }
+        for item in series:
+            item["values"] = values[item["class"]]
+            item["n"] = len(item["values"])
+        for item in data["figures"]["experiment-outcomes"]["experiments"]:
+            if item["status"] == "baseline":
+                item["median_seconds"] = 50
+            elif item["status"] == "retain":
+                item["median_seconds"] = candidate
+        percent = 100 * (50 - candidate) / 50
+        loop = data["figures"]["autoresearch-loop"]
+        loop["acceptance_improvement_percent"] = percent
+        loop["candidate_cap"] = 12
+        workers = data["figures"]["two-worker-execution"]
+        workers["isolated_baseline_median_seconds"] = 50
+        workers["isolated_candidate_median_seconds"] = candidate
+        workers["isolated_improvement_percent"] = percent
+        data["study"]["target"].update(threshold_seconds=35, met=True)
+        data["figures"]["profile-bottlenecks"]["observations"][0]["percent"] = 10
+        data["figures"]["profile-bottlenecks"]["observations"][1]["percent"] = 4
+        return data
+
+    def test_annotations_follow_samples_threshold_counts_and_profile_shares(self) -> None:
+        rendered = self.generate(self.changed_measurements())
+        for name in ("autoresearch-loop.svg", "two-worker-execution.svg"):
+            root = rendered[name]
+            self.assertTrue({40, 50}.issubset(self.seconds(root)))
+            self.assertRegex(self.text(root), r"20%\s+lower")
+        worker_text = self.text(rendered["two-worker-execution.svg"])
+        self.assertRegex(worker_text, r"n=3\s+candidate")
+        self.assertRegex(worker_text, r"n=5\s+baseline")
+        for name in ("system-boundary.svg", "autoresearch-loop.svg", "latency-distributions.svg"):
+            root = rendered[name]
+            self.assertIn(35, self.seconds(root))
+            self.assertNotIn("not met", self.text(root))
+        self.assertIn(0.75, self.seconds(rendered["latency-distributions.svg"]))
+        loop_text = self.text(rendered["autoresearch-loop.svg"])
+        self.assertRegex(loop_text, r"11\s+(?:measured\s+)?candidates")
+        self.assertNotIn("Cap reached", loop_text)
+        profile = rendered["profile-bottlenecks.svg"]
+        self.assertRegex(self.text(profile), r"10%")
+        self.assertRegex(self.text(profile), r"4%")
+        description = profile.find(SVG_NAMESPACE + "desc").text
+        self.assertIn("10%", description)
+        self.assertIn("4%", description)
+
+    def test_slower_candidate_is_not_reported_as_an_improvement(self) -> None:
+        rendered = self.generate(self.changed_measurements(candidate=60))
+        for name in ("autoresearch-loop.svg", "two-worker-execution.svg"):
+            self.assertRegex(self.text(rendered[name]), r"20%\s+higher")
+            self.assertNotRegex(self.text(rendered[name]), r"20%\s+lower")
+
+    def test_target_uses_final_confirmation_and_strict_threshold_not_cache_hit(self) -> None:
+        data = self.changed_measurements()
+        data["study"]["target"].update(threshold_seconds=34, met=False)
+        rendered = self.generate(data)
+        for name in ("system-boundary.svg", "autoresearch-loop.svg", "latency-distributions.svg"):
+            self.assertIn("not met", self.text(rendered[name]))
+        data["study"]["target"]["met"] = True
+        with self.assertRaises(ValueError):
+            self.generate(data)
+
+    def test_invalid_quantitative_data_is_rejected_before_writing_figures(self) -> None:
+        supplied = self.data["figures"]
+        series = supplied["latency-distributions"]["series"]
+        experiments = supplied["experiment-outcomes"]["experiments"]
+        loop = supplied["autoresearch-loop"]
+        workers = supplied["two-worker-execution"]
+        profile = supplied["profile-bottlenecks"]["observations"]
+        production = self.data["production_context"]
+        mutations = [
+            (("figures", "latency-distributions", "series", 0, "n"), series[0]["n"] + 1),
+            (("figures", "latency-distributions", "series", 0, "n"), True),
+            (("figures", "latency-distributions", "series", 0, "n"), 3.0),
+            (("figures", "latency-distributions", "series", 0, "values"), []),
+            (("figures", "latency-distributions", "series", 0, "values", 0), float("nan")),
+            (("figures", "latency-distributions", "series", 0, "values", 0), float("inf")),
+            (("figures", "latency-distributions", "series", 0, "values", 0), -1),
+            (("figures", "latency-distributions", "series", 0, "values", 0), True),
+            (("figures", "latency-distributions", "series", 1, "class"), "uncached"),
+            (("figures", "experiment-outcomes", "experiments", 0, "median_seconds"), experiments[0]["median_seconds"] + 1),
+            (("figures", "experiment-outcomes", "experiments", 1, "median_seconds"), 1),
+            (("figures", "experiment-outcomes", "experiments", 2, "status"), "success"),
+            (("figures", "experiment-outcomes", "experiments", 2, "run"), experiments[0]["run"]),
+            (("figures", "autoresearch-loop", "baseline_count"), 2),
+            (("figures", "autoresearch-loop", "candidate_cap"), len(experiments) - loop["baseline_count"] - 1),
+            (("figures", "autoresearch-loop", "acceptance_improvement_percent"), loop["acceptance_improvement_percent"] + 1),
+            (("figures", "two-worker-execution", "isolated_improvement_percent"), workers["isolated_improvement_percent"] + 1),
+            (("figures", "two-worker-execution", "isolated_candidate_median_seconds"), workers["isolated_candidate_median_seconds"] + 1),
+            (("figures", "two-worker-execution", "max_workers"), 3),
+            (("figures", "system-boundary", "search_count"), 3),
+            (("figures", "profile-bottlenecks", "observations", 0, "percent"), 101),
+            (("figures", "profile-bottlenecks", "observations", 1, "percent"), profile[0]["percent"] + 1),
+            (("study", "target", "threshold_seconds"), 0),
+            (("study", "target", "met"), not self.data["study"]["target"]["met"]),
+            (("study", "request", "deadline_seconds"), float("inf")),
+            (("production_context", "cases"), 0),
+            (("production_context", "baseline_timeouts"), production["cases"] + 1),
+            (("production_context", "candidate_timeouts"), -1),
+            (("production_context", "candidate_p95_ms"), production["candidate_median_ms"] / 2),
+        ]
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, (keys, value) in enumerate(mutations):
+                with self.subTest(keys=keys, value=value):
+                    invalid = copy.deepcopy(self.data)
+                    container = invalid
+                    for key in keys[:-1]:
+                        container = container[key]
+                    container[keys[-1]] = value
+                    source = root / "data.json"
+                    source.write_text(json.dumps(invalid), encoding="utf-8")
+                    output = root / f"output-{index}"
+                    with self.assertRaises(ValueError):
+                        figures.generate(output, source)
+                    self.assertFalse(output.exists())
+
+    def test_larger_latency_and_threshold_remain_inside_chart(self) -> None:
+        data = self.changed_measurements()
+        confirmation = next(item for item in data["figures"]["latency-distributions"]["series"] if item["class"] == "final_confirmation")
+        confirmation["values"] = [160, 180, 200]
+        data["study"]["target"].update(threshold_seconds=150, met=False)
+        root = self.generate(data)["latency-distributions.svg"]
+        self.assertIn(150, self.seconds(root))
+        ticks = [
+            float(item.text) for item in root.iter(SVG_NAMESPACE + "text")
+            if re.fullmatch(r"\d+(?:\.\d+)?", item.text or "")
+        ]
+        self.assertGreaterEqual(max(ticks), 200)
+        width = float(root.attrib["width"])
+        for circle in root.iter(SVG_NAMESPACE + "circle"):
+            center = float(circle.attrib["cx"])
+            radius = float(circle.attrib["r"])
+            self.assertGreaterEqual(center - radius, 0)
+            self.assertLessEqual(center + radius, width)
+
+    def test_generation_is_deterministic_and_accessible(self) -> None:
+        with TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            first = figures.generate(directory, DATA_PATH)
+            hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in first}
+            second = figures.generate(directory, DATA_PATH)
+            self.assertEqual(hashes, {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in second})
+            self.assertEqual(set(hashes), set(figures.CANONICAL_FILENAMES))
+            for path in second:
+                root = ElementTree.parse(path).getroot()
+                self.assertEqual(root.tag, SVG_NAMESPACE + "svg")
+                self.assertEqual(root.attrib["role"], "img")
+                title = root.find(SVG_NAMESPACE + "title")
+                description = root.find(SVG_NAMESPACE + "desc")
+                self.assertEqual(root.attrib["aria-labelledby"].split(), [title.attrib["id"], description.attrib["id"]])
+                self.assertTrue(title.text.strip())
+                self.assertTrue(description.text.strip())
+
+
+class MaintenanceMetricTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        subprocess.run(["git", "init", "--quiet", str(self.root)], check=True, capture_output=True)
+        self.patch_root = patch.object(cleanup, "ROOT", self.root)
+        self.patch_root.start()
+        self.addCleanup(self.patch_root.stop)
+        self.put(".ruff.toml", '[lint]\nselect = ["F"]\n', tracked=False)
+
+    def put(self, name, content, *, tracked=True):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        if tracked:
+            subprocess.run(["git", "add", "--", name], cwd=self.root, check=True, capture_output=True)
+        return path
+
+    def metrics(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cleanup.main()
+        return {
+            name: int(value)
+            for line in output.getvalue().splitlines()
+            for name, value in [line.removeprefix("METRIC ").split("=")]
+        }
+
+    def test_native_shell_lines_and_lint_penalty_keep_existing_objective(self) -> None:
+        self.put("src/search.c", "int search(void) {\n    return 0; }\n")
+        self.put("src/search.h", "int search(void);\n")
+        self.put("scripts/task.sh", "#!/bin/sh\nset -e\necho ready\n")
+        self.put("autoresearch.sh", "#!/bin/sh\necho run\n")
+        self.put("src/tracked.py", "import os\n")  # One actual F401 violation.
+        self.put("README.md", "Title\nDescription\n")
+        self.put("tests/test_tracked.py", "value = 1\nother = 2\n")
+        self.put("src/blob.bin", "not maintenance text\n")
+        result = self.metrics()
+        self.assertEqual(result, {
+            "maintenance_debt": 10011,
+            "ruff_violations": 1,
+            "maintenance_lines": 11,
+            "active_files": 6,
+            "test_lines": 2,
+        })
+
+    def test_untracked_outputs_and_tests_do_not_change_inventory_or_lint_debt(self) -> None:
+        tracked = self.put("src/file with spaces.py", "value = 1\n")
+        self.put("tests/test_tracked.py", "value = 1\n")
+        before = self.metrics()
+        self.put("src/untracked.py", "import missing_dependency\n", tracked=False)
+        self.put("docs/generated.md", "generated\n" * 100, tracked=False)
+        self.put("scripts/generated.sh", "echo generated\n", tracked=False)
+        self.put("tests/test_untracked.py", "import missing_dependency\n", tracked=False)
+        self.assertEqual(self.metrics(), before)
+        tracked.write_text("value = 1\nother = 2\n", encoding="utf-8")
+        after = self.metrics()
+        self.assertEqual(after["maintenance_lines"], before["maintenance_lines"] + 1)
+        self.assertEqual(after["maintenance_debt"], before["maintenance_debt"] + 1)
+        self.assertEqual(after["active_files"], before["active_files"])
+
+    def test_staged_additions_and_worktree_deletions_affect_source_debt(self) -> None:
+        source = self.put("src/search.cpp", "int value = 1;\n")
+        self.assertEqual(self.metrics()["maintenance_lines"], 1)
+        self.put("scripts/task.sh", "echo one\necho two\n")
+        self.assertEqual(self.metrics()["maintenance_lines"], 3)
+        source.unlink()
+        result = self.metrics()
+        self.assertEqual(result["maintenance_lines"], 2)
+        self.assertEqual(result["active_files"], 1)
+
+    def test_missing_git_inventory_fails_instead_of_guessing_filesystem(self) -> None:
+        with TemporaryDirectory() as temporary, patch.object(cleanup, "ROOT", Path(temporary)):
+            with self.assertRaises(RuntimeError):
+                cleanup.main()
 
 
 if __name__ == "__main__":

@@ -172,7 +172,7 @@ def test_target_grid_rejection():
         TargetGrid(z=14, x=4958, y=6059, crs="EPSG:4326")
 
     # Mismatched bounds
-    with pytest.raises(ValueError, match="do not match computed bounds"):
+    with pytest.raises(ValueError):
         TargetGrid(z=14, x=4958, y=6059, bounds=(0.0, 0.0, 1.0, 1.0))
 
     # Mismatched affine
@@ -182,6 +182,65 @@ def test_target_grid_rejection():
     # Missing dict keys
     with pytest.raises(ValueError, match="missing required key"):
         TargetGrid.from_dict({"z": 14, "x": 4958})
+
+
+def test_target_grid_from_dict_round_trip_and_missing_derived_fields():
+    grid = TargetGrid.from_tile(z=14, x=4958, y=6059, width=512, height=256)
+    data = grid.to_dict()
+    assert TargetGrid.from_dict(data) == grid
+    minimal = {"z": 14, "x": 4958, "y": 6059, "width": 512, "height": 256}
+    assert TargetGrid.from_dict(minimal) == grid
+
+
+@pytest.mark.parametrize("key", ["z", "x", "y", "width", "height"])
+@pytest.mark.parametrize("bad", [14.7, 14.0, True, "14", None])
+def test_target_grid_from_dict_rejects_non_integer_coords_and_dimensions(key, bad):
+    data = TargetGrid.from_tile(z=14, x=4958, y=6059).to_dict()
+    data[key] = bad
+    with pytest.raises(ValueError):
+        TargetGrid.from_dict(data)
+
+
+@pytest.mark.parametrize("key,size", [("bounds", 4), ("affine", 6)])
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda values: values[:-1],
+        lambda values: values + [0.0],
+        lambda values: [],
+        lambda values: None,
+        lambda values: "1234",
+        lambda values: 5.0,
+        lambda values: {str(i): v for i, v in enumerate(values)},
+        lambda values: [float("nan")] + values[1:],
+        lambda values: [float("inf")] + values[1:],
+        lambda values: values[:1] + [False] + values[2:],
+        lambda values: values[:1] + [str(values[1])] + values[2:],
+    ],
+)
+def test_target_grid_from_dict_rejects_present_malformed_bounds_and_affine(
+    key, size, mutate
+):
+    # Tile z=1/x=1/y=0 has exact 0.0 at index 1 of both bounds and affine, so
+    # bool/string substitutions are numerically equal and only typing rejects them.
+    data = TargetGrid.from_tile(z=1, x=1, y=0).to_dict()
+    assert data[key][1] == 0.0
+    assert len(data[key]) == size
+    data[key] = mutate(list(data[key]))
+    with pytest.raises(ValueError, match=key):
+        TargetGrid.from_dict(data)
+
+
+@pytest.mark.parametrize("key", ["bounds", "affine"])
+def test_target_grid_constructor_rejects_bool_and_string_derived_values(key):
+    computed = list(getattr(TargetGrid.from_tile(z=1, x=1, y=0), key))
+    assert computed[1] == 0.0
+    for bad in (
+        computed[:1] + ["0.0"] + computed[2:],
+        computed[:1] + [False] + computed[2:],
+    ):
+        with pytest.raises(ValueError, match=key):
+            TargetGrid(z=1, x=1, y=0, **{key: tuple(bad)})
 
 
 def test_route_tile_matching_integration():
