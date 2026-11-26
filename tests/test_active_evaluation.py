@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.scenic_scorer.active_evaluation import (
+from scenicdriver.scenic_scorer.active_evaluation import (
     evaluate_active_baseline,
     evaluate_candidate_validation,
     evaluate_stage_two,
@@ -18,7 +18,7 @@ from src.scenic_scorer.active_evaluation import (
     promote_with_user_override,
     rollback_registry,
 )
-from src.scenic_scorer.regression import ScenicRegressionModel
+from scenicdriver.scenic_scorer.regression import ScenicRegressionModel
 
 
 def _sha(path: Path) -> str:
@@ -2663,9 +2663,9 @@ def test_evaluate_active_baseline_nondeterminism_failure(
             {"image_path": "img2.jpg", "split": "test", "scenic_human_mean": "4.5"}
         )
 
-    import src.scenic_scorer.active_evaluation
+    import scenicdriver.scenic_scorer.active_evaluation
 
-    original_predict = src.scenic_scorer.active_evaluation._predict_dataset
+    original_predict = scenicdriver.scenic_scorer.active_evaluation._predict_dataset
     call_count = 0
 
     def mock_predict(*args, **kwargs):
@@ -2677,7 +2677,7 @@ def test_evaluate_active_baseline_nondeterminism_failure(
         return res
 
     monkeypatch.setattr(
-        src.scenic_scorer.active_evaluation, "_predict_dataset", mock_predict
+        scenicdriver.scenic_scorer.active_evaluation, "_predict_dataset", mock_predict
     )
 
     with pytest.raises(ValueError, match="Deterministic CPU inference failure"):
@@ -3419,7 +3419,7 @@ def test_stage_two_records_benchmarks_and_resolved_policy(tmp_path: Path) -> Non
 
 @pytest.mark.parametrize("state", ["paused", "failed"])
 def test_baseline_rejects_incomplete_modern_checkpoint(tmp_path: Path, state: str) -> None:
-    from src.scenic_scorer.active_evaluation import load_model_checkpoint
+    from scenicdriver.scenic_scorer.active_evaluation import load_model_checkpoint
 
     checkpoint = create_real_checkpoint(tmp_path / "baseline.pt")
     payload = torch.load(checkpoint, weights_only=False)
@@ -3431,7 +3431,7 @@ def test_baseline_rejects_incomplete_modern_checkpoint(tmp_path: Path, state: st
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), 1e100])
 def test_activation_rejects_nonfinite_or_overflowing_weights(tmp_path: Path, value: float) -> None:
-    from src.scenic_scorer.active_evaluation import load_model_checkpoint
+    from scenicdriver.scenic_scorer.active_evaluation import load_model_checkpoint
 
     checkpoint = create_real_checkpoint(tmp_path / "candidate.pt")
     payload = torch.load(checkpoint, weights_only=False)
@@ -3443,7 +3443,7 @@ def test_activation_rejects_nonfinite_or_overflowing_weights(tmp_path: Path, val
 
 
 def test_inference_rejects_redistributed_feature_widths(tmp_path: Path) -> None:
-    from src.scenic_scorer.active_evaluation import load_model_checkpoint, predict_dataset
+    from scenicdriver.scenic_scorer.active_evaluation import load_model_checkpoint, predict_dataset
 
     model = load_model_checkpoint(create_real_checkpoint(tmp_path / "candidate.pt"))
     # Combined width remains 13; a concatenation-only check would silently infer

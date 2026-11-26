@@ -12,8 +12,8 @@ import pandas as pd
 import torch
 import pytest
 
-from src.scenic_scorer.regression import ScenicRegressionModel
-from src.scenic_scorer.active_training import (
+from scenicdriver.scenic_scorer.regression import ScenicRegressionModel
+from scenicdriver.scenic_scorer.active_training import (
     ActiveTrainingConfig,
     ActiveTrainingError,
     _config_hash,
@@ -78,9 +78,24 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     pd.DataFrame(
         {
             "image_path": names,
+            "region": ["r1"] * 6,
+            "geographic_block": ["b0", "b0", "b1", "b1", "b2", "b2"],
             "split": ["train", "train", "val", "val", "test", "test"],
         }
     ).to_csv(run / "geographic_splits.csv", index=False)
+    split_registry = run / "geographic_split_registry.json"
+    split_registry.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "rule": {"name": "stable-block", "seed": 0},
+                "regions": {
+                    "r1": {"b0": "train", "b1": "val", "b2": "test"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     checkpoint = run / "baseline.pt"
     checkpoint.write_bytes(b"baseline checkpoint")
     registry = run / "registry.json"
@@ -94,6 +109,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
         "absolute_annotations",
         "mixed_labels",
         "geographic_splits",
+        "geographic_split_registry",
         "baseline_registry",
     ):
         path = {
@@ -102,6 +118,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
             "absolute_annotations": run / "absolute_annotations.csv",
             "mixed_labels": run / "mixed_labels.csv",
             "geographic_splits": run / "geographic_splits.csv",
+            "geographic_split_registry": split_registry,
             "baseline_registry": registry,
         }[key]
         artifacts[key] = {"path": path.name, "sha256": _sha256(path), "required": True}
@@ -704,7 +721,8 @@ def test_restore_rng_state_normalizes_non_cpu_tensor_and_validates_types(
     )
 
     resume_path = output / "resume.pt"
-    ckpt = torch.load(resume_path, weights_only=False)
+    ckpt = torch.load(resume_path, weights_only=True)
+    assert ("mps" in ckpt["rng_state"]) is (device == "mps")
 
     if torch.backends.mps.is_available():
         ckpt["rng_state"]["torch"] = ckpt["rng_state"]["torch"].to("mps")
@@ -737,19 +755,19 @@ def test_restore_rng_state_normalizes_non_cpu_tensor_and_validates_types(
     if torch.backends.mps.is_available():
         state["torch"] = state["torch"].to("mps")
 
-    _restore_rng_state(state)
+    _restore_rng_state(state, device)
     assert passed_to_set_rng_state is not None
     assert passed_to_set_rng_state.device.type == "cpu"
 
     bad_dtype_state = dict(ckpt["rng_state"])
     bad_dtype_state["torch"] = torch.tensor([1, 2, 3], dtype=torch.float32)
     with pytest.raises(ActiveTrainingError, match="uint8 ByteTensor"):
-        _restore_rng_state(bad_dtype_state)
+        _restore_rng_state(bad_dtype_state, device)
 
     bad_type_state = dict(ckpt["rng_state"])
     bad_type_state["torch"] = "not_a_tensor"
     with pytest.raises(ActiveTrainingError, match="uint8 ByteTensor"):
-        _restore_rng_state(bad_type_state)
+        _restore_rng_state(bad_type_state, device)
 
 
 def _benchmark_rows() -> list[dict[str, Any]]:
@@ -1190,6 +1208,68 @@ def test_training_initial_checkpoint_fail_closed(tmp_path: Path) -> None:
         )
 
 
+def _write_marker(path: str) -> None:
+    Path(path).write_text("executed", encoding="utf-8")
+
+
+class _MaliciousPayload:
+    def __init__(self, marker: Path) -> None:
+        self.marker = marker
+
+    def __reduce__(self) -> tuple[object, tuple[str]]:
+        return _write_marker, (str(self.marker),)
+
+
+def test_initial_and_resume_checkpoints_refuse_pickle_code_execution(
+    tmp_path: Path,
+) -> None:
+    handoff, split_csv, run = _fixture(tmp_path)
+    dataset = run / "prepared.npz"
+    prepare_active_dataset(handoff, dataset)
+    marker = tmp_path / "executed"
+    source = ScenicRegressionModel(vit_dim=4, terrain_dim=2, num_classes=3)
+    malicious_initial = run / "malicious_initial.pt"
+    torch.save(
+        {
+            "model_state_dict": source.state_dict(),
+            "vit_dim": 4,
+            "terrain_dim": 2,
+            "num_classes": 3,
+            "payload": _MaliciousPayload(marker),
+        },
+        malicious_initial,
+    )
+    with pytest.raises(ActiveTrainingError, match="Weights only load failed"):
+        train_active_model(
+            dataset,
+            split_csv,
+            run / "initial",
+            ActiveTrainingConfig(
+                epochs=1,
+                batch_size=2,
+                device="cpu",
+                initial_checkpoint_path=str(malicious_initial),
+                initial_checkpoint_sha256=_sha256(malicious_initial),
+            ),
+        )
+    assert not marker.exists()
+
+    output = run / "training"
+    config = ActiveTrainingConfig(epochs=2, batch_size=2, max_steps=1, device="cpu")
+    train_active_model(dataset, split_csv, output, config)
+    resume_path = output / "resume.pt"
+    checkpoint = torch.load(resume_path, weights_only=True)
+    checkpoint["payload"] = _MaliciousPayload(marker)
+    torch.save(checkpoint, resume_path)
+    summary_path = output / "training_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["resume_checkpoint_sha256"] = _sha256(resume_path)
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    with pytest.raises(ActiveTrainingError, match="Weights only load failed"):
+        train_active_model(dataset, split_csv, output, config, resume=True)
+    assert not marker.exists()
+
+
 def test_training_multiplier_and_test_metric_suppression(tmp_path: Path) -> None:
     handoff, split_csv, run = _fixture(tmp_path)
     dataset = run / "prepared.npz"
@@ -1498,7 +1578,7 @@ def test_resume_does_not_require_initial_checkpoint_file(tmp_path: Path) -> None
 
 @pytest.mark.parametrize("training", [True, False])
 def test_metrics_restores_model_mode(training: bool) -> None:
-    from src.scenic_scorer.active_training import _metrics
+    from scenicdriver.scenic_scorer.active_training import _metrics
 
     model = ScenicRegressionModel(vit_dim=2, terrain_dim=1, num_classes=1)
     model.train(training)
@@ -1514,7 +1594,7 @@ def test_metrics_restores_model_mode(training: bool) -> None:
 
 
 def test_metrics_restores_training_mode_after_inference_failure() -> None:
-    from src.scenic_scorer.active_training import _metrics
+    from scenicdriver.scenic_scorer.active_training import _metrics
 
     class BrokenModel(torch.nn.Module):
         def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
@@ -1536,7 +1616,7 @@ def test_metrics_restores_training_mode_after_inference_failure() -> None:
 
 @pytest.mark.parametrize("weighted", [True, False])
 def test_metrics_bounds_inference_and_preserves_statistics(weighted: bool) -> None:
-    from src.scenic_scorer.active_training import _metrics
+    from scenicdriver.scenic_scorer.active_training import _metrics
 
     class IdentityModel(torch.nn.Module):
         def forward(self, vit: torch.Tensor, *inputs: torch.Tensor) -> torch.Tensor:
@@ -1579,7 +1659,7 @@ def _prepared(tmp_path: Path) -> tuple[Path, Path, Path]:
 def test_hard_kill_after_batch_commit_resumes_latest_generation_exactly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import src.scenic_scorer.active_training as active_training
+    import scenicdriver.scenic_scorer.active_training as active_training
 
     dataset, split_csv, run = _prepared(tmp_path)
     config = ActiveTrainingConfig(epochs=3, batch_size=1, device="cpu", seed=7)
@@ -1622,7 +1702,7 @@ def test_hard_kill_after_batch_commit_resumes_latest_generation_exactly(
 def test_sidecar_publication_failure_recovers_paused_and_completed_generations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import src.scenic_scorer.active_training as active_training
+    import scenicdriver.scenic_scorer.active_training as active_training
 
     dataset, split_csv, run = _prepared(tmp_path)
     output = run / "training"
@@ -1683,7 +1763,7 @@ def test_sidecar_publication_failure_recovers_paused_and_completed_generations(
 def _pause_during_metrics_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_call: int
 ) -> tuple[dict[str, Any], Path, Path, Path, ActiveTrainingConfig]:
-    import src.scenic_scorer.active_training as active_training
+    import scenicdriver.scenic_scorer.active_training as active_training
 
     dataset, split_csv, run = _prepared(tmp_path)
     output = run / "training"

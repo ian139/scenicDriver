@@ -7,7 +7,7 @@ import pickle
 
 import pytest
 
-from src.data_pipeline.source_contracts import (
+from scenicdriver.data_pipeline.source_contracts import (
     AcquisitionTileIdentity,
     EmbeddingFeatureIdentity,
     PredictionReportIdentity,

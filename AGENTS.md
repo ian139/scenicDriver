@@ -5,15 +5,15 @@ Scenic Drive scores scenic beauty from satellite imagery and terrain data, then 
 
 ## Active Surfaces
 - `apps/new_england_north/`: canonical static MapLibre web MVP.
-- `src/app_api/`: FastAPI route-compare and contributor endpoints.
-- `src/route_planner/`: graph, cost, planner, and route service logic.
-- `src/classifier/`, `src/scenic_scorer/`, `src/terrain/`, `src/heuristics/`, `src/data_pipeline/`: ML/data pipeline code.
+- `src/scenicdriver/app_api/`: FastAPI route-compare and contributor endpoints.
+- `src/scenicdriver/route_planner/`: graph, cost, planner, and route service logic.
+- `src/scenicdriver/classifier/`, `src/scenicdriver/scenic_scorer/`, `src/scenicdriver/terrain/`, `src/scenicdriver/heuristics/`, `src/scenicdriver/data_pipeline/`: ML/data pipeline code.
 - `notebooks/`: marimo training, scoring, and annotation workflows.
 - `scripts/`: workflow CLIs grouped by annotation, ingest, modeling, reports, and routing.
 
 ## Commands
-- `uv sync`
-- `uv run uvicorn src.app_api.main:app --host 0.0.0.0 --port 8080 --reload`
+- `uv sync` — installs the default `dev` group, including `ml` and `ingest` extras; CI uses `uv sync --frozen`. For the lean API environment use `uv sync --no-dev`; add `--extra ml` or `--extra ingest` for those workflows.
+- `uv run uvicorn scenicdriver.app_api.main:app --host 0.0.0.0 --port 8080 --reload`
 - `cd apps/new_england_north && python3 -m http.server 3000`
 - `uv run marimo edit notebooks/train.mo.py`
 - `uv run marimo edit notebooks/regression.mo.py`

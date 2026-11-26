@@ -28,10 +28,11 @@ import pandas as pd
 from scipy import stats
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.active_learning.common import (  # noqa: E402
+from scenicdriver.active_learning.common import (  # noqa: E402
     atomic_write_json,
     sha256_file,
 )

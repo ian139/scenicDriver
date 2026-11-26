@@ -9,10 +9,11 @@ import sys
 from typing import Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.active_learning.scoring import (  # noqa: E402
+from scenicdriver.active_learning.scoring import (  # noqa: E402
     DEFAULT_SCORING_BATCH_SIZE,
     DEFAULT_SCORING_NUM_WORKERS,
     run_active_learning_scoring,
@@ -46,7 +47,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-rows", type=int)
     parser.add_argument("--lsh-seed", type=int, default=0)
     parser.add_argument("--lsh-bits", type=int, default=16)
-    parser.add_argument("--imagenet-stats", action="store_true")
+    parser.add_argument(
+        "--normalization",
+        choices=("imagenet", "resisc45"),
+        default=None,
+        help="Optional assertion against the classifier checkpoint's preprocessing contract",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -61,7 +67,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         registry_path=args.registry,
         classifier_checkpoint=args.classifier_checkpoint,
         device=args.device,
-        classifier_use_resisc45_stats=not args.imagenet_stats,
+        classifier_normalization=args.normalization,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         max_rows=args.max_rows,

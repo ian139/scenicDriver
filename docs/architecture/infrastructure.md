@@ -27,7 +27,7 @@ flowchart TB
 ## Offline pipeline
 
 1. `scripts/ingest/` downloads or synchronizes satellite and Terrain-RGB tiles.
-2. `src/terrain/` and `src/heuristics/` derive tile features and weak scenic labels.
+2. `src/scenicdriver/terrain/` and `src/scenicdriver/heuristics/` derive tile features and weak scenic labels.
 3. `scripts/annotation/` and `notebooks/annotate_scenic.mo.py` collect and reconcile human labels.
 4. `scripts/modeling/` and the marimo modeling notebooks export features, train regression candidates, evaluate them, and promote one checkpoint into the model registry.
 5. `scripts/reports/` writes learned regional score artifacts.
@@ -37,7 +37,7 @@ Large inputs and outputs live under ignored `data/`, `models/`, and `cache/` pat
 
 ## Online request path
 
-The static app in `apps/new_england_north/` calls `src/app_api/main.py`. FastAPI resolves the selected region from `config/app_regions.json` and delegates route work to `src/route_planner/`.
+The static app in `apps/new_england_north/` calls `src/scenicdriver/app_api/main.py`. FastAPI resolves the selected region from `config/app_regions.json` and delegates route work to `src/scenicdriver/route_planner/`.
 
 The route planner provides:
 
@@ -55,8 +55,8 @@ At beta startup, required-preload mode validates and opens the configured graph,
 | Surface | Responsibility |
 |---|---|
 | `apps/new_england_north/` | MapLibre UI, search controls, heatmap, route comparison |
-| `src/app_api/` | HTTP schemas, region/artifact resolution, contributor endpoints |
-| `src/route_planner/` | Graph representation, endpoint projection, route objectives, execution safety |
+| `src/scenicdriver/app_api/` | HTTP schemas, region/artifact resolution, contributor endpoints |
+| `src/scenicdriver/route_planner/` | Graph representation, endpoint projection, route objectives, execution safety |
 | `config/app_regions.json` | Region bounds and active artifact paths |
 | `deploy/beta_artifacts.json` | Versioned release artifact identity, sizes, and digests |
 | `Dockerfile.remote-training` | Canonical CUDA training image |

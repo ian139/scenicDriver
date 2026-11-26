@@ -5,7 +5,7 @@
       "region": "new_england_north",
       "display_name": "New England North",
       "description": "Canonical learned coverage across the New England North full-bbox road network.",
-      "graph": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3",
+      "graph": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.compact.json",
       "run_name": "prompt_two_candidate_exp02_fresh_test20_20260810",
       "max_route_snap_km": 1.0,
       "model_checkpoint": "data/processed/regression/checkpoints/0a165e429c8ac050524c7da409dd533d2de8849600c5dd8605aa1a1024d823e9.pt",
@@ -14,6 +14,12 @@
         "min_lon": -73.5205078125,
         "max_lat": 47.50235895196859,
         "max_lon": -66.796875
+      },
+      "coverage_probes": {
+        "rutland_usps": {"lat": 43.60784414, "lon": -72.98226538},
+        "lisbon_police": {"lat": 44.02516775, "lon": -70.10003245},
+        "burlington": {"lat": 44.475884, "lon": -73.214003},
+        "bangor": {"lat": 44.801616, "lon": -68.771305}
       },
       "map": {
         "center": {

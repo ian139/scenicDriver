@@ -1,0 +1,30 @@
+# Lean core environment: the API imports only the route planner (no ML/ingest extras).
+FROM python:3.12.12-slim-bookworm AS python-base
+
+FROM python-base AS builder
+COPY --from=ghcr.io/astral-sh/uv:0.9.16 /uv /usr/local/bin/uv
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+# Match the runtime libc and target architecture; never copy a host-built .so.
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY src/scenicdriver/route_planner/_compact_search_c.c src/scenicdriver/route_planner/_compact_search_c.c
+RUN gcc -O3 -shared -fPIC src/scenicdriver/route_planner/_compact_search_c.c \
+    -o src/scenicdriver/route_planner/_compact_search_c.so -lm
+
+FROM python-base AS runtime
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH="/app/src" \
+    PATH="/app/.venv/bin:${PATH}"
+WORKDIR /app
+COPY --from=builder /app/.venv /app/.venv
+COPY src/ src/
+COPY config/ config/
+COPY --from=builder /app/src/scenicdriver/route_planner/_compact_search_c.so src/scenicdriver/route_planner/_compact_search_c.so
+# The loader recompiles when the source is newer; preserve equal mtimes.
+RUN touch -r src/scenicdriver/route_planner/_compact_search_c.c src/scenicdriver/route_planner/_compact_search_c.so \
+    && python -c 'from scenicdriver.route_planner._compact_search import compact_search_available; assert compact_search_available()'
+EXPOSE 8080
+CMD ["uvicorn", "scenicdriver.app_api.main:app", "--host", "0.0.0.0", "--port", "8080"]

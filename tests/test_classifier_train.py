@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import json
 import math
+import pickle
+import random
+import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
 from torch import nn
 from torchvision import transforms
 
-from src.classifier import model as classifier_model
-from src.classifier import train as training
+from scenicdriver.classifier import model as classifier_model
+from scenicdriver.classifier import train as training
+from scenicdriver.classifier.inference import RESISC45_MEAN, RESISC45_STD, PreprocessingContract
+from scenicdriver.scenic_scorer import regression
 
 
 @pytest.fixture
@@ -35,8 +41,8 @@ def image_dataset(tmp_path):
 @pytest.fixture(autouse=True)
 def small_transforms(monkeypatch):
     transform = transforms.Compose([transforms.Resize((8, 8)), transforms.ToTensor()])
-    monkeypatch.setattr(training, "get_training_transform", lambda **kwargs: transform)
-    monkeypatch.setattr(training, "get_inference_transform", lambda **kwargs: transform)
+    monkeypatch.setattr(training, "get_training_transform", lambda _preprocessing: transform)
+    monkeypatch.setattr(training, "get_inference_transform", lambda _preprocessing: transform)
 
 
 @pytest.fixture
@@ -59,9 +65,6 @@ def tiny_classifier(monkeypatch):
         def get_model_info(self):
             count = sum(parameter.numel() for parameter in self.parameters())
             return {"architecture": "tiny", "total_params": count, "trainable_params": count}
-
-        def save_weights(self, path):
-            torch.save(self.state_dict(), path)
 
     monkeypatch.setattr(classifier_model, "LandscapeClassifier", TinyClassifier)
     previous_threads = torch.get_num_threads()
@@ -349,3 +352,269 @@ def test_resume_rejects_dataset_split_change(image_dataset, tmp_path, tiny_class
 
     with pytest.raises(ValueError, match="split_identity"):
         _run_training(root, output, epochs=2, warmup_epochs=2, seed=resume_seed, resume=path)
+
+
+@pytest.fixture
+def tiny_vit(monkeypatch):
+    """Real LandscapeClassifier with a size-agnostic tiny backbone in place of ViT-B/16."""
+
+    def create_model(*_args, **_kwargs):
+        backbone = nn.Sequential(nn.AdaptiveAvgPool2d(2), nn.Flatten(), nn.Linear(12, 6))
+        backbone.num_features = 6
+        return backbone
+
+    monkeypatch.setattr(classifier_model.timm, "create_model", create_model)
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield
+    torch.set_num_threads(previous_threads)
+
+
+def _write_marker(path: str) -> None:
+    Path(path).write_text("executed", encoding="utf-8")
+
+
+class _MaliciousPayload:
+    def __init__(self, marker: Path) -> None:
+        self.marker = marker
+
+    def __reduce__(self):
+        return _write_marker, (str(self.marker),)
+
+
+def _export_argv(labels, raw_dir, checkpoint, output, *extra):
+    return [
+        "export", "--labels-csv", str(labels), "--raw-dir", str(raw_dir),
+        "--classifier-ckpt", str(checkpoint), "--output", str(output), "--device", "cpu",
+        *extra,
+    ]
+
+
+def test_train_save_load_export_and_score_derive_one_normalization(
+    image_dataset, tmp_path, tiny_vit, monkeypatch
+):
+    from scenicdriver.active_learning import scoring
+    from scenicdriver.heuristics.labeler import _load_classifier
+    from scripts.modeling import export_regression_dataset as exporter
+
+    root = image_dataset(counts=2)
+    output = tmp_path / "trained"
+    _run_training(root, output, epochs=1, warmup_epochs=2, seed=73)
+    checkpoint = output / "checkpoint.pt"
+    expected = PreprocessingContract.for_normalization(
+        "resisc45", class_names=classifier_model.TERRAIN_CLASSES
+    )
+
+    # Training defaults to RESISC45 and records the full contract as primitives.
+    raw = torch.load(checkpoint, weights_only=True)
+    assert raw["checkpoint_format"] == classifier_model.CHECKPOINT_FORMAT
+    assert raw["preprocessing"] == {
+        "normalization": "resisc45",
+        "mean": list(RESISC45_MEAN),
+        "std": list(RESISC45_STD),
+        "image_size": 224,
+        "class_names": classifier_model.TERRAIN_CLASSES,
+    }
+    assert classifier_model.load_classifier_checkpoint(checkpoint)[1] == expected
+
+    # Exporter derives its transform from the checkpoint.
+    raw_dir = tmp_path / "raw"
+    for kind in ("satellite", "terrain"):
+        (raw_dir / "images" / kind).mkdir(parents=True)
+        Image.new("RGB", (8, 8), (40, 90, 20)).save(raw_dir / "images" / kind / "a.png")
+    labels = tmp_path / "labels.csv"
+    labels.write_text("image_path,scenic_score\nimages/satellite/a.png,5\n", encoding="utf-8")
+    seen = []
+    real_transform = exporter.get_inference_transform
+
+    def spy_transform(preprocessing):
+        seen.append(preprocessing)
+        return real_transform(preprocessing)
+
+    monkeypatch.setattr(exporter, "get_inference_transform", spy_transform)
+    monkeypatch.setattr(
+        exporter, "_terrain_features_from_images", lambda *_args: np.zeros(6, dtype=np.float32)
+    )
+    exported = tmp_path / "dataset.npz"
+    monkeypatch.setattr(sys, "argv", _export_argv(labels, raw_dir, checkpoint, exported))
+    exporter.main()
+    assert seen == [expected]
+    with np.load(exported) as dataset:
+        assert dataset["vit_embeddings"].shape == (1, 6)
+        assert dataset["class_logits"].shape == (1, 45)
+
+    # A conflicting CLI override fails and publishes nothing.
+    conflicting = tmp_path / "conflicting.npz"
+    monkeypatch.setattr(
+        sys, "argv",
+        _export_argv(labels, raw_dir, checkpoint, conflicting, "--normalization", "imagenet"),
+    )
+    with pytest.raises(ValueError, match="conflicts"):
+        exporter.main()
+    assert not conflicting.exists()
+
+    # A failed export (zero samples) never leaves an output at the canonical path.
+    missing_labels = tmp_path / "missing.csv"
+    missing_labels.write_text(
+        "image_path,scenic_score\nimages/satellite/absent.png,5\n", encoding="utf-8"
+    )
+    failed = tmp_path / "failed.npz"
+    monkeypatch.setattr(
+        sys, "argv", _export_argv(missing_labels, raw_dir, checkpoint, failed, "--skip-missing")
+    )
+    with pytest.raises(ValueError, match="No samples exported"):
+        exporter.main()
+    assert not failed.exists()
+    assert sorted(path.name for path in tmp_path.iterdir() if path.name.startswith(".")) == []
+
+    # Active scorer derives transform, class order, and cache identity from it.
+    regression_path = tmp_path / "regression.pt"
+    regression_model = regression.ScenicRegressionModel(vit_dim=6, terrain_dim=6, num_classes=45)
+    torch.save(
+        {
+            "model_state_dict": regression_model.state_dict(),
+            "vit_dim": 6, "terrain_dim": 6, "num_classes": 45,
+        },
+        regression_path,
+    )
+    registry = tmp_path / "registry.json"
+    registry.write_text(json.dumps({"active": {"checkpoint": str(regression_path)}}))
+    loaded = scoring.load_scoring_models(
+        registry_path=registry, classifier_checkpoint=checkpoint, device="cpu"
+    )
+    assert loaded.class_names == tuple(classifier_model.TERRAIN_CLASSES)
+    assert loaded.classifier_preprocess_identity == scoring.classifier_preprocess_identity(expected)
+    normalize = loaded.classifier_transform.transforms[-1]
+    assert tuple(normalize.mean) == RESISC45_MEAN and tuple(normalize.std) == RESISC45_STD
+    with pytest.raises(ValueError, match="conflicts"):
+        scoring.load_scoring_models(
+            registry_path=registry, classifier_checkpoint=checkpoint, device="cpu",
+            classifier_normalization="imagenet",
+        )
+
+    # Heuristic labeler inference derives the same contract.
+    _, transform, _, class_names = _load_classifier(
+        use_classifier=True, classifier_best_ckpt=checkpoint, device="cpu", warnings=[]
+    )
+    assert class_names == classifier_model.TERRAIN_CLASSES
+    assert tuple(transform.transforms[-1].mean) == RESISC45_MEAN
+
+
+def test_legacy_bare_checkpoint_rejected_with_guidance_and_explicit_migration(
+    tmp_path, tiny_vit
+):
+    legacy = tmp_path / "legacy.pt"
+    torch.save(
+        classifier_model.LandscapeClassifier(pretrained=False, device="cpu").state_dict(), legacy
+    )
+    with pytest.raises(ValueError, match="legacy bare state dicts.*Retrain.*migrate"):
+        classifier_model.LandscapeClassifier(pretrained=False, pretrained_path=legacy, device="cpu")
+
+    migrated = tmp_path / "migrated.pt"
+    classifier_model.migrate_legacy_checkpoint(legacy, migrated, normalization="imagenet")
+    loaded = classifier_model.LandscapeClassifier(
+        pretrained=False, pretrained_path=migrated, device="cpu"
+    )
+    assert loaded.preprocessing.normalization == "imagenet"
+
+
+def test_classifier_checkpoint_load_refuses_pickle_code_execution(tmp_path, tiny_vit):
+    marker = tmp_path / "executed"
+    checkpoint = tmp_path / "malicious.pt"
+    torch.save(
+        {
+            "checkpoint_format": classifier_model.CHECKPOINT_FORMAT,
+            "checkpoint_schema_version": classifier_model.CHECKPOINT_SCHEMA_VERSION,
+            "model_state_dict": {},
+            "payload": _MaliciousPayload(marker),
+        },
+        checkpoint,
+    )
+    with pytest.raises(pickle.UnpicklingError, match="Weights only load failed"):
+        classifier_model.load_classifier_checkpoint(checkpoint)
+    assert not marker.exists()
+
+
+def test_interrupted_checkpoint_write_keeps_previous_checkpoint(
+    image_dataset, tmp_path, tiny_classifier, monkeypatch
+):
+    root = image_dataset(counts=2)
+    output = tmp_path / "atomic"
+    _run_training(root, output, epochs=1, warmup_epochs=2, seed=73)
+    previous = (output / "checkpoint.pt").read_bytes()
+
+    def interrupted_save(value, handle):
+        handle.write(b"partial checkpoint")
+        raise OSError("killed mid-write")
+
+    monkeypatch.setattr(regression.torch, "save", interrupted_save)
+    with pytest.raises(OSError, match="killed mid-write"):
+        _run_training(
+            root, output, epochs=3, warmup_epochs=2, seed=73, resume=output / "checkpoint.pt"
+        )
+    monkeypatch.undo()
+    assert (output / "checkpoint.pt").read_bytes() == previous
+    assert not [path for path in output.iterdir() if path.name.endswith(".tmp")]
+
+
+def test_resume_restores_rng_streams_like_continuous_run(
+    image_dataset, tmp_path, tiny_classifier, monkeypatch
+):
+    base = transforms.Compose([transforms.Resize((8, 8)), transforms.ToTensor()])
+
+    def stochastic(image):
+        tensor = base(image)
+        return (
+            tensor
+            + 0.1 * torch.rand_like(tensor)
+            + float(np.random.rand()) * 0.01
+            + random.random() * 0.01
+        )
+
+    monkeypatch.setattr(training, "get_training_transform", lambda _preprocessing: stochastic)
+    root = image_dataset(counts=2)
+    _run_training(root, tmp_path / "full", epochs=4, warmup_epochs=1, seed=73)
+    full = torch.load(tmp_path / "full/checkpoint.pt", weights_only=True)
+
+    original_train_epoch = training.train_epoch
+    completed = 0
+
+    class Interrupted(Exception):
+        pass
+
+    def interrupt_before_third_epoch(*args, **kwargs):
+        nonlocal completed
+        if completed == 2:
+            raise Interrupted
+        completed += 1
+        return original_train_epoch(*args, **kwargs)
+
+    monkeypatch.setattr(training, "train_epoch", interrupt_before_third_epoch)
+    resumed_output = tmp_path / "resumed"
+    with pytest.raises(Interrupted):
+        _run_training(root, resumed_output, epochs=4, warmup_epochs=1, seed=73)
+    prefix = torch.load(resumed_output / "checkpoint.pt", weights_only=True)
+    assert prefix["epoch"] == 1
+    for key in ("python", "numpy", "torch"):
+        assert key in prefix["rng_state"]
+
+    monkeypatch.setattr(training, "train_epoch", original_train_epoch)
+    with pytest.raises(ValueError, match="conflicts"):
+        _run_training(
+            root, resumed_output, epochs=4, warmup_epochs=1, seed=73,
+            normalization="imagenet", resume=resumed_output / "checkpoint.pt",
+        )
+    _run_training(
+        root, resumed_output, epochs=4, warmup_epochs=1, seed=73,
+        resume=resumed_output / "checkpoint.pt",
+    )
+    resumed = torch.load(resumed_output / "checkpoint.pt", weights_only=True)
+
+    assert torch.equal(resumed["rng_state"]["torch"], full["rng_state"]["torch"])
+    assert torch.equal(resumed["rng_state"]["numpy"]["keys"], full["rng_state"]["numpy"]["keys"])
+    assert resumed["rng_state"]["numpy"]["pos"] == full["rng_state"]["numpy"]["pos"]
+    assert resumed["rng_state"]["python"] == full["rng_state"]["python"]
+    assert torch.equal(resumed["loader_generator_state"], full["loader_generator_state"])
+    for name, tensor in full["model_state_dict"].items():
+        assert torch.equal(resumed["model_state_dict"][name], tensor), name
+    assert resumed["history"] == full["history"]

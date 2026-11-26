@@ -23,10 +23,11 @@ import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.active_learning.common import sha256_file, validate_run_name  # noqa: E402
+from scenicdriver.active_learning.common import sha256_file, validate_run_name  # noqa: E402
 
 
 BOOL_TRUE = {"1", "true", "yes", "y", "t", "on"}

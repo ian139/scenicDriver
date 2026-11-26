@@ -47,10 +47,11 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.data_pipeline.metered_transport import (
+from scenicdriver.data_pipeline.metered_transport import (
     Boto3MeteredTransport,
     CapExceededError,
     Counters,
@@ -61,11 +62,11 @@ from src.data_pipeline.metered_transport import (
     RateCard,
     SharedMeteredBudget,
 )
-from src.data_pipeline.naip import (
+from scenicdriver.data_pipeline.naip import (
     NaipAdapter,
     calculate_intersection_area,
 )
-from src.data_pipeline.raster_processing import (
+from scenicdriver.data_pipeline.raster_processing import (
     NoDataOnLandError,
     TargetGrid,
     TerrainRGBRangeError,
@@ -73,19 +74,19 @@ from src.data_pipeline.raster_processing import (
     process_imagery,
     write_atomic_png,
 )
-from src.data_pipeline.region_planning import parse_geojson_geometry
-from src.data_pipeline.source_contracts import (
+from scenicdriver.data_pipeline.region_planning import parse_geojson_geometry
+from scenicdriver.data_pipeline.source_contracts import (
     SourceAsset,
     compute_acquisition_tile_identity,
 )
-from src.data_pipeline.tile_inventory import acquisition_provenance_reason
-from src.data_pipeline.usgs_3dep import (
+from scenicdriver.data_pipeline.tile_inventory import acquisition_provenance_reason
+from scenicdriver.data_pipeline.usgs_3dep import (
     VALID_ELEVATION_UNITS,
     VALID_VERTICAL_DATUMS,
     load_hash_pinned_catalog,
     validate_3dep_record,
 )
-from src.data_pipeline.web_mercator import tile_bounds_wgs84
+from scenicdriver.data_pipeline.web_mercator import tile_bounds_wgs84
 
 SUPPORTED_IMAGERY_SOURCE = "naip-visualization"
 SUPPORTED_TERRAIN_SOURCE = "usgs-3dep-13as"
@@ -3875,6 +3876,8 @@ def process_tile_pair(
     region: str,
     satellite_paths: Sequence[Path],
     terrain_paths: Sequence[Path],
+    satellite_source_hashes: Mapping[str, str],
+    terrain_source_hashes: Mapping[str, str],
     terrain_vertical_datums: Sequence[str | None],
     image_root: Path,
     contract: dict[str, Any],
@@ -3919,6 +3922,7 @@ def process_tile_pair(
         min_land_variance=float(satellite_qc_contract.get("min_land_variance", 0.0)),
         reject_all_black=bool(satellite_qc_contract.get("reject_all_black", True)),
         reject_all_white=bool(satellite_qc_contract.get("reject_all_white", True)),
+        verified_source_hashes=satellite_source_hashes,
     )
     terrain_rgb, _dem, _terrain_land_mask, terrain_qc = process_dem(
         list(terrain_paths),
@@ -3928,6 +3932,7 @@ def process_tile_pair(
         mosaic_order=str(preprocessing.get("mosaic_order", "first")),
         source_vertical_datum=source_vertical_datums,
         target_vertical_datum=str(preprocessing["target_vertical_datum"]),
+        verified_source_hashes=terrain_source_hashes,
     )
 
     satellite_path = image_root / "satellite" / f"z{z}" / region / f"{x}_{y}.png"
@@ -4523,9 +4528,10 @@ def execute_plan(
             )
 
         satellite_paths: list[Path] = []
+        satellite_source_hashes: dict[str, str] = {}
         for asset_id in satellite_asset_ids:
             asset = asset_by_id[asset_id]
-            path, _ = _ensure_object(
+            path, content_sha = _ensure_object(
                 transport=imagery_transport,
                 cache_root=cache_root,
                 bucket=contract["imagery"]["bucket"],
@@ -4536,10 +4542,12 @@ def execute_plan(
                 flights=object_flights,
             )
             satellite_paths.append(path)
+            satellite_source_hashes[str(path)] = content_sha
         terrain_paths: list[Path] = []
+        terrain_source_hashes: dict[str, str] = {}
         for asset_id in terrain_asset_ids:
             asset = asset_by_id[asset_id]
-            path, _ = _ensure_object(
+            path, content_sha = _ensure_object(
                 transport=terrain_transport,
                 cache_root=cache_root,
                 bucket=contract["terrain"]["bucket"],
@@ -4550,6 +4558,7 @@ def execute_plan(
                 flights=object_flights,
             )
             terrain_paths.append(path)
+            terrain_source_hashes[str(path)] = content_sha
 
         reserve_generated_output(coord_key)
         installing_record = {
@@ -4575,6 +4584,8 @@ def execute_plan(
                 region=region,
                 satellite_paths=satellite_paths,
                 terrain_paths=terrain_paths,
+                satellite_source_hashes=satellite_source_hashes,
+                terrain_source_hashes=terrain_source_hashes,
                 image_root=image_root,
                 terrain_vertical_datums=[
                     asset_by_id[asset_id].vertical_datum
@@ -4894,7 +4905,7 @@ def execute_plan(
     )
 
     # Re-inventory and re-assess water so the manifest is truthful.
-    from src.data_pipeline.tile_inventory import scan_tile_inventory
+    from scenicdriver.data_pipeline.tile_inventory import scan_tile_inventory
 
     bound_row_order = {
         (row["region"], int(row["z"]), int(row["x"]), int(row["y"])): index

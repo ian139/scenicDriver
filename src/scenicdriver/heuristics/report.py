@@ -1,0 +1,1649 @@
+from __future__ import annotations
+
+from pathlib import Path
+import shutil
+import re
+from typing import Any, Sequence
+import json
+import os
+from io import BytesIO
+
+import numpy as np
+from PIL import Image
+
+
+def union_report_tiles(
+    tile_groups: Sequence[Sequence[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Deterministic additive union of report tiles keyed by (z, x, y, image_path).
+
+    Rejects coordinate disagreement within and across rows, preserving unknowns
+    and dataset origin columns.
+    """
+    from scenicdriver.heuristics.labeler import parse_tile_coords
+
+    merged: dict[tuple[int | None, int | None, int | None, str], dict[str, Any]] = {}
+    coords_by_image: dict[str, dict[str, Any]] = {}
+
+    for group in tile_groups:
+        for tile in group:
+            img_path = str(tile.get("image_path") or "").strip()
+            parsed = parse_tile_coords(img_path)
+            if parsed is None:
+                match = re.search(
+                    r"z(\d+)[/_-]+(?:x)?(\d+)[/_-]+(?:y)?(\d+)",
+                    img_path,
+                    re.IGNORECASE,
+                )
+                if match:
+                    parsed = tuple(int(value) for value in match.groups())
+            inferred = dict(zip(("z", "x", "y"), parsed)) if parsed else {}
+            if not inferred:
+                match = re.fullmatch(r"(\d+)[_-](\d+)", Path(img_path).stem)
+                if match:
+                    inferred.update(zip(("x", "y"), map(int, match.groups())))
+            row_copy = dict(tile)
+            for coord_col in ("z", "x", "y"):
+                supplied = tile.get(coord_col)
+                value = int(supplied) if supplied is not None else inferred.get(coord_col)
+                if supplied is not None and coord_col in inferred and value != inferred[coord_col]:
+                    raise ValueError(
+                        f"Coordinate disagreement for column {coord_col!r} "
+                        f"in image {img_path!r}: {value} != {inferred[coord_col]}"
+                    )
+                row_copy[coord_col] = value
+            row_copy["image_path"] = img_path
+
+            # The image identity must agree even if differing coordinates would
+            # otherwise put rows under different union keys.
+            known_coords = coords_by_image.setdefault(img_path, {})
+            for coord_col in ("lat", "lon", "x", "y", "z"):
+                value = row_copy.get(coord_col)
+                existing_value = known_coords.get(coord_col)
+                if value is not None and existing_value is not None:
+                    try:
+                        agrees = abs(float(existing_value) - float(value)) <= 1e-5
+                    except (TypeError, ValueError):
+                        agrees = str(existing_value).strip() == str(value).strip()
+                    if not agrees:
+                        raise ValueError(
+                            f"Coordinate disagreement for column {coord_col!r} "
+                            f"in image {img_path!r}: {existing_value!r} != {value!r}"
+                        )
+                if value is not None:
+                    known_coords[coord_col] = value
+
+            key = (row_copy["z"], row_copy["x"], row_copy["y"], img_path)
+            if key in merged:
+                existing = merged[key]
+                # Preserve dataset origin columns
+                for origin_col in (
+                    "dataset_origin",
+                    "source_dataset",
+                    "origin_run",
+                    "dataset",
+                    "source_identity",
+                ):
+                    if origin_col in tile and origin_col not in existing:
+                        existing[origin_col] = tile[origin_col]
+                    elif (
+                        origin_col in tile
+                        and origin_col in existing
+                        and existing[origin_col] != tile[origin_col]
+                    ):
+                        if isinstance(existing[origin_col], list):
+                            if tile[origin_col] not in existing[origin_col]:
+                                existing[origin_col].append(tile[origin_col])
+                        else:
+                            existing[origin_col] = (
+                                f"{existing[origin_col]},{tile[origin_col]}"
+                            )
+            else:
+                merged[key] = row_copy
+
+    sorted_keys = sorted(
+        merged, key=lambda key: (tuple((v is not None, v or 0) for v in key[:3]), key[3])
+    )
+    result_tiles = [merged[k] for k in sorted_keys]
+    for idx, tile in enumerate(result_tiles):
+        tile["index"] = idx
+    return result_tiles
+
+
+_IDENTITY_DIMENSIONS: dict[str, tuple[str, ...]] = {
+    "source_contract": (
+        "source_contract_sha256",
+        "source_contract_identity",
+        "source_contract",
+        "source_identity",
+        "source",
+    ),
+    "preprocessing": (
+        "preprocessing_contract_sha256",
+        "preprocessing_contract_identity",
+        "preprocessing_identity",
+        "preprocessing_contract",
+        "classifier_preprocessing_sha256",
+    ),
+    "grid": (
+        "grid_contract_sha256",
+        "grid_identity",
+        "grid_contract",
+        "grid_sha256",
+        "grid_spec",
+        "grid",
+    ),
+    "classifier_checkpoint": (
+        "classifier_checkpoint_sha256",
+        "classifier_checkpoint_identity",
+        "classifier_checkpoint",
+    ),
+    "regression_checkpoint": (
+        "regression_checkpoint_sha256",
+        "regression_checkpoint_identity",
+        "regression_checkpoint",
+        "checkpoint_sha256",
+        "learned_checkpoint_identity",
+        "checkpoint_path",
+        "checkpoint",
+    ),
+    "score_schema": (
+        "score_schema_version",
+        "score_schema_identity",
+        "score_schema",
+    ),
+    "label_schema": (
+        "label_schema_version",
+        "label_schema_identity",
+        "label_schema",
+    ),
+    "calibration": (
+        "calibration_artifact_sha256",
+        "calibration_identity",
+        "calibration_mode",
+        "calibration_type",
+        "scoring_mode",
+        "calibration_config_sha256",
+    ),
+}
+
+REQUIRED_LEARNED_FIELDS: dict[str, str] = {
+    "source_contract": "source_contract_sha256",
+    "preprocessing": "preprocessing_contract_sha256",
+    "grid": "grid_contract_sha256",
+    "classifier_checkpoint": "classifier_checkpoint_sha256",
+    "regression_checkpoint": "regression_checkpoint_sha256",
+    "score_schema": "score_schema_version",
+    "label_schema": "label_schema_version",
+    "calibration": "calibration_artifact_sha256",
+}
+
+
+def _is_learned_report(
+    content: dict[str, Any], dim_map: dict[str, Any], field_map: dict[str, Any]
+) -> bool:
+    run_info = (
+        content.get("run_info") if isinstance(content.get("run_info"), dict) else {}
+    )
+    scoring_mode = (
+        str(run_info.get("scoring_mode") or content.get("scoring_mode") or "")
+        .strip()
+        .lower()
+    )
+    if scoring_mode == "learned":
+        return True
+    if (
+        run_info.get("derived_visualization") is True
+        or content.get("derived_visualization") is True
+    ):
+        return True
+    for k in (
+        "classifier_checkpoint_sha256",
+        "regression_checkpoint_sha256",
+        "checkpoint_sha256",
+        "learned_checkpoint_identity",
+        "learned_checkpoint",
+    ):
+        if k in field_map:
+            return True
+    return False
+
+
+def _extract_report_identities(
+    content: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Extract dimension map and field map from report dict."""
+    candidate_dicts = []
+
+    # 1. run_info
+    if "run_info" in content and isinstance(content["run_info"], dict):
+        candidate_dicts.append(content["run_info"])
+        if "identity" in content["run_info"] and isinstance(
+            content["run_info"]["identity"], dict
+        ):
+            candidate_dicts.append(content["run_info"]["identity"])
+        if "metadata" in content["run_info"] and isinstance(
+            content["run_info"]["metadata"], dict
+        ):
+            candidate_dicts.append(content["run_info"]["metadata"])
+
+    # 2. metadata
+    if "metadata" in content and isinstance(content["metadata"], dict):
+        candidate_dicts.append(content["metadata"])
+
+    # 3. identity
+    if "identity" in content and isinstance(content["identity"], dict):
+        candidate_dicts.append(content["identity"])
+
+    # 4. content top-level
+    candidate_dicts.append(content)
+
+    dim_map: dict[str, Any] = {}
+    field_map: dict[str, Any] = {}
+
+    for dim_name, key_tuple in _IDENTITY_DIMENSIONS.items():
+        for d in candidate_dicts:
+            for key in key_tuple:
+                if key in d and d[key] is not None:
+                    val = str(d[key]).strip()
+                    if val:
+                        if dim_name not in dim_map:
+                            dim_map[dim_name] = val
+                        if key in field_map and field_map[key] != val:
+                            raise ValueError(
+                                f"Conflicting identity field {key!r} within one report: "
+                                f"{field_map[key]!r} != {val!r}"
+                            )
+                        field_map[key] = val
+
+    # Also capture any other identity/contract/sha256 keys from candidate dicts
+    all_keys = tuple(
+        k for key_tuple in _IDENTITY_DIMENSIONS.values() for k in key_tuple
+    )
+    for d in candidate_dicts:
+        for k, v in d.items():
+            if v is not None and (
+                k in all_keys
+                or k.endswith("_identity")
+                or k.endswith("_contract")
+                or k.endswith("_sha256")
+            ):
+                val = str(v).strip()
+                if val:
+                    if k in field_map and field_map[k] != val:
+                        raise ValueError(
+                            f"Conflicting identity field {k!r} within one report: "
+                            f"{field_map[k]!r} != {val!r}"
+                        )
+                    field_map[k] = val
+
+    return dim_map, field_map
+
+
+def recover_report_run_info(
+    content: dict[str, Any], *, source: str, guidance: str
+) -> dict[str, Any]:
+    """Recover admitted provenance without guessing a legacy run's scoring mode."""
+    if not isinstance(content, dict):
+        raise ValueError(f"Invalid report metadata in {source}; {guidance}")
+    raw_info = content.get("run_info")
+    if raw_info is not None and not isinstance(raw_info, dict):
+        raise ValueError(f"Invalid run_info in {source}; {guidance}")
+    run_info = dict(raw_info or {})
+    dim_map, fields = _extract_report_identities(content)
+    mode = str(run_info.get("scoring_mode") or content.get("scoring_mode") or "").strip().lower()
+    if mode not in {"learned", "heuristic"}:
+        raise ValueError(f"Missing or invalid scoring_mode in {source}; {guidance}")
+    if mode == "heuristic" and _is_learned_report(content, dim_map, fields):
+        raise ValueError(f"Conflicting heuristic scoring_mode and learned identity in {source}; {guidance}")
+    run_info.update(fields)
+    run_info["scoring_mode"] = mode
+    if _is_learned_report(content, dim_map, fields):
+        for field in REQUIRED_LEARNED_FIELDS.values():
+            if field not in fields:
+                raise ValueError(f"Missing required learned identity {field!r} in {source}; {guidance}")
+    validate_report_union_compatibility([{"run_info": run_info}])
+    return run_info
+
+
+def validate_report_union_compatibility(
+    reports_or_contents: Sequence[dict[str, Any]],
+) -> None:
+    """Validate report-union compatibility across multiple report dictionaries.
+
+    Fails closed with ValueError if:
+    - Any learned report lacks any of the 8 required identity dimensions
+      (source_contract, preprocessing, grid, classifier_checkpoint,
+       regression_checkpoint, score_schema, label_schema, calibration).
+    - Reports have incompatible identities across declared dimensions.
+    - There is a one-sided missing identity for any declared dimension.
+    - Learned and non-learned (heuristic) reports are mixed in a union.
+
+    Preserves purely heuristic legacy unions ONLY when every input is non-learned
+    and uniformly lacks learned identities across all dimensions.
+    """
+    if not reports_or_contents:
+        return
+
+    extracted = [_extract_report_identities(item) for item in reports_or_contents]
+    dim_maps = [dim_map for dim_map, _ in extracted]
+    field_maps = [field_map for _, field_map in extracted]
+    is_learned_flags = [
+        _is_learned_report(content, dim_map, field_map)
+        for content, (dim_map, field_map) in zip(
+            reports_or_contents, extracted, strict=True
+        )
+    ]
+
+    any_learned = any(is_learned_flags)
+    all_learned = all(is_learned_flags)
+
+    if any_learned and not all_learned:
+        learned_idx = is_learned_flags.index(True)
+        heuristic_idx = is_learned_flags.index(False)
+        raise ValueError(
+            f"Cannot union learned report (input {learned_idx}) with "
+            f"non-learned/heuristic report (input {heuristic_idx})"
+        )
+
+    if any_learned:
+        for idx, field_map in enumerate(field_maps):
+            if is_learned_flags[idx]:
+                for dimension, field in REQUIRED_LEARNED_FIELDS.items():
+                    if field not in field_map:
+                        raise ValueError(
+                            f"Learned report at input {idx} missing required "
+                            f"identity dimension {dimension!r}: exact field {field!r}"
+                        )
+
+    for dim_name in _IDENTITY_DIMENSIONS:
+        declared = [
+            (idx, d[dim_name]) for idx, d in enumerate(dim_maps) if dim_name in d
+        ]
+        if not declared:
+            continue
+        if len(declared) < len(reports_or_contents):
+            declared_idx, val = declared[0]
+            missing_indices = [
+                i
+                for i in range(len(reports_or_contents))
+                if dim_name not in dim_maps[i]
+            ]
+            raise ValueError(
+                f"One-sided missing identity for {dim_name!r}: input {declared_idx} "
+                f"declares {val!r} while input {missing_indices[0]} lacks it"
+            )
+        first_val = declared[0][1]
+        for idx, val in declared[1:]:
+            if val != first_val:
+                raise ValueError(
+                    f"Incompatible {dim_name!r} identity across reports: "
+                    f"{first_val!r} != {val!r}"
+                )
+
+    all_fields = sorted({k for f in field_maps for k in f.keys()})
+    for key in all_fields:
+        declared = [(idx, f[key]) for idx, f in enumerate(field_maps) if key in f]
+        if not declared:
+            continue
+        if len(declared) < len(reports_or_contents):
+            declared_idx, val = declared[0]
+            missing_indices = [
+                i for i in range(len(reports_or_contents)) if key not in field_maps[i]
+            ]
+            raise ValueError(
+                f"One-sided missing identity field {key!r}: input {declared_idx} "
+                f"declares {val!r} while input {missing_indices[0]} lacks it"
+            )
+        first_val = declared[0][1]
+        for idx, val in declared[1:]:
+            if val != first_val:
+                raise ValueError(
+                    f"Incompatible identity field {key!r} across reports: "
+                    f"{first_val!r} != {val!r}"
+                )
+
+
+def union_reports(
+    reports_or_paths: Sequence[dict[str, Any] | str | Path],
+    *,
+    report_dir: str | Path | None = None,
+    raw_dir: str | Path | None = None,
+    run_info: dict[str, Any] | None = None,
+    include_thumbs: bool = False,
+) -> dict[str, Any]:
+    """Union multiple reports or tile lists into one deterministic report."""
+    contents = []
+    tile_groups = []
+    merged_run_info = dict(run_info or {})
+    for item in reports_or_paths:
+        if isinstance(item, (str, Path)):
+            p = Path(item)
+            if p.is_dir():
+                if (p / "report" / "report.json").is_file():
+                    p = p / "report" / "report.json"
+                else:
+                    p = p / "report.json"
+            content = json.loads(p.read_text(encoding="utf-8"))
+            contents.append(content)
+            tile_groups.append(content.get("tiles", []))
+            if "run_info" in content and isinstance(content["run_info"], dict):
+                merged_run_info.update(content["run_info"])
+        elif isinstance(item, dict):
+            content = item
+            contents.append(content)
+            tile_groups.append(content.get("tiles", []))
+            if "run_info" in item and isinstance(item["run_info"], dict):
+                merged_run_info.update(item["run_info"])
+        else:
+            raise ValueError(f"Invalid report item: {type(item)}")
+
+    to_validate = list(contents)
+    if run_info and isinstance(run_info, dict):
+        to_validate.append({"run_info": run_info})
+    validate_report_union_compatibility(to_validate)
+
+    unified_tiles = union_report_tiles(tile_groups)
+    if report_dir is not None:
+        return build_report(
+            tiles=unified_tiles,
+            report_dir=report_dir,
+            raw_dir=raw_dir or report_dir,
+            run_info=merged_run_info,
+            include_thumbs=include_thumbs,
+        )
+    scores = np.array([float(t["scenic_score"]) for t in unified_tiles], dtype=np.float32)
+    hist_counts, hist_edges = np.histogram(scores, bins=20, range=(0.0, 10.0))
+    summary = {
+        "total_tiles": int(len(unified_tiles)),
+        "mean": float(scores.mean()) if len(unified_tiles) else 0.0,
+        "median": float(np.median(scores)) if len(unified_tiles) else 0.0,
+        "std": float(scores.std()) if len(unified_tiles) else 0.0,
+        "min": float(scores.min()) if len(unified_tiles) else 0.0,
+        "max": float(scores.max()) if len(unified_tiles) else 0.0,
+    }
+    grid = _build_grid_mapping(unified_tiles)
+    feature_summary = _build_feature_summary(unified_tiles)
+    return {
+        "summary": summary,
+        "feature_summary": feature_summary,
+        "histogram": {
+            "counts": [int(c) for c in hist_counts.tolist()],
+            "edges": [float(e) for e in hist_edges.tolist()],
+        },
+        "tiles": unified_tiles,
+        "grid": grid,
+        "run_info": merged_run_info,
+    }
+
+
+def build_report(
+    *,
+    tiles: list[dict[str, Any]],
+    report_dir: str | Path,
+    raw_dir: str | Path,
+    run_info: dict[str, Any],
+    histogram_bins: int = 20,
+    thumb_size: int = 128,
+    include_thumbs: bool = True,
+) -> dict[str, Any]:
+    if run_info and isinstance(run_info, dict):
+        validate_report_union_compatibility([{"run_info": run_info}])
+    tiles = union_report_tiles([tiles])
+    report_path = Path(report_dir)
+    report_path.mkdir(parents=True, exist_ok=True)
+
+    thumbs_dir = report_path / "thumbs"
+    if include_thumbs:
+        thumbs_dir.mkdir(parents=True, exist_ok=True)
+        _attach_thumbnails(tiles, raw_dir, thumbs_dir, thumb_size)
+    else:
+        for idx, tile in enumerate(tiles):
+            tile["index"] = idx
+
+    scores = np.array([float(t["scenic_score"]) for t in tiles], dtype=np.float32)
+    hist_counts, hist_edges = np.histogram(
+        scores, bins=histogram_bins, range=(0.0, 10.0)
+    )
+
+    summary = {
+        "total_tiles": int(len(tiles)),
+        "mean": float(scores.mean()) if tiles else 0.0,
+        "median": float(np.median(scores)) if tiles else 0.0,
+        "std": float(scores.std()) if tiles else 0.0,
+        "min": float(scores.min()) if tiles else 0.0,
+        "max": float(scores.max()) if tiles else 0.0,
+    }
+
+    grid = _build_grid_mapping(tiles)
+    feature_summary = _build_feature_summary(tiles)
+
+    report_json = {
+        "summary": summary,
+        "feature_summary": feature_summary,
+        "histogram": {
+            "counts": [int(c) for c in hist_counts.tolist()],
+            "edges": [float(e) for e in hist_edges.tolist()],
+        },
+        "tiles": tiles,
+        "grid": grid,
+        "run_info": run_info,
+    }
+
+    with open(report_path / "report.json", "w", encoding="utf-8") as f:
+        json.dump(report_json, f, indent=2)
+
+    with open(report_path / "index.html", "w", encoding="utf-8") as f:
+        f.write(_render_index_html())
+
+    _copy_report_config(report_path)
+
+    return report_json
+
+
+def _attach_thumbnails(
+    tiles: list[dict[str, Any]],
+    raw_dir: str | Path,
+    thumbs_dir: Path,
+    thumb_size: int,
+) -> None:
+    """Prefer local images and fetch missing fallback tiles from the raw/ S3 root."""
+    raw_dir_str = str(raw_dir)
+    raw_root = Path(raw_dir_str)
+
+    s3_bucket = os.getenv("SCENIC_S3_BUCKET")
+    s3_prefix = "raw"
+    s3_only = False
+    if raw_dir_str.startswith("s3://"):
+        s3_parts = raw_dir_str.replace("s3://", "", 1).split("/", 1)
+        parsed_bucket = s3_parts[0] if s3_parts else None
+        parsed_prefix = s3_parts[1] if len(s3_parts) > 1 else ""
+        # Treat s3:// raw_dir as authoritative; env flag can explicitly disable.
+        s3_only = os.getenv("SCENIC_S3_ONLY", "1").lower() not in ("0", "false", "no")
+        s3_bucket = parsed_bucket or s3_bucket
+        s3_prefix = parsed_prefix
+
+    s3 = None
+    if s3_only:
+        if not s3_bucket:
+            raise ValueError(
+                "SCENIC_S3_BUCKET and s3:// raw_dir required for S3-only mode."
+            )
+        import boto3
+
+        # Reuse a single client for all thumbnail fetches.
+        s3 = boto3.client("s3")
+
+    for idx, tile in enumerate(tiles):
+        image_path = raw_root / tile["image_path"]
+        thumb_name = f"{idx:05d}.jpg"
+        thumb_path = thumbs_dir / thumb_name
+
+        if s3_only or (s3_bucket and not image_path.exists()):
+            if s3 is None:
+                import boto3
+
+                s3 = boto3.client("s3")
+            key = (
+                f"{s3_prefix}/{tile['image_path']}" if s3_prefix else tile["image_path"]
+            )
+            resp = s3.get_object(Bucket=s3_bucket, Key=key)
+            image = Image.open(BytesIO(resp["Body"].read())).convert("RGB")
+        else:
+            image = Image.open(image_path).convert("RGB")
+        image.thumbnail((thumb_size, thumb_size))
+        image.save(thumb_path, format="JPEG", quality=85)
+
+        tile["index"] = idx
+        tile["thumb"] = f"thumbs/{thumb_name}"
+
+
+def _build_grid_mapping(tiles: list[dict[str, Any]]) -> dict[str, Any]:
+    zooms = {int(t["z"]) for t in tiles if t.get("z") is not None}
+    if len(zooms) > 1:
+        raise ValueError(f"Mixed-zoom report grids are not supported: {sorted(zooms)}")
+    coords = [(t.get("x"), t.get("y"), t.get("z")) for t in tiles]
+    has_coords = bool(coords) and all(
+        x is not None and y is not None and z is not None for x, y, z in coords
+    )
+    if not has_coords:
+        return {"has_coords": False, "index_by_coord": {}}
+
+    xs = [int(t["x"]) for t in tiles]
+    ys = [int(t["y"]) for t in tiles]
+    zoom = next(iter(zooms))
+
+    index_by_coord = {f"{t['x']},{t['y']}": int(t["index"]) for t in tiles}
+
+    return {
+        "has_coords": True,
+        "zoom": zoom,
+        "min_x": int(min(xs)),
+        "max_x": int(max(xs)),
+        "min_y": int(min(ys)),
+        "max_y": int(max(ys)),
+        "index_by_coord": index_by_coord,
+    }
+
+
+def _build_feature_summary(tiles: list[dict[str, Any]]) -> dict[str, Any]:
+    fields = [
+        ("relief", "Relief (m)"),
+        ("roughness", "Roughness"),
+        ("slope_mean", "Slope Mean"),
+        ("water_proxy", "Water Proxy"),
+        ("veg_proxy", "Veg Proxy"),
+        ("water_fraction", "Water Fraction"),
+    ]
+    summary: dict[str, Any] = {"fields": []}
+    for key, label in fields:
+        values = [float(t[key]) for t in tiles if key in t]
+        if not values:
+            continue
+        arr = np.array(values, dtype=np.float32)
+        summary["fields"].append(
+            {
+                "key": key,
+                "label": label,
+                "mean": float(arr.mean()),
+                "median": float(np.median(arr)),
+                "min": float(arr.min()),
+                "max": float(arr.max()),
+            }
+        )
+    return summary
+
+
+def _render_index_html() -> str:
+    return """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Heuristic Scoring Report</title>
+    <link
+      href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg: #0f1a1c;
+        --panel: #162326;
+        --accent: #ffb347;
+        --accent-2: #7bdff2;
+        --text: #e4f2f2;
+        --muted: #9bb4b4;
+      }
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", "Fira Sans", "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top, #1c2f33, #0f1a1c 55%);
+        color: var(--text);
+      }
+      .container {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 16px;
+        padding: 24px;
+      }
+      .card {
+        background: var(--panel);
+        border-radius: 12px;
+        padding: 16px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+      }
+      h1, h2, h3 {
+        margin: 0 0 12px 0;
+        font-weight: 600;
+      }
+      .title-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 8px;
+        flex-wrap: wrap;
+      }
+      h1 {
+        font-size: 24px;
+      }
+      .mode-badge {
+        border-radius: 999px;
+        padding: 4px 10px;
+        font-size: 12px;
+        font-weight: 600;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+      }
+      .mode-badge.learned {
+        background: rgba(123, 223, 242, 0.16);
+        color: #bdefff;
+      }
+      .mode-badge.heuristic {
+        background: rgba(255, 179, 71, 0.16);
+        color: #ffd8a1;
+      }
+      .summary-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        gap: 12px;
+      }
+      .summary-item {
+        background: rgba(255, 255, 255, 0.04);
+        padding: 10px;
+        border-radius: 8px;
+      }
+      .summary-item span {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .summary-item strong {
+        font-size: 18px;
+      }
+      .cluster-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 10px;
+      }
+      .cluster-card {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 8px;
+        padding: 10px;
+      }
+      .cluster-card h4 {
+        margin: 0 0 8px 0;
+        font-size: 14px;
+      }
+      .cluster-card .muted {
+        font-size: 11px;
+      }
+      #histogram {
+        width: 100%;
+        height: 200px;
+      }
+      #mapbox-map {
+        width: 100%;
+        height: 520px;
+        border-radius: 8px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      #map-controls {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+        margin-bottom: 8px;
+      }
+      #map-controls label {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      #heatmap-opacity {
+        width: 160px;
+      }
+      .panel {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .nav {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .nav button {
+        background: rgba(255, 255, 255, 0.08);
+        color: var(--text);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        padding: 6px 12px;
+        cursor: pointer;
+      }
+      .nav button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      .tile-preview {
+        width: 100%;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .breakdown {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+        gap: 8px;
+      }
+      .pill {
+        background: rgba(123, 223, 242, 0.12);
+        color: var(--accent-2);
+        border-radius: 999px;
+        padding: 4px 10px;
+        display: inline-block;
+        font-size: 12px;
+      }
+      @media (max-width: 900px) {
+        .container {
+          grid-template-columns: 1fr;
+        }
+        #heatmap {
+          height: 320px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="card">
+        <div class="title-row">
+          <h1 id="report-title">Scenic Scoring Report</h1>
+          <div class="mode-badge heuristic" id="scoring-mode-badge">Mode: heuristic</div>
+        </div>
+        <div class="summary-grid" id="summary"></div>
+        <h3>Terrain Feature Summary</h3>
+        <div class="summary-grid" id="feature-summary"></div>
+        <h3>Cluster View</h3>
+        <div class="cluster-grid" id="cluster-summary"></div>
+        <h3>Score Histogram</h3>
+        <canvas id="histogram"></canvas>
+        <h3>Interactive Map</h3>
+        <div id="map-controls">
+          <label>Base:
+            <select id="base-layer">
+              <option value="osm">Map</option>
+              <option value="sat">Satellite</option>
+              <option value="none">Heatmap only</option>
+            </select>
+          </label>
+          <label>Heatmap Opacity:
+            <input id="heatmap-opacity" type="range" min="0" max="1" step="0.05" value="0.6" />
+          </label>
+        </div>
+        <div id="mapbox-map"></div>
+      <div class="muted" id="mapbox-note">
+          Map overlay requires a Mapbox token (set in report_config.json or window.MAPBOX_TOKEN).
+      </div>
+      <div class="muted" id="route-legend" style="display:none;">
+          Route overlay: <span style="color:#ffb347;">scenic</span> vs <span style="color:#66c2ff;">baseline</span>
+      </div>
+      <div id="route-stats-wrap" style="display:none; margin-top:8px;">
+        <div class="summary-grid" id="route-stats"></div>
+      </div>
+      <div class="muted" id="route-stats-note">Route metrics appear when route overlay data is available.</div>
+      </div>
+      <div class="card panel">
+        <h2>Tile Details</h2>
+        <div class="nav">
+          <button id="prev-tile">Prev</button>
+          <button id="next-tile">Next</button>
+          <div class="pill" id="tile-id">Select a tile</div>
+        </div>
+        <img id="tile-thumb" class="tile-preview" alt="tile thumbnail" hidden />
+        <div id="tile-no-thumb" class="muted" hidden>No thumbnail available.</div>
+        <div id="tile-score"></div>
+        <div class="breakdown" id="tile-breakdown"></div>
+        <div class="muted" id="tile-path"></div>
+        <div class="muted">Use heatmap clicks or arrow keys to navigate.</div>
+      </div>
+    </div>
+    <script>
+      const summaryEl = document.getElementById("summary");
+      const featureSummaryEl = document.getElementById("feature-summary");
+      const reportTitleEl = document.getElementById("report-title");
+      const scoringModeBadgeEl = document.getElementById("scoring-mode-badge");
+      const histogramCanvas = document.getElementById("histogram");
+      const clusterSummaryEl = document.getElementById("cluster-summary");
+      const heatmapCanvas = document.createElement("canvas");
+      const baseLayerSelect = document.getElementById("base-layer");
+      const heatmapOpacityInput = document.getElementById("heatmap-opacity");
+      const mapboxNote = document.getElementById("mapbox-note");
+      const routeLegend = document.getElementById("route-legend");
+      const routeStatsWrap = document.getElementById("route-stats-wrap");
+      const routeStatsEl = document.getElementById("route-stats");
+      const routeStatsNote = document.getElementById("route-stats-note");
+      const tileIdEl = document.getElementById("tile-id");
+      const tileThumbEl = document.getElementById("tile-thumb");
+      const tileNoThumbEl = document.getElementById("tile-no-thumb");
+      const tileScoreEl = document.getElementById("tile-score");
+      const tileBreakdownEl = document.getElementById("tile-breakdown");
+      const tilePathEl = document.getElementById("tile-path");
+      const prevBtn = document.getElementById("prev-tile");
+      const nextBtn = document.getElementById("next-tile");
+
+      const colorStops = [
+        { t: 0.0, c: [20, 50, 90] },
+        { t: 0.35, c: [50, 160, 140] },
+        { t: 0.6, c: [240, 200, 90] },
+        { t: 0.8, c: [240, 140, 70] },
+        { t: 1.0, c: [220, 60, 60] },
+      ];
+
+      const colorForScore = (score) => {
+        const t = Math.min(1, Math.max(0, score / 10));
+        for (let i = 0; i < colorStops.length - 1; i++) {
+          const a = colorStops[i];
+          const b = colorStops[i + 1];
+          if (t >= a.t && t <= b.t) {
+            const span = (t - a.t) / (b.t - a.t);
+            const r = Math.round(a.c[0] + span * (b.c[0] - a.c[0]));
+            const g = Math.round(a.c[1] + span * (b.c[1] - a.c[1]));
+            const bcol = Math.round(a.c[2] + span * (b.c[2] - a.c[2]));
+            return `rgb(${r}, ${g}, ${bcol})`;
+          }
+        }
+        return "rgb(200, 200, 200)";
+      };
+
+      let tiles = [];
+      let currentIndex = 0;
+      let mapboxToken = null;
+      let mapboxReady = false;
+      let mapInstance = null;
+      let heatmapLayerId = "scenic-heatmap-layer";
+
+      fetch(`report.json?ts=${Date.now()}`)
+        .then((r) => r.json())
+        .then((data) => {
+          renderHeader(data.run_info);
+          renderSummary(data.summary, data.run_info);
+          renderFeatureSummary(data.feature_summary);
+          renderClusterSummary(data.tiles || []);
+          renderHistogram(data.histogram);
+          tiles = data.tiles || [];
+          const cacheBust =
+            data.run_info && data.run_info.timestamp ? data.run_info.timestamp : Date.now();
+          tiles.forEach((tile) => {
+            if (tile.thumb) {
+              tile.thumb_url = `${tile.thumb}?v=${cacheBust}`;
+            }
+          });
+          renderHeatmap(data);
+          if (tiles.length > 0) {
+            setTile(tiles[0]);
+          }
+
+          Promise.all([loadToken(), loadMapboxGL()]).then(([token]) => {
+            mapboxToken = token;
+            initMapbox(data);
+          });
+        });
+
+      function inferScoringMode(runInfo) {
+        if (!runInfo) return "heuristic";
+        const mode = String(runInfo.scoring_mode || "").trim().toLowerCase();
+        if (mode === "learned") return "learned";
+        return "heuristic";
+      }
+
+      function renderHeader(runInfo) {
+        const mode = inferScoringMode(runInfo);
+        reportTitleEl.textContent = mode === "learned" ? "Learned Scenic Scoring Report" : "Heuristic Scenic Scoring Report";
+        scoringModeBadgeEl.textContent = `Mode: ${mode}`;
+        scoringModeBadgeEl.classList.remove("learned", "heuristic");
+        scoringModeBadgeEl.classList.add("mode-badge", mode);
+      }
+
+      function loadMapboxGL() {
+        if (window.maplibregl) {
+          mapboxReady = true;
+          return Promise.resolve();
+        }
+        const candidates = [
+          "https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js",
+        ];
+        return new Promise((resolve) => {
+          const script = document.createElement("script");
+          let idx = 0;
+          const tryNext = () => {
+            if (idx >= candidates.length) return resolve();
+            script.src = candidates[idx++];
+            script.onload = () => {
+              mapboxReady = true;
+              resolve();
+            };
+            script.onerror = () => tryNext();
+          };
+          tryNext();
+          document.head.appendChild(script);
+        });
+      }
+
+      function loadToken() {
+        if (window.MAPBOX_TOKEN) {
+          return Promise.resolve(window.MAPBOX_TOKEN);
+        }
+        return fetch("report_config.json")
+          .then((resp) => {
+            if (!resp.ok) return null;
+            return resp.json();
+          })
+          .then((cfg) => (cfg && cfg.mapbox_token ? cfg.mapbox_token : null))
+          .catch(() => null);
+      }
+
+      function normalizeFeatureCollection(routeGeo, fallbackKind) {
+        if (!routeGeo) return null;
+        if (routeGeo.type === "FeatureCollection" && Array.isArray(routeGeo.features)) {
+          const features = routeGeo.features
+            .filter((feature) => feature && feature.type === "Feature")
+            .map((feature) => {
+              const properties = Object.assign({}, feature.properties || {});
+              if (!properties.route_kind) properties.route_kind = fallbackKind;
+              return Object.assign({}, feature, { properties });
+            });
+          return { type: "FeatureCollection", features };
+        }
+        if (routeGeo.type === "Feature") {
+          const properties = Object.assign({}, routeGeo.properties || {});
+          if (!properties.route_kind) properties.route_kind = fallbackKind;
+          return {
+            type: "FeatureCollection",
+            features: [Object.assign({}, routeGeo, { properties })],
+          };
+        }
+        return null;
+      }
+
+      function pickRouteFeature(routeGeo, preferredKind, fallbackKind) {
+        const normalized = normalizeFeatureCollection(routeGeo, fallbackKind);
+        if (!normalized || normalized.features.length === 0) return null;
+        const preferred = normalized.features.find((feature) => {
+          const kind = String((feature.properties || {}).route_kind || "").toLowerCase();
+          return kind === preferredKind;
+        });
+        return preferred || normalized.features[0];
+      }
+
+      function fetchRouteGeojson(path) {
+        return fetch(`${path}?ts=${Date.now()}`)
+          .then((resp) => (resp.ok ? resp.json() : null))
+          .catch(() => null);
+      }
+
+      async function loadRouteOverlay() {
+        const primary = await fetchRouteGeojson("route.geojson");
+        if (primary) {
+          return normalizeFeatureCollection(primary, "scenic");
+        }
+
+        const [scenicGeo, fastGeo] = await Promise.all([
+          fetchRouteGeojson("route_scenic.geojson"),
+          fetchRouteGeojson("route_fast.geojson"),
+        ]);
+        const features = [];
+        const scenicFeature = pickRouteFeature(scenicGeo, "scenic", "scenic");
+        const baselineFeature = pickRouteFeature(fastGeo, "baseline", "baseline");
+
+        if (scenicFeature) {
+          const properties = Object.assign({}, scenicFeature.properties || {}, {
+            route_kind: "scenic",
+          });
+          features.push(Object.assign({}, scenicFeature, { properties }));
+        }
+        if (baselineFeature) {
+          const properties = Object.assign({}, baselineFeature.properties || {}, {
+            route_kind: "baseline",
+          });
+          features.push(Object.assign({}, baselineFeature, { properties }));
+        }
+
+        if (features.length === 0) return null;
+        return { type: "FeatureCollection", features };
+      }
+
+      function _routeFeatureByKind(routeGeo, kind) {
+        if (!routeGeo || !Array.isArray(routeGeo.features)) return null;
+        const target = String(kind || "").toLowerCase();
+        for (const feature of routeGeo.features) {
+          const current = String((feature.properties || {}).route_kind || "scenic").toLowerCase();
+          if (current === target) return feature;
+        }
+        return null;
+      }
+
+      function _toFiniteNumber(value) {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+      }
+
+      function _formatNumber(value, digits) {
+        const n = _toFiniteNumber(value);
+        if (n === null) return "n/a";
+        return n.toFixed(digits);
+      }
+
+      function _formatSigned(value, digits) {
+        const n = _toFiniteNumber(value);
+        if (n === null) return "n/a";
+        const sign = n > 0 ? "+" : "";
+        return `${sign}${n.toFixed(digits)}`;
+      }
+
+      function _routeMetricsFromFeature(feature) {
+        const props = (feature && feature.properties) || {};
+        return {
+          distanceKm: _toFiniteNumber(props.total_distance_km),
+          durationMin: _toFiniteNumber(props.estimated_duration_minutes),
+          scenicScore: _toFiniteNumber(props.average_scenic_score),
+          segments: _toFiniteNumber(props.segments),
+        };
+      }
+
+      function renderRouteStats(routeGeo) {
+        if (!routeStatsWrap || !routeStatsEl || !routeStatsNote) return;
+        if (!routeGeo || !Array.isArray(routeGeo.features) || routeGeo.features.length === 0) {
+          routeStatsWrap.style.display = "none";
+          routeStatsEl.innerHTML = "";
+          routeStatsNote.style.display = "block";
+          return;
+        }
+
+        const baselineFeature = _routeFeatureByKind(routeGeo, "baseline");
+        const scenicFeature = _routeFeatureByKind(routeGeo, "scenic")
+          || routeGeo.features.find((f) => f !== baselineFeature)
+          || null;
+
+        const scenic = _routeMetricsFromFeature(scenicFeature);
+        const baseline = _routeMetricsFromFeature(baselineFeature);
+
+        const items = [];
+        if (scenicFeature) {
+          items.push(["Scenic Dist (km)", _formatNumber(scenic.distanceKm, 2)]);
+          items.push(["Scenic Time (min)", _formatNumber(scenic.durationMin, 1)]);
+          items.push(["Scenic Score", _formatNumber(scenic.scenicScore, 2)]);
+        }
+        if (baselineFeature) {
+          items.push(["Base Dist (km)", _formatNumber(baseline.distanceKm, 2)]);
+          items.push(["Base Time (min)", _formatNumber(baseline.durationMin, 1)]);
+          items.push(["Base Score", _formatNumber(baseline.scenicScore, 2)]);
+        }
+        if (scenicFeature && baselineFeature) {
+          items.push(["Delta Dist (km)", _formatSigned(scenic.distanceKm - baseline.distanceKm, 2)]);
+          items.push(["Delta Time (min)", _formatSigned(scenic.durationMin - baseline.durationMin, 1)]);
+          items.push(["Delta Scenic", _formatSigned(scenic.scenicScore - baseline.scenicScore, 2)]);
+        }
+
+        routeStatsEl.innerHTML = items
+          .map(([label, value]) => {
+            return `<div class="summary-item"><span>${label}</span><strong>${value}</strong></div>`;
+          })
+          .join("");
+        routeStatsWrap.style.display = "block";
+        routeStatsNote.style.display = "none";
+      }
+
+      function renderSummary(summary, runInfo) {
+        runInfo = runInfo || {};
+        const scoringMode = inferScoringMode(runInfo);
+        const items = [
+          ["Total Tiles", summary.total_tiles],
+          ["Mean Score", summary.mean.toFixed(2)],
+          ["Median Score", summary.median.toFixed(2)],
+          ["Std Dev", summary.std.toFixed(2)],
+          ["Min Score", summary.min.toFixed(2)],
+          ["Max Score", summary.max.toFixed(2)],
+          ["Scoring Mode", scoringMode],
+          ["Classifier", runInfo.used_classifier == null ? "n/a" : (runInfo.used_classifier ? "on" : "off")],
+          ["Device", runInfo.device || "n/a"],
+          ["Missing Pairs", runInfo.counts?.missing_pairs ?? "n/a"],
+        ];
+        summaryEl.innerHTML = items
+          .map(([label, value]) => {
+            return `<div class="summary-item"><span>${label}</span><strong>${value}</strong></div>`;
+          })
+          .join("");
+      }
+
+      function renderFeatureSummary(featureSummary) {
+        if (!featureSummary || !featureSummary.fields || featureSummary.fields.length === 0) {
+          featureSummaryEl.innerHTML = `<div class="summary-item"><span>Terrain</span><strong>n/a</strong></div>`;
+          return;
+        }
+        const items = featureSummary.fields.flatMap((field) => {
+          return [
+            [`${field.label} Mean`, Number(field.mean).toFixed(2)],
+            [`${field.label} Median`, Number(field.median).toFixed(2)],
+            [`${field.label} Min`, Number(field.min).toFixed(2)],
+            [`${field.label} Max`, Number(field.max).toFixed(2)],
+          ];
+        });
+        featureSummaryEl.innerHTML = items
+          .map(([label, value]) => {
+            return `<div class="summary-item"><span>${label}</span><strong>${value}</strong></div>`;
+          })
+          .join("");
+      }
+
+      function _safeNum(value, fallback = 0) {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : fallback;
+      }
+
+      function _minMax(values) {
+        if (!values.length) return [0, 1];
+        let lo = values[0];
+        let hi = values[0];
+        for (const v of values) {
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+        if (lo === hi) return [lo, lo + 1];
+        return [lo, hi];
+      }
+
+      function _normalize(v, lo, hi) {
+        return (v - lo) / Math.max(hi - lo, 1e-6);
+      }
+
+      function _kmeans(vectors, k, iters = 10) {
+        if (!vectors.length) return [];
+        const dim = vectors[0].length;
+        const centers = [];
+        const n = vectors.length;
+        const step = Math.max(1, Math.floor(n / k));
+        for (let i = 0; i < k; i++) {
+          centers.push(vectors[Math.min(i * step, n - 1)].slice());
+        }
+        const assign = new Array(n).fill(0);
+
+        for (let iter = 0; iter < iters; iter++) {
+          for (let i = 0; i < n; i++) {
+            let best = 0;
+            let bestDist = Infinity;
+            for (let c = 0; c < k; c++) {
+              let dist = 0;
+              for (let d = 0; d < dim; d++) {
+                const diff = vectors[i][d] - centers[c][d];
+                dist += diff * diff;
+              }
+              if (dist < bestDist) {
+                bestDist = dist;
+                best = c;
+              }
+            }
+            assign[i] = best;
+          }
+
+          const sums = Array.from({ length: k }, () => new Array(dim).fill(0));
+          const counts = new Array(k).fill(0);
+          for (let i = 0; i < n; i++) {
+            const c = assign[i];
+            counts[c] += 1;
+            for (let d = 0; d < dim; d++) sums[c][d] += vectors[i][d];
+          }
+          for (let c = 0; c < k; c++) {
+            if (counts[c] === 0) continue;
+            for (let d = 0; d < dim; d++) centers[c][d] = sums[c][d] / counts[c];
+          }
+        }
+        return assign;
+      }
+
+      function renderClusterSummary(tileRows) {
+        if (!clusterSummaryEl) return;
+        if (!Array.isArray(tileRows) || tileRows.length < 8) {
+          clusterSummaryEl.innerHTML = `<div class="summary-item"><span>Clusters</span><strong>n/a</strong></div>`;
+          return;
+        }
+
+        const reliefs = tileRows.map((t) => _safeNum(t.relief));
+        const slopes = tileRows.map((t) => _safeNum(t.slope_mean));
+        const vegs = tileRows.map((t) => _safeNum(t.veg_proxy));
+        const [relLo, relHi] = _minMax(reliefs);
+        const [sloLo, sloHi] = _minMax(slopes);
+        const [vegLo, vegHi] = _minMax(vegs);
+
+        const vectors = tileRows.map((t) => [
+          _safeNum(t.scenic_score) / 10.0,
+          _normalize(_safeNum(t.relief), relLo, relHi),
+          _normalize(_safeNum(t.slope_mean), sloLo, sloHi),
+          _normalize(_safeNum(t.veg_proxy), vegLo, vegHi),
+        ]);
+        const k = Math.max(3, Math.min(6, Math.floor(Math.sqrt(tileRows.length / 80))));
+        const assign = _kmeans(vectors, k, 12);
+        const groups = Array.from({ length: k }, () => []);
+        tileRows.forEach((tile, i) => groups[assign[i]].push(tile));
+
+        const cards = groups
+          .map((rows, i) => {
+            if (!rows.length) return null;
+            const meanScore = rows.reduce((a, t) => a + _safeNum(t.scenic_score), 0) / rows.length;
+            const meanRelief = rows.reduce((a, t) => a + _safeNum(t.relief), 0) / rows.length;
+            const classCounts = {};
+            for (const row of rows) {
+              const name = String(row.class_name || "unknown");
+              classCounts[name] = (classCounts[name] || 0) + 1;
+            }
+            const topClass = Object.entries(classCounts).sort((a, b) => b[1] - a[1])[0];
+            return {
+              idx: i + 1,
+              rows: rows.length,
+              meanScore,
+              meanRelief,
+              topClass: topClass ? `${topClass[0]} (${topClass[1]})` : "n/a",
+            };
+          })
+          .filter(Boolean)
+          .sort((a, b) => b.meanScore - a.meanScore);
+
+        clusterSummaryEl.innerHTML = cards
+          .map((c) => {
+            return `<div class="cluster-card">
+              <h4>Cluster ${c.idx}</h4>
+              <div class="summary-item"><span>Tiles</span><strong>${c.rows}</strong></div>
+              <div class="summary-item"><span>Mean Score</span><strong>${c.meanScore.toFixed(2)}</strong></div>
+              <div class="summary-item"><span>Mean Relief</span><strong>${c.meanRelief.toFixed(1)}</strong></div>
+              <div class="muted">Top Class: ${c.topClass}</div>
+            </div>`;
+          })
+          .join("");
+      }
+
+      function renderHistogram(histogram) {
+        const ctx = histogramCanvas.getContext("2d");
+        const width = histogramCanvas.clientWidth;
+        const height = histogramCanvas.clientHeight;
+        histogramCanvas.width = width;
+        histogramCanvas.height = height;
+        ctx.clearRect(0, 0, width, height);
+
+        const counts = histogram.counts;
+        const maxCount = Math.max(...counts, 1);
+        const barWidth = width / counts.length;
+
+        counts.forEach((count, idx) => {
+          const barHeight = (count / maxCount) * (height - 20);
+          ctx.fillStyle = colorForScore((idx / counts.length) * 10);
+          ctx.fillRect(idx * barWidth, height - barHeight, barWidth - 2, barHeight);
+        });
+      }
+
+      function tileToLatLon(x, y, z) {
+        const n = Math.pow(2, z);
+        const lon = (x / n) * 360 - 180;
+        const latRad = Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / n)));
+        const lat = (latRad * 180) / Math.PI;
+        return [lat, lon];
+      }
+
+      function initMapbox(data) {
+        if (!mapboxReady || !window.maplibregl) {
+          mapboxNote.textContent =
+            "MapLibre failed to load. Check network access or allow https://unpkg.com.";
+          return;
+        }
+        if (!data.grid || !data.grid.has_coords) {
+          mapboxNote.textContent = "No tile coordinates available for map overlay.";
+          return;
+        }
+        const sources = {
+          "osm": {
+            "type": "raster",
+            "tiles": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+            "tileSize": 256,
+          },
+        };
+        const layers = [
+          {
+            "id": "osm",
+            "type": "raster",
+            "source": "osm",
+          },
+        ];
+        if (mapboxToken) {
+          sources["satellite"] = {
+            "type": "raster",
+            "tiles": [
+              `https://api.mapbox.com/styles/v1/mapbox/satellite-v9/tiles/{z}/{x}/{y}?access_token=${mapboxToken}`,
+            ],
+            "tileSize": 256,
+          };
+          layers.push({
+            "id": "satellite",
+            "type": "raster",
+            "source": "satellite",
+            "layout": { "visibility": "none" },
+          });
+          mapboxNote.style.display = "none";
+        } else {
+          mapboxNote.textContent =
+            "Satellite layer requires a Mapbox token (set in report_config.json or window.MAPBOX_TOKEN).";
+          mapboxNote.style.display = "block";
+          const satOption = baseLayerSelect.querySelector('option[value="sat"]');
+          if (satOption) satOption.disabled = true;
+        }
+
+        const map = new maplibregl.Map({
+          container: "mapbox-map",
+          style: {
+            "version": 8,
+            "sources": sources,
+            "layers": layers
+          },
+          center: [-72.5, 42.4],
+          zoom: data.grid.zoom || 12,
+        });
+        mapInstance = map;
+
+        map.on("load", () => {
+          const grid = data.grid;
+          const [nwLat, nwLon] = tileToLatLon(grid.min_x, grid.min_y, grid.zoom);
+          const [seLat, seLon] = tileToLatLon(grid.max_x + 1, grid.max_y + 1, grid.zoom);
+          const coordinates = [
+            [nwLon, nwLat],
+            [seLon, nwLat],
+            [seLon, seLat],
+            [nwLon, seLat],
+          ];
+
+          const overlayUrl = heatmapCanvas.toDataURL("image/png");
+          map.addSource("scenic-heatmap", {
+            type: "image",
+            url: overlayUrl,
+            coordinates,
+          });
+          map.addLayer({
+            id: "scenic-heatmap-layer",
+            type: "raster",
+            source: "scenic-heatmap",
+            paint: { "raster-opacity": 0.6 },
+          });
+          map.fitBounds([ [nwLon, seLat], [seLon, nwLat] ], { padding: 20, duration: 0 });
+
+          loadRouteOverlay()
+            .then((routeGeo) => {
+              if (!routeGeo || !routeGeo.features || routeGeo.features.length === 0) return;
+              map.addSource("scenic-route", { type: "geojson", data: routeGeo });
+              routeLegend.style.display = "block";
+              renderRouteStats(routeGeo);
+
+              // Baseline (non-scenic) route in blue.
+              map.addLayer({
+                id: "scenic-route-line-baseline",
+                type: "line",
+                source: "scenic-route",
+                filter: ["==", ["coalesce", ["get", "route_kind"], "scenic"], "baseline"],
+                paint: {
+                  "line-color": "#66c2ff",
+                  "line-width": 4,
+                  "line-opacity": 0.92,
+                },
+              });
+
+              // Scenic-optimized route in orange.
+              map.addLayer({
+                id: "scenic-route-line",
+                type: "line",
+                source: "scenic-route",
+                filter: ["!=", ["coalesce", ["get", "route_kind"], "scenic"], "baseline"],
+                paint: { "line-color": "#ffb347", "line-width": 6, "line-opacity": 0.95 },
+              });
+            })
+            .catch(() => null);
+          applyMapControls();
+        });
+
+        map.on("click", (event) => {
+          if (!data.grid || !data.grid.has_coords) return;
+          const z = data.grid.zoom;
+          const lat = event.lngLat.lat;
+          const lon = event.lngLat.lng;
+          const n = Math.pow(2, z);
+          const x = Math.floor(((lon + 180) / 360) * n);
+          const y = Math.floor(
+            (1 - Math.log(Math.tan((lat * Math.PI) / 180) + 1 / Math.cos((lat * Math.PI) / 180)) / Math.PI) / 2 * n
+          );
+          const key = `${x},${y}`;
+          const idx = data.grid.index_by_coord[key];
+          if (idx !== undefined) {
+            setTile(tiles[idx]);
+          }
+        });
+        baseLayerSelect.addEventListener("change", applyMapControls);
+        heatmapOpacityInput.addEventListener("input", applyMapControls);
+      }
+
+      function applyMapControls() {
+        if (!mapInstance) return;
+        const opacity = parseFloat(heatmapOpacityInput.value || "0.6");
+        if (mapInstance.getLayer(heatmapLayerId)) {
+          mapInstance.setPaintProperty(heatmapLayerId, "raster-opacity", opacity);
+        }
+        const base = baseLayerSelect.value;
+        const showOsm = base === "osm";
+        const showSat = base === "sat";
+        const showNone = base === "none";
+        if (mapInstance.getLayer("osm")) {
+          mapInstance.setLayoutProperty("osm", "visibility", showOsm && !showNone ? "visible" : "none");
+        }
+        if (mapInstance.getLayer("satellite")) {
+          mapInstance.setLayoutProperty("satellite", "visibility", showSat && !showNone ? "visible" : "none");
+        }
+      }
+
+      function renderHeatmap(data) {
+        const grid = data.grid;
+        if (!grid.has_coords) {
+          return;
+        }
+
+        tiles = data.tiles || [];
+        const gridW = grid.max_x - grid.min_x + 1;
+        const gridH = grid.max_y - grid.min_y + 1;
+        const maxDim = 512;
+        const baseScale = Math.max(1, Math.ceil(Math.max(gridW, gridH) / maxDim));
+
+        const ctx = heatmapCanvas.getContext("2d");
+        drawHeatmap(ctx, baseScale, {
+          minX: grid.min_x,
+          maxX: grid.max_x,
+          minY: grid.min_y,
+          maxY: grid.max_y,
+        });
+      }
+
+      function drawHeatmap(ctx, baseScale, view) {
+        const viewW = view.maxX - view.minX + 1;
+        const viewH = view.maxY - view.minY + 1;
+        const scale = Math.max(1, Math.ceil(Math.max(viewW, viewH) / 512));
+        heatmapCanvas.width = Math.ceil(viewW / scale);
+        heatmapCanvas.height = Math.ceil(viewH / scale);
+        ctx.clearRect(0, 0, heatmapCanvas.width, heatmapCanvas.height);
+
+        tiles.forEach((tile) => {
+          if (
+            tile.x < view.minX ||
+            tile.x > view.maxX ||
+            tile.y < view.minY ||
+            tile.y > view.maxY
+          ) {
+            return;
+          }
+
+          const px = Math.floor((tile.x - view.minX) / scale);
+          const py = Math.floor((tile.y - view.minY) / scale);
+          ctx.fillStyle = colorForScore(tile.scenic_score);
+          ctx.fillRect(px, py, 1, 1);
+        });
+      }
+
+      function setTile(tile) {
+        currentIndex = tile.index;
+        tileIdEl.textContent = `Tile ${tile.index + 1} / ${tiles.length}`;
+        const thumbnail = tile.thumb_url || tile.thumb;
+        tileThumbEl.hidden = !thumbnail;
+        tileNoThumbEl.hidden = !!thumbnail;
+        if (thumbnail) {
+          tileThumbEl.src = thumbnail;
+        } else {
+          tileThumbEl.removeAttribute("src");
+        }
+        const classScore = tile.class_score == null
+          ? "n/a"
+          : _formatNumber(tile.class_score, 2);
+        tileScoreEl.innerHTML = `<strong>Score:</strong> ${tile.scenic_score.toFixed(
+          2
+        )} <span class="muted">(class: ${
+          tile.class_name || "unknown"
+        }, class score: ${classScore})</span>`;
+
+        const breakdown = [
+          ["Relief (m)", tile.relief],
+          ["Roughness", tile.roughness],
+          ["Slope Mean", tile.slope_mean],
+          ["Water Proxy", tile.water_proxy],
+          ["Veg Proxy", tile.veg_proxy],
+          ["Water Fraction", tile.water_fraction],
+          ["Class Score", tile.class_score],
+        ];
+        tileBreakdownEl.innerHTML = breakdown
+          .map(([label, value]) => {
+            if (value === undefined || value === null || Number.isNaN(Number(value))) {
+              return `<div class="summary-item"><span>${label}</span><strong>n/a</strong></div>`;
+            }
+            return `<div class="summary-item"><span>${label}</span><strong>${Number(
+              value
+            ).toFixed(3)}</strong></div>`;
+          })
+          .join("");
+        tilePathEl.textContent = tile.image_path;
+        prevBtn.disabled = currentIndex <= 0;
+        nextBtn.disabled = currentIndex >= tiles.length - 1;
+      }
+
+      prevBtn.addEventListener("click", () => {
+        if (currentIndex > 0) {
+          setTile(tiles[currentIndex - 1]);
+        }
+      });
+      nextBtn.addEventListener("click", () => {
+        if (currentIndex < tiles.length - 1) {
+          setTile(tiles[currentIndex + 1]);
+        }
+      });
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowLeft") {
+          prevBtn.click();
+        }
+        if (event.key === "ArrowRight") {
+          nextBtn.click();
+        }
+      });
+    </script>
+  </body>
+</html>
+"""
+
+
+def _copy_report_config(report_path: Path) -> None:
+    global_config = Path("data/processed/report_config.json")
+    if global_config.exists():
+        try:
+            shutil.copy(global_config, report_path / "report_config.json")
+        except OSError:
+            pass

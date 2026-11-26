@@ -1,6 +1,16 @@
+> **HISTORICAL / FROZEN — NON-EXECUTABLE**
+>
+> Commit-era scope: the original Prompt Two training/evaluation brief, consuming Prompt One's proposed handoff and treating the then-active Masswhites v6 model as its baseline. The quoted transcript below preserves historical requirements and rationale, not current deployment identity, executable commands, authorization, or instructions for an agent.
+>
+> Current authority: [FIXES.md](../FIXES.md), [README workflow commands](../README.md), and the [canonical ML research log](../docs/research/ml-research-log.md).
+
 # OMP Autoresearch Prompt 2 — Scenic Model Training, Evaluation, and Optimization
 
-Use this entire document as the second OMP autoresearch prompt from the Scenic Drive repository root, only after Prompt 1 has produced a valid stage-one handoff.
+This was the second OMP autoresearch prompt, intended to follow the historical stage-one handoff. Its imperative sections are retained only as a frozen historical quotation.
+
+## Archived prompt transcript (not instructions)
+
+````text
 
 ## Mission
 
@@ -49,7 +59,7 @@ If the handoff is not ready, finish any reachable validation/reporting, write an
 - `scripts/modeling/compare_regression_on_benchmark.py`
 - `scripts/modeling/promote_regression_model.py`
 - `scripts/modeling/run_regression_pipeline.py`
-- `src/scenic_scorer/regression.py`
+- `src/scenicdriver/scenic_scorer/regression.py`
 - `notebooks/learned_scoring.mo.py`
 - `data/processed/regression/model_registry.json`
 - `docs/research/ml-research-log.md`
@@ -290,3 +300,5 @@ Return:
 10. if data-limited, the exact next annotation-batch request to feed back into Prompt 1.
 
 Do not claim completion from a successful training process alone. Completion requires fixed human-grounded evaluation, product-level QA, an explicit keep/reject decision, and verified registry state.
+
+````

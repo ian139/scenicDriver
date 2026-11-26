@@ -40,6 +40,14 @@ const outputStart = viewerSource.indexOf("function routeOutputMarkup");
 const outputEnd = viewerSource.indexOf("\n\nfunction setRouteResultsVerbose", outputStart);
 assert.ok(outputStart >= 0 && outputEnd > outputStart);
 const outputSource = viewerSource.slice(outputStart, outputEnd);
+const deadlineSource = viewerSource.slice(
+  viewerSource.indexOf("const FETCH_DEADLINE_MS"),
+  viewerSource.indexOf("\nfunction resolveRegionSelection")
+);
+const publicStatusSource = viewerSource.slice(
+  viewerSource.indexOf("function setPublicRouteStatus"),
+  viewerSource.indexOf("\nfunction escapeHtml")
+);
 
 function makeRouteOutputHarness() {
   const context = {
@@ -78,6 +86,7 @@ class FakeElement {
   constructor(tag = "div") {
     this.tagName = tag;
     this.value = "";
+    this.disabled = false;
     this.children = [];
     this.dataset = {};
     this.listeners = new Map();
@@ -85,6 +94,7 @@ class FakeElement {
     this.classList = {
       add: () => {},
       remove: () => {},
+      toggle: () => {},
     };
   }
 
@@ -138,16 +148,15 @@ function makeRegionHarness(search = "", payload = { regions: [] }) {
     String,
     Array,
     Error,
+    AbortController,
+    setTimeout,
+    clearTimeout,
     DEFAULTS: {
       displayRange: "new_england_north",
       sourceRegion: "new_england_north",
       workingRun: "prompt_two_candidate_exp02_fresh_test20_20260810",
-      zoom: 6.2,
+      zoom: 1,
     },
-    REGION_BOUNDS: [
-      [-73.5205078125, 42.488301979602255],
-      [-66.796875, 47.50235895196859],
-    ],
     activeRegionBounds: null,
     selectedRegionMetadata: null,
     CONFIG: {
@@ -177,7 +186,8 @@ function makeRegionHarness(search = "", payload = { regions: [] }) {
     },
   };
   vm.runInNewContext(
-    `${regionSource}
+    `${deadlineSource}
+${regionSource}
 globalThis.resolveRegionSelection = resolveRegionSelection;
 globalThis.selectionUrl = selectionUrl;
 globalThis.validHeatmapMetadata = validHeatmapMetadata;
@@ -196,7 +206,6 @@ test("route output stays compact until diagnostics are explicitly enabled", () =
     routes: { scenic: { highway_count: 1, score_run: ["edge-1"] } },
     diagnostics: {
       planning_elapsed_ms: 24,
-      requested_scenic_weight: 0.8,
     },
   };
   const compact = harness.routeOutputMarkup(payload);
@@ -313,6 +322,58 @@ test("URL-selected region resolves its run and persists source/run alignment", a
   );
 });
 
+test("selected metadata alone supplies region bounds and fallback camera", async () => {
+  const region = {
+    region: "other_region",
+    display_name: "Other region",
+    latest_run_name: "other-run",
+    bbox: { min_lon: 145, min_lat: -44, max_lon: 150, max_lat: -40 },
+  };
+  const harness = makeRegionHarness("?source=other_region", { regions: [region] });
+  assert.equal(harness.context.regionCamera(null), null);
+  await harness.context.loadSupportedRegions();
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.context.activeRegionBounds)), [
+    [145, -44], [150, -40],
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.context.regionCamera(region))), {
+    center: [147.5, -42], zoom: 1,
+  });
+});
+
+test("invalid selected bbox rejects metadata before publishing region state", async () => {
+  const valid = supportedRegions.regions[0].bbox;
+  const invalidBounds = [
+    undefined, null, {},
+    { ...valid, min_lon: undefined },
+    { ...valid, min_lon: null },
+    { ...valid, min_lon: "" },
+    { ...valid, min_lon: String(valid.min_lon) },
+    { ...valid, min_lon: false },
+    { ...valid, min_lon: NaN },
+    { ...valid, max_lat: Infinity },
+    { ...valid, min_lon: -181 },
+    { ...valid, max_lon: 181 },
+    { ...valid, min_lat: -91 },
+    { ...valid, max_lat: 91 },
+    { ...valid, min_lon: valid.max_lon },
+    { ...valid, min_lon: valid.max_lon + 1 },
+    { ...valid, min_lat: valid.max_lat },
+    { ...valid, min_lat: valid.max_lat + 1 },
+  ];
+  for (const bbox of invalidBounds) {
+    const selected = { ...supportedRegions.regions[1], bbox };
+    const harness = makeRegionHarness("?source=masswhites&run=stale", {
+      regions: [supportedRegions.regions[0], selected],
+    });
+    await assert.rejects(() => harness.context.loadSupportedRegions(), /invalid region bounds/i);
+    assert.equal(harness.context.activeRegionBounds, null);
+    assert.equal(harness.context.selectedRegionMetadata, null);
+    assert.equal(harness.context.CONFIG.workingRun, "stale");
+    assert.equal(harness.regionSelect.children.length, 0);
+    assert.deepEqual(harness.replacements, []);
+  }
+});
+
 test("route capability distinguishes disabled routing from a missing graph", () => {
   const harness = makeRegionHarness("", supportedRegions);
   const intentionallyDisabled = {
@@ -373,6 +434,7 @@ test("invalid and unavailable metadata fall back or report no run without crashi
         display_name: "New England North",
         latest_run_name: null,
         is_default: true,
+        bbox: supportedRegions.regions[0].bbox,
       },
     ],
   };
@@ -436,7 +498,7 @@ function makeHarness() {
     },
   };
   vm.runInNewContext(
-    `function newSearchSessionToken() { return "session-fixed"; }\n${installSource}\nglobalThis.installAddressSearch = installAddressSearch;`,
+    `${deadlineSource}\nfunction newSearchSessionToken() { return "session-fixed"; }\n${installSource}\nglobalThis.installAddressSearch = installAddressSearch;`,
     context
   );
   context.el = {
@@ -661,7 +723,6 @@ function makeLifecycleHarness() {
   context.displayedRouteRequest = null;
   context.mapReady = false;
   context.CONFIG = { sourceRegion: "test-region", workingRun: "test-run" };
-  context.DEFAULTS = { scenicWeight: 0.8 };
   context.AbortController = AbortController;
   context.URL = URL;
   context.setTimeout = setTimeout;
@@ -673,6 +734,7 @@ function makeLifecycleHarness() {
     avoidHighways: new FakeElement("input"),
     submitRoute: new FakeElement("button"),
     shareRouteBtn: new FakeElement("button"),
+    routeStatus: new FakeElement("p"),
   };
   context.el.startInput.value = "40.03,-75.22";
   context.el.endInput.value = "40.065,-75.19";
@@ -681,7 +743,7 @@ function makeLifecycleHarness() {
   context.selectedRoutePoints = { start: null, end: null };
   context.parsePoint = (text) => {
     const [lat, lon] = text.split(",").map(Number);
-    return { lat, lon };
+    return Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null;
   };
   context.api = (path) => path;
   context.setRouteOutput = (title, message) => { harness.output = { title, message }; };
@@ -689,8 +751,12 @@ function makeLifecycleHarness() {
   context.syncZoomElasticity = () => {};
   context.routePlanningAvailable = () => true;
   context.routeOutputMarkup = () => "Routes shown";
-  context.renderRouteComparison = () => {};
+  context.renderRouteComparison = (payload) => { harness.comparison = payload; };
   context.escapeHtml = (text) => String(text).replaceAll("<", "&lt;");
+  context.setText = (node, text) => { if (node) node.textContent = text; };
+  context.updateRouteControls = () => {
+    context.el.submitRoute.disabled = !context.mapReady || !context.routePlanningAvailable();
+  };
   context.window = {
     location: new URL("https://test.local/nested/viewer"),
     setTimeout: () => {},
@@ -703,7 +769,9 @@ function makeLifecycleHarness() {
   const planStart = viewerSource.indexOf("async function planRoute");
   const planEnd = viewerSource.indexOf("\nfunction initBindings", planStart);
   vm.runInNewContext(
-    `${failureSource}
+    `${deadlineSource}
+${publicStatusSource}
+${failureSource}
 ${viewerSource.slice(lifecycleStart, lifecycleEnd)}
 ${viewerSource.slice(planStart, planEnd)}
 globalThis.installRouteRenderLifecycle = installRouteRenderLifecycle;
@@ -727,7 +795,7 @@ test("deferred route drains after load, shares its request, and clear cancels pe
   harness.emit("load");
   harness.setStyleLoaded(false); // Tiles started loading after the one-time load.
   const planning = context.planRoute({ preventDefault() {} });
-  harness.pending[0].resolve(response({ geojson: makeRouteGeojson() }));
+  harness.pending[0].resolve(routeResponse({ geojson: makeRouteGeojson() }));
   await planning;
   assert.equal(harness.fitted.length, 0);
   harness.emit("idle");
@@ -752,7 +820,7 @@ test("deferred route drains after load, shares its request, and clear cancels pe
   const next = context.planRoute({ preventDefault() {} });
   await context.copyShareUrl();
   assert.equal(harness.shared, shared.toString());
-  harness.pending[1].resolve(response({ geojson: makeRouteGeojson() }));
+  harness.pending[1].resolve(routeResponse({ geojson: makeRouteGeojson() }));
   await next;
   context.clearRoute();
   harness.setStyleLoaded(true);
@@ -772,9 +840,9 @@ test("pre-load responses wait for readiness and superseded requests cannot publi
   const old = context.planRoute({ preventDefault() {} });
   context.el.startInput.value = "1,2";
   const current = context.planRoute({ preventDefault() {} });
-  harness.pending[1].resolve(response({ geojson: makeRouteGeojson() }));
+  harness.pending[1].resolve(routeResponse({ geojson: makeRouteGeojson() }));
   await current;
-  harness.pending[0].resolve(response({ geojson: makeRouteGeojson() }));
+  harness.pending[0].resolve(routeResponse({ geojson: makeRouteGeojson() }));
   await old;
   harness.setStyleLoaded(true);
   harness.emit("idle");
@@ -787,7 +855,7 @@ test("pre-load responses wait for readiness and superseded requests cannot publi
 
 test("structured route failures render the server's reason without emitting markup", async () => {
   // Failure-detail dicts exactly as the FastAPI /v1/route/compare error path
-  // emits them (src/app_api/main.py, mirrored by tests/test_app_api.py) — not
+  // emits them (src/scenicdriver/app_api/main.py, mirrored by tests/test_app_api.py) — not
   // invented payloads.  `reason` carries the structured cause's internal
   // reason string; the viewer renders it and falls back to `message` when the
   // server omits it.
@@ -886,6 +954,7 @@ test("local assets resolve at the root even for a nested app-shell URL", () => {
 
 
 const response = (payload) => ({ ok: true, json: async () => payload });
+const routeResponse = (payload) => response({ routes: { scenic: {} }, diagnostics: {}, ...payload });
 const tick = (ms = 230) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test("route failure presentation distinguishes no-route constraints", () => {
@@ -996,6 +1065,9 @@ test("heatmap metadata and keyboard navigation work without a summary or pointer
     lngLatToTile: (lng) => ({ x: lng, y: 2 }),
     setText: (node, text) => { node.textContent = text; },
   };
+  context.AbortController = AbortController;
+  context.setTimeout = setTimeout;
+  context.clearTimeout = clearTimeout;
   context.CONFIG = { sourceRegion: "test", workingRun: "test-run" };
   context.api = (path) => `https://test.local${path}`;
   context.URL = class extends URL {
@@ -1009,7 +1081,8 @@ test("heatmap metadata and keyboard navigation work without a summary or pointer
   const heatmapStart = viewerSource.indexOf("async function loadHeatmap");
   const heatmapEnd = viewerSource.indexOf("\nasync function checkApiHealth", heatmapStart);
   vm.runInNewContext(
-    `${viewerSource.slice(heatmapStart, heatmapEnd)}
+    `${deadlineSource}
+${viewerSource.slice(heatmapStart, heatmapEnd)}
 ${viewerSource.slice(start, end)}
 globalThis.installHeatmapInspector = installHeatmapInspector;
 globalThis.loadHeatmap = loadHeatmap;`, context);
@@ -1033,7 +1106,9 @@ globalThis.loadHeatmap = loadHeatmap;`, context);
       arrayBuffer: async () => values.buffer,
     };
   };
-  context.installHeatmapInspector(await context.loadHeatmap());
+  const heatmap = await context.loadHeatmap();
+  await heatmap.gridReady;
+  context.installHeatmapInspector(heatmap);
   assert.equal(inspectorScore.textContent, "2 tiles");
   context.document.activeElement = canvas;
   canvas.dispatch("focus");
@@ -1052,4 +1127,407 @@ globalThis.loadHeatmap = loadHeatmap;`, context);
   canvas.dispatch("pointermove", { offsetX: 3, offsetY: 2 });
   assert.equal(inspectorScore.textContent, "--");
   assert.equal(inspectorCoords.textContent, "No learned score for this tile");
+});
+
+test("replacement result publishes geometry, metrics and new share identity together", async () => {
+  const harness = makeLifecycleHarness();
+  const { context } = harness;
+  harness.setStyleLoaded(true);
+  harness.emit("load");
+  const firstPayload = { geojson: makeRouteGeojson(), routes: { scenic: { total_distance_km: 10 } }, diagnostics: {} };
+  const first = context.planRoute({ preventDefault() {} });
+  harness.pending[0].resolve(routeResponse(firstPayload));
+  await first;
+  assert.equal(context.el.shareRouteBtn.disabled, false);
+  assert.equal(harness.comparison.routes.scenic.total_distance_km, 10);
+  await context.copyShareUrl();
+  const firstShare = harness.shared;
+
+  harness.setStyleLoaded(false);
+  context.el.startInput.value = "41,-74";
+  context.el.endInput.value = "42,-73";
+  const second = context.planRoute({ preventDefault() {} });
+  assert.equal(context.el.shareRouteBtn.disabled, true);
+  assert.match(context.el.shareRouteBtn.textContent, /pending/i);
+  const secondPayload = { geojson: makeRouteGeojson(), routes: { scenic: { total_distance_km: 20 } }, diagnostics: {} };
+  harness.pending[1].resolve(routeResponse(secondPayload));
+  await second;
+  assert.equal(context.el.shareRouteBtn.disabled, true);
+  assert.equal(harness.comparison.routes.scenic.total_distance_km, 10);
+  assert.equal(harness.fitted.length, 1);
+  assert.match(context.el.routeStatus.textContent, /Waiting for the map/);
+  await context.copyShareUrl();
+  assert.equal(harness.shared, firstShare);
+  assert.match(context.el.routeStatus.textContent, /Share unavailable/);
+
+  harness.setStyleLoaded(true);
+  harness.emit("idle");
+  assert.equal(harness.fitted.length, 2);
+  assert.equal(harness.comparison.routes.scenic.total_distance_km, 20);
+  assert.equal(context.el.shareRouteBtn.disabled, false);
+  assert.match(context.el.routeStatus.textContent, /Route ready/);
+  await context.copyShareUrl();
+  const shared = new URL(harness.shared);
+  assert.equal(shared.searchParams.get("start"), "41,-74");
+  assert.equal(shared.searchParams.get("end"), "42,-73");
+});
+
+test("public form status exposes validation and request errors with invalid endpoints", async () => {
+  const harness = makeLifecycleHarness();
+  const { context } = harness;
+  context.el.startInput.value = "not coordinates";
+  await context.planRoute({ preventDefault() {} });
+  assert.equal(harness.pending.length, 0);
+  assert.match(context.el.routeStatus.textContent, /valid coordinates/);
+  assert.equal(context.el.startInput.attributes.get("aria-invalid"), "true");
+  assert.equal(context.el.endInput.attributes.get("aria-invalid"), "false");
+  context.el.startInput.value = "40,-75";
+  const planned = context.planRoute({ preventDefault() {} });
+  assert.match(context.el.routeStatus.textContent, /Planning/);
+  harness.pending[0].resolve({
+    ok: false,
+    json: async () => ({ detail: {
+      error: "route_endpoint_outside_coverage", endpoint: "end",
+      message: "Choose an endpoint inside coverage.", hint: "Try a nearer road.",
+    } }),
+  });
+  await planned;
+  assert.match(context.el.routeStatus.textContent, /Outside route coverage: Choose an endpoint inside coverage.*Try a nearer road/);
+  assert.equal(context.el.endInput.attributes.get("aria-invalid"), "true");
+  assert.equal(context.el.startInput.attributes.get("aria-invalid"), "false");
+  const rejected = context.planRoute({ preventDefault() {} });
+  harness.pending[1].resolve({ ok: false, json: async () => ({ detail: "Server rejected the request." }) });
+  await rejected;
+  assert.match(context.el.routeStatus.textContent, /Server rejected the request/);
+  const html = fs.readFileSync(new URL("../apps/new_england_north/index.html", import.meta.url), "utf8");
+  assert.ok(html.indexOf('id="routeStatus"') < html.indexOf('<details class="dev-panel">'));
+  for (const id of ["startInput", "endInput", "submitRoute"]) {
+    assert.match(html, new RegExp(`id="${id}"[^>]*aria-describedby="routeStatus"`));
+  }
+});
+
+function makeStartupHarness(search = "") {
+  const elements = new Map();
+  const element = (id) => {
+    if (!elements.has(id)) elements.set(id, new FakeElement());
+    return elements.get(id);
+  };
+  element("startInput").value = "44.475884,-73.214003";
+  element("endInput").value = "44.801616,-68.771305";
+  Object.assign(element("detourFactor"), { value: "1.8", min: "1", max: "3" });
+  element("avoidHighways").checked = true;
+  const dialog = element("routeResultsDialog");
+  dialog.showModal = () => { dialog.open = true; };
+  dialog.close = () => { dialog.open = false; };
+  const timers = new Map();
+  let timerId = 0;
+  const requests = [];
+  let map;
+  class FakeMap {
+    constructor(options) {
+      this.options = options;
+      this.events = new Map();
+      this.sources = new Map();
+      this.layers = new Map();
+      this.canvas = new FakeElement("canvas");
+      this.styleLoaded = false;
+      this.boundsCalls = [];
+      this.minimumZooms = [];
+      map = this;
+    }
+    on(event, callback) {
+      const callbacks = this.events.get(event) || [];
+      callbacks.push(callback);
+      this.events.set(event, callbacks);
+    }
+    emit(event) {
+      if (event === "load") this.styleLoaded = true;
+      for (const callback of this.events.get(event) || []) callback({});
+    }
+    isStyleLoaded() { return this.styleLoaded; }
+    addControl() {}
+    cameraForBounds(bounds) {
+      this.boundsCalls.push(bounds);
+      return { zoom: 6 };
+    }
+    setMinZoom(zoom) { this.minimumZooms.push(zoom); }
+    getCanvas() { return this.canvas; }
+    getSource(id) { return this.sources.get(id); }
+    getLayer(id) { return this.layers.get(id); }
+    addSource(id, source) {
+      this.sources.set(id, { ...source, setData(data) { this.data = data; } });
+    }
+    addLayer(layer) { this.layers.set(layer.id, layer); }
+    removeSource(id) { this.sources.delete(id); }
+    removeLayer(id) { this.layers.delete(id); }
+    fitBounds() {}
+    jumpTo(camera) { this.camera = camera; }
+  }
+  class FakeBounds {
+    extend() { return this; }
+  }
+  const location = new URL(`https://test.local/viewer${search}`);
+  const context = {
+    URL: class extends URL { static createObjectURL() { return "blob:heatmap"; } },
+    URLSearchParams,
+    AbortController,
+    crypto: { randomUUID: () => "search-session" },
+    maplibregl: { Map: FakeMap, NavigationControl: class {}, LngLatBounds: FakeBounds },
+    document: {
+      getElementById: element,
+      createElement: (tag) => new FakeElement(tag),
+      activeElement: null,
+    },
+    window: {
+      location, innerWidth: 1200, innerHeight: 900,
+      history: { replaceState: (_state, _title, url) => { context.window.location = new URL(url); } },
+      setTimeout: () => {},
+    },
+    setTimeout: (callback, delay) => {
+      const id = ++timerId;
+      timers.set(id, { callback, delay });
+      return id;
+    },
+    clearTimeout: (id) => timers.delete(id),
+    fetch: (url, options) => new Promise((resolve, reject) => {
+      const request = { path: new URL(url).pathname, url: String(url), options, resolve, reject };
+      requests.push(request);
+      options.signal.addEventListener("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    }),
+  };
+  vm.runInNewContext(
+    `${viewerSource.slice(0, viewerSource.indexOf("\nmain().catch"))}
+globalThis.main = main;`,
+    context
+  );
+  const startup = context.main();
+  return {
+    context, element, requests, startup,
+    get map() { return map; },
+    expireDeadlines() {
+      for (const [id, timer] of [...timers]) {
+        if (timer.delay === 15000) {
+          timers.delete(id);
+          timer.callback();
+        }
+      }
+    },
+    request(path) { return requests.find((request) => request.path === path); },
+  };
+}
+
+function resolveStartupResources(harness, { gridFails = false, regionsFail = false, regions = supportedRegions } = {}) {
+  harness.request("/api/v1/regions").resolve(regionsFail
+    ? { ok: false, status: 503, json: async () => ({}) }
+    : response(regions));
+  harness.request("/api/v1/healthz").resolve(response({ status: "ok" }));
+  harness.request("/api/v1/training-results").resolve(response({}));
+  harness.request("/api/v1/heatmap").resolve(response({
+    tile_zoom: 14, total_tiles: 1,
+    bounds: { min_lon: -73.52, min_lat: 42.48, max_lon: -66.79, max_lat: 47.5 },
+  }));
+  harness.request("/api/v1/heatmap-image").resolve({ ok: true, blob: async () => ({}) });
+  harness.request("/api/v1/heatmap-scores.bin").resolve(gridFails
+    ? { ok: false, status: 503, statusText: "Unavailable" }
+    : {
+      ok: true,
+      headers: new Map([
+        ["X-Scenic-Tile-Zoom", "14"], ["X-Scenic-Min-X", "1"], ["X-Scenic-Min-Y", "2"],
+        ["X-Scenic-Grid-Width", "1"], ["X-Scenic-Grid-Height", "1"],
+      ]),
+      arrayBuffer: async () => new ArrayBuffer(4),
+    });
+}
+
+function validatedArtifact() {
+  return {
+    geojson: makeRouteGeojson(),
+    request: { start: [40.04, -75.2], end: [40.043, -75.197], max_detour_factor: 1.8, avoid_highways: true },
+    routes: { scenic: {}, baseline: {} }, score_mapping: {},
+  };
+}
+
+test("shared URL plans restored controls after map readiness without installing the default artifact", async () => {
+  const harness = makeStartupHarness("?start=44.5,-72.5&end=45,-70&max_detour=2.5&avoid_highways=false");
+  resolveStartupResources(harness);
+  await tick(0);
+  assert.equal(harness.request("/api/v1/route/compare"), undefined);
+  assert.equal(harness.map.sources.has("route-source"), false);
+  assert.doesNotMatch(harness.element("routeTitle").textContent || "", /validated|Burlington/);
+  harness.map.emit("load");
+  await tick(0);
+  const route = harness.request("/api/v1/route/compare");
+  const body = JSON.parse(route.options.body);
+  assert.deepEqual(body.start, { lat: 44.5, lon: -72.5 });
+  assert.deepEqual(body.end, { lat: 45, lon: -70 });
+  assert.equal(body.max_detour_factor, 2.5);
+  assert.equal(body.avoid_highways, false);
+  assert.equal(harness.request("/api/v1/validated-route"), undefined);
+  route.resolve(routeResponse({ geojson: makeRouteGeojson() }));
+  await harness.startup;
+  assert.equal(harness.requests.filter((request) => request.path === "/api/v1/route/compare").length, 1);
+  assert.equal(harness.element("routeTitle").textContent, "Route computed");
+  assert.equal(harness.element("shareRouteBtn").disabled, false);
+});
+
+test("grid failure preserves image source and explicitly disables only the score inspector", async () => {
+  const harness = makeStartupHarness();
+  resolveStartupResources(harness, { gridFails: true });
+  harness.map.emit("load");
+  await tick(0);
+  harness.request("/api/v1/validated-route").resolve(response(validatedArtifact()));
+  await harness.startup;
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.map.boundsCalls)), [
+    [[-73.52, 42.48], [-66.79, 47.5]],
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.map.camera)), {
+    center: [-70.15, 44.99], zoom: 6.2,
+  });
+  assert.equal(harness.map.sources.get("scenic-heatmap-source").url, "blob:heatmap");
+  assert.equal(harness.map.layers.has("scenic-heatmap-fill"), true);
+  assert.equal(harness.element("inspector").attributes.get("aria-disabled"), "true");
+  assert.match(harness.element("inspectorCoords").textContent, /inspector unavailable.*503/i);
+});
+
+test("startup constructs basemap and initiates independent resources concurrently with deadlines", async () => {
+  const harness = makeStartupHarness();
+  assert.ok(harness.map);
+  assert.equal(harness.map.options.style.sources.voyager.type, "raster");
+  assert.deepEqual(Array.from(harness.map.options.center), [0, 0]);
+  assert.equal(harness.map.options.zoom, 1);
+  harness.map.emit("resize");
+  harness.map.emit("zoomend");
+  assert.deepEqual(harness.map.boundsCalls, []);
+  assert.equal(harness.map.camera, undefined);
+  assert.deepEqual(harness.requests.map((request) => request.path).sort(), [
+    "/api/v1/healthz", "/api/v1/heatmap", "/api/v1/heatmap-image",
+    "/api/v1/heatmap-scores.bin", "/api/v1/regions", "/api/v1/training-results",
+  ]);
+  assert.ok(harness.requests.every((request) => !request.options.signal.aborted));
+  harness.expireDeadlines();
+  await harness.startup;
+  assert.ok(harness.requests.every((request) => request.options.signal.aborted));
+  assert.equal(harness.element("submitRoute").disabled, true);
+  assert.match(harness.element("routeStatus").textContent, /metadata unavailable.*timed out/i);
+});
+
+test("unknown region metadata keeps every planning control disabled and forbids planning", async () => {
+  const harness = makeStartupHarness();
+  assert.equal(harness.element("startInput").disabled, true);
+  resolveStartupResources(harness, { regionsFail: true });
+  harness.map.emit("load");
+  await harness.startup;
+  harness.map.emit("resize");
+  harness.map.emit("zoomend");
+  assert.deepEqual(harness.map.boundsCalls, []);
+  assert.equal(harness.map.camera, undefined);
+  assert.equal(harness.map.minimumZooms.at(-1), 0);
+  for (const id of ["submitRoute", "startInput", "endInput", "detourFactor", "avoidHighways"]) {
+    assert.equal(harness.element(id).disabled, true, id);
+  }
+  assert.equal(harness.request("/api/v1/validated-route"), undefined);
+  harness.element("routeForm").dispatch("submit");
+  await tick(0);
+  assert.equal(harness.request("/api/v1/route/compare"), undefined);
+  assert.match(harness.element("routeStatus").textContent, /authoritative region capabilities/);
+});
+
+test("missing metadata bounds fail closed without aligning camera or installing region layers", async () => {
+  const harness = makeStartupHarness();
+  const region = { ...supportedRegions.regions[0] };
+  delete region.bbox;
+  resolveStartupResources(harness, { regions: { regions: [region] } });
+  harness.map.emit("load");
+  await harness.startup;
+  harness.map.emit("resize");
+  harness.map.emit("zoomend");
+  assert.deepEqual(harness.map.boundsCalls, []);
+  assert.equal(harness.map.camera, undefined);
+  assert.equal(harness.map.minimumZooms.at(-1), 0);
+  assert.equal(harness.map.sources.size, 0);
+  assert.equal(harness.request("/api/v1/validated-route"), undefined);
+  assert.equal(harness.request("/api/v1/route/compare"), undefined);
+  assert.match(harness.element("regionStatus").textContent, /Region metadata unavailable:.*invalid region bounds/);
+  for (const id of ["submitRoute", "startInput", "endInput", "detourFactor", "avoidHighways"]) {
+    assert.equal(harness.element(id).disabled, true, id);
+  }
+});
+
+test("route planning deadline aborts the request and reports a public actionable timeout", async () => {
+  const harness = makeStartupHarness("?start=44.5,-72.5&end=45,-70");
+  resolveStartupResources(harness);
+  harness.map.emit("load");
+  await tick(0);
+  const request = harness.request("/api/v1/route/compare");
+  assert.equal(request.options.signal.aborted, false);
+  harness.expireDeadlines();
+  await harness.startup;
+  assert.equal(request.options.signal.aborted, true);
+  assert.match(harness.element("routeStatus").textContent, /timed out.*try again/i);
+  assert.equal(harness.element("shareRouteBtn").disabled, true);
+  assert.equal(harness.element("submitRoute").disabled, false);
+});
+
+test("route publication reuses installed geometry and connector sources", () => {
+  const harness = makeRouteHarness();
+  const request = { start: { lat: 40.03, lon: -75.22 }, end: { lat: 40.065, lon: -75.19 } };
+  harness.context.renderRoute(makeRouteGeojson(), request);
+  const routeSource = harness.sources.get("route-source");
+  const connectorSource = harness.sources.get("route-endpoint-source");
+  let routeUpdates = 0;
+  let connectorUpdates = 0;
+  routeSource.setData = (data) => { routeSource.data = data; routeUpdates += 1; };
+  connectorSource.setData = (data) => { connectorSource.data = data; connectorUpdates += 1; };
+  const operationCount = harness.operations.length;
+  harness.context.renderRoute(makeRouteGeojson(), request);
+  assert.equal(harness.sources.get("route-source"), routeSource);
+  assert.equal(harness.sources.get("route-endpoint-source"), connectorSource);
+  assert.equal(routeUpdates, 1);
+  assert.equal(connectorUpdates, 1);
+  assert.equal(harness.operations.length, operationCount);
+});
+
+test("image publishes before a slow grid and remains visible when the grid deadline expires", async () => {
+  const harness = makeStartupHarness();
+  const gridRequest = harness.request("/api/v1/heatmap-scores.bin");
+  const gridResolve = gridRequest.resolve;
+  gridRequest.resolve = () => {};
+  resolveStartupResources(harness);
+  gridRequest.resolve = gridResolve;
+  harness.map.emit("load");
+  await tick(0);
+  harness.request("/api/v1/validated-route").resolve(response(validatedArtifact()));
+  await tick(0);
+  assert.equal(harness.map.sources.get("scenic-heatmap-source").url, "blob:heatmap");
+  assert.match(harness.element("inspectorCoords").textContent, /loading/i);
+  harness.expireDeadlines();
+  await harness.startup;
+  assert.equal(gridRequest.options.signal.aborted, true);
+  assert.equal(harness.map.sources.get("scenic-heatmap-source").url, "blob:heatmap");
+  assert.match(harness.element("inspectorCoords").textContent, /unavailable.*timed out/i);
+});
+
+test("late clipboard completion cannot replace the pending share label", async () => {
+  const harness = makeLifecycleHarness();
+  harness.setStyleLoaded(true);
+  harness.emit("load");
+  const first = harness.context.planRoute({ preventDefault() {} });
+  harness.pending[0].resolve(routeResponse({ geojson: makeRouteGeojson() }));
+  await first;
+  let finishCopy;
+  harness.context.navigator.clipboard.writeText = () => new Promise((resolve) => { finishCopy = resolve; });
+  const copy = harness.context.copyShareUrl();
+  harness.setStyleLoaded(false);
+  const second = harness.context.planRoute({ preventDefault() {} });
+  finishCopy();
+  await copy;
+  assert.equal(harness.context.el.shareRouteBtn.disabled, true);
+  assert.match(harness.context.el.shareRouteBtn.textContent, /pending/i);
+  harness.pending[1].resolve(routeResponse({ geojson: makeRouteGeojson() }));
+  await second;
+  harness.context.clearRoute();
 });

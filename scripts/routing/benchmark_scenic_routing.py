@@ -17,12 +17,13 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.route_planner.cost import is_highway_road_type  # noqa: E402
-from src.route_planner.graph import Edge, Node, RoadGraph  # noqa: E402
-from src.route_planner.planner import ScenicRoutePlanner  # noqa: E402
+from scenicdriver.route_planner.cost import is_highway_road_type  # noqa: E402
+from scenicdriver.route_planner.graph import Edge, Node, RoadGraph  # noqa: E402
+from scenicdriver.route_planner.planner import ScenicRoutePlanner  # noqa: E402
 
 
 _TOLERANCE = 1e-9

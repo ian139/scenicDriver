@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 from pathlib import Path
 import struct
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
+import threading
 import time
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest.mock import patch
+import sys
 
 import pandas as pd
 
@@ -17,24 +21,24 @@ from PIL import Image
 import pytest
 from fastapi.testclient import TestClient
 
-from src.app_api.contrib_repo import ContribConfig, ContribRepo
+from scenicdriver.app_api.contrib_repo import ContribConfig, ContribRepo
 
 # The exported app retains this repository, so retain its root for the module's
 # lifetime too. Restore main's by-value constructor binding after the import.
 _import_directory = TemporaryDirectory(prefix="scenic-api-tests-")
 with patch(
-    "src.app_api.contrib_repo.ContribRepo",
+    "scenicdriver.app_api.contrib_repo.ContribRepo",
     return_value=ContribRepo(ContribConfig(root_dir=Path(_import_directory.name))),
 ):
-    import src.app_api.main as app_api
+    import scenicdriver.app_api.main as app_api
 app_api.ContribRepo = ContribRepo
 
-from src.route_planner.cancellation import (
+from scenicdriver.route_planner.cancellation import (
     RoutingCancelled,
     RoutingDeadline,
     RoutingTimeout,
 )
-from src.app_api.main import create_app
+from scenicdriver.app_api.main import create_app
 
 
 @pytest.fixture(autouse=True)
@@ -51,8 +55,34 @@ def _stub_named_test_run_report(
     )
 
 
+class _InlineTestSupervisor:
+    """Keep API contract tests in-process; isolation has separate coverage."""
+
+    def run_job(self, function, *args, deadline, **kwargs):
+        return function(deadline, *args, **kwargs)
+
+    def health(self):
+        return {"alive": True, "closed": False}
+
+    def close(self):
+        pass
+
+
 @pytest.fixture(autouse=True)
-def contrib_repo(tmp_path, monkeypatch):
+def _route_runtime(monkeypatch):
+    original = app_api.create_app
+
+    def test_app():
+        app = original()
+        app.state.route_supervisor = _InlineTestSupervisor()
+        return app
+
+    monkeypatch.setattr(app_api, "create_app", test_app)
+    monkeypatch.setattr(sys.modules[__name__], "create_app", test_app)
+
+
+@pytest.fixture(autouse=True)
+def contrib_repo(tmp_path, monkeypatch, _route_runtime):
     source = tmp_path / "source.csv"
     seed = tmp_path / "seed.csv"
     rows = [{"image_path": f"philadelphia/{i}.jpg", "scenic_human": 6.5} for i in range(40)]
@@ -71,9 +101,11 @@ def contrib_repo(tmp_path, monkeypatch):
 
 def test_healthz() -> None:
     resp = client.get("/v1/healthz")
-    assert resp.status_code == 200
+    assert resp.status_code == 503
     payload = resp.json()
     assert payload["ok"] is True
+    assert payload["liveness"] == {"ok": True}
+    assert payload["routing"]["ready"] is False
     assert "regions_available" in payload
 
 
@@ -136,7 +168,7 @@ def test_healthz_redacts_preload_asset_paths(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         app_api.PreloadedRouteSupervisor,
         "start",
-        lambda **_kwargs: type("StubSupervisor", (), {"close": lambda self: None})(),
+        lambda **_kwargs: _InlineTestSupervisor(),
     )
     with TestClient(create_app()) as test_client:
         payload = test_client.get("/v1/healthz").json()
@@ -163,7 +195,6 @@ def test_route_compare_missing_graph_does_not_leak_path(monkeypatch) -> None:
         json={
             "start": {"lat": 40.03, "lon": -75.22},
             "end": {"lat": 40.065, "lon": -75.19},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
@@ -643,7 +674,11 @@ def test_validated_route_projects_canonical_artifacts(tmp_path, monkeypatch) -> 
         "features": [
             {
                 "type": "Feature",
-                "properties": {"route_kind": route_kind},
+                "properties": {
+                    "route_kind": route_kind,
+                    "segment_identity": [{"edge_id": "rich-artifact-segment"}],
+                    "score_provenance": {"source": "/private/report.json"},
+                },
                 "geometry": {
                     "type": "LineString",
                     "coordinates": [[-73, 44], [-69, 45]],
@@ -661,7 +696,6 @@ def test_validated_route_projects_canonical_artifacts(tmp_path, monkeypatch) -> 
                 "request": {
                     "start": [44.4, -73.2],
                     "end": [44.8, -68.8],
-                    "scenic_weight": 0.8,
                     "max_detour_factor": 1.8,
                     "graph_geojson": "private/graph.json",
                 },
@@ -706,7 +740,15 @@ def test_validated_route_projects_canonical_artifacts(tmp_path, monkeypatch) -> 
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["geojson"] == route_geojson
+    for feature in payload["geojson"]["features"]:
+        kind = feature["properties"]["route_kind"]
+        route = payload["routes"][kind]
+        assert feature["geometry"] == route["geometry"]
+        assert route["snapped_start"] == [44, -73]
+        assert route["snapped_end"] == [45, -69]
+        assert feature["properties"] == {
+            "route_kind": kind, "snapped_start": [44, -73], "snapped_end": [45, -69],
+        }
     assert payload["routes"]["scenic"]["total_distance_km"] == 461.2
     assert payload["score_mapping"] == {
         "enabled": True,
@@ -719,42 +761,11 @@ def test_validated_route_projects_canonical_artifacts(tmp_path, monkeypatch) -> 
     assert "graph_geojson" not in payload["request"]
 
 
-def test_contrib_session_and_label_flow() -> None:
-    start = client.post(
-        "/v1/contrib/session/start",
-        json={
-            "contributor_id": "tester_api",
-            "display_name": "Tester API",
-            "region": "philadelphia",
-        },
-    )
-    assert start.status_code == 200
-    s_payload = start.json()
-    assert "profile" in s_payload
-    tasks = s_payload.get("tasks", [])
-    assert tasks
-
-    task = tasks[0]
-    label = client.post(
-        "/v1/contrib/labels",
-        json={
-            "contributor_id": "tester_api",
-            "task_id": task["task_id"],
-            "image_path": task["image_path"],
-            "scenic_human": 6.5,
-            "confidence": "high",
-            "skip": False,
-            "notes": "api smoke test",
-            "region": "philadelphia",
-        },
-    )
-    assert label.status_code == 200
-    l_payload = label.json()
-    assert l_payload["saved"] is True
-
-    profile = client.get("/v1/contrib/profile", params={"contributor_id": "tester_api"})
-    assert profile.status_code == 200
-    assert "profile" in profile.json()
+def _new_contributor(display_name: str = "Tester") -> tuple[str, dict[str, str]]:
+    response = client.post("/v1/contrib/profile", json={"display_name": display_name})
+    assert response.status_code == 201
+    body = response.json()
+    return body["profile"]["contributor_id"], {"X-Contributor-Token": body["contributor_token"]}
 
 
 def _contrib_payload(repo, contributor_id="tester", **changes):
@@ -763,10 +774,141 @@ def _contrib_payload(repo, contributor_id="tester", **changes):
             "image_path": task["image_path"], "scenic_human": 6.5, **changes}
 
 
+def _label_body(payload):
+    # Identity travels only in X-Contributor-Token; the body never names it.
+    return {key: value for key, value in payload.items() if key != "contributor_id"}
+
+
+def _contrib_csv(repo, path):
+    repo.export_csvs()
+    return pd.read_csv(path)
+
+
+def _contrib_snapshot(repo):
+    with repo._transaction() as connection:
+        return tuple(connection.iterdump())
+
+
+def test_contrib_token_holder_flow_end_to_end(contrib_repo, monkeypatch) -> None:
+    created = client.post("/v1/contrib/profile", json={"display_name": "Tester API"})
+    assert created.status_code == 201
+    token = created.json()["contributor_token"]
+    contributor_id = created.json()["profile"]["contributor_id"]
+    assert created.json()["profile"]["display_name"] == "Tester API"
+    assert "token_sha256" not in created.json()["profile"]
+    # Only the hash is persisted; the plaintext is returned exactly once.
+    stored = str(_contrib_snapshot(contrib_repo))
+    assert token not in stored
+    assert hashlib.sha256(token.encode()).hexdigest() in stored
+    headers = {"X-Contributor-Token": token}
+
+    start = client.post("/v1/contrib/session/start", json={"region": "philadelphia"},
+                        headers=headers)
+    assert start.status_code == 200
+    assert start.json()["profile"]["contributor_id"] == contributor_id
+    assert start.json()["tasks"]
+    more = client.get("/v1/contrib/tasks/next", params={"region": "philadelphia", "count": 2},
+                      headers=headers)
+    assert more.status_code == 200
+    task = more.json()["tasks"][0]
+    assert task["task_id"] == start.json()["tasks"][0]["task_id"]
+
+    label = client.post("/v1/contrib/labels", headers=headers, json={
+        "task_id": task["task_id"], "image_path": task["image_path"], "scenic_human": 6.5,
+        "confidence": "high", "skip": False, "notes": "api smoke test",
+        "region": "philadelphia",
+    })
+    assert label.status_code == 200
+    assert label.json()["saved"] is True
+    assert label.json()["record"]["contributor_id"] == contributor_id
+
+    renamed = client.patch("/v1/contrib/profile", json={"display_name": "Renamed"},
+                           headers=headers)
+    assert renamed.status_code == 200
+    assert renamed.json()["profile"]["display_name"] == "Renamed"
+
+    monkeypatch.setenv("CONTRIB_ADMIN_TOKEN", "admin-secret")
+    review = client.post("/v1/admin/contrib/review/run", headers={"X-Admin-Token": "admin-secret"})
+    assert review.status_code == 200
+    assert review.json()["promoted"] == 1
+
+    board = client.get("/v1/contrib/leaderboard").json()["leaderboard"]
+    assert [(row["contributor_id"], row["display_name"], row["credits"]) for row in board] == [
+        (contributor_id, "Renamed", 1.5)
+    ]
+    assert all("token_sha256" not in row and "agreement_count" not in row for row in board)
+    profile = client.get("/v1/contrib/profile", params={"contributor_id": contributor_id})
+    assert profile.status_code == 200
+    assert profile.json()["profile"] == board[0]
+
+
+def test_contrib_profile_get_is_read_only(contrib_repo) -> None:
+    before = _contrib_snapshot(contrib_repo)
+    response = client.get("/v1/contrib/profile", params={"contributor_id": "unknown"})
+    assert response.status_code == 404
+    assert _contrib_snapshot(contrib_repo) == before
+
+
+def test_contrib_impersonation_with_known_id_is_rejected(contrib_repo) -> None:
+    victim_id, victim_headers = _new_contributor("Victim")
+    victim_task = client.get("/v1/contrib/tasks/next", params={"region": "philadelphia", "count": 1},
+                             headers=victim_headers).json()["tasks"][0]
+    # The victim's ID is public; knowing it must not grant any mutation.
+    assert client.get("/v1/contrib/leaderboard").json()["leaderboard"][0]["contributor_id"] == victim_id
+    forged_label = {"contributor_id": victim_id, "task_id": victim_task["task_id"],
+                    "image_path": victim_task["image_path"], "scenic_human": 6.5}
+    before = _contrib_snapshot(contrib_repo)
+    for headers in ({}, {"X-Contributor-Token": victim_id}, {"X-Contributor-Token": "forged"}):
+        assert client.post("/v1/contrib/labels", json=forged_label, headers=headers).status_code == 401
+        assert client.post("/v1/contrib/labels", json=_label_body(forged_label),
+                           headers=headers).status_code == 401
+        assert client.post("/v1/contrib/session/start", json={"contributor_id": victim_id},
+                           headers=headers).status_code == 401
+        assert client.get("/v1/contrib/tasks/next", params={"contributor_id": victim_id},
+                          headers=headers).status_code == 401
+        assert client.patch("/v1/contrib/profile", json={"display_name": "Owned"},
+                            headers=headers).status_code == 401
+    assert _contrib_snapshot(contrib_repo) == before
+
+    # A valid token cannot act for someone else: body identity is not accepted,
+    # and the victim's task was never issued to the attacker.
+    _, attacker_headers = _new_contributor("Attacker")
+    assert client.post("/v1/contrib/labels", json=forged_label,
+                       headers=attacker_headers).status_code == 422
+    assert client.post("/v1/contrib/labels", json=_label_body(forged_label),
+                       headers=attacker_headers).status_code == 422
+    assert _contrib_csv(contrib_repo, contrib_repo.pending_path).empty
+    assert contrib_repo.get_profile(victim_id)["display_name"] == "Victim"
+
+
+def test_contrib_legacy_profile_without_token_cannot_mutate(contrib_repo) -> None:
+    # Legacy CSVs predate token_sha256; their rows stay readable but immutable.
+    pd.DataFrame([{
+        "contributor_id": "legacy", "display_name": "Legacy", "credits": 3.0,
+        "approved_labels": 2, "pending_labels": 0, "agreement_score": 0.9,
+        "agreement_count": 2, "created_at": "2026-01-01", "updated_at": "2026-01-01",
+    }]).to_csv(contrib_repo.profiles_path, index=False)
+    # The legacy snapshot is installed before the first database initialization.
+    contrib_repo.db_path.unlink()
+    repo = ContribRepo(contrib_repo.cfg)
+    profile = client.get("/v1/contrib/profile", params={"contributor_id": "legacy"})
+    assert profile.status_code == 200
+    assert profile.json()["profile"]["display_name"] == "Legacy"
+    assert "token_sha256" not in profile.json()["profile"]
+    empty_hash = hashlib.sha256(b"").hexdigest()
+    for token in ("", "legacy", empty_hash):
+        assert repo.authenticate(token) is None
+        headers = {"X-Contributor-Token": token}
+        assert client.get("/v1/contrib/tasks/next", headers=headers).status_code == 401
+        assert client.patch("/v1/contrib/profile", json={"display_name": "x"},
+                            headers=headers).status_code == 401
+    assert _contrib_csv(repo, repo.tasks_path).empty
+
+
 def test_contrib_concurrent_submissions_lose_nothing(contrib_repo):
     repo = contrib_repo
     tasks = repo.next_tasks("parallel", "philadelphia", count=25)
-    # Independent instances must share the same process/file lock.
+    # Independent instances share SQLite's transactional write serialization.
     repos = [ContribRepo(repo.cfg) for _ in tasks]
     with ThreadPoolExecutor(max_workers=10) as workers:
         list(workers.map(
@@ -774,7 +916,7 @@ def test_contrib_concurrent_submissions_lose_nothing(contrib_repo):
                 "contributor_id": "parallel", "task_id": item[1]["task_id"],
                 "image_path": item[1]["image_path"], "scenic_human": 6.5,
             }), zip(repos, tasks)))
-    pending = pd.read_csv(repo.pending_path)
+    pending = _contrib_csv(repo, repo.pending_path)
     assert set(pending["task_id"]) == {task["task_id"] for task in tasks}
     assert repo.get_profile("parallel")["pending_labels"] == 25
 
@@ -786,9 +928,9 @@ def test_contrib_optional_numeric_metadata_is_missing(contrib_repo, marker, colu
         "image_path": "philadelphia/NA.jpg", "class_id": "",
         "class_name": "NA", "scenic_score": "", column: marker,
     }]).to_csv(contrib_repo.cfg.labels_source_csv, index=False)
-    response = client.post("/v1/contrib/session/start", json={
-        "contributor_id": "NA", "region": "philadelphia",
-    })
+    _, headers = _new_contributor()
+    response = client.post("/v1/contrib/session/start", json={"region": "philadelphia"},
+                           headers=headers)
     assert response.status_code == 200
     task = response.json()["tasks"][0]
     assert task["class_id"] is None
@@ -802,9 +944,9 @@ def test_contrib_float_form_class_ids_beside_blanks(contrib_repo):
         {"image_path": "philadelphia/1.jpg", "class_id": "1.0", "scenic_score": "6.5"},
         {"image_path": "philadelphia/2.jpg", "class_id": "", "scenic_score": ""},
     ]).to_csv(contrib_repo.cfg.labels_source_csv, index=False)
-    response = client.post("/v1/contrib/session/start", json={
-        "contributor_id": "numeric", "region": "philadelphia",
-    })
+    _, headers = _new_contributor()
+    response = client.post("/v1/contrib/session/start", json={"region": "philadelphia"},
+                           headers=headers)
     assert response.status_code == 200
     tasks = response.json()["tasks"]
     assert [(task["class_id"], task["scenic_score"]) for task in tasks] == [(1, 6.5), (None, None)]
@@ -815,11 +957,11 @@ def test_contrib_nonfinite_task_scores_are_rejected(contrib_repo, score):
     pd.DataFrame([{
         "image_path": "philadelphia/bad.jpg", "scenic_score": score,
     }]).to_csv(contrib_repo.cfg.labels_source_csv, index=False)
-    response = client.post("/v1/contrib/session/start", json={
-        "contributor_id": "nonfinite", "region": "philadelphia",
-    })
+    _, headers = _new_contributor()
+    response = client.post("/v1/contrib/session/start", json={"region": "philadelphia"},
+                           headers=headers)
     assert response.status_code == 422
-    assert pd.read_csv(contrib_repo.tasks_path).empty
+    assert _contrib_csv(contrib_repo, contrib_repo.tasks_path).empty
 
 
 @pytest.mark.parametrize("class_id", ["1.5", "inf", "unknown"])
@@ -827,39 +969,44 @@ def test_contrib_invalid_class_ids_are_rejected(contrib_repo, class_id):
     pd.DataFrame([{
         "image_path": "philadelphia/bad.jpg", "class_id": class_id,
     }]).to_csv(contrib_repo.cfg.labels_source_csv, index=False)
-    response = client.post("/v1/contrib/session/start", json={
-        "contributor_id": "invalid", "region": "philadelphia",
-    })
+    _, headers = _new_contributor()
+    response = client.post("/v1/contrib/session/start", json={"region": "philadelphia"},
+                           headers=headers)
     assert response.status_code == 422
-    assert pd.read_csv(contrib_repo.tasks_path).empty
+    assert _contrib_csv(contrib_repo, contrib_repo.tasks_path).empty
 
 
 def _exercise_unpatched_apps(root):
     # Spawned processes import this module without running its pytest fixtures.
     cfg = ContribConfig(root_dir=Path(root))
-    with patch("src.app_api.contrib_repo.ContribConfig", return_value=cfg):
+    with patch("scenicdriver.app_api.contrib_repo.ContribConfig", return_value=cfg):
         fresh = create_app()
     results = []
-    for app, contributor_id in [(app_api.app, "imported"), (fresh, "fresh")]:
+    for app, display_name in [(app_api.app, "imported"), (fresh, "fresh")]:
         with TestClient(app) as test_client:
+            created = test_client.post("/v1/contrib/profile", json={"display_name": display_name})
+            contributor_id = created.json()["profile"]["contributor_id"]
             response = test_client.get("/v1/contrib/profile", params={"contributor_id": contributor_id})
-            results.append((response.status_code, response.json()["profile"]["contributor_id"]))
-    return results, (cfg.root_dir / "contributor_profiles.csv").exists()
+            results.append((created.status_code, response.status_code,
+                             response.json()["profile"]["display_name"]))
+    return results, (cfg.root_dir / "contributors.sqlite3").exists()
 
 
 def test_contrib_imported_app_and_unpatched_factory_remain_usable(tmp_path):
     with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as workers:
         results, persisted = workers.submit(_exercise_unpatched_apps, tmp_path / "factory").result(timeout=60)
-    assert results == [(200, "imported"), (200, "fresh")]
+    assert results == [(201, 200, "imported"), (201, 200, "fresh")]
     assert persisted
 
 
 @pytest.mark.parametrize("contributor_id", ["007", "NA", "nan", "1e5"])
 def test_contrib_identifier_round_trip(contrib_repo, contributor_id, monkeypatch):
-    import src.app_api.contrib_repo as storage
+    import scenicdriver.app_api.contrib_repo as storage
     repo = contrib_repo
     monkeypatch.setattr(storage.uuid, "uuid4", lambda: contributor_id)
-    repo.upsert_profile(contributor_id)
+    profile, token = repo.create_profile("Round trip")
+    assert profile["contributor_id"] == contributor_id
+    assert repo.authenticate(token) == contributor_id
     payload = _contrib_payload(repo, contributor_id)
     assert payload["task_id"] == contributor_id
     repo = ContribRepo(repo.cfg)
@@ -868,40 +1015,119 @@ def test_contrib_identifier_round_trip(contrib_repo, contributor_id, monkeypatch
     assert repo.get_profile(contributor_id)["contributor_id"] == contributor_id
     assert repo.run_qa_promotion()["promoted"] == 1
     assert repo.get_profile(contributor_id)["credits"] == 1.5
-    assert len(pd.read_csv(repo.profiles_path)) == 1
+    assert len(_contrib_csv(repo, repo.profiles_path)) == 1
 
 
 @pytest.mark.parametrize("score", [None, 6.5])
 def test_contrib_skip_never_approved_or_credited(contrib_repo, score):
-    payload = _contrib_payload(contrib_repo, skip=True)
+    contributor_id, headers = _new_contributor()
+    payload = _contrib_payload(contrib_repo, contributor_id, skip=True)
     if score is None:
         payload.pop("scenic_human")
-    response = client.post("/v1/contrib/labels", json=payload)
+    response = client.post("/v1/contrib/labels", json=_label_body(payload), headers=headers)
     assert response.status_code == 200
     result = contrib_repo.run_qa_promotion()
     assert result["promoted"] == 0
     assert result["remaining_pending"] == 0
-    profile = contrib_repo.get_profile("tester")
+    profile = contrib_repo.get_profile(contributor_id)
     assert profile["credits"] == profile["approved_labels"] == profile["pending_labels"] == 0
-    assert pd.read_csv(contrib_repo.approved_path).empty
-    events = pd.read_csv(contrib_repo.events_path)
+    assert _contrib_csv(contrib_repo, contrib_repo.approved_path).empty
+    events = _contrib_csv(contrib_repo, contrib_repo.events_path)
     assert json.loads(events.iloc[0]["metadata"])["status"] == "skipped"
 
 
-def test_contrib_replay_foreign_and_mismatched_tasks_rejected(contrib_repo):
-    payload = _contrib_payload(contrib_repo, "owner")
-    for changes in ({"contributor_id": "stranger"}, {"task_id": "unknown"},
-                    {"image_path": "philadelphia/other.jpg"}, {"task_id": " "}):
-        assert client.post("/v1/contrib/labels", json={**payload, **changes}).status_code == 422
-    assert client.post("/v1/contrib/labels", json=payload).status_code == 200
-    assert client.post("/v1/contrib/labels", json=payload).status_code == 422
+def test_contrib_first_approved_agreement_initializes_score(contrib_repo):
+    contributor_id, headers = _new_contributor()
+    start = client.post("/v1/contrib/session/start", json={"region": "philadelphia"},
+                        headers=headers)
+    assert start.status_code == 200
+    initial_profile = start.json()["profile"]
+    assert initial_profile["agreement_score"] == 0
+    assert "agreement_count" not in initial_profile
+    assert "token_sha256" not in initial_profile
+    assert _contrib_csv(contrib_repo, contrib_repo.profiles_path).iloc[0]["agreement_count"] == 0
+    payload = _label_body(_contrib_payload(contrib_repo, contributor_id))
+    response = client.post("/v1/contrib/labels", json=payload, headers=headers)
+    assert response.status_code == 200
+    assert set(response.json()["profile"]) == set(initial_profile)
     assert contrib_repo.run_qa_promotion()["promoted"] == 1
-    assert client.post("/v1/contrib/labels", json=payload).status_code == 422
-    assert contrib_repo.get_profile("owner")["credits"] == 1.5
+    profile = client.get("/v1/contrib/profile", params={"contributor_id": contributor_id})
+    assert profile.status_code == 200
+    assert profile.json()["profile"]["agreement_score"] == 1.0
+    assert set(profile.json()["profile"]) == set(initial_profile)
+    assert _contrib_csv(contrib_repo, contrib_repo.profiles_path).iloc[0]["agreement_count"] == 1
+
+
+@pytest.mark.parametrize("same_batch", [False, True])
+def test_contrib_agreement_mean_persists_and_reaches_leaderboard(contrib_repo, same_batch):
+    repo = contrib_repo
+    repo.submit_label(_contrib_payload(repo))
+    if not same_batch:
+        assert repo.run_qa_promotion()["promoted"] == 1
+        repo = ContribRepo(repo.cfg)
+    repo.submit_label(_contrib_payload(repo, scenic_human=1.5))
+    assert repo.run_qa_promotion(min_agreement=0.5)["promoted"] == (2 if same_batch else 1)
+    reopened = ContribRepo(repo.cfg)
+    profile = reopened.get_profile("tester")
+    assert profile["agreement_score"] == 0.75
+    assert profile["approved_labels"] == 2
+    assert _contrib_csv(repo, repo.profiles_path).iloc[0]["agreement_count"] == 2
+    response = client.get("/v1/contrib/leaderboard")
+    assert response.status_code == 200
+    assert response.json()["leaderboard"] == [profile]
+    # A third approval must weight the existing two labels, not just the mean.
+    reopened.submit_label(_contrib_payload(reopened))
+    assert reopened.run_qa_promotion()["promoted"] == 1
+    assert reopened.get_profile("tester")["agreement_score"] == pytest.approx(5 / 6)
+    assert _contrib_csv(repo, repo.profiles_path).iloc[0]["agreement_count"] == 3
+
+
+@pytest.mark.parametrize("missing_count", ["column", "value"])
+def test_contrib_legacy_agreement_restarts_at_next_approval(contrib_repo, missing_count):
+    repo = contrib_repo
+    pd.DataFrame([{
+        "contributor_id": "tester", "display_name": "tester", "credits": 0.0,
+        "approved_labels": 0, "pending_labels": 0, "agreement_score": 0.0,
+        "agreement_count": 0, "created_at": "2026-01-01", "updated_at": "2026-01-01",
+    }]).to_csv(repo.profiles_path, index=False)
+    profiles = pd.read_csv(repo.profiles_path)
+    profiles["agreement_score"] = 0.875
+    profiles["approved_labels"] = 8
+    if missing_count == "column":
+        profiles = profiles.drop(columns="agreement_count")
+    else:
+        profiles["agreement_count"] = ""
+    profiles.to_csv(repo.profiles_path, index=False)
+    repo.db_path.unlink()
+    repo = ContribRepo(repo.cfg)
+    assert repo.get_profile("tester")["agreement_score"] == 0.875
+    repo.submit_label(_contrib_payload(repo))
+    assert repo.run_qa_promotion()["promoted"] == 1
+    assert repo.get_profile("tester")["agreement_score"] == 1.0
+    assert repo.get_profile("tester")["approved_labels"] == 9
+    assert _contrib_csv(repo, repo.profiles_path).iloc[0]["agreement_count"] == 1
+
+
+def test_contrib_replay_foreign_and_mismatched_tasks_rejected(contrib_repo):
+    owner_id, owner_headers = _new_contributor("Owner")
+    stranger_id, stranger_headers = _new_contributor("Stranger")
+    payload = _label_body(_contrib_payload(contrib_repo, owner_id))
+    assert client.post("/v1/contrib/labels", json=payload,
+                       headers=stranger_headers).status_code == 422
+    for changes in ({"contributor_id": owner_id}, {"task_id": "unknown"},
+                    {"image_path": "philadelphia/other.jpg"}, {"task_id": " "}):
+        assert client.post("/v1/contrib/labels", json={**payload, **changes},
+                           headers=owner_headers).status_code == 422
+    assert client.post("/v1/contrib/labels", json=payload, headers=owner_headers).status_code == 200
+    assert client.post("/v1/contrib/labels", json=payload, headers=owner_headers).status_code == 422
+    assert contrib_repo.run_qa_promotion()["promoted"] == 1
+    assert client.post("/v1/contrib/labels", json=payload, headers=owner_headers).status_code == 422
+    assert contrib_repo.get_profile(owner_id)["credits"] == 1.5
+    assert contrib_repo.get_profile(stranger_id)["credits"] == 0
     # Different contributors may annotate the same image independently.
-    other = _contrib_payload(contrib_repo, "other")
+    other = _label_body(_contrib_payload(contrib_repo, stranger_id))
     assert other["image_path"] == payload["image_path"]
-    assert client.post("/v1/contrib/labels", json=other).status_code == 200
+    assert client.post("/v1/contrib/labels", json=other, headers=stranger_headers).status_code == 200
 
 
 def test_contrib_concurrent_replay_earns_one_credit(contrib_repo):
@@ -924,16 +1150,6 @@ def test_contrib_concurrent_replay_earns_one_credit(contrib_repo):
 
 def _submit_process_batch(cfg, payloads):
     repo = ContribRepo(cfg)
-    original_read = repo._read
-
-    def slow_read(path):
-        table = original_read(path)
-        if path == repo.pending_path:
-            # Widen the read/modify/write window so an absent file lock loses rows.
-            time.sleep(0.05)
-        return table
-
-    repo._read = slow_read
     _submission_barrier.wait(timeout=30)
     results = []
     for payload in payloads:
@@ -962,7 +1178,7 @@ def test_contrib_multiprocess_submissions_and_replay(contrib_repo):
         futures = [workers.submit(_submit_process_batch, repo.cfg, payloads[i::4]) for i in range(4)]
         saved = [row for future in futures for row in future.result(timeout=60)]
         assert set(saved) == {("saved", task["task_id"]) for task in tasks}
-        pending = pd.read_csv(repo.pending_path)
+        pending = _contrib_csv(repo, repo.pending_path)
         assert len(pending) == 20
         assert set(pending["task_id"]) == {task["task_id"] for task in tasks}
         assert repo.get_profile("processes")["pending_labels"] == 20
@@ -972,7 +1188,7 @@ def test_contrib_multiprocess_submissions_and_replay(contrib_repo):
         results = [row for future in futures for row in future.result(timeout=60)]
         assert results.count(("saved", replay["task_id"])) == 1
         assert results.count(("rejected", replay["task_id"])) == 3
-    pending = pd.read_csv(repo.pending_path)
+    pending = _contrib_csv(repo, repo.pending_path)
     expected = {task["task_id"] for task in tasks} | {replay["task_id"]}
     assert len(pending) == 21
     assert set(pending["task_id"]) == expected
@@ -981,82 +1197,79 @@ def test_contrib_multiprocess_submissions_and_replay(contrib_repo):
     assert repo.get_profile("replay")["credits"] == 1.5
     assert repo.get_profile("replay")["approved_labels"] == 1
     assert repo.get_profile("processes")["credits"] == 30
-    approved = pd.read_csv(repo.approved_path)
+    approved = _contrib_csv(repo, repo.approved_path)
     assert len(approved) == 21
     assert set(approved["task_id"]) == expected
-    events = pd.read_csv(repo.events_path)
+    events = _contrib_csv(repo, repo.events_path)
     assert len(events) == 21
     assert set(events["contributor_id"]) == {"processes", "replay"}
 
 
 
 
+def _contrib_fault_connection(repo, monkeypatch, *, fail_commit=False, fail_rollback=False):
+    import sqlite3
+    original_connect = repo._connect
+
+    class FaultConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if not fail_commit and sql.startswith("INSERT INTO events"):
+                raise OSError("injected event persistence failure")
+            return super().execute(sql, parameters)
+
+        def commit(self):
+            if fail_commit:
+                raise OSError("injected transaction commit failure")
+            return super().commit()
+
+        def rollback(self):
+            if fail_rollback:
+                raise OSError("interrupted rollback")
+            return super().rollback()
+
+    def connect():
+        connection = sqlite3.connect(repo.db_path, isolation_level=None, factory=FaultConnection)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+
+    monkeypatch.setattr(repo, "_connect", connect)
+    return original_connect
+
+
 def test_contrib_mid_promotion_failure_rolls_back(contrib_repo, monkeypatch):
-    import src.app_api.contrib_repo as storage
     repo = contrib_repo
     repo.submit_label(_contrib_payload(repo))
-    paths = [repo.profiles_path, repo.events_path, repo.approved_path, repo.pending_path]
-    before = {path: path.read_bytes() for path in paths}
-    original_replace = storage.os.replace
-    failed = False
-
-    def fail_after_credits(source, target):
-        nonlocal failed
-        if Path(target) == repo.events_path and not failed:
-            failed = True
-            raise OSError("injected event persistence failure")
-        return original_replace(source, target)
-
-    monkeypatch.setattr(storage.os, "replace", fail_after_credits)
+    before = _contrib_snapshot(repo)
+    original_connect = _contrib_fault_connection(repo, monkeypatch)
     with pytest.raises(OSError, match="injected"):
         repo.run_qa_promotion()
-    assert {path: path.read_bytes() for path in paths} == before
+    monkeypatch.setattr(repo, "_connect", original_connect)
+    assert _contrib_snapshot(repo) == before
     assert repo.run_qa_promotion()["promoted"] == 1
     assert repo.get_profile("tester")["credits"] == 1.5
 
 
-def test_contrib_promotion_staging_failure_changes_nothing(contrib_repo, monkeypatch):
+def test_contrib_promotion_commit_failure_changes_nothing(contrib_repo, monkeypatch):
     repo = contrib_repo
     repo.submit_label(_contrib_payload(repo))
-    paths = [repo.profiles_path, repo.events_path, repo.approved_path, repo.pending_path]
-    before = {path: path.read_bytes() for path in paths}
-    original_stage = repo._stage
-
-    def fail_staging(path, table):
-        if path == repo.approved_path:
-            raise OSError("injected CSV staging failure")
-        return original_stage(path, table)
-
-    monkeypatch.setattr(repo, "_stage", fail_staging)
-    with pytest.raises(OSError, match="staging"):
+    before = _contrib_snapshot(repo)
+    original_connect = _contrib_fault_connection(repo, monkeypatch, fail_commit=True)
+    with pytest.raises(OSError, match="commit"):
         repo.run_qa_promotion()
-    assert {path: path.read_bytes() for path in paths} == before
+    monkeypatch.setattr(repo, "_connect", original_connect)
+    assert _contrib_snapshot(repo) == before
 
 
 def test_contrib_failed_rollback_recovers_on_reopen(contrib_repo, monkeypatch):
-    import src.app_api.contrib_repo as storage
     repo = contrib_repo
     repo.submit_label(_contrib_payload(repo))
-    paths = [repo.profiles_path, repo.events_path, repo.approved_path, repo.pending_path]
-    before = {path: path.read_bytes() for path in paths}
-    original_replace = storage.os.replace
-    rolling_back = False
-
-    def interrupted_replace(source, target):
-        nonlocal rolling_back
-        if Path(target) == repo.approved_path:
-            rolling_back = True
-            raise OSError("interrupted promotion")
-        if rolling_back and Path(target) == repo.events_path:
-            raise OSError("interrupted rollback")
-        return original_replace(source, target)
-
-    monkeypatch.setattr(storage.os, "replace", interrupted_replace)
+    before = _contrib_snapshot(repo)
+    _contrib_fault_connection(repo, monkeypatch, fail_rollback=True)
     with pytest.raises(OSError, match="rollback"):
         repo.run_qa_promotion()
-    monkeypatch.setattr(storage.os, "replace", original_replace)
     reopened = ContribRepo(repo.cfg)
-    assert {path: path.read_bytes() for path in paths} == before
+    assert _contrib_snapshot(reopened) == before
     assert reopened.run_qa_promotion()["promoted"] == 1
     assert reopened.get_profile("tester")["credits"] == 1.5
 
@@ -1073,29 +1286,162 @@ def test_contrib_admin_authorization(monkeypatch):
     assert "configured" in response.json()["detail"].lower()
 
 
-@pytest.mark.parametrize("contributor_id", ["", " ", "\t"])
-def test_contrib_blank_identifier_rejected(contrib_repo, contributor_id):
-    assert client.post("/v1/contrib/session/start", json={
-        "contributor_id": contributor_id}).status_code == 422
-    assert client.get("/v1/contrib/profile", params={
-        "contributor_id": contributor_id}).status_code == 422
-    assert client.get("/v1/contrib/tasks/next", params={
-        "contributor_id": contributor_id}).status_code == 422
-    payload = _contrib_payload(contrib_repo)
-    for field in ("contributor_id", "task_id"):
-        assert client.post("/v1/contrib/labels", json={
-            **payload, field: contributor_id}).status_code == 422
+@pytest.mark.parametrize("blank", ["", " ", "\t"])
+def test_contrib_blank_identifier_rejected(contrib_repo, blank):
+    assert client.get("/v1/contrib/profile", params={"contributor_id": blank}).status_code == 422
+    assert client.post("/v1/contrib/profile", json={"display_name": blank}).status_code == 422
+    contributor_id, headers = _new_contributor()
+    assert client.patch("/v1/contrib/profile", json={"display_name": blank},
+                        headers=headers).status_code == 422
+    payload = _label_body(_contrib_payload(contrib_repo, contributor_id))
+    assert client.post("/v1/contrib/labels", json={**payload, "task_id": blank},
+                       headers=headers).status_code == 422
 
 
 def test_contrib_score_required_unless_skipping(contrib_repo):
-    payload = _contrib_payload(contrib_repo)
+    contributor_id, headers = _new_contributor()
+    payload = _label_body(_contrib_payload(contrib_repo, contributor_id))
     payload.pop("scenic_human")
-    assert client.post("/v1/contrib/labels", json=payload).status_code == 422
+    assert client.post("/v1/contrib/labels", json=payload, headers=headers).status_code == 422
+
+
+def test_contrib_legacy_csv_migration_is_once_and_enforces_bindings(contrib_repo, tmp_path):
+    import sqlite3
+    repo = contrib_repo
+    profile, token = repo.create_profile("Migrated")
+    contributor_id = profile["contributor_id"]
+    approved = _contrib_payload(repo, contributor_id)
+    repo.submit_label(approved)
+    assert repo.run_qa_promotion()["promoted"] == 1
+    pending = _contrib_payload(repo, contributor_id, scenic_human=1.5)
+    repo.submit_label(pending)
+    issued = _contrib_payload(repo, contributor_id)
+    expected_profile = repo.get_profile(contributor_id)
+    exports = repo.export_csvs()
+    root = tmp_path / "legacy"
+    root.mkdir()
+    for path in exports.values():
+        (root / path.name).write_bytes(path.read_bytes())
+    migrated = ContribRepo(ContribConfig(root, repo.cfg.approved_seed_csv, repo.cfg.labels_source_csv))
+    assert migrated.get_profile(contributor_id) == expected_profile
+    assert migrated.authenticate(token) == contributor_id
+    with migrated._transaction() as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert connection.execute("SELECT count(*) FROM annotations WHERE status='pending'").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM annotations WHERE status='approved'").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 1
+    for payload in (approved, pending):
+        with pytest.raises(ValueError, match="already"):
+            migrated.submit_label(payload)
+    with migrated._transaction(write=True) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("INSERT INTO issued_tasks VALUES (?, ?, ?, 'issued')",
+                               ("duplicate", contributor_id, issued["image_path"]))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("INSERT INTO annotations SELECT * FROM annotations LIMIT 1")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("""INSERT INTO annotations
+                (task_id, contributor_id, image_path, region, confidence, skip, notes, status, timestamp, qa_reason)
+                VALUES (?, 'foreign', ?, '', '', 1, '', 'pending', '', '')""",
+                (issued["task_id"], issued["image_path"]))
+    # Neither corrupting snapshots nor deleting them changes the live store.
+    for path in root.glob("*.csv"):
+        path.write_text("not a table", encoding="utf-8")
+    reopened = ContribRepo(migrated.cfg)
+    assert reopened.get_profile(contributor_id) == expected_profile
+    assert reopened.authenticate(token) == contributor_id
+    for path in root.glob("*.csv"):
+        path.unlink()
+    assert reopened.run_qa_promotion(min_agreement=0.5)["promoted"] == 1
+    assert reopened.get_profile(contributor_id)["agreement_score"] == 0.75
+    assert reopened.submit_label(issued)["status"] == "pending"
+    assert reopened.export_csvs()["approved"].exists()
+
+
+def test_contrib_interleaved_wal_readers_and_row_writes(contrib_repo, monkeypatch):
+    repo = contrib_repo
+    other = ContribRepo(repo.cfg)
+    first, token = repo.create_profile("First")
+    second, _ = other.create_profile("Second")
+    a = _contrib_payload(repo, first["contributor_id"])
+    b = _contrib_payload(other, second["contributor_id"])
+    repo.submit_label(a)
+    assert repo.run_qa_promotion()["promoted"] == 1  # Prime both external input indexes.
+    next_a = _contrib_payload(repo, first["contributor_id"])
+    snapshots = repo.export_csvs()
+    before = {path: path.read_bytes() for path in snapshots.values()}
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("live operation reparsed or rewrote a whole CSV")
+
+    monkeypatch.setattr(ContribRepo, "_read_csv", forbidden)
+    monkeypatch.setattr(pd.DataFrame, "to_csv", forbidden)
+    with repo._transaction() as reader:
+        old_credits = reader.execute("SELECT credits FROM profiles WHERE contributor_id=?",
+                                     (first["contributor_id"],)).fetchone()[0]
+        other.submit_label(b)
+        repo.submit_label(next_a)
+        assert other.run_qa_promotion()["promoted"] == 2
+        # A WAL reader remains on its original snapshot while writers commit.
+        assert reader.execute("SELECT credits FROM profiles WHERE contributor_id=?",
+                              (first["contributor_id"],)).fetchone()[0] == old_credits
+    assert repo.authenticate(token) == first["contributor_id"]
+    assert repo.get_profile(first["contributor_id"])["credits"] == 3
+    assert other.get_profile(second["contributor_id"])["credits"] == 1.5
+    assert {path: path.read_bytes() for path in before} == before
+    with repo._transaction() as connection:
+        for query, values in [
+            ("SELECT * FROM profiles WHERE contributor_id=?", (first["contributor_id"],)),
+            ("SELECT * FROM issued_tasks WHERE contributor_id=? AND image_path=?", (first["contributor_id"], a["image_path"])),
+            ("SELECT * FROM annotations WHERE contributor_id=? AND image_path=?", (first["contributor_id"], a["image_path"])),
+            ("SELECT * FROM source_images WHERE image_path=?", (a["image_path"],)),
+            ("SELECT * FROM annotations WHERE status=?", ("pending",)),
+        ]:
+            plan = " ".join(row[3] for row in connection.execute("EXPLAIN QUERY PLAN " + query, values))
+            assert "SEARCH" in plan and "INDEX" in plan
+
+
+def _interrupt_contrib_transaction(cfg):
+    import os
+    repo = ContribRepo(cfg)
+    with repo._transaction(write=True) as connection:
+        connection.execute("UPDATE profiles SET credits=999")
+        connection.execute("UPDATE annotations SET status='approved'")
+        os._exit(73)
+
+
+def test_contrib_process_interruption_rolls_back_on_reopen(contrib_repo):
+    repo = contrib_repo
+    repo.submit_label(_contrib_payload(repo))
+    before = _contrib_snapshot(repo)
+    process = multiprocessing.get_context("spawn").Process(target=_interrupt_contrib_transaction, args=(repo.cfg,))
+    process.start()
+    process.join(timeout=30)
+    assert process.exitcode == 73
+    reopened = ContribRepo(repo.cfg)
+    assert _contrib_snapshot(reopened) == before
+    assert reopened.run_qa_promotion()["promoted"] == 1
+
+
+def test_contrib_migration_failure_can_restart(contrib_repo):
+    import sqlite3
+    repo = contrib_repo
+    profile, token = repo.create_profile("Migration")
+    repo.export_csvs()
+    profiles = pd.read_csv(repo.profiles_path)
+    pd.concat([profiles, profiles]).to_csv(repo.profiles_path, index=False)
+    repo.db_path.unlink()
+    with pytest.raises(sqlite3.IntegrityError):
+        ContribRepo(repo.cfg)
+    profiles.to_csv(repo.profiles_path, index=False)
+    reopened = ContribRepo(repo.cfg)
+    assert reopened.get_profile(profile["contributor_id"]) == profile
+    assert reopened.authenticate(token) == profile["contributor_id"]
 
 
 @pytest.mark.parametrize("deadline,override,status", [(30, None, 200), (0, None, 504), (30, "0", 504)])
 def test_route_compare_contract(tmp_path, monkeypatch, deadline, override, status) -> None:
-    from src.data_pipeline.web_mercator import lat_lon_to_tile
+    from scenicdriver.data_pipeline.web_mercator import lat_lon_to_tile
     graph = tmp_path / "graph.geojson"
     graph.write_text(json.dumps({
         "type": "FeatureCollection", "features": [{
@@ -1144,6 +1490,10 @@ def _strict_route_metrics(
 ) -> dict[str, object]:
     return {
         "route_kind": route_kind,
+        "geometry": {
+            "type": "LineString",
+            "coordinates": [[-75.22, 40.03], [-75.19, 40.065]],
+        },
         "segments": 1,
         "edge_ids": [edge_id],
         "segment_identity": [
@@ -1161,8 +1511,6 @@ def _strict_route_metrics(
         "objective": raw_score,
         "objective_value": raw_score,
         "objective_components": {"objective_value": raw_score},
-        "requested_scenic_weight": 0.8,
-        "applied_scenic_weight": 0.8,
         "requested_max_detour_factor": cap,
         "applied_max_detour_factor": cap,
         "actual_duration_ratio": duration_min / 16.0,
@@ -1186,21 +1534,14 @@ def _strict_geojson(*metrics: dict[str, object]) -> dict[str, object]:
         "type": "FeatureCollection",
         "features": [
             {
+                "type": "Feature",
                 "properties": {
+                    # Only map rendering and endpoint-summary metadata belongs here.
                     "route_kind": route_metrics["route_kind"],
-                    "segment_identity": route_metrics["segment_identity"],
-                    "requested_start": route_metrics["requested_start"],
-                    "requested_end": route_metrics["requested_end"],
                     "snapped_start": route_metrics["snapped_start"],
                     "snapped_end": route_metrics["snapped_end"],
                 },
-                "geometry": {
-                    "type": "LineString",
-                    "coordinates": [
-                        [-75.22, 40.03],
-                        [-75.19, 40.065],
-                    ],
-                },
+                "geometry": route_metrics["geometry"],
             }
             for route_metrics in metrics
         ],
@@ -1210,8 +1551,6 @@ def _strict_geojson(*metrics: dict[str, object]) -> dict[str, object]:
 def _strict_diagnostics() -> dict[str, object]:
     return {
         "planner": "ok",
-        "requested_scenic_weight": 0.8,
-        "applied_scenic_weight": 0.8,
         "requested_max_detour_factor": 1.8,
         "applied_max_detour_factor": 1.8,
         "scenic_fastest_duration_ratio": 1.25,
@@ -1303,7 +1642,6 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
         json={
             "start": {"lat": 40.03, "lon": -75.22},
             "end": {"lat": 40.065, "lon": -75.19},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": True,
@@ -1343,6 +1681,114 @@ def test_route_compare_success_plans_once_without_diagnosis(monkeypatch) -> None
     assert payload["geojson"] == _strict_geojson(scenic_metrics, baseline_metrics)
 
 
+def test_route_compare_serialization_cache_skips_validation_and_ipc(tmp_path, monkeypatch) -> None:
+    graph = tmp_path / "graph.geojson"
+    graph.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(app_api, "_app_region", lambda region: None)
+    monkeypatch.setattr(app_api, "_region_to_graph", lambda region: graph)
+    monkeypatch.setattr(app_api, "_latest_run_for_region", lambda region: "test-run")
+    metrics = _strict_route_metrics(
+        distance_km=10.0, duration_min=20.0, raw_score=0.8, edge_id="scenic-edge",
+    )
+    calls = {"plan": 0, "validate": 0, "project": 0}
+    original_validate = app_api._validate_route_contract
+    original_project = app_api._project_route_response
+
+    def plan(request, **kwargs):
+        calls["plan"] += 1
+        diagnostics = _strict_diagnostics()
+        diagnostics.update({
+            "route_response_cache_hit": False, "graph_cache_hit": True,
+            "tile_score_cache_hit": True, "scored_graph_cache_hit": True,
+            "graph_load_elapsed_ms": 19.0, "tile_score_load_elapsed_ms": 13.0,
+            "score_application_elapsed_ms": 7.0, "planning_elapsed_ms": 12345.0,
+        })
+        return {
+            "routes": [{"route_kind": "scenic", "metrics": metrics}],
+            "diagnostics": diagnostics, "score_mapping": _strict_score_mapping(),
+            "geojson": _strict_geojson(metrics),
+        }
+
+    def validate(*args, **kwargs):
+        calls["validate"] += 1
+        return original_validate(*args, **kwargs)
+
+    def project(*args, **kwargs):
+        calls["project"] += 1
+        return original_project(*args, **kwargs)
+
+    monkeypatch.setattr(app_api, "plan_routes", plan)
+    monkeypatch.setattr(app_api, "_validate_route_contract", validate)
+    monkeypatch.setattr(app_api, "_project_route_response", project)
+    body = {
+        "start": {"lat": 40.03, "lon": -75.22},
+        "end": {"lat": 40.065, "lon": -75.19},
+        "region": "cache-region", "max_detour_factor": 1.8,
+        "avoid_highways": False, "include_baseline": False,
+    }
+    first = client.post("/v1/route/compare", json=body)
+    second = client.post("/v1/route/compare", json=body)
+    assert first.status_code == second.status_code == 200
+    assert calls == {"plan": 1, "validate": 1, "project": 1}
+    first_payload, second_payload = first.json(), second.json()
+    assert first_payload["diagnostics"]["route_response_cache_hit"] is False
+    diagnostics = second_payload.pop("diagnostics")
+    first_payload.pop("diagnostics")
+    assert second_payload == first_payload
+    assert diagnostics["route_response_cache_hit"] is True
+    assert diagnostics["planning_elapsed_ms"] != 12345.0
+    assert diagnostics["graph_load_elapsed_ms"] == 0.0
+    assert diagnostics["tile_score_load_elapsed_ms"] == 0.0
+    assert diagnostics["score_application_elapsed_ms"] == 0.0
+    assert not any(diagnostics[key] for key in ("graph_cache_hit", "tile_score_cache_hit", "scored_graph_cache_hit"))
+    assert set(second_payload["geojson"]["features"][0]["properties"]) == {
+        "route_kind", "snapped_start", "snapped_end",
+    }
+    # Each identity-changing input invalidates the public serialization, not
+    # only the planner's internal response cache.
+    body["avoid_highways"] = True
+    assert client.post("/v1/route/compare", json=body).status_code == 200
+    graph.write_text('{"changed": true}', encoding="utf-8")
+    assert client.post("/v1/route/compare", json=body).status_code == 200
+    report = app_api._run_report_path("test-run")
+    report.write_text('{"tiles": [], "summary": {"changed": true}}', encoding="utf-8")
+    assert client.post("/v1/route/compare", json=body).status_code == 200
+    monkeypatch.setenv("SCENIC_ROUTE_FRONTIER_TIME_LIMIT_SECONDS", "0.25")
+    assert client.post("/v1/route/compare", json=body).status_code == 200
+    assert calls == {"plan": 5, "validate": 5, "project": 5}
+
+
+def test_route_projection_redacts_shared_containers_once_without_mutation() -> None:
+    metrics = _strict_route_metrics(
+        distance_km=10.0, duration_min=20.0, raw_score=0.8, edge_id="scenic-edge",
+    )
+    shared = {"source": "/private/report.json", "nested": [{"score": 0.8}]}
+    metrics["score_provenance"] = shared
+    mapping = _strict_score_mapping()
+    mapping["provenance"] = shared
+    result = {
+        "routes": [{"route_kind": "scenic", "metrics": metrics}],
+        "diagnostics": _strict_diagnostics(), "score_mapping": mapping,
+        "geojson": _strict_geojson(metrics),
+    }
+    payload = app_api.RouteCompareRequest(
+        start={"lat": 40.03, "lon": -75.22}, end={"lat": 40.065, "lon": -75.19},
+        region="test", include_baseline=False,
+    )
+    public = app_api._project_route_response(
+        result, payload=payload, run_name="test-run", request=_strict_geometry_request(),
+        deadline=RoutingDeadline.after(30),
+    )
+    route = public["routes"]["scenic"]
+    feature = public["geojson"]["features"][0]
+    assert route["geometry"] is feature["geometry"]
+    assert route["snapped_start"] is feature["properties"]["snapped_start"]
+    assert route["score_provenance"] is public["score_mapping"]["provenance"]
+    assert route["score_provenance"] == {"nested": [{"score": 0.8}]}
+    assert route["score_provenance"] is not shared
+    assert shared["source"] == "/private/report.json"
+
+
 def _strict_geometry_request(*, include_baseline: bool = False) -> app_api.RouteRequest:
     return app_api.RouteRequest(
         graph_geojson="test-graph",
@@ -1359,11 +1805,11 @@ def test_route_geometry_rejects_missing_or_wrong_geometry() -> None:
         raw_score=0.8,
         edge_id="scenic-edge",
     )
-    geojson = _strict_geojson(metrics)
-    geojson["features"][0]["geometry"] = {
+    metrics["geometry"] = {
         "type": "Point",
         "coordinates": [-75.22, 40.03],
     }
+    geojson = _strict_geojson(metrics)
 
     with pytest.raises(app_api.HTTPException) as raised:
         app_api._validate_route_geometry(
@@ -1392,13 +1838,9 @@ def test_route_geometry_rejects_duplicate_features_and_identity_mismatch() -> No
         )
 
     mismatched = _strict_geojson(metrics)
-    mismatched["features"][0]["properties"]["segment_identity"] = [
-        {
-            "edge_id": "other-edge",
-            "start": [40.03, -75.22],
-            "end": [40.065, -75.19],
-        }
-    ]
+    mismatched["features"][0]["geometry"] = {
+        "type": "LineString", "coordinates": [[-75.22, 40.03], [-75.18, 40.065]],
+    }
     with pytest.raises(app_api.HTTPException, match="does not match"):
         app_api._validate_route_geometry(
             mismatched,
@@ -1461,7 +1903,7 @@ def test_route_geometry_rejects_requested_metadata_mismatch() -> None:
         edge_id="scenic-edge",
     )
     geojson = _strict_geojson(metrics)
-    geojson["features"][0]["properties"]["requested_start"] = [40.04, -75.22]
+    metrics["requested_start"] = [40.04, -75.22]
 
     with pytest.raises(app_api.HTTPException) as raised:
         app_api._validate_route_geometry(
@@ -1497,7 +1939,7 @@ def test_route_geometry_accepts_zero_edge_with_distinct_requested_points() -> No
         "features": [
             {
                 "type": "Feature",
-                "properties": properties,
+                "properties": {key: properties[key] for key in ("route_kind", "snapped_start", "snapped_end")},
                 "geometry": {
                     "type": "LineString",
                     "coordinates": [[-75.21, 40.04], [-75.21, 40.04]],
@@ -1505,12 +1947,13 @@ def test_route_geometry_accepts_zero_edge_with_distinct_requested_points() -> No
             }
         ],
     }
+    properties["geometry"] = geojson["features"][0]["geometry"]
 
     assert (
         app_api._validate_route_geometry(
             geojson,
             request=request,
-            routes={"scenic": {"segment_identity": []}},
+            routes={"scenic": properties},
         )["scenic"]
         == geojson["features"][0]
     )
@@ -1527,7 +1970,7 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
     def fake_plan(request, **kwargs):
         plan_calls.append(request)
         # The planner's real duration-cap failure reason string (see
-        # src/route_planner/planner.py, matched verbatim by service.py).
+        # src/scenicdriver/route_planner/planner.py, matched verbatim by service.py).
         raise ValueError("No route satisfies the requested duration cap.")
 
     def fake_diagnose(request, **kwargs):
@@ -1542,7 +1985,6 @@ def test_route_compare_rejects_without_relaxing_detour_cap(monkeypatch) -> None:
         json={
             "start": {"lat": 44.4, "lon": -70.2},
             "end": {"lat": 44.5, "lon": -70.1},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.4,
             "avoid_highways": True,
@@ -1589,7 +2031,6 @@ def test_route_compare_omits_reason_for_unrecognized_planner_failure(monkeypatch
         json={
             "start": {"lat": 44.4, "lon": -70.2},
             "end": {"lat": 44.5, "lon": -70.1},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.4,
             "avoid_highways": False,
@@ -1630,7 +2071,6 @@ def test_route_compare_reports_endpoint_coverage_error(monkeypatch) -> None:
         json={
             "start": {"lat": 44.4, "lon": -70.2},
             "end": {"lat": 44.5, "lon": -70.1},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
@@ -1668,7 +2108,6 @@ def test_route_compare_reports_invalid_route_configuration(monkeypatch) -> None:
         json={
             "start": {"lat": 44.4, "lon": -70.2},
             "end": {"lat": 44.5, "lon": -70.1},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.4,
             "avoid_highways": True,
@@ -1710,7 +2149,6 @@ def test_route_compare_rejects_incomplete_service_response(monkeypatch) -> None:
         json={
             "start": {"lat": 40.03, "lon": -75.22},
             "end": {"lat": 40.065, "lon": -75.19},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
@@ -1721,27 +2159,18 @@ def test_route_compare_rejects_incomplete_service_response(monkeypatch) -> None:
     assert response.json()["detail"]["missing_metrics"] == ["score_run"]
 
 
-def test_route_compare_request_fixes_scenic_weight_at_point_eight() -> None:
-    from pydantic import ValidationError
-
+def test_route_compare_request_has_no_unapplied_weight() -> None:
     request = app_api.RouteCompareRequest(
         start={"lat": 40.03, "lon": -75.22},
         end={"lat": 40.065, "lon": -75.19},
     )
-    assert request.scenic_weight == pytest.approx(0.8)
-    with pytest.raises(ValidationError):
-        app_api.RouteCompareRequest(
-            start={"lat": 40.03, "lon": -75.22},
-            end={"lat": 40.065, "lon": -75.19},
-            scenic_weight=0.7,
-        )
+    assert not any("weight" in key for key in request.model_dump())
+    assert not any("weight" in key for key in request.model_json_schema()["properties"])
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("scenic_weight", float("nan")),
-        ("scenic_weight", float("inf")),
         ("max_detour_factor", float("nan")),
         ("max_detour_factor", float("inf")),
     ],
@@ -1813,7 +2242,6 @@ def test_route_compare_rejects_inconsistent_certified_bound(monkeypatch) -> None
         json={
             "start": {"lat": 40.03, "lon": -75.22},
             "end": {"lat": 40.065, "lon": -75.19},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
@@ -1824,7 +2252,7 @@ def test_route_compare_rejects_inconsistent_certified_bound(monkeypatch) -> None
     assert "certified gap" in response.json()["detail"]["message"]
 
 
-def test_route_compare_rejects_per_route_weight_mismatch(monkeypatch) -> None:
+def test_route_compare_rejects_per_route_detour_mismatch(monkeypatch) -> None:
     monkeypatch.setattr(
         app_api, "_region_to_graph", lambda region: Path("/private/graph.json")
     )
@@ -1835,7 +2263,7 @@ def test_route_compare_rejects_per_route_weight_mismatch(monkeypatch) -> None:
         raw_score=0.8,
         edge_id="scenic-edge",
     )
-    scenic_metrics["applied_scenic_weight"] = 0.7
+    scenic_metrics["applied_max_detour_factor"] = 1.7
     monkeypatch.setattr(
         app_api,
         "plan_routes",
@@ -1850,7 +2278,6 @@ def test_route_compare_rejects_per_route_weight_mismatch(monkeypatch) -> None:
         json={
             "start": {"lat": 40.03, "lon": -75.22},
             "end": {"lat": 40.065, "lon": -75.19},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
@@ -1878,9 +2305,6 @@ def test_route_compare_redacts_private_asset_paths(monkeypatch) -> None:
     diagnostics = _strict_diagnostics()
     diagnostics["score_mapping_coverage"] = 0.37
     geojson = _strict_geojson(scenic_metrics)
-    geojson["features"][0]["properties"]["score_provenance"] = {
-        "source": "/private/report.json"
-    }
     monkeypatch.setattr(
         app_api,
         "plan_routes",
@@ -1896,7 +2320,6 @@ def test_route_compare_redacts_private_asset_paths(monkeypatch) -> None:
         json={
             "start": {"lat": 40.03, "lon": -75.22},
             "end": {"lat": 40.065, "lon": -75.19},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
@@ -1911,17 +2334,15 @@ def test_route_compare_redacts_private_asset_paths(monkeypatch) -> None:
         "run_name",
         "start",
         "end",
-        "scenic_weight",
         "avoid_highways",
         "max_detour_factor",
         "include_baseline",
     }
     assert "source" not in payload["score_mapping"]
     assert "source" not in payload["routes"]["scenic"]["score_provenance"]
-    assert (
-        "source"
-        not in payload["geojson"]["features"][0]["properties"]["score_provenance"]
-    )
+    assert set(payload["geojson"]["features"][0]["properties"]) == {
+        "route_kind", "snapped_start", "snapped_end",
+    }
 
 
 def test_invalid_frontier_configuration_fails_startup_even_when_preload_off(
@@ -1981,7 +2402,7 @@ def test_route_preload_lifespan_calls_once_and_skips_missing_optional(
     monkeypatch.setattr(
         app_api.PreloadedRouteSupervisor,
         "start",
-        lambda **_kwargs: type("StubSupervisor", (), {"close": lambda self: None})(),
+        lambda **_kwargs: _InlineTestSupervisor(),
     )
     with TestClient(create_app()) as test_client:
         health = test_client.get("/v1/healthz")
@@ -2142,18 +2563,47 @@ def test_route_supervisor_starts_after_preload_and_closes_on_lifespan_exit(
     assert app.state.route_supervisor is None
 
 
-def test_route_supervisor_not_started_when_preload_is_off(monkeypatch) -> None:
+@pytest.mark.parametrize("mode", ["off", "best_effort"])
+def test_route_supervisor_starts_without_preloaded_assets(tmp_path, monkeypatch, mode) -> None:
+    from scenicdriver.data_pipeline.web_mercator import lat_lon_to_tile
+
+    graph, report = tmp_path / "missing.geojson", tmp_path / "scores.json"
     monkeypatch.setattr(app_api, "validate_route_configuration", lambda: None)
-    monkeypatch.setattr(app_api, "_route_preload_mode", lambda: "off")
-
-    class FailingSupervisor:
-        @classmethod
-        def start(cls, **kwargs):
-            raise AssertionError("supervisor must not start with preload off")
-
-    monkeypatch.setattr(app_api, "PreloadedRouteSupervisor", FailingSupervisor)
-    with TestClient(create_app()):
-        pass
+    monkeypatch.setattr(app_api, "_route_preload_mode", lambda: mode)
+    monkeypatch.setattr(app_api, "_configured_regions", lambda: [{
+        "region": "cold", "graph_path": graph, "run_name": "missing",
+        "tile_scores_path": report, "tile_score_zoom": 13,
+    }])
+    monkeypatch.setattr(app_api, "_default_region_key", lambda: "cold")
+    app = create_app()
+    with TestClient(app) as test_client:
+        assert app.state.route_supervisor is not None
+        assert app.state.route_supervisor.health()["alive"] is True
+        health = test_client.get("/v1/healthz")
+        assert health.status_code == 503
+        assert health.json()["routing"]["assets_ready"] is False
+        assert health.json()["routing"]["execution_mode"] == "hard_stop_supervisor"
+        # Publish assets after the supervisor fork: its first planning child
+        # must load them lazily, without any parent preload cache.
+        graph.write_text(json.dumps({
+            "type": "FeatureCollection", "features": [{
+                "type": "Feature",
+                "properties": {"id": "edge", "road_type": "secondary", "one_way": True},
+                "geometry": {"type": "LineString", "coordinates": [[-72, 42], [-72, 42.01]]},
+            }],
+        }), encoding="utf-8")
+        x, y = lat_lon_to_tile(42.005, -72, 13)
+        report.write_text(json.dumps({"tiles": [
+            {"z": 13, "x": x, "y": y, "scenic_score": 6.5},
+        ]}), encoding="utf-8")
+        _write_graph_readiness(graph)
+        route = test_client.post("/v1/route/compare", json={
+            "start": {"lat": 42, "lon": -72},
+            "end": {"lat": 42.01, "lon": -72}, "region": "cold",
+        })
+        assert route.status_code == 200
+        assert route.json()["routes"]["scenic"]["raw_scenic_score"] == pytest.approx(6.5)
+        assert test_client.get("/v1/healthz").json()["routing"]["ready"] is True
 
 
 def test_route_preload_required_fails_for_missing_default(
@@ -2194,7 +2644,6 @@ def test_route_compare_maps_routing_timeout_to_504(monkeypatch) -> None:
         json={
             "start": {"lat": 44.4, "lon": -70.2},
             "end": {"lat": 44.5, "lon": -70.1},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
@@ -2224,7 +2673,6 @@ def test_route_compare_maps_routing_cancelled_to_non_no_route(monkeypatch) -> No
         json={
             "start": {"lat": 44.4, "lon": -70.2},
             "end": {"lat": 44.5, "lon": -70.1},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
@@ -2266,7 +2714,6 @@ def test_route_compare_passes_one_deadline_to_plan_routes_and_diagnostics(
         json={
             "start": {"lat": 44.4, "lon": -70.2},
             "end": {"lat": 44.5, "lon": -70.1},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
@@ -2304,7 +2751,6 @@ def test_route_compare_fallback_diagnose_maps_routing_timeout_to_504(
         json={
             "start": {"lat": 44.4, "lon": -70.2},
             "end": {"lat": 44.5, "lon": -70.1},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
@@ -2337,7 +2783,6 @@ def test_route_compare_fallback_diagnose_maps_routing_cancelled_to_non_no_route(
         json={
             "start": {"lat": 44.4, "lon": -70.2},
             "end": {"lat": 44.5, "lon": -70.1},
-            "scenic_weight": 0.8,
             "region": "new_england_north",
             "max_detour_factor": 1.8,
             "avoid_highways": False,
@@ -2352,7 +2797,6 @@ def _route_compare_payload() -> dict[str, object]:
     return {
         "start": {"lat": 44.4, "lon": -70.2},
         "end": {"lat": 44.5, "lon": -70.1},
-        "scenic_weight": 0.8,
         "region": "new_england_north",
         "max_detour_factor": 1.8,
         "avoid_highways": False,
@@ -2390,6 +2834,10 @@ def test_route_compare_supervisor_receives_parent_deadline_without_in_process_pl
             },
             {
                 "scenic": {
+                    "route_kind": "scenic",
+                    "geometry": {"type": "LineString", "coordinates": [[-70.2, 44.4], [-70.1, 44.5]]},
+                    "snapped_start": [44.4, -70.2],
+                    "snapped_end": [44.5, -70.1],
                     "total_distance_km": 1.0,
                     "estimated_duration_minutes": 2.0,
                     "normalized_scenic_score": 0.5,
@@ -2480,13 +2928,13 @@ def test_review_counts_seed_annotations_before_averaging(contrib_repo):
 
 
 def test_contrib_region_does_not_fall_back_or_trust_label_region(contrib_repo):
-    response = client.get("/v1/contrib/tasks/next", params={
-        "contributor_id": "regional", "region": "unsupported",
-    })
+    contributor_id, headers = _new_contributor()
+    response = client.get("/v1/contrib/tasks/next", params={"region": "unsupported"},
+                          headers=headers)
     assert response.status_code == 200
     assert response.json()["tasks"] == []
-    payload = _contrib_payload(contrib_repo, "regional", region="forged")
-    response = client.post("/v1/contrib/labels", json=payload)
+    payload = _label_body(_contrib_payload(contrib_repo, contributor_id, region="forged"))
+    response = client.post("/v1/contrib/labels", json=payload, headers=headers)
     assert response.status_code == 200
     assert response.json()["record"]["region"] == "philadelphia"
 
@@ -2495,11 +2943,12 @@ def test_contrib_region_does_not_fall_back_or_trust_label_region(contrib_repo):
     ("/v1/heatmap", {"region": "test", "max_points": 0}),
     ("/v1/heatmap", {"region": "test", "max_tiles": 100001}),
     ("/v1/heatmap", {"region": "test", "tile_offset": -1}),
-    ("/v1/contrib/tasks/next", {"contributor_id": "test", "count": 0}),
+    ("/v1/contrib/tasks/next", {"count": 0}),
     ("/v1/contrib/leaderboard", {"limit": -1}),
 ])
 def test_api_rejects_invalid_batch_sizes(path, params):
-    assert client.get(path, params=params).status_code == 422
+    _, headers = _new_contributor()
+    assert client.get(path, params=params, headers=headers).status_code == 422
 
 
 @pytest.mark.parametrize("artifact", [
@@ -2540,14 +2989,18 @@ def test_search_provider_failures_are_controlled(monkeypatch, failure, status):
 
 
 @pytest.mark.parametrize("field,size", [
-    ("contributor_id", 129), ("task_id", 129), ("image_path", 2049),
-    ("notes", 4097), ("confidence", 33),
+    ("task_id", 129), ("image_path", 2049), ("notes", 4097), ("confidence", 33),
 ])
 def test_contrib_rejects_oversized_text(contrib_repo, field, size):
-    payload = _contrib_payload(contrib_repo)
-    assert client.post("/v1/contrib/labels", json={
+    contributor_id, headers = _new_contributor()
+    payload = _label_body(_contrib_payload(contrib_repo, contributor_id))
+    assert client.post("/v1/contrib/labels", headers=headers, json={
         **payload, field: "x" * size,
     }).status_code == 422
+
+
+def test_contrib_rejects_oversized_display_name():
+    assert client.post("/v1/contrib/profile", json={"display_name": "x" * 129}).status_code == 422
 
 
 def test_api_limits_request_body():
@@ -2585,7 +3038,7 @@ def test_validated_route_run_selection_and_complete_contract(tmp_path, monkeypat
     metrics = {
         **routes, "score_mapping": {}, "request": {
             "start": [40.03, -75.22], "end": [40.065, -75.19],
-            "scenic_weight": 0.8, "max_detour_factor": 1.8,
+            "max_detour_factor": 1.8,
         },
     }
     route_file = report / "route.geojson"
@@ -2632,7 +3085,7 @@ def test_route_asset_errors_are_not_no_route(monkeypatch, error):
 
 def test_http_disconnect_cancels_supervised_route(monkeypatch):
     import asyncio
-    from src.route_planner.supervisor import PreloadedRouteSupervisor
+    from scenicdriver.route_planner.supervisor import PreloadedRouteSupervisor
     _stub_route_compare_assets(monkeypatch)
     def wait_for_cancel(request, *, deadline):
         while True:
@@ -2681,10 +3134,312 @@ def test_contrib_region_comes_from_image_provenance(contrib_repo, path, source_r
     if source_region:
         image["region"] = source_region
     pd.DataFrame([image]).to_csv(contrib_repo.cfg.labels_source_csv, index=False)
-    task = contrib_repo.next_tasks("regional", "philadelphia", 1)[0]
-    response = client.post("/v1/contrib/labels", json={
-        "contributor_id": "regional", "task_id": task["task_id"],
-        "image_path": task["image_path"], "scenic_human": 6, "region": "forged",
+    contributor_id, headers = _new_contributor()
+    task = contrib_repo.next_tasks(contributor_id, "philadelphia", 1)[0]
+    response = client.post("/v1/contrib/labels", headers=headers, json={
+        "task_id": task["task_id"], "image_path": task["image_path"],
+        "scenic_human": 6, "region": "forged",
     })
     assert response.status_code == 200
     assert response.json()["record"]["region"] == expected
+
+
+def test_search_is_rate_limited_per_client_after_burst(monkeypatch):
+    monkeypatch.setenv("SCENIC_SEARCH_BURST", "2")
+    monkeypatch.setenv("SCENIC_SEARCH_RATE_PER_MIN", "1")
+    test_client = TestClient(create_app())
+    # Blank queries never reach the provider but still spend the client's budget.
+    for _ in range(2):
+        response = test_client.get("/v1/search/suggest", params={"q": " ", "session_token": "s"})
+        assert response.status_code == 200
+    for endpoint, params in [
+        ("suggest", {"q": " ", "session_token": "s"}),
+        ("retrieve", {"mapbox_id": "id", "session_token": "s"}),
+    ]:
+        response = test_client.get(f"/v1/search/{endpoint}", params=params)
+        assert response.status_code == 429
+        assert response.json()["detail"]["error"] == "search_rate_limited"
+        assert 1 <= int(response.headers["retry-after"]) <= 60
+
+
+def test_search_rate_limiter_refills_and_tracks_clients_separately(monkeypatch):
+    limiter = app_api._ClientRateLimiter(rate_per_minute=60, burst=1)
+    now = [100.0]
+    monkeypatch.setattr(app_api.time, "monotonic", lambda: now[0])
+    assert limiter.acquire("a") == 0
+    assert limiter.acquire("a") == pytest.approx(1.0)
+    assert limiter.acquire("b") == 0
+    now[0] += 1.0
+    assert limiter.acquire("a") == 0
+
+
+def test_route_compare_rejects_beyond_queue_cap_with_503(monkeypatch):
+    monkeypatch.setenv("SCENIC_ROUTE_MAX_PENDING", "1")
+    _stub_route_compare_assets(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockingSupervisor:
+        def run_job(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(timeout=10)
+            raise RoutingTimeout("deadline exceeded")
+
+    app = create_app()
+    app.state.route_supervisor = BlockingSupervisor()
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        first = workers.submit(TestClient(app).post, "/v1/route/compare",
+                               json=_route_compare_payload())
+        assert entered.wait(timeout=10)
+        rejected = TestClient(app).post("/v1/route/compare", json=_route_compare_payload())
+        release.set()
+        assert first.result(timeout=10).status_code == 504
+    assert rejected.status_code == 503
+    assert rejected.json()["detail"] == {
+        "error": "routing_capacity_exceeded",
+        "message": "The routing service is busy; retry shortly.",
+    }
+    # The finished request released its slot.
+    entered.clear()
+    assert TestClient(app).post("/v1/route/compare", json=_route_compare_payload()).status_code == 504
+
+
+def test_cors_allows_only_configured_origins(monkeypatch):
+    monkeypatch.setenv("SCENIC_ALLOWED_ORIGINS", "https://scenic.example, https://beta.example")
+    test_client = TestClient(create_app())
+    allowed = test_client.get("/", headers={"Origin": "https://beta.example"})
+    assert allowed.headers["access-control-allow-origin"] == "https://beta.example"
+    exposed = {name.strip() for name in allowed.headers["access-control-expose-headers"].split(",")}
+    assert exposed == {"X-Scenic-Tile-Zoom", "X-Scenic-Min-X", "X-Scenic-Min-Y",
+                       "X-Scenic-Grid-Width", "X-Scenic-Grid-Height"}
+    denied = test_client.get("/", headers={"Origin": "https://evil.example"})
+    assert "access-control-allow-origin" not in denied.headers
+    preflight = test_client.options("/v1/contrib/labels", headers={
+        "Origin": "https://evil.example", "Access-Control-Request-Method": "POST",
+    })
+    assert "access-control-allow-origin" not in preflight.headers
+
+
+def test_cors_defaults_to_local_viewer_origins(monkeypatch):
+    monkeypatch.delenv("SCENIC_ALLOWED_ORIGINS", raising=False)
+    test_client = TestClient(create_app())
+    for origin in ("http://localhost:3000", "http://127.0.0.1:3000"):
+        response = test_client.get("/", headers={"Origin": origin})
+        assert response.headers["access-control-allow-origin"] == origin
+    response = test_client.get("/", headers={"Origin": "https://scenic.example"})
+    assert "access-control-allow-origin" not in response.headers
+
+
+@pytest.mark.parametrize("region,run_name", [
+    ("new_england_north", "other-run"),
+    ("new_england_north", "philadelphia_z16_learned_v5"),
+    ("unconfigured_region", "test-run"),
+])
+def test_route_compare_rejects_unreleased_score_runs(monkeypatch, region, run_name):
+    _stub_route_compare_assets(monkeypatch)
+    monkeypatch.setattr(app_api, "plan_routes",
+                        lambda *args, **kwargs: pytest.fail("planning must not start"))
+    response = client.post("/v1/route/compare",
+                           json={**_route_compare_payload(), "region": region, "run_name": run_name})
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "score_run_not_released"
+
+
+def test_route_compare_accepts_the_released_score_run(monkeypatch):
+    _stub_route_compare_assets(monkeypatch)
+    monkeypatch.setattr(app_api, "_app_region",
+                        lambda region: {"region": region, "run_name": "test-run"})
+
+    def timeout(*args, **kwargs):
+        raise RoutingTimeout("deadline exceeded")
+
+    monkeypatch.setattr(app_api, "plan_routes", timeout)
+    response = client.post("/v1/route/compare",
+                           json={**_route_compare_payload(), "run_name": "test-run"})
+    assert response.status_code == 504
+
+
+def test_route_admission_hashes_off_event_loop(tmp_path, monkeypatch):
+    import asyncio
+
+    graph = tmp_path / "graph.json"
+    graph.write_text("graph", encoding="utf-8")
+    _write_graph_readiness(graph)
+    configured = {"region": "test", "graph_path": graph, "run_name": "test-run"}
+    loop_threads, hash_threads = [], []
+    original_hash = app_api.hashlib.file_digest
+
+    def region_config(region):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            loop_threads.append(threading.get_ident())
+        return configured
+
+    def hasher(*args, **kwargs):
+        hash_threads.append(threading.get_ident())
+        with pytest.raises(RuntimeError):
+            asyncio.get_running_loop()
+        return original_hash(*args, **kwargs)
+
+    monkeypatch.setattr(app_api, "_app_region", region_config)
+    monkeypatch.setattr(app_api.hashlib, "file_digest", hasher)
+    monkeypatch.setattr(app_api, "plan_routes", lambda *args, **kwargs: (_ for _ in ()).throw(RoutingTimeout("planned")))
+    response = client.post("/v1/route/compare", json={**_route_compare_payload(), "region": "test"})
+    assert response.status_code == 504
+    assert hash_threads and loop_threads
+    assert set(hash_threads).isdisjoint(loop_threads)
+
+
+def test_route_validation_and_projection_run_off_loop(monkeypatch):
+    import asyncio
+
+    _stub_route_compare_assets(monkeypatch)
+    calls = []
+
+    def validate(result, *, request, deadline):
+        with pytest.raises(RuntimeError):
+            asyncio.get_running_loop()
+        calls.append(("validate", deadline))
+        return {"scenic_score_delta_absolute": 0.0}, {
+            "scenic": {
+                "route_kind": "scenic",
+                "geometry": {"type": "LineString", "coordinates": [[-70.2, 44.4], [-70.1, 44.5]]},
+                "snapped_start": [44.4, -70.2], "snapped_end": [44.5, -70.1],
+            },
+        }
+
+    original_redact = app_api._redact_private_response
+
+    def redact(value):
+        with pytest.raises(RuntimeError):
+            asyncio.get_running_loop()
+        calls.append(("redact", None))
+        return original_redact(value)
+
+    monkeypatch.setattr(app_api, "_validate_route_contract", validate)
+    monkeypatch.setattr(app_api, "_redact_private_response", redact)
+    monkeypatch.setattr(app_api, "plan_routes", lambda *args, **kwargs: {"score_mapping": {}, "geojson": {}})
+    response = client.post("/v1/route/compare", json=_route_compare_payload())
+    assert response.status_code == 200
+    assert calls[0][0] == "validate"
+    assert len(calls) == 2
+    assert calls[1] == ("redact", None)
+
+
+def test_route_deadline_includes_artifact_admission(monkeypatch):
+    _stub_route_compare_assets(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+
+    def resolve(region):
+        entered.set()
+        assert release.wait(timeout=10)
+        return Path("/tmp/unused.json")
+
+    monkeypatch.setattr(app_api, "_region_to_graph", resolve)
+    monkeypatch.setattr(app_api, "_route_deadline_seconds", lambda configured: 0.05)
+    monkeypatch.setattr(app_api, "plan_routes", lambda *args, **kwargs: pytest.fail("expired admission must not plan"))
+    try:
+        response = client.post("/v1/route/compare", json=_route_compare_payload())
+        assert entered.is_set()
+        assert not release.is_set()
+        assert response.status_code == 504
+    finally:
+        release.set()
+
+
+def test_heatmap_png_and_extents_cached_by_full_file_identity(tmp_path, monkeypatch):
+    import os
+
+    report = tmp_path / "report.json"
+    payload = {
+        "tiles": [
+            {"x": 1, "y": 1, "z": 4, "scenic_score": 2.0},
+            {"x": 2, "y": 2, "z": 4, "scenic_score": 4.0},
+        ],
+        "summary": {"min": 0.0, "max": 5.0},
+    }
+    report.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(app_api, "_run_report_path", lambda run: report)
+    calls = []
+    original_new = Image.new
+
+    def new_image(*args, **kwargs):
+        calls.append(args)
+        return original_new(*args, **kwargs)
+
+    monkeypatch.setattr(Image, "new", new_image)
+    params = {"region": "test", "run_name": "cache-test"}
+    first = client.get("/v1/heatmap-image", params=params)
+    second = client.get("/v1/heatmap-image", params=params)
+    assert first.status_code == second.status_code == 200
+    assert first.content == second.content
+    assert first.headers == second.headers
+    assert len(calls) == 1
+
+    class NoFullScan(list):
+        def __iter__(self):
+            raise AssertionError("limited JSON page must reuse cached extents")
+
+    _, _, parsed = app_api._heatmap_artifact("test", "cache-test")
+    parsed["tiles"] = NoFullScan(parsed["tiles"])
+    page = client.get("/v1/heatmap", params={**params, "max_points": 1, "max_tiles": 1, "tile_offset": 0})
+    assert page.status_code == 200
+    assert page.json()["total_tiles"] == 2
+
+    old_stat = report.stat()
+    payload["tiles"][1]["x"] = 3
+    report.write_text(json.dumps(payload), encoding="utf-8")
+    os.utime(report, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+    changed = client.get("/v1/heatmap-image", params=params)
+    assert changed.status_code == 200
+    assert changed.content != first.content
+    assert len(calls) == 2
+    assert Image.open(io.BytesIO(changed.content)).size == (3, 2)
+
+
+def test_health_reports_dead_supervisor_despite_successful_preload(tmp_path, monkeypatch):
+    graph, report = tmp_path / "graph.json", tmp_path / "report.json"
+    graph.write_text("graph", encoding="utf-8")
+    report.write_text("report", encoding="utf-8")
+    _write_graph_readiness(graph)
+    monkeypatch.setattr(app_api, "_configured_regions", lambda: [{
+        "region": "test", "graph_path": graph, "run_name": "run",
+        "tile_scores_path": report,
+    }])
+    monkeypatch.setattr(app_api, "_default_region_key", lambda: "test")
+
+    class Supervisor(_InlineTestSupervisor):
+        alive = True
+
+        def health(self):
+            return {"alive": self.alive, "closed": False}
+
+    supervisor = Supervisor()
+    app = create_app()
+    app.state.route_supervisor = supervisor
+    app.state.route_preload_diagnostics = {"loaded_regions": ["test"], "regions": []}
+    test_client = TestClient(app)
+    ready = test_client.get("/v1/healthz")
+    assert ready.status_code == 200
+    assert ready.json()["routing"]["ready"] is True
+    supervisor.alive = False
+    dead = test_client.get("/v1/healthz")
+    assert dead.status_code == 503
+    assert dead.json()["ok"] is True
+    assert dead.json()["liveness"] == {"ok": True}
+    assert dead.json()["routing"] == {
+        "ready": False, "assets_ready": True, "supervisor_alive": False,
+        "execution_mode": "unavailable", "ready_regions": ["test"],
+    }
+
+
+def test_routing_fails_closed_without_supervisor(monkeypatch):
+    _stub_route_compare_assets(monkeypatch)
+    app = create_app()
+    app.state.route_supervisor = None
+    monkeypatch.setattr(app_api, "plan_routes", lambda *args, **kwargs: pytest.fail("parent must not plan"))
+    response = TestClient(app).post("/v1/route/compare", json=_route_compare_payload())
+    assert response.status_code == 503
+    assert response.json()["detail"]["error"] == "routing_supervisor_unavailable"

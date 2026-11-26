@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 import torch
 
-from src.heuristics import labeler
+from scenicdriver.heuristics import labeler
 
-from src.scenic_scorer import regression
-from src.scenic_scorer.regression import ScenicRegressionModel
+from scenicdriver.scenic_scorer import regression
+from scenicdriver.scenic_scorer.regression import ScenicRegressionModel
 
 
 def _write_marker(path: str) -> None:
@@ -67,6 +67,95 @@ def test_load_learned_regressor_rejects_pickle_code_execution(tmp_path: Path) ->
         )
 
     assert not marker.exists()
+
+
+def test_active_evaluation_load_rejects_pickle_code_execution(tmp_path: Path) -> None:
+    from scenicdriver.scenic_scorer.active_evaluation import _load_model_checkpoint
+
+    checkpoint = tmp_path / "malicious.pt"
+    marker = tmp_path / "executed"
+    _write_checkpoint(checkpoint, payload=_MaliciousPayload(marker))
+
+    with pytest.raises(ValueError, match="Weights only load failed"):
+        _load_model_checkpoint(checkpoint, is_candidate=False)
+
+    assert not marker.exists()
+
+
+def test_active_scoring_regression_load_rejects_pickle_code_execution(
+    tmp_path: Path,
+) -> None:
+    from scenicdriver.active_learning.scoring import _validate_regression_checkpoint
+
+    checkpoint = tmp_path / "malicious.pt"
+    marker = tmp_path / "executed"
+    _write_checkpoint(checkpoint, payload=_MaliciousPayload(marker))
+
+    with pytest.raises(pickle.UnpicklingError, match="Weights only load failed"):
+        _validate_regression_checkpoint(checkpoint, device="cpu")
+
+    assert not marker.exists()
+
+
+def test_atomic_torch_save_interrupted_write_keeps_previous_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "model.pt"
+    regression.atomic_torch_save(path, {"generation": 1})
+    previous = path.read_bytes()
+
+    def interrupted_save(value: object, handle) -> None:
+        handle.write(b"partial checkpoint bytes")
+        raise OSError("disk full mid-write")
+
+    monkeypatch.setattr(regression.torch, "save", interrupted_save)
+    with pytest.raises(OSError, match="disk full mid-write"):
+        regression.atomic_torch_save(path, {"generation": 2})
+
+    assert path.read_bytes() == previous
+    assert torch.load(path, weights_only=True) == {"generation": 1}
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["model.pt"]
+
+
+def test_rng_state_round_trips_through_weights_only_checkpoint(tmp_path: Path) -> None:
+    import random
+
+    random.seed(3)
+    np.random.seed(3)
+    torch.manual_seed(3)
+    np.random.normal()  # populate the cached gaussian
+    path = tmp_path / "rng.pt"
+    regression.atomic_torch_save(path, {"rng_state": regression.capture_rng_state("cpu")})
+    expected = (random.random(), float(np.random.normal()), torch.rand(4))
+
+    random.seed(99)
+    np.random.seed(99)
+    torch.manual_seed(99)
+    state = torch.load(path, weights_only=True)["rng_state"]
+    regression.restore_rng_state(state, "cpu")
+    actual = (random.random(), float(np.random.normal()), torch.rand(4))
+
+    assert actual[:2] == expected[:2]
+    assert torch.equal(actual[2], expected[2])
+
+
+def test_rng_state_captures_and_requires_mps_generator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator_state = torch.arange(8, dtype=torch.uint8)
+    restored: list[torch.Tensor] = []
+    monkeypatch.setattr(regression.torch.mps, "get_rng_state", lambda: generator_state)
+    monkeypatch.setattr(regression.torch.mps, "set_rng_state", restored.append)
+
+    state = regression.capture_rng_state("mps")
+    assert torch.equal(state["mps"], generator_state)
+    assert "mps" not in regression.capture_rng_state("cpu")
+
+    regression.restore_rng_state(state, "mps")
+    assert len(restored) == 1 and torch.equal(restored[0], generator_state)
+
+    with pytest.raises(ValueError, match="lacks the mps generator"):
+        regression.restore_rng_state(regression.capture_rng_state("cpu"), "mps")
 
 
 @pytest.mark.parametrize(
@@ -171,7 +260,7 @@ def test_validation_loss_is_sample_aggregated_across_uneven_batches(
     indices = np.arange(20)
     np.random.shuffle(indices)
     val_idx = indices[17:]
-    checkpoint = torch.load(output_path, weights_only=False)
+    checkpoint = torch.load(output_path, weights_only=True)
     model = ScenicRegressionModel(vit_dim=2, terrain_dim=1, num_classes=3)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()

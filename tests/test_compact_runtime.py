@@ -2,36 +2,37 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import sys
 from pathlib import Path
 from threading import Event
 
 import pytest
 
-from src.data_pipeline.web_mercator import lat_lon_to_tile
-from src.route_planner import service as route_service
-from src.route_planner.cancellation import (
+from scenicdriver.data_pipeline.web_mercator import lat_lon_to_tile
+from scenicdriver.route_planner import service as route_service
+from scenicdriver.route_planner.cancellation import (
     RoutingCancelled,
     RoutingDeadline,
     RoutingTimeout,
 )
-from src.route_planner.graph import (
+from scenicdriver.route_planner.graph import (
     CompactRoadGraph,
     Edge,
     Node,
     RoadGraph,
+    _sha256_file,
     write_compact_graph,
 )
-from src.route_planner.planner import ScenicRoutePlanner
+from scenicdriver.route_planner.planner import ScenicRoutePlanner
 
 # The eager score pass lives in the service module; import it there to avoid
 # depending on private graph-module aliases.
-from src.route_planner.service import (
+from scenicdriver.route_planner.service import (
     RouteRequest,
     _apply_tile_scores_to_graph_native,
     _file_signature,
     _resolved_path_key,
-    _signature_digest,
     load_tile_scores,
 )
 
@@ -210,6 +211,10 @@ def _tile_report(
         json.dumps({"tiles": rows}), encoding="utf-8"
     )
     return report_path, tiles
+
+
+def _report_sha256(path: Path) -> str:
+    return _sha256_file(path).hex()
 
 
 def test_compact_round_trip_preserves_graph_and_metadata(tmp_path: Path) -> None:
@@ -403,16 +408,13 @@ def test_score_sidecar_deterministic_and_matches_eager(tmp_path: Path) -> None:
     _apply_tile_scores_to_graph_native(eager, score_map, zoom=14, fallback=None)
 
     compact = CompactRoadGraph.load(manifest_path)
-    report_signature = _signature_digest(
-        _resolved_path_key(report_path), _file_signature(report_path)
-    )
+    report_sha256 = _report_sha256(report_path)
     matched, total = compact.activate_report_scores(
         score_map,
         zoom=14,
         fallback=None,
-        report_signature=report_signature,
+        report_sha256=report_sha256,
         normalization="linear-v1",
-        tile_scores_path=report_path,
     )
     assert (matched, total) == (4, 4)
     assert compact._route_service_score_mapping == (4, 4, 0)
@@ -423,7 +425,7 @@ def test_score_sidecar_deterministic_and_matches_eager(tmp_path: Path) -> None:
 
     # Deterministic regeneration: identical sidecar bytes for identical inputs.
     json_path, bin_path = compact._score_sidecar_paths(
-        report_signature, 14, None, "linear-v1"
+        report_sha256, 14, None, "linear-v1"
     )
     first_json = json_path.read_bytes()
     first_bin = bin_path.read_bytes()
@@ -434,18 +436,18 @@ def test_score_sidecar_deterministic_and_matches_eager(tmp_path: Path) -> None:
         score_map,
         zoom=14,
         fallback=None,
-        report_signature=report_signature,
+        report_sha256=report_sha256,
         normalization="linear-v1",
-        tile_scores_path=report_path,
     )
     json_path_again, bin_path_again = compact_again._score_sidecar_paths(
-        report_signature, 14, None, "linear-v1"
+        report_sha256, 14, None, "linear-v1"
     )
     assert json_path_again.read_bytes() == first_json
     assert bin_path_again.read_bytes() == first_bin
 
     sidecar_manifest = json.loads(first_json.decode("utf-8"))
-    assert sidecar_manifest["report_signature"] == report_signature
+    assert sidecar_manifest["tile_scores_sha256"] == report_sha256
+    assert "tile_scores_source" not in sidecar_manifest
     assert sidecar_manifest["source"]["sha256"] == record["source_sha256"]
     assert sidecar_manifest["zoom"] == 14
     assert sidecar_manifest["fallback"] is None
@@ -466,16 +468,12 @@ def test_score_sidecar_fallback_provenance(tmp_path: Path) -> None:
     )
     score_map, _zoom = load_tile_scores(report_path)
     compact = CompactRoadGraph.load(manifest_path)
-    report_signature = _signature_digest(
-        _resolved_path_key(report_path), _file_signature(report_path)
-    )
     matched, total = compact.activate_report_scores(
         score_map,
         zoom=14,
         fallback=4.0,
-        report_signature=report_signature,
+        report_sha256=_report_sha256(report_path),
         normalization="linear-v1",
-        tile_scores_path=report_path,
     )
     assert (matched, total) == (2, 4)
     assert compact._route_service_score_mapping == (2, 4, 2)
@@ -485,10 +483,146 @@ def test_score_sidecar_fallback_provenance(tmp_path: Path) -> None:
     assert compact.edges["e3"].scenic_score == pytest.approx(4.0)
 
 
+def _forbid_sidecar_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scenicdriver.route_planner.graph as graph_module
+
+    def forbidden(path: Path, payload: bytes) -> None:
+        raise AssertionError(f"unexpected sidecar write: {path}")
+
+    monkeypatch.setattr(graph_module, "_write_atomic_bytes", forbidden)
+
+
+def test_score_sidecar_name_survives_copy_and_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+
+    graph = _fixture_graph()
+    host_a = tmp_path / "host_a"
+    host_a.mkdir()
+    _sqlite, manifest_a, _record = _publish_compact(host_a, graph)
+    report_a, score_map = _tile_report(host_a, graph, {"e0": 6.5, "e1": 9.0})
+    with CompactRoadGraph.load(manifest_a) as compact:
+        compact.activate_report_scores(
+            score_map, zoom=14, fallback=None,
+            report_sha256=_report_sha256(report_a), normalization="linear-v1",
+        )
+        built_json, built_bin = compact._score_sidecar_paths(
+            _report_sha256(report_a), 14, None, "linear-v1"
+        )
+    assert built_json.is_file() and built_bin.is_file()
+
+    # Deploy to another host: new absolute paths, inodes, mtimes, and a
+    # renamed report.  Identical bytes must resolve the prebuilt sidecar.
+    host_b = tmp_path / "elsewhere" / "host_b"
+    shutil.copytree(host_a, host_b)
+    report_b = host_b / "renamed_report.json"
+    (host_b / report_a.name).rename(report_b)
+    manifest_b = host_b / manifest_a.name
+    _forbid_sidecar_writes(monkeypatch)
+    with CompactRoadGraph.load(manifest_b) as copied:
+        json_b, bin_b = copied._score_sidecar_paths(
+            _report_sha256(report_b), 14, None, "linear-v1"
+        )
+        assert (json_b.name, bin_b.name) == (built_json.name, built_bin.name)
+        matched, total = copied.activate_report_scores(
+            score_map, zoom=14, fallback=None,
+            report_sha256=_report_sha256(report_b), normalization="linear-v1",
+        )
+        assert copied._active_score_sidecar.path == bin_b
+    assert (matched, total) == (2, 4)
+
+
+def test_score_sidecar_name_changes_with_content_and_policy(tmp_path: Path) -> None:
+    graph = _fixture_graph()
+    _sqlite, manifest_path, _record = _publish_compact(tmp_path, graph)
+    report, _scores = _tile_report(tmp_path, graph, {"e0": 6.5})
+    digest = _report_sha256(report)
+    report.write_text(report.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    changed_digest = _report_sha256(report)
+    assert changed_digest != digest
+    with CompactRoadGraph.load(manifest_path) as compact:
+        names = {
+            compact._score_sidecar_paths(*args)[1].name
+            for args in (
+                (digest, 14, None, "linear-v1"),
+                (changed_digest, 14, None, "linear-v1"),
+                (digest, 13, None, "linear-v1"),
+                (digest, 14, 4.0, "linear-v1"),
+                (digest, 14, None, "other-v2"),
+            )
+        }
+        assert len(names) == 5
+        assert compact._score_sidecar_paths(digest, 14, 4, "linear-v1") == (
+            compact._score_sidecar_paths(digest, 14, 4.0, "linear-v1")
+        )
+
+    other_graph = _fixture_graph()
+    other_graph.edges["e0"].scenic_score = 1.25
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    _sqlite, other_manifest, _record = _publish_compact(other_dir, other_graph)
+    with CompactRoadGraph.load(manifest_path) as compact, CompactRoadGraph.load(
+        other_manifest
+    ) as other:
+        assert compact.source_sha256 != other.source_sha256
+        assert (
+            compact._score_sidecar_paths(digest, 14, None, "linear-v1")[1].name
+            != other._score_sidecar_paths(digest, 14, None, "linear-v1")[1].name
+        )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0,
+    reason="needs POSIX permissions enforced for the current user",
+)
+def test_read_only_graph_dir_without_sidecar_fails_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scenicdriver.route_planner.graph import RouteAssetError
+
+    graph = _fixture_graph()
+    graph_dir = tmp_path / "graph"
+    graph_dir.mkdir()
+    _sqlite, manifest_path, _record = _publish_compact(graph_dir, graph)
+    report, _scores = _tile_report(tmp_path, graph, {"e0": 6.5})
+    before = sorted(path.name for path in graph_dir.iterdir())
+    _forbid_sidecar_writes(monkeypatch)
+    graph_dir.chmod(0o555)
+    try:
+        with pytest.raises(RouteAssetError, match="not provisioned"):
+            route_service.preload_route_assets(
+                manifest_path, tile_scores_path=report, tile_score_zoom=14
+            )
+    finally:
+        graph_dir.chmod(0o755)
+    assert sorted(path.name for path in graph_dir.iterdir()) == before
+    assert not route_service._SCORED_GRAPH_CACHE
+    assert not route_service._ACTIVE_GRAPH_VARIANT_KEYS
+
+
+def test_writable_graph_dir_generates_missing_sidecar(tmp_path: Path) -> None:
+    graph = _fixture_graph()
+    _sqlite, manifest_path, _record = _publish_compact(tmp_path, graph)
+    report, _scores = _tile_report(tmp_path, graph, {"e0": 6.5, "e1": 9.0})
+    with CompactRoadGraph.load(manifest_path) as compact:
+        json_path, bin_path = compact._score_sidecar_paths(
+            _report_sha256(report), 14, None, route_service._NORMALIZATION_VERSION
+        )
+    assert not json_path.exists() and not bin_path.exists()
+    preload = route_service.preload_route_assets(
+        manifest_path, tile_scores_path=report, tile_score_zoom=14
+    )
+    assert preload["score_mapping"]["matched_edges"] == 2
+    assert json_path.is_file() and bin_path.is_file()
+    manifest = json.loads(json_path.read_text(encoding="utf-8"))
+    assert manifest["tile_scores_sha256"] == _report_sha256(report)
+
+
 def test_compact_load_avoids_eager_object_materialization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import src.route_planner.graph as graph_module
+    import scenicdriver.route_planner.graph as graph_module
 
     graph = _fixture_graph()
     sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
@@ -555,7 +689,6 @@ def test_compact_scored_plan_routes_avoids_native_clone(
         graph_geojson=str(manifest_path),
         start=(42.0, -72.0),
         end=(42.1, -72.1),
-        scenic_weight=0.8,
         tile_scores_json=str(report_path),
     )
     result = route_service.plan_routes(request)
@@ -607,20 +740,20 @@ def test_compact_scored_plan_routes_avoids_native_clone(
     route_service.clear_route_caches()
 
     cancel_event = Event()
-    real_dumps = route_service.pickle.dumps
+    real_deepcopy = route_service.deepcopy
 
-    def cancel_after_serialize(value: object, *args: object, **kwargs: object) -> bytes:
-        serialized = real_dumps(value, *args, **kwargs)
+    def cancel_after_copy(value: object, *args: object, **kwargs: object) -> object:
+        copied = real_deepcopy(value, *args, **kwargs)
         cancel_event.set()
-        return serialized
+        return copied
 
-    monkeypatch.setattr(route_service.pickle, "dumps", cancel_after_serialize)
+    monkeypatch.setattr(route_service, "deepcopy", cancel_after_copy)
     with pytest.raises(RoutingCancelled):
         route_service.plan_routes(
             request,
             deadline=RoutingDeadline(cancel_event=cancel_event),
         )
-    monkeypatch.setattr(route_service.pickle, "dumps", real_dumps)
+    monkeypatch.setattr(route_service, "deepcopy", real_deepcopy)
     uncached = route_service.plan_routes(request)
     assert uncached["diagnostics"]["route_response_cache_hit"] is False
 
@@ -1069,7 +1202,7 @@ def test_compact_no_scan_no_copy_and_compiled_traversal(
     def fail_scan(*args: object, **kwargs: object) -> None:
         raise AssertionError("Graph-wide trigonometric scan was invoked")
 
-    import src.route_planner.graph as graph_module
+    import scenicdriver.route_planner.graph as graph_module
     monkeypatch.setattr(graph_module, "_haversine_km", fail_scan)
     assert compact.endpoint_geodesic_bound_speed(False) is None
     preload = route_service.preload_route_assets(manifest_path)
@@ -1115,7 +1248,7 @@ def _long_chain_graph(edge_count: int = 2600) -> RoadGraph:
 def test_compact_search_returns_original_seed_indices_after_filtering(
     tmp_path: Path,
 ) -> None:
-    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
 
     graph = _long_chain_graph(4)
     _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
@@ -1456,7 +1589,7 @@ def test_compact_search_duplicate_node_seed_returns_winning_index(
     """Duplicate seeds on the same node must resolve by (cost, rank): the
     actual winning seed index is returned, not the first match of a
     reconstruction rescan."""
-    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
 
     graph = _long_chain_graph(4)
     _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
@@ -1521,7 +1654,7 @@ def test_compact_equal_cost_paths_match_eager_ranked_ordering(
     the Python ranked (cost, rank_key) ordering: the lexicographically
     smaller canonical edge-id sequence wins, deterministically, matching the
     eager reference route."""
-    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
 
     graph = _diamond_graph()
     sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
@@ -1579,7 +1712,7 @@ def test_compact_shared_first_edge_suffix_tie_matches_eager(
     compare every canonical edge id oldest-to-newest - not just the shared
     first edge - to pick e0/e1/e2 exactly like Python tuple ordering and the
     eager reference route."""
-    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
 
     graph = _shared_prefix_merge_graph()
     sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
@@ -1659,7 +1792,7 @@ def test_compact_meeting_candidates_compare_full_forward_then_reverse(
     the shared first forward edge ties them and keeps the first-arriving
     larger ez route; the full forward comparison (ez > ea) must pick the ea
     route exactly like Python tuple ordering and the eager ranked search."""
-    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
 
     graph = _split_meeting_nodes_graph()
     _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
@@ -1737,7 +1870,7 @@ def test_compact_deep_equal_cost_shared_prefix_no_stack_overflow(
     materializes the chains in bounded transient scratch instead, completes,
     and picks the canonical-smaller ``ea`` final edge exactly like Python
     tuple ordering."""
-    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
 
     edge_count = 262144
     graph = _deep_prefix_parallel_end_graph(edge_count)
@@ -1775,8 +1908,8 @@ def test_compact_long_meeting_reconstruction_is_connected_with_eager_parity(
     """The compact bidirectional search must reconstruct one connected
     directed traversal when both meeting sides exceed the former fixed
     1024-position buffers, matching the eager reference route exactly."""
-    import src.route_planner.planner as planner_module
-    from src.route_planner._compact_search import (
+    import scenicdriver.route_planner.planner as planner_module
+    from scenicdriver.route_planner._compact_search import (
         run_compact_bidirectional_search,
     )
 
@@ -1870,7 +2003,7 @@ def test_compact_search_native_deadline_interrupts_long_search(
     The unbounded call keeps returning the exact full chain, so the timeout
     path stays distinct from generic search failure.
     """
-    from src.route_planner._compact_search import (
+    from scenicdriver.route_planner._compact_search import (
         run_compact_bidirectional_search,
     )
 
@@ -1927,8 +2060,8 @@ def test_compact_route_longer_than_legacy_output_cap(
 ) -> None:
     """A route longer than the former fixed 4096-position output cap must be
     returned in full by the compact search, with no Python fallback."""
-    import src.route_planner.planner as planner_module
-    from src.route_planner._compact_search import (
+    import scenicdriver.route_planner.planner as planner_module
+    from scenicdriver.route_planner._compact_search import (
         run_compact_bidirectional_search,
     )
 
@@ -2504,7 +2637,7 @@ def test_compact_eviction_defers_close_until_final_reference_released(
 
 
 def _native_library():
-    from src.route_planner._compact_search import _ensure_compiled_library
+    from scenicdriver.route_planner._compact_search import _ensure_compiled_library
 
     lib = _ensure_compiled_library()
     if lib is None:
@@ -2516,7 +2649,7 @@ def _native_cost_spec(planner) -> object:
     """Replicate the wrapper's CostSpec construction for the fastest
     cost function, so native-level probes exercise the same parameters."""
 
-    from src.route_planner._compact_search import _CostSpec
+    from scenicdriver.route_planner._compact_search import _CostSpec
 
     cost_function = planner._make_fastest_cost_function()
     weights = getattr(cost_function, "weights", None)
@@ -2550,7 +2683,7 @@ def _native_cost_spec(planner) -> object:
 def _scenic_cost_spec() -> object:
     """CostSpec matching ScenicCostFunction(0.8) with default weights."""
 
-    from src.route_planner._compact_search import _CostSpec
+    from scenicdriver.route_planner._compact_search import _CostSpec
 
     return _CostSpec(
         scenic_weight=0.8,
@@ -2614,7 +2747,7 @@ def _native_graph_spec(compact: CompactRoadGraph, arrays) -> object:
 
     import numpy as _np
 
-    from src.route_planner._compact_search import _CompactGraphSpec
+    from scenicdriver.route_planner._compact_search import _CompactGraphSpec
 
     def get_ptr(name: str, ctype) -> object:
         arr = arrays.get(name)
@@ -2889,7 +3022,7 @@ def test_compact_native_search_is_deterministic_across_calls(
     """Repeated native calls on a long chain must return byte-identical
     routes.  The dense per-call state reuses heap pages between calls, so
     this probes the explicit seen-state sentinel against stale bytes."""
-    from src.route_planner._compact_search import (
+    from scenicdriver.route_planner._compact_search import (
         run_compact_bidirectional_search,
     )
 
@@ -3081,7 +3214,7 @@ def test_compact_sidecar_native_uses_edge_rank_indexed_scores(
 
     import numpy as np
 
-    from src.route_planner._compact_search import (
+    from scenicdriver.route_planner._compact_search import (
         run_compact_bidirectional_search,
     )
 
@@ -3099,16 +3232,12 @@ def test_compact_sidecar_native_uses_edge_rank_indexed_scores(
     eager = RoadGraph.load(sqlite_path)
     _apply_tile_scores_to_graph_native(eager, score_map, zoom=14, fallback=None)
     compact = CompactRoadGraph.load(manifest_path)
-    report_signature = _signature_digest(
-        _resolved_path_key(report_path), _file_signature(report_path)
-    )
     matched, total = compact.activate_report_scores(
         score_map,
         zoom=14,
         fallback=None,
-        report_signature=report_signature,
+        report_sha256=_report_sha256(report_path),
         normalization="linear-v1",
-        tile_scores_path=report_path,
     )
     assert (matched, total) == (4, 4)
     sidecar = compact._active_score_sidecar
@@ -3123,7 +3252,7 @@ def test_compact_sidecar_native_uses_edge_rank_indexed_scores(
 
     eager_planner = ScenicRoutePlanner(graph=eager)
     compact_planner = ScenicRoutePlanner(graph=compact)
-    from src.route_planner.cost import ScenicCostFunction
+    from scenicdriver.route_planner.cost import ScenicCostFunction
     cost_function = ScenicCostFunction(scenic_weight=0.8)
     fwd = [("n0", 0.0, (), None)]
     rev = [("n1", 0.0, (), None)]
@@ -3470,7 +3599,7 @@ def test_compact_lagrangian_two_worker_overlap(
 ) -> None:
     import time
     import threading
-    import src.route_planner.planner as planner_module
+    import scenicdriver.route_planner.planner as planner_module
 
     graph = _fixture_graph()
     _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
@@ -3524,7 +3653,7 @@ def test_compact_lagrangian_two_worker_overlap(
 def test_compact_lagrangian_result_ordering_and_identical_evaluation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import src.route_planner.planner as planner_module
+    import scenicdriver.route_planner.planner as planner_module
 
     graph = _fixture_graph()
     _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
@@ -3569,7 +3698,7 @@ def test_compact_lagrangian_exception_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import time
-    import src.route_planner.planner as planner_module
+    import scenicdriver.route_planner.planner as planner_module
 
     graph = _fixture_graph()
     _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
@@ -3616,7 +3745,7 @@ def test_compact_lagrangian_sequential_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import threading
-    import src.route_planner.planner as planner_module
+    import scenicdriver.route_planner.planner as planner_module
 
     graph = _fixture_graph()
     _sqlite_path, manifest_path, _record = _publish_compact(tmp_path, graph)
@@ -3661,9 +3790,9 @@ def test_compact_cost_weight_limit_parity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     weight: float, multiplier: float, limit: float | None,
 ) -> None:
-    from src.route_planner import planner as planner_module
-    from src.route_planner._compact_search import run_compact_bidirectional_search
-    from src.route_planner.cost import CostWeights, ScenicCostFunction
+    from scenicdriver.route_planner import planner as planner_module
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner.cost import CostWeights, ScenicCostFunction
 
     assert _native_library() is not None
     graph = _rank_permutation_graph()
@@ -3701,9 +3830,9 @@ def test_compact_cost_weight_limit_parity(
 def test_compact_lagrangian_seed_and_internal_costs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.route_planner import planner as planner_module
-    from src.route_planner._compact_search import run_compact_bidirectional_search
-    from src.route_planner.cost import ScenicCostFunction
+    from scenicdriver.route_planner import planner as planner_module
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner.cost import ScenicCostFunction
 
     assert _native_library() is not None
     graph = _rank_permutation_graph()
@@ -3735,9 +3864,9 @@ def test_compact_lagrangian_seed_and_internal_costs(
 def test_compact_highway_overflow_remains_expensive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.route_planner import planner as planner_module
-    from src.route_planner._compact_search import run_compact_bidirectional_search
-    from src.route_planner.cost import ScenicCostFunction
+    from scenicdriver.route_planner import planner as planner_module
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner.cost import ScenicCostFunction
 
     assert _native_library() is not None
     graph = RoadGraph()
@@ -3770,8 +3899,8 @@ def test_compact_highway_overflow_remains_expensive(
 def test_compact_negative_cost_limit_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native: bool,
 ) -> None:
-    from src.route_planner import planner as planner_module
-    from src.route_planner.cost import ScenicCostFunction
+    from scenicdriver.route_planner import planner as planner_module
+    from scenicdriver.route_planner.cost import ScenicCostFunction
 
     assert _native_library() is not None
     _, manifest, _ = _publish_compact(tmp_path, _rank_permutation_graph())
@@ -3801,8 +3930,8 @@ def test_compact_single_edge_scalar_csr_native_parity(
     normalized: tuple[float, float, float],
 ) -> None:
     from decimal import Decimal
-    from src.route_planner._compact_search import run_compact_bidirectional_search
-    from src.route_planner.cost import CostWeights, ScenicCostFunction
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner.cost import CostWeights, ScenicCostFunction
 
     assert _native_library() is not None
     graph = RoadGraph()
@@ -3841,8 +3970,8 @@ def test_compact_single_edge_scalar_csr_native_parity(
 def test_compact_fastest_zero_duration_accepts_zero_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, multiplier: float,
 ) -> None:
-    from src.route_planner import planner as planner_module
-    from src.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner import planner as planner_module
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
 
     assert _native_library() is not None
     graph = RoadGraph()
@@ -3871,9 +4000,9 @@ def test_compact_fastest_zero_duration_accepts_zero_limit(
 def test_compact_rejects_cost_accumulation_overflow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native: bool, overflow: str,
 ) -> None:
-    from src.route_planner import planner as planner_module
-    from src.route_planner._compact_search import run_compact_bidirectional_search
-    from src.route_planner.cost import CostWeights, ScenicCostFunction
+    from scenicdriver.route_planner import planner as planner_module
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner.cost import CostWeights, ScenicCostFunction
 
     assert _native_library() is not None
     graph = _rank_permutation_graph()
@@ -3898,7 +4027,7 @@ def test_compact_rejects_cost_accumulation_overflow(
 
 
 def test_highway_objective_ratio_prevents_intermediate_overflow() -> None:
-    from src.route_planner.cost import evaluate_path
+    from scenicdriver.route_planner.cost import evaluate_path
 
     edge = Edge("h", "s", "t", 10.0, 0.0, road_type="trunk", speed_limit_kmh=60)
     evaluation = evaluate_path(
@@ -3991,7 +4120,7 @@ def test_compact_rejects_section_contract_mismatch(tmp_path: Path, mutation: str
 def test_compact_conversion_rejects_source_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import src.route_planner.graph as graph_module
+    import scenicdriver.route_planner.graph as graph_module
 
     source = tmp_path / "source.sqlite3"
     _fixture_graph().save(source)
@@ -4027,8 +4156,7 @@ def test_compact_rejects_nonfinite_report_scores(
             compact.activate_report_scores(
                 {} if fallback else scores, zoom=14,
                 fallback=value if fallback else None,
-                report_signature="nonfinite", normalization="test",
-                tile_scores_path=report,
+                report_sha256=_report_sha256(report), normalization="test",
             )
 
 
@@ -4049,7 +4177,7 @@ def test_native_rejects_null_output_pointer_without_crashing(missing: int) -> No
 
     script = """
 import ctypes as c
-from src.route_planner._compact_search import _ensure_compiled_library
+from scenicdriver.route_planner._compact_search import _ensure_compiled_library
 lib = _ensure_compiled_library()
 assert lib is not None
 positions = c.POINTER(c.c_int64)()
@@ -4076,43 +4204,274 @@ def test_compact_rejects_invalid_utf8_ids(tmp_path: Path) -> None:
         CompactRoadGraph.load(path, verify=False)
 
 
-def test_compact_rejects_nonfinite_cached_score_payload(tmp_path: Path) -> None:
+def _isolated_edge_graph() -> RoadGraph:
+    """Fixture graph plus one edge no n0->n3 search can ever relax."""
+    graph = _fixture_graph()
+    graph.add_node(Node("n8", 43.0, -73.0))
+    graph.add_node(Node("n9", 43.01, -73.0))
+    graph.add_edge(
+        Edge("e9", "n8", "n9", distance_km=1.0, scenic_score=5.0,
+             road_type="secondary", speed_limit_kmh=50, one_way=True)
+    )
+    return graph
+
+
+def _write_score(path: Path, rank: int, value: float) -> None:
     import struct
+
+    with path.open("r+b") as stream:
+        stream.seek(rank * 8)
+        stream.write(struct.pack("<d", value))
+
+
+def test_compact_rejects_nonfinite_cached_score_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scenicdriver.route_planner.graph as graph_module
 
     graph = _fixture_graph()
     _, manifest, _ = _publish_compact(tmp_path, graph)
     report, scores = _tile_report(tmp_path, graph, {"e0": 8.0})
-    kwargs = dict(zoom=14, fallback=None, report_signature="cached",
-                  normalization="test", tile_scores_path=report)
+    kwargs = dict(zoom=14, fallback=None, report_sha256=_report_sha256(report),
+                  normalization="test")
     with CompactRoadGraph.load(manifest) as compact:
         compact.activate_report_scores(scores, **kwargs)
         score_path = compact._active_score_sidecar.path
-    with score_path.open("r+b") as stream:
-        stream.write(struct.pack("<d", float("inf")))
+    _write_score(score_path, 0, float("inf"))
+    # Re-admitting a payload whose identity changed since this process
+    # admitted it re-verifies the digest even with verify=False.
+    with CompactRoadGraph.load(manifest) as compact:
+        with pytest.raises(ValueError, match="SHA-256 mismatch"):
+            compact.activate_report_scores(scores, verify=False, **kwargs)
+    # A process that never admitted it still rejects it at the admission scan.
+    monkeypatch.setattr(graph_module, "_ADMITTED_SCORE_SIDECAR_IDENTITIES", {})
     with CompactRoadGraph.load(manifest) as compact:
         with pytest.raises(ValueError, match="finite"):
             compact.activate_report_scores(scores, verify=False, **kwargs)
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), 1.0])
 def test_native_rejects_score_payload_changed_after_activation(tmp_path: Path, value: float) -> None:
-    import struct
-    from src.route_planner._compact_search import run_compact_bidirectional_search
-    from src.route_planner.cost import ScenicCostFunction
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner.cost import ScenicCostFunction
+    from scenicdriver.route_planner.graph import RouteAssetChangedError
 
     graph = _fixture_graph()
     _, manifest, _ = _publish_compact(tmp_path, graph)
     report, scores = _tile_report(tmp_path, graph, {"e0": 8.0})
     with CompactRoadGraph.load(manifest) as compact:
         compact.activate_report_scores(
-            scores, zoom=14, fallback=None, report_signature="live",
-            normalization="test", tile_scores_path=report,
+            scores, zoom=14, fallback=None, report_sha256=_report_sha256(report),
+            normalization="test",
         )
-        with compact._active_score_sidecar.path.open("r+b") as stream:
-            stream.write(struct.pack("<d", value))
         planner = ScenicRoutePlanner(graph=compact)
+        topology = planner._csr_topology()
+        seeds = ([("n0", 0.0, (), None)], [("n3", 0.0, (), None)])
+        assert run_compact_bidirectional_search(
+            topology, ScenicCostFunction(0.8), *seeds
+        ) is not None
+        # Any in-place write (finite or not) breaks the admitted identity;
+        # the O(1) fstat guard rejects the handle before the native call.
+        _write_score(compact._active_score_sidecar.path, 0, value)
+        with pytest.raises(RouteAssetChangedError, match="changed after admission"):
+            run_compact_bidirectional_search(
+                topology, ScenicCostFunction(0.8), *seeds
+            )
+
+
+def test_native_trusts_admitted_sidecar_without_rescanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admission scans the payload once; the native entry never rescans it.
+
+    The admission guard is bypassed to simulate an undetected post-admission
+    write: a corrupt score on an edge the search never relaxes is not seen
+    (no O(E) rescan), while a corrupt score the search consumes still fails
+    closed through the O(1) per-edge guard.
+    """
+    import scenicdriver.route_planner.graph as graph_module
+    from scenicdriver.route_planner._compact_search import run_compact_bidirectional_search
+    from scenicdriver.route_planner.cost import ScenicCostFunction
+
+    admissions = 0
+    original_admit = graph_module._admit_score_values
+
+    def counting_admit(values: object) -> None:
+        nonlocal admissions
+        admissions += 1
+        original_admit(values)
+
+    monkeypatch.setattr(graph_module, "_admit_score_values", counting_admit)
+    graph = _isolated_edge_graph()
+    _, manifest, _ = _publish_compact(tmp_path, graph)
+    report, scores = _tile_report(tmp_path, graph, {"e0": 8.0})
+    with CompactRoadGraph.load(manifest) as compact:
+        compact.activate_report_scores(
+            scores, zoom=14, fallback=None, report_sha256=_report_sha256(report),
+            normalization="test",
+        )
+        planner = ScenicRoutePlanner(graph=compact)
+        topology = planner._csr_topology()
+        seeds = ([("n0", 0.0, (), None)], [("n3", 0.0, (), None)])
+        baseline = run_compact_bidirectional_search(
+            topology, ScenicCostFunction(0.8), *seeds
+        )
+        assert baseline is not None
+        for _ in range(5):
+            assert run_compact_bidirectional_search(
+                topology, ScenicCostFunction(0.8), *seeds
+            ) == baseline
+        for _ in range(2):
+            planner.find_scenic_route((42.0, -72.0), (42.1, -72.1), scenic_weight=0.8)
+        assert admissions == 1
+
+        monkeypatch.setattr(graph_module._ScoreSidecar, "is_admitted", lambda self: True)
+        score_path = compact._active_score_sidecar.path
+        _write_score(score_path, compact._rank_for_id("e9", "edge"), float("nan"))
+        assert run_compact_bidirectional_search(
+            topology, ScenicCostFunction(0.8), *seeds
+        ) == baseline
+        _write_score(score_path, compact._rank_for_id("e0", "edge"), float("nan"))
         with pytest.raises(ValueError, match="non-finite scenic scores"):
             run_compact_bidirectional_search(
-                planner._csr_topology(), ScenicCostFunction(0.8),
-                [("n0", 0.0, (), None)], [("n3", 0.0, (), None)],
+                topology, ScenicCostFunction(0.8), *seeds
             )
+        assert admissions == 1
+
+
+def test_service_readmits_scored_variant_after_sidecar_mutation(
+    tmp_path: Path,
+) -> None:
+    """A cached compact variant is trusted until its sidecar identity changes.
+
+    The next request then evicts the variant at the scored-cache boundary and
+    re-admission re-verifies the sidecar digest, rejecting the mutated file.
+    """
+    graph = _fixture_graph()
+    _, manifest_path, _ = _publish_compact(tmp_path, graph)
+    report_path, _tiles = _tile_report(
+        tmp_path, graph, {"e0": 6.5, "e1": 9.0, "e2": 2.0, "e3": 7.5}
+    )
+    request = RouteRequest(
+        graph_geojson=str(manifest_path),
+        start=(42.0, -72.0),
+        end=(42.1, -72.1),
+        tile_scores_json=str(report_path),
+    )
+    route_service.plan_routes(request)
+    route_service.clear_route_response_cache()
+    assert route_service.plan_routes(request)["diagnostics"]["scored_graph_cache_hit"] is True
+    (variant,) = route_service._SCORED_GRAPH_CACHE.values()
+    _write_score(variant._active_score_sidecar.path, 0, 1.0)
+    route_service.clear_route_response_cache()
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        route_service.plan_routes(request)
+    assert not route_service._SCORED_GRAPH_CACHE
+
+
+def test_scored_graph_hits_do_not_rescan_admitted_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _fixture_graph()
+    _, manifest_path, _ = _publish_compact(tmp_path, graph)
+    report_path, _tiles = _tile_report(
+        tmp_path, graph, {"e0": 6.5, "e1": 9.0, "e2": 2.0, "e3": 7.5}
+    )
+    scanned: list[int] = []
+    original = route_service._validate_report_scores
+
+    def counting_validate(score_map, fallback, deadline=None):
+        scanned.append(len(score_map))
+        original(score_map, fallback, deadline)
+
+    monkeypatch.setattr(route_service, "_validate_report_scores", counting_validate)
+    request = RouteRequest(
+        graph_geojson=str(manifest_path),
+        start=(42.0, -72.0),
+        end=(42.1, -72.1),
+        tile_scores_json=str(report_path),
+    )
+    route_service.plan_routes(request)
+    for _ in range(3):
+        route_service.clear_route_response_cache()
+        result = route_service.plan_routes(request)
+        assert result["diagnostics"]["scored_graph_cache_hit"] is True
+    # Admitted request maps are never rescanned by the service: only the
+    # O(1) fallback check runs (with an empty map) on every request.
+    assert scanned and all(size == 0 for size in scanned)
+
+
+def test_nonnative_lagrangian_reuses_one_weight_arena(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    graph = _fixture_graph()
+    sqlite_path, _manifest, _ = _publish_compact(tmp_path, graph)
+    reference = RoadGraph.load(sqlite_path)
+    monkeypatch.setattr(ScenicRoutePlanner, "_ENDPOINT_OVERLAY_MAX_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_LARGE_GRAPH_EDGE_THRESHOLD", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_COMPILED_SCENIC_MIN_NODES", 2)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_NODES", 0)
+    monkeypatch.setattr(ScenicRoutePlanner, "_EXACT_ORACLE_MAX_EDGES", 0)
+    planner = ScenicRoutePlanner(graph=reference)
+    seen: list[tuple[int, np.ndarray, object]] = []
+    built: list[object] = []
+    original = ScenicRoutePlanner._large_graph_multi_access_path
+    original_data = ScenicRoutePlanner._csr_data
+
+    def data_spy(self, *args, **kwargs):
+        data = original_data(self, *args, **kwargs)
+        built.append(data)
+        return data
+
+    def spy(self, *args, **kwargs):
+        weights = kwargs.get("weights")
+        if weights is not None:
+            seen.append((id(weights), np.array(weights, copy=True), built[-1]))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ScenicRoutePlanner, "_csr_data", data_spy)
+    monkeypatch.setattr(ScenicRoutePlanner, "_large_graph_multi_access_path", spy)
+    route = planner.find_scenic_route(
+        (42.0, -72.0), (42.1, -72.1), q=0.5, kappa=4.0, avoid_highways=True
+    )
+    assert route.algorithm == "compiled-lagrangian-endpoint-search"
+    assert route.edge_ids == ("e0", "e1", "e2")
+    # Fixed frontier first; up to two request-scaled probes may follow.
+    assert 4 <= len(seen) <= 6
+    # One arena reused by every multiplier instead of per-multiplier arrays.
+    assert len({arena_id for arena_id, _, _ in seen}) == 1
+
+    def _expected(multiplier: float, data) -> np.ndarray:
+        base = data.weights
+        with np.errstate(over="ignore", invalid="ignore"):
+            return np.where(
+                np.isfinite(base),
+                np.maximum(
+                    base + multiplier * data.topology.travel_time_minutes, 0.0
+                ),
+                np.inf,
+            )
+
+    # Each fixed refill matches the eager per-multiplier formula exactly.
+    for (_, snapshot, data), multiplier in zip(seen, (0.0, 0.25, 0.75, 1.5)):
+        assert np.array_equal(snapshot, _expected(multiplier, data))
+    # Adaptive probes: derive the multiplier from one sample index exactly,
+    # then match the eager formula across the arena to float tolerance (the
+    # derived multiplier itself is inexact, so bitwise equality is wrong here).
+    adaptive: list[float] = []
+    for _, snapshot, data in seen[4:]:
+        base = data.weights
+        travel = data.topology.travel_time_minutes
+        finite = np.isfinite(base) & (travel > 0)
+        assert finite.any()
+        index = int(np.flatnonzero(finite)[0])
+        derived = float((snapshot[index] - base[index]) / travel[index])
+        assert np.isfinite(derived) and derived > 0
+        adaptive.append(round(derived, 9))
+        expected = _expected(derived, data)
+        assert np.isfinite(snapshot[index]) and snapshot[index] == expected[index]
+        assert np.allclose(snapshot, expected, rtol=1e-9, atol=1e-9)
+    assert len(set(adaptive)) == len(adaptive)
+    assert np.isinf(seen[0][1]).any()

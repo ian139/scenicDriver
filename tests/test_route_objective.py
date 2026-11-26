@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.route_planner.cost import (
+from scenicdriver.route_planner.cost import (
     PathEvaluation,
     clamp_scenic_score,
     combined_utility,
@@ -13,7 +13,7 @@ from src.route_planner.cost import (
     evaluate_path,
     normalize_scenic_score,
 )
-from src.route_planner.graph import Edge
+from scenicdriver.route_planner.graph import Edge
 
 
 def edge(edge_id: str, distance: float, score: float, speed: float = 60.0, road_type: str = "secondary") -> Edge:

@@ -3,14 +3,9 @@ const DEFAULTS = Object.freeze({
   sourceRegion: "new_england_north",
   workingRun: "prompt_two_candidate_exp02_fresh_test20_20260810",
   apiBase: `${window.location.origin}/api`,
-  zoom: 6.2,
-  scenicWeight: 0.8,
+  zoom: 1,
 });
 
-const REGION_BOUNDS = Object.freeze([
-  Object.freeze([-73.5205078125, 42.488301979602255]),
-  Object.freeze([-66.796875, 47.50235895196859]),
-]);
 // Navigation stays unconstrained to the learned rectangle. This soft fit is
 // only a visual reference: a small lower buffer lets users pull back farther
 // before the map gently settles to the region overview.
@@ -68,6 +63,7 @@ const el = {
   submitRoute: document.getElementById("submitRoute"),
   routeTitle: document.getElementById("routeTitle"),
   routeOutput: document.getElementById("routeOutput"),
+  routeStatus: document.getElementById("routeStatus"),
   trainingResults: document.getElementById("trainingResults"),
   clearRoute: document.getElementById("clearRoute"),
   clearStartBtn: document.getElementById("clearStartBtn"),
@@ -93,8 +89,6 @@ const el = {
   baselineNormalizedScore: document.getElementById("baselineNormalizedScore"),
   scenicScoreUpliftAbsolute: document.getElementById("scenicScoreUpliftAbsolute"),
   scenicScoreUpliftRelative: document.getElementById("scenicScoreUpliftRelative"),
-  requestedScenicWeight: document.getElementById("requestedScenicWeight"),
-  appliedScenicWeight: document.getElementById("appliedScenicWeight"),
   requestedDetourCap: document.getElementById("requestedDetourCap"),
   appliedDetourCap: document.getElementById("appliedDetourCap"),
   actualDurationRatio: document.getElementById("actualDurationRatio"),
@@ -124,15 +118,41 @@ let verboseRouteResults = false;
 let latestRoutePayload = null;
 let displayedRouteRequest = null;
 let mapReady = false;
+let sharedRequestPending = false;
 
 let map;
 let latestHeatmap = null;
 const selectedRoutePoints = { start: null, end: null };
 let selectedRegionMetadata = null;
-let activeRegionBounds = REGION_BOUNDS;
+let activeRegionBounds = null;
 
 function api(path) {
   return `${apiBase.replace(/\/+$/, "")}${path}`;
+}
+
+const FETCH_DEADLINE_MS = 15000;
+
+async function fetchWithDeadline(url, options = {}, consume = (response) => response.json()) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  options.signal?.addEventListener("abort", abort, { once: true });
+  if (options.signal?.aborted) abort();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, FETCH_DEADLINE_MS);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    const body = await consume(response);
+    return { response, body };
+  } catch (error) {
+    if (timedOut) throw new Error("Request timed out after 15 seconds. Please try again.");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    options.signal?.removeEventListener("abort", abort);
+  }
 }
 
 function resolveRegionSelection(payload, requestedRegion, requestedRun) {
@@ -164,18 +184,22 @@ function boundsFromRegion(region) {
   if (
     !bbox ||
     !["min_lon", "min_lat", "max_lon", "max_lat"].every((key) =>
-      Number.isFinite(Number(bbox[key]))
-    )
+      typeof bbox[key] === "number" && Number.isFinite(bbox[key])
+    ) ||
+    bbox.min_lon < -180 || bbox.max_lon > 180 ||
+    bbox.min_lat < -90 || bbox.max_lat > 90 ||
+    bbox.min_lon >= bbox.max_lon || bbox.min_lat >= bbox.max_lat
   ) {
-    return REGION_BOUNDS;
+    throw new Error("API returned invalid region bounds");
   }
   return [
-    [Number(bbox.min_lon), Number(bbox.min_lat)],
-    [Number(bbox.max_lon), Number(bbox.max_lat)],
+    [bbox.min_lon, bbox.min_lat],
+    [bbox.max_lon, bbox.max_lat],
   ];
 }
 
 function regionCamera(region) {
+  if (!activeRegionBounds) return null;
   const center = region?.map?.center;
   const lon = Number(center?.lon);
   const lat = Number(center?.lat);
@@ -235,15 +259,16 @@ function validHeatmapMetadata(payload) {
 }
 
 async function loadSupportedRegions() {
-  const response = await fetch(api("/v1/regions"));
+  const { response, body } = await fetchWithDeadline(api("/v1/regions"));
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   const selection = resolveRegionSelection(
-    await response.json(),
+    body,
     CONFIG.sourceRegion,
     params.get("run")
   );
+  const bounds = boundsFromRegion(selection.region);
   selectedRegionMetadata = selection.region;
-  activeRegionBounds = boundsFromRegion(selection.region);
+  activeRegionBounds = bounds;
   CONFIG = {
     ...CONFIG,
     displayRange: selection.region.display_name || selection.region.region,
@@ -273,7 +298,15 @@ function routePlanningIntentionallyDisabled(region = selectedRegionMetadata) {
 
 
 function routePlanningAvailable(region = selectedRegionMetadata) {
-  return !routePlanningIntentionallyDisabled(region) && region?.graph_exists !== false;
+  return Boolean(region) && !routePlanningIntentionallyDisabled(region) && region.graph_exists === true;
+}
+
+function updateRouteControls() {
+  const available = mapReady && Boolean(CONFIG.workingRun) && routePlanningAvailable();
+  for (const control of [el.startInput, el.endInput, el.detourFactor, el.avoidHighways]) {
+    if (control) control.disabled = !available;
+  }
+  if (el.submitRoute) el.submitRoute.disabled = !available || Boolean(activeRouteRequest);
 }
 
 function setText(node, text) {
@@ -290,6 +323,19 @@ function setApiStatus(text, kind = "") {
 function setRouteOutput(title, html) {
   setText(el.routeTitle, title);
   if (el.routeOutput) el.routeOutput.innerHTML = html;
+}
+
+function setPublicRouteStatus(message, invalidEndpoints = []) {
+  setText(el.routeStatus, message);
+  for (const endpoint of ["start", "end"]) {
+    el[`${endpoint}Input`]?.setAttribute("aria-invalid", String(invalidEndpoints.includes(endpoint)));
+  }
+}
+
+function setShareState(available, label = "Share unavailable") {
+  if (!el.shareRouteBtn) return;
+  el.shareRouteBtn.disabled = !available;
+  el.shareRouteBtn.textContent = available ? "Share" : label;
 }
 
 function escapeHtml(value) {
@@ -352,9 +398,9 @@ function renderTrainingResults(payload) {
 
 async function loadTrainingResults() {
   try {
-    const response = await fetch(api("/v1/training-results"));
+    const { response, body } = await fetchWithDeadline(api("/v1/training-results"));
     if (!response.ok) throw new Error(String(response.status));
-    renderTrainingResults(await response.json());
+    renderTrainingResults(body);
   } catch {
     el.trainingResults.className = "route-output route-error";
     el.trainingResults.textContent = "Remote training results are unavailable.";
@@ -455,6 +501,12 @@ function fitToGeojson(geojson, options = {}) {
 
 
 function syncZoomElasticity() {
+  if (!map) return;
+  if (!activeRegionBounds) {
+    softMinimumZoom = null;
+    map.setMinZoom(0);
+    return;
+  }
   const camera = map.cameraForBounds(activeRegionBounds, {
     padding: MAP_NAVIGATION.softFitPaddingPx,
   });
@@ -495,7 +547,7 @@ function handleZoomEnd(event) {
   // A gesture that interrupted a bounce owns this zoomend; re-check it
   // rather than leaving the map below the soft region overview.
   zoomBounceActive = false;
-  if (!Number.isFinite(softMinimumZoom) || map.getZoom() >= softMinimumZoom) return;
+  if (!activeRegionBounds || !Number.isFinite(softMinimumZoom) || map.getZoom() >= softMinimumZoom) return;
   zoomBounceActive = true;
   if (prefersReducedMotion()) {
     // jumpTo is immediate and keeps the correction from overriding the user's
@@ -518,66 +570,68 @@ async function loadHeatmap() {
   if (!CONFIG.workingRun) {
     throw new Error(`No scenic run is configured for ${CONFIG.displayRange}`);
   }
-  const url = new URL(api("/v1/heatmap"));
-  url.searchParams.set("region", CONFIG.sourceRegion);
-  url.searchParams.set("run_name", CONFIG.workingRun);
-  url.searchParams.set("max_points", "1");
-  url.searchParams.set("max_tiles", "1");
-
-  try {
-    const response = await fetch(url);
+  const urlFor = (path) => {
+    const url = new URL(api(path));
+    url.searchParams.set("region", CONFIG.sourceRegion);
+    url.searchParams.set("run_name", CONFIG.workingRun);
+    return url;
+  };
+  const metadataUrl = urlFor("/v1/heatmap");
+  metadataUrl.searchParams.set("max_points", "1");
+  metadataUrl.searchParams.set("max_tiles", "1");
+  const requireOk = (response) => {
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  };
+  const metadataTask = fetchWithDeadline(metadataUrl, {}, async (response) => {
+    requireOk(response);
     const payload = await response.json();
-    const bounds = payload.bounds;
-    if (!validHeatmapMetadata(payload)) {
-      throw new Error("API returned invalid learned heatmap metadata");
-    }
-    const imageUrl = new URL(api("/v1/heatmap-image"));
-    imageUrl.searchParams.set("region", CONFIG.sourceRegion);
-    imageUrl.searchParams.set("run_name", CONFIG.workingRun);
-    const imageResponse = await fetch(imageUrl);
-    if (!imageResponse.ok) {
-      throw new Error(`${imageResponse.status} ${imageResponse.statusText}`);
-    }
-    const imageBlob = await imageResponse.blob();
-    const imageObjectUrl = URL.createObjectURL(imageBlob);
-    const scoreGridUrl = new URL(api("/v1/heatmap-scores.bin"));
-    scoreGridUrl.searchParams.set("region", CONFIG.sourceRegion);
-    scoreGridUrl.searchParams.set("run_name", CONFIG.workingRun);
-    const scoreGridResponse = await fetch(scoreGridUrl);
-    if (!scoreGridResponse.ok) {
-      throw new Error(`${scoreGridResponse.status} ${scoreGridResponse.statusText}`);
-    }
-    const scoreGrid = {
-      zoom: Number(scoreGridResponse.headers.get("X-Scenic-Tile-Zoom")),
-      minX: Number(scoreGridResponse.headers.get("X-Scenic-Min-X")),
-      minY: Number(scoreGridResponse.headers.get("X-Scenic-Min-Y")),
-      width: Number(scoreGridResponse.headers.get("X-Scenic-Grid-Width")),
-      height: Number(scoreGridResponse.headers.get("X-Scenic-Grid-Height")),
-      values: new DataView(await scoreGridResponse.arrayBuffer()),
+    if (!validHeatmapMetadata(payload)) throw new Error("API returned invalid learned heatmap metadata");
+    return payload;
+  });
+  const imageTask = fetchWithDeadline(urlFor("/v1/heatmap-image"), {}, async (response) => {
+    requireOk(response);
+    return URL.createObjectURL(await response.blob());
+  });
+  // A grid is optional for the image: catch here, before either image task settles.
+  const gridTask = fetchWithDeadline(urlFor("/v1/heatmap-scores.bin"), {}, async (response) => {
+    requireOk(response);
+    return {
+      zoom: Number(response.headers.get("X-Scenic-Tile-Zoom")),
+      minX: Number(response.headers.get("X-Scenic-Min-X")),
+      minY: Number(response.headers.get("X-Scenic-Min-Y")),
+      width: Number(response.headers.get("X-Scenic-Grid-Width")),
+      height: Number(response.headers.get("X-Scenic-Grid-Height")),
+      values: new DataView(await response.arrayBuffer()),
     };
-    if (
-      scoreGrid.zoom !== payload.tile_zoom ||
-      !Number.isInteger(scoreGrid.minX) ||
-      !Number.isInteger(scoreGrid.minY) ||
-      !Number.isInteger(scoreGrid.width) ||
-      !Number.isInteger(scoreGrid.height) ||
-      scoreGrid.values.byteLength !== scoreGrid.width * scoreGrid.height * 4
-    ) {
-      throw new Error("API returned invalid learned score grid");
-    }
-    latestHeatmap = {
+  }).then(({ body }) => ({ grid: body }), (error) => ({ error }));
+  try {
+    const [{ body: payload }, { body: imageUrl }] = await Promise.all([metadataTask, imageTask]);
+    const heatmap = {
       source: "api",
-      imageUrl: imageObjectUrl,
-      bounds,
+      imageUrl,
+      bounds: payload.bounds,
       runName: payload.run_name,
       tileZoom: payload.tile_zoom,
       totalTiles: payload.total_tiles,
       normalization: payload.normalization,
-      scoreGrid,
+      scoreGrid: null,
+      inspectorError: "Score inspector loading…",
     };
-    setApiStatus("API: online", "ok");
-    return latestHeatmap;
+    heatmap.gridReady = gridTask.then(({ grid, error }) => {
+      if (!error && (
+        grid.zoom !== payload.tile_zoom ||
+        !Number.isInteger(grid.minX) ||
+        !Number.isInteger(grid.minY) ||
+        !Number.isInteger(grid.width) ||
+        !Number.isInteger(grid.height) ||
+        grid.values.byteLength !== grid.width * grid.height * 4
+      )) error = new Error("API returned invalid learned score grid");
+      heatmap.scoreGrid = error ? null : grid;
+      heatmap.inspectorError = error ? `Score inspector unavailable: ${error.message || error}` : null;
+      return heatmap;
+    });
+    latestHeatmap = heatmap;
+    return heatmap;
   } catch (error) {
     latestHeatmap = null;
     setApiStatus("API: heatmap unavailable", "warn");
@@ -587,7 +641,7 @@ async function loadHeatmap() {
 
 async function checkApiHealth() {
   try {
-    const response = await fetch(api("/v1/healthz"));
+    const { response } = await fetchWithDeadline(api("/v1/healthz"));
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     setApiStatus("API: online", "ok");
   } catch {
@@ -778,11 +832,11 @@ function renderRoute(geojson, request = null) {
     removeLayer(ROUTE_ENDPOINT_CONNECTORS);
     removeSource(ROUTE_ENDPOINT_SOURCE);
   }
-  displayedRouteRequest = request;
   fitToGeojson(
     { type: "FeatureCollection", features: [...geojson.features, ...connectors.features] },
     { maxZoom: 12 }
   );
+  return true;
 }
 
 function drainPendingRouteRender() {
@@ -794,7 +848,23 @@ function drainPendingRouteRender() {
   if (!mapReady || !map.isStyleLoaded()) return;
   const pending = pendingRouteRender;
   pendingRouteRender = null;
-  renderRoute(pending.geojson, pending.request);
+  try {
+    if (!renderRoute(pending.geojson, pending.request)) return;
+    if (pending.payload) renderRouteComparison(pending.payload);
+    displayedRouteRequest = pending.request;
+    latestRoutePayload = pending.payload || null;
+    setRouteOutput(pending.title || "Route computed", pending.payload
+      ? routeOutputMarkup(pending.payload)
+      : "Validated scenic and baseline routes are shown on the map.");
+    setPublicRouteStatus(pending.title || "Route ready. Scenic and baseline routes are shown on the map.");
+    setShareState(Boolean(pending.request));
+    setApiStatus("API: online", "ok");
+  } catch (error) {
+    displayedRouteRequest = null;
+    setShareState(false);
+    setPublicRouteStatus(`Route failed: ${error.message || error}`);
+    setRouteOutput("Route failed", escapeHtml(error.message || error));
+  }
 }
 
 function installRouteRenderLifecycle() {
@@ -802,7 +872,7 @@ function installRouteRenderLifecycle() {
     mapReady = true;
     drainPendingRouteRender();
     syncZoomElasticity();
-    el.submitRoute.disabled = !CONFIG.workingRun || !routePlanningAvailable();
+    updateRouteControls();
   });
   // load fires once; tile activity can defer later route responses as well.
   map.on("idle", drainPendingRouteRender);
@@ -815,6 +885,9 @@ function clearRoute() {
   activeRouteRequest = null;
   latestRoutePayload = null;
   displayedRouteRequest = null;
+  setShareState(false);
+  el.routeResultsDialog?.close();
+  setPublicRouteStatus("Enter start/end coordinates or choose address suggestions, then plan a route.");
   removeLayer(ROUTE_ENDPOINT_CONNECTORS);
   removeLayer(ROUTE_SCENIC);
   removeLayer(ROUTE_BASELINE);
@@ -948,14 +1021,6 @@ function routeDiagnosticsMarkup(payload) {
   ) {
     append("Planning", `${formatNumber(elapsedMs, 0)} ms`);
   }
-  append(
-    "Requested weight",
-    displayText(formatNumber(diagnostics.requested_scenic_weight, 2))
-  );
-  append(
-    "Applied weight",
-    displayText(formatNumber(diagnostics.applied_scenic_weight, 2))
-  );
   append("Requested cap", displayRatio(diagnostics.requested_max_detour_factor));
   append("Applied cap", displayRatio(diagnostics.applied_max_detour_factor));
   append("Actual ratio", displayRatio(diagnostics.scenic_fastest_duration_ratio));
@@ -1105,14 +1170,6 @@ function renderRouteComparison(payload) {
       : "--"
   );
   setText(
-    el.requestedScenicWeight,
-    formatNumber(diagnostics.requested_scenic_weight, 2)
-  );
-  setText(
-    el.appliedScenicWeight,
-    formatNumber(diagnostics.applied_scenic_weight, 2)
-  );
-  setText(
     el.requestedDetourCap,
     displayRatio(diagnostics.requested_max_detour_factor)
   );
@@ -1193,9 +1250,8 @@ async function fetchValidatedRoute() {
   if (selectedRegionMetadata?.graph_exists === false) {
     throw new Error(`Route graph is unavailable for ${CONFIG.displayRange}`);
   }
-  const response = await fetch(url);
+  const { response, body: result } = await fetchWithDeadline(url);
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-  const result = await response.json();
   validateRouteGeojson(result.geojson);
   const kinds = new Set(
     result.geojson?.features?.map((feature) => feature.properties?.route_kind)
@@ -1283,10 +1339,10 @@ function installAddressSearch(which) {
     url.searchParams.set("session_token", sessionToken);
     renderStatus("Searching…", "loading");
     try {
-      const response = await fetch(url, { signal: token.controller.signal });
+      const { response, body } = await fetchWithDeadline(url, { signal: token.controller.signal });
       if (!isCurrentAddressRequest(token, fingerprint)) return;
       if (!response.ok) throw new Error(String(response.status));
-      const result = (await response.json()).result;
+      const result = body.result;
       if (!isCurrentAddressRequest(token, fingerprint)) return;
       if (!Number.isFinite(result?.lat) || !Number.isFinite(result?.lon)) {
         throw new Error("invalid address result");
@@ -1359,10 +1415,9 @@ function installAddressSearch(which) {
       url.searchParams.set("region", CONFIG.sourceRegion);
       renderStatus("Searching…", "loading");
       try {
-        const response = await fetch(url, { signal: token.controller.signal });
+        const { response, body: result } = await fetchWithDeadline(url, { signal: token.controller.signal });
         if (!isCurrentAddressRequest(token, fingerprint)) return;
         if (!response.ok) throw new Error(String(response.status));
-        const result = await response.json();
         if (!isCurrentAddressRequest(token, fingerprint)) return;
         renderSuggestions(result.suggestions || []);
       } catch (error) {
@@ -1422,10 +1477,20 @@ async function planRoute(event) {
   latestRoutePayload = null;
   activeRouteRequest?.controller.abort();
   activeRouteRequest = null;
+  displayedRouteRequest = null;
+  setShareState(false, "Share pending…");
+  if (!CONFIG.workingRun || !routePlanningAvailable()) {
+    setShareState(false);
+    setPublicRouteStatus("Route planning unavailable: authoritative region capabilities are not available or routing is disabled.");
+    return;
+  }
   const start = parsePoint(el.startInput.value) || selectedRoutePoints.start;
   const end = parsePoint(el.endInput.value) || selectedRoutePoints.end;
   if (!start || !end) {
     setRouteOutput("Invalid input", "Enter coordinates or choose an address suggestion.");
+    setShareState(false);
+    setPublicRouteStatus("Enter valid coordinates as lat, lon or choose an address suggestion.",
+      [!start && "start", !end && "end"].filter(Boolean));
     (!start ? el.startInput : el.endInput).focus();
     return;
   }
@@ -1435,7 +1500,6 @@ async function planRoute(event) {
     run_name: CONFIG.workingRun,
     start: Object.freeze({ lat: start.lat, lon: start.lon }),
     end: Object.freeze({ lat: end.lat, lon: end.lon }),
-    scenic_weight: DEFAULTS.scenicWeight,
     max_detour_factor: Number(el.detourFactor.value),
     avoid_highways: Boolean(el.avoidHighways?.checked),
     include_baseline: true,
@@ -1461,13 +1525,14 @@ async function planRoute(event) {
     "Computing route",
     "Calling <code>/v1/route/compare</code> with the same run used by the heatmap."
   );
+  setPublicRouteStatus("Planning route…");
 
   const isCurrent = () =>
     activeRouteRequest === requestToken &&
     requestToken.requestId === routeRequestSequence &&
     requestToken.fingerprint === fingerprint;
   try {
-    const response = await fetch(api("/v1/route/compare"), {
+    const { response, body: payload } = await fetchWithDeadline(api("/v1/route/compare"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1477,8 +1542,6 @@ async function planRoute(event) {
       body: JSON.stringify(requestBody),
       signal: controller.signal,
     });
-    if (!isCurrent()) return;
-    const payload = await response.json();
     if (!isCurrent()) return;
     if (!response.ok) {
       const detail = payload?.detail;
@@ -1498,25 +1561,32 @@ async function planRoute(event) {
           .join(" — ")
       );
       error.routeFailureCode = failureCode;
+      error.routeEndpoint = detail?.endpoint;
+      error.publicMessage = [message || `${response.status} ${response.statusText}`, hint]
+        .filter(Boolean).join(" — ");
       throw error;
     }
     const routeGeojson = validateRouteGeojson(payload.geojson);
-    pendingRouteRender = { requestId, geojson: routeGeojson, request: requestBody };
+    if (!payload.routes?.scenic || !payload.diagnostics) {
+      throw new Error("API returned an incomplete route comparison");
+    }
+    buildRouteEndpointConnectors(routeGeojson, requestBody);
+    pendingRouteRender = { requestId, geojson: routeGeojson, request: requestBody, payload };
+    setPublicRouteStatus("Route computed. Waiting for the map to finish loading…");
     drainPendingRouteRender();
-    renderRouteComparison(payload);
-    latestRoutePayload = payload;
-    setRouteOutput("Route computed", routeOutputMarkup(payload));
-    setApiStatus("API: online", "ok");
   } catch (error) {
     if (error?.name === "AbortError" || !isCurrent()) return;
     const presentation = routeFailurePresentation(error?.routeFailureCode);
     setApiStatus(presentation.status, "warn");
     setRouteOutput(presentation.title, escapeHtml(error.message || error));
+    setShareState(false);
+    setPublicRouteStatus(`${presentation.title}: ${error.publicMessage || error.message || error}`,
+      error.routeEndpoint ? [error.routeEndpoint] : []);
   } finally {
     if (isCurrent()) {
       activeRouteRequest = null;
       if (el.submitRoute) {
-        el.submitRoute.disabled = false;
+        el.submitRoute.disabled = !mapReady || !CONFIG.workingRun || !routePlanningAvailable();
         el.submitRoute.textContent = "Plan route";
       }
     }
@@ -1556,11 +1626,15 @@ function applyUrlParams() {
       avoidHighways.toLowerCase()
     );
   }
+  sharedRequestPending = Boolean(start && end);
 }
 
 async function copyShareUrl() {
   const request = displayedRouteRequest;
-  if (!request) return;
+  if (!request || pendingRouteRender || activeRouteRequest) {
+    setPublicRouteStatus("Share unavailable until the current route is displayed.");
+    return;
+  }
   const [startLon, startLat] = routeRequestCoordinate(request, "start");
   const [endLon, endLat] = routeRequestCoordinate(request, "end");
   const shareUrl = buildShareUrl({
@@ -1580,6 +1654,7 @@ async function copyShareUrl() {
   } catch {
     copied = false;
   }
+  if (displayedRouteRequest !== request || el.shareRouteBtn.disabled) return;
   if (!copied) {
     const textarea = document.createElement("textarea");
     try {
@@ -1598,7 +1673,9 @@ async function copyShareUrl() {
   }
   el.shareRouteBtn.textContent = copied ? "Copied" : "Copy failed";
   window.setTimeout(() => {
-    el.shareRouteBtn.textContent = originalLabel;
+    if (displayedRouteRequest === request && !el.shareRouteBtn.disabled) {
+      el.shareRouteBtn.textContent = originalLabel;
+    }
   }, 1600);
 }
 
@@ -1606,6 +1683,7 @@ function initBindings() {
   applyUrlParams();
   setRouteResultsVerbose(false);
   el.submitRoute.disabled = true;
+  setShareState(false);
   const syncRangeOutputs = () => {
     setText(el.detourOut, `${Number(el.detourFactor.value).toFixed(2)}×`);
   };
@@ -1641,6 +1719,13 @@ function initAddressSearch() {
 }
 
 function installHeatmapInspector(heatmap) {
+  if (!heatmap.scoreGrid) {
+    el.inspector?.setAttribute("aria-disabled", "true");
+    setText(el.inspectorScore, "--");
+    setText(el.inspectorCoords, heatmap.inspectorError || "Score inspector unavailable.");
+    return;
+  }
+  el.inspector?.setAttribute("aria-disabled", "false");
   const mapCanvas = map.getCanvas();
   const inspect = (lngLat) => {
     const tile = lngLatToTile(lngLat.lng, lngLat.lat, heatmap.tileZoom);
@@ -1694,37 +1779,109 @@ function installHeatmapInspector(heatmap) {
 
 async function main() {
   initBindings();
-  const artifactErrors = [];
-  try {
-    await loadSupportedRegions();
-  } catch (error) {
-    const message = `Region metadata unavailable: ${error.message || error}`;
-    artifactErrors.push(message);
-    setText(el.regionStatus, message);
-    setApiStatus("API: regions unavailable", "warn");
-  }
   initAddressSearch();
-  void loadTrainingResults();
-  await checkApiHealth();
-
-  let heatmap = null;
-  let validatedRoute = null;
-  try {
-    heatmap = await loadHeatmap();
-  } catch (error) {
-    artifactErrors.push(error.message || String(error));
-  }
-  if (!routePlanningIntentionallyDisabled()) {
-    try {
-      validatedRoute = await fetchValidatedRoute();
-    } catch (error) {
-      artifactErrors.push(`Validated route unavailable: ${error.message || error}`);
+  updateRouteControls();
+  setPublicRouteStatus("Loading supported region capabilities…");
+  const replaySharedRequest = sharedRequestPending;
+  const startupRequestId = routeRequestSequence;
+  map = new maplibregl.Map({
+    container: "map",
+    style: cartoVoyagerStyle(),
+    center: [0, 0],
+    zoom: DEFAULTS.zoom,
+    attributionControl: true,
+    dragRotate: false,
+    pitchWithRotate: false,
+  });
+  map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), "top-right");
+  map.on("zoomstart", handleZoomStart);
+  map.on("zoomend", handleZoomEnd);
+  const alignCamera = () => {
+    if (!selectedRegionMetadata || !activeRegionBounds) return;
+    syncZoomElasticity();
+    if (routeRequestSequence === startupRequestId) {
+      map.jumpTo(regionCamera(selectedRegionMetadata), PROGRAMMATIC_CAMERA_EVENT);
     }
-  }
+  };
+  // Align the authoritative camera before the lifecycle can publish a route.
+  map.on("load", () => {
+    if (selectedRegionMetadata) alignCamera();
+  });
+  installRouteRenderLifecycle();
+  map.on("resize", syncZoomElasticity);
+  const mapLoaded = new Promise((resolve) => map.on("load", resolve));
 
-  const style = cartoVoyagerStyle();
-  if (heatmap) {
-    style.sources[HEATMAP_SOURCE] = {
+  // Start independent requests together; only region-specific publication waits
+  // for canonical metadata. A requested stale run is discarded, not displayed.
+  const initialSelection = `${CONFIG.sourceRegion}/${CONFIG.workingRun}`;
+  const heatmapTask = loadHeatmap().then(
+    (heatmap) => ({ heatmap }), (error) => ({ error })
+  );
+  const regionsTask = loadSupportedRegions().then(() => {
+    updateRouteControls();
+    if (mapReady) alignCamera();
+    if (!routePlanningAvailable() || !CONFIG.workingRun) {
+      setPublicRouteStatus(selectedRegionMetadata.description ||
+        "Route planning is unavailable for this region.");
+    } else {
+      setPublicRouteStatus(replaySharedRequest ? "Loading shared route…" : "Ready to plan a route.");
+    }
+    return true;
+  }, (error) => {
+    selectedRegionMetadata = null;
+    activeRegionBounds = null;
+    cancelZoomBounce();
+    syncZoomElasticity();
+    updateRouteControls();
+    const message = `Region metadata unavailable: ${error.message || error}. Route planning is disabled.`;
+    setText(el.regionStatus, message);
+    setPublicRouteStatus(message);
+    setApiStatus("API: regions unavailable", "warn");
+    return false;
+  });
+  const healthTask = checkApiHealth();
+  const trainingTask = loadTrainingResults();
+
+  const routeTask = regionsTask.then(async (regionsAvailable) => {
+    if (!regionsAvailable || !routePlanningAvailable() || !CONFIG.workingRun) return;
+    if (replaySharedRequest) {
+      await mapLoaded;
+      if (routeRequestSequence !== startupRequestId) return;
+      sharedRequestPending = false;
+      await planRoute({ preventDefault() {} });
+      return;
+    }
+    try {
+      const validatedRoute = await fetchValidatedRoute();
+      if (routeRequestSequence !== startupRequestId) return;
+      buildRouteEndpointConnectors(validatedRoute.geojson, validatedRoute.request);
+      pendingRouteRender = {
+        requestId: startupRequestId,
+        geojson: validatedRoute.geojson,
+        request: validatedRoute.request,
+        title: `${CONFIG.displayRange} validated route`,
+      };
+      setShareState(false, "Share pending…");
+      setPublicRouteStatus("Validated route ready. Waiting for the map to finish loading…");
+      drainPendingRouteRender();
+    } catch (error) {
+      if (routeRequestSequence !== startupRequestId) return;
+      setRouteOutput("Validated route unavailable", escapeHtml(error.message || error));
+    }
+  });
+  const imageTask = regionsTask.then(async (regionsAvailable) => {
+    if (!regionsAvailable) return;
+    const result = initialSelection === `${CONFIG.sourceRegion}/${CONFIG.workingRun}`
+      ? await heatmapTask
+      : await loadHeatmap().then((heatmap) => ({ heatmap }), (error) => ({ error }));
+    if (result.error) {
+      setText(el.inspectorCoords, result.error.message || String(result.error));
+      el.inspector?.setAttribute("aria-disabled", "true");
+      return;
+    }
+    const { heatmap } = result;
+    await mapLoaded;
+    map.addSource(HEATMAP_SOURCE, {
       type: "image",
       url: heatmap.imageUrl,
       coordinates: [
@@ -1733,81 +1890,24 @@ async function main() {
         [heatmap.bounds.max_lon, heatmap.bounds.min_lat],
         [heatmap.bounds.min_lon, heatmap.bounds.min_lat],
       ],
-    };
-    style.layers.push({
+    });
+    map.addLayer({
       id: HEATMAP_FILL,
       type: "raster",
       source: HEATMAP_SOURCE,
-      paint: {
-        "raster-opacity": 0.78,
-        "raster-resampling": "nearest",
-      },
-    });
-  }
-
-  if (validatedRoute) {
-    const validatedConnectors = buildRouteEndpointConnectors(
-      validatedRoute.geojson,
-      validatedRoute.request
-    );
-    style.sources[ROUTE_SOURCE] = { type: "geojson", data: validatedRoute.geojson };
-    style.layers.push(
-      routeLayer("baseline", "#ffffff", 4, 0.62),
-      routeLayer("scenic", "#62c58a", 5.5, 0.96)
-    );
-    if (validatedConnectors.features.length) {
-      style.sources[ROUTE_ENDPOINT_SOURCE] = {
-        type: "geojson",
-        data: validatedConnectors,
-      };
-      style.layers.push(routeEndpointConnectorLayer());
-    }
-    displayedRouteRequest = validatedRoute.request;
-  }
-
-  const camera = regionCamera(selectedRegionMetadata);
-  map = new maplibregl.Map({
-    container: "map",
-    style,
-    center: camera.center,
-    zoom: camera.zoom,
-    attributionControl: true,
-    dragRotate: false,
-    pitchWithRotate: false,
+      paint: { "raster-opacity": 0.78, "raster-resampling": "nearest" },
+    }, map.getLayer(ROUTE_BASELINE) ? ROUTE_BASELINE : undefined);
+    const inspectorReady = Boolean(heatmap.scoreGrid);
+    installHeatmapInspector(heatmap);
+    // Do not hold the image hostage to a slow or failed binary grid.
+    await heatmap.gridReady;
+    if (!inspectorReady) installHeatmapInspector(heatmap);
   });
-  map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), "top-right");
-  map.on("zoomstart", handleZoomStart);
-  map.on("zoomend", handleZoomEnd);
-  installRouteRenderLifecycle();
-  map.on("resize", syncZoomElasticity);
-  if (heatmap) installHeatmapInspector(heatmap);
-  if (heatmap && routePlanningIntentionallyDisabled()) {
-    const message =
-      selectedRegionMetadata.description ||
-      "Route planning is unavailable because this heatmap has no configured road graph.";
-    setText(el.regionStatus, `${CONFIG.displayRange} · heatmap only`);
-    setRouteOutput(`${CONFIG.displayRange} heatmap`, escapeHtml(message));
-  }
-  if (validatedRoute) {
-    const title =
-      CONFIG.sourceRegion === DEFAULTS.sourceRegion
-        ? "Burlington → Bangor"
-        : `${CONFIG.displayRange} validated route`;
-    setRouteOutput(title, "Validated scenic and baseline routes are shown on the map.");
-  }
-  if (artifactErrors.length) {
-    setApiStatus("API: artifacts unavailable", "warn");
-    setText(el.regionStatus, artifactErrors.join(" "));
-    if (!validatedRoute) {
-      setRouteOutput(
-        `${CONFIG.displayRange} artifacts unavailable`,
-        escapeHtml(artifactErrors.join(" "))
-      );
-    }
-  }
+  await Promise.all([routeTask, imageTask, healthTask, trainingTask]);
 }
 
 main().catch((error) => {
   setApiStatus("Viewer failed", "warn");
   setRouteOutput("Viewer failed", escapeHtml(error.message || error));
+  setPublicRouteStatus(`Viewer failed: ${error.message || error}`);
 });

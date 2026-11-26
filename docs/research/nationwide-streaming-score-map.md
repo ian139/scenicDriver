@@ -50,7 +50,7 @@ Hawaii and territories may be studied separately only with explicit geometry, im
 
 The committed NAIP/3DEP workflow in `scripts/ingest/naip_3dep_workflow.py` is designed for deterministic acquisition and reproducible retained raster pairs. Its source contract, `config/data_sources/naip_3dep_v1.json`, currently declares:
 
-- an explicit `allowed_states` list limited to the current eastern/Midwestern target region, mirrored by `src.data_pipeline.naip.ALLOWED_STATES`;
+- an explicit `allowed_states` list limited to the current eastern/Midwestern target region, mirrored by `scenicdriver.data_pipeline.naip.ALLOWED_STATES`;
 - whole-object source downloads;
 - deterministic 512×512 satellite PNG output;
 - deterministic 512×512 Terrain-RGB PNG output;
@@ -96,10 +96,10 @@ flowchart LR
 
 Reuse the geometry and coordinate primitives rather than creating new Web Mercator math:
 
-- `src.data_pipeline.region_planning.enumerate_land_tiles`
-- `src.data_pipeline.region_planning.enumerate_polygon_tiles`
-- `src.data_pipeline.web_mercator.tile_bounds_wgs84`
-- `src.data_pipeline.web_mercator.tile_transform_web_mercator`
+- `scenicdriver.data_pipeline.region_planning.enumerate_land_tiles`
+- `scenicdriver.data_pipeline.region_planning.enumerate_polygon_tiles`
+- `scenicdriver.data_pipeline.web_mercator.tile_bounds_wgs84`
+- `scenicdriver.data_pipeline.web_mercator.tile_transform_web_mercator`
 
 The inventory must be generated from a hash-pinned official CONUS land geometry and contain one deterministic row per admitted tile. The exact count is unknown until this run executes. Preliminary estimates are not planning truth.
 
@@ -131,7 +131,7 @@ Provider selection is an experimental outcome. The implementation must benchmark
 
 Reuse and extend:
 
-- `src.data_pipeline.metered_transport.MeteredTransport`
+- `scenicdriver.data_pipeline.metered_transport.MeteredTransport`
 - `Boto3MeteredTransport`
 - `NetworkCaps`
 - `SharedMeteredBudget`
@@ -147,9 +147,9 @@ Workers should process tiles in source-asset/spatial order so adjacent target ti
 
 Reuse the canonical target and preprocessing semantics from:
 
-- `src.data_pipeline.raster_processing.process_imagery`
-- `src.data_pipeline.raster_processing.process_dem`
-- `src.data_pipeline.web_mercator.TargetGrid`
+- `scenicdriver.data_pipeline.raster_processing.process_imagery`
+- `scenicdriver.data_pipeline.raster_processing.process_dem`
+- `scenicdriver.data_pipeline.web_mercator.TargetGrid`
 - `config/data_sources/naip_3dep_v1.json`
 
 The missing interface accepts opened windows/datasets or arrays rather than local paths. Both sources are warped to the exact same EPSG:3857 z14 512×512 grid, pixel centers, transform, bounds, and orientation.
@@ -178,7 +178,7 @@ B = q & 255
 
 Decoded round-trip error must remain at most `0.0500001 m`. NaN/Inf or no-data on valid land fails the tile. Ocean fill occurs only after applying the pinned land mask.
 
-`src.terrain.features.compute_terrain_features` accepts RGB arrays, so no PNG serialization is required. The six regression features remain, in canonical order:
+`scenicdriver.terrain.features.compute_terrain_features` accepts RGB arrays, so no PNG serialization is required. The six regression features remain, in canonical order:
 
 1. normalized slope variation;
 2. elevation change divided by 1000;
@@ -205,7 +205,7 @@ Terrain-RGB + satellite RGB
   -> scenic score in [0, 10]
 ```
 
-Reuse model loading and identity validation from `src.active_learning.scoring.load_scoring_models` and `src.scenic_scorer.regression.ScenicRegressionModel`.
+Reuse model loading and identity validation from `scenicdriver.active_learning.scoring.load_scoring_models` and `scenicdriver.scenic_scorer.regression.ScenicRegressionModel`.
 
 The existing `score_tile_manifest` is not the nationwide executor because it materializes result structures and feature arrays for the complete pool. The new public batch primitive should accept bounded in-memory RGB arrays, return bounded score/QC rows, and release tensors after each batch. Batch size, prefetch depth, CPU worker count, GPU queue depth, and peak resident memory are explicit run parameters and evidence fields.
 
@@ -392,19 +392,19 @@ Rejected because a provider change alters byte content, vintages, access costs, 
 
 Expected reusable or modified areas:
 
-- `src/data_pipeline/region_planning.py` — exact national land enumeration;
-- `src/data_pipeline/web_mercator.py` — canonical tile grid;
-- `src/data_pipeline/metered_transport.py` — explicit metered ranges and aggregate caps;
-- `src/data_pipeline/naip.py` — deterministic imagery catalog and selection;
-- `src/data_pipeline/usgs_3dep.py` — deterministic terrain catalog and selection;
-- `src/data_pipeline/raster_processing.py` — dataset/window/array preprocessing interface;
-- `src/data_pipeline/source_contracts.py` — streaming, partition, score, and report identities;
-- `src/active_learning/scoring.py` — reusable bounded in-memory inference primitive;
+- `src/scenicdriver/data_pipeline/region_planning.py` — exact national land enumeration;
+- `src/scenicdriver/data_pipeline/web_mercator.py` — canonical tile grid;
+- `src/scenicdriver/data_pipeline/metered_transport.py` — explicit metered ranges and aggregate caps;
+- `src/scenicdriver/data_pipeline/naip.py` — deterministic imagery catalog and selection;
+- `src/scenicdriver/data_pipeline/usgs_3dep.py` — deterministic terrain catalog and selection;
+- `src/scenicdriver/data_pipeline/raster_processing.py` — dataset/window/array preprocessing interface;
+- `src/scenicdriver/data_pipeline/source_contracts.py` — streaming, partition, score, and report identities;
+- `src/scenicdriver/active_learning/scoring.py` — reusable bounded in-memory inference primitive;
 - `scripts/ingest/naip_3dep_workflow.py` — planning/authorization integration or clean replacement by one canonical streaming orchestrator;
 - `scripts/modeling/export_prediction_heatmap.py` — partitioned score input and PMTiles-compatible export;
 - `scripts/annotation/build_source_shift_batch.py` — human benchmark preparation;
 - `scripts/modeling/evaluate_source_shift.py` — source-shift gates;
-- `src/route_planner/` and `src/app_api/` — only for supported post-map route and serving validation;
+- `src/scenicdriver/route_planner/` and `src/scenicdriver/app_api/` — only for supported post-map route and serving validation;
 - `data/README.md`, architecture, setup, and deployment documentation — final artifact contracts after implementation.
 
 Potential new modules must each own one clear concern: remote COG windows, streaming orchestration, or score-partition artifacts. Do not create duplicate coordinate, model-loading, budget, identity, or promotion frameworks.

@@ -1665,69 +1665,85 @@ name = "scenicdriver"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [
-    { name = "boto3" },
+    { name = "anyio" },
     { name = "fastapi" },
-    { name = "marimo" },
     { name = "msgspec" },
     { name = "numpy" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
     { name = "pandas", version = "3.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
     { name = "pillow" },
-    { name = "pyarrow" },
-    { name = "pyproj" },
+    { name = "pydantic" },
     { name = "python-dotenv" },
-    { name = "rasterio" },
     { name = "requests" },
     { name = "scalar-fastapi" },
     { name = "scipy" },
-    { name = "shapely" },
-    { name = "timm" },
-    { name = "torch" },
-    { name = "torchvision" },
-    { name = "tqdm" },
+    { name = "starlette" },
     { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "ruff" },
+ingest = [
+    { name = "boto3" },
+    { name = "botocore" },
+    { name = "networkx" },
+    { name = "pyarrow" },
+    { name = "pyproj" },
+    { name = "rasterio" },
+    { name = "shapely" },
+]
+ml = [
+    { name = "marimo" },
+    { name = "timm" },
+    { name = "torch" },
+    { name = "torchvision" },
+    { name = "tqdm" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "httpx" },
+    { name = "pytest" },
+    { name = "ruff" },
+    { name = "scenicdriver", extra = ["ingest", "ml"] },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "boto3", specifier = ">=1.34" },
+    { name = "anyio", specifier = ">=4.4" },
+    { name = "boto3", marker = "extra == 'ingest'", specifier = ">=1.34" },
+    { name = "botocore", marker = "extra == 'ingest'", specifier = ">=1.34" },
     { name = "fastapi", specifier = ">=0.115" },
-    { name = "marimo", specifier = ">=0.19.7" },
+    { name = "marimo", marker = "extra == 'ml'", specifier = ">=0.19.7" },
     { name = "msgspec", specifier = ">=0.20,<1" },
+    { name = "networkx", marker = "extra == 'ingest'", specifier = ">=3.2" },
     { name = "numpy", specifier = ">=1.26,<2" },
     { name = "pandas", specifier = ">=2.2" },
     { name = "pillow", specifier = ">=10.0" },
-    { name = "pyarrow", specifier = ">=25.0.1" },
-    { name = "pyproj", specifier = ">=3.7,<4" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pyarrow", marker = "extra == 'ingest'", specifier = ">=25.0.1" },
+    { name = "pydantic", specifier = ">=2.7,<3" },
+    { name = "pyproj", marker = "extra == 'ingest'", specifier = ">=3.7,<4" },
     { name = "python-dotenv", specifier = ">=1.0" },
-    { name = "rasterio", specifier = ">=1.4,<2" },
+    { name = "rasterio", marker = "extra == 'ingest'", specifier = ">=1.4,<2" },
     { name = "requests", specifier = ">=2.31" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.7" },
     { name = "scalar-fastapi", specifier = ">=1.8.2" },
     { name = "scipy", specifier = ">=1.13,<2" },
-    { name = "shapely", specifier = ">=2.0,<3" },
-    { name = "timm", specifier = ">=1.0.24" },
-    { name = "torch", specifier = ">=2.2" },
-    { name = "torchvision", specifier = ">=0.17" },
-    { name = "tqdm", specifier = ">=4.66" },
+    { name = "shapely", marker = "extra == 'ingest'", specifier = ">=2.0,<3" },
+    { name = "starlette", specifier = ">=0.40" },
+    { name = "timm", marker = "extra == 'ml'", specifier = ">=1.0.24" },
+    { name = "torch", marker = "extra == 'ml'", specifier = ">=2.2" },
+    { name = "torchvision", marker = "extra == 'ml'", specifier = ">=0.17" },
+    { name = "tqdm", marker = "extra == 'ml'", specifier = ">=4.66" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["ml", "ingest"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "httpx", specifier = ">=0.28.1" }]
+dev = [
+    { name = "httpx", specifier = ">=0.28.1" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "ruff", specifier = ">=0.7" },
+    { name = "scenicdriver", extras = ["ml", "ingest"] },
+]
 
 [[package]]
 name = "scipy"

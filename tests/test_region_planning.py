@@ -9,18 +9,17 @@ from pathlib import Path
 import pytest
 from shapely.geometry import MultiPolygon, Point, Polygon, box
 
-from src.data_pipeline import region_planning
+from scenicdriver.data_pipeline import region_planning
 
-from src.data_pipeline.region_planning import (
+from scenicdriver.data_pipeline.region_planning import (
     enumerate_bbox_tiles,
     enumerate_land_tiles,
     enumerate_polygon_tiles,
-    get_builtin_region_spec,
     parse_and_validate_region_spec,
     project_geometry_to_5070,
     parse_geojson_geometry,
 )
-from src.data_pipeline.web_mercator import (
+from scenicdriver.data_pipeline.web_mercator import (
     tile_bounds_wgs84,
     tile_to_lat_lon_center,
 )
@@ -628,24 +627,6 @@ def test_schema_and_per_coordinate_metadata(tmp_path: Path) -> None:
             "land_fraction",
             "bbox",
         )
-
-
-def test_builtin_spec_structure_and_missing_file_blocker(tmp_path: Path) -> None:
-    spec = get_builtin_region_spec()
-    assert spec["version"] == 1
-    assert "bbox-only" not in spec["geographic_source"]
-    assert len(spec["regions"]) >= 2
-
-    app_regions = tmp_path / "app_regions.json"
-    app_regions.write_text(
-        json.dumps(
-            {"regions": [{"region": "new_england_north", "bbox": spec["regions"][0]["bbox"]}]}
-        ),
-        encoding="utf-8",
-    )
-    spec["regions"][1]["geometry_file"] = str(tmp_path / "missing-boundary.geojson")
-    with pytest.raises(FileNotFoundError, match="Authoritative boundary file"):
-        parse_and_validate_region_spec(spec, app_regions_path=app_regions)
 
 
 def test_pinned_jurisdiction_land_intersection_records_audit_metrics(

@@ -1,0 +1,13 @@
+{
+  "name": "scenic-drive-browser-smoke",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic Playwright smoke lane for apps/new_england_north (static app + local fake API, no external network).",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.60.0",
+    "maplibre-gl": "3.6.2"
+  }
+}

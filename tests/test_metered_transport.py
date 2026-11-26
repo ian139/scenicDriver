@@ -25,7 +25,7 @@ from botocore.exceptions import (
 from urllib3.exceptions import IncompleteRead as Urllib3IncompleteRead
 from urllib3.exceptions import ProtocolError
 
-from src.data_pipeline.metered_transport import (
+from scenicdriver.data_pipeline.metered_transport import (
     AuthenticationError,
     Boto3MeteredTransport,
     CapExceededError,

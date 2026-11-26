@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
@@ -13,8 +14,9 @@ import sys
 import time
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
 from scripts.remote.cmux_vast_host import (  # noqa: E402
     ARTIFACTS_DIR,
@@ -47,7 +49,12 @@ DEFAULT_OFFER_QUERY = (
     "num_gpus>=1 dlperf>250 dlperf_per_dphtotal>100 total_flops>200 dph<8 "
     "verified=true direct_port_count>=1 rentable=true gpu_ram>=12 disk_space>=64"
 )
-DEFAULT_IMAGE = "ian139/scenicdriver-remote-training:latest"
+# Release tags are publish-once; see docs/setup/vast-training.md.
+DEFAULT_IMAGE = "ian139/scenicdriver-remote-training:torch2.10.0-cu128-20261006"
+PINNED_TORCH_VERSION = "2.10.0"
+PINNED_TORCHVISION_VERSION = "0.25.0"
+PINNED_CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
+REMOTE_KILL_AFTER_SECONDS = 30
 DEFAULT_REMOTE_REPO_DIR = "/workspace"
 DEFAULT_REMOTE_ENV_FILE = "/root/.scenic/aws.env"
 DEFAULT_REMOTE_OUTPUT_BASE = "/workspace/scenic_artifacts/vast"
@@ -57,6 +64,8 @@ DEFAULT_TRAIN_DATASET = "/workspace/data/processed/regression/train_features.npz
 DEFAULT_REMOTE_DATA_ROOT = "/workspace/data/processed/regression"
 DEFAULT_REMOTE_MODELS_ROOT = "/workspace/models"
 REMOTE_BENCHMARK_SPLIT_CSV = "/workspace/data/benchmark/benchmark_split.csv"
+REMOTE_LABELS_CSV = "/workspace/data/processed/regression/training_labels.csv"
+REMOTE_CLASSIFIER_CHECKPOINT = "/workspace/models/export_classifier.pt"
 DEFAULT_VALIDATION_CHECKPOINT_KEY = "models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt"
 
 REUSABLE_STATUSES = {"destroyed", "failed_destroyed"}
@@ -68,6 +77,9 @@ class VastTrainConfig:
     run_id: str
     train_dataset_key: str
     benchmark_split_key: str
+    labels_key: str
+    classifier_checkpoint_key: str
+    use_resisc45_stats: bool
     s3_bucket: str
     s3_data_prefix: str
     s3_models_prefix: str
@@ -135,6 +147,33 @@ def _readable_file(path_text: str, label: str) -> str:
     return str(path)
 
 
+def runtime_identity(image: str) -> dict:
+    """Identify the actual installed runtime and image-bundled source bytes."""
+    import torch
+    import torchvision
+
+    digest = hashlib.sha256()
+    for name in ("pyproject.toml", "uv.lock", "src", "scripts", "notebooks", "config"):
+        root = PROJECT_ROOT / name
+        paths = sorted(root.rglob("*")) if root.is_dir() else [root]
+        for path in paths:
+            if not path.is_file() or "__pycache__" in path.parts or path.suffix in {".pyc", ".so"}:
+                continue
+            relative = path.relative_to(PROJECT_ROOT).as_posix().encode()
+            content = path.read_bytes()
+            digest.update(len(relative).to_bytes(8, "big"))
+            digest.update(relative)
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+    return {
+        "image": image,
+        "torch_version": torch.__version__,
+        "torchvision_version": torchvision.__version__,
+        "cuda_version": torch.version.cuda,
+        "source_digest": "sha256:" + digest.hexdigest(),
+    }
+
+
 def build_remote_training_script(config: VastTrainConfig) -> str:
     remote_output_root = _remote_output_root(config.run_id)
     remote_lifecycle_dir = _remote_lifecycle_dir(config.run_id)
@@ -147,7 +186,7 @@ def build_remote_training_script(config: VastTrainConfig) -> str:
     )
     timeout_minutes = max(1, math.ceil(config.timeout_seconds / 60))
     return f"""set -Eeuo pipefail
-cd {DEFAULT_REMOTE_REPO_DIR}
+cd {_quote(DEFAULT_REMOTE_REPO_DIR)}
 if [[ -f {_quote(config.remote_env_file)} ]]; then
   set -a
   source {_quote(config.remote_env_file)}
@@ -158,6 +197,8 @@ export SCENIC_S3_DATA_PREFIX={_quote(config.s3_data_prefix)}
 export SCENIC_S3_MODELS_PREFIX={_quote(config.s3_models_prefix)}
 export SCENIC_S3_OUTPUT_PREFIX={_quote(config.s3_output_prefix)}
 export SCENIC_RUN_ID={_quote(config.run_id)}
+export SCENIC_RUNTIME_IMAGE={_quote(config.image)}
+export SCENIC_REMOTE_DEADLINE_SECONDS={_quote(config.timeout_seconds)}
 export SCENIC_TIMEOUT_MINUTES={_quote(timeout_minutes)}
 export SCENIC_STEP_TIMEOUT_SECONDS=600
 export SCENIC_OUTPUT_ROOT={_quote(remote_output_root)}
@@ -166,6 +207,10 @@ export SCENIC_TRAIN_DATASET_KEY={_quote(config.train_dataset_key)}
 export SCENIC_TRAIN_DATASET={_quote(DEFAULT_TRAIN_DATASET)}
 export SCENIC_BENCHMARK_SPLIT_KEY={_quote(config.benchmark_split_key)}
 export SCENIC_BENCHMARK_SPLIT_CSV={_quote(REMOTE_BENCHMARK_SPLIT_CSV)}
+export SCENIC_LABELS_KEY={_quote(config.labels_key)}
+export SCENIC_LABELS_CSV={_quote(REMOTE_LABELS_CSV)}
+export SCENIC_CLASSIFIER_CHECKPOINT_KEY={_quote(config.classifier_checkpoint_key)}
+export SCENIC_CLASSIFIER_CHECKPOINT={_quote(REMOTE_CLASSIFIER_CHECKPOINT)}
 export SCENIC_DATASET_PATH={_quote(validation_dataset)}
 export SCENIC_VALIDATION_CHECKPOINT_KEY={_quote(config.validation_checkpoint_key)}
 export SCENIC_CHECKPOINT_PATH={_quote(validation_checkpoint)}
@@ -184,27 +229,42 @@ from __future__ import annotations
 import sys
 
 import torch
+import torchvision
 
+versions_match = (
+    torch.__version__.split("+")[0] == {PINNED_TORCH_VERSION!r}
+    and torchvision.__version__.split("+")[0] == {PINNED_TORCHVISION_VERSION!r}
+    and torch.version.cuda == "12.8"
+)
+if not versions_match:
+    raise SystemExit(42)
 if not torch.cuda.is_available():
-    print("torch CUDA support check skipped: cuda unavailable")
-    raise SystemExit(0)
+    raise SystemExit("Pinned CUDA runtime cannot access a GPU")
 major, minor = torch.cuda.get_device_capability(0)
 arch = f"sm_{{major}}{{minor}}"
 arches = set(torch.cuda.get_arch_list())
 print(f"torch {{torch.__version__}}; gpu capability {{arch}}; supported arches: {{sorted(arches)}}")
 if arch not in arches:
-    if major >= 12:
-        raise SystemExit(42)
-    raise SystemExit(f"Current torch build does not support GPU capability {{arch}}")
+    raise SystemExit(42)
 PY
   local code=$?
   set -e
   if [[ "$code" -eq 42 ]]; then
-    echo "GPU requires a newer PyTorch CUDA wheel; upgrading torch/torchvision with uv"
-    uv pip install --system --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 --upgrade "torch==2.7.1" "torchvision==0.22.1" "numpy>=1.26,<2" || \
-      uv pip install --system --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 --upgrade torch torchvision "numpy>=1.26,<2"
+    echo "Installing pinned PyTorch CUDA runtime"
+    if ! uv pip install --system --no-cache-dir --index-url {_quote(PINNED_CUDA_INDEX)} "torch=={PINNED_TORCH_VERSION}" "torchvision=={PINNED_TORCHVISION_VERSION}"; then
+      echo "Pinned PyTorch CUDA wheels unavailable; refusing an unversioned fallback" >&2
+      return 1
+    fi
     python - <<'PY'
 import torch
+import torchvision
+if (
+    torch.__version__.split("+")[0] != {PINNED_TORCH_VERSION!r}
+    or torchvision.__version__.split("+")[0] != {PINNED_TORCHVISION_VERSION!r}
+    or torch.version.cuda != "12.8"
+    or not torch.cuda.is_available()
+):
+    raise SystemExit("Pinned PyTorch CUDA runtime validation failed")
 major, minor = torch.cuda.get_device_capability(0)
 arch = f"sm_{{major}}{{minor}}"
 arches = set(torch.cuda.get_arch_list())
@@ -233,6 +293,8 @@ payload = {{
     "status": status,
     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "output_root": os.environ.get("SCENIC_OUTPUT_ROOT"),
+    "runtime_identity": json.load(open(os.path.join(os.environ["SCENIC_OUTPUT_ROOT"], "runtime_identity.json"))),
+    "remote_deadline_seconds": int(os.environ["SCENIC_REMOTE_DEADLINE_SECONDS"]),
 }}
 if exit_text:
     payload["exit_code"] = int(exit_text)
@@ -241,30 +303,56 @@ with open(path, "w", encoding="utf-8") as handle:
     handle.write("\\n")
 PY
 }}
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+from scripts.remote.vast_train import runtime_identity
+path = Path(os.environ["SCENIC_OUTPUT_ROOT"]) / "runtime_identity.json"
+path.write_text(json.dumps(runtime_identity(os.environ["SCENIC_RUNTIME_IMAGE"]), indent=2, sort_keys=True) + "\\n")
+PY
 write_lifecycle_json "$SCENIC_LIFECYCLE_DIR/started.json" started
 set +e
 (
   set -euo pipefail
   ensure_torch_supports_gpu
-  python -m src.data_pipeline.s3 download-file \
+  python - <<'PY'
+import json
+import os
+from pathlib import Path
+from scripts.remote.vast_train import runtime_identity
+path = Path(os.environ["SCENIC_OUTPUT_ROOT"]) / "runtime_identity.json"
+path.write_text(json.dumps(runtime_identity(os.environ["SCENIC_RUNTIME_IMAGE"]), indent=2, sort_keys=True) + "\\n")
+PY
+  python -m scenicdriver.data_pipeline.s3 download-file \
     --bucket "$SCENIC_S3_BUCKET" \
     --key "$SCENIC_TRAIN_DATASET_KEY" \
     --dest "$SCENIC_DATASET_PATH" \
     --required
-  python -m src.data_pipeline.s3 download-file \
+  python -m scenicdriver.data_pipeline.s3 download-file \
     --bucket "$SCENIC_S3_BUCKET" \
     --key "$SCENIC_VALIDATION_CHECKPOINT_KEY" \
     --dest "$SCENIC_CHECKPOINT_PATH" \
     --required
-  python -m src.data_pipeline.s3 download-file \
+  python -m scenicdriver.data_pipeline.s3 download-file \
     --bucket "$SCENIC_S3_BUCKET" \
     --key "$SCENIC_TRAIN_DATASET_KEY" \
     --dest "$SCENIC_TRAIN_DATASET" \
     --required
-  python -m src.data_pipeline.s3 download-file \
+  python -m scenicdriver.data_pipeline.s3 download-file \
     --bucket "$SCENIC_S3_BUCKET" \
     --key "$SCENIC_BENCHMARK_SPLIT_KEY" \
     --dest "$SCENIC_BENCHMARK_SPLIT_CSV" \
+    --required
+  python -m scenicdriver.data_pipeline.s3 download-file \
+    --bucket "$SCENIC_S3_BUCKET" \
+    --key "$SCENIC_LABELS_KEY" \
+    --dest "$SCENIC_LABELS_CSV" \
+    --required
+  python -m scenicdriver.data_pipeline.s3 download-file \
+    --bucket "$SCENIC_S3_BUCKET" \
+    --key "$SCENIC_CLASSIFIER_CHECKPOINT_KEY" \
+    --dest "$SCENIC_CLASSIFIER_CHECKPOINT" \
     --required
   python scripts/remote/vast_train.py validate \
     --device cuda \
@@ -274,6 +362,9 @@ set +e
   python scripts/modeling/train_regression_baseline.py \
     --dataset "$SCENIC_TRAIN_DATASET" \
     --benchmark-split-csv "$SCENIC_BENCHMARK_SPLIT_CSV" \
+    --labels-csv "$SCENIC_LABELS_CSV" \
+    --classifier-checkpoint "$SCENIC_CLASSIFIER_CHECKPOINT" \
+    --normalization {"resisc45" if config.use_resisc45_stats else "imagenet"} \
     --output "$SCENIC_TRAIN_OUTPUT" \
     --epochs "$SCENIC_TRAIN_EPOCHS" \
     --batch-size "$SCENIC_TRAIN_BATCH_SIZE" \
@@ -286,7 +377,7 @@ set +e
     --checkpoint "$SCENIC_TRAIN_OUTPUT" \
     --dataset "$SCENIC_TRAIN_DATASET" \
     --output "$SCENIC_OUTPUT_ROOT/trained_inference_result.json"
-  python -m src.data_pipeline.s3 upload-prefix \
+  python -m scenicdriver.data_pipeline.s3 upload-prefix \
     --src "$SCENIC_OUTPUT_ROOT" \
     --bucket "$SCENIC_S3_BUCKET" \
     --prefix "$SCENIC_S3_OUTPUT_PREFIX" \
@@ -314,6 +405,10 @@ def initial_state(config: VastTrainConfig, offer_id: int, instance_id: int) -> d
         "instance_id": instance_id,
         "offer_id": offer_id,
         "image": config.image,
+        "runtime_identity": None,
+        "remote_deadline_seconds": config.timeout_seconds,
+        "remote_kill_after_seconds": REMOTE_KILL_AFTER_SECONDS,
+        "provider_expiry": None,
         "disk_gb": config.disk_gb,
         "allocation_attempts": config.allocation_attempts,
         "ssh_host": "",
@@ -334,6 +429,11 @@ def initial_state(config: VastTrainConfig, offer_id: int, instance_id: int) -> d
         "train_dataset": DEFAULT_TRAIN_DATASET,
         "benchmark_split_key": config.benchmark_split_key,
         "benchmark_split_csv": REMOTE_BENCHMARK_SPLIT_CSV,
+        "labels_key": config.labels_key,
+        "labels_csv": REMOTE_LABELS_CSV,
+        "classifier_checkpoint_key": config.classifier_checkpoint_key,
+        "classifier_checkpoint": REMOTE_CLASSIFIER_CHECKPOINT,
+        "use_resisc45_stats": config.use_resisc45_stats,
         "train_output": _remote_train_output(config.run_id),
         "created_at": now,
         "updated_at": now,
@@ -348,9 +448,36 @@ def launch_remote_training(target: SshTarget, state: dict, script: str) -> None:
     lifecycle_dir = str(state["remote_lifecycle_dir"])
     pid_file = str(state["remote_pid_file"])
     log_path = f"{lifecycle_dir}/train.log"
+    deadline_seconds = int(state["remote_deadline_seconds"])
+    # Keep the completion recorder outside timeout's process group so deadline
+    # failures remain recoverable even after SIGKILL of the training tree.
+    supervisor = f"""set +e
+timeout --kill-after={REMOTE_KILL_AFTER_SECONDS}s {deadline_seconds}s bash -lc {shlex.quote(script)}
+code=$?
+if [[ "$code" -ne 0 ]]; then
+  printf '%s\\n' "$code" > {shlex.quote(lifecycle_dir + "/exit_code.txt")}
+  python - {shlex.quote(lifecycle_dir)} "$code" <<'PY'
+import json
+from pathlib import Path
+import sys
+import time
+lifecycle = Path(sys.argv[1])
+identity_path = lifecycle.parent / "runtime_identity.json"
+payload = {{
+    "status": "failed",
+    "exit_code": int(sys.argv[2]),
+    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "remote_deadline_seconds": {deadline_seconds},
+    "runtime_identity": json.loads(identity_path.read_text()) if identity_path.exists() else None,
+}}
+(lifecycle / "failed.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\\n")
+PY
+fi
+exit "$code"
+"""
     remote_command = (
-        f"mkdir -p {shlex.quote(lifecycle_dir)} && "
-        f"{{ nohup bash -lc {shlex.quote(script)} </dev/null >> {shlex.quote(log_path)} 2>&1 & "
+        f"command -v timeout >/dev/null && mkdir -p {shlex.quote(lifecycle_dir)} && "
+        f"{{ nohup bash -lc {shlex.quote(supervisor)} </dev/null >> {shlex.quote(log_path)} 2>&1 & "
         f"echo $! > {shlex.quote(pid_file)}; }}"
     )
     ssh(target, remote_command)
@@ -420,6 +547,10 @@ def copy_training_artifacts(state: dict, *, required: bool) -> None:
     remote_path = str(state["remote_output_root"]).rstrip("/") + "/"
     if not copy_remote_path(target, remote_path, local_dir, required=required) and required:
         raise RuntimeError(f"required training artifacts were not recovered from {remote_path}")
+    identity_path = local_dir / "runtime_identity.json"
+    if identity_path.is_file():
+        state["runtime_identity"] = json.loads(identity_path.read_text(encoding="utf-8"))
+        write_state(state)
 
 
 def destroy_recorded_instance(state: dict) -> bool:
@@ -439,6 +570,9 @@ def _config_from_args(args: argparse.Namespace) -> VastTrainConfig:
         run_id=run_id,
         train_dataset_key=args.train_dataset_key,
         benchmark_split_key=args.benchmark_split_key,
+        labels_key=args.labels_key,
+        classifier_checkpoint_key=args.classifier_checkpoint_key,
+        use_resisc45_stats=args.use_resisc45_stats,
         s3_bucket=s3_bucket,
         s3_data_prefix=args.s3_data_prefix,
         s3_models_prefix=args.s3_models_prefix,
@@ -477,12 +611,21 @@ def _check_run_preconditions(config: VastTrainConfig) -> None:
     _readable_file(config.identity_file, "identity file")
     _readable_file(config.ssh_public_key, "ssh public key")
     _readable_file(config.local_secrets_env_file, "local secrets env file")
+    image_name = config.image.rsplit("/", 1)[-1]
+    if not config.image.strip() or ("@" not in image_name and (":" not in image_name or image_name.endswith(":latest"))):
+        raise SystemExit("--image must specify a version tag or digest, not implicit or explicit latest")
+    if config.timeout_seconds < 1:
+        raise SystemExit("--timeout-seconds must be positive")
     if not config.s3_bucket.strip():
         raise SystemExit("--s3-bucket or SCENIC_S3_BUCKET is required")
     if not config.train_dataset_key.strip():
         raise SystemExit("--train-dataset-key is required")
     if not config.benchmark_split_key.strip():
         raise SystemExit("--benchmark-split-key is required")
+    if not config.labels_key.strip():
+        raise SystemExit("--labels-key is required")
+    if not config.classifier_checkpoint_key.strip():
+        raise SystemExit("--classifier-checkpoint-key is required")
     if not config.validation_checkpoint_key.strip():
         raise SystemExit("--validation-checkpoint-key is required")
     if not config.validation_checkpoint_key.startswith(config.s3_models_prefix):
@@ -610,6 +753,9 @@ def _provision_and_launch(config: VastTrainConfig, attempt: int) -> tuple[dict, 
         # From here the detached training may exist remotely even when the launch
         # acknowledgement is lost: persist the boundary before firing.
         state["launch_attempted"] = True
+        state["remote_deadline_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + config.timeout_seconds)
+        )
         write_state(state)
         launch_remote_training(target, state, script)
         state["launch_outcome"] = "launched"
@@ -734,7 +880,7 @@ def handle_validate(args: argparse.Namespace) -> int:
     import numpy as np
     import torch
 
-    from src.scenic_scorer.regression import ScenicRegressionModel, ScenicScoreDataset
+    from scenicdriver.scenic_scorer.regression import ScenicRegressionModel, ScenicScoreDataset
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA validation requested but CUDA is unavailable")
     checkpoint = Path(args.checkpoint)
@@ -827,6 +973,11 @@ def handle_validate(args: argparse.Namespace) -> int:
         "dimensions": actual_dimensions,
         "prediction": float(prediction.reshape(-1)[0].item()),
     }
+    identity_path = os.environ.get("SCENIC_OUTPUT_ROOT")
+    if identity_path:
+        payload["runtime_identity"] = json.loads(
+            (Path(identity_path) / "runtime_identity.json").read_text(encoding="utf-8")
+        )
     if args.output:
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -847,13 +998,19 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Exact S3 key of the benchmark split CSV whose val/test identities are excluded from training",
     )
+    run.add_argument("--labels-key", required=True, help="Exact S3 key of the labels CSV used for feature export")
+    run.add_argument("--classifier-checkpoint-key", required=True, help="Exact S3 key of the classifier used for feature export")
+    run.add_argument(
+        "--use-resisc45-stats", action=argparse.BooleanOptionalAction, default=True,
+        help="Assert classifier checkpoint normalization (false asserts ImageNet); never override its contract",
+    )
     run.add_argument("--s3-bucket")
     run.add_argument("--s3-data-prefix", default=DEFAULT_S3_DATA_PREFIX)
     run.add_argument("--s3-models-prefix", default=DEFAULT_S3_MODELS_PREFIX)
     run.add_argument("--validation-checkpoint-key", default=DEFAULT_VALIDATION_CHECKPOINT_KEY)
     run.add_argument("--s3-output-prefix")
     run.add_argument("--run-id")
-    run.add_argument("--image", default=DEFAULT_IMAGE)
+    run.add_argument("--image", default=DEFAULT_IMAGE, help="Publish-once version tag or registry digest")
     offer = run.add_mutually_exclusive_group()
     offer.add_argument("--offer-query", default=DEFAULT_OFFER_QUERY)
     offer.add_argument("--offer-id", type=int)
@@ -863,7 +1020,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--ssh-public-key", default="~/.ssh/id_ed25519.pub")
     run.add_argument("--local-secrets-env-file", default=".secrets/aws.env")
     run.add_argument("--remote-env-file", default=DEFAULT_REMOTE_ENV_FILE)
-    run.add_argument("--timeout-seconds", type=int, default=1800)
+    run.add_argument(
+        "--timeout-seconds", type=int, default=1800,
+        help="Remote training/upload deadline and local provisioning/poll timeout (seconds)",
+    )
     run.add_argument("--poll-seconds", type=int, default=30)
     run.add_argument("--epochs", type=int, default=40)
     run.add_argument("--batch-size", type=int, default=128)

@@ -10,7 +10,9 @@ This is the canonical forward plan. Completed experiment details belong in the r
 
 ## Model quality
 
-The promoted v6 learned regressor remains the baseline. Its metrics and provenance are recorded in the [ML research log](research/ml-research-log.md).
+Masswhites v6 was the promoted baseline in the historical Masswhites era; its measurements and provenance remain in the [canonical ML research log](research/ml-research-log.md), not as metrics for the current deployment.
+
+The current default deployment in [`config/app_regions.json`](../config/app_regions.json) is New England North with Prompt Two exp02 run `prompt_two_candidate_exp02_fresh_test20_20260810` and checkpoint `data/processed/regression/checkpoints/0a165e429c8ac050524c7da409dd533d2de8849600c5dd8605aa1a1024d823e9.pt`. The route-enabled Northeast Expanded entry uses run `prompt_two_candidate_exp02_expanded_20260810` and declares no region-local checkpoint override. The legacy Masswhites entry retains its v6 checkpoint with route planning disabled; it is not the current default model.
 
 - Expand weakly supervised regional training data without making new human labels the immediate bottleneck.
 - Compare the current RESISC-based feature recipe with a geospatial foundation embedding on the same labels and split.

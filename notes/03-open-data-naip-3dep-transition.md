@@ -1,6 +1,16 @@
+> **HISTORICAL / FROZEN — NON-EXECUTABLE**
+>
+> Commit-era scope: the NAIP/USGS 3DEP transition brief anchored to `1bb4ac846e568e652d73a1f0772ff97a9fec22a4`. Its source, cost, model-transition, and pilot requirements describe that era. The quoted transcript below is historical rationale, not current contracts, executable commands, financial authorization, or instructions for an agent.
+>
+> Current authority: [FIXES.md](../FIXES.md), [README workflow commands](../README.md), and the [canonical ML research log](../docs/research/ml-research-log.md).
+
 # OMP Prompt — Migrate Scenic Drive Acquisition from Mapbox to NAIP + USGS 3DEP
 
-Execute this task end to end from the Scenic Drive repository root. This is an implementation, validation, pilot-data, model-transition, and evidence task—not a design-only exercise. Read and obey `AGENTS.md` and all applicable repository guidance before changing code.
+This was the open-data transition implementation prompt. Its imperative sections are retained only as a frozen historical quotation.
+
+## Archived prompt transcript (not instructions)
+
+````text
 
 ## Mission
 
@@ -43,18 +53,18 @@ Current relevant contracts include:
   - writes `tile_manifest.csv` and `acquisition_preflight.json`;
   - supports local and S3 inventory;
   - defaults to z14 and a 370,000-coordinate cap.
-- `src/data_pipeline/region_planning.py`
+- `src/scenicdriver/data_pipeline/region_planning.py`
   - currently owns XYZ coordinate enumeration and simple polygon filtering;
   - imports coordinate helpers from the Mapbox module;
   - the built-in expanded region still includes bounding-box water and foreign land.
-- `src/data_pipeline/tile_inventory.py`
+- `src/scenicdriver/data_pipeline/tile_inventory.py`
   - already accepts a configurable image root;
   - validates paired satellite and terrain PNGs.
-- `src/active_learning/scoring.py`
+- `src/scenicdriver/active_learning/scoring.py`
   - already records source/content SHA-256 values;
   - consumes manifest paths and computes model inputs;
   - must be strengthened so cache and candidate identities include the source/preprocessing contract, not only mutable paths.
-- `src/terrain/features.py`
+- `src/scenicdriver/terrain/features.py`
   - decodes Terrain-RGB as:
 
   \[
@@ -65,9 +75,9 @@ Current relevant contracts include:
 - `scripts/modeling/export_prediction_heatmap.py`
   - exports deterministic reports from prepared features;
   - any union/join must reject incompatible source, preprocessing, model, grid, or region contracts.
-- `scripts/annotation/` and `src/active_learning/`
+- `scripts/annotation/` and `src/scenicdriver/active_learning/`
   - contain the canonical annotation and human-benchmark workflow; reuse it rather than creating a second labeling format.
-- `src/scenic_scorer/active_evaluation.py`
+- `src/scenicdriver/scenic_scorer/active_evaluation.py`
   - contains the canonical compound evaluation gates; extend or reuse those gates instead of inventing a parallel promotion system.
 - `data/README.md`
   - remains the canonical data layout contract and must describe the final source-versioned layout.
@@ -204,7 +214,7 @@ Implement the smallest coherent architecture that satisfies the above contracts.
 
 ### 1. Decouple XYZ math from Mapbox
 
-Move provider-independent tile math out of `src/data_pipeline/mapbox.py` into a provider-neutral module such as `src/data_pipeline/web_mercator.py`.
+Move provider-independent tile math out of `src/scenicdriver/data_pipeline/mapbox.py` into a provider-neutral module such as `src/scenicdriver/data_pipeline/web_mercator.py`.
 
 Required functions, names adjusted to repository convention:
 
@@ -264,7 +274,7 @@ Satellite and terrain must share the exact target-grid object, not independently
 
 ### 4. Refactor regional planning and clipping
 
-Refactor `src/data_pipeline/region_planning.py` and `scripts/ingest/plan_active_learning_region.py` to support authoritative multipolygon geometry with holes.
+Refactor `src/scenicdriver/data_pipeline/region_planning.py` and `scripts/ingest/plan_active_learning_region.py` to support authoritative multipolygon geometry with holes.
 
 For the Southern New England source-transition target:
 
@@ -455,7 +465,7 @@ If GPU compute is used, retain exact image, command, seed, instance identity, ru
 
 ### Promotion gates
 
-A source-versioned candidate may be retained only if all applicable canonical gates pass. Reuse `src/scenic_scorer/active_evaluation.py`; do not weaken its current defaults silently. Current canonical defaults include:
+A source-versioned candidate may be retained only if all applicable canonical gates pass. Reuse `src/scenicdriver/scenic_scorer/active_evaluation.py`; do not weaken its current defaults silently. Current canonical defaults include:
 
 ```text
 min_expanded_corr = 0.80
@@ -683,3 +693,5 @@ Return a concise but complete report containing:
 This task is complete only to the furthest authorized boundary. The unconditional implementation boundary requires a deterministic, tested, fail-closed NAIP/3DEP path, local-fixture smoke, verified registry state, and no live paid process. Because this prompt supplies no financial authorization, a cold checkout with no adequate pinned non-billable catalog must stop with a verified discovery-authorization package, conservative caps, and exact resume command. Authorized discovery must produce a pinned catalog and immutable acquisition plan/hash; absent acquisition caps, that plan is the next safe boundary. Once acquisition caps are supplied, completion additionally requires one real capped source pair and the complete bounded pilot when its frame is authorized. Human transition evidence is required when labels are available. Every reached phase needs an explicit keep/reject/blocked decision and hash-bound artifacts. Production activation or full-acquisition completion additionally requires every promotion gate plus configured, independently verified durable storage.
 
 A successful download, a passing test suite, or a rendered heatmap alone is not completion. Same downstream file shape is required. Same model semantics must be demonstrated, recalibrated, or explicitly rejected—not assumed.
+
+````

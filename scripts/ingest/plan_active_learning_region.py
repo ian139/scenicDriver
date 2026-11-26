@@ -37,29 +37,29 @@ from PIL import Image
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.active_learning.common import validate_run_name  # noqa: E402
-from src.active_learning.water import (  # noqa: E402
+from scenicdriver.active_learning.common import validate_run_name  # noqa: E402
+from scenicdriver.active_learning.water import (  # noqa: E402
     MAX_SELECTABLE_WATER_FRACTION,
     compute_satellite_water_fraction,
     evaluate_water_status,
     WATER_FILTER_STATUS_EXCESSIVE,
 )
-from src.data_pipeline.region_planning import (  # noqa: E402
-    get_builtin_region_spec,
+from scenicdriver.data_pipeline.region_planning import (  # noqa: E402
     parse_and_validate_region_spec,
 )
-from src.data_pipeline.tile_inventory import (  # noqa: E402
+from scenicdriver.data_pipeline.tile_inventory import (  # noqa: E402
     build_inventory_report,
     scan_tile_inventory,
 )
-from src.data_pipeline.web_mercator import (  # noqa: E402
+from scenicdriver.data_pipeline.web_mercator import (  # noqa: E402
     tile_bounds_wgs84,
     tile_to_lat_lon_center,
 )
-from src.terrain.features import (  # noqa: E402
+from scenicdriver.terrain.features import (  # noqa: E402
     compute_terrain_sea_level_fraction,
     compute_terrain_valid_mask,
 )
@@ -113,7 +113,11 @@ PLANNING_SCHEMA_VERSION = MANIFEST_SCHEMA_VERSION
 
 def _load_spec(path: str | None) -> dict[str, Any]:
     if path is None:
-        return get_builtin_region_spec()
+        raise ValueError(
+            "--region-spec is required for planning; use "
+            "--region-spec config/data_sources/regions_v1.json "
+            "(app bounds are canonical in config/app_regions.json)"
+        )
     with open(path, "r", encoding="utf-8") as stream:
         return json.load(stream)
 
@@ -979,7 +983,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None, help="Plan-mode run slug")
     parser.add_argument(
         "--region-spec",
-        help="Versioned JSON region specification; defaults to the built-in spec",
+        help=(
+            "Required planning JSON: config/data_sources/regions_v1.json; "
+            "app bounds are canonical in config/app_regions.json"
+        ),
     )
     parser.add_argument("--imagery-source", default=SUPPORTED_IMAGERY_SOURCE)
     parser.add_argument("--terrain-source", default=SUPPORTED_TERRAIN_SOURCE)
@@ -1040,7 +1047,19 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help=f"Bounded concurrent processing workers (1..{MAX_WORKERS})",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (
+        not args.execute_plan
+        and not args.discover_raw_catalogs
+        and not args.discover_catalog_metadata
+        and not args.region_spec
+    ):
+        parser.error(
+            "--region-spec is required for planning; use "
+            "--region-spec config/data_sources/regions_v1.json "
+            "(app bounds are canonical in config/app_regions.json)"
+        )
+    return args
 
 
 def main() -> None:

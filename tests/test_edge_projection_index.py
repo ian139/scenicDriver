@@ -11,15 +11,15 @@ from pathlib import Path
 import pytest
 import numpy as np
 
-from src.route_planner import _edge_projection as edge_projection_module
-from src.route_planner._edge_projection import (
+from scenicdriver.route_planner import _edge_projection as edge_projection_module
+from scenicdriver.route_planner._edge_projection import (
     EdgeProjectionIndex,
     _EPI_HEADER_SIZE,
     _EPI_SECTION_DESCRIPTOR_SIZE,
     _EPI_VERSION,
     _NUM_SECTIONS,
 )
-from src.route_planner.graph import Edge, Node, RoadGraph
+from scenicdriver.route_planner.graph import Edge, Node, RoadGraph
 
 
 def _sidecar_path(path: Path) -> Path:

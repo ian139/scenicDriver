@@ -12,11 +12,11 @@ def _():
     _mo.md(
         """
         # Training Hub (Marimo-only)
-        This repo now uses two separate notebooks for training:
-        - `notebooks/classifier.mo.py` (Stage 1: RESISC45 classifier)
-        - `notebooks/regression.mo.py` (Stage 2/3: heuristic labels + multitask)
-        - `notebooks/learned_scoring.mo.py` (Step 3: feature export + baseline regressor)
-        - `notebooks/annotate_scenic.mo.py` (manual scenic labeling set)
+        This hub links four supported training and annotation notebooks:
+        - `notebooks/classifier.mo.py` (RESISC45 landscape classifier training)
+        - `notebooks/regression.mo.py` (heuristic-label generation + multitask regression/classification training)
+        - `notebooks/learned_scoring.mo.py` (feature export + baseline regressor training and evaluation with benchmark-bound splits)
+        - `notebooks/annotate_scenic.mo.py` (manual scenic labeling)
 
         Quick start:
         - `uv run marimo edit notebooks/classifier.mo.py`

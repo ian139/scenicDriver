@@ -10,8 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.routing import build_graph_from_osm as builder
-from src.route_planner._edge_projection import EdgeProjectionIndex
-from src.route_planner.graph import Edge, Node, RoadGraph
+from scenicdriver.route_planner._edge_projection import EdgeProjectionIndex
+from scenicdriver.route_planner.graph import Edge, Node, RoadGraph
 
 
 def _args(**overrides):
@@ -66,7 +66,7 @@ def test_parser_accepts_compact_graph_format(monkeypatch) -> None:
 
 
 def test_publish_compact_graph_matches_sqlite_and_loads(tmp_path: Path) -> None:
-    from src.route_planner.graph import CompactRoadGraph
+    from scenicdriver.route_planner.graph import CompactRoadGraph
 
     graph = RoadGraph()
     graph.add_node(Node("n0", 42.0, -72.0))
@@ -1102,7 +1102,7 @@ def test_compact_publication_never_exposes_mixed_generations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.route_planner.graph import CompactRoadGraph
+    from scenicdriver.route_planner.graph import CompactRoadGraph
 
     _old_generation(tmp_path)
     output = tmp_path / "road_graph.sqlite3"

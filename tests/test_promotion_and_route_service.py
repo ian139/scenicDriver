@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -9,15 +10,15 @@ import sys
 from threading import Event, Lock
 import pytest
 
-from src.data_pipeline.web_mercator import lat_lon_to_tile
-from src.route_planner import service as route_service
-from src.route_planner.cancellation import (
+from scenicdriver.data_pipeline.web_mercator import lat_lon_to_tile
+from scenicdriver.route_planner import service as route_service
+from scenicdriver.route_planner.cancellation import (
     RoutingCancelled,
     RoutingDeadline,
     RoutingTimeout,
 )
-from src.route_planner.graph import Edge, Node, RoadGraph
-from src.route_planner.planner import Route, RouteSegment, ScenicRoutePlanner
+from scenicdriver.route_planner.graph import Edge, Node, RoadGraph
+from scenicdriver.route_planner.planner import Route, RouteSegment, ScenicRoutePlanner
 
 _SEARCH_DIAGNOSTIC_KEYS = {
     "time_limit_seconds",
@@ -37,8 +38,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def test_promote_regression_model_smoke(tmp_path: Path) -> None:
     import torch
-    from src.active_learning.common import sha256_file
-    from src.scenic_scorer.regression import ScenicRegressionModel
+    from scenicdriver.active_learning.common import sha256_file
+    from scenicdriver.scenic_scorer.regression import ScenicRegressionModel
 
     decision_json = tmp_path / "decision.json"
     registry_json = tmp_path / "model_registry.json"
@@ -172,6 +173,47 @@ def test_route_compare_service_smoke(tmp_path: Path) -> None:
     metrics = json.loads(route_metrics.read_text(encoding="utf-8"))
     assert "scenic" in metrics
     assert "score_mapping" in metrics
+    for payload in (metrics["request"], metrics["scenic"], metrics["baseline"]):
+        assert not any("scenic_weight" in key for key in payload)
+
+
+def test_route_compare_service_cli_rejects_removed_weight(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from scripts.routing import route_compare_service
+
+    argv = [
+        "route_compare_service.py",
+        "--start", "42.0", "-72.0",
+        "--end", "42.1", "-72.0",
+        "--run-name", "smoke_run",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    args = route_compare_service.parse_args()
+    assert not any("weight" in key for key in vars(args))
+    monkeypatch.setattr(sys, "argv", [*argv, "--scenic-weight", "0.5"])
+    with pytest.raises(SystemExit) as error:
+        route_compare_service.parse_args()
+    assert error.value.code == 2
+    assert "unrecognized arguments: --scenic-weight" in capsys.readouterr().err
+
+
+def test_route_request_serializes_only_applied_settings() -> None:
+    payload = {
+        "graph_geojson": "graph.geojson",
+        "start": [42.0, -72.0],
+        "end": [42.1, -72.0],
+        "avoid_highways": True,
+        "max_detour_factor": 1.5,
+        "include_baseline": False,
+        "tile_scores_json": None,
+        "tile_score_zoom": None,
+        "tile_score_fallback": None,
+        "max_snap_distance_km": None,
+    }
+    request = route_service.RouteRequest.from_dict(payload)
+    assert request.to_dict() == payload
+    assert set(vars(request)) == set(payload)
 
 
 def test_plan_routes_uses_unrestricted_baseline_for_filtered_scenic_cap(
@@ -222,6 +264,8 @@ def test_plan_routes_uses_unrestricted_baseline_for_filtered_scenic_cap(
         def find_scenic_route(self, **kwargs: object) -> Route:
             self.calls.append(("scenic", bool(kwargs["avoid_highways"])))
             assert kwargs["detour_reference_duration_minutes"] == pytest.approx(10.0)
+            assert kwargs["scenic_priority"] is True
+            assert not any("weight" in key for key in kwargs)
             result = route(12.0, 10.0, 8.0)
             result.fastest_duration_minutes = 10.0
             result.duration_cap_minutes = 15.0
@@ -261,10 +305,23 @@ def test_plan_routes_uses_unrestricted_baseline_for_filtered_scenic_cap(
         result["score_mapping"]["matched_ratio"]
     )
     assert diagnostics["score_mapping_coverage"] == pytest.approx(0.0)
-    assert diagnostics["requested_scenic_weight"] == pytest.approx(0.8)
-    assert diagnostics["applied_scenic_weight"] == pytest.approx(0.8)
+    for payload in (request.to_dict(), diagnostics):
+        assert not any("scenic_weight" in key for key in payload)
     scenic_metrics = result["routes"][0]["metrics"]
     baseline_metrics = result["routes"][1]["metrics"]
+    for row, feature in zip(result["routes"], result["geojson"]["features"]):
+        metrics = row["metrics"]
+        assert feature["properties"] == {
+            "route_kind": row["route_kind"],
+            "snapped_start": metrics["snapped_start"],
+            "snapped_end": metrics["snapped_end"],
+        }
+        assert feature["geometry"] is metrics["geometry"]
+        assert feature["properties"]["snapped_start"] is metrics["snapped_start"]
+        assert feature["properties"]["snapped_end"] is metrics["snapped_end"]
+    for metrics in (scenic_metrics, baseline_metrics):
+        assert not any("scenic_weight" in key for key in metrics)
+        assert not any("scenic_weight" in key for key in metrics["objective_components"])
     assert scenic_metrics["objective_value"] != pytest.approx(
         baseline_metrics["objective_value"]
     )
@@ -286,14 +343,10 @@ def test_plan_routes_uses_unrestricted_baseline_for_filtered_scenic_cap(
     assert set(search_diagnostics) == _SEARCH_DIAGNOSTIC_KEYS
     assert scenic_metrics["search_diagnostics"] == search_diagnostics
     assert set(baseline_metrics["search_diagnostics"]) == _SEARCH_DIAGNOSTIC_KEYS
-    assert (
-        result["geojson"]["features"][0]["properties"]["search_diagnostics"]
-        == scenic_metrics["search_diagnostics"]
-    )
-    assert (
-        result["geojson"]["features"][1]["properties"]["search_diagnostics"]
-        == baseline_metrics["search_diagnostics"]
-    )
+    assert scenic_metrics["requested_start"] == list(request.start)
+    assert scenic_metrics["requested_end"] == list(request.end)
+    assert baseline_metrics["requested_start"] == list(request.start)
+    assert baseline_metrics["requested_end"] == list(request.end)
 
 
 def test_best_effort_avoidance_retries_with_highway_penalty() -> None:
@@ -334,7 +387,6 @@ def test_best_effort_avoidance_retries_with_highway_penalty() -> None:
         graph_geojson="unused.geojson",
         start=(42.0, -72.0),
         end=(42.1, -72.0),
-        scenic_weight=0.8,
         avoid_highways=True,
         max_detour_factor=1.8,
     )
@@ -386,7 +438,6 @@ def test_best_effort_avoidance_retries_strict_over_unrestricted_cap() -> None:
         graph_geojson="unused.geojson",
         start=(42.0, -72.0),
         end=(42.1, -72.0),
-        scenic_weight=0.8,
         avoid_highways=True,
         max_detour_factor=1.8,
     )
@@ -421,8 +472,6 @@ def test_best_effort_avoidance_retries_strict_over_unrestricted_cap() -> None:
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("scenic_weight", float("nan")),
-        ("scenic_weight", float("inf")),
         ("max_detour_factor", 3.1),
         ("max_detour_factor", float("nan")),
         ("start", [91.0, 0.0]),
@@ -494,7 +543,6 @@ def test_plan_routes_without_baseline_uses_route_fastest_duration(
             start=(42.0, -72.0),
             end=(42.1, -72.0),
             include_baseline=False,
-            scenic_weight=0.5,
             max_detour_factor=1.5,
         )
     )
@@ -880,6 +928,112 @@ def test_plan_routes_caches_graph_and_tile_parsing_and_preserves_response_shape(
     assert second["diagnostics"]["tile_score_cache_hit"] is False
     assert second["diagnostics"]["scored_graph_cache_hit"] is False
     assert second["score_mapping"] == first["score_mapping"]
+    for response in (first, second):
+        metrics = response["routes"][0]["metrics"]
+        feature = response["geojson"]["features"][0]
+        assert feature["properties"] == {
+            "route_kind": "scenic",
+            "snapped_start": metrics["snapped_start"],
+            "snapped_end": metrics["snapped_end"],
+        }
+        assert feature["geometry"] is metrics["geometry"]
+        assert feature["properties"]["snapped_start"] is metrics["snapped_start"]
+        assert feature["properties"]["snapped_end"] is metrics["snapped_end"]
+        assert response["diagnostics"]["planning_elapsed_ms"] >= 0.0
+    for field in (
+        "graph_load_elapsed_ms",
+        "tile_score_load_elapsed_ms",
+        "score_application_elapsed_ms",
+    ):
+        assert second["diagnostics"][field] == 0.0
+    cached_response = next(iter(route_service._ROUTE_RESPONSE_CACHE.values()))
+    assert not any(
+        name.endswith(("_cache_hit", "_elapsed_ms"))
+        for name in cached_response["diagnostics"]
+    )
+
+
+@pytest.mark.parametrize("include_baseline", [False, True])
+def test_plan_routes_cache_isolates_mutations_and_preserves_geometry_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    include_baseline: bool,
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    _write_cache_graph(graph_path)
+    route_service.clear_route_caches()
+    planning_calls = 0
+
+    class FakePlanner:
+        def __init__(self, *, graph: object) -> None:
+            del graph
+
+        def find_scenic_route(self, **kwargs: object) -> Route:
+            nonlocal planning_calls
+            del kwargs
+            planning_calls += 1
+            return _cache_test_route(8.0)
+
+        def find_fastest_route(self, **kwargs: object) -> Route:
+            del kwargs
+            return _cache_test_route(1.0)
+
+    monkeypatch.setattr(route_service, "ScenicRoutePlanner", FakePlanner)
+    request = route_service.RouteRequest(
+        graph_geojson=str(graph_path),
+        start=(42.0, -72.0),
+        end=(42.1, -72.0),
+        include_baseline=include_baseline,
+    )
+    first = route_service.plan_routes(request)
+    expected = deepcopy(first)
+
+    def mutate(response: dict[str, object]) -> None:
+        for row, feature in zip(response["routes"], response["geojson"]["features"]):
+            metrics = row["metrics"]
+            assert metrics["geometry"] is feature["geometry"]
+            assert metrics["snapped_start"] is feature["properties"]["snapped_start"]
+            assert metrics["snapped_end"] is feature["properties"]["snapped_end"]
+            feature["geometry"]["coordinates"][0][0] = 0.0
+            metrics["segment_identity"][0]["scenic_score"] = -1.0
+            metrics["edge_ids"].append("caller-mutation")
+            metrics["score_provenance"]["matched_edges"] = -1
+            feature["properties"]["snapped_start"][0] = 0.0
+            metrics["snapped_end"][0] = 0.0
+            feature["properties"]["route_kind"] = "caller-mutation"
+        response["request"]["start"][0] = 0.0
+        response["score_mapping"]["matched_edges"] = -1
+        response["diagnostics"]["graph_nodes"] = -1
+        response["diagnostics"]["planning_elapsed_ms"] = -1.0
+        response["diagnostics"]["route_response_cache_hit"] = False
+
+    mutate(first)
+    second = route_service.plan_routes(request)
+    assert second["routes"] == expected["routes"]
+    assert second["geojson"] == expected["geojson"]
+    assert second["request"] == expected["request"]
+    assert second["score_mapping"] == expected["score_mapping"]
+    assert second["diagnostics"]["graph_nodes"] == expected["diagnostics"]["graph_nodes"]
+    assert second["diagnostics"]["planning_elapsed_ms"] >= 0.0
+    assert second["diagnostics"]["route_response_cache_hit"] is True
+    assert (
+        second["routes"][0]["metrics"]["geometry"]
+        is not first["routes"][0]["metrics"]["geometry"]
+    )
+    mutate(second)
+    third = route_service.plan_routes(request)
+    assert third["routes"] == expected["routes"]
+    assert third["geojson"] == expected["geojson"]
+    assert third["request"] == expected["request"]
+    assert third["score_mapping"] == expected["score_mapping"]
+    assert third["diagnostics"]["graph_nodes"] == expected["diagnostics"]["graph_nodes"]
+    assert third["diagnostics"]["planning_elapsed_ms"] >= 0.0
+    assert third["diagnostics"]["route_response_cache_hit"] is True
+    for row, feature in zip(third["routes"], third["geojson"]["features"]):
+        assert row["metrics"]["geometry"] is feature["geometry"]
+        assert row["metrics"]["snapped_start"] is feature["properties"]["snapped_start"]
+        assert row["metrics"]["snapped_end"] is feature["properties"]["snapped_end"]
+    assert planning_calls == 1
 
 
 def test_plan_routes_invalidates_graph_and_tile_caches_when_files_change(
@@ -1643,3 +1797,147 @@ def test_route_to_feature_checks_during_waypoint_materialization() -> None:
     with pytest.raises(RoutingTimeout, match="waypoint timeout"):
         route_service.route_to_feature(route, "scenic", deadline=deadline)
     assert deadline.checks >= 1
+
+
+def _sqlite_cache_graph(path: Path, edge_id: str) -> None:
+    graph = RoadGraph()
+    graph.add_node(Node(id="A", lat=42.0, lon=-72.0))
+    graph.add_node(Node(id="B", lat=42.1, lon=-72.0))
+    graph.add_edge(
+        Edge(
+            id=edge_id,
+            start_node_id="A",
+            end_node_id="B",
+            distance_km=11.0,
+            scenic_score=5.0,
+        )
+    )
+    graph.save(path)
+
+
+def test_sqlite_graph_swapped_during_row_reading_is_reloaded_not_poisoned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    from scenicdriver.route_planner import graph as graph_module
+
+    graph_path = tmp_path / "road_graph.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    _sqlite_cache_graph(graph_path, "old")
+    _sqlite_cache_graph(replacement, "new")
+    route_service.clear_route_caches()
+    original_edges = graph_module._iter_sqlite_edges
+    swaps = 0
+
+    def swapping_edges(*args, **kwargs):
+        nonlocal swaps
+        for index, row in enumerate(original_edges(*args, **kwargs)):
+            if index == 0 and swaps == 0:
+                swaps += 1
+                os.replace(replacement, graph_path)
+            yield row
+
+    monkeypatch.setattr(graph_module, "_iter_sqlite_edges", swapping_edges)
+    graph, path_key, signature, hit = route_service._load_cached_graph(graph_path)
+
+    assert swaps == 1
+    assert hit is False
+    assert list(graph.edges) == ["new"]
+    assert signature == route_service._file_signature(graph_path)
+    assert list(route_service._GRAPH_CACHE) == [(path_key, signature)]
+    assert list(route_service._GRAPH_CACHE[(path_key, signature)].edges) == ["new"]
+
+
+def test_graph_swapped_after_every_read_raises_and_caches_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph_path = tmp_path / "graph.geojson"
+    staging = tmp_path / "staging.geojson"
+    _write_cache_graph(graph_path, scenic_score=1.0)
+    route_service.clear_route_caches()
+    original_loader = route_service._load_graph
+    loads = 0
+
+    def swapping_loader(path: Path, **kwargs: object) -> object:
+        nonlocal loads
+        loads += 1
+        graph = original_loader(path, **kwargs)
+        _write_cache_graph(staging, scenic_score=float(loads + 1))
+        staging.replace(graph_path)
+        return graph
+
+    monkeypatch.setattr(route_service, "_load_graph", swapping_loader)
+    with pytest.raises(route_service.RouteAssetChangedError, match="changed while loading"):
+        route_service._load_cached_graph(graph_path)
+    assert loads == 2
+    assert not route_service._GRAPH_CACHE
+
+
+def test_tile_report_swapped_during_read_is_reloaded_not_poisoned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    tile_path = tmp_path / "tiles.json"
+    staging = tmp_path / "staging.json"
+    _write_cache_tiles(tile_path, 2.0)
+    _write_cache_tiles(staging, 9.0)
+    route_service.clear_route_caches()
+    original_loader = route_service.load_tile_scores
+    swaps = 0
+
+    def swapping_loader(path: Path, **kwargs: object) -> object:
+        nonlocal swaps
+        result = original_loader(path, **kwargs)
+        if swaps == 0:
+            swaps += 1
+            staging.replace(tile_path)
+        return result
+
+    monkeypatch.setattr(route_service, "load_tile_scores", swapping_loader)
+    (
+        score_map,
+        _zoom,
+        report_sha256,
+        path_key,
+        signature,
+        hit,
+    ) = route_service._load_cached_tile_scores(tile_path)
+
+    assert swaps == 1
+    assert hit is False
+    assert set(score_map.values()) == {9.0}
+    assert report_sha256 == hashlib.sha256(tile_path.read_bytes()).hexdigest()
+    assert signature == route_service._file_signature(tile_path)
+    assert list(route_service._TILE_SCORE_CACHE) == [(path_key, signature)]
+    cached_map, _cached_zoom, cached_sha = route_service._TILE_SCORE_CACHE[
+        (path_key, signature)
+    ]
+    assert set(cached_map.values()) == {9.0}
+    assert cached_sha == report_sha256
+
+
+def test_tile_report_swapped_after_every_read_raises_and_caches_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tile_path = tmp_path / "tiles.json"
+    staging = tmp_path / "staging.json"
+    _write_cache_tiles(tile_path, 2.0)
+    route_service.clear_route_caches()
+    original_loader = route_service.load_tile_scores
+    loads = 0
+
+    def swapping_loader(path: Path, **kwargs: object) -> object:
+        nonlocal loads
+        loads += 1
+        result = original_loader(path, **kwargs)
+        _write_cache_tiles(staging, float(loads + 2))
+        staging.replace(tile_path)
+        return result
+
+    monkeypatch.setattr(route_service, "load_tile_scores", swapping_loader)
+    with pytest.raises(route_service.RouteAssetChangedError, match="changed while loading"):
+        route_service._load_cached_tile_scores(tile_path)
+    assert loads == 2
+    assert not route_service._TILE_SCORE_CACHE

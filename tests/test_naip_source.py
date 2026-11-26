@@ -7,7 +7,7 @@ import json
 import unittest
 from typing import Any
 
-from src.data_pipeline.naip import (
+from scenicdriver.data_pipeline.naip import (
     ALLOWED_STATES,
     CatalogValidationError,
     CrossStateSubstitutionError,

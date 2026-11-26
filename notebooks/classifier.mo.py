@@ -31,7 +31,7 @@ def _():
         batch_size: int = 32
         lr: float = 1e-4
         num_workers: int = 0
-        use_resisc45_stats: bool = True
+        normalization: str = "resisc45"
         seed: int = 42
 
     cfg = Config()
@@ -49,7 +49,7 @@ def _(cfg):
     if str(_project_root) not in _sys.path:
         _sys.path.insert(0, str(_project_root))
 
-    from src.classifier.train import train
+    from scenicdriver.classifier.train import train
 
     _resisc_dir = Path(cfg.resisc45_dir)
     if not _resisc_dir.exists():
@@ -62,7 +62,7 @@ def _(cfg):
         batch_size=cfg.batch_size,
         learning_rate=cfg.lr,
         num_workers=cfg.num_workers,
-        use_resisc45_stats=cfg.use_resisc45_stats,
+        normalization=cfg.normalization,
         seed=cfg.seed,
     )
 

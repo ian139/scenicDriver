@@ -26,6 +26,7 @@ def _():
         _safe_image_path as safe_image_path,
         _sample_stratified as sample_stratified,
     )
+    from scenicdriver.active_learning.finalize import UNUSABLE_REASONS
 
     return (
         AnnotatorState,
@@ -33,6 +34,7 @@ def _():
         Image,
         Path,
         WebAnnotatorConfig,
+        UNUSABLE_REASONS,
         dataclass,
         mo,
         os,
@@ -159,7 +161,7 @@ def _(Path, annotator_state, config, loaded_batch, pd, safe_image_path, sample_s
 
 
 @app.cell
-def _(annotator_id, batch_df, done_paths, labels_df, mo):
+def _(UNUSABLE_REASONS, annotator_id, batch_df, done_paths, labels_df, mo):
     mo.md(
         f"Labels pool: **{len(labels_df)}** tiles | Sampled pending for `{annotator_id}`: "
         f"**{len(batch_df)}** | Annotated by `{annotator_id}` (any batch): **{len(done_paths)}**"
@@ -204,6 +206,11 @@ def _(annotator_id, batch_df, done_paths, labels_df, mo):
     ui_score = mo.ui.number(label="Scenic Score (0-10)", value=5.0, step=0.1, start=0, stop=10)
     ui_conf = mo.ui.dropdown(label="Confidence", options=["high", "medium", "low"], value="medium")
     ui_skip = mo.ui.checkbox(label="Skip", value=False)
+    ui_unusable_reason = mo.ui.dropdown(
+        label="Unusable Reason (required when skipping)",
+        options=["", *UNUSABLE_REASONS],
+        value="",
+    )
     ui_notes = mo.ui.text_area(label="Notes", value="", rows=3)
 
     ui_save_click = mo.ui.run_button(label="Save Annotation", kind="success")
@@ -215,12 +222,21 @@ def _(annotator_id, batch_df, done_paths, labels_df, mo):
             ui_score,
             ui_conf,
             ui_skip,
+            ui_unusable_reason,
             ui_notes,
             ui_save_click,
         ]
     )
     controls
-    return current_index, ui_conf, ui_notes, ui_save_click, ui_score, ui_skip
+    return (
+        current_index,
+        ui_conf,
+        ui_notes,
+        ui_save_click,
+        ui_score,
+        ui_skip,
+        ui_unusable_reason,
+    )
 
 
 @app.cell
@@ -262,19 +278,23 @@ def _(
     ui_save_click,
     ui_score,
     ui_skip,
+    ui_unusable_reason,
 ):
     def _value(widget):
         return widget.value() if callable(widget.value) else widget.value
 
     save_result = None
     if bool(_value(ui_save_click)) and image_path:
+        _skip = bool(_value(ui_skip))
+        _reason = _value(ui_unusable_reason)
         try:
             save_result = annotator_state.save_annotation(
                 {
                     "image_path": image_path,
                     "scenic_human": float(_value(ui_score)),
                     "confidence": str(_value(ui_conf)),
-                    "skip": bool(_value(ui_skip)),
+                    "skip": _skip,
+                    "unusable_reason": _reason if _skip else None,
                     "notes": str(_value(ui_notes)),
                 }
             )

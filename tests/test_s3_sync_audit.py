@@ -33,7 +33,7 @@ def test_lifecycle_rule_targets_canonical_raw_images_prefix() -> None:
 
 
 def test_labeler_s3_prefix_from_local_dir_matches_data_contract() -> None:
-    from src.heuristics.labeler import _s3_prefix_from_local_dir
+    from scenicdriver.heuristics.labeler import _s3_prefix_from_local_dir
 
     assert (
         _s3_prefix_from_local_dir(Path("data/raw/images/satellite/z14/masswhites"))
@@ -46,7 +46,7 @@ def test_labeler_s3_prefix_from_local_dir_matches_data_contract() -> None:
 
 
 def test_relative_paths_reject_non_raw_s3_keys() -> None:
-    from src.heuristics.labeler import S3ImageRef, _relative_paths_or_raise
+    from scenicdriver.heuristics.labeler import S3ImageRef, _relative_paths_or_raise
 
     with pytest.raises(ValueError, match="raw/"):
         _relative_paths_or_raise(
@@ -119,7 +119,7 @@ def test_s3_sync_requires_bucket(tmp_path: Path) -> None:
 
 
 def test_iter_objects_uses_canonical_paginator_across_pages() -> None:
-    from src.data_pipeline.s3 import _iter_objects
+    from scenicdriver.data_pipeline.s3 import _iter_objects
 
     calls: list[tuple[str, dict[str, str]]] = []
 
@@ -150,7 +150,7 @@ def test_report_thumbnails_use_explicit_s3_raw_dir_bucket(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from src.heuristics.report import _attach_thumbnails
+    from scenicdriver.heuristics.report import _attach_thumbnails
 
     png_buffer = BytesIO()
     Image.new("RGB", (4, 4), color="green").save(png_buffer, format="PNG")
@@ -349,7 +349,7 @@ def test_regression_dataset_sample_weight_preserves_explicit_and_missing_behavio
 
 
 def test_classifier_resume_requires_canonical_best_acc() -> None:
-    from src.classifier.train import _best_acc_from_checkpoint
+    from scenicdriver.classifier.train import _best_acc_from_checkpoint
 
     assert _best_acc_from_checkpoint({"best_acc": 0.8, "val_acc": 0.1}) == 0.8
     with pytest.raises(ValueError, match="required 'best_acc'"):
@@ -358,7 +358,7 @@ def test_classifier_resume_requires_canonical_best_acc() -> None:
 
 def test_upload_prefix_verified_success(tmp_path: Path) -> None:
     import hashlib
-    from src.data_pipeline.s3 import upload_prefix
+    from scenicdriver.data_pipeline.s3 import upload_prefix
 
     local_file = tmp_path / "test.bin"
     data = b"hello s3 verification"
@@ -386,7 +386,7 @@ def test_upload_prefix_verified_success(tmp_path: Path) -> None:
 
 
 def test_upload_prefix_missing_remote_object(tmp_path: Path) -> None:
-    from src.data_pipeline.s3 import upload_prefix
+    from scenicdriver.data_pipeline.s3 import upload_prefix
 
     local_file = tmp_path / "missing.bin"
     local_file.write_bytes(b"payload")
@@ -403,7 +403,7 @@ def test_upload_prefix_missing_remote_object(tmp_path: Path) -> None:
 
 
 def test_upload_prefix_size_mismatch(tmp_path: Path) -> None:
-    from src.data_pipeline.s3 import upload_prefix
+    from scenicdriver.data_pipeline.s3 import upload_prefix
 
     local_file = tmp_path / "data.bin"
     local_file.write_bytes(b"payload")
@@ -420,7 +420,7 @@ def test_upload_prefix_size_mismatch(tmp_path: Path) -> None:
 
 
 def test_upload_prefix_checksum_mismatch(tmp_path: Path) -> None:
-    from src.data_pipeline.s3 import upload_prefix
+    from scenicdriver.data_pipeline.s3 import upload_prefix
 
     local_file = tmp_path / "data.bin"
     local_file.write_bytes(b"payload")
@@ -442,7 +442,7 @@ def test_upload_prefix_checksum_mismatch(tmp_path: Path) -> None:
 def test_upload_prefix_directory_deterministic_and_relative_keys(
     tmp_path: Path,
 ) -> None:
-    from src.data_pipeline.s3 import upload_prefix
+    from scenicdriver.data_pipeline.s3 import upload_prefix
 
     src_dir = tmp_path / "src"
     src_dir.mkdir()
@@ -479,7 +479,7 @@ def test_upload_prefix_directory_deterministic_and_relative_keys(
 def test_download_prefix_rejects_unsafe_keys_without_writes(
     tmp_path: Path, key: str
 ) -> None:
-    from src.data_pipeline.s3 import download_prefix
+    from scenicdriver.data_pipeline.s3 import download_prefix
 
     downloads: list[str] = []
 
@@ -507,7 +507,7 @@ def test_download_prefix_rejects_unsafe_keys_without_writes(
 def test_download_prefix_rejects_resolved_target_outside_destination(
     tmp_path: Path, symlink_kind: str
 ) -> None:
-    from src.data_pipeline.s3 import download_prefix
+    from scenicdriver.data_pipeline.s3 import download_prefix
 
     dest = tmp_path / "download"
     dest.mkdir()
@@ -546,7 +546,7 @@ def test_download_prefix_rejects_resolved_target_outside_destination(
 def test_download_prefix_writes_normal_relative_key(
     tmp_path: Path, prefix: str
 ) -> None:
-    from src.data_pipeline.s3 import download_prefix
+    from scenicdriver.data_pipeline.s3 import download_prefix
 
     key = f"{prefix.rstrip('/')}/ok/a.tif" if prefix else "ok/a.tif"
 
@@ -569,7 +569,7 @@ def test_download_prefix_writes_normal_relative_key(
 def test_inventory_does_not_attribute_or_reuse_unproven_valid_tiles(
     tmp_path: Path,
 ) -> None:
-    from src.data_pipeline.tile_inventory import (
+    from scenicdriver.data_pipeline.tile_inventory import (
         build_inventory_report,
         scan_tile_inventory,
     )
@@ -614,8 +614,8 @@ def test_inventory_reuse_requires_matching_acquisition_and_output_hashes(
 ) -> None:
     import hashlib
 
-    from src.data_pipeline.source_contracts import compute_acquisition_tile_identity
-    from src.data_pipeline.tile_inventory import scan_tile_inventory
+    from scenicdriver.data_pipeline.source_contracts import compute_acquisition_tile_identity
+    from scenicdriver.data_pipeline.tile_inventory import scan_tile_inventory
 
     row = {
         "region": "fixture",
@@ -672,7 +672,7 @@ def test_inventory_reuse_requires_matching_acquisition_and_output_hashes(
 
 
 def test_inventory_report_does_not_reuse_unproven_s3_pairs() -> None:
-    from src.data_pipeline.tile_inventory import build_inventory_report
+    from scenicdriver.data_pipeline.tile_inventory import build_inventory_report
 
     report = build_inventory_report(
         [{"satellite_s3_present": True, "terrain_s3_present": True}], {}

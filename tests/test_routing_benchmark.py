@@ -17,8 +17,8 @@ import subprocess
 
 import scripts.routing.benchmark_scenic_routing as synthetic_benchmark
 import scripts.routing.northeast_expanded_autoresearch_benchmark as autoresearch_benchmark
-from src.route_planner.graph import Edge, Node, RoadGraph, write_compact_graph
-from src.data_pipeline.web_mercator import lat_lon_to_tile
+from scenicdriver.route_planner.graph import Edge, Node, RoadGraph, write_compact_graph
+from scenicdriver.data_pipeline.web_mercator import lat_lon_to_tile
 
 import scripts.routing.production_benchmark as production_benchmark
 from scripts.routing.production_benchmark import (
@@ -28,7 +28,6 @@ from scripts.routing.production_benchmark import (
     _case_specs,
     _classify_pairs,
     _invariant_summary,
-    _evaluations_match,
     evaluate_service_response,
     parse_args,
     recompute_feature_metrics,
@@ -98,10 +97,12 @@ def _feature(
     }
 
 
-def _response(*, q: float = 0.5, kappa: float = 1.8, avoid: bool = False) -> dict[str, object]:
-    # Scenic duration=12, baseline duration=10, scenic score=8, baseline=4.
-    # objective=(1-q)*.75+q*.8=.775 for q=.5,kappa=1.8.
-    scenic_objective = (1.0 - q) * 0.75 + q * 0.8
+def _response(
+    *, q: float = 0.5, kappa: float = 1.8, avoid: bool = False,
+    scenic_priority: bool = False,
+) -> dict[str, object]:
+    # Scalarized planner fixtures use q; fixed service fixtures have no q setting.
+    scenic_objective = 0.8 if scenic_priority else (1.0 - q) * 0.75 + q * 0.8
     scenic = _feature(
         "scenic",
         score=8.0,
@@ -121,8 +122,6 @@ def _response(*, q: float = 0.5, kappa: float = 1.8, avoid: bool = False) -> dic
     for feature in (scenic, baseline):
         feature["properties"].update(
             {
-                "requested_scenic_weight": q,
-                "applied_scenic_weight": q,
                 "requested_max_detour_factor": kappa,
                 "applied_max_detour_factor": kappa,
             }
@@ -144,8 +143,8 @@ def _response(*, q: float = 0.5, kappa: float = 1.8, avoid: bool = False) -> dic
         }
     )
     return {
+        **({} if scenic_priority else {"planner_parameters": {"q": q, "scenic_priority": False}}),
         "request": {
-            "scenic_weight": q,
             "max_detour_factor": kappa,
             "avoid_highways": avoid,
             "include_baseline": True,
@@ -154,8 +153,6 @@ def _response(*, q: float = 0.5, kappa: float = 1.8, avoid: bool = False) -> dic
             "graph_cache_hit": True,
             "tile_score_cache_hit": True,
             "scored_graph_cache_hit": True,
-            "requested_scenic_weight": q,
-            "applied_scenic_weight": q,
             "requested_max_detour_factor": kappa,
             "applied_max_detour_factor": kappa,
             "avoid_highways_applied": avoid,
@@ -165,7 +162,10 @@ def _response(*, q: float = 0.5, kappa: float = 1.8, avoid: bool = False) -> dic
             "highway_preference": 0.0,
             "highway_avoidance_cost": 0.0,
             "hard_highway_count": 0,
-            "optimization_mode": "scenic_score_under_duration_cap",
+            "optimization_mode": (
+                "scenic_score_under_duration_cap" if scenic_priority
+                else "scalarized_under_duration_cap"
+            ),
             "detour_reference_duration_minutes": 10.0,
             "duration_cap_minutes": 10.0 * kappa,
             "duration_cap_satisfied": 12.0 <= 10.0 * kappa + 1e-9,
@@ -737,7 +737,7 @@ def test_avoid_highways_invariants_allow_unrestricted_baseline() -> None:
 
 
 def test_best_effort_fallback_recomputes_highway_penalty() -> None:
-    response = _response(q=1.0, kappa=1.5, avoid=True)
+    response = _response(q=1.0, kappa=1.5, avoid=True, scenic_priority=True)
     scenic = response["geojson"]["features"][0]
     scenic_properties = scenic["properties"]
     for row in scenic_properties["segment_identity"]:
@@ -760,7 +760,7 @@ def test_best_effort_fallback_recomputes_highway_penalty() -> None:
 
     evaluation = evaluate_service_response(
         response,
-        q=1.0,
+        q=None,
         kappa=1.5,
         avoid_highways=True,
         scenic_priority=True,
@@ -786,26 +786,40 @@ def test_evaluate_service_response_flags_prohibited_highway_and_q0_violation() -
         scenic_priority=False,
     )
     assert evaluation["invariants"]["prohibited_highways"] is False
-    assert evaluation["invariants"]["q0_fastest"] is False
+    assert evaluation["invariants"]["planner_q0_fastest"] is False
     assert evaluation["invariants"]["duration_cap"] is False
 
 
-def test_evaluate_service_response_allows_q0_scenic_priority() -> None:
-    response = _response(q=0.0, kappa=3.0)
+def test_evaluate_service_response_has_fixed_priority_without_q() -> None:
+    response = _response(kappa=3.0, scenic_priority=True)
     response["geojson"]["features"][0]["properties"][
         "estimated_duration_minutes"
     ] = 12.0
     response["geojson"]["features"][0]["properties"]["objective_value"] = 0.8
     evaluation = evaluate_service_response(
         response,
-        q=0.0,
+        q=None,
         kappa=3.0,
         avoid_highways=False,
         scenic_priority=True,
     )
-    assert evaluation["invariants"]["q0_fastest"] is True
+    assert "planner_q0_fastest" not in evaluation["invariants"]
     assert evaluation["status"] == "ok"
     assert evaluation["failed_invariants"] == []
+    assert evaluation["objective_mode"] == "fixed_scenic_priority"
+    assert "planner_parameters" not in response
+    assert "q" not in response["request"]
+
+
+def test_fixed_service_evaluation_rejects_planner_parameter_claim() -> None:
+    response = _response(scenic_priority=True)
+    response["planner_parameters"] = {"q": 0.5, "scenic_priority": False}
+    evaluation = evaluate_service_response(
+        response, q=None, kappa=1.8, avoid_highways=False, scenic_priority=True,
+    )
+    assert evaluation["status"] == "invalid"
+    assert "settings_consistency" in evaluation["failed_invariants"]
+    assert "planner_q0_fastest" not in evaluation["invariants"]
 
 
 def test_invariant_summary_records_cache_boundary() -> None:
@@ -972,7 +986,7 @@ def test_no_highway_free_category_accepts_successful_fallback() -> None:
             "edge_metric_recomputation",
         ),
         (
-            lambda response: response["request"].update({"scenic_weight": 0.4}),
+            lambda response: response["planner_parameters"].update({"q": 0.4}),
             "settings_consistency",
         ),
         (
@@ -1071,6 +1085,229 @@ def test_evaluator_rejects_positive_gap_same_route_proof() -> None:
     assert "no_better_reason_consistency" in evaluation["failed_invariants"]
 
 
+@pytest.mark.parametrize("upper_bound", [1.0, 0.95])
+def test_evaluator_distinguishes_universal_ceiling_from_search_certificate(
+    upper_bound: float,
+) -> None:
+    response = deepcopy(_response())
+    objective = response["geojson"]["features"][0]["properties"]["objective_value"]
+    for container in (
+        response["geojson"]["features"][0]["properties"],
+        response["routes"][0]["metrics"],
+        response["diagnostics"],
+    ):
+        container.update({
+            "exactness_status": "approximate-universal-ceiling",
+            "certified_upper_bound": upper_bound,
+            "optimality_gap": upper_bound - objective,
+            "search_diagnostics": {
+                "upper_bound_kind": "universal-ceiling",
+                "candidate_multipliers": [0.0, 0.25, 0.75, 1.5],
+            },
+        })
+    evaluation = evaluate_service_response(
+        response, q=0.5, kappa=1.8, avoid_highways=False,
+    )
+    assert evaluation["upper_bound_kind"] == "universal-ceiling"
+    assert evaluation["request_specific_optimality_certification"] is False
+    assert (evaluation["status"] == "ok") is (upper_bound == 1.0)
+    if upper_bound != 1.0:
+        assert "certification_consistency" in evaluation["failed_invariants"]
+
+
+def test_evaluator_rejects_universal_ceiling_mislabeled_as_request_specific() -> None:
+    response = deepcopy(_response())
+    objective = response["geojson"]["features"][0]["properties"]["objective_value"]
+    for container in (
+        response["geojson"]["features"][0]["properties"],
+        response["routes"][0]["metrics"],
+        response["diagnostics"],
+    ):
+        container.update({
+            "exactness_status": "approximate-universal-ceiling",
+            "certified_upper_bound": 1.0, "optimality_gap": 1.0 - objective,
+            "search_diagnostics": {"upper_bound_kind": "request-specific"},
+        })
+    evaluation = evaluate_service_response(
+        response, q=0.5, kappa=1.8, avoid_highways=False,
+    )
+    assert evaluation["status"] == "invalid"
+    assert "universal_ceiling_semantics" in evaluation["failed_invariants"]
+
+
+def test_universal_ceiling_zero_gap_is_not_counted_as_search_certification() -> None:
+    route = {
+        "exactness_status": "approximate-universal-ceiling",
+        "certified_upper_bound": 1.0, "optimality_gap": 0.0,
+    }
+    assert production_benchmark._certification_consistent(route, 1.0)
+    assert not production_benchmark._has_request_specific_certificate(route)
+
+
+@pytest.fixture(scope="module")
+def generated_quality_report() -> dict[str, Any]:
+    planner = production_benchmark.ScenicRoutePlanner
+    thresholds = (
+        planner._EXACT_ORACLE_MAX_NODES, planner._COMPILED_SCENIC_MIN_NODES,
+        planner._LARGE_GRAPH_EDGE_THRESHOLD,
+        planner._ENDPOINT_OVERLAY_MAX_NODES,
+    )
+    enumerate_optimum = planner._enumerate_simple_optimum
+    compiled_search = planner._compact_lagrangian_scenic_search
+    counts = {"oracle": 0, "compiled": 0}
+
+    def count_oracle(self, *args, **kwargs):
+        counts["oracle"] += 1
+        return enumerate_optimum(self, *args, **kwargs)
+
+    def count_compiled(self, *args, **kwargs):
+        counts["compiled"] += 1
+        return compiled_search(self, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(planner, "_enumerate_simple_optimum", count_oracle)
+        patch.setattr(planner, "_compact_lagrangian_scenic_search", count_compiled)
+        report = production_benchmark._run_generated_oracle_corpus()
+    assert counts == {"oracle": report["case_count"], "compiled": 2 * report["case_count"]}
+    assert thresholds == (
+        planner._EXACT_ORACLE_MAX_NODES, planner._COMPILED_SCENIC_MIN_NODES,
+        planner._LARGE_GRAPH_EDGE_THRESHOLD,
+        planner._ENDPOINT_OVERLAY_MAX_NODES,
+    )
+    return report
+
+
+def test_generated_oracle_fixture_inputs_are_deterministic() -> None:
+    def inputs():
+        return [
+            (
+                fixture.name, fixture.size, fixture.start, fixture.end, fixture.policy,
+                tuple(
+                    (node.id, node.lat, node.lon) for node in fixture.graph.nodes.values()
+                ),
+                tuple(
+                    (edge.id, edge.start_node_id, edge.end_node_id, edge.distance_km,
+                     edge.scenic_score, edge.speed_limit_kmh, edge.road_type)
+                    for edge in fixture.graph.edges.values()
+                ),
+            )
+            for fixture in production_benchmark._generated_oracle_fixtures()
+        ]
+    assert inputs() == inputs()
+
+
+def test_measured_gap_distribution_percentiles() -> None:
+    result = production_benchmark._gap_distribution([0.4, 0.0, 0.2, 0.1])
+    assert result["count"] == 4
+    assert result["min"] == 0.0 and result["max"] == 0.4
+    assert result["median"] == pytest.approx(0.15)
+    assert result["p95"] == pytest.approx(0.37)
+    assert result["mean"] == pytest.approx(0.175)
+    assert result["zero_count"] == 1 and result["positive_count"] == 3
+
+
+def test_generated_oracle_labels_and_gap_distribution(generated_quality_report) -> None:
+    report = generated_quality_report
+    assert report["scope"] == "generated_small_medium_fixtures"
+    assert report["production_request_corpus_exact_oracle"] is False
+    assert report["deadline_scope"] == "unbounded_generated_fixtures_no_live_deadline_guarantee"
+    assert report["oracle"] == "exhaustive_feasible_simple_paths_same_endpoint_graph_cap_policy"
+    assert report["candidate_generator"] == "production_compiled_lagrangian"
+    assert report["gap_metric"] == "exact_oracle_objective_minus_candidate_objective"
+    assert report["optimality_gap_semantics"] == (
+        "universal_ceiling_minus_candidate_objective_not_measured_gap"
+    )
+    assert report["case_count"] == 9
+    for size in ("all", "small", "medium"):
+        cases = [
+            case for case in report["cases"] if size == "all" or case["size"] == size
+        ]
+        for variant in ("legacy", "adaptive"):
+            distribution = report["measured_oracle_gap_distribution"][size][variant]
+            gaps = [case[variant]["measured_oracle_gap"] for case in cases]
+            assert distribution == production_benchmark._gap_distribution(gaps)
+            assert distribution["count"] == len(cases)
+            assert distribution["min"] <= distribution["median"] <= distribution["p95"]
+            assert distribution["p95"] <= distribution["max"]
+            assert distribution["zero_count"] + distribution["positive_count"] == len(cases)
+
+
+def test_generated_exact_corpus_compiled_candidates_do_not_regress(
+    generated_quality_report,
+) -> None:
+    report = generated_quality_report
+    assert report["acceptance"]["status"] == "pass"
+    assert report["acceptance"]["non_regression_count"] == report["case_count"]
+    assert report["acceptance"]["improved_count"] >= 2
+    for case in report["cases"]:
+        assert case["non_regression"] and case["corridor_bound_consistent"]
+        assert case["adaptive"]["objective"] + 1e-9 >= case["legacy"]["objective"]
+        assert set(case["legacy"]["candidate_multipliers"]).issubset(
+            case["adaptive"]["candidate_multipliers"]
+        )
+        for variant in ("legacy", "adaptive"):
+            candidate = case[variant]
+            assert candidate["valid"]
+            assert not candidate["deadline_reached"]
+            assert candidate["search_mode"] == "compiled-lagrangian"
+            assert candidate["exactness_status"] == "approximate-universal-ceiling"
+            assert candidate["upper_bound_kind"] == "universal-ceiling"
+            assert candidate["certified_upper_bound"] == 1.0
+            assert candidate["request_specific_optimality_certification"] is False
+            assert candidate["optimality_gap"] == pytest.approx(1.0 - candidate["objective"])
+            assert candidate["measured_oracle_gap"] == pytest.approx(
+                case["oracle_objective"] - candidate["objective"], abs=1e-9,
+            )
+            assert candidate["duration_minutes"] <= case["duration_cap_minutes"] + 1e-9
+
+
+@pytest.mark.parametrize("size", ["small", "medium"])
+def test_request_scaled_multipliers_close_measured_unlock_gap(
+    generated_quality_report, size: str,
+) -> None:
+    case = next(
+        case for case in generated_quality_report["cases"]
+        if case["case_id"] == f"{size}_multiplier_unlock"
+    )
+    assert case["oracle_objective"] == pytest.approx(0.975)
+    assert case["legacy"]["objective"] == pytest.approx(0.8)
+    assert case["legacy"]["measured_oracle_gap"] == pytest.approx(0.175)
+    assert case["adaptive"]["objective"] == pytest.approx(0.975)
+    assert case["adaptive"]["measured_oracle_gap"] == pytest.approx(0.0, abs=1e-9)
+    assert case["adaptive"]["optimality_gap"] == pytest.approx(0.025)
+    assert case["corridor_bound"]["objective_upper_bound"] == pytest.approx(0.975)
+    assert any(
+        value == pytest.approx(0.1) for value in case["adaptive"]["candidate_multipliers"]
+    )
+    if size == "medium":
+        assert case["graph_node_count"] > 12
+
+
+def test_medium_corridor_measures_residual_gap_and_independent_ceiling(
+    generated_quality_report,
+) -> None:
+    case = next(
+        case for case in generated_quality_report["cases"]
+        if case["case_id"] == "medium_bounded_corridor"
+    )
+    assert case["size"] == "medium" and case["graph_node_count"] == 26
+    assert case["oracle_objective"] == pytest.approx(9.55 / 11.0)
+    bound = case["corridor_bound"]
+    assert bound["upper_bound_kind"] == "duration-corridor-edge-score-ceiling"
+    assert bound["eligible_traversal_count"] == 32
+    assert bound["policy_traversal_count"] == 34
+    assert bound["objective_upper_bound"] == pytest.approx(0.95)
+    for variant in ("legacy", "adaptive"):
+        candidate = case[variant]
+        assert candidate["objective"] == pytest.approx(0.5)
+        assert candidate["measured_oracle_gap"] == pytest.approx(9.55 / 11.0 - 0.5)
+        assert 0 < candidate["measured_oracle_gap"] < candidate["optimality_gap"]
+        assert candidate["measured_oracle_gap"] <= (
+            bound["objective_upper_bound"] - candidate["objective"] + 1e-9
+        )
+
+
+
 def test_cache_invariant_requires_both_signatures() -> None:
     evaluation = evaluate_service_response(
         _response(), q=0.5, kappa=1.8, avoid_highways=False
@@ -1112,16 +1349,94 @@ def test_kappa_one_and_zero_duration_objective_boundaries() -> None:
     assert zero_result["actual_duration_ratio"] == 1.0
 
 
-def test_strict_direct_parity_checks_route_identity_and_objective() -> None:
-    strict = evaluate_service_response(
-        _response(), q=0.5, kappa=1.8, avoid_highways=False
-    )
-    direct = deepcopy(strict)
-    assert all(_evaluations_match(strict, direct).values())
 
-    direct["routes"]["scenic"]["traversal_ids"] = ["different"]
-    checks = _evaluations_match(strict, direct)
-    assert checks["scenic_traversal_ids"] is False
+@pytest.mark.parametrize("strict_service_full", [False, True])
+def test_production_matrix_q_changes_planner_choice_not_service_priority(
+    monkeypatch, strict_service_full: bool,
+) -> None:
+    graph = RoadGraph()
+    for node_id, latitude, longitude in (
+        ("S", 42.0, -72.0), ("A", 42.01, -72.01), ("G", 42.02, -72.0),
+    ):
+        graph.add_node(Node(node_id, latitude, longitude))
+    for edge_id, start, end, distance, score in (
+        ("fast", "S", "G", 10.0, 1.0),
+        ("scenic-west", "S", "A", 6.0, 9.0),
+        ("scenic-east", "A", "G", 6.0, 9.0),
+    ):
+        graph.add_edge(Edge(
+            edge_id, start, end, distance_km=distance, scenic_score=score,
+            road_type="secondary", speed_limit_kmh=60, one_way=True,
+        ))
+    planner = production_benchmark.ScenicRoutePlanner(graph=graph)
+    score_mapping = {"graph_signature": "graph-a", "report_signature": "report-a"}
+    request = production_benchmark.RouteRequest(
+        graph_geojson="g", start=(42.0, -72.0), end=(42.02, -72.0),
+        max_detour_factor=1.8, include_baseline=True,
+    )
+    # q=1 has the same pure-scenic objective as the fixed service policy.
+    # The service fixture deliberately exposes no planner parameter metadata.
+    service_response = production_benchmark._direct_planner_response(
+        planner, request, q=1.0, score_mapping=score_mapping,
+    )
+    service_response.pop("planner_parameters")
+    service_response["diagnostics"].update({
+        "optimization_mode": "scenic_score_under_duration_cap",
+        "graph_cache_hit": True, "tile_score_cache_hit": True,
+        "scored_graph_cache_hit": True,
+    })
+    service_response["geojson"]["features"][0]["properties"]["optimization_mode"] = (
+        "scenic_score_under_duration_cap"
+    )
+    service_calls = []
+
+    def fixed_service(service_request, *, deadline):
+        assert deadline is not None
+        assert "scenic_weight" not in service_request.to_dict()
+        service_calls.append(service_request.to_dict())
+        return deepcopy(service_response)
+
+    monkeypatch.setattr(production_benchmark, "plan_routes", fixed_service)
+    rows = [
+        production_benchmark._execute_case(
+            spec=CaseSpec("q-choice", request.start, request.end, q, 1.8, False),
+            index=index, graph_path=Path("g"), report_path=Path("r"),
+            case_timeout_seconds=0.0, strict_service_full=strict_service_full,
+            context=({"score_mapping": score_mapping}, planner, graph.edges, graph.nodes),
+            route_error_cache={},
+        )
+        for index, q in enumerate((0.0, 1.0))
+    ]
+    for row in rows:
+        assert row["evaluation"]["status"] == "ok", row
+        assert row["execution_mode"] == "direct_planner"
+        assert row["parameter_scope"] == "planner_scalarized"
+        assert row["evaluation"]["objective_mode"] == "planner_scalarized"
+        assert row["evaluation"]["diagnostics"]["optimization_mode"] == "scalarized_under_duration_cap"
+    fastest, scenic = (row["evaluation"] for row in rows)
+    assert fastest["duration_minutes"] == pytest.approx(10.0)
+    assert scenic["duration_minutes"] == pytest.approx(12.0)
+    assert fastest["routes"]["scenic"]["canonical_edge_ids"] != scenic["routes"]["scenic"]["canonical_edge_ids"]
+    assert fastest["objective"]["recomputed"] == pytest.approx(1.0)
+    assert scenic["objective"]["recomputed"] == pytest.approx(0.9)
+    assert scenic["normalized_scenic_score"] > fastest["normalized_scenic_score"]
+    summary = _invariant_summary(rows)
+    assert summary["monotonic_best_scalarized_slope_q"] == {"pass": 1}
+    if strict_service_full:
+        assert len(service_calls) == 2
+        assert service_calls[0] == service_calls[1]
+        for row in rows:
+            check = row["service_check"]
+            assert check["parameter_scope"] == "fixed_scenic_priority"
+            assert check["evaluation"]["status"] == "ok", check
+            assert check["evaluation"]["objective_mode"] == "fixed_scenic_priority"
+            assert check["evaluation"]["objective"]["recomputed"] == pytest.approx(0.9)
+            assert "q" not in check["request"]
+        assert summary["warm_cache_hits"] == {"pass": 1}
+    else:
+        assert service_calls == []
+        assert all("service_check" not in row for row in rows)
+
 
 def test_frontier_extended_stress_beats_recorded_baseline() -> None:
     case = next(
@@ -1161,6 +1476,7 @@ def _checkpoint_row(index: int, spec: CaseSpec) -> dict[str, object]:
         "wall_ms": 1.0,
         "reason": None,
         "execution_mode": "direct_planner",
+        "parameter_scope": "planner_scalarized",
     }
 
 
@@ -1182,6 +1498,10 @@ def _patch_checkpoint_runtime(monkeypatch: pytest.MonkeyPatch) -> list[CaseSpec]
     )
     monkeypatch.setattr(production_benchmark, "_classify_pairs", lambda corpus, rows: ({}, {}))
     monkeypatch.setattr(production_benchmark, "_invariant_summary", lambda rows: {})
+    monkeypatch.setattr(
+        production_benchmark, "_run_generated_oracle_corpus",
+        lambda: {"scope": "generated_small_medium_fixtures", "acceptance": {"status": "pass"}},
+    )
     return specs
 
 
@@ -1205,6 +1525,12 @@ def test_benchmark_resume_skips_stable_case_keys_and_orders_results(
         group_size=1,
     )
     assert first["matrix"]["all_cases_persisted"] is True
+    assert first["schema_version"] == 2
+    assert first["benchmark"] == "production_artifact_planner_parameter_sweep"
+    assert first["matrix"]["parameter_scope"] == "planner_scalarized"
+    assert first["matrix"]["q_parameter"] == (
+        "ScenicRoutePlanner.find_scenic_route(scenic_weight=q, scenic_priority=False)"
+    )
     assert [row["pair_id"] for row in json.loads(output.read_text())["results"]] == [
         spec.pair_id for spec in specs
     ]
@@ -1219,6 +1545,51 @@ def test_benchmark_resume_skips_stable_case_keys_and_orders_results(
     )
     assert calls == []
     assert second["matrix"]["all_cases_persisted"] is True
+
+
+@pytest.mark.parametrize("gate_status", ["pass", "fail"])
+def test_benchmark_integrates_generated_oracle_once_and_gates_invariants(
+    tmp_path, monkeypatch, gate_status: str,
+) -> None:
+    _patch_checkpoint_runtime(monkeypatch)
+    monkeypatch.setattr(production_benchmark, "_HAS_POSIX_FORK", False)
+
+    def execute(**kwargs):
+        row = _checkpoint_row(kwargs["index"], kwargs["spec"])
+        if kwargs["index"] == 0:
+            row["evaluation"].update({
+                "exactness_status": "approximate-universal-ceiling",
+                "optimality_gap": 0.2, "certified_upper_bound": 1.0,
+                "objective": {"recomputed": 0.8},
+            })
+        return row
+
+    monkeypatch.setattr(production_benchmark, "_execute_case", execute)
+    calls = []
+    quality = {
+        "scope": "generated_small_medium_fixtures",
+        "production_request_corpus_exact_oracle": False,
+        "acceptance": {"status": gate_status},
+        "measured_oracle_gap_distribution": {"all": {"adaptive": {"count": 9}}},
+    }
+
+    def generated():
+        calls.append(True)
+        return quality
+
+    monkeypatch.setattr(production_benchmark, "_run_generated_oracle_corpus", generated)
+    output = tmp_path / "benchmark.json"
+    report = production_benchmark.run_benchmark(
+        corpus_path=tmp_path / "corpus.json", graph_path=tmp_path / "graph",
+        report_path=tmp_path / "report", output_path=output,
+    )
+    assert calls == [True]
+    assert report["generated_fixture_quality"] == quality
+    assert report["invariants"]["generated_fixture_quality"] == {gate_status: 1}
+    assert json.loads(output.read_text())["generated_fixture_quality"] == quality
+    assert report["exactness"]["universal_ceiling_count"] == 1
+    assert report["exactness"]["request_specific_certificate_count"] == 2
+
 
 
 def test_benchmark_interruption_preserves_checkpoint_and_final_json(
@@ -1421,6 +1792,9 @@ def test_direct_planner_response_forwards_one_deadline_identity(monkeypatch) -> 
         average_scenic_score = 5.0
         estimated_duration_minutes = 10.0
         fastest_duration_minutes = 0.0
+        objective_value = 0.75
+        exact = True
+        optimality_gap = 0.0
 
     class FakePlanner:
         graph = SimpleNamespace(nodes={}, edges={})
@@ -1428,20 +1802,17 @@ def test_direct_planner_response_forwards_one_deadline_identity(monkeypatch) -> 
         def find_scenic_route(self, **kwargs):
             deadlines.append(("scenic", kwargs.get("deadline")))
             assert kwargs["detour_reference_duration_minutes"] == 10.0
+            assert kwargs["scenic_weight"] == 0.5
+            assert kwargs["scenic_priority"] is False
             return FakeRoute()
 
         def find_fastest_route(self, **kwargs):
             deadlines.append(("baseline", kwargs.get("deadline")))
             return FakeRoute()
 
-    def fake_objective(request, scenic, baseline, *, deadline=None, **kwargs):
-        deadlines.append(("objective", deadline))
-        return {
-            "objective_value": 0.5,
-            "highway_preference": 0.0,
-            "highway_avoidance_cost": 0.0,
-            "optimization_mode": "scenic_score_under_duration_cap",
-        }
+    def fake_identity(route, *, deadline=None):
+        deadlines.append(("identity", deadline))
+        return ()
 
     def fake_route_to_feature(route, kind, *, deadline=None, **kwargs):
         deadlines.append((kind, deadline))
@@ -1460,7 +1831,7 @@ def test_direct_planner_response_forwards_one_deadline_identity(monkeypatch) -> 
         }
 
     monkeypatch.setattr(
-        production_benchmark.route_service, "_objective_components", fake_objective
+        production_benchmark.route_service, "_route_comparison_identity", fake_identity
     )
     monkeypatch.setattr(
         production_benchmark.route_service, "route_to_feature", fake_route_to_feature
@@ -1471,7 +1842,6 @@ def test_direct_planner_response_forwards_one_deadline_identity(monkeypatch) -> 
         graph_geojson="g.geojson",
         start=(1.0, 2.0),
         end=(1.1, 2.1),
-        scenic_weight=0.5,
         max_detour_factor=1.8,
         avoid_highways=False,
         include_baseline=True,
@@ -1481,15 +1851,17 @@ def test_direct_planner_response_forwards_one_deadline_identity(monkeypatch) -> 
     response = production_benchmark._direct_planner_response(
         planner,
         request,
+        q=0.5,
         score_mapping={},
         deadline=deadline,
     )
     assert response is not None
-    assert len(deadlines) == 5
+    assert len(deadlines) == 6
     assert [label for label, _ in deadlines] == [
         "baseline",
         "scenic",
-        "objective",
+        "identity",
+        "identity",
         "scenic",
         "baseline",
     ]
@@ -1695,6 +2067,10 @@ def test_run_benchmark_hard_timeout_wall_ms_is_nonzero(tmp_path, monkeypatch) ->
     )
     monkeypatch.setattr(production_benchmark, "_classify_pairs", lambda corpus, rows: ({}, {}))
     monkeypatch.setattr(production_benchmark, "_invariant_summary", lambda rows: {})
+    monkeypatch.setattr(
+        production_benchmark, "_run_generated_oracle_corpus",
+        lambda: {"scope": "generated_small_medium_fixtures", "acceptance": {"status": "pass"}},
+    )
     monkeypatch.setattr(production_benchmark, "_execute_case", fake_execute)
     output = tmp_path / "benchmark.json"
     result = production_benchmark.run_benchmark(

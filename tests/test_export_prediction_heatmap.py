@@ -51,7 +51,7 @@ def _sha256(path: Path) -> str:
 
 
 def _save_checkpoint(path: Path) -> None:
-    from src.scenic_scorer.regression import ScenicRegressionModel
+    from scenicdriver.scenic_scorer.regression import ScenicRegressionModel
 
     torch.manual_seed(0)
     model = ScenicRegressionModel(
@@ -289,7 +289,7 @@ def test_export_writes_standard_outputs(
 
 def test_row_mapping_strict_alignment(pool: dict[str, object], tmp_path: Path) -> None:
     """Predictions must follow the original-row/dense-feature index contract."""
-    from src.scenic_scorer.active_evaluation import (
+    from scenicdriver.scenic_scorer.active_evaluation import (
         load_model_checkpoint,
         predict_dataset,
     )
@@ -687,7 +687,7 @@ def test_export_with_identity_manifest(pool: dict[str, object], tmp_path: Path) 
 
 
 def test_export_union_compatibility(pool: dict[str, object], tmp_path: Path) -> None:
-    from src.heuristics.report import union_reports
+    from scenicdriver.heuristics.report import union_reports
 
     out_root = tmp_path / "union_runs"
     _export(pool, out_root, run_name="run_a")
@@ -711,7 +711,7 @@ def test_export_union_compatibility(pool: dict[str, object], tmp_path: Path) -> 
 
 
 def test_sparse_original_rows_map_predictions(pool: dict[str, object], tmp_path: Path) -> None:
-    from src.scenic_scorer.active_evaluation import load_model_checkpoint, predict_dataset
+    from scenicdriver.scenic_scorer.active_evaluation import load_model_checkpoint, predict_dataset
 
     originals = np.array([19, 3, 22, 8], dtype=np.int64)
     rows = [dict(row) for row in pool["rows"]]
@@ -780,14 +780,26 @@ def _benchmark_files(tmp_path):
     return labels_path, split_path
 
 
-def test_baseline_excludes_fixed_heldout_by_exact_export_identity(tmp_path) -> None:
-    from scripts.modeling.train_regression_baseline import training_arrays
+def test_baseline_excludes_fixed_heldout_by_physical_tile(tmp_path) -> None:
+    import pandas as pd
+    from scripts.modeling.regression_split import holdout_population_mask
 
-    dataset = _regression_export(tmp_path, ("train", "test-b", "test-a", "validation", "other/test-a"))
-    _, split = _benchmark_files(tmp_path)
-    arrays = training_arrays(dataset, split)
-    assert arrays["image_paths"].tolist() == ["train", "other/test-a"]
-    assert arrays["vit_embeddings"].ravel().tolist() == [0, 4]
+    paths = (
+        "images/satellite/z14/east/10_10.png",  # benchmark test tile
+        "images/satellite/z14/west/10_10.png",  # region alias of the same physical tile
+        "images/satellite/z14/east/11_10.png",  # inside the one-tile buffer
+        "images/satellite/z14/east/20_20.png",
+    )
+    dataset = _regression_export(tmp_path, paths)
+    labels = tmp_path / "labels.csv"
+    pd.DataFrame({"image_path": paths, "scenic_score": [5] * len(paths)}).to_csv(labels, index=False)
+    split = tmp_path / "benchmark.csv"
+    pd.DataFrame({"image_path": [paths[0], paths[3]], "split": ["test", "train"]}).to_csv(
+        split, index=False
+    )
+    assert holdout_population_mask(dataset, labels, split, holdout_buffer_tiles=1).tolist() == [
+        False, False, False, True,
+    ]
 
 
 def test_benchmark_uses_human_targets_with_reordered_and_skipped_exports(tmp_path) -> None:
@@ -828,7 +840,7 @@ def test_benchmark_rejects_incomplete_or_nonhuman_population(tmp_path, problem) 
 
 def test_comparison_measures_both_checkpoints_on_same_human_population(tmp_path, monkeypatch) -> None:
     from scripts.modeling.compare_regression_on_benchmark import main
-    from src.scenic_scorer.regression import ScenicRegressionModel
+    from scenicdriver.scenic_scorer.regression import ScenicRegressionModel
 
     dataset = _regression_export(tmp_path)
     labels, split = _benchmark_files(tmp_path)
@@ -869,6 +881,8 @@ def test_zero_epoch_baseline_rejected_before_saved_claim(tmp_path, monkeypatch, 
     monkeypatch.setattr(sys, "argv", [
         "train", "--dataset", str(tmp_path / "absent.npz"),
         "--benchmark-split-csv", str(tmp_path / "absent.csv"),
+        "--labels-csv", str(tmp_path / "absent-labels.csv"),
+        "--classifier-checkpoint", str(tmp_path / "absent-classifier.pt"),
         "--output", str(output), "--epochs", epochs,
     ])
     with pytest.raises(SystemExit):
@@ -919,6 +933,87 @@ def test_s3_export_propagates_network_and_invalid_imagery() -> None:
         _open_image("tile.png", "s3://bucket/raw", InvalidImageClient())
 
 
+def test_regression_export_uses_one_backbone_per_batch(tmp_path, monkeypatch) -> None:
+    from PIL import Image
+    from scripts.modeling import export_regression_dataset as exporter
+
+    class FixtureBackbone(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batch_sizes = []
+
+        def forward(self, batch):
+            self.batch_sizes.append(len(batch))
+            return batch.mean(dim=(2, 3))
+
+    class FixtureClassifier(torch.nn.Module):
+        def __init__(self) -> None:
+            from scenicdriver.classifier.inference import PreprocessingContract
+
+            super().__init__()
+            self.backbone = FixtureBackbone()
+            self.preprocessing = PreprocessingContract.for_normalization(
+                "resisc45", class_names=("first", "second")
+            )
+
+        def forward(self, _batch):
+            raise AssertionError("export should use the combined forward")
+
+        def get_features(self, _batch):
+            raise AssertionError("export should not run a separate feature forward")
+
+        def forward_with_features(self, batch):
+            features = self.backbone(batch)
+            return features[:, :2], features
+
+    classifier = FixtureClassifier()
+    colors = [(1, 2, 3), (4, 5, 6), (7, 8, 9)]
+    image_paths = [f"images/satellite/{i}.png" for i in range(len(colors))]
+    labels = tmp_path / "labels.csv"
+    _write_metadata(labels, [
+        {"image_path": path, "scenic_score": i + 1, "class_id": i}
+        for i, path in enumerate(image_paths)
+    ])
+    checkpoint = tmp_path / "classifier.pt"
+    checkpoint.touch()
+    output = tmp_path / "dataset.npz"
+    monkeypatch.setattr(exporter, "LandscapeClassifier", lambda **_kwargs: classifier)
+    monkeypatch.setattr(
+        exporter, "_open_image",
+        lambda path, *_args: Image.new("RGB", (4, 4), colors[int(Path(path).stem)]),
+    )
+    monkeypatch.setattr(
+        exporter, "get_inference_transform",
+        lambda _preprocessing: lambda image: torch.from_numpy(
+            np.array(image, dtype=np.float32)
+        ).permute(2, 0, 1),
+    )
+    monkeypatch.setattr(
+        exporter, "_terrain_features_from_images",
+        lambda *_args: np.zeros(6, dtype=np.float32),
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "export", "--labels-csv", str(labels), "--classifier-ckpt", str(checkpoint),
+        "--output", str(output), "--batch-size", "2", "--device", "cpu",
+    ])
+
+    exporter.main()
+
+    assert classifier.backbone.batch_sizes == [2, 1]
+    features = torch.tensor(colors, dtype=torch.float32)
+    logits = features[:, :2]
+    with np.load(output) as dataset:
+        np.testing.assert_array_equal(dataset["vit_embeddings"], features.numpy())
+        np.testing.assert_array_equal(dataset["class_logits"], logits.numpy())
+        np.testing.assert_array_equal(
+            dataset["class_probs"], torch.softmax(logits, dim=1).numpy()
+        )
+        assert dataset["vit_embeddings"].dtype == np.float32
+        assert dataset["class_logits"].dtype == np.float32
+        assert dataset["class_probs"].dtype == np.float32
+        assert dataset["image_paths"].tolist() == image_paths
+
+
 def test_heatmap_rejects_conflicting_original_and_dense_indices(pool, tmp_path) -> None:
     rows = [dict(row) for row in pool["rows"]]
     rows[0]["embedding_row_index"], rows[1]["embedding_row_index"] = 1, 0
@@ -932,7 +1027,7 @@ def test_heatmap_rejects_conflicting_original_and_dense_indices(pool, tmp_path) 
 @pytest.mark.parametrize("problem", ["missing-identities", "conflicting-split"])
 def test_regression_consumers_fail_closed_on_identity_contract(tmp_path, consumer, problem) -> None:
     from scripts.modeling.compare_regression_on_benchmark import benchmark_dataset
-    from scripts.modeling.train_regression_baseline import training_arrays
+    from scripts.modeling.regression_split import holdout_population_mask
 
     dataset = _regression_export(tmp_path)
     labels, split = _benchmark_files(tmp_path)
@@ -945,23 +1040,33 @@ def test_regression_consumers_fail_closed_on_identity_contract(tmp_path, consume
     np.savez(dataset, **arrays)
     with pytest.raises(ValueError, match="exported image_paths|conflicts"):
         if consumer == "training":
-            training_arrays(dataset, split)
+            holdout_population_mask(dataset, labels, split, holdout_buffer_tiles=1)
         else:
             benchmark_dataset(dataset, labels, split)
 
 
 def test_training_excludes_embedded_heldout_not_in_benchmark(tmp_path) -> None:
-    from scripts.modeling.train_regression_baseline import training_arrays
+    import pandas as pd
+    from scripts.modeling.regression_split import holdout_population_mask
 
-    dataset = _regression_export(tmp_path, ("train", "test-b", "test-a", "validation", "other"))
-    _, split = _benchmark_files(tmp_path)
+    paths = (
+        "images/satellite/z14/east/10_10.png",
+        "images/satellite/z14/east/30_30.png",  # embedded test row, absent from benchmark
+        "images/satellite/z14/east/31_31.png",  # adjacent to the embedded test row
+        "images/satellite/z14/east/50_50.png",  # benchmark test tile
+    )
+    dataset = _regression_export(tmp_path, paths)
     with np.load(dataset, allow_pickle=False) as data:
         arrays = {key: data[key] for key in data.files}
-    arrays["splits"] = np.array(["train", "test", "test", "val", "test"])
+    arrays["splits"] = np.array(["train", "test", "train", "test"])
     np.savez(dataset, **arrays)
-    result = training_arrays(dataset, split)
-    assert result["image_paths"].tolist() == ["train"]
-    assert result["vit_embeddings"].ravel().tolist() == [0]
+    labels = tmp_path / "labels.csv"
+    pd.DataFrame({"image_path": paths, "scenic_score": [5] * len(paths)}).to_csv(labels, index=False)
+    split = tmp_path / "benchmark.csv"
+    pd.DataFrame({"image_path": [paths[3]], "split": ["test"]}).to_csv(split, index=False)
+    assert holdout_population_mask(dataset, labels, split, holdout_buffer_tiles=1).tolist() == [
+        True, False, False, False,
+    ]
 
 
 def test_benchmark_prefers_explicit_benchmark_human_mean(tmp_path) -> None:

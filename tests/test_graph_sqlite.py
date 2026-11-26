@@ -7,14 +7,17 @@ import sqlite3
 import networkx as nx
 import pytest
 
-from src.route_planner.graph import (
+from scenicdriver.route_planner.graph import (
+    CompactRoadGraph,
     Edge,
     Node,
     RoadGraph,
     _graph_from_osmnx,
     _iter_osmnx_graph_rows,
     _write_sqlite_graph,
+    write_compact_graph,
 )
+from scenicdriver.route_planner.planner import ScenicRoutePlanner
 
 def _fake_osm_graph() -> nx.MultiDiGraph:
     graph = nx.MultiDiGraph()
@@ -193,16 +196,7 @@ def test_streamed_osm_rows_match_roadgraph_conversion(tmp_path: Path) -> None:
         assert actual.nodes[loaded.start_node_id].coords == expected.nodes[edge.start_node_id].coords
 
 
-def test_graph_replaced_during_load_marks_sidecar_stale(tmp_path: Path) -> None:
-    import os
-
-    from src.route_planner import graph as graph_module
-
-    path = tmp_path / "road_graph.sqlite3"
-    graph = _basic_graph()
-    graph.save(path)
-
-    replacement = tmp_path / "replacement.sqlite3"
+def _replacement_graph(path: Path) -> None:
     replacement_graph = RoadGraph()
     replacement_graph.add_node(Node(id="C", lat=10.0, lon=10.0))
     replacement_graph.add_node(Node(id="D", lat=10.1, lon=10.0))
@@ -215,32 +209,65 @@ def test_graph_replaced_during_load_marks_sidecar_stale(tmp_path: Path) -> None:
             scenic_score=5.0,
         )
     )
-    replacement_graph.save(replacement)
+    replacement_graph.save(path)
 
-    original_stat = graph_module._path_identity(path.resolve())
 
-    def swap_after_read_identity(*args, **kwargs):
-        os.replace(replacement, path)
-        return original_stat
-
+def test_graph_replaced_before_connect_is_rejected(tmp_path: Path) -> None:
+    import os
     import unittest.mock as mock
 
-    with mock.patch.object(
-        graph_module, "_path_identity", side_effect=swap_after_read_identity
-    ):
-        loaded = RoadGraph.load(path)
+    from scenicdriver.route_planner import graph as graph_module
+    from scenicdriver.route_planner.graph import RouteAssetChangedError
 
-    assert loaded.edge_projection_index_status["state"] == "invalid"
-    assert (
-        loaded.edge_projection_index_status["invalid_reason"]
-        == "graph_replaced_during_load"
-    )
-    projections, _distance = loaded.find_nearest_edge_positions_with_distance(
-        10.05,
-        10.0,
-    )
-    assert [projection.edge.id for projection in projections] == ["CD"]
-    assert loaded.edge_projection_index_status["state"] == "rebuilt"
+    path = tmp_path / "road_graph.sqlite3"
+    _basic_graph().save(path)
+    replacement = tmp_path / "replacement.sqlite3"
+    _replacement_graph(replacement)
+
+    original_stat = graph_module._path_identity(path.resolve())
+    real_identity = graph_module._path_identity
+    calls = 0
+
+    def swap_after_initial_identity(target: Path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            os.replace(replacement, path)
+            return original_stat
+        return real_identity(target)
+
+    with mock.patch.object(
+        graph_module, "_path_identity", side_effect=swap_after_initial_identity
+    ):
+        with pytest.raises(RouteAssetChangedError, match="changed while loading"):
+            RoadGraph.load(path)
+
+
+def test_graph_replaced_during_row_reading_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    from scenicdriver.route_planner import graph as graph_module
+    from scenicdriver.route_planner.graph import RouteAssetChangedError
+
+    path = tmp_path / "road_graph.sqlite3"
+    _basic_graph().save(path)
+    replacement = tmp_path / "replacement.sqlite3"
+    _replacement_graph(replacement)
+    original_edges = graph_module._iter_sqlite_edges
+
+    def swapping_edges(*args, **kwargs):
+        for index, row in enumerate(original_edges(*args, **kwargs)):
+            if index == 0:
+                os.replace(replacement, path)
+            yield row
+
+    monkeypatch.setattr(graph_module, "_iter_sqlite_edges", swapping_edges)
+    with pytest.raises(RouteAssetChangedError, match="changed while loading"):
+        RoadGraph.load(path)
+    monkeypatch.setattr(graph_module, "_iter_sqlite_edges", original_edges)
+    assert list(RoadGraph.load(path).edges) == ["CD"]
 
 
 def _traversals(graph: RoadGraph, node_id: str) -> list[tuple[str, str, str]]:
@@ -518,7 +545,12 @@ def test_persisted_speed_round_trips_exactly(tmp_path: Path, suffix: str) -> Non
     graph = RoadGraph()
     graph.add_node(Node(id="A", lat=42.0, lon=-72.0))
     graph.add_node(Node(id="B", lat=42.1, lon=-72.0))
-    for edge_id, speed in (("slow", 5), ("fractional", 47.5), ("fast", 150)):
+    for edge_id, speed in (
+        ("sub_one", 0.5),
+        ("slow", 5),
+        ("fractional", 47.5),
+        ("fast", 150),
+    ):
         graph.add_edge(
             Edge(
                 id=edge_id,
@@ -536,10 +568,42 @@ def test_persisted_speed_round_trips_exactly(tmp_path: Path, suffix: str) -> Non
     loaded = RoadGraph.load(path)
 
     assert {edge_id: e.speed_limit_kmh for edge_id, e in loaded.edges.items()} == {
+        "sub_one": 0.5,
         "slow": 5.0,
         "fractional": 47.5,
         "fast": 150.0,
     }
+    assert loaded.edges["sub_one"].travel_time_minutes == 120.0
+
+
+def test_sub_one_speed_scalar_and_native_csr_durations_match(tmp_path: Path) -> None:
+    graph = _basic_graph()
+    graph.edges["AB"].distance_km = 1.0
+    graph.edges["AB"].speed_limit_kmh = 0.5
+    sqlite_path = tmp_path / "graph.sqlite3"
+    graph.save(sqlite_path)
+    loaded = RoadGraph.load(sqlite_path)
+
+    scalar_duration = loaded.edges["AB"].travel_time_minutes
+    assert scalar_duration == 120.0
+    topology = ScenicRoutePlanner(graph=loaded)._build_csr_topology()
+    assert topology is not None
+    assert topology.travel_time_minutes.tolist() == [scalar_duration, scalar_duration]
+
+    manifest_path = tmp_path / "graph.compact.json"
+    write_compact_graph(sqlite_path, manifest_path)
+    compact = CompactRoadGraph.load(manifest_path)
+    try:
+        assert compact.edges["AB"].speed_limit_kmh == 0.5
+        assert compact.edges["AB"].travel_time_minutes == scalar_duration
+        compact_topology = ScenicRoutePlanner(graph=compact)._build_csr_topology()
+        assert compact_topology is not None
+        assert compact_topology.travel_time_minutes.tolist() == [
+            scalar_duration,
+            scalar_duration,
+        ]
+    finally:
+        compact.close()
 
 
 def test_osm_maxspeed_parsing_stays_separate_from_persisted_speed() -> None:

@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-import src.route_planner.graph as graph_module
-from src.route_planner.graph import CompactRoadGraph, Edge, Node, RoadGraph, write_compact_graph
+import scenicdriver.route_planner.graph as graph_module
+from scenicdriver.route_planner.graph import CompactRoadGraph, Edge, Node, RoadGraph, write_compact_graph
 
 
 def _save_graph(path: Path, scenic_score: float) -> None:

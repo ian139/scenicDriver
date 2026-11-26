@@ -1,0 +1,82 @@
+name: scenic-beta
+services:
+  api:
+    image: ${SCENIC_IMAGE_PREFIX:-scenicdriver}/beta-api:${SCENIC_RELEASE_TAG:?Set SCENIC_RELEASE_TAG to a unique release tag}
+    build:
+      context: .
+      dockerfile: Dockerfile.beta-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      MAPBOX_ACCESS_TOKEN: ${MAPBOX_ACCESS_TOKEN:-}
+      SCENIC_ALLOWED_ORIGINS: ${SCENIC_ALLOWED_ORIGINS:-}
+      CONTRIB_ADMIN_TOKEN: ${CONTRIB_ADMIN_TOKEN:-}
+      SCENIC_ROUTE_DEADLINE_SECONDS: ${SCENIC_ROUTE_DEADLINE_SECONDS:-}
+      SCENIC_ROUTE_PRELOAD: required
+    volumes:
+      - type: bind
+        source: ${SCENIC_ARTIFACT_ROOT:-./data/processed}/road_graphs/new_england_north_full_bbox_v1
+        target: /app/data/processed/road_graphs/new_england_north_full_bbox_v1
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SCENIC_ARTIFACT_ROOT:-./data/processed}/road_graphs/northeast_expanded_scored_tiles_v1
+        target: /app/data/processed/road_graphs/northeast_expanded_scored_tiles_v1
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SCENIC_ARTIFACT_ROOT:-./data/processed}/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report
+        target: /app/data/processed/heuristic_runs/prompt_two_candidate_exp02_fresh_test20_20260810/report
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SCENIC_ARTIFACT_ROOT:-./data/processed}/heuristic_runs/prompt_two_candidate_exp02_expanded_20260810/report
+        target: /app/data/processed/heuristic_runs/prompt_two_candidate_exp02_expanded_20260810/report
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SCENIC_ARTIFACT_ROOT:-./data/processed}/regression/model_registry.json
+        target: /app/data/processed/regression/model_registry.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SCENIC_ARTIFACT_ROOT:-./data/processed}/regression/checkpoints/0a165e429c8ac050524c7da409dd533d2de8849600c5dd8605aa1a1024d823e9.pt
+        target: /app/data/processed/regression/checkpoints/0a165e429c8ac050524c7da409dd533d2de8849600c5dd8605aa1a1024d823e9.pt
+        read_only: true
+        bind:
+          create_host_path: false
+      - contrib-data:/app/data/processed/contrib
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, urllib.request; h = json.load(urllib.request.urlopen('http://127.0.0.1:8080/v1/healthz', timeout=5)); assert h['ok'] and h['model_registry_exists'] and {'new_england_north', 'northeast_expanded'}.issubset(h['route_preload']['loaded_regions'])"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10m
+  frontend:
+    image: ${SCENIC_IMAGE_PREFIX:-scenicdriver}/beta-frontend:${SCENIC_RELEASE_TAG:?Set SCENIC_RELEASE_TAG to a unique release tag}
+    build:
+      context: .
+      dockerfile: apps/new_england_north/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:80:80"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1/index.html"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  contrib-data:

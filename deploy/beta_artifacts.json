@@ -34,14 +34,14 @@
     },
     {
       "name": "graph.compact.score.manifest",
-      "destination": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.score.7f7dc54cd1d8e1f6.z14.fbnull.nlinear-v1.json",
+      "destination": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.score.710bbec5c1803a32.z14.fbnull.nlinear-v1.json",
       "source_key": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.score.7f7dc54cd1d8e1f6.z14.fbnull.nlinear-v1.json",
       "sha256": "84ff0e9cbfa9a81f5239dd1474250edae9c0ee53fcc37bf7531098b66400f7e8",
       "size_bytes": 825
     },
     {
       "name": "graph.compact.score.payload",
-      "destination": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.score.7f7dc54cd1d8e1f6.z14.fbnull.nlinear-v1.bin",
+      "destination": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.score.710bbec5c1803a32.z14.fbnull.nlinear-v1.bin",
       "source_key": "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.score.7f7dc54cd1d8e1f6.z14.fbnull.nlinear-v1.bin",
       "sha256": "0465d2acf0326e3d541c2c12f90358068503a12edad5bc8b342fd91d40917758",
       "size_bytes": 86340224
@@ -115,14 +115,14 @@
     },
     {
       "name": "expanded_graph.compact.score.manifest",
-      "destination": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.score.a9fff23e89860bfc.z14.fbnull.nlinear-v1.json",
+      "destination": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.score.8ff6ed5ef75f5433.z14.fbnull.nlinear-v1.json",
       "source_key": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.score.a9fff23e89860bfc.z14.fbnull.nlinear-v1.json",
       "sha256": "12ac08f462b8cc086fd92c0478cff794a9778b02c76ede49d511691135a64d8a",
       "size_bytes": 803
     },
     {
       "name": "expanded_graph.compact.score.payload",
-      "destination": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.score.a9fff23e89860bfc.z14.fbnull.nlinear-v1.bin",
+      "destination": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.score.8ff6ed5ef75f5433.z14.fbnull.nlinear-v1.bin",
       "source_key": "data/processed/road_graphs/northeast_expanded_scored_tiles_v1/road_graph.score.a9fff23e89860bfc.z14.fbnull.nlinear-v1.bin",
       "sha256": "381a14525d4f6561b345acf2315f3d88e6a7bad31e731428f61f566e1366e8e9",
       "size_bytes": 533502928

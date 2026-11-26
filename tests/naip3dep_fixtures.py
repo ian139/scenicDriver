@@ -18,7 +18,7 @@ from rasterio.enums import ColorInterp
 from rasterio.io import MemoryFile
 from rasterio.transform import from_bounds
 
-from src.data_pipeline.metered_transport import (
+from scenicdriver.data_pipeline.metered_transport import (
     CapExceededError,
     Counters,
     HeadObjectResult,
@@ -34,8 +34,8 @@ from src.data_pipeline.metered_transport import (
     SharedMeteredBudget,
     _validate_range_request,
 )
-from src.data_pipeline.region_planning import enumerate_bbox_tiles
-from src.data_pipeline.web_mercator import tile_bounds_wgs84
+from scenicdriver.data_pipeline.region_planning import enumerate_bbox_tiles
+from scenicdriver.data_pipeline.web_mercator import tile_bounds_wgs84
 
 # Two real adjacent z14 Web Mercator tiles in Connecticut (Hartford area).
 TILE_COORDS = enumerate_bbox_tiles(41.60, -72.75, 41.80, -72.60, zoom=14)[:2]

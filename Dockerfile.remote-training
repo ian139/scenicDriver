@@ -2,12 +2,28 @@
 FROM ghcr.io/astral-sh/uv:0.9.16 AS builder
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
-RUN uv export --locked --no-dev --no-emit-project \
+RUN uv export --locked --no-dev --all-extras --no-emit-project \
       --prune torch --prune torchvision \
       --output-file /tmp/remote-training-requirements.txt
 
-# Stage 2: CUDA runtime
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime AS runtime
+# Stage 2: Shared target-platform CUDA base
+# Matches vast_train.py's torch2.10.0-cu128 release; amd64 base digest from
+# https://hub.docker.com/v2/repositories/pytorch/pytorch/tags/2.10.0-cuda12.8-cudnn9-runtime
+FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime@sha256:b85566342b86d13a67712e9315d40cdc2dad7f8d86df1aff3831f80835edbcca AS cuda-base
+
+# Stage 3: Native route search, built against the runtime's libc.
+# Do not use BUILDPLATFORM here: the library must match the target image.
+FROM cuda-base AS native-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY src/scenicdriver/route_planner/_compact_search_c.c ./
+RUN gcc -O3 -shared -fPIC _compact_search_c.c -o _compact_search_c.so -lm
+
+# Stage 4: CUDA runtime without the build toolchain
+FROM cuda-base AS runtime
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/conda/bin:/root/.local/bin:${PATH}" \
@@ -15,21 +31,30 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Etc/UTC
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    coreutils \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=ghcr.io/astral-sh/uv:0.9.16 /uv /uvx /usr/local/bin/
 WORKDIR /workspace
 COPY --from=builder /tmp/remote-training-requirements.txt /tmp/remote-training-requirements.txt
-RUN uv pip install --system --no-cache-dir --no-deps \
+# Resolve dependencies while constraining the CUDA wheel set from the base.
+RUN printf 'torch==2.10.0\ntorchvision==0.25.0\n' > /tmp/cuda-constraints.txt \
+ && uv pip install --system --no-cache-dir \
+      --constraint /tmp/cuda-constraints.txt \
       --requirement /tmp/remote-training-requirements.txt \
- && rm /tmp/remote-training-requirements.txt
+ && rm /tmp/remote-training-requirements.txt /tmp/cuda-constraints.txt
 COPY pyproject.toml uv.lock ./
 COPY src/ src/
+COPY --from=native-builder /build/_compact_search_c.so src/scenicdriver/route_planner/_compact_search_c.so
 COPY scripts/ scripts/
 COPY notebooks/ notebooks/
 COPY config/ config/
 COPY data/README.md data/README.md
 COPY README.md AGENTS.md ./
 RUN uv pip install --system --no-cache-dir --no-deps -e .
+RUN python -c 'import torch, torchvision; assert torch.__version__.split("+")[0] == "2.10.0"; assert torchvision.__version__.split("+")[0] == "0.25.0"; assert torch.version.cuda == "12.8"'
+# Match source mtime so the loader never tries a runtime recompilation.
+RUN touch -r src/scenicdriver/route_planner/_compact_search_c.c src/scenicdriver/route_planner/_compact_search_c.so \
+ && python -c 'from scenicdriver.route_planner._compact_search import compact_search_available; assert compact_search_available(), "Native compact search failed to load"'
 RUN mkdir -p data/raw data/processed models cache scenic_artifacts
 # The image intentionally has no runtime command; callers select a canonical
 # lifecycle or benchmark entrypoint explicitly.

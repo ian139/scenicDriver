@@ -7,7 +7,7 @@ import json
 import pytest
 from pathlib import Path
 
-from src.data_pipeline.usgs_3dep import (
+from scenicdriver.data_pipeline.usgs_3dep import (
     USGS3DEPAdapter,
     CatalogNotFoundError,
     CatalogValidationError,

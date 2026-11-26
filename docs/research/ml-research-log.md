@@ -1,8 +1,14 @@
 # ML Research Log: Learned Scoring v1 through v6
 
-This file tracks what changed across the `masswhites` learned-scoring checkpoint iterations and why `v6` is now the promoted model.
+This canonical ML research log preserves the `masswhites` learned-scoring checkpoint history and the rationale for promoting `v6` in that era. The historical measurements below are not metrics for the current deployment.
 
-## Scope
+## Current deployment identity
+
+[`config/app_regions.json`](../../config/app_regions.json) defines the current default region as `new_england_north`, using Prompt Two exp02 run `prompt_two_candidate_exp02_fresh_test20_20260810` and checkpoint `data/processed/regression/checkpoints/0a165e429c8ac050524c7da409dd533d2de8849600c5dd8605aa1a1024d823e9.pt`. The route-enabled `northeast_expanded` entry uses run `prompt_two_candidate_exp02_expanded_20260810`; that entry declares no region-local checkpoint override.
+
+The configured `masswhites` entry retains run `masswhites_z14_learned_h4_v2` and the v6 checkpoint recorded below, with `route_planning: false`. That legacy regional entry does not make v6 the current default deployment model. [README](../../README.md) contains current workflow commands; [FIXES.md](../../FIXES.md) records current engineering contracts.
+
+## Historical Masswhites scope
 
 All three versions below use:
 
@@ -59,7 +65,7 @@ Metrics source files:
   - Mean absolute score change on changed tiles: `0.5759`
 - Feature export SHA256 changed:
   - `513036c572791421dd316f73cf1bb5f18bead68c2134572aa5e9b4ece21def3b`
-- Result: major quality improvement (best version so far).
+- Result: major quality improvement (best version at that iteration).
 
 ## v3 (accidental v1-equivalent rerun)
 
@@ -74,14 +80,14 @@ Metrics source files:
 - v1 report (`masswhites_z14_learned_h4_5k`) and v3 report (`masswhites_z14_learned_h4_v3`) have matching summary distributions.
 - v2 report (`masswhites_z14_learned_h4_v2`) is broader and better calibrated (higher max, wider spread), aligned with better validation metrics.
 
-## Decision
+## Historical v6 promotion decision
 
-Use `v6` as the active model:
+The decision in the Masswhites v6 era was to use `v6` as the active model:
 
 - `models/scenic_regression_baseline_masswhites_z14_mixed5000_v6_vast_weighted_h4.pt`
-- Registry source of truth: `data/processed/regression/model_registry.json`
+- Registry source of truth at that time: `data/processed/regression/model_registry.json`
 
-Treat `v1`, `v2`, `v3`, `v4`, and `v5` as baselines/controls. The v6 promotion compares against v4 using the corrected training/evaluation validation split in `baseline_metrics_masswhites_z14_mixed5000_v4_weighted_h4.local_verify.json`.
+`v1`, `v2`, `v3`, `v4`, and `v5` served as baselines/controls. The v6 promotion compared against v4 using the corrected training/evaluation validation split in `baseline_metrics_masswhites_z14_mixed5000_v4_weighted_h4.local_verify.json`.
 
 ## Guardrail for Next Iteration
 

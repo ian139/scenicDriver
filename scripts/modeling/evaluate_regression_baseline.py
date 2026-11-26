@@ -1,10 +1,12 @@
 """
 Evaluate a trained scenic regression baseline checkpoint on an exported .npz dataset.
 
-Validation membership is not guessed here: it is exactly the membership the
-trained model used during training, reproduced from the split artifact written
-by train_regression_baseline.py through the shared derivation in
-scripts/modeling/regression_split.py.
+Validation membership is not guessed here: the run is first admitted through
+scripts/modeling/regression_split.py, which verifies that the checkpoint, split
+artifact, dataset, labels CSV, benchmark split CSV and classifier checkpoint
+match the content digests bound by the training run manifest (and that the
+classifier's preprocessing identity matches), then reproduces exactly the
+trained model's geographic validation membership through the shared derivation.
 """
 
 from __future__ import annotations
@@ -19,10 +21,11 @@ import torch
 import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.scenic_scorer.regression import ScenicRegressionModel, ScenicScoreDataset, resolve_device  # noqa: E402
+from scenicdriver.scenic_scorer.regression import ScenicRegressionModel, ScenicScoreDataset, resolve_device  # noqa: E402
 from scripts.modeling.regression_split import load_validation_membership  # noqa: E402
 
 
@@ -35,6 +38,22 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         required=True,
         help="Training split artifact whose validation membership is evaluated",
+    )
+    parser.add_argument(
+        "--run-manifest",
+        type=Path,
+        required=True,
+        help="Training run manifest binding every run input and output by content digest",
+    )
+    parser.add_argument("--labels-csv", type=Path, required=True, help="Labels CSV bound by the run manifest")
+    parser.add_argument(
+        "--benchmark-split-csv", type=Path, required=True, help="Benchmark split CSV bound by the run manifest"
+    )
+    parser.add_argument(
+        "--classifier-checkpoint",
+        type=Path,
+        required=True,
+        help="Classifier checkpoint bound by the run manifest",
     )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
@@ -54,7 +73,15 @@ def main() -> None:
 
     device = resolve_device(args.device)
 
-    membership = load_validation_membership(args.dataset, args.split_artifact)
+    membership = load_validation_membership(
+        args.dataset,
+        args.split_artifact,
+        run_manifest=args.run_manifest,
+        checkpoint=args.checkpoint,
+        labels_csv=args.labels_csv,
+        benchmark_split_csv=args.benchmark_split_csv,
+        classifier_checkpoint=args.classifier_checkpoint,
+    )
     ds = ScenicScoreDataset(args.dataset)
     val_ds = torch.utils.data.Subset(ds, membership.val_dataset_indices.tolist())
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
@@ -96,6 +123,7 @@ def main() -> None:
         "val_split": membership.val_split,
         "seed": membership.seed,
         "split_artifact": str(args.split_artifact),
+        "run_manifest": str(args.run_manifest),
         "dataset": str(args.dataset),
         "checkpoint": str(args.checkpoint),
     }

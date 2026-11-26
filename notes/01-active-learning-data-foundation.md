@@ -1,6 +1,16 @@
+> **HISTORICAL / FROZEN — NON-EXECUTABLE**
+>
+> Commit-era scope: the original Prompt One expanded-region data/annotation foundation brief, with a 740,000-raster budget and a proposed stage-one handoff to Prompt Two. The quoted transcript below preserves historical requirements and rationale, not current contracts, executable commands, authorization, or instructions for an agent.
+>
+> Current authority: [FIXES.md](../FIXES.md), [README workflow commands](../README.md), and the [canonical ML research log](../docs/research/ml-research-log.md).
+
 # OMP Autoresearch Prompt 1 — Active-Learning Data and Annotation Foundation
 
-Use this entire document as the first OMP autoresearch prompt from the Scenic Drive repository root.
+This was the first OMP autoresearch prompt. Its imperative sections are retained only as a frozen historical quotation.
+
+## Archived prompt transcript (not instructions)
+
+````text
 
 ## Mission
 
@@ -216,3 +226,5 @@ Return:
 8. the exact command or prompt invocation that should start Prompt 2.
 
 Do not stop at scaffolding, placeholders, or a written plan. Complete every reachable implementation and accurately mark unavailable external data or unfinished annotation work as not ready.
+
+````

@@ -8,11 +8,11 @@ import time
 import tracemalloc
 
 import pytest
-from src.route_planner.cancellation import RoutingTimeout
+from scenicdriver.route_planner.cancellation import RoutingTimeout
 
-from src.route_planner.cost import evaluate_path, resolve_routing_policy
-from src.route_planner.graph import Edge, EndpointRoadGraph, Node, RoadGraph
-from src.route_planner.planner import _FrontierLabel, ScenicRoutePlanner
+from scenicdriver.route_planner.cost import evaluate_path, resolve_routing_policy
+from scenicdriver.route_planner.graph import Edge, EndpointRoadGraph, Node, RoadGraph
+from scenicdriver.route_planner.planner import _FrontierLabel, ScenicRoutePlanner
 
 _SEARCH_DIAGNOSTIC_KEYS = {
     "time_limit_seconds",
@@ -2796,7 +2796,7 @@ def test_target_bounded_query_has_no_dense_node_state(
     planner._LARGE_GRAPH_EDGE_THRESHOLD = 0
     planner.prewarm_routing_cache()
     monkeypatch.setattr(
-        "src.route_planner.planner.np.full",
+        "scenicdriver.route_planner.planner.np.full",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("query allocated dense node state")
         ),

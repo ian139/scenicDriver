@@ -9,10 +9,11 @@ import sys
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.scenic_scorer.active_training import (  # noqa: E402
+from scenicdriver.scenic_scorer.active_training import (  # noqa: E402
     ActiveTrainingConfig,
     prepare_active_dataset,
     train_active_model,

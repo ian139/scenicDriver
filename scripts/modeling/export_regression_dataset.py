@@ -27,16 +27,19 @@ import torch
 import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.classifier.inference import get_inference_transform  # noqa: E402
-from src.classifier.model import LandscapeClassifier  # noqa: E402
-from src.terrain.features import (  # noqa: E402
+from scenicdriver.classifier.inference import get_inference_transform  # noqa: E402
+from scenicdriver.classifier.model import LandscapeClassifier  # noqa: E402
+from scenicdriver.data_pipeline.web_mercator import tile_pixel_ground_spacing_m  # noqa: E402
+from scenicdriver.heuristics.labeler import parse_tile_coords  # noqa: E402
+from scenicdriver.terrain.features import (  # noqa: E402
     compute_terrain_features,
     compute_terrain_valid_mask,
 )
-from src.scenic_scorer.regression import resolve_device  # noqa: E402
+from scenicdriver.scenic_scorer.regression import atomic_write, resolve_device  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,10 +51,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
     parser.add_argument(
-        "--use-resisc45-stats",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use RESISC45 normalization stats for classifier transforms",
+        "--normalization",
+        choices=("imagenet", "resisc45"),
+        default=None,
+        help="Optional assertion: fail unless the checkpoint's preprocessing contract "
+        "uses this normalization (the transform always comes from the checkpoint)",
     )
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument(
@@ -122,10 +126,17 @@ def _open_image(path: str, raw_dir: str, s3_client: Any | None) -> Image.Image:
     return Image.open(BytesIO(obj["Body"].read())).convert("RGB")
 
 
-def _terrain_features_from_images(terrain_img: Image.Image, sat_img: Image.Image) -> np.ndarray:
+def _terrain_features_from_images(
+    terrain_img: Image.Image, sat_img: Image.Image, image_path: str
+) -> np.ndarray:
     """Return the canonical terrain vector for regression export."""
+    coords = parse_tile_coords(image_path)
+    if coords is None:
+        raise ValueError(f"Tile z/x/y required for terrain pixel spacing: {image_path}")
+    zoom, x, y = coords
     return compute_terrain_features(
-        terrain_img, sat_img, valid_mask=compute_terrain_valid_mask(terrain_img)
+        terrain_img, sat_img, valid_mask=compute_terrain_valid_mask(terrain_img),
+        pixel_spacing_m=tile_pixel_ground_spacing_m(x, y, zoom, *terrain_img.size),
     ).features.to_array().astype(np.float32)
 
 
@@ -223,7 +234,8 @@ def main() -> None:
         device=device,
     ).to(device)
     model.eval()
-    transform = get_inference_transform(use_resisc45_stats=args.use_resisc45_stats)
+    model.preprocessing.require_normalization(args.normalization)
+    transform = get_inference_transform(model.preprocessing)
 
     vit_embeddings = []
     terrain_features = []
@@ -243,16 +255,18 @@ def main() -> None:
         if not batch_imgs:
             return
         x = torch.stack(batch_imgs, dim=0).to(device)
-        logits = model(x)
-        feats = model.get_features(x)
+        logits, feats = model.forward_with_features(x)
         probs = torch.softmax(logits, dim=1)
+        feats_cpu = feats.detach().cpu().numpy().astype(np.float32, copy=False)
+        logits_cpu = logits.detach().cpu().numpy().astype(np.float32, copy=False)
+        probs_cpu = probs.detach().cpu().numpy().astype(np.float32, copy=False)
 
         for i in range(x.shape[0]):
             terrain, score, class_id, sample_weight, image_path = batch_meta[i]
-            vit_embeddings.append(feats[i].detach().cpu().numpy().astype(np.float32))
+            vit_embeddings.append(feats_cpu[i])
             terrain_features.append(terrain)
-            class_logits.append(logits[i].detach().cpu().numpy().astype(np.float32))
-            class_probs.append(probs[i].detach().cpu().numpy().astype(np.float32))
+            class_logits.append(logits_cpu[i])
+            class_probs.append(probs_cpu[i])
             scenic_scores.append(np.float32(score))
             class_ids.append(np.int64(class_id))
             sample_weights.append(np.float32(sample_weight))
@@ -283,7 +297,7 @@ def main() -> None:
             batch_imgs.append(tensor)
             batch_meta.append(
                 (
-                    _terrain_features_from_images(terr_img, sat_img),
+                    _terrain_features_from_images(terr_img, sat_img, sat_rel),
                     float(row["scenic_score"]),
                     int(row["class_id"]) if "class_id" in df.columns else -1,
                     _sample_weight_for_row(
@@ -307,36 +321,36 @@ def main() -> None:
 
         flush_batch()
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        args.output,
-        vit_embeddings=np.array(vit_embeddings, dtype=np.float32),
-        terrain_features=np.array(terrain_features, dtype=np.float32),
-        class_logits=np.array(class_logits, dtype=np.float32),
-        class_probs=np.array(class_probs, dtype=np.float32),
-        scenic_scores=np.array(scenic_scores, dtype=np.float32),
-        class_ids=np.array(class_ids, dtype=np.int64),
-        sample_weights=np.array(sample_weights, dtype=np.float32),
-        image_paths=np.array(image_paths, dtype=str),
-        **({"splits": np.array([fixed_splits[path] for path in image_paths], dtype=str)}
-           if fixed_splits is not None else {}),
-    )
-    print(f"Wrote dataset: {args.output}")
-    print(f"Samples: {len(vit_embeddings)}")
-    if sample_weights:
-        weights_arr = np.asarray(sample_weights, dtype=np.float32)
-        unique_weights = np.unique(np.round(weights_arr, 6))
-        if len(unique_weights) <= 10:
-            printable = ", ".join(str(float(w)) for w in unique_weights.tolist())
-            print(f"Sample weights used: [{printable}]")
-        print(
-            "Weight stats: "
-            f"min={weights_arr.min():.3f}, max={weights_arr.max():.3f}, mean={weights_arr.mean():.3f}"
-        )
     if missing_rows:
         print(f"Skipped rows with missing files: {missing_rows}")
     if len(vit_embeddings) == 0:
         raise ValueError("No samples exported. Check labels paths and --raw-dir.")
+    arrays = {
+        "vit_embeddings": np.array(vit_embeddings, dtype=np.float32),
+        "terrain_features": np.array(terrain_features, dtype=np.float32),
+        "class_logits": np.array(class_logits, dtype=np.float32),
+        "class_probs": np.array(class_probs, dtype=np.float32),
+        "scenic_scores": np.array(scenic_scores, dtype=np.float32),
+        "class_ids": np.array(class_ids, dtype=np.int64),
+        "sample_weights": np.array(sample_weights, dtype=np.float32),
+        "image_paths": np.array(image_paths, dtype=str),
+        **({"splits": np.array([fixed_splits[path] for path in image_paths], dtype=str)}
+           if fixed_splits is not None else {}),
+    }
+    if len({len(value) for value in arrays.values()}) != 1:
+        raise ValueError("Exported arrays have inconsistent row counts; refusing to publish")
+    atomic_write(args.output, lambda handle: np.savez_compressed(handle, **arrays))
+    print(f"Wrote dataset: {args.output}")
+    print(f"Samples: {len(vit_embeddings)}")
+    weights_arr = arrays["sample_weights"]
+    unique_weights = np.unique(np.round(weights_arr, 6))
+    if len(unique_weights) <= 10:
+        printable = ", ".join(str(float(w)) for w in unique_weights.tolist())
+        print(f"Sample weights used: [{printable}]")
+    print(
+        "Weight stats: "
+        f"min={weights_arr.min():.3f}, max={weights_arr.max():.3f}, mean={weights_arr.mean():.3f}"
+    )
 
 
 if __name__ == "__main__":

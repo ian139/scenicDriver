@@ -9,20 +9,21 @@ import select
 import signal
 import socket
 import struct
+import sys
 import threading
 import time
 from typing import Any, Callable
 
 import pytest
 
-from src.route_planner.cancellation import (
+from scenicdriver.route_planner.cancellation import (
     RoutingCancelled,
     RoutingDeadline,
     RoutingTimeout,
     SharedCancelFlag,
 )
-from src.route_planner import supervisor as supervisor_module
-from src.route_planner.supervisor import (
+from scenicdriver.route_planner import supervisor as supervisor_module
+from scenicdriver.route_planner.supervisor import (
     PreloadedRouteSupervisor,
     SupervisorError,
     get_preload_marker,
@@ -147,13 +148,23 @@ def _job_die_inside_cancellation_checks(deadline) -> None:
     os.kill(os.getpid(), signal.SIGKILL)
 
 
-def _job_sleep(deadline, seconds: float) -> str:
-    time.sleep(seconds)
+# Set by tests immediately before ``PreloadedRouteSupervisor.start()`` so the
+# forked supervisor and worker inherit them (fork-context events cannot be
+# pickled into a job's arguments).
+_SLOT_HELD: Any = None
+_SLOT_RELEASE: Any = None
+
+
+def _job_hold_slot(deadline) -> str:
+    """Signal that the job is running, then hold the slot until released."""
+    _SLOT_HELD.set()
+    if not _SLOT_RELEASE.wait(timeout=10.0):
+        raise AssertionError("slot holder was never released")
     return "slow-done"
 
 
 def _job_raise_route_coverage_error(deadline) -> None:
-    from src.route_planner.service import RouteCoverageError
+    from scenicdriver.route_planner.service import RouteCoverageError
 
     raise RouteCoverageError("start", 1.234, 1.0)
 
@@ -251,34 +262,43 @@ def test_worker_killed_inside_cancellation_check_does_not_wedge_cancellation() -
     assert result["token"] == "after-kills"
 
 
-def test_queued_caller_with_expiring_deadline_times_out_without_waiting() -> None:
+def test_queued_caller_with_expiring_deadline_times_out_without_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = multiprocessing.get_context("fork")
+    held, release = ctx.Event(), ctx.Event()
+    monkeypatch.setattr(sys.modules[__name__], "_SLOT_HELD", held)
+    monkeypatch.setattr(sys.modules[__name__], "_SLOT_RELEASE", release)
     with PreloadedRouteSupervisor.start() as sup:
         slow: dict[str, Any] = {}
         slow_thread = threading.Thread(
             target=lambda: slow.setdefault(
-                "value", sup.run_job(_job_sleep, 1.0, deadline_seconds=5.0)
+                "value", sup.run_job(_job_hold_slot, deadline_seconds=15.0)
             )
         )
         slow_thread.start()
-        time.sleep(0.2)  # the slow job now holds the only job slot
+        try:
+            # The worker only runs a job while its caller holds the only slot.
+            assert held.wait(timeout=10.0), "slot-holding job never started"
 
-        start = time.monotonic()
-        with pytest.raises(RoutingTimeout, match="deadline exceeded"):
-            sup.run_job(_job_success, "queued", deadline_seconds=0.1)
-        timed_out_after = time.monotonic() - start
+            start = time.monotonic()
+            with pytest.raises(RoutingTimeout, match="deadline exceeded"):
+                sup.run_job(_job_success, "queued", deadline_seconds=0.1)
+            timed_out_after = time.monotonic() - start
 
-        cancel_event = threading.Event()
-        threading.Timer(0.1, cancel_event.set).start()
-        start = time.monotonic()
-        with pytest.raises(RoutingCancelled, match="was cancelled"):
-            sup.run_job(
-                _job_success,
-                "queued-cancel",
-                deadline=RoutingDeadline.after(5.0, cancel_event=cancel_event),
-            )
-        cancelled_after = time.monotonic() - start
-
-        slow_thread.join(timeout=5.0)
+            cancel_event = threading.Event()
+            threading.Timer(0.1, cancel_event.set).start()
+            start = time.monotonic()
+            with pytest.raises(RoutingCancelled, match="was cancelled"):
+                sup.run_job(
+                    _job_success,
+                    "queued-cancel",
+                    deadline=RoutingDeadline.after(5.0, cancel_event=cancel_event),
+                )
+            cancelled_after = time.monotonic() - start
+        finally:
+            release.set()
+            slow_thread.join(timeout=10.0)
 
     assert timed_out_after < 0.4
     assert cancelled_after < 0.4
@@ -287,7 +307,7 @@ def test_queued_caller_with_expiring_deadline_times_out_without_waiting() -> Non
 
 
 def test_route_coverage_error_survives_transport_with_fields() -> None:
-    from src.route_planner.service import RouteCoverageError
+    from scenicdriver.route_planner.service import RouteCoverageError
 
     with PreloadedRouteSupervisor.start() as sup:
         with pytest.raises(RouteCoverageError) as exc_info:
@@ -402,22 +422,26 @@ def test_deadline_object_exact_expiry_observed_by_worker() -> None:
 
 def test_queued_delay_does_not_extend_deadline() -> None:
     """A RoutingDeadline passed before queue/IPC keeps its original budget."""
-    budget = 0.5
+    budget = 30.0
     deadline = RoutingDeadline.after(budget)
     expected_expires = deadline.expires_at
-    time.sleep(0.15)  # simulate caller-side queuing/serialization delay
-    sent_at = time.monotonic()
+    created_at = time.monotonic()
 
     with PreloadedRouteSupervisor.start() as sup:
-        child_expires, _ = sup.run_job(
+        # Real caller-side delay: supervisor startup plus one completed job.
+        assert sup.run_job(_job_success, "warm", deadline_seconds=5.0)["token"] == "warm"
+        sent_at = time.monotonic()
+        assert sent_at > created_at
+        child_expires, child_now = sup.run_job(
             _job_return_expires_at,
             deadline=deadline,
             grace_seconds=0.2,
         )
-    # Expiry did not shift because of the sleep or IPC.
+    # Expiry did not shift because of the delay or IPC.
     assert child_expires is not None
     assert child_expires == expected_expires
     assert child_expires - sent_at < budget
+    assert child_now < child_expires
 
 
 def test_already_expired_deadline_fails_before_send() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import http.client
 import json
 import threading
@@ -7,6 +8,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -17,6 +19,7 @@ from scripts.annotation.annotate_scenic_web import (
     AnnotatorConfig,
     AnnotatorState,
     PathPolicy,
+    UNUSABLE_REASONS,
     _safe_image_path,
     _sample_stratified,
     make_handler,
@@ -290,6 +293,110 @@ def test_strict_annotations_csv_schema_validation(tmp_path: Path) -> None:
     res = state.get_annotation("tile.png")
     assert res["found"] is True
     assert res["record"]["notes"] == "note"
+
+
+@pytest.mark.parametrize(
+    ("reason", "notes", "error_code"),
+    [
+        (None, "", "unusable_reason_required"),
+        ("", "", "unusable_reason_required"),
+        (None, "[unusable: missing_imagery]", "unusable_reason_required"),
+        ("unsupported", "", "invalid_unusable_reason"),
+        ("missing_imagery, duplicate", "", "invalid_unusable_reason"),
+        ("missing_imagery", "duplicate", "invalid_unusable_reason"),
+        ("missing_imagery", "[unusable: missing_imagery] duplicate", "invalid_unusable_reason"),
+    ],
+)
+def test_save_rejects_invalid_skips_before_any_persistence(
+    tmp_path: Path, reason: str | None, notes: str, error_code: str,
+) -> None:
+    state = fixture_state(tmp_path)
+    state.load_batch({})
+    state.save_annotation({"image_path": "tile.png", "scenic_human": 8})
+    annotations_path = Path(state.config.annotations_csv)
+    progress_path = Path(state.progress_path)
+    annotations_before = annotations_path.read_bytes()
+    progress_before = progress_path.read_bytes()
+
+    with pytest.raises(ApiError) as exc_info:
+        state.save_annotation(
+            {"image_path": "tile.png", "skip": True, "unusable_reason": reason, "notes": notes}
+        )
+
+    assert exc_info.value.status == 400
+    assert exc_info.value.code == error_code
+    assert "Unusable Reason" in exc_info.value.message
+    assert annotations_path.read_bytes() == annotations_before
+    assert progress_path.read_bytes() == progress_before
+
+
+@pytest.mark.parametrize("reason", UNUSABLE_REASONS)
+def test_save_accepts_each_supported_skip_reason(tmp_path: Path, reason: str) -> None:
+    state = fixture_state(tmp_path)
+    loaded = state.load_batch({})
+    assert loaded["unusable_reasons"] == sorted(UNUSABLE_REASONS)
+
+    saved = state.save_annotation(
+        {"image_path": "tile.png", "skip": True, "unusable_reason": reason, "notes": "clear"}
+    )
+
+    assert saved["saved"] is True
+    assert saved["record"]["notes"] == f"[unusable: {reason}] clear"
+    frame = pd.read_csv(state.config.annotations_csv)
+    assert bool(frame.iloc[0]["skip"]) is True
+    assert frame.iloc[0]["notes"] == saved["record"]["notes"]
+
+
+@pytest.mark.parametrize("reason", ["", "unsupported", "missing_imagery"])
+def test_notebook_save_cell_uses_shared_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str,
+) -> None:
+    notebook = Path(__file__).resolve().parents[1] / "notebooks" / "annotate_scenic.mo.py"
+    module = ast.parse(notebook.read_text(encoding="utf-8"))
+    save_cell = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and any(
+            isinstance(child, ast.Attribute) and child.attr == "save_annotation"
+            for child in ast.walk(node)
+        )
+    )
+    save_cell.decorator_list = []
+    namespace: dict = {}
+    exec(compile(ast.Module(body=[save_cell], type_ignores=[]), str(notebook), "exec"), namespace)
+    state = fixture_state(tmp_path)
+    state.load_batch({})
+    payloads: list[dict] = []
+    save_annotation = state.save_annotation
+
+    def save(payload: dict) -> dict:
+        payloads.append(payload)
+        return save_annotation(payload)
+
+    monkeypatch.setattr(state, "save_annotation", save)
+    result, = namespace["_"](
+        ApiError=ApiError,
+        annotator_state=state,
+        image_path="tile.png",
+        mo=SimpleNamespace(callout=lambda message, **kwargs: message),
+        ui_conf=SimpleNamespace(value="medium"),
+        ui_notes=SimpleNamespace(value="clear"),
+        ui_save_click=SimpleNamespace(value=True),
+        ui_score=SimpleNamespace(value=5),
+        ui_skip=SimpleNamespace(value=True),
+        ui_unusable_reason=SimpleNamespace(value=reason),
+    )
+
+    assert len(payloads) == 1
+    assert payloads[0]["unusable_reason"] == reason
+    assert result["saved"] is (reason == "missing_imagery")
+    if result["saved"]:
+        assert pd.read_csv(state.config.annotations_csv).iloc[0]["notes"] == (
+            "[unusable: missing_imagery] clear"
+        )
+    else:
+        assert "Unusable Reason" in result["error"]
+        assert not Path(state.config.annotations_csv).exists()
 
 
 def test_explicit_unusable_reason_persistence_and_restoration(tmp_path: Path) -> None:
@@ -579,6 +686,24 @@ def test_web_saves_require_scope_token_and_reject_cross_batch_saves(
         assert status == 409
         assert body["error"]["code"] == "scope_mismatch"
 
+        # Browser-side validation cannot bypass the shared skip contract.
+        skipped = {"image_path": "tile.png", "skip": True, "scope_token": token_b}
+        status, body = post("/api/save-annotation", skipped)
+        assert status == 400
+        assert body["error"]["code"] == "unusable_reason_required"
+        status, body = post(
+            "/api/save-annotation", {**skipped, "unusable_reason": "unsupported"}
+        )
+        assert status == 400
+        assert body["error"]["code"] == "invalid_unusable_reason"
+        assert not (raw / "batch_b_human.csv").exists()
+        status, body = post(
+            "/api/save-annotation", {**skipped, "unusable_reason": "missing_imagery"}
+        )
+        assert status == 200
+        assert body["record"]["notes"] == "[unusable: missing_imagery]"
+
+        # Ordinary scored decisions remain unaffected, including upserts.
         status, body = post("/api/save-annotation", {**save, "scope_token": token_b})
         assert status == 200
         assert body["saved"] is True

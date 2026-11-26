@@ -15,13 +15,14 @@ from typing import Any, Mapping
 
 import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
 
-from src.route_planner._edge_projection import EdgeProjectionIndex, _SidecarError
-from src.heuristics.report import recover_report_run_info
-from src.route_planner.graph import (
+from scenicdriver.route_planner._edge_projection import EdgeProjectionIndex, _SidecarError
+from scenicdriver.heuristics.report import recover_report_run_info
+from scenicdriver.route_planner.graph import (
     _COMPACT_DTYPE_ITEMSIZE,
     _COMPACT_FORMAT,
     _COMPACT_SCENIC_BYWAY_ROAD_TYPE,
@@ -32,25 +33,12 @@ from src.route_planner.graph import (
     RoadGraph,
     _compact_highway_road_types,
 )
-from src.route_planner.service import _load_graph, load_tile_scores
+from scenicdriver.route_planner.service import _load_graph, load_tile_scores
 CONFIG_PATH = Path("config/app_regions.json")
 REGISTRY_PATH = Path("data/processed/regression/model_registry.json")
-DEFAULT_GRAPH_PATH = Path(
-    "data/processed/road_graphs/new_england_north_full_bbox_v1/road_graph.sqlite3"
-)
-DEFAULT_RUN_NAME = "prompt_two_candidate_exp02_fresh_test20_20260810"
-DEFAULT_CHECKPOINT_PATH = Path(
-    "data/processed/regression/checkpoints/0a165e429c8ac050524c7da409dd533d2de8849600c5dd8605aa1a1024d823e9.pt"
-)
 
 _SQLITE_GRAPH_FORMAT = "scenic-roadgraph-sqlite"
 _SQLITE_SCHEMA_VERSION = 1
-_CANONICAL_PROBE_COORDINATES = {
-    "rutland_usps": (43.60784414, -72.98226538),
-    "lisbon_police": (44.02516775, -70.10003245),
-    "burlington": (44.475884, -73.214003),
-    "bangor": (44.801616, -68.771305),
-}
 
 _REQUIRED_SQLITE_COLUMNS = {
     "metadata": ("key", "value"),
@@ -151,75 +139,23 @@ def _configured_route_regions(
     issues: list[str] = []
 
     if not config_path.is_file():
-        default_graph = (
-            _project_path(root, cli_graph)
-            if cli_graph is not None
-            else root / DEFAULT_GRAPH_PATH
-        )
-        return [
-            {
-                "region": "new_england_north",
-                "graph_path": default_graph,
-                "run_name": DEFAULT_RUN_NAME,
-                "region_dict": None,
-                "is_default": True,
-            }
-        ], []
+        return [], [f"missing: {CONFIG_PATH} (canonical region config is required)"]
 
     try:
         payload: Any = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        default_graph = (
-            _project_path(root, cli_graph)
-            if cli_graph is not None
-            else root / DEFAULT_GRAPH_PATH
-        )
-        return [
-            {
-                "region": "new_england_north",
-                "graph_path": default_graph,
-                "run_name": DEFAULT_RUN_NAME,
-                "region_dict": None,
-                "is_default": True,
-            }
-        ], [f"invalid: {CONFIG_PATH} ({exc})"]
+        return [], [f"invalid: {CONFIG_PATH} ({exc})"]
 
     if not isinstance(payload, dict):
-        default_graph = (
-            _project_path(root, cli_graph)
-            if cli_graph is not None
-            else root / DEFAULT_GRAPH_PATH
-        )
-        return [
-            {
-                "region": "new_england_north",
-                "graph_path": default_graph,
-                "run_name": DEFAULT_RUN_NAME,
-                "region_dict": None,
-                "is_default": True,
-            }
-        ], [f"invalid: {CONFIG_PATH} (config payload is not a dict)"]
+        return [], [f"invalid: {CONFIG_PATH} (config payload is not a dict)"]
 
     default_region_name = payload.get("default_region")
-    if not isinstance(default_region_name, str) or not default_region_name:
-        default_region_name = "new_england_north"
+    if not isinstance(default_region_name, str) or not default_region_name.strip():
+        return [], [f"invalid: {CONFIG_PATH} (default_region is missing)"]
 
     regions_raw = payload.get("regions")
     if not isinstance(regions_raw, list):
-        default_graph = (
-            _project_path(root, cli_graph)
-            if cli_graph is not None
-            else root / DEFAULT_GRAPH_PATH
-        )
-        return [
-            {
-                "region": default_region_name,
-                "graph_path": default_graph,
-                "run_name": DEFAULT_RUN_NAME,
-                "region_dict": None,
-                "is_default": True,
-            }
-        ], [f"invalid: {CONFIG_PATH} (regions array is missing)"]
+        return [], [f"invalid: {CONFIG_PATH} (regions array is missing)"]
 
     route_regions: list[dict[str, Any]] = []
     found_default = False
@@ -253,9 +189,9 @@ def _configured_route_regions(
             graph_path = _project_path(root, raw_graph)
 
         run_name = item.get("run_name")
-        if not isinstance(run_name, str) or not run_name:
+        if not isinstance(run_name, str) or not run_name.strip():
             issues.append(f"invalid: {CONFIG_PATH} ({region_name} run_name is missing)")
-            run_name = DEFAULT_RUN_NAME if is_default else ""
+            continue
 
         route_regions.append(
             {
@@ -270,22 +206,6 @@ def _configured_route_regions(
     if not found_default:
         issues.append(
             f"invalid: {CONFIG_PATH} ({default_region_name} is not configured)"
-        )
-
-    if not route_regions:
-        default_graph = (
-            _project_path(root, cli_graph)
-            if cli_graph is not None
-            else root / DEFAULT_GRAPH_PATH
-        )
-        route_regions.append(
-            {
-                "region": default_region_name,
-                "graph_path": default_graph,
-                "run_name": DEFAULT_RUN_NAME,
-                "region_dict": None,
-                "is_default": True,
-            }
         )
 
     return route_regions, issues
@@ -441,15 +361,9 @@ def _validate_sqlite_graph(
         if not isinstance(probes, Mapping):
             return [f"invalid: {label} (coverage_probes metadata is missing)"]
         configured_probes = region.get("coverage_probes")
-        if configured_probes is None:
-            expected_probes: Mapping[str, Any] = {
-                name: {"lat": coordinates[0], "lon": coordinates[1]}
-                for name, coordinates in _CANONICAL_PROBE_COORDINATES.items()
-            }
-        elif isinstance(configured_probes, Mapping) and configured_probes:
-            expected_probes = configured_probes
-        else:
+        if not isinstance(configured_probes, Mapping) or not configured_probes:
             return [f"invalid: {label} (configured coverage_probes are invalid)"]
+        expected_probes = configured_probes
 
         for probe_name, expected_probe in expected_probes.items():
             if not isinstance(probe_name, str) or not isinstance(
@@ -770,38 +684,30 @@ def _validate_compact_graph(
 
     return _validate_admitted_graph(manifest_path, region)
 
-def _active_checkpoint(root: Path) -> tuple[Path, list[str]]:
+def _active_checkpoint(root: Path) -> tuple[Path | None, list[str]]:
     """Resolve the checkpoint named by the active model-registry record."""
 
     registry_path = root / REGISTRY_PATH
-    checkpoint_path = root / DEFAULT_CHECKPOINT_PATH
-    issues: list[str] = []
     if not registry_path.is_file():
-        return checkpoint_path, issues
+        return None, [f"missing: {REGISTRY_PATH} (model registry is required)"]
 
     try:
         payload: Any = json.loads(registry_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        issues.append(f"invalid: {REGISTRY_PATH} ({exc})")
-        return checkpoint_path, issues
+        return None, [f"invalid: {REGISTRY_PATH} ({exc})"]
 
     active = payload.get("active") if isinstance(payload, dict) else None
     configured_checkpoint = (
         active.get("checkpoint") if isinstance(active, dict) else None
     )
-    if isinstance(configured_checkpoint, str) and configured_checkpoint:
-        checkpoint_path, resolve_issues = _resolve_active_checkpoint(
-            root, registry_path, configured_checkpoint
-        )
-        issues.extend(resolve_issues)
-    else:
-        issues.append(f"invalid: {REGISTRY_PATH} (active checkpoint is missing)")
-    return checkpoint_path, issues
+    if not isinstance(configured_checkpoint, str) or not configured_checkpoint.strip():
+        return None, [f"invalid: {REGISTRY_PATH} (active checkpoint is missing)"]
+    return _resolve_active_checkpoint(root, registry_path, configured_checkpoint)
 
 
 def _score_report_path(root: Path, reg: Mapping[str, Any]) -> Path:
     """Match API startup score-report override precedence."""
-    item = reg["region_dict"] or {}
+    item = reg["region_dict"]
     configured = next(
         (item.get(key) for key in ("tile_scores_json", "tile_scores_path", "report", "report_json")
          if item.get(key)), None,
@@ -814,11 +720,14 @@ def _score_report_path(root: Path, reg: Mapping[str, Any]) -> Path:
 def _validate_report(path: Path, checkpoint: Path, *, heatmap: bool = True) -> list[str]:
     """Validate consumed scores and canonical learned provenance/model association."""
     from fastapi import HTTPException
-    from src.app_api.main import _parse_heatmap_artifact
+    from scenicdriver.app_api.main import (
+        _parse_heatmap_artifact,
+        _readiness_file_identity,
+    )
 
     try:
         if heatmap:
-            payload = _parse_heatmap_artifact(str(path), path.stat().st_mtime_ns)
+            payload = _parse_heatmap_artifact(str(path), _readiness_file_identity(path))
         else:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict) or not isinstance(payload.get("tiles"), list):
@@ -879,7 +788,7 @@ def _validate_saved_routes(report_dir: Path) -> list[str]:
         request = metrics["request"]
         for endpoint in ("start", "end"):
             coordinate(request.get(endpoint), latitude_first=True)
-        if not all(finite(request.get(key)) for key in ("scenic_weight", "max_detour_factor")):
+        if not finite(request.get("max_detour_factor")):
             raise ValueError("missing finite route request")
     except (OSError, UnicodeError, ValueError, TypeError, KeyError, AttributeError) as exc:
         return [f"invalid: {report_dir} (saved route artifacts: {exc})"]
@@ -957,10 +866,7 @@ def _validate_admitted_graph(path: Path, region: Mapping[str, Any] | None) -> li
                 if not math.isfinite(edge.distance_km) or edge.distance_km < 0 or not math.isfinite(edge.scenic_score) or not 0 <= edge.scenic_score <= 10:
                     raise ValueError("invalid edge numeric values")
 
-        probes = region.get("coverage_probes", {
-            name: {"lat": lat, "lon": lon}
-            for name, (lat, lon) in _CANONICAL_PROBE_COORDINATES.items()
-        })
+        probes = region.get("coverage_probes")
         max_snap = region.get("max_route_snap_km")
         if isinstance(max_snap, bool) or not isinstance(max_snap, (int, float)) or not math.isfinite(max_snap) or max_snap < 0:
             raise ValueError("invalid max_route_snap_km")
@@ -1015,7 +921,7 @@ def _validate_admitted_graph(path: Path, region: Mapping[str, Any] | None) -> li
 def _validate_readiness_gate(root: Path, graph_path: Path) -> list[str]:
     """Validate the builder's ``run.json`` publication gate for one admitted graph.
 
-    Mirrors the runtime gate in ``src.app_api.main._graph_readiness``: the
+    Mirrors the runtime gate in ``scenicdriver.app_api.main._graph_readiness``: the
     record must carry the shipped graph identity, project-root-relative paths,
     and (when the admitted graph is the compact manifest) the compact identity.
     A missing or stale gate means the API refuses to route the region, so
@@ -1085,17 +991,17 @@ def check_artifacts(project_root: Path, graph: Path | None = None) -> int:
     checkpoint_path, registry_issues = _active_checkpoint(root)
     issues.extend(registry_issues)
 
-    required_paths: list[Path] = [
-        root / REGISTRY_PATH,
-        checkpoint_path,
-    ]
+    required_paths: list[Path] = [root / REGISTRY_PATH]
+    if checkpoint_path is not None:
+        required_paths.append(checkpoint_path)
 
     for reg in regions:
         graph_path = reg["graph_path"]
-        region_dict = reg["region_dict"] or {}
+        region_dict = reg["region_dict"]
         model_path = _project_path(root, region_dict["model_checkpoint"]) if region_dict.get("model_checkpoint") else checkpoint_path
         reg["model_path"] = model_path
-        required_paths.append(model_path)
+        if model_path is not None:
+            required_paths.append(model_path)
         report_path = _score_report_path(root, reg)
         reg["report_path"] = report_path
         required_paths.append(report_path)
@@ -1150,13 +1056,14 @@ def check_artifacts(project_root: Path, graph: Path | None = None) -> int:
     for reg in regions:
         report_path = reg["report_path"]
         canonical_report = root / "data/processed/heuristic_runs" / reg["run_name"] / "report/report.json"
-        if report_path != canonical_report and report_path not in missing:
-            issues.extend(_validate_report(report_path, reg["model_path"], heatmap=False))
+        model_path = reg["model_path"]
+        if report_path != canonical_report and report_path not in missing and model_path is not None:
+            issues.extend(_validate_report(report_path, model_path, heatmap=False))
         if reg["run_name"]:
             report_dir = root / "data/processed/heuristic_runs" / reg["run_name"] / "report"
             canonical_report = report_dir / "report.json"
-            if canonical_report not in missing:
-                issues.extend(_validate_report(canonical_report, reg["model_path"]))
+            if canonical_report not in missing and model_path is not None:
+                issues.extend(_validate_report(canonical_report, model_path))
             if all((report_dir / name) not in missing for name in ("route.geojson", "route_metrics.json")):
                 issues.extend(_validate_saved_routes(report_dir))
 

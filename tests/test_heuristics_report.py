@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import pytest
 
-from src.heuristics.report import (
+from scenicdriver.heuristics.report import (
     build_report,
     union_report_tiles,
     union_reports,
@@ -382,9 +382,9 @@ def learned_cli_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import numpy as np
     import torch
     from PIL import Image
-    from src.heuristics import labeler
-    from src.scenic_scorer.regression import ScenicRegressionModel
-    from src.terrain.features import compute_terrain_features, compute_terrain_valid_mask
+    from scenicdriver.heuristics import labeler
+    from scenicdriver.scenic_scorer.regression import ScenicRegressionModel
+    from scenicdriver.terrain.features import compute_terrain_features, compute_terrain_valid_mask
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("SCENIC_S3_BUCKET", raising=False)
@@ -409,7 +409,7 @@ def learned_cli_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     torch.save(classifier.state_dict(), classifier_path)
     terrain_dim = len(
         compute_terrain_features(
-            image, image, valid_mask=compute_terrain_valid_mask(image)
+            image, image, valid_mask=compute_terrain_valid_mask(image), pixel_spacing_m=1.0
         ).features.to_array()
     )
     model = ScenicRegressionModel(vit_dim=2, terrain_dim=terrain_dim, num_classes=3)
@@ -451,7 +451,7 @@ def learned_cli_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def test_learned_report_cli_preserves_admitted_identity(learned_cli_args) -> None:
     import json
     from scripts.reports.heuristic_report import run_report
-    from src.heuristics.report import REQUIRED_LEARNED_FIELDS
+    from scenicdriver.heuristics.report import REQUIRED_LEARNED_FIELDS
 
     args, identity = learned_cli_args
     run_dir = run_report(args)
@@ -557,7 +557,7 @@ def test_fresh_learned_report_uses_checkpoint_metadata(learned_cli_args) -> None
     import json
     import torch
     from scripts.reports.heuristic_report import run_report
-    from src.heuristics.report import REQUIRED_LEARNED_FIELDS
+    from scenicdriver.heuristics.report import REQUIRED_LEARNED_FIELDS
 
     args, identity = learned_cli_args
     checkpoint = Path(args.regression_ckpt)
@@ -678,7 +678,7 @@ def test_summary_rendering_accepts_minimal_metadata(run_info) -> None:
     import re
     import shutil
     import subprocess
-    from src.heuristics.report import _render_index_html
+    from scenicdriver.heuristics.report import _render_index_html
 
     node = shutil.which("node")
     if node is None:
@@ -838,8 +838,8 @@ def test_tile_preview_switches_between_thumbnail_and_placeholder(tmp_path):
 @pytest.mark.parametrize("hidden_dim", [None, 12])
 def test_learned_checkpoint_restores_regression_architecture(tmp_path: Path, hidden_dim) -> None:
     import torch
-    from src.heuristics.labeler import _load_learned_regressor
-    from src.scenic_scorer.regression import ScenicRegressionModel
+    from scenicdriver.heuristics.labeler import _load_learned_regressor
+    from scenicdriver.scenic_scorer.regression import ScenicRegressionModel
 
     model = ScenicRegressionModel(vit_dim=2, terrain_dim=3, num_classes=2, hidden_dim=hidden_dim or 256)
     model.eval()
@@ -858,7 +858,7 @@ def test_learned_checkpoint_restores_regression_architecture(tmp_path: Path, hid
 
 @pytest.mark.parametrize("remote_satellite", [False, True])
 def test_fallback_image_references_support_mixed_storage(tmp_path: Path, remote_satellite) -> None:
-    from src.heuristics.labeler import S3ImageRef, _relative_paths_or_raise
+    from scenicdriver.heuristics.labeler import S3ImageRef, _relative_paths_or_raise
 
     satellite = "images/satellite/z14/region/100_200.png"
     terrain = "images/terrain/z14/region/100_200.png"
@@ -871,7 +871,7 @@ def test_fallback_image_references_support_mixed_storage(tmp_path: Path, remote_
 
 @pytest.mark.parametrize("key", ["processed/tile.png", "raw/../tile.png", "raw//tile.png"])
 def test_fallback_s3_references_reject_outside_raw_keys(tmp_path: Path, key) -> None:
-    from src.heuristics.labeler import S3ImageRef, _relative_paths_or_raise
+    from scenicdriver.heuristics.labeler import S3ImageRef, _relative_paths_or_raise
 
     with pytest.raises(ValueError, match="raw/"):
         _relative_paths_or_raise(
@@ -882,8 +882,8 @@ def test_fallback_s3_references_reject_outside_raw_keys(tmp_path: Path, key) -> 
 
 def test_no_classifier_uses_non_class_id() -> None:
     from PIL import Image
-    from src.classifier.model import TERRAIN_CLASSES
-    from src.heuristics.labeler import _infer_class
+    from scenicdriver.classifier.model import TERRAIN_CLASSES
+    from scenicdriver.heuristics.labeler import _infer_class
 
     class_id, class_name, weight = _infer_class(
         sat_img=Image.new("RGB", (2, 2)), classifier=None, clf_transform=None,
@@ -898,8 +898,8 @@ def test_learned_classifier_extracts_outputs_in_one_backbone_pass(monkeypatch) -
     import numpy as np
     import torch
     from PIL import Image
-    from src.classifier import model
-    from src.heuristics.labeler import _infer_class
+    from scenicdriver.classifier import model
+    from scenicdriver.heuristics.labeler import _infer_class
 
     backbone = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(12, 4))
     backbone.num_features = 4
@@ -926,7 +926,7 @@ def test_learned_classifier_extracts_outputs_in_one_backbone_pass(monkeypatch) -
 
 
 def test_s3_reference_preserves_literal_object_key(tmp_path: Path) -> None:
-    from src.heuristics.labeler import S3ImageRef, _relative_paths_or_raise
+    from scenicdriver.heuristics.labeler import S3ImageRef, _relative_paths_or_raise
 
     assert _relative_paths_or_raise(
         S3ImageRef("raw/images/satellite//tile.png"), tmp_path / "terrain.png", tmp_path,

@@ -543,12 +543,12 @@ export SCENIC_DATASET_PATH={remote_quote(dataset_path)}
 export SCENIC_CHECKPOINT_PATH={remote_quote(checkpoint_path)}
 mkdir -p "$(dirname "$SCENIC_DATASET_PATH")" "$(dirname "$SCENIC_CHECKPOINT_PATH")"
 uv sync --python 3.11
-uv run python -m src.data_pipeline.s3 download-file \
+uv run python -m scenicdriver.data_pipeline.s3 download-file \
   --bucket "$SCENIC_S3_BUCKET" \
   --key "$SCENIC_VALIDATION_DATASET_KEY" \
   --dest "$SCENIC_DATASET_PATH" \
   --required
-uv run python -m src.data_pipeline.s3 download-file \
+uv run python -m scenicdriver.data_pipeline.s3 download-file \
   --bucket "$SCENIC_S3_BUCKET" \
   --key "$SCENIC_VALIDATION_CHECKPOINT_KEY" \
   --dest "$SCENIC_CHECKPOINT_PATH" \

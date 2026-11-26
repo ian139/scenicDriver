@@ -1,3 +1,9 @@
+> **HISTORICAL / FROZEN — NON-EXECUTABLE**
+>
+> Commit-era scope: the stopped 2026-07-27 multi-detour autoresearch experiment, including the fixed 18-case boundary at `f39cf85c`. Its benchmark commands reference a removed harness; all objectives, constraints, next hypotheses, commands, and measurements below are historical records, not current contracts or instructions to resume execution.
+>
+> Current authority: [FIXES.md](../../FIXES.md), [README workflow commands](../../README.md), and the [canonical ML research log](../../docs/research/ml-research-log.md).
+
 # Multi-detour routing accuracy
 
 - Status: stopped after the current run at user direction
@@ -77,7 +83,7 @@ Improve compiled scenic-route planning accuracy for one route containing multipl
 - Confirmed rollback again: immutable mean regret `44.019087826685` pp and compiled p95 `1567` µs.
 - Measured the lazy-canonical prefix frontier: zero objective/scenic regret and every accuracy/control rate `1.0`, but compiled p95 was `2339` µs, so the candidate was rejected.
 - Profiled the rejected helper at `56` ms over 90 calls; `rank_states` consumed `13` ms across 105 calls, `state_identity` `10` ms across 4,580 calls, and edge premeasurement `7` ms across 180 calls.
-- Restored `src/route_planner/planner.py` and confirmed the immutable rollback: mean objective regret `44.019087826685` pp, exact/frontier match `1.0`, correctness failures `0`, compiled p95 `1598` µs.
+- Restored `src/scenicdriver/route_planner/planner.py` and confirmed the immutable rollback: mean objective regret `44.019087826685` pp, exact/frontier match `1.0`, correctness failures `0`, compiled p95 `1598` µs.
 
 ### Current
 
@@ -94,7 +100,7 @@ Improve compiled scenic-route planning accuracy for one route containing multipl
 
 ## Touched files and symbols
 
-- `src/route_planner/planner.py`: rejected bounded-repair experiments; restored to the retained production baseline.
+- `src/scenicdriver/route_planner/planner.py`: rejected bounded-repair experiments; restored to the retained production baseline.
 - `scripts/routing/autoresearch_multidetour.py`: fixed compiled multi-detour benchmark.
 - `autoresearch.sh`: canonical benchmark command.
 - `.omp/work-context/20260727-multidetour-routing-accuracy.md`: durable task state.
@@ -106,18 +112,18 @@ Improve compiled scenic-route planning accuracy for one route containing multipl
 - `git revert --no-edit 85b9153d 18198564 facd6431` → three clean revert commits ending at `a76a7968`.
 - `bash autoresearch.sh` on the rollback → denominator `14`, digest `72a11c49b549791702bfa6b637068d901e61648090a2c37740715b0401655074`, mean regret `47.480323804377` pp, exact/frontier match `1.0`, correctness failures `0`, compiled p95 `1482` µs.
 - `bash autoresearch.sh` on the expanded rollback → denominator `16`, digest `6ac7ede8dc6be0aa16411f49e5a55583d675b1602aebcfa576276de33cf36a5f`, mean regret `42.021473805021` pp, review match `0.0`, exact/frontier match `1.0`, correctness failures `0`, compiled p95 `1738` µs.
-- Temporary `git cherry-pick --no-commit facd6431` plus that expanded benchmark → overall oracle match `0.875`, review match `0.0`, mean regret `0.476190476190` pp, compiled p95 `2225` µs; `git restore --staged --worktree src/route_planner/planner.py` left only the intended harness/work-record changes.
+- Temporary `git cherry-pick --no-commit facd6431` plus that expanded benchmark → overall oracle match `0.875`, review match `0.0`, mean regret `0.476190476190` pp, compiled p95 `2225` µs; `git restore --staged --worktree src/scenicdriver/route_planner/planner.py` left only the intended harness/work-record changes.
 - `uv run ruff check scripts/routing/autoresearch_multidetour.py` → `OK`.
 - Pyright diagnostics for `scripts/routing/autoresearch_multidetour.py` → `OK`.
 - Independent `HarnessReview` verdict → correct/safe to freeze, confidence `0.98`, no findings.
 - `git commit` froze the harness at `d4c4a7ad`.
 - Formal `bash autoresearch.sh` baseline at `d4c4a7ad` → mean regret `42.021473805021` pp, review match `0.0`, exact/frontier match `1.0`, correctness failures `0`, compiled p95 `1793` µs.
 - Rejected corrected-frontier benchmark → mean/worst regret `0`, overall/review/multi-detour/recall/exact/frontier match `1.0`, correctness failures `0`, compiled p95 `2194` µs (`+22.37%` versus `1793`).
-- `git restore --staged --worktree src/route_planner/planner.py` followed by `bash autoresearch.sh` → baseline mean regret `42.021473805021` pp and compiled p95 `1616` µs, confirming rollback.
+- `git restore --staged --worktree src/scenicdriver/route_planner/planner.py` followed by `bash autoresearch.sh` → baseline mean regret `42.021473805021` pp and compiled p95 `1616` µs, confirming rollback.
 - Per-fixture 12-run profile: rejected reference distance adversary median/p95 `2350/2525` µs; rollback median/p95 `1715.5/2421` µs. Other candidate medians were at most `1517.5` µs.
 - cProfile over 40 rejected-reference distance runs → helper cumulative `83` ms, `summarize` cumulative `30` ms across `5,120` calls; the state-evaluation allocation path is the bounded hotspot.
 - Accepted optimized-frontier benchmark → mean/worst objective and scenic regret `0`, overall/review/multi-detour/detour-recall/exact/frontier match `1.0`, q0 pass `1`, correctness failures `0`, compiled p95 `1942` µs (`+8.31%` versus `1793`).
-- `uv run ruff check src/route_planner/planner.py` → `OK`.
+- `uv run ruff check src/scenicdriver/route_planner/planner.py` → `OK`.
 - `git commit` retained the measured candidate at `bdc2d73f`.
 - `RetainedFrontierReview` and `FrontierInvariantChallenge` → unsafe for retention, confidence `0.99`; both independently reproduced canonical-cutoff and rounded-aggregate rank inversions.
 - `git revert --no-edit bdc2d73f` → rollback revision `895e31b6`.
@@ -130,10 +136,10 @@ Improve compiled scenic-route planning accuracy for one route containing multipl
 - Formal `bash autoresearch.sh` at `f39cf85c` → digest `843ab3a7f6df0378233620f5402783cceae7ed2c88037b23c20d53820b64511a`, denominator `18`, review denominator `4`, mean objective regret `44.019087826685` pp, exact/frontier match `1.0`, correctness failures `0`, compiled p95 `1660` µs; the 10% retention ceiling is `1826` µs.
 - Rejected path-order frontier `bash autoresearch.sh` → zero objective/scenic regret, every match/recall/control rate `1.0`, correctness failures `0`, compiled p95 `2540` µs (`+53.01%` versus `1660`).
 - cProfile on the rejected frontier → helper cumulative `59` ms over 90 compiled calls; `can_complete` `12` ms, `append_segment` `9` ms, and edge premeasurement `7` ms.
-- `git restore --staged --worktree src/route_planner/planner.py` followed by `bash autoresearch.sh` → immutable rollback digest/denominators unchanged, mean regret `44.019087826685` pp, compiled p95 `1627` µs.
+- `git restore --staged --worktree src/scenicdriver/route_planner/planner.py` followed by `bash autoresearch.sh` → immutable rollback digest/denominators unchanged, mean regret `44.019087826685` pp, compiled p95 `1627` µs.
 - Rejected cutoff/final direct-ranking `bash autoresearch.sh` → zero regret, every match/recall/control rate `1.0`, correctness failures `0`, compiled p95 `2541` µs (`+53.07%` versus `1660`).
 - cProfile → helper cumulative `61` ms over 90 calls; memoized `summarize` cumulative `22` ms across 2,980 calls.
-- `git restore --staged --worktree src/route_planner/planner.py` followed by `bash autoresearch.sh` → immutable rollback mean regret `44.019087826685` pp, compiled p95 `1567` µs.
+- `git restore --staged --worktree src/scenicdriver/route_planner/planner.py` followed by `bash autoresearch.sh` → immutable rollback mean regret `44.019087826685` pp, compiled p95 `1567` µs.
 - Rejected lazy-canonical prefix `bash autoresearch.sh` → zero objective/scenic regret, every match/recall/control rate `1.0`, correctness failures `0`, compiled p95 `2339` µs (`+40.90%` versus `1660`).
 - cProfile → helper cumulative `56` ms over 90 calls; `rank_states` `13` ms across 105 calls, `state_identity` `10` ms across 4,580 calls, and edge premeasurement `7` ms across 180 calls.
-- `git restore --staged --worktree src/route_planner/planner.py` followed by `bash autoresearch.sh` → digest and denominators unchanged, baseline mean objective regret `44.019087826685` pp, exact/frontier match `1.0`, correctness failures `0`, compiled p95 `1598` µs.
+- `git restore --staged --worktree src/scenicdriver/route_planner/planner.py` followed by `bash autoresearch.sh` → digest and denominators unchanged, baseline mean objective regret `44.019087826685` pp, exact/frontier match `1.0`, correctness failures `0`, compiled p95 `1598` µs.

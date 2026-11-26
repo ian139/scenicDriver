@@ -8,11 +8,11 @@ from pathlib import Path
 import networkx as nx
 import pytest
 
-from src.route_planner.cost import CostWeights, ScenicCostFunction
-from src.route_planner.graph import Edge, Node, RoadGraph
-from src.route_planner.planner import ScenicRoutePlanner
-from src.data_pipeline.web_mercator import lat_lon_to_tile
-from src.route_planner.service import apply_tile_scores_to_graph
+from scenicdriver.route_planner.cost import CostWeights, ScenicCostFunction
+from scenicdriver.route_planner.graph import Edge, Node, RoadGraph
+from scenicdriver.route_planner.planner import ScenicRoutePlanner
+from scenicdriver.data_pipeline.web_mercator import lat_lon_to_tile
+from scenicdriver.route_planner.service import apply_tile_scores_to_graph
 
 
 def test_graph_bidirectional_edges() -> None:
@@ -707,8 +707,8 @@ def test_scenic_cost_is_invariant_under_equivalent_edge_split() -> None:
 
 
 def test_osm_linestring_intermediate_coordinates_survive_route_feature() -> None:
-    from src.route_planner.graph import _graph_from_osmnx
-    from src.route_planner.service import route_to_feature
+    from scenicdriver.route_planner.graph import _graph_from_osmnx
+    from scenicdriver.route_planner.service import route_to_feature
 
     class _Geometry:
         coords = [(-72.0, 42.0), (-71.99, 42.005), (-71.98, 42.01)]
@@ -765,7 +765,7 @@ def test_zero_edge_route_feature_uses_snapped_road_geometry() -> None:
 
 
 def test_zero_edge_equal_endpoint_route_feature_has_two_positions() -> None:
-    from src.route_planner.service import route_to_feature
+    from scenicdriver.route_planner.service import route_to_feature
 
     graph = RoadGraph()
     graph.add_node(Node(id="only", lat=42.0, lon=-72.0))
@@ -787,7 +787,7 @@ def test_zero_edge_equal_endpoint_route_feature_has_two_positions() -> None:
 
 
 def test_osm_length_is_authoritative_for_curves_and_geometryless_edges() -> None:
-    from src.route_planner.graph import _graph_from_osmnx, _haversine_km
+    from scenicdriver.route_planner.graph import _graph_from_osmnx, _haversine_km
 
     class _Geometry:
         coords = [
@@ -837,7 +837,7 @@ def test_osm_length_is_authoritative_for_curves_and_geometryless_edges() -> None
 
 
 def test_osm_invalid_length_falls_back_to_chord_total() -> None:
-    from src.route_planner.graph import _graph_from_osmnx, _haversine_km
+    from scenicdriver.route_planner.graph import _graph_from_osmnx, _haversine_km
 
     osm_graph = nx.MultiDiGraph()
     osm_graph.add_nodes_from(
@@ -911,7 +911,7 @@ def test_missing_mapping_pop_is_a_cache_and_epoch_noop() -> None:
 
 
 def test_kd_cutoff_preserves_exact_ties_and_compact_arrays(monkeypatch) -> None:
-    import src.route_planner.graph as graph_module
+    import scenicdriver.route_planner.graph as graph_module
 
     cutoff = graph_module._KD_SMALL_SUBTREE_CUTOFF
     calls = 0
@@ -3996,7 +3996,7 @@ def test_scenic_floor_is_proportional_below_one_microcost(road_type: str) -> Non
 
 
 def test_direct_scenic_access_survives_disconnected_middle_search() -> None:
-    from src.route_planner.cost import evaluate_path, resolve_routing_policy
+    from scenicdriver.route_planner.cost import evaluate_path, resolve_routing_policy
 
     graph = RoadGraph()
     for prefix in ("fast", "scenic"):
@@ -4053,6 +4053,15 @@ def test_heuristic_zero_improvement_does_not_claim_absence(
     assert route.exact is False
     assert route.optimality_gap > 0.0
     assert route.zero_improvement_reason == "no_scenic_improvement_found"
+    assert route.exactness_status == "approximate-universal-ceiling"
+    assert route.certified_upper_bound == 1.0
+    assert route.optimality_gap == pytest.approx(1.0 - route.objective_value)
+    assert route.search_diagnostics["upper_bound_kind"] == "universal-ceiling"
+    from scenicdriver.route_planner.service import route_to_feature
+    properties = route_to_feature(route, "scenic")["properties"]
+    assert properties["exactness_status"] == "approximate-universal-ceiling"
+    assert properties["search_diagnostics"]["upper_bound_kind"] == "universal-ceiling"
+    assert properties["certified_upper_bound"] == 1.0
 
 
 @pytest.mark.parametrize("cache_kind", ["fastest", "reachability", "csr", "speed"])
@@ -4145,7 +4154,7 @@ def test_shared_cache_lookup_survives_concurrent_invalidation(
 def test_tile_score_admission_rejects_nonfinite_reports(
     tmp_path: Path, score: float,
 ) -> None:
-    from src.route_planner.service import load_tile_scores
+    from scenicdriver.route_planner.service import load_tile_scores
 
     report = tmp_path / "scores.json"
     report.write_text(json.dumps({
@@ -4153,3 +4162,47 @@ def test_tile_score_admission_rejects_nonfinite_reports(
     }), encoding="utf-8")
     with pytest.raises(ValueError, match="finite"):
         load_tile_scores(report)
+
+
+@pytest.mark.parametrize("kappa", [1.0, 1.5, 2.0, 4.0])
+def test_scenic_multipliers_preserve_fixed_candidates_and_scale_to_cap(
+    kappa: float,
+) -> None:
+    edge = Edge(
+        id="fast", start_node_id="S", end_node_id="G", distance_km=1.0,
+        scenic_score=8.0, speed_limit_kmh=60, one_way=True,
+    )
+    cost = ScenicCostFunction(scenic_weight=1.0)
+    multipliers = ScenicRoutePlanner._scenic_search_multipliers(
+        [edge], cost, fastest_duration_minutes=1.0,
+        duration_cap_minutes=kappa,
+    )
+    assert multipliers[:4] == (0.0, 0.25, 0.75, 1.5)
+    assert len(multipliers) <= 6
+    assert len(set(multipliers)) == len(multipliers)
+    if kappa == 1.0:
+        assert len(multipliers) == 4
+    else:
+        scale = cost.calculate(edge) / (kappa - 1.0)
+        assert scale in multipliers
+        assert scale * 0.5 in multipliers
+
+
+def test_scenic_multiplier_scaling_is_invariant_under_edge_split() -> None:
+    whole = Edge(
+        id="whole", start_node_id="S", end_node_id="G", distance_km=1.0,
+        scenic_score=8.0, speed_limit_kmh=60, one_way=True,
+    )
+    parts = [
+        Edge(
+            id=str(index), start_node_id=str(index),
+            end_node_id=str(index + 1), distance_km=0.5,
+            scenic_score=8.0, speed_limit_kmh=60, one_way=True,
+        )
+        for index in range(2)
+    ]
+    cost = ScenicCostFunction(scenic_weight=1.0)
+    arguments = dict(fastest_duration_minutes=1.0, duration_cap_minutes=2.0)
+    assert ScenicRoutePlanner._scenic_search_multipliers(
+        [whole], cost, **arguments,
+    ) == ScenicRoutePlanner._scenic_search_multipliers(parts, cost, **arguments)

@@ -10,21 +10,22 @@ permissions:
 
 jobs:
   tests:
+    name: tests (ubuntu, Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
     steps:
       - name: Check out source
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
           version: "0.9.16"
+          python-version: ${{ matrix.python-version }}
           enable-cache: true
 
       - name: Set up Node.js
@@ -32,12 +33,120 @@ jobs:
         with:
           node-version: "20"
 
-      # Sync project and test dependencies from the checked-in lockfile.
+      # The default dev group installs every extra from the checked-in lockfile.
       - name: Install locked Python dependencies
-        run: uv sync --frozen --extra dev
+        run: uv sync --frozen
 
+      - name: Lint
+        run: uv run --frozen ruff check
+
+      # Includes tests/test_tracked_artifact_policy.py (no tracked data, weights, caches, builds).
       - name: Run Python tests
-        run: uv run pytest -q
+        run: uv run --frozen pytest -q
 
       - name: Run viewer tests
         run: node --test tests/test_new_england_north_viewer.mjs
+
+  browser:
+    name: viewer browser tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install browser test dependencies
+        run: |
+          npm ci --prefix tests/browser
+          (cd tests/browser && npx playwright install --with-deps chromium)
+
+      - name: Run browser tests
+        run: node tests/browser/run.mjs
+
+  native-macos:
+    name: native compact search (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.16"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install locked Python dependencies
+        run: uv sync --frozen
+
+      - name: Run native compact suite
+        run: uv run --frozen pytest -q -m native
+
+  package:
+    name: wheel install smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.16"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Build wheel
+        run: uv build --wheel --out-dir "$RUNNER_TEMP/dist"
+
+      - name: Check wheel ships the native source
+        run: unzip -l "$RUNNER_TEMP"/dist/*.whl | grep -q 'scenicdriver/route_planner/_compact_search_c.c'
+
+      # Lean core only: the API must import without the ml/ingest extras.
+      - name: Install wheel outside the checkout
+        run: |
+          uv export --frozen --no-dev --no-emit-project --no-hashes --output-file "$RUNNER_TEMP/core.txt"
+          uv venv "$RUNNER_TEMP/venv"
+          uv pip install --python "$RUNNER_TEMP/venv" --requirement "$RUNNER_TEMP/core.txt"
+          uv pip install --python "$RUNNER_TEMP/venv" --no-deps "$RUNNER_TEMP"/dist/*.whl
+
+      - name: Import the installed API
+        working-directory: ${{ runner.temp }}
+        run: |
+          ./venv/bin/python -c '
+          import importlib.util
+          import scenicdriver.app_api.main as api
+          from scenicdriver.route_planner._compact_search import compact_search_available
+          assert "site-packages" in api.__file__, api.__file__
+          assert compact_search_available(), "native compact search failed to build/load"
+          assert all(importlib.util.find_spec(n) is None for n in ("torch", "rasterio", "boto3", "marimo"))
+          '
+
+  image:
+    name: beta API image smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --file Dockerfile.beta-api --tag scenicdriver/beta-api:ci .
+
+      - name: Import API and load native library in the image
+        run: |
+          docker run --rm --network none scenicdriver/beta-api:ci python -c '
+          import importlib.util
+          import scenicdriver.app_api.main
+          from scenicdriver.route_planner._compact_search import compact_search_available
+          assert compact_search_available(), "native compact search failed to load"
+          assert all(importlib.util.find_spec(n) is None for n in ("torch", "rasterio", "boto3", "marimo"))
+          '

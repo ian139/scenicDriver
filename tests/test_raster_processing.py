@@ -1,5 +1,5 @@
 """
-Tests for src/data_pipeline/raster_processing.py.
+Tests for src/scenicdriver/data_pipeline/raster_processing.py.
 Covers local-only path validation, remote URI and GDAL VSI rejection, exact Terrain-RGB
 encoding/decoding, vertical datum rejection, tiny local raster reprojection, land geometry masking,
 zero no-data on land validation, outside-land filling, mosaic order precedence, atomic PNG write/hash, and QC stats.
@@ -15,8 +15,8 @@ from PIL import Image
 import rasterio
 from rasterio.transform import from_bounds
 
-from src.data_pipeline.web_mercator import TargetGrid
-from src.data_pipeline.raster_processing import (
+from scenicdriver.data_pipeline.web_mercator import TargetGrid
+from scenicdriver.data_pipeline.raster_processing import (
     RemotePathError,
     NoDataOnLandError,
     TerrainRGBRangeError,
@@ -29,7 +29,7 @@ from src.data_pipeline.raster_processing import (
     process_imagery,
     process_dem,
 )
-from src.data_pipeline.tile_inventory import scan_tile_inventory, validate_png_image
+from scenicdriver.data_pipeline.tile_inventory import scan_tile_inventory, validate_png_image
 
 
 def _create_georeferenced_tif(
@@ -374,7 +374,7 @@ def test_mosaic_order_precedence():
 
 
 def test_raster_coast_mask_carries_land_only_features(tmp_path):
-    from src.terrain.features import compute_terrain_features, compute_terrain_valid_mask
+    from scenicdriver.terrain.features import compute_terrain_features, compute_terrain_valid_mask
 
     grid = TargetGrid.from_tile(z=10, x=100, y=200, width=20, height=20)
     land = np.zeros((20, 20), dtype=bool)
@@ -389,7 +389,8 @@ def test_raster_coast_mask_carries_land_only_features(tmp_path):
     np.testing.assert_array_equal(image_mask, land)
     np.testing.assert_array_equal(compute_terrain_valid_mask(terrain.transpose(1, 2, 0)), land)
     result = compute_terrain_features(
-        terrain.transpose(1, 2, 0), satellite.transpose(1, 2, 0), valid_mask=dem_mask
+        terrain.transpose(1, 2, 0), satellite.transpose(1, 2, 0), valid_mask=dem_mask,
+        pixel_spacing_m=1.0,
     )
     assert result.relief == result.roughness == result.slope_mean == 0.0
     assert result.features.vegetation_density == pytest.approx(0.8)
@@ -546,3 +547,223 @@ def test_inventory_does_not_count_wrong_size_tiles_as_valid(tmp_path):
     assert counts["complete_pairs"] == 0
     assert counts["invalid_files"] == 2
     assert rows[0]["satellite_reason"] == "unexpected_dimensions:4x4"
+
+
+def _full_read_reprojection_oracle(path, grid, bands_count, resampling, is_float):
+    """Frozen pre-windowing behavior, including effective GDAL mask precedence."""
+    from rasterio.enums import Resampling
+
+    with rasterio.open(path) as src:
+        valid = src.dataset_mask() > 0
+        bands = [src.read(b).astype(np.float64) for b in range(1, bands_count + 1)]
+        for b, data in enumerate(bands, 1):
+            valid &= (src.read_masks(b) > 0) & np.isfinite(data)
+        result = np.full((bands_count, grid.height, grid.width), np.nan)
+        for index, data in enumerate(bands):
+            data[~valid] = np.nan
+            rasterio.warp.reproject(
+                source=data,
+                destination=result[index],
+                src_transform=src.transform,
+                src_crs=src.crs,
+                src_nodata=np.nan,
+                dst_transform=rasterio.Affine(*grid.affine),
+                dst_crs=grid.crs,
+                dst_nodata=np.nan,
+                init_dest_nodata=True,
+                resampling=Resampling[resampling],
+            )
+    valid = np.all(np.isfinite(result), axis=0)
+    if not is_float:
+        result = np.rint(np.clip(result, 0.0, 255.0))
+        result[~np.isfinite(result)] = 0.0
+        result = result.astype(np.uint8)
+    return result, valid
+
+
+@pytest.mark.parametrize("resampling", ["nearest", "bilinear", "cubic", "lanczos", "average"])
+@pytest.mark.parametrize("scale", [0.65, 2.5])
+@pytest.mark.parametrize("kind", ["dem_nodata", "dem_mask", "imagery_nodata", "imagery_mask", "imagery_alpha"])
+def test_window_reprojection_matches_full_read_oracle(tmp_path, resampling, scale, kind):
+    from scenicdriver.data_pipeline import raster_processing as rp
+    from rasterio.enums import ColorInterp
+
+    grid = TargetGrid.from_tile(z=14, x=4800, y=6000, width=16, height=16)
+    transform = (
+        rasterio.Affine(*grid.affine)
+        * rasterio.Affine.translation(-20.25, -19.5)
+        * rasterio.Affine.scale(1 / scale)
+    )
+    row, col = np.indices((128, 128))
+    is_float = kind.startswith("dem")
+    bands_count = 1 if is_float else 3
+    if is_float:
+        data = (100 + np.sin(col / 3) * 50 + np.cos(row / 4) * 20)[None].astype("float32")
+        nodata = -9999.0
+    else:
+        data = np.stack([(row * 7 + col * 11 + b * 41) % 255 + 1 for b in range(3)]).astype("uint8")
+        nodata = 0
+    top, left = int(19.5 * scale), int(20.25 * scale)
+    # Invalid values inside the tile and on both sides of its footprint border
+    # exercise mask precedence and kernel support beyond the requested tile.
+    data[0, top + 2:top + 4, left + 2:left + 4] = nodata
+    if is_float:
+        data[0, top + 5, left + 5] = np.nan
+        data[0, top + 6, left + 5] = np.inf
+    if kind.endswith("alpha"):
+        alpha = np.full((128, 128), 255, dtype="uint8")
+        alpha[top - 1:top + 2, left - 1:left + 5] = 0
+        data = np.concatenate([data, alpha[None]])
+        nodata = None
+    path = tmp_path / f"{kind}.tif"
+    with rasterio.open(
+        path, "w", driver="GTiff", width=128, height=128,
+        count=data.shape[0], dtype=data.dtype, crs=grid.crs,
+        transform=transform, nodata=nodata,
+    ) as dst:
+        dst.write(data)
+        if kind.endswith("mask"):
+            mask = np.full((128, 128), 255, dtype="uint8")
+            mask[top - 1:top + 2, left - 1:left + 5] = 0
+            dst.write_mask(mask)
+        if kind.endswith("alpha"):
+            dst.colorinterp = (ColorInterp.red, ColorInterp.green, ColorInterp.blue, ColorInterp.alpha)
+
+    expected, expected_valid = _full_read_reprojection_oracle(
+        path, grid, bands_count, resampling, is_float
+    )
+    actual, actual_valid = rp._load_and_reproject_raster(
+        path, grid, bands_count, resampling, is_float
+    )
+    np.testing.assert_array_equal(actual_valid, expected_valid)
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_windowed_reads_are_bounded_and_disjoint_sources_are_not_read(tmp_path, monkeypatch):
+    from scenicdriver.data_pipeline import raster_processing as rp
+
+    grid = TargetGrid.from_tile(z=14, x=4800, y=6000, width=16, height=16)
+    path = tmp_path / "large_dem.tif"
+    transform = rasterio.Affine(*grid.affine) * rasterio.Affine.translation(-200, -200)
+    with rasterio.open(
+        path, "w", driver="GTiff", width=512, height=512, count=1,
+        dtype="float32", crs=grid.crs, transform=transform,
+    ) as dst:
+        dst.write(np.full((512, 512), 123.0, dtype="float32"), 1)
+    original_open = rasterio.open
+    calls = []
+
+    class TrackedReader:
+        def __init__(self, reader):
+            self.reader = reader
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.reader.close()
+
+        def __getattr__(self, name):
+            attr = getattr(self.reader, name)
+            if name not in {"read", "read_masks", "dataset_mask"}:
+                return attr
+
+            def tracked(*args, **kwargs):
+                window = kwargs.get("window")
+                assert window is not None, f"{name} attempted an unbounded read"
+                assert window.width <= 32 and window.height <= 32
+                calls.append((name, window))
+                return attr(*args, **kwargs)
+            return tracked
+
+    monkeypatch.setattr(rp.rasterio, "open", lambda *a, **kw: TrackedReader(original_open(*a, **kw)))
+    data, valid = rp._load_and_reproject_raster(path, grid, 1, "lanczos", True)
+    assert valid.all()
+    np.testing.assert_allclose(data, 123.0)
+    assert {name for name, _ in calls} == {"read", "read_masks", "dataset_mask"}
+    calls.clear()
+    disjoint = TargetGrid.from_tile(z=14, x=4900, y=6100, width=16, height=16)
+    data, valid = rp._load_and_reproject_raster(path, disjoint, 1, "bilinear", True)
+    assert not valid.any()
+    assert np.isnan(data).all()
+    assert not calls
+
+
+@pytest.mark.parametrize("processor", [process_imagery, process_dem])
+def test_verified_hashes_bypass_source_rehash(tmp_path, monkeypatch, processor):
+    from scenicdriver.data_pipeline import raster_processing as rp
+
+    grid = TargetGrid.from_tile(z=14, x=4800, y=6000, width=4, height=4)
+    is_float = processor is process_dem
+    data = np.full((4, 4) if is_float else (4, 4, 3), 123, dtype="float32" if is_float else "uint8")
+    path = _create_georeferenced_tif(tmp_path / "source.tif", data, grid, is_float)
+    verified = {str(path): rp.compute_file_sha256(path)}
+
+    def fail_rehash(*args):
+        pytest.fail("verified source content was rehashed")
+
+    monkeypatch.setattr(rp, "compute_file_sha256", fail_rehash)
+    for _ in range(2):
+        *_, qc = processor([path], grid, np.ones((4, 4), dtype=bool), verified_source_hashes=verified)
+        assert qc["source_hashes"] == verified
+
+
+@pytest.mark.parametrize("resampling", ["nearest", "bilinear", "cubic", "lanczos", "average"])
+@pytest.mark.parametrize("source_crs", ["EPSG:32618", "EPSG:4326"])
+@pytest.mark.parametrize("rotated", [False, True])
+@pytest.mark.parametrize("at_source_edge", [False, True])
+@pytest.mark.parametrize("is_float", [False, True])
+def test_projected_window_and_source_edges_match_oracle(
+    tmp_path, resampling, source_crs, rotated, at_source_edge, is_float
+):
+    from scenicdriver.data_pipeline import raster_processing as rp
+
+    grid = TargetGrid.from_tile(z=14, x=4800, y=6000, width=16, height=16)
+    left, bottom, right, top = rasterio.warp.transform_bounds(
+        grid.crs, source_crs, *grid.bounds, densify_pts=21
+    )
+    dx, dy = right - left, top - bottom
+    if at_source_edge:
+        # The dataset ends inside the requested tile: missing coverage, edge
+        # kernels, and dataset-border mask pixels must match the original.
+        right -= dx / 4
+        bottom += dy / 4
+    else:
+        left -= dx
+        right += dx
+        bottom -= dy
+        top += dy
+    transform = from_bounds(left, bottom, right, top, 128, 128)
+    if rotated:
+        transform *= (
+            rasterio.Affine.translation(64, 64)
+            * rasterio.Affine.rotation(12)
+            * rasterio.Affine.translation(-64, -64)
+        )
+    row, col = np.indices((128, 128))
+    count = 1 if is_float else 3
+    data = np.stack([
+        (100 + np.sin(col / 3) * 40 + np.cos(row / 4) * 20 + b * 20)
+        for b in range(count)
+    ]).astype("float32" if is_float else "uint8")
+    data[0, 62:66, 62:66] = np.nan if is_float else 0
+    mask = np.full((128, 128), 255, dtype="uint8")
+    mask[0:2] = 0
+    mask[:, -2:] = 0
+    mask[68:72, 70:74] = 0
+    path = tmp_path / "projected.tif"
+    with rasterio.open(
+        path, "w", driver="GTiff", width=128, height=128, count=count,
+        dtype=data.dtype, crs=source_crs, transform=transform,
+        nodata=np.nan if is_float else 0,
+    ) as dst:
+        dst.write(data)
+        dst.write_mask(mask)
+    expected, expected_valid = _full_read_reprojection_oracle(
+        path, grid, count, resampling, is_float
+    )
+    actual, actual_valid = rp._load_and_reproject_raster(
+        path, grid, count, resampling, is_float
+    )
+    np.testing.assert_array_equal(actual_valid, expected_valid)
+    np.testing.assert_array_equal(actual, expected)

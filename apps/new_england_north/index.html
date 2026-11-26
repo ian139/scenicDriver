@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Scenic Drive</title>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <link rel="stylesheet" href="/styles.css?v=viewer-hardening-v1" />
+    <link rel="stylesheet" href="/styles.css?v=8491770fedf844df0bb1a858d5eee19907ec0e770f1cf1959ffda3905ec9018f" />
   </head>
   <body>
     <main class="viewer-shell">
@@ -31,7 +31,7 @@
             <label class="field">
               <span class="field-label">Start point</span>
               <span class="input-shell">
-                <input id="startInput" name="start" autocomplete="off" value="44.475884, -73.214003" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="startSuggestions" />
+                <input id="startInput" name="start" autocomplete="off" value="44.475884, -73.214003" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="startSuggestions" aria-describedby="routeStatus" aria-invalid="false" />
                 <button id="clearStartBtn" type="button" class="input-clear" aria-label="Clear start point" title="Clear start point">×</button>
               </span>
               <div id="startSuggestions" class="address-suggestions" role="listbox" aria-label="Start point suggestions"></div>
@@ -39,12 +39,12 @@
             <label class="field">
               <span class="field-label">End point</span>
               <span class="input-shell">
-                <input id="endInput" name="end" autocomplete="off" value="44.801616, -68.771305" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="endSuggestions" />
+                <input id="endInput" name="end" autocomplete="off" value="44.801616, -68.771305" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="endSuggestions" aria-describedby="routeStatus" aria-invalid="false" />
                 <button id="clearEndBtn" type="button" class="input-clear" aria-label="Clear end point" title="Clear end point">×</button>
               </span>
               <div id="endSuggestions" class="address-suggestions" role="listbox" aria-label="End point suggestions"></div>
             </label>
-            <button id="submitRoute" type="submit" class="btn-primary" disabled>Plan route</button>
+            <button id="submitRoute" type="submit" class="btn-primary" aria-describedby="routeStatus" disabled>Plan route</button>
 
             <div class="range-row">
               <label for="detourFactor" class="range-label">
@@ -58,6 +58,7 @@
               <span>Avoid highways and major roads when possible</span>
             </label>
           </form>
+          <p id="routeStatus" class="route-output" role="status" aria-live="polite">Loading supported region capabilities…</p>
 
           <details class="dev-panel">
             <summary>
@@ -168,8 +169,6 @@
             <dl class="metric-grid">
               <div><dt>Score uplift</dt><dd><span id="scenicScoreUpliftAbsolute">--</span></dd></div>
               <div><dt>Relative uplift</dt><dd><span id="scenicScoreUpliftRelative">--</span></dd></div>
-              <div><dt>Requested scenic weight</dt><dd><span id="requestedScenicWeight">--</span></dd></div>
-              <div><dt>Applied scenic weight</dt><dd><span id="appliedScenicWeight">--</span></dd></div>
               <div><dt>Requested cap</dt><dd><span id="requestedDetourCap">--</span></dd></div>
               <div><dt>Applied cap</dt><dd><span id="appliedDetourCap">--</span></dd></div>
               <div><dt>Actual duration ratio</dt><dd><span id="actualDurationRatio">--</span></dd></div>
@@ -192,7 +191,7 @@
           </section>
 
           <div class="dialog-actions">
-            <button id="shareRouteBtn" type="button" class="btn-primary">Share</button>
+            <button id="shareRouteBtn" type="button" class="btn-primary" aria-describedby="routeStatus" disabled>Share unavailable</button>
             <button id="closeRouteDialogBtn" type="button" class="btn-secondary">Close</button>
           </div>
         </div>
@@ -200,6 +199,6 @@
     </main>
 
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <script type="module" src="/viewer.js?v=viewer-hardening-v1"></script>
+    <script type="module" src="/viewer.js?v=8491770fedf844df0bb1a858d5eee19907ec0e770f1cf1959ffda3905ec9018f"></script>
   </body>
 </html>

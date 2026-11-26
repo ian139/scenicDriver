@@ -27,6 +27,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
+from scenicdriver.active_learning.finalize import UNUSABLE_REASONS, _supported_notes_reasons
+
 try:  # fcntl is available on the supported macOS/Linux annotation hosts.
     import fcntl
 except ImportError:  # pragma: no cover - Windows gets process-local serialization.
@@ -78,14 +80,6 @@ PUBLIC_BATCH_COLUMNS = {
     "is_repeat",
     "qa_repeat",
     "is_qa_overlap",
-}
-UNUSABLE_REASONS = {
-    "missing_imagery",
-    "corrupted_image",
-    "cloud_or_obstruction",
-    "excessive_water",
-    "duplicate",
-    "other",
 }
 CONFIDENCE_VALUES = {"low", "medium", "high"}
 SESSION_COOKIE_NAME = "scenic_session"
@@ -922,6 +916,10 @@ class AnnotatorState:
         batch switch cannot interleave: a save whose token no longer matches
         the active scope is refused before any write instead of cross-persisting
         into another batch's annotations file.
+
+        Skipped decisions require one supported ``unusable_reason``. Their
+        persisted notes must also contain exactly one supported reason, matching
+        the finalizer's audit backstop.
         """
         if not isinstance(payload, dict):
             raise ApiError(400, "invalid_payload", "Request body must be an object")
@@ -986,15 +984,30 @@ class AnnotatorState:
                 400, "notes_too_long", "notes must not exceed 4000 characters"
             )
         reason = payload.get("unusable_reason")
+        if skip and reason in (None, ""):
+            raise ApiError(
+                400,
+                "unusable_reason_required",
+                "Select an Unusable Reason before saving a skipped tile.",
+            )
         if reason not in (None, "") and str(reason) not in UNUSABLE_REASONS:
             raise ApiError(
-                400, "invalid_unusable_reason", "unusable_reason is unsupported"
+                400,
+                "invalid_unusable_reason",
+                "Select one supported Unusable Reason: " + ", ".join(UNUSABLE_REASONS),
             )
         if reason and not skip:
             raise ApiError(
                 400, "invalid_unusable_reason", "unusable_reason requires skip=true"
             )
         formatted_notes = _format_notes(notes, str(reason) if reason else None)
+        if skip and len(_supported_notes_reasons(formatted_notes)) != 1:
+            raise ApiError(
+                400,
+                "invalid_unusable_reason",
+                "Skipped tiles must contain exactly one supported Unusable Reason; "
+                "remove conflicting reason tokens from Notes.",
+            )
         if len(formatted_notes) > 4000:
             raise ApiError(
                 400, "notes_too_long", "notes must not exceed 4000 characters"

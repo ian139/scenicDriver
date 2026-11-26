@@ -14,11 +14,12 @@ import webbrowser
 import os
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.heuristics.labeler import HeuristicLabelerConfig, run_heuristic_labeling  # noqa: E402
-from src.heuristics.report import build_report  # noqa: E402
+from scenicdriver.heuristics.labeler import HeuristicLabelerConfig, run_heuristic_labeling  # noqa: E402
+from scenicdriver.heuristics.report import build_report  # noqa: E402
 
 DEFAULT_S3_BUCKET = "scenicdriver-data"
 DEFAULT_S3_ONLY = "1"
@@ -124,7 +125,6 @@ def run_report(args: argparse.Namespace) -> Path:
         max_tiles=max_tiles,
         use_classifier=use_classifier,
         classifier_best_ckpt=cfg.classifier_best_ckpt,
-        classifier_use_resisc45_stats=cfg.classifier_use_resisc45_stats,
         default_lat=cfg.heuristic_default_lat,
         default_lon=cfg.heuristic_default_lon,
         seed=seed,

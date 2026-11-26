@@ -2,44 +2,79 @@
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["scenicdriver*"]
+
+[tool.setuptools.package-data]
+"scenicdriver.route_planner" = ["_compact_search_c.c"]
+
 [project]
 name = "scenicdriver"
 version = "1.0.0"
 description = "Scenic route planning with imagery + terrain ML"
 requires-python = ">=3.11"
+# Core: the route planner and HTTP API (`scenicdriver.app_api.main`).
 dependencies = [
   "numpy>=1.26,<2",
   "scipy>=1.13,<2",
   "pandas>=2.2",
   "pillow>=10.0",
-  "marimo>=0.19.7",
   "msgspec>=0.20,<1",
   "fastapi>=0.115",
+  "starlette>=0.40",
+  "pydantic>=2.7,<3",
+  "anyio>=4.4",
   "uvicorn>=0.30",
+  "requests>=2.31",
+  "python-dotenv>=1.0",
+  "scalar-fastapi>=1.8.2",
+]
+
+[project.optional-dependencies]
+# Model training, inference, and marimo notebooks.
+ml = [
   "torch>=2.2",
   "torchvision>=0.17",
   "timm>=1.0.24",
-  "boto3>=1.34",
-  "requests>=2.31",
   "tqdm>=4.66",
-  "python-dotenv>=1.0",
-  "scalar-fastapi>=1.8.2",
+  "marimo>=0.19.7",
+]
+# Imagery/terrain ingest, S3 transport, and road-graph builds.
+ingest = [
+  "boto3>=1.34",
+  "botocore>=1.34",
   "rasterio>=1.4,<2",
   "shapely>=2.0,<3",
   "pyproj>=3.7,<4",
   "pyarrow>=25.0.1",
+  "networkx>=3.2",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
+# The development environment installs every extra.
 dev = [
+  "scenicdriver[ml,ingest]",
   "pytest>=8.0",
   "ruff>=0.7",
+  "httpx>=0.28.1",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
-[dependency-groups]
-dev = [
-    "httpx>=0.28.1",
+addopts = ["--strict-markers"]
+markers = [
+  "native: loads or compiles the native compact-search C extension",
+  "integration: forks real supervisor/worker processes or runs subprocesses",
+  "slow: takes several seconds; deselect with -m 'not slow' for quick loops",
 ]
+
+[tool.ruff]
+# archive/ holds frozen historical snapshots that are never imported or run.
+extend-exclude = ["archive"]
+
+[tool.ruff.lint]
+# Enforced: ruff defaults (E4, E7, E9, F) minus the debt below.
+# Debt: E402 (sys.path bootstrap before imports in scripts and test_app_api),
+# E731 (lambda assignment).
+ignore = ["E402", "E731"]

@@ -24,16 +24,17 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 try:
-    from src.active_learning.common import validate_run_name  # noqa: E402
+    from scenicdriver.active_learning.common import validate_run_name  # noqa: E402
 except (ImportError, SyntaxError):
     import importlib.util
 
-    _common_path = PROJECT_ROOT / "src" / "active_learning" / "common.py"
+    _common_path = PROJECT_ROOT / "src" / "scenicdriver" / "active_learning" / "common.py"
     _spec = importlib.util.spec_from_file_location(
-        "src_active_learning_common", _common_path
+        "scenicdriver_active_learning_common", _common_path
     )
     if _spec and _spec.loader:
         _mod = importlib.util.module_from_spec(_spec)
@@ -66,12 +67,12 @@ except (ImportError, SyntaxError):
 
 import torch  # noqa: E402
 
-from src.scenic_scorer.active_training import (  # noqa: E402
+from scenicdriver.scenic_scorer.active_training import (  # noqa: E402
     ActiveTrainingConfig,
     prepare_active_dataset,
     train_active_model,
 )
-from src.scenic_scorer.active_evaluation import (  # noqa: E402
+from scenicdriver.scenic_scorer.active_evaluation import (  # noqa: E402
     evaluate_candidate_validation,
     evaluate_stage_two,
     promote_from_decision,

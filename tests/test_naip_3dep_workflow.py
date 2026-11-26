@@ -31,7 +31,7 @@ from scripts.ingest.naip_3dep_workflow import (
     plan_digest,
     select_pilot_frame,
 )
-from src.data_pipeline.metered_transport import (
+from scenicdriver.data_pipeline.metered_transport import (
     MeteredLedger,
     NetworkCaps,
     NotFoundError,
@@ -499,7 +499,7 @@ def test_resume_skips_valid_and_repairs_corrupt(tmp_path: Path) -> None:
 def test_resume_restores_cleared_source_attribution(
     tmp_path: Path, repair: bool
 ) -> None:
-    from src.data_pipeline.tile_inventory import scan_tile_inventory
+    from scenicdriver.data_pipeline.tile_inventory import scan_tile_inventory
 
     plan, plan_sha, plan_path = _plan_and_execute(tmp_path, run_name="attribution")
     objects = build_fixture_objects()
@@ -2321,9 +2321,48 @@ def test_single_flight_failure_cleans_up_and_does_not_poison_retries(
     assert counts["head_object"] == 0
 
 
-def test_execute_plan_acquires_each_distinct_asset_once(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cached", [False, True], ids=["download", "verified_cache"])
+def test_execute_plan_acquires_each_distinct_asset_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cached: bool
+) -> None:
+    from scenicdriver.data_pipeline import raster_processing
+
     plan, plan_sha, plan_path = _plan_and_execute(tmp_path, run_name="dedup")
     objects = build_fixture_objects()
+    contract, _ = load_source_contract(plan["inputs"]["source_contract_path"])
+    cache_root = tmp_path / "cache"
+    if cached:
+        for source, key in (("imagery", NAIP_SAT_KEY), ("terrain", TNM_DEM_KEY)):
+            wf._install_cached_object(
+                cache_root,
+                bucket=contract[source]["bucket"],
+                key=key,
+                etag=None,
+                size=len(objects[key]),
+                content=objects[key],
+            )
+
+    acquisitions: dict[str, list[tuple[Path, str]]] = {}
+    acquisition_lock = threading.Lock()
+    ensure_object = wf._ensure_object
+
+    def record_acquisition(**kwargs):
+        result = ensure_object(**kwargs)
+        with acquisition_lock:
+            acquisitions.setdefault(kwargs["key"], []).append(result)
+        return result
+
+    compute_hash = raster_processing.compute_file_sha256
+
+    def forbid_processor_source_rehash(path):
+        if Path(path).parent == cache_root / "objects":
+            pytest.fail("processors must reuse the acquisition's verified source hash")
+        return compute_hash(path)
+
+    monkeypatch.setattr(wf, "_ensure_object", record_acquisition)
+    monkeypatch.setattr(
+        raster_processing, "compute_file_sha256", forbid_processor_source_rehash
+    )
     counts = {
         "lock": threading.Lock(),
         "get_range": 0,
@@ -2348,8 +2387,8 @@ def test_execute_plan_acquires_each_distinct_asset_once(tmp_path: Path) -> None:
     # Both tiles share the same 2021 NAIP asset and the same terrain record;
     # concurrent workers must fetch each distinct object exactly once.
     assert counts["head_object"] == 0
-    assert counts["get_range"] == 2
-    assert res["counters"]["requests"] == 2
+    assert counts["get_range"] == (0 if cached else 2)
+    assert res["counters"]["requests"] == (0 if cached else 2)
 
     cache_objects = list((tmp_path / "cache" / "objects").glob("*.bin"))
     assert len(cache_objects) == 2
@@ -2360,4 +2399,26 @@ def test_execute_plan_acquires_each_distinct_asset_once(tmp_path: Path) -> None:
         .read_text()
         .splitlines()
     ]
-    assert sum(1 for e in ledger_events if e["event"] == "cache_hit") == 2
+    assert sum(1 for e in ledger_events if e["event"] == "cache_hit") == (
+        4 if cached else 2
+    )
+
+    provenance = [
+        json.loads(line)
+        for line in (plan_path.parent / "nested_provenance.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert {(entry["x"], entry["y"]) for entry in provenance} == set(TILE_COORDS)
+    assert len(provenance) == 2
+    assert set(acquisitions) == {NAIP_SAT_KEY, TNM_DEM_KEY}
+    for style, key in (("satellite", NAIP_SAT_KEY), ("terrain", TNM_DEM_KEY)):
+        results = acquisitions[key]
+        assert len(results) == 2
+        assert results[0] == results[1]
+        path, verified_hash = results[0]
+        assert verified_hash == hashlib.sha256(objects[key]).hexdigest()
+        expected_hashes = {str(path): verified_hash}
+        for entry in provenance:
+            assert entry[style]["qc"]["source_files"] == [str(path)]
+            assert entry[style]["qc"]["source_hashes"] == expected_hashes

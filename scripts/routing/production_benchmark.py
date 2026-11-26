@@ -1,12 +1,16 @@
 """Deterministic production-artifact routing benchmark.
 
-The runner deliberately calls the strict ``plan_routes`` service response for
-one preloaded graph/report and records every point in the q/kappa matrix.  It
-never silently drops a case: a timeout or a no-route response is a row with an
-exact reason.  Large output belongs under ignored ``data/processed``.
+The q/kappa matrix explicitly sweeps the planner's scalarized objective with
+``scenic_priority=False``. Strict ``plan_routes`` calls are supplemental fixed
+scenic-priority checks, never q-sweep results. Every timeout or no-route case
+is persisted with an exact reason. Large output belongs under ignored ``data/processed``.
 Relative input/output paths are rooted at the project directory, independent
 of the invoking shell's directory. Resume fingerprints include both compact
 search implementations so Python/native search edits invalidate checkpoints.
+The independent quality gate enumerates only explicitly labelled generated
+small/medium fixtures, not the production request corpus. Measured oracle gaps
+are separate from ``optimality_gap``: for ``approximate-universal-ceiling``
+that field is merely ``1 - objective``, never a request-specific certificate.
 """
 
 from __future__ import annotations
@@ -19,8 +23,10 @@ import hashlib
 import json
 import math
 import pickle
+import heapq
 import struct
 import os
+import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import resource
 import select
@@ -33,21 +39,32 @@ from time import monotonic, perf_counter
 from typing import Any, Iterator, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.route_planner import service as route_service  # noqa: E402
-from src.route_planner.cost import (  # noqa: E402
+from scenicdriver.route_planner import service as route_service  # noqa: E402
+from scenicdriver.route_planner.cost import (  # noqa: E402
     HIGHWAY_ROAD_TYPES,
     MIN_EDGE_COST,
+    RoutingPolicy,
+    evaluate_path,
+    normalize_scenic_score,
+    resolve_routing_policy,
 )
-from src.route_planner.cancellation import (  # noqa: E402
+from scenicdriver.route_planner.cancellation import (  # noqa: E402
     RoutingCancelled,
     RoutingDeadline,
     RoutingTimeout,
 )
-from src.route_planner.planner import ScenicRoutePlanner  # noqa: E402
-from src.route_planner.service import (  # noqa: E402
+from scenicdriver.route_planner.graph import (  # noqa: E402
+    Edge,
+    Node,
+    RoadGraph,
+    write_compact_graph,
+)
+from scenicdriver.route_planner.planner import ScenicRoutePlanner  # noqa: E402
+from scenicdriver.route_planner.service import (  # noqa: E402
     RouteRequest,
     clear_route_caches,
     plan_routes,
@@ -68,13 +85,13 @@ DEFAULT_REPORT = Path(
 
 _BENCHMARK_IMPLEMENTATION_PATHS = {
     "production_benchmark": Path(__file__).resolve(),
-    "route_compact_search": PROJECT_ROOT / "src/route_planner/_compact_search.py",
-    "route_compact_search_c": PROJECT_ROOT / "src/route_planner/_compact_search_c.c",
-    "route_cost": PROJECT_ROOT / "src/route_planner/cost.py",
-    "route_edge_projection": PROJECT_ROOT / "src/route_planner/_edge_projection.py",
-    "route_graph": PROJECT_ROOT / "src/route_planner/graph.py",
-    "route_planner": PROJECT_ROOT / "src/route_planner/planner.py",
-    "route_service": PROJECT_ROOT / "src/route_planner/service.py",
+    "route_compact_search": PROJECT_ROOT / "src/scenicdriver/route_planner/_compact_search.py",
+    "route_compact_search_c": PROJECT_ROOT / "src/scenicdriver/route_planner/_compact_search_c.c",
+    "route_cost": PROJECT_ROOT / "src/scenicdriver/route_planner/cost.py",
+    "route_edge_projection": PROJECT_ROOT / "src/scenicdriver/route_planner/_edge_projection.py",
+    "route_graph": PROJECT_ROOT / "src/scenicdriver/route_planner/graph.py",
+    "route_planner": PROJECT_ROOT / "src/scenicdriver/route_planner/planner.py",
+    "route_service": PROJECT_ROOT / "src/scenicdriver/route_planner/service.py",
 }
 Q_VALUES = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
 KAPPA_VALUES = (1.0, 1.1, 1.2, 1.4, 1.8, 2.2, 3.0)
@@ -1168,8 +1185,6 @@ def recompute_feature_metrics(
         "canonical_edge_ids": canonical_ids,
         "traversal_ids": traversal_ids,
         "segment_identity": [dict(row) for row in rows],
-        "requested_scenic_weight": _as_float(properties.get("requested_scenic_weight")),
-        "applied_scenic_weight": _as_float(properties.get("applied_scenic_weight")),
         "requested_max_detour_factor": _as_float(
             properties.get("requested_max_detour_factor")
         ),
@@ -1207,14 +1222,14 @@ def _duration_utility(
 
 def recompute_objective(
     *,
-    q: float,
+    q: float | None,
     kappa: float,
     scenic: Mapping[str, Any],
     baseline: Mapping[str, Any] | None,
     scenic_priority: bool = False,
     highway_preference: float = 0.0,
 ) -> dict[str, float | None]:
-    """Recompute service objective components from independent path metrics."""
+    """Recompute planner scalarized or fixed scenic-priority components."""
     scenic_duration = _as_float(scenic.get("duration_minutes_recomputed"))
     fastest_duration = _as_float(scenic.get("fastest_duration_minutes_declared"))
     if (
@@ -1263,11 +1278,12 @@ def recompute_objective(
         * highway_duration
         / max(fastest_duration, MIN_EDGE_COST)
     )
-    base_objective = (
-        scenic_utility
-        if scenic_priority
-        else (1.0 - q) * duration_utility + q * scenic_utility
-    )
+    if scenic_priority:
+        base_objective = scenic_utility
+    else:
+        if q is None:
+            raise ValueError("scalarized planner objective requires q")
+        base_objective = (1.0 - q) * duration_utility + q * scenic_utility
     objective = base_objective - highway_cost
     return {
         "duration_utility": float(duration_utility),
@@ -1342,6 +1358,7 @@ def _certification_consistent(
     route: Mapping[str, Any],
     objective_value: float | None,
 ) -> bool:
+    """Validate numeric evidence without promoting a universal ceiling to search proof."""
     status = str(route.get("exactness_status") or "")
     gap = _as_float(route.get("optimality_gap"))
     upper_bound = _as_float(route.get("certified_upper_bound"))
@@ -1351,14 +1368,24 @@ def _certification_consistent(
         return (gap is None or _close_enough(gap, 0.0)) and (
             upper_bound is None or _close_enough(upper_bound, float(objective_value))
         )
-    if status == "approximate-certified":
+    if status in {"approximate-certified", "approximate-universal-ceiling"}:
         return (
             gap is not None
             and upper_bound is not None
+            and (
+                status != "approximate-universal-ceiling"
+                or _close_enough(upper_bound, 1.0)
+            )
             and upper_bound + 1e-8 >= float(objective_value)
             and _close_enough(gap, upper_bound - float(objective_value))
         )
     return False
+
+
+def _has_request_specific_certificate(route: Mapping[str, Any]) -> bool:
+    """A universal ceiling is consistent evidence, but not search certification."""
+    return route.get("exactness_status") in {"exact", "approximate-certified"}
+
 
 
 def _no_better_reason_consistent(
@@ -1383,7 +1410,7 @@ def _no_better_reason_consistent(
 def evaluate_service_response(
     result: Mapping[str, Any],
     *,
-    q: float,
+    q: float | None,
     kappa: float,
     avoid_highways: bool,
     edge_index: Mapping[str, Any] | None = None,
@@ -1392,7 +1419,7 @@ def evaluate_service_response(
     requested_end: tuple[float, float] | None = None,
     scenic_priority: bool = False,
 ) -> dict[str, Any]:
-    """Evaluate a strict response against canonical graph-edge metrics."""
+    """Evaluate serialized routes using their explicitly selected objective."""
     routes = {
         str(row.get("route_kind")): row.get("metrics", {})
         for row in result.get("routes", [])
@@ -1574,24 +1601,15 @@ def evaluate_service_response(
     request_payload = result.get("request", {})
     settings_ok = (
         isinstance(request_payload, Mapping)
-        and _close_enough(_as_float(request_payload.get("scenic_weight")), q)
         and _close_enough(_as_float(request_payload.get("max_detour_factor")), kappa)
         and request_payload.get("avoid_highways") is bool(avoid_highways)
         and all(
-            _close_enough(route.get("requested_scenic_weight"), q)
-            and _close_enough(route.get("applied_scenic_weight"), q)
-            and _close_enough(route.get("requested_max_detour_factor"), kappa)
+            _close_enough(route.get("requested_max_detour_factor"), kappa)
             and _close_enough(route.get("applied_max_detour_factor"), kappa)
             for route in (scenic, baseline)
             if route is not None
         )
         and isinstance(diagnostics_payload, Mapping)
-        and _close_enough(
-            _as_float(diagnostics_payload.get("requested_scenic_weight")), q
-        )
-        and _close_enough(
-            _as_float(diagnostics_payload.get("applied_scenic_weight")), q
-        )
         and _close_enough(
             _as_float(diagnostics_payload.get("requested_max_detour_factor")),
             kappa,
@@ -1601,6 +1619,16 @@ def evaluate_service_response(
             kappa,
         )
         and avoidance_reporting_ok
+    )
+    planner_parameters = result.get("planner_parameters")
+    settings_ok = settings_ok and (
+        planner_parameters is None
+        if scenic_priority
+        else (
+            isinstance(planner_parameters, Mapping)
+            and _close_enough(_as_float(planner_parameters.get("q")), q)
+            and planner_parameters.get("scenic_priority") is False
+        )
     )
     derived_same_route = baseline is not None and scenic.get(
         "traversal_ids"
@@ -1639,6 +1667,20 @@ def evaluate_service_response(
     certification_ok = certification_data_finite and _certification_consistent(
         scenic, recomputed_objective
     )
+    search_evidence = declared_properties.get("search_diagnostics", {})
+    diagnostic_search = (
+        diagnostics_payload.get("search_diagnostics", {})
+        if isinstance(diagnostics_payload, Mapping) else {}
+    )
+    universal_ceiling_semantics_ok = (
+        scenic["exactness_status"] != "approximate-universal-ceiling"
+        or (
+            isinstance(search_evidence, Mapping)
+            and search_evidence.get("upper_bound_kind") == "universal-ceiling"
+            and isinstance(diagnostic_search, Mapping)
+            and diagnostic_search.get("upper_bound_kind") == "universal-ceiling"
+        )
+    )
     reason_ok = _no_better_reason_consistent(scenic, recomputed_objective)
     expected_highway_preference = 2.0 if avoidance_fallback else 0.0
     expected_optimization_mode = (
@@ -1646,6 +1688,12 @@ def evaluate_service_response(
         if avoidance_fallback
         else "scenic_score_under_duration_cap"
     )
+    if not scenic_priority:
+        expected_optimization_mode = (
+            "scalarized_with_best_effort_highway_avoidance_under_duration_cap"
+            if avoidance_fallback
+            else "scalarized_under_duration_cap"
+        )
     diagnostics_consistency = (
         isinstance(diagnostics_payload, Mapping)
         and diagnostics_payload.get("exactness_status")
@@ -1723,7 +1771,7 @@ def evaluate_service_response(
             "duration_cap": cap_ok,
             "prohibited_highways": highway_ok,
             "highway_avoidance_reporting": avoidance_reporting_ok,
-            "q0_fastest": q0_fastest,
+            **({} if scenic_priority else {"planner_q0_fastest": q0_fastest}),
             "objective_recomputation": objective_error is not None
             and objective_error <= 1e-8,
             "edge_metric_recomputation": edge_metrics_ok,
@@ -1732,12 +1780,14 @@ def evaluate_service_response(
             "settings_consistency": settings_ok,
             "route_comparison_recomputation": declared_comparison_ok,
             "certification_consistency": certification_ok,
+            "universal_ceiling_semantics": universal_ceiling_semantics_ok,
             "no_better_reason_consistency": reason_ok,
         }.items()
         if not passed
     ]
     return {
         "status": "ok" if not failed_invariants else "invalid",
+        "objective_mode": "fixed_scenic_priority" if scenic_priority else "planner_scalarized",
         "diagnostics": dict(result.get("diagnostics", {})),
         "score_mapping": dict(result.get("score_mapping", {})),
         "routes": {"scenic": scenic, "baseline": baseline},
@@ -1758,6 +1808,18 @@ def evaluate_service_response(
         "exactness_status": scenic["exactness_status"],
         "optimality_gap": scenic["optimality_gap"],
         "certified_upper_bound": scenic["certified_upper_bound"],
+        "upper_bound_kind": (
+            "universal-ceiling"
+            if scenic["exactness_status"] == "approximate-universal-ceiling"
+            else ("exact" if scenic["exactness_status"] == "exact" else "request-specific")
+        ),
+        "request_specific_optimality_certification": _has_request_specific_certificate(
+            scenic
+        ),
+        "candidate_multipliers": (
+            search_evidence.get("candidate_multipliers")
+            if isinstance(search_evidence, Mapping) else None
+        ),
         "no_route_reason": declared_properties.get("no_route_reason"),
         "failed_invariants": list(failed_invariants),
         "invariants": {
@@ -1765,7 +1827,7 @@ def evaluate_service_response(
             "duration_cap": bool(cap_ok),
             "prohibited_highways": bool(highway_ok),
             "highway_avoidance_reporting": bool(avoidance_reporting_ok),
-            "q0_fastest": bool(q0_fastest),
+            **({} if scenic_priority else {"planner_q0_fastest": bool(q0_fastest)}),
             "objective_recomputation": objective_error is not None
             and objective_error <= 1e-8,
             "edge_metric_recomputation": bool(edge_metrics_ok),
@@ -1775,6 +1837,7 @@ def evaluate_service_response(
             "certification_data_finite": bool(certification_data_finite),
             "route_comparison_recomputation": bool(declared_comparison_ok),
             "certification_consistency": bool(certification_ok),
+            "universal_ceiling_semantics": bool(universal_ceiling_semantics_ok),
             "no_better_reason_consistency": bool(reason_ok),
         },
     }
@@ -1810,85 +1873,6 @@ def _pair_distance(pair: Mapping[str, Any]) -> float:
     return _haversine_km(start, end)
 
 
-def _evaluations_match(
-    strict_evaluation: Mapping[str, Any],
-    direct_evaluation: Mapping[str, Any],
-) -> dict[str, bool]:
-    checks: dict[str, bool] = {}
-    for route_kind in ("scenic", "baseline"):
-        strict_route = strict_evaluation.get("routes", {}).get(route_kind)
-        direct_route = direct_evaluation.get("routes", {}).get(route_kind)
-        checks[f"{route_kind}_present"] = isinstance(
-            strict_route, Mapping
-        ) and isinstance(direct_route, Mapping)
-        if not checks[f"{route_kind}_present"]:
-            continue
-        checks[f"{route_kind}_traversal_ids"] = strict_route.get(
-            "traversal_ids"
-        ) == direct_route.get("traversal_ids")
-        checks[f"{route_kind}_canonical_edge_ids"] = strict_route.get(
-            "canonical_edge_ids"
-        ) == direct_route.get("canonical_edge_ids")
-        for metric in ("distance_km", "duration_minutes", "raw_scenic_score"):
-            checks[f"{route_kind}_{metric}"] = _close_enough(
-                _as_float(strict_route.get(metric)),
-                _as_float(direct_route.get(metric)),
-            )
-        checks[f"{route_kind}_exactness"] = strict_route.get(
-            "exactness_status"
-        ) == direct_route.get("exactness_status")
-        checks[f"{route_kind}_reason"] = strict_route.get(
-            "no_better_route_reason"
-        ) == direct_route.get("no_better_route_reason")
-        checks[f"{route_kind}_same_route"] = strict_route.get(
-            "same_route"
-        ) == direct_route.get("same_route")
-        approximate_pair = str(strict_route.get("exactness_status") or "").startswith(
-            "approximate"
-        ) and str(direct_route.get("exactness_status") or "").startswith("approximate")
-        for metric in (
-            "objective_value_declared",
-            "optimality_gap",
-            "certified_upper_bound",
-            "scenic_score_delta_absolute",
-            "scenic_score_delta_relative",
-        ):
-            strict_value = _as_float(strict_route.get(metric))
-            direct_value = _as_float(direct_route.get(metric))
-            checks[f"{route_kind}_{metric}"] = (
-                approximate_pair
-                and metric in {"optimality_gap", "certified_upper_bound"}
-            ) or (
-                (strict_value is None and direct_value is None)
-                or _close_enough(strict_value, direct_value)
-            )
-    strict_scenic = strict_evaluation.get("routes", {}).get("scenic", {})
-    direct_scenic = direct_evaluation.get("routes", {}).get("scenic", {})
-    checks["same_route"] = strict_scenic.get("same_route") == direct_scenic.get(
-        "same_route"
-    )
-    checks["highway_count"] = strict_evaluation.get(
-        "highway_count"
-    ) == direct_evaluation.get("highway_count")
-    checks["normalized_scenic_score"] = _close_enough(
-        _as_float(strict_evaluation.get("normalized_scenic_score")),
-        _as_float(direct_evaluation.get("normalized_scenic_score")),
-    )
-    for metric in ("scenic_score_delta_absolute", "scenic_score_delta_relative"):
-        strict_value = _as_float(strict_scenic.get(metric))
-        direct_value = _as_float(direct_scenic.get(metric))
-        checks[metric] = (
-            strict_value is None and direct_value is None
-        ) or _close_enough(strict_value, direct_value)
-    checks["objective"] = _close_enough(
-        _as_float(strict_evaluation.get("objective", {}).get("recomputed")),
-        _as_float(direct_evaluation.get("objective", {}).get("recomputed")),
-    )
-    checks["duration_ratio"] = _close_enough(
-        _as_float(strict_evaluation.get("duration_ratio")),
-        _as_float(direct_evaluation.get("duration_ratio")),
-    )
-    return checks
 
 
 def _classify_pairs(
@@ -1954,6 +1938,7 @@ def _classify_pairs(
         scenic_improvement = any(
             row["q"] > 0.0
             and row["evaluation"].get("status") == "ok"
+            and _has_request_specific_certificate(row["evaluation"])
             and (row["evaluation"].get("optimality_gap") or 0.0) <= 1e-12
             and (row["evaluation"].get("uplift_absolute") or 0.0) > 1e-6
             and row["evaluation"]["routes"]["scenic"]["segment_identity_sha256"]
@@ -2003,9 +1988,11 @@ def _classify_pairs(
                 <= 1e-6
                 < at_18["evaluation"].get("uplift_absolute", 0.0)
             ):
-                if (at_1["evaluation"].get("optimality_gap") or 0.0) > 1e-12 or (
-                    at_18["evaluation"].get("optimality_gap") or 0.0
-                ) > 1e-12:
+                if any(
+                    not _has_request_specific_certificate(row["evaluation"])
+                    or (row["evaluation"].get("optimality_gap") or 0.0) > 1e-12
+                    for row in (at_1, at_18)
+                ):
                     continue
                 unlock = True
                 break
@@ -2030,12 +2017,14 @@ def _invariant_summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
     for row in completed:
         for name, passed in row["evaluation"].get("invariants", {}).items():
             counts[name]["pass" if passed else "fail"] += 1
-    # q monotonicity uses the chosen route's scenic utility; kappa monotonicity
-    # uses declared objective. A positive gap downgrades a decrease to
-    # not_proven_positive_gap rather than claiming a global optimum.
+    # q monotonicity concerns the affine objective's scenic-minus-duration
+    # slope, including when a fixed highway penalty is active. Kappa compares
+    # objective values. Neither assertion includes fixed-priority service checks.
     groups_q: dict[tuple[str, float, bool], list[Mapping[str, Any]]] = defaultdict(list)
     groups_k: dict[tuple[str, float, bool], list[Mapping[str, Any]]] = defaultdict(list)
     for row in completed:
+        if row["evaluation"].get("objective_mode") == "fixed_scenic_priority":
+            continue
         groups_q[
             (str(row["pair_id"]), float(row["kappa"]), bool(row["avoid_highways"]))
         ].append(row)
@@ -2045,26 +2034,40 @@ def _invariant_summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
     for group in groups_q.values():
         ordered = sorted(group, key=lambda row: row["q"])
         for previous, current in zip(ordered, ordered[1:]):
-            prev_value = previous["evaluation"].get("normalized_scenic_score")
-            current_value = current["evaluation"].get("normalized_scenic_score")
+            previous_components = previous["evaluation"]["objective"]["components_recomputed"]
+            current_components = current["evaluation"]["objective"]["components_recomputed"]
+            prev_value = previous_components["scenic_utility"] - previous_components["duration_utility"]
+            current_value = current_components["scenic_utility"] - current_components["duration_utility"]
+            if any(
+                not _has_request_specific_certificate(row["evaluation"])
+                for row in (previous, current)
+            ):
+                counts["monotonic_best_scalarized_slope_q"]["not_proven_universal_ceiling"] += 1
+                continue
             if (previous["evaluation"].get("optimality_gap") or 0.0) > 0.0 or (
                 current["evaluation"].get("optimality_gap") or 0.0
             ) > 0.0:
-                counts["monotonic_best_utility_q"]["not_proven_positive_gap"] += 1
+                counts["monotonic_best_scalarized_slope_q"]["not_proven_positive_gap"] += 1
                 continue
             if prev_value is None or current_value is None:
-                counts["monotonic_best_utility_q"]["skip"] += 1
+                counts["monotonic_best_scalarized_slope_q"]["skip"] += 1
             elif current_value + 1e-8 >= prev_value:
-                counts["monotonic_best_utility_q"]["pass"] += 1
+                counts["monotonic_best_scalarized_slope_q"]["pass"] += 1
             elif (current["evaluation"].get("optimality_gap") or 0.0) > 0.0:
-                counts["monotonic_best_utility_q"]["not_proven_positive_gap"] += 1
+                counts["monotonic_best_scalarized_slope_q"]["not_proven_positive_gap"] += 1
             else:
-                counts["monotonic_best_utility_q"]["fail"] += 1
+                counts["monotonic_best_scalarized_slope_q"]["fail"] += 1
     for group in groups_k.values():
         ordered = sorted(group, key=lambda row: row["kappa"])
         for previous, current in zip(ordered, ordered[1:]):
             prev_value = previous["evaluation"]["objective"].get("recomputed")
             current_value = current["evaluation"]["objective"].get("recomputed")
+            if any(
+                not _has_request_specific_certificate(row["evaluation"])
+                for row in (previous, current)
+            ):
+                counts["monotonic_best_utility_kappa"]["not_proven_universal_ceiling"] += 1
+                continue
             if (previous["evaluation"].get("optimality_gap") or 0.0) > 0.0 or (
                 current["evaluation"].get("optimality_gap") or 0.0
             ) > 0.0:
@@ -2096,21 +2099,19 @@ def _invariant_summary(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
     ] += 1
     counts["cache_isolation"]["not_proven_single_variant"] += 1
     strict_completed = [
-        row for row in completed if row.get("execution_mode") == "strict_service"
+        row["service_check"]["evaluation"]
+        for row in rows
+        if row.get("service_check", {}).get("evaluation", {}).get("status") == "ok"
     ]
+    for evaluation in strict_completed:
+        for name, passed in evaluation.get("invariants", {}).items():
+            counts[f"fixed_service_{name}"]["pass" if passed else "fail"] += 1
     if len(strict_completed) > 1:
         hits = all(
-            row.get("evaluation", {}).get("diagnostics", {}).get("graph_cache_hit")
-            is True
-            and row.get("evaluation", {})
-            .get("diagnostics", {})
-            .get("tile_score_cache_hit")
-            is True
-            and row.get("evaluation", {})
-            .get("diagnostics", {})
-            .get("scored_graph_cache_hit")
-            is True
-            for row in strict_completed[1:]
+            evaluation.get("diagnostics", {}).get("graph_cache_hit") is True
+            and evaluation.get("diagnostics", {}).get("tile_score_cache_hit") is True
+            and evaluation.get("diagnostics", {}).get("scored_graph_cache_hit") is True
+            for evaluation in strict_completed[1:]
         )
         counts["warm_cache_hits"]["pass" if hits else "fail"] += 1
     else:
@@ -2165,16 +2166,14 @@ def _direct_planner_response(
     planner: ScenicRoutePlanner,
     request: RouteRequest,
     *,
+    q: float,
     score_mapping: Mapping[str, Any],
     deadline: RoutingDeadline | None = None,
 ) -> dict[str, Any]:
-    """Adapt one direct planner call to the strict service response shape.
+    """Serialize a scalarized planner q case without a service priority knob.
 
-    Matrix cases use the already loaded/scored graph and one long-lived
-    planner.  A small deterministic subset still calls ``plan_routes`` below
-    so strict API serialization and service cache boundaries remain exercised.
-    The same ``RoutingDeadline`` is forwarded unchanged to every routing,
-    scoring, and serialization stage.
+    Reuse service geometry/identity serialization, but not its scenic-priority
+    routing wrapper or objective. Every planner stage shares one deadline.
     """
     if deadline is None:
         deadline = RoutingDeadline()
@@ -2194,27 +2193,96 @@ def _direct_planner_response(
         if request.include_baseline:
             baseline_route = unrestricted_baseline
     deadline.check()
-    (
-        scenic_route,
-        strict_highway_avoidance_applied,
-        highway_avoidance_fallback_reason,
-    ) = route_service._find_scenic_route_with_best_effort_avoidance(
-        planner,
-        request,
-        detour_reference_duration_minutes=(detour_reference_duration_minutes),
-        deadline=deadline,
-    )
-    highway_avoidance_fallback = (
-        request.avoid_highways and not strict_highway_avoidance_applied
-    )
+    fallback_reason = None
+    try:
+        scenic_route = planner.find_scenic_route(
+            start=request.start,
+            end=request.end,
+            scenic_weight=q,
+            scenic_priority=False,
+            avoid_highways=request.avoid_highways,
+            max_detour_factor=request.max_detour_factor,
+            detour_reference_duration_minutes=detour_reference_duration_minutes,
+            deadline=deadline,
+        )
+    except ValueError as error:
+        if not request.avoid_highways or str(error) not in {
+            "No route found between the given coordinates.",
+            "No route satisfies the requested duration cap.",
+        }:
+            raise
+        fallback_reason = (
+            "strict_no_route"
+            if str(error) == "No route found between the given coordinates."
+            else "strict_over_unrestricted_cap"
+        )
+        scenic_route = planner.find_scenic_route(
+            start=request.start,
+            end=request.end,
+            scenic_weight=q,
+            scenic_priority=False,
+            avoid_highways=False,
+            max_detour_factor=request.max_detour_factor,
+            highway_preference=2.0,
+            detour_reference_duration_minutes=detour_reference_duration_minutes,
+            deadline=deadline,
+        )
+    highway_avoidance_fallback = fallback_reason is not None
+    strict_highway_avoidance_applied = request.avoid_highways and not highway_avoidance_fallback
+    highway_avoidance_fallback_reason = fallback_reason
     deadline.check()
-    objective = route_service._objective_components(
-        request,
-        scenic_route,
-        baseline_route,
-        deadline=deadline,
-        highway_avoidance_fallback=highway_avoidance_fallback,
+    fastest_duration = route_service._detour_reference_duration(scenic_route, baseline_route)
+    duration_utility = _duration_utility(
+        scenic_route.estimated_duration_minutes, fastest_duration, request.max_detour_factor
     )
+    scenic_utility = _normalise_score(scenic_route.average_scenic_score)
+    base_objective = (1.0 - q) * duration_utility + q * scenic_utility
+    absolute = (
+        scenic_route.average_scenic_score - baseline_route.average_scenic_score
+        if baseline_route is not None else None
+    )
+    same_route = baseline_route is not None and (
+        route_service._route_comparison_identity(scenic_route, deadline=deadline)
+        == route_service._route_comparison_identity(baseline_route, deadline=deadline)
+    )
+    certified = bool(scenic_route.exact) or (
+        scenic_route.exactness_status != "approximate-universal-ceiling"
+        and scenic_route.optimality_gap == 0.0
+    )
+    reason = None
+    if same_route or (absolute is not None and absolute <= 0.0):
+        reason = (
+            ("same_route" if same_route else "no_better_route")
+            if certified else "approximation_did_not_find_scenic_improvement"
+        )
+    objective = {
+        "duration_utility": duration_utility,
+        "scenic_utility": scenic_utility,
+        "objective_value": float(scenic_route.objective_value),
+        "optimization_mode": (
+            "scalarized_with_best_effort_highway_avoidance_under_duration_cap"
+            if highway_avoidance_fallback else "scalarized_under_duration_cap"
+        ),
+        "highway_preference": 2.0 if highway_avoidance_fallback else 0.0,
+        "highway_avoidance_cost": (
+            max(0.0, base_objective - scenic_route.objective_value)
+            if highway_avoidance_fallback else 0.0
+        ),
+        "normalized_scenic_score": scenic_utility,
+        "requested_max_detour_factor": float(request.max_detour_factor),
+        "applied_max_detour_factor": float(request.max_detour_factor),
+        "actual_duration_ratio": (
+            scenic_route.estimated_duration_minutes / fastest_duration
+            if fastest_duration > 0.0 else 1.0
+        ),
+        "scenic_score_delta_absolute": absolute,
+        "scenic_score_delta_relative": (
+            absolute / abs(baseline_route.average_scenic_score)
+            if absolute is not None and baseline_route.average_scenic_score else None
+        ),
+        "same_route": same_route,
+        "no_better_route_reason": reason,
+    }
     deadline.check()
     scenic_feature = route_service.route_to_feature(
         scenic_route,
@@ -2233,12 +2301,10 @@ def _direct_planner_response(
         baseline_objective = {
             "duration_utility": 1.0,
             "scenic_utility": baseline_normalized,
-            "objective_value": baseline_normalized,
+            "objective_value": (1.0 - q) + q * baseline_normalized,
             "optimization_mode": "fastest_duration_baseline",
             "raw_scenic_score": float(baseline_route.average_scenic_score),
             "normalized_scenic_score": baseline_normalized,
-            "requested_scenic_weight": float(request.scenic_weight),
-            "applied_scenic_weight": float(request.scenic_weight),
             "requested_max_detour_factor": float(request.max_detour_factor),
             "applied_max_detour_factor": float(request.max_detour_factor),
             "actual_duration_ratio": 1.0,
@@ -2277,6 +2343,7 @@ def _direct_planner_response(
     )
     return {
         "request": request.to_dict(),
+        "planner_parameters": {"q": float(q), "scenic_priority": False},
         "diagnostics": {
             "graph_nodes": len(planner.graph.nodes) if planner.graph is not None else 0,
             "graph_edges": len(planner.graph.edges) if planner.graph is not None else 0,
@@ -2284,8 +2351,6 @@ def _direct_planner_response(
             "tile_score_cache_hit": None,
             "scored_graph_cache_hit": None,
             "cache_measurement": "inapplicable_direct_planner",
-            "requested_scenic_weight": float(request.scenic_weight),
-            "applied_scenic_weight": float(request.scenic_weight),
             "requested_max_detour_factor": float(request.max_detour_factor),
             "applied_max_detour_factor": float(request.max_detour_factor),
             "hard_highway_count": scenic_feature["properties"].get("highway_count"),
@@ -2317,6 +2382,7 @@ def _direct_planner_response(
             "score_application_elapsed_ms": 0.0,
             "planning_elapsed_ms": 0.0,
             "exactness_status": scenic_feature["properties"].get("exactness_status"),
+            "search_diagnostics": scenic_feature["properties"].get("search_diagnostics", {}),
             "optimality_gap": scenic_feature["properties"].get("optimality_gap"),
             "certified_upper_bound": scenic_feature["properties"].get(
                 "certified_upper_bound"
@@ -2520,7 +2586,6 @@ def _execute_case(
         graph_geojson=str(graph_path),
         start=spec.start,
         end=spec.end,
-        scenic_weight=spec.q,
         max_detour_factor=spec.kappa,
         avoid_highways=spec.avoid_highways,
         include_baseline=True,
@@ -2533,7 +2598,9 @@ def _execute_case(
     row: dict[str, Any] = {
         "case_index": index,
         "case_id": case_id,
-        "execution_mode": "strict_service" if strict_service else "direct_planner",
+        "execution_mode": "direct_planner",
+        "parameter_scope": "planner_scalarized",
+        "service_check_requested": strict_service,
         "pair_id": spec.pair_id,
         "start": list(spec.start),
         "end": list(spec.end),
@@ -2553,19 +2620,17 @@ def _execute_case(
         try:
             with _case_deadline(case_deadline_seconds) as deadline:
                 deadline.check()
-                if strict_service:
-                    response = plan_routes(request, deadline=deadline)
-                else:
-                    planning_started = perf_counter()
-                    response = _direct_planner_response(
-                        matrix_planner,
-                        request,
-                        score_mapping=preload["score_mapping"],
-                        deadline=deadline,
-                    )
-                    response["diagnostics"]["planning_elapsed_ms"] = (
-                        perf_counter() - planning_started
-                    ) * 1000.0
+                planning_started = perf_counter()
+                response = _direct_planner_response(
+                    matrix_planner,
+                    request,
+                    q=spec.q,
+                    score_mapping=preload["score_mapping"],
+                    deadline=deadline,
+                )
+                response["diagnostics"]["planning_elapsed_ms"] = (
+                    perf_counter() - planning_started
+                ) * 1000.0
                 deadline.check()
                 row["evaluation"] = evaluate_service_response(
                     response,
@@ -2576,7 +2641,7 @@ def _execute_case(
                     node_index=node_index,
                     requested_start=spec.start,
                     requested_end=spec.end,
-                    scenic_priority=True,
+                    scenic_priority=False,
                 )
                 deadline.check()
                 row["reason"] = (
@@ -2586,46 +2651,40 @@ def _execute_case(
                     + ",".join(row["evaluation"].get("failed_invariants", []))
                 )
                 row["route_error_cache_hit"] = False
-                if (
-                    spec.pair_id == "checked_in_default_reproduction"
-                    and spec.q == 0.8
-                    and spec.kappa == 1.8
-                    and not spec.avoid_highways
-                    and row["evaluation"].get("status") == "ok"
-                ):
-                    deadline.check()
-                    direct_response = _direct_planner_response(
-                        matrix_planner,
-                        request,
-                        score_mapping=preload["score_mapping"],
-                        deadline=deadline,
-                    )
-                    deadline.check()
-                    direct_evaluation = evaluate_service_response(
-                        direct_response,
-                        q=spec.q,
-                        kappa=spec.kappa,
-                        avoid_highways=spec.avoid_highways,
-                        edge_index=edge_index,
-                        node_index=node_index,
-                        requested_start=spec.start,
-                        requested_end=spec.end,
-                        scenic_priority=True,
-                    )
-                    deadline.check()
-                    parity = _evaluations_match(row["evaluation"], direct_evaluation)
-                    row["ui_reproduction_parity"] = {
-                        "strict_service": row["evaluation"],
-                        "direct_planner": direct_evaluation,
-                        "checks": parity,
-                        "pass": bool(parity) and all(parity.values()),
+                if strict_service:
+                    service_started = perf_counter()
+                    service_check: dict[str, Any] = {
+                        "execution_mode": "strict_service",
+                        "parameter_scope": "fixed_scenic_priority",
+                        "request": request.to_dict(),
                     }
-                    if not row["ui_reproduction_parity"]["pass"]:
-                        row["evaluation"]["status"] = "invalid"
-                        row["evaluation"].setdefault("failed_invariants", []).append(
-                            "strict_direct_parity"
+                    row["service_check"] = service_check
+                    try:
+                        deadline.check()
+                        service_response = plan_routes(request, deadline=deadline)
+                        service_check["evaluation"] = evaluate_service_response(
+                            service_response,
+                            q=None,
+                            kappa=spec.kappa,
+                            avoid_highways=spec.avoid_highways,
+                            edge_index=edge_index,
+                            node_index=node_index,
+                            requested_start=spec.start,
+                            requested_end=spec.end,
+                            scenic_priority=True,
                         )
-                        row["reason"] = "invalid:strict_direct_parity"
+                        deadline.check()
+                        service_check["reason"] = (
+                            None if service_check["evaluation"]["status"] == "ok"
+                            else "invalid:" + ",".join(
+                                service_check["evaluation"]["failed_invariants"]
+                            )
+                        )
+                    except Exception as error:
+                        service_check["evaluation"] = {"status": "error"}
+                        service_check["reason"] = _error_reason(error)
+                        service_check["error"] = str(error)
+                    service_check["wall_ms"] = (perf_counter() - service_started) * 1000.0
         except Exception as error:
             row["evaluation"] = {"status": "error"}
             row["reason"] = _error_reason(error)
@@ -2762,11 +2821,9 @@ def _timeout_row(
     return {
         "case_index": index,
         "case_id": case_id,
-        "execution_mode": (
-            "strict_service"
-            if strict_service_full or case_id in STRICT_SERVICE_CASE_IDS
-            else "direct_planner"
-        ),
+        "execution_mode": "direct_planner",
+        "parameter_scope": "planner_scalarized",
+        "service_check_requested": strict_service_full or case_id in STRICT_SERVICE_CASE_IDS,
         "pair_id": spec.pair_id,
         "start": list(spec.start),
         "end": list(spec.end),
@@ -2791,11 +2848,9 @@ def _worker_failure_row(
     return {
         "case_index": index,
         "case_id": _case_id(spec),
-        "execution_mode": (
-            "strict_service"
-            if strict_full or _case_id(spec) in STRICT_SERVICE_CASE_IDS
-            else "direct_planner"
-        ),
+        "execution_mode": "direct_planner",
+        "parameter_scope": "planner_scalarized",
+        "service_check_requested": strict_full or _case_id(spec) in STRICT_SERVICE_CASE_IDS,
         "pair_id": spec.pair_id,
         "start": list(spec.start),
         "end": list(spec.end),
@@ -2810,6 +2865,369 @@ def _worker_failure_row(
         "wall_ms": 0.0,
         "phase_ms": {},
         "cache": {"route_error_cache_hit": False},
+    }
+
+
+@dataclass(frozen=True)
+class _OracleFixture:
+    name: str
+    size: str
+    graph: RoadGraph
+    start: tuple[float, float]
+    end: tuple[float, float]
+    policy: RoutingPolicy
+
+
+def _generated_oracle_fixtures() -> list[_OracleFixture]:
+    """Bounded generated graphs, deliberately unrelated to real corpus requests."""
+    fixtures: list[_OracleFixture] = []
+
+    def add_edge(
+        graph: RoadGraph, edge_id: str, start: str, end: str,
+        duration: float, score: float, *, speed: float = 60.0,
+        road_type: str = "secondary",
+    ) -> None:
+        graph.add_edge(Edge(
+            id=edge_id, start_node_id=start, end_node_id=end,
+            distance_km=duration * speed / 60.0, scenic_score=score,
+            road_type=road_type, speed_limit_kmh=speed, one_way=True,
+        ))
+
+    # Additive costs .2, .05, .02 at durations 1, 2, 3. The cap is 2.
+    # Legacy lambda=0 selects the infeasible path; .25 and above select fast.
+    # Adaptive scale=.2 and midpoint=.1 expose the feasible .975-score path.
+    graph = RoadGraph()
+    for node_id, lat, lon in (
+        ("S", 42.0, -72.0), ("A", 42.01, -72.01),
+        ("B", 42.01, -71.99), ("G", 42.02, -72.0),
+    ):
+        graph.add_node(Node(node_id, lat, lon))
+    add_edge(graph, "fast", "S", "G", 1.0, 8.0)
+    add_edge(graph, "feasible-1", "S", "A", 1.0, 9.75)
+    add_edge(graph, "feasible-2", "A", "G", 1.0, 9.75)
+    add_edge(graph, "over-cap-1", "S", "B", 1.5, 10.0 - 0.2 / 3.0)
+    add_edge(graph, "over-cap-2", "B", "G", 1.5, 10.0 - 0.2 / 3.0)
+    fixtures.append(_OracleFixture(
+        "small_multiplier_unlock", "small", graph, (42.0, -72.0),
+        (42.02, -72.0), resolve_routing_policy(
+            scenic_weight=1.0, kappa=2.0, scenic_priority=True,
+        ),
+    ))
+
+    for seed in range(6):
+        rng = random.Random(731 + seed)
+        graph = RoadGraph()
+        for index in range(6):
+            graph.add_node(Node(
+                str(index), 42.0 + index * 0.01, -72.0 + (index % 2) * 0.002,
+            ))
+        for start in range(5):
+            for end in range(start + 1, 6):
+                if end > start + 1 and rng.random() < 0.35:
+                    continue
+                add_edge(
+                    graph, f"{start}-{end}", str(start), str(end),
+                    rng.uniform(0.7, 4.0), rng.uniform(2.0, 9.6),
+                    speed=rng.choice((30.0, 60.0, 90.0)),
+                    road_type=(
+                        "motorway" if end > start + 1 and seed % 2 == 0
+                        else "secondary"
+                    ),
+                )
+        fixtures.append(_OracleFixture(
+            f"small_seed_{seed}", "small", graph, (42.0, -72.0),
+            (42.05, -71.998), resolve_routing_policy(
+                scenic_weight=(0.5, 0.8, 1.0)[seed % 3],
+                kappa=(1.0, 1.8, 2.2)[seed % 3],
+                strict_highways=seed % 3 == 0,
+                scenic_priority=seed % 2 == 0,
+            ),
+        ))
+
+    # Subdivide the analytic unlock into a medium graph without changing costs.
+    graph = RoadGraph()
+    graph.add_node(Node("S", 42.0, -72.0))
+    graph.add_node(Node("G", 42.02, -72.0))
+    for branch, duration, score, offset in (
+        ("fast", 1.0, 8.0, 0.0),
+        ("feasible", 2.0, 9.75, -0.004),
+        ("over-cap", 3.0, 10.0 - 0.2 / 3.0, 0.004),
+    ):
+        previous = "S"
+        for index in range(1, 9):
+            current = "G" if index == 8 else f"{branch}-{index}"
+            if index < 8:
+                graph.add_node(Node(
+                    current, 42.0 + index * 0.0025, -72.0 + offset,
+                ))
+            add_edge(graph, f"{branch}-edge-{index}", previous, current, duration / 8, score)
+            previous = current
+    fixtures.append(_OracleFixture(
+        "medium_multiplier_unlock", "medium", graph, (42.0, -72.0),
+        (42.02, -72.0), resolve_routing_policy(
+            scenic_weight=1.0, kappa=2.0, scenic_priority=True,
+        ),
+    ))
+
+    # 8 diamonds = 256 simple paths, 26 nodes including an over-cap spur.
+    # At cap 11.2 only six of eight scenic branches fit. Scalar probes can
+    # miss that mixture, so the measured gap also documents heuristic limits.
+    graph = RoadGraph()
+    for index in range(9):
+        graph.add_node(Node(f"v{index}", 42.0 + index * 0.01, -72.0))
+    for index in range(8):
+        for branch, duration, score, longitude in (
+            ("fast", 1.0, 5.0, -72.003),
+            ("scenic", 1.5, 9.5, -71.997),
+        ):
+            middle = f"{branch}-{index}"
+            graph.add_node(Node(middle, 42.005 + index * 0.01, longitude))
+            add_edge(graph, f"{middle}-a", f"v{index}", middle, duration / 2, score)
+            add_edge(graph, f"{middle}-b", middle, f"v{index + 1}", duration / 2, score)
+    graph.add_node(Node("over-cap", 42.04, -72.02))
+    add_edge(graph, "spur-a", "v0", "over-cap", 20.0, 10.0)
+    add_edge(graph, "spur-b", "over-cap", "v8", 20.0, 10.0)
+    fixtures.append(_OracleFixture(
+        "medium_bounded_corridor", "medium", graph, (42.0, -72.0),
+        (42.08, -72.0), resolve_routing_policy(
+            scenic_weight=1.0, kappa=1.4, scenic_priority=True,
+        ),
+    ))
+    return fixtures
+
+
+def _duration_corridor_upper_bound(
+    planner: ScenicRoutePlanner, start: Node, goal: Node,
+    duration_cap: float, policy: RoutingPolicy,
+) -> dict[str, Any]:
+    """Independent duration-corridor ceiling, not an exact optimum.
+
+    Every feasible traversal satisfies dS(u)+t(e)+dG(v)<=cap. A nonnegative
+    distance-weighted route average cannot exceed the maximum eligible edge
+    score. Duration utility is at most one and highway penalties are nonnegative.
+    """
+    outgoing: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    incoming: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    edges: list[Edge] = []
+    for node_id in planner.graph.nodes:
+        for edge in planner._iter_edges(node_id):
+            if policy.strict_highways and str(edge.road_type).lower() in HIGHWAY_TYPES:
+                continue
+            duration = float(edge.travel_time_minutes)
+            outgoing[str(edge.start_node_id)].append((str(edge.end_node_id), duration))
+            incoming[str(edge.end_node_id)].append((str(edge.start_node_id), duration))
+            edges.append(edge)
+
+    def distances(
+        adjacency: Mapping[str, list[tuple[str, float]]], source: str,
+    ) -> dict[str, float]:
+        result = {source: 0.0}
+        queue = [(0.0, source)]
+        while queue:
+            duration, node_id = heapq.heappop(queue)
+            if duration != result[node_id]:
+                continue
+            for neighbor, weight in adjacency.get(node_id, ()):
+                candidate = duration + weight
+                if candidate < result.get(neighbor, math.inf):
+                    result[neighbor] = candidate
+                    heapq.heappush(queue, (candidate, neighbor))
+        return result
+
+    forward = distances(outgoing, start.id)
+    reverse = distances(incoming, goal.id)
+    eligible = [
+        edge for edge in edges
+        if str(edge.start_node_id) in forward and str(edge.end_node_id) in reverse
+        and planner._duration_within_cap(
+            forward[str(edge.start_node_id)]
+            + float(edge.travel_time_minutes)
+            + reverse[str(edge.end_node_id)], duration_cap,
+        )
+    ]
+    maximum = max((normalize_scenic_score(edge.scenic_score) for edge in eligible), default=0.0)
+    return {
+        "upper_bound_kind": "duration-corridor-edge-score-ceiling",
+        "eligible_traversal_count": len(eligible),
+        "policy_traversal_count": len(edges),
+        "maximum_normalized_edge_score": maximum,
+        "objective_upper_bound": (
+            maximum if policy.scenic_priority
+            else 1.0 - policy.scenic_weight + policy.scenic_weight * maximum
+        ),
+    }
+
+
+def _gap_distribution(values: list[float]) -> dict[str, Any]:
+    """Distribution of measured absolute objective gaps, never ceiling gaps."""
+    ordered = sorted(values)
+
+    def percentile(fraction: float) -> float | None:
+        if not ordered:
+            return None
+        index = (len(ordered) - 1) * fraction
+        lower = math.floor(index)
+        upper = math.ceil(index)
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower)
+
+    return {
+        "count": len(ordered),
+        "min": min(ordered) if ordered else None,
+        "median": percentile(0.5),
+        "p95": percentile(0.95),
+        "max": max(ordered) if ordered else None,
+        "mean": sum(ordered) / len(ordered) if ordered else None,
+        "zero_count": sum(value <= 1e-9 for value in ordered),
+        "positive_count": sum(value > 1e-9 for value in ordered),
+    }
+
+
+def _run_generated_oracle_corpus() -> dict[str, Any]:
+    """Compare real compiled candidates against exhaustive generated-fixture search.
+
+    Only these local planner instances force the compiled path. Neither global
+    production thresholds nor production request deadlines/caches are patched.
+    The oracle uses the identical endpoint overlay, resolved policy and cap;
+    its exhaustive paths are never fed to either candidate generator.
+    Fixtures have no deadline: retained probes imply non-regression only when
+    every search finishes, not that live deadline-constrained requests finish.
+    """
+    cases: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="scenic-routing-oracle-") as directory:
+        for fixture in _generated_oracle_fixtures():
+            sqlite_path = Path(directory) / f"{fixture.name}.sqlite3"
+            manifest_path = sqlite_path.with_suffix(".compact.json")
+            fixture.graph.save(sqlite_path)
+            write_compact_graph(sqlite_path, manifest_path)
+            graph = RoadGraph.load(manifest_path)
+            try:
+                policy = fixture.policy
+                oracle = ScenicRoutePlanner(graph=graph)
+                request = oracle._build_endpoint_access_request(
+                    fixture.start, fixture.end, avoid_highways=policy.strict_highways,
+                )
+                oracle.graph = request.overlay
+                start = request.overlay.nodes[request.start_node_id]
+                goal = request.overlay.nodes[request.end_node_id]
+                fastest = oracle._canonical_fastest_edges(start, goal, policy.strict_highways)
+                if fastest is None:
+                    raise RuntimeError(f"generated oracle fixture has no route: {fixture.name}")
+                fastest_duration = oracle._path_duration_minutes(fastest)
+                cap = fastest_duration * policy.kappa
+                optimum_edges, optimum = oracle._enumerate_simple_optimum(
+                    start, goal, q=policy.scenic_weight, kappa=policy.kappa,
+                    fastest_duration_minutes=fastest_duration,
+                    duration_cap_minutes=cap, policy=policy,
+                )
+                if optimum_edges is None or optimum is None:
+                    raise RuntimeError(f"generated oracle fixture is infeasible: {fixture.name}")
+                corridor = _duration_corridor_upper_bound(oracle, start, goal, cap, policy)
+                candidates: dict[str, Any] = {}
+                for variant in ("legacy", "adaptive"):
+                    planner = ScenicRoutePlanner(graph=graph)
+                    planner._EXACT_ORACLE_MAX_NODES = 0
+                    planner._COMPILED_SCENIC_MIN_NODES = 0
+                    planner._LARGE_GRAPH_EDGE_THRESHOLD = 0
+                    planner._ENDPOINT_OVERLAY_MAX_NODES = 0
+                    planner._last_endpoint_access_request = request
+                    setattr(request.overlay, "_route_access_request", request)
+                    if variant == "legacy":
+                        planner._scenic_search_multipliers = lambda *args, **kwargs: (
+                            0.0, 0.25, 0.75, 1.5,
+                        )
+                    route = planner.find_scenic_route(
+                        fixture.start, fixture.end, scenic_weight=policy.scenic_weight,
+                        max_detour_factor=policy.kappa,
+                        strict_highways=policy.strict_highways,
+                        highway_preference=policy.highway_preference,
+                        scenic_priority=policy.scenic_priority,
+                        detour_reference_duration_minutes=fastest_duration,
+                    )
+                    edges = [request.overlay.edges[edge_id] for edge_id in route.edge_ids]
+                    evaluation = evaluate_path(
+                        edges, q=policy.scenic_weight, kappa=policy.kappa,
+                        fastest_duration_minutes=fastest_duration, policy=policy,
+                    )
+                    nodes = [start.id] + [str(edge.end_node_id) for edge in edges]
+                    valid = (
+                        all(str(edge.start_node_id) == node for edge, node in zip(edges, nodes))
+                        and nodes[-1] == goal.id and len(nodes) == len(set(nodes))
+                        and oracle._duration_within_cap(evaluation.duration_minutes, cap)
+                        and (not policy.strict_highways or evaluation.highway_count == 0)
+                        and _close_enough(evaluation.objective, route.objective_value)
+                        and evaluation.objective <= optimum.objective + 1e-9
+                        and route.search_diagnostics.get("mode") == "compiled-lagrangian"
+                        and route.exactness_status == "approximate-universal-ceiling"
+                        and not route.search_diagnostics.get("deadline_reached")
+                        and _certification_consistent({
+                            "exactness_status": route.exactness_status,
+                            "optimality_gap": route.optimality_gap,
+                            "certified_upper_bound": route.certified_upper_bound,
+                        }, evaluation.objective)
+                    )
+                    candidates[variant] = {
+                        "objective": evaluation.objective,
+                        "measured_oracle_gap": max(0.0, optimum.objective - evaluation.objective),
+                        "duration_minutes": evaluation.duration_minutes,
+                        "edge_ids": list(route.edge_ids),
+                        "candidate_multipliers": route.search_diagnostics["candidate_multipliers"],
+                        "search_mode": route.search_diagnostics["mode"],
+                        "exactness_status": route.exactness_status,
+                        "upper_bound_kind": route.search_diagnostics["upper_bound_kind"],
+                        "certified_upper_bound": route.certified_upper_bound,
+                        "optimality_gap": route.optimality_gap,
+                        "request_specific_optimality_certification": False,
+                        "deadline_reached": route.search_diagnostics["deadline_reached"],
+                        "valid": valid,
+                    }
+                cases.append({
+                    "case_id": fixture.name, "size": fixture.size,
+                    "graph_node_count": len(graph.nodes), "graph_edge_count": len(graph.edges),
+                    "q": policy.scenic_weight, "kappa": policy.kappa,
+                    "strict_highways": policy.strict_highways,
+                    "scenic_priority": policy.scenic_priority,
+                    "fastest_duration_minutes": fastest_duration, "duration_cap_minutes": cap,
+                    "oracle_objective": optimum.objective,
+                    "oracle_edge_ids": [str(edge.id) for edge in optimum_edges],
+                    "corridor_bound": corridor, **candidates,
+                    "non_regression": candidates["adaptive"]["objective"] + 1e-9
+                    >= candidates["legacy"]["objective"],
+                    "corridor_bound_consistent": corridor["objective_upper_bound"] + 1e-9
+                    >= optimum.objective,
+                })
+            finally:
+                graph.close()
+    passed = all(
+        case["non_regression"] and case["corridor_bound_consistent"]
+        and case["legacy"]["valid"] and case["adaptive"]["valid"] for case in cases
+    )
+    return {
+        "scope": "generated_small_medium_fixtures",
+        "production_request_corpus_exact_oracle": False,
+        "oracle": "exhaustive_feasible_simple_paths_same_endpoint_graph_cap_policy",
+        "candidate_generator": "production_compiled_lagrangian",
+        "deadline_scope": "unbounded_generated_fixtures_no_live_deadline_guarantee",
+        "gap_metric": "exact_oracle_objective_minus_candidate_objective",
+        "optimality_gap_semantics": "universal_ceiling_minus_candidate_objective_not_measured_gap",
+        "case_count": len(cases),
+        "acceptance": {
+            "status": "pass" if passed else "fail",
+            "criterion": "valid_compiled_candidates_and_exact_corpus_objective_non_regression",
+            "non_regression_count": sum(case["non_regression"] for case in cases),
+            "improved_count": sum(
+                case["adaptive"]["objective"] > case["legacy"]["objective"] + 1e-9
+                for case in cases
+            ),
+        },
+        "measured_oracle_gap_distribution": {
+            size: {
+                variant: _gap_distribution([
+                    case[variant]["measured_oracle_gap"] for case in cases
+                    if size == "all" or case["size"] == size
+                ]) for variant in ("legacy", "adaptive")
+            } for size in ("all", "small", "medium")
+        },
+        "cases": cases,
     }
 
 
@@ -3058,11 +3476,15 @@ def run_benchmark(
     for row in rows:
         if row.get("reason"):
             no_route_reasons[str(row["reason"])] += 1
-    ui_reproduction_parity = next(
+    ui_service_reproduction = next(
         (
-            row["ui_reproduction_parity"]
+            row["service_check"]
             for row in rows
-            if "ui_reproduction_parity" in row
+            if row.get("pair_id") == "checked_in_default_reproduction"
+            and row.get("q") == 0.8
+            and row.get("kappa") == 1.8
+            and row.get("avoid_highways") is False
+            and "service_check" in row
         ),
         None,
     )
@@ -3076,9 +3498,13 @@ def run_benchmark(
         }
     else:
         invariant_summary["all_case_latency_sla"] = {"skip": 1}
+    generated_fixture_quality = _run_generated_oracle_corpus()
+    invariant_summary["generated_fixture_quality"] = {
+        generated_fixture_quality["acceptance"]["status"]: 1
+    }
     payload = {
-        "schema_version": 1,
-        "benchmark": "production_artifact_routing",
+        "schema_version": 2,
+        "benchmark": "production_artifact_planner_parameter_sweep",
         "corpus_path": str(corpus_path),
         "graph_path": str(graph_path),
         "report_path": str(report_path),
@@ -3090,6 +3516,8 @@ def run_benchmark(
         "matrix": {
             "pair_count": len(corpus["pairs"]),
             "q_values": list(Q_VALUES),
+            "parameter_scope": "planner_scalarized",
+            "q_parameter": "ScenicRoutePlanner.find_scenic_route(scenic_weight=q, scenic_priority=False)",
             "kappa_values": list(KAPPA_VALUES),
             "avoid_highways_values": [False, True],
             "planned_cases": len(specs),
@@ -3105,8 +3533,8 @@ def run_benchmark(
                 "direct_planner": sum(
                     1 for row in rows if row.get("execution_mode") == "direct_planner"
                 ),
-                "strict_service": sum(
-                    1 for row in rows if row.get("execution_mode") == "strict_service"
+                "supplemental_fixed_scenic_priority": sum(
+                    1 for row in rows if "service_check" in row
                 ),
             },
             "strict_service_case_ids": sorted(STRICT_SERVICE_CASE_IDS),
@@ -3159,9 +3587,20 @@ def run_benchmark(
             "exact_count": exact,
             "approximate_count": approx,
             "completed_count": len(completed),
+            "universal_ceiling_count": sum(
+                row["evaluation"].get("exactness_status") == "approximate-universal-ceiling"
+                for row in completed
+            ),
+            "request_specific_certificate_count": sum(
+                _has_request_specific_certificate(row["evaluation"]) for row in completed
+            ),
+            "optimality_gap_semantics": (
+                "exact_zero_or_request_specific_bound_gap_or_universal_ceiling_gap_by_status"
+            ),
         },
+        "generated_fixture_quality": generated_fixture_quality,
         "no_route_reasons": dict(sorted(no_route_reasons.items())),
-        "ui_reproduction_parity": ui_reproduction_parity,
+        "ui_service_reproduction": ui_service_reproduction,
         "results_jsonl": str(jsonl_path),
     }
     if payload["matrix"]["all_cases_persisted"]:
@@ -3189,7 +3628,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strict-service-full",
         action="store_true",
-        help="Execute every matrix case through plan_routes instead of the direct planner adapter.",
+        help="Also exercise fixed scenic-priority plan_routes for every planner q case; service results are separate, not part of the q sweep.",
     )
     parser.add_argument(
         "--resume",

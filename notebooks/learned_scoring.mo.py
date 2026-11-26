@@ -30,14 +30,17 @@ def _():
         2. Train baseline regressor (`scripts/modeling/train_regression_baseline.py`)
         3. Evaluate baseline (`scripts/modeling/evaluate_regression_baseline.py`)
 
-        Training requires `cfg.benchmark_split_csv`: set it per run to the benchmark
-        split CSV whose held-out identities must be excluded from training. It has no
-        default; with `cfg.run_train` enabled the notebook fails before any step runs
-        when it is unset.
+        Training and evaluation require `cfg.benchmark_split_csv`: set it per run to
+        the benchmark split CSV whose held-out tiles (plus a buffer) must be excluded
+        from training. It has no default; with `cfg.run_train` or `cfg.run_eval`
+        enabled the notebook fails before any step runs when it is unset.
 
-        Training writes the validation-membership split artifact `cfg.split_artifact`,
-        and evaluation consumes that artifact to score exactly the rows the trained
-        model validated on — evaluation derives nothing from `cfg.dataset_npz` alone.
+        Training splits train/validation geographically and writes the split artifact
+        `cfg.split_artifact` plus the run manifest `cfg.run_manifest`, which binds the
+        checkpoint, split artifact, features, labels CSV, benchmark split CSV and
+        classifier checkpoint by content digest. Evaluation admits the run only when
+        every supplied file matches, then scores exactly the rows the trained model
+        validated on — evaluation derives nothing from `cfg.dataset_npz` alone.
         """
     )
     return
@@ -51,8 +54,10 @@ def _(Path, dataclass, os):
         raw_dir: str = "data/raw"
         dataset_npz: str = "data/processed/regression/features_v1.npz"
         checkpoint: str = "models/scenic_regression_baseline.pt"
+        classifier_checkpoint: str = "models/classifier/best_model.pt"
         metrics_json: str = "data/processed/regression/baseline_metrics.json"
         split_artifact: str = "models/scenic_regression_baseline.split.json"
+        run_manifest: str = "models/scenic_regression_baseline.manifest.json"
         benchmark_split_csv: str | None = None
 
         skip_missing: bool = True
@@ -92,11 +97,11 @@ def _(Path, dataclass, os):
 
 @app.cell
 def _(Path, cfg, shlex, subprocess, sys):
-    if cfg.run_train:
+    if cfg.run_train or cfg.run_eval:
         if not cfg.benchmark_split_csv:
             raise ValueError(
-                "cfg.benchmark_split_csv is required for training: set it to this run's "
-                "benchmark split CSV (passed as --benchmark-split-csv)."
+                "cfg.benchmark_split_csv is required for training and evaluation: set it "
+                "to this run's benchmark split CSV (passed as --benchmark-split-csv)."
             )
         if not Path(cfg.benchmark_split_csv).is_file():
             raise FileNotFoundError(f"Benchmark split CSV not found: {cfg.benchmark_split_csv}")
@@ -114,6 +119,8 @@ def _(Path, cfg, shlex, subprocess, sys):
         cfg.raw_dir,
         "--output",
         cfg.dataset_npz,
+        "--classifier-ckpt",
+        cfg.classifier_checkpoint,
         "--device",
         cfg.device,
     ]
@@ -142,12 +149,18 @@ def _(Path, cfg, shlex, subprocess, sys):
         "scripts/modeling/train_regression_baseline.py",
         "--dataset",
         cfg.dataset_npz,
+        "--labels-csv",
+        cfg.labels_csv,
         "--benchmark-split-csv",
         str(cfg.benchmark_split_csv),
+        "--classifier-checkpoint",
+        cfg.classifier_checkpoint,
         "--output",
         cfg.checkpoint,
         "--split-artifact",
         cfg.split_artifact,
+        "--run-manifest",
+        cfg.run_manifest,
         "--epochs",
         str(cfg.epochs),
         "--batch-size",
@@ -175,6 +188,14 @@ def _(Path, cfg, shlex, subprocess, sys):
         cfg.checkpoint,
         "--split-artifact",
         cfg.split_artifact,
+        "--run-manifest",
+        cfg.run_manifest,
+        "--labels-csv",
+        cfg.labels_csv,
+        "--benchmark-split-csv",
+        str(cfg.benchmark_split_csv),
+        "--classifier-checkpoint",
+        cfg.classifier_checkpoint,
         "--batch-size",
         str(cfg.batch_size),
         "--device",
@@ -198,12 +219,12 @@ def _(Path, cfg, shlex, subprocess, sys):
     if cfg.run_eval:
         if not Path(cfg.checkpoint).exists():
             raise FileNotFoundError(f"Checkpoint not found: {cfg.checkpoint}")
-        if not Path(cfg.split_artifact).exists():
-            raise FileNotFoundError(
-                f"Split artifact not found: {cfg.split_artifact}. Evaluation scores "
-                "exactly the trained model's validation membership and cannot run "
-                "without the artifact training writes (run the train step first)."
-            )
+        for _name, _path in (("Split artifact", cfg.split_artifact), ("Run manifest", cfg.run_manifest)):
+            if not Path(_path).exists():
+                raise FileNotFoundError(
+                    f"{_name} not found: {_path}. Evaluation admits only the run "
+                    "training wrote (run the train step first)."
+                )
         _run(eval_cmd)
     else:
         print("Skipping eval step (cfg.run_eval=False)")

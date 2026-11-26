@@ -7,8 +7,12 @@ holds input data, checkpoints, and outputs.
 
 The canonical GPU image definition is [`Dockerfile.remote-training`](../../Dockerfile.remote-training).
 Use `-f Dockerfile.remote-training` in scripted Docker/Vast commands. The
-published image used by the lifecycle scripts is
-`ian139/scenicdriver-remote-training:latest`.
+release selected by `vast_train.py`'s `DEFAULT_IMAGE` is
+`ian139/scenicdriver-remote-training:torch2.10.0-cu128-20261006`.
+This is a **publish-once** release tag, not a claim that it is already published.
+Build and publish it below before renting; never overwrite a released tag.
+For registry-enforced immutability, pass the pushed `repo@sha256:...` digest via
+`--image`. Untagged images and `:latest` are rejected.
 
 > **Safety gate:** The provisioning path performs S3, GPU, CUDA-import, and
 > minimal-inference checks before it reaches a manual stop point. Do not start
@@ -18,7 +22,7 @@ published image used by the lifecycle scripts is
 ## Prerequisites
 
 - A Docker host with one NVIDIA GPU, the Docker GPU runtime (`--gpus all`), and
-  drivers compatible with the CUDA 12.4 base image.
+  drivers compatible with the CUDA 12.8 base image.
 - At least 64 GB of disk for the image, downloaded S3 prefixes, and output
   artifacts.
 - Vast.ai CLI access and an SSH key (the examples use `~/.ssh/id_ed25519`).
@@ -27,7 +31,7 @@ published image used by the lifecycle scripts is
   `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, and `SCENIC_S3_BUCKET`.
   Follow [`aws-s3.md`](aws-s3.md) for bucket and credential setup. Container
   provisioning checks identity and bucket access with `boto3`, then uses the
-  repository's `python -m src.data_pipeline.s3` helper for every S3 prefix
+  repository's `python -m scenicdriver.data_pipeline.s3` helper for every S3 prefix
   check and transfer.
 - `uv` and the checked-out repository for the state-backed wrapper path.
 
@@ -50,12 +54,12 @@ exposing an NVIDIA GPU. The image ships no checkpoint or dataset, so download
 both inputs first and mount them into the container:
 
 ```bash
-uv run python -m src.data_pipeline.s3 download-file \
+uv run python -m scenicdriver.data_pipeline.s3 download-file \
   --bucket "$SCENIC_S3_BUCKET" \
   --key <checkpoint-key> \
   --dest models/<checkpoint>.pt \
   --required
-uv run python -m src.data_pipeline.s3 download-file \
+uv run python -m scenicdriver.data_pipeline.s3 download-file \
   --bucket "$SCENIC_S3_BUCKET" \
   --key <features-key> \
   --dest data/processed/regression/<features>.npz \
@@ -76,15 +80,26 @@ docker run --rm --gpus all \
   --checkpoint models/<checkpoint>.pt --dataset data/processed/regression/<features>.npz
 ```
 
-Publishing is separate from GPU rental. Tag, push, and prove that the registry
-can serve the image before allocating a Vast instance:
+Publishing is separate from GPU rental. The amd64 base is digest-pinned to
+PyTorch 2.10.0 / torchvision 0.25.0 / CUDA 12.8, matching the local lock's
+torch/torchvision versions. Dependency installation resolves against these
+constraints rather than silently keeping the older 2.5.1 runtime.
+Tag, push, and prove that the registry serves the image before allocating:
 
 ```bash
-docker tag scenicdriver/remote-training:vast-smoke \
-  ian139/scenicdriver-remote-training:latest
-docker push ian139/scenicdriver-remote-training:latest
-docker pull --platform linux/amd64 ian139/scenicdriver-remote-training:latest
+export SCENIC_RUNTIME_IMAGE="$(uv run python -c 'from scripts.remote.vast_train import DEFAULT_IMAGE; print(DEFAULT_IMAGE)')"
+docker tag scenicdriver/remote-training:vast-smoke "$SCENIC_RUNTIME_IMAGE"
+docker push "$SCENIC_RUNTIME_IMAGE"
+docker pull --platform linux/amd64 "$SCENIC_RUNTIME_IMAGE"
+docker image inspect "$SCENIC_RUNTIME_IMAGE" --format '{{index .RepoDigests 0}}'
 ```
+
+Use the printed digest as `vast_train.py run ... --image <repo@sha256:digest>`
+when a registry cannot enforce publish-once tags. A changed source tree or
+dependency set requires a new release tag and an updated `DEFAULT_IMAGE`.
+GPU compatibility repair installs only `torch==2.10.0` and
+`torchvision==0.25.0` from the CUDA 12.8 wheel index. Unavailable wheels or an
+unsupported GPU fail the run; no unversioned upgrade is attempted.
 
 ## Short validation run
 
@@ -99,12 +114,12 @@ export SCENIC_S3_DATA_PREFIX=processed/regression/vast-smoke/$SCENIC_RUN_ID/
 export SCENIC_S3_MODELS_PREFIX=models/vast-smoke/$SCENIC_RUN_ID/
 export SCENIC_S3_OUTPUT_PREFIX=outputs/vast/$SCENIC_RUN_ID/
 
-uv run python -m src.data_pipeline.s3 upload-prefix \
+uv run python -m scenicdriver.data_pipeline.s3 upload-prefix \
   --src /path/to/tiny_features.npz \
   --bucket "$SCENIC_S3_BUCKET" \
   --prefix "$SCENIC_S3_DATA_PREFIX" \
   --required
-uv run python -m src.data_pipeline.s3 upload-prefix \
+uv run python -m scenicdriver.data_pipeline.s3 upload-prefix \
   --src /path/to/tiny_regression.pt \
   --bucket "$SCENIC_S3_BUCKET" \
   --prefix "$SCENIC_S3_MODELS_PREFIX" \
@@ -131,7 +146,9 @@ arguments:
 
 ```bash
 ssh -i ~/.ssh/id_ed25519 -p <ssh-port> root@<ssh-host>
-docker pull ian139/scenicdriver-remote-training:latest
+# In the remote shell, select the release just published (or its registry digest).
+export SCENIC_RUNTIME_IMAGE=ian139/scenicdriver-remote-training:torch2.10.0-cu128-20261006
+docker pull "$SCENIC_RUNTIME_IMAGE"
 mkdir -p /workspace/scenic-data /workspace/scenic-models /workspace/scenic-artifacts /root/.scenic
 # Copy /root/.scenic/aws.env out-of-band; do not bake credentials into the image.
 
@@ -145,8 +162,8 @@ docker run --rm \
   --env-file /root/.scenic/aws.env \
   -v /workspace/scenic-data:/workspace/data/processed/regression \
   -v /workspace/scenic-models:/workspace/models \
-  ian139/scenicdriver-remote-training:latest \
-  python -m src.data_pipeline.s3 download-file \
+  "$SCENIC_RUNTIME_IMAGE" \
+  python -m scenicdriver.data_pipeline.s3 download-file \
   --bucket "$SCENIC_S3_BUCKET" \
   --key "$SCENIC_VALIDATION_CHECKPOINT_KEY" \
   --dest models/validation_checkpoint.pt \
@@ -155,8 +172,8 @@ docker run --rm \
   --env-file /root/.scenic/aws.env \
   -v /workspace/scenic-data:/workspace/data/processed/regression \
   -v /workspace/scenic-models:/workspace/models \
-  ian139/scenicdriver-remote-training:latest \
-  python -m src.data_pipeline.s3 download-file \
+  "$SCENIC_RUNTIME_IMAGE" \
+  python -m scenicdriver.data_pipeline.s3 download-file \
   --bucket "$SCENIC_S3_BUCKET" \
   --key "$SCENIC_TRAIN_DATASET_KEY" \
   --dest data/processed/regression/validation_features.npz \
@@ -166,7 +183,7 @@ docker run --rm --gpus all --name scenic-vast-validate \
   -v /workspace/scenic-data:/workspace/data/processed/regression \
   -v /workspace/scenic-models:/workspace/models \
   -v /workspace/scenic-artifacts:/workspace/scenic_artifacts \
-  ian139/scenicdriver-remote-training:latest \
+  "$SCENIC_RUNTIME_IMAGE" \
   python scripts/remote/vast_train.py validate --device cuda \
   --checkpoint models/validation_checkpoint.pt \
   --dataset data/processed/regression/validation_features.npz \
@@ -188,20 +205,20 @@ import os
 import boto3
 boto3.client("s3").head_bucket(Bucket=os.environ["SCENIC_S3_BUCKET"])
 PY
-python -m src.data_pipeline.s3 check-prefix \
+python -m scenicdriver.data_pipeline.s3 check-prefix \
   --bucket "$SCENIC_S3_BUCKET" \
   --prefix "$SCENIC_S3_DATA_PREFIX" \
   --required
-python -m src.data_pipeline.s3 check-prefix \
+python -m scenicdriver.data_pipeline.s3 check-prefix \
   --bucket "$SCENIC_S3_BUCKET" \
   --prefix "$SCENIC_S3_MODELS_PREFIX" \
   --required
-python -m src.data_pipeline.s3 download-prefix \
+python -m scenicdriver.data_pipeline.s3 download-prefix \
   --bucket "$SCENIC_S3_BUCKET" \
   --prefix "$SCENIC_S3_DATA_PREFIX" \
   --dest data/processed/regression \
   --required
-python -m src.data_pipeline.s3 download-prefix \
+python -m scenicdriver.data_pipeline.s3 download-prefix \
   --bucket "$SCENIC_S3_BUCKET" \
   --prefix "$SCENIC_S3_MODELS_PREFIX" \
   --dest models \
@@ -211,7 +228,7 @@ python scripts/remote/vast_train.py validate --device cuda \
   --checkpoint models/<checkpoint>.pt \
   --dataset data/processed/regression/<features>.npz \
   --output scenic_artifacts/vast/<run-id>/inference_result.json
-python -m src.data_pipeline.s3 upload-prefix \
+python -m scenicdriver.data_pipeline.s3 upload-prefix \
   --src scenic_artifacts/vast/<run-id>/ \
   --bucket "$SCENIC_S3_BUCKET" \
   --prefix "$SCENIC_S3_OUTPUT_PREFIX" \
@@ -228,7 +245,7 @@ Validation checklist:
 - [ ] The image builds with `Dockerfile.remote-training`.
 - [ ] The image pulls from Docker Hub on the Vast host.
 - [ ] `vast_train.py validate --device cuda` succeeds.
-- [ ] `python -m src.data_pipeline.s3 upload-prefix` uploads the output
+- [ ] `python -m scenicdriver.data_pipeline.s3 upload-prefix` uploads the output
       directory to the output prefix.
 - [ ] No long training command starts before every item above passes.
 
@@ -319,15 +336,15 @@ run before training starts.
 ```bash
 export SCENIC_S3_BUCKET=scenicdriver-data
 
-python scripts/remote/vast_train.py run <task-name> \
+uv run python scripts/remote/vast_train.py run <task-name> \
   --train-dataset-key <key> \
   --benchmark-split-key <split-csv-key> \
   --epochs 1 \
   --batch-size 64
 
-python scripts/remote/vast_train.py status <task-name>
+uv run python scripts/remote/vast_train.py status <task-name>
 
-python scripts/remote/vast_train.py cleanup <task-name> --copy-artifacts --destroy --yes
+uv run python scripts/remote/vast_train.py cleanup <task-name> --copy-artifacts --destroy --yes
 ```
 
 `--epochs 1 --batch-size 64` is a cost-controlled smoke train. Omit those
@@ -346,6 +363,38 @@ in the state file and keeps the host regardless of `--no-destroy` /
 `--keep-on-failure`, because training may be running on it. Recover or destroy
 that host only via the explicit `cleanup ... --copy-artifacts --destroy --yes`
 command.
+
+### Runtime identity and deadline
+
+Each output bundle includes `runtime_identity.json`: `image` (the exact
+reference passed to Vast), actual `torch_version`, `torchvision_version`,
+`cuda_version`, and `source_digest`. The digest is SHA-256 of sorted,
+length-delimited paths and bytes from `pyproject.toml`, `uv.lock`, `src/`,
+`scripts/`, `notebooks/`, and `config/` inside the running image; Python caches
+and host native binaries are excluded. Lifecycle sentinels and validation JSON
+also carry this identity; the manifest identifies the accompanying checkpoint
+and logs. Artifact recovery copies it into local run state as `runtime_identity`.
+`image` is the submitted release tag or digest, **not** a fabricated resolved
+registry digest; choose `--image repo@sha256:...` to record a registry digest.
+
+`--timeout-seconds` (default 1800) also caps the **entire detached remote
+training/upload script** with GNU `timeout --kill-after=30s`. State records
+`remote_deadline_seconds`, `remote_kill_after_seconds`, and
+`remote_deadline_at` (UTC launch-boundary deadline). Exported remote knobs are
+`SCENIC_REMOTE_DEADLINE_SECONDS`, `SCENIC_TIMEOUT_MINUTES`, and
+`SCENIC_STEP_TIMEOUT_SECONDS`; the outer deadline is authoritative. Timeout
+terminates the whole process group independently of the local orchestrator.
+A surviving supervisor records failure (exit 124, or 137 after forced kill),
+leaving outputs available for cleanup/recovery.
+
+The installed Vast CLI and [create-instance reference](https://docs.vast.ai/cli/reference/create-instance)
+provide no instance-expiry option, so state records `provider_expiry: null`.
+**The training deadline does not destroy the rental or end billing.** Retained
+hosts (including ambiguous launches and failed artifact recovery) still require
+explicit `cleanup ... --copy-artifacts --destroy --yes`; no watchdog discards
+their only copy of artifacts. If the local orchestrator dies, training stops
+after the deadline plus at most 30 seconds, but rental/storage charges continue
+until you recover and destroy the instance.
 
 ## Monitoring and emergency cleanup
 
@@ -373,15 +422,15 @@ workspace. The watch/down wrappers use the recorded workspace identity before
 collecting artifacts or destroying the host:
 
 ```bash
-python scripts/remote/cmux_vast_host.py start-task scenic-vast-smoke \
+uv run python scripts/remote/cmux_vast_host.py start-task scenic-vast-smoke \
   --agent none \
   --allocation-attempts 3 \
   --disk-gb 64 \
-  --image ian139/scenicdriver-remote-training:latest \
+  --image "$SCENIC_RUNTIME_IMAGE" \
   --timeout-seconds 1800
 
-python scripts/remote/cmux_vast_host.py watch --interval-seconds 60 --destroy --yes
-python scripts/remote/cmux_vast_host.py down scenic-vast-smoke --copy-artifacts --destroy --yes
+uv run python scripts/remote/cmux_vast_host.py watch --interval-seconds 60 --destroy --yes
+uv run python scripts/remote/cmux_vast_host.py down scenic-vast-smoke --copy-artifacts --destroy --yes
 ```
 
 The CMUX state file keeps the workspace reference and id tied to the unique

@@ -34,7 +34,6 @@ def _():
         processed_dir: str = "data/processed"
         model_dir: str = "models"
         classifier_best_ckpt: str = "models/classifier/best_model.pt"
-        classifier_use_resisc45_stats: bool = True
         terrain_features_csv: str = ""
         use_terrain_features: bool = False
 
@@ -132,7 +131,7 @@ def _(Path, cfg, np, pd):
         if str(_project_root) not in _sys.path:
             _sys.path.insert(0, str(_project_root))
 
-        from src.heuristics.labeler import run_heuristic_labeling
+        from scenicdriver.heuristics.labeler import run_heuristic_labeling
 
         _labels_df, _tiles, _run_info = run_heuristic_labeling(
             satellite_dir=cfg.satellite_dir,
@@ -141,7 +140,6 @@ def _(Path, cfg, np, pd):
             max_tiles=cfg.heuristic_max_tiles,
             use_classifier=cfg.heuristic_use_classifier,
             classifier_best_ckpt=cfg.classifier_best_ckpt,
-            classifier_use_resisc45_stats=cfg.classifier_use_resisc45_stats,
             default_lat=cfg.heuristic_default_lat,
             default_lon=cfg.heuristic_default_lon,
             seed=cfg.seed,
@@ -448,7 +446,14 @@ def _(
 
                 _pred_scores, _logits = model(_images, _terrain)
                 _reg_loss = nn.functional.mse_loss(_pred_scores, _scenic_scores)
-                _cls_loss = nn.functional.cross_entropy(_logits, _class_ids)
+                _valid_classes = _class_ids != -1
+                _cls_loss = (
+                    nn.functional.cross_entropy(
+                        _logits[_valid_classes], _class_ids[_valid_classes]
+                    )
+                    if _valid_classes.any()
+                    else _logits.new_zeros(())
+                )
                 loss = cfg.loss_weights[0] * _reg_loss + cfg.loss_weights[1] * _cls_loss
 
                 _optimizer.zero_grad()
@@ -481,7 +486,14 @@ def _(
 
                     _pred_scores, _logits = model(_images, _terrain)
                     _reg_loss = nn.functional.mse_loss(_pred_scores, _scenic_scores)
-                    _cls_loss = nn.functional.cross_entropy(_logits, _class_ids)
+                    _valid_classes = _class_ids != -1
+                    _cls_loss = (
+                        nn.functional.cross_entropy(
+                            _logits[_valid_classes], _class_ids[_valid_classes]
+                        )
+                        if _valid_classes.any()
+                        else _logits.new_zeros(())
+                    )
                     loss = cfg.loss_weights[0] * _reg_loss + cfg.loss_weights[1] * _cls_loss
 
                     _val_loss += loss.item()

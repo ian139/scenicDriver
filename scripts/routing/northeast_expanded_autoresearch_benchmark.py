@@ -24,12 +24,13 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.route_planner.cancellation import RoutingDeadline  # noqa: E402
-from src.route_planner.graph import CompactRoadGraph  # noqa: E402
-from src.route_planner.service import (  # noqa: E402
+from scenicdriver.route_planner.cancellation import RoutingDeadline  # noqa: E402
+from scenicdriver.route_planner.graph import CompactRoadGraph  # noqa: E402
+from scenicdriver.route_planner.service import (  # noqa: E402
     RouteRequest,
     clear_route_caches,
     clear_route_response_cache,
@@ -142,7 +143,7 @@ def _command_output(*args: str) -> str | None:
 
 
 def _host_metadata() -> dict[str, Any]:
-    native_library = PROJECT_ROOT / "src/route_planner/_compact_search_c.so"
+    native_library = PROJECT_ROOT / "src/scenicdriver/route_planner/_compact_search_c.so"
     disk = shutil.disk_usage(PROJECT_ROOT)
     return {
         "commit": _command_output("git", "rev-parse", "HEAD"),
@@ -185,7 +186,6 @@ def _request() -> RouteRequest:
         tile_scores_json=str(REPORT_PATH),
         start=(44.475884, -73.214003),
         end=(40.44062, -79.99589),
-        scenic_weight=0.8,
         max_detour_factor=1.8,
         avoid_highways=False,
         include_baseline=True,

@@ -4,13 +4,13 @@ import signal
 from threading import Event
 
 import pytest
-import src.route_planner.planner as planner_module
+import scenicdriver.route_planner.planner as planner_module
 
-from src.route_planner.cost import evaluate_path
-from src.route_planner.graph import Edge, Node, RoadGraph
-from src.route_planner.planner import ScenicRoutePlanner
+from scenicdriver.route_planner.cost import evaluate_path
+from scenicdriver.route_planner.graph import Edge, Node, RoadGraph
+from scenicdriver.route_planner.planner import ScenicRoutePlanner
 
-from src.route_planner.cancellation import (
+from scenicdriver.route_planner.cancellation import (
     CancelToken,
     RoutingCancelled,
     RoutingDeadline,

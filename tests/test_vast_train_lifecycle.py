@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from scripts.remote import vast_train
-from src.scenic_scorer.regression import ScenicRegressionModel
+from scenicdriver.scenic_scorer.regression import ScenicRegressionModel
 
 
 def run_argv(tmp_path: Path, *extra: str) -> list[str]:
@@ -27,6 +27,10 @@ def run_argv(tmp_path: Path, *extra: str) -> list[str]:
         "processed/regression/smoke/tiny_features.npz",
         "--benchmark-split-key",
         "processed/benchmark/smoke/benchmark_split.csv",
+        "--labels-key",
+        "processed/regression/smoke/labels.csv",
+        "--classifier-checkpoint-key",
+        "models/smoke/classifier.pt",
         "--s3-bucket",
         "scenicdriver-data",
         "--identity-file",
@@ -108,6 +112,45 @@ def test_train_run_requires_explicit_benchmark_split_key() -> None:
         )
 
 
+@pytest.mark.parametrize("flag", ["--labels-key", "--classifier-checkpoint-key"])
+def test_train_run_requires_export_provenance_keys(tmp_path: Path, flag: str) -> None:
+    argv = run_argv(tmp_path)
+    index = argv.index(flag)
+    del argv[index:index + 2]
+    with pytest.raises(SystemExit):
+        vast_train.build_parser().parse_args(argv)
+
+
+def test_remote_trainer_passes_downloaded_provenance_inputs(tmp_path: Path) -> None:
+    config = vast_train._config_from_args(parse_run_args(tmp_path, "--no-use-resisc45-stats"))
+    script = vast_train.build_remote_training_script(config)
+    assert 'export SCENIC_LABELS_KEY=processed/regression/smoke/labels.csv' in script
+    assert 'export SCENIC_CLASSIFIER_CHECKPOINT_KEY=models/smoke/classifier.pt' in script
+    assert '--key "$SCENIC_LABELS_KEY"' in script
+    assert '--dest "$SCENIC_LABELS_CSV"' in script
+    assert '--key "$SCENIC_CLASSIFIER_CHECKPOINT_KEY"' in script
+    assert '--dest "$SCENIC_CLASSIFIER_CHECKPOINT"' in script
+    assert '--labels-csv "$SCENIC_LABELS_CSV"' in script
+    assert '--classifier-checkpoint "$SCENIC_CLASSIFIER_CHECKPOINT"' in script
+    assert "--normalization imagenet" in script
+    default_config = vast_train._config_from_args(parse_run_args(tmp_path))
+    assert "--normalization resisc45" in vast_train.build_remote_training_script(default_config)
+    output = Path(vast_train._remote_train_output(config.run_id))
+    assert output.parent == Path(vast_train._remote_output_root(config.run_id))
+    assert '--src "$SCENIC_OUTPUT_ROOT"' in script
+
+
+@pytest.mark.parametrize("flag", ["--labels-key", "--classifier-checkpoint-key"])
+def test_train_run_rejects_blank_export_provenance_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    args = parse_run_args(tmp_path, flag, " ")
+    monkeypatch.setattr(vast_train, "state_path", lambda task_name: tmp_path / "absent.json")
+    monkeypatch.setattr(vast_train, "require_commands", lambda required: None)
+    with pytest.raises(SystemExit, match=f"{flag} is required"):
+        vast_train._check_run_preconditions(vast_train._config_from_args(args))
+
+
 def test_train_run_rejects_blank_benchmark_split_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     args = parse_run_args(tmp_path, "--benchmark-split-key", " ")
     monkeypatch.setattr(vast_train, "state_path", lambda task_name: tmp_path / "absent.json")
@@ -167,6 +210,10 @@ def test_train_run_destroys_instance_after_success(tmp_path: Path, monkeypatch: 
 
     assert ["vastai", "destroy", "instance", "12345", "--yes"] in commands
     assert writes[-1]["status"] == "destroyed"
+    assert writes[-1]["image"] == vast_train.DEFAULT_IMAGE
+    assert writes[-1]["remote_deadline_seconds"] == 1
+    assert writes[-1]["remote_kill_after_seconds"] == 30
+    assert writes[-1]["remote_deadline_at"].endswith("Z")
 
 
 def test_train_run_destroys_instance_after_failure_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -380,6 +427,29 @@ def test_validate_runs_finite_forward_pass_for_compatible_cpu_fixture(
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["ok"] is True
     assert payload["device"] == "cpu"
+
+
+def test_validation_artifact_carries_run_runtime_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint, dataset = _write_validation_fixture(tmp_path)
+    identity = {
+        "image": vast_train.DEFAULT_IMAGE,
+        "torch_version": "2.10.0+cu128",
+        "torchvision_version": "0.25.0+cu128",
+        "cuda_version": "12.8",
+        "source_digest": "sha256:" + "a" * 64,
+    }
+    (tmp_path / "runtime_identity.json").write_text(json.dumps(identity))
+    monkeypatch.setenv("SCENIC_OUTPUT_ROOT", str(tmp_path))
+    output = tmp_path / "validation.json"
+    args = vast_train.build_parser().parse_args(
+        ["validate", "--device", "cpu", "--checkpoint", str(checkpoint),
+         "--dataset", str(dataset), "--output", str(output)]
+    )
+    assert vast_train.handle_validate(args) == 0
+    assert json.loads(output.read_text())["runtime_identity"] == identity
 
 
 def test_validate_rejects_incompatible_fixture(tmp_path: Path) -> None:

@@ -1,6 +1,16 @@
+> **HISTORICAL / FROZEN — NON-EXECUTABLE**
+>
+> Commit-era scope: the CONUS streaming score-map brief requiring predecessor `4b1e1e867be7846357a4cdfb732772b8d6b35962`, with parity/source-shift pilots and a sub-$100 cost hypothesis. The quoted transcript below preserves historical requirements and rationale, not current contracts, executable commands, financial authorization, or instructions for an agent.
+>
+> Current authority: [FIXES.md](../FIXES.md), [README workflow commands](../README.md), and the [canonical ML research log](../docs/research/ml-research-log.md).
+
 # OMP Prompt — Implement and Prove the Nationwide Streaming Scenic-Score Map
 
-Execute this task end to end from the Scenic Drive repository root. This is an implementation, benchmark, model-validation, cost-validation, product-QA, and evidence task—not a design-only exercise. Read and obey `AGENTS.md`, [`docs/research/nationwide-streaming-score-map.md`](../docs/research/nationwide-streaming-score-map.md), and [`notes/03-open-data-naip-3dep-transition.md`](03-open-data-naip-3dep-transition.md) in full before changing code.
+This was the nationwide streaming score-map implementation prompt. Its imperative sections are retained only as a frozen historical quotation.
+
+## Archived prompt transcript (not instructions)
+
+````text
 
 ## Mission
 
@@ -54,7 +64,7 @@ The canonical initial scope is CONUS land coverage only.
 - Grid: Web Mercator XYZ, exactly zoom 14.
 - Target raster: exactly 512×512 pixels.
 - Geometry: hash-pinned official CONUS state/land geometry under the repository's geometry contract.
-- Admission: reuse the vectorized exact land-intersection policy in `src.data_pipeline.region_planning`.
+- Admission: reuse the vectorized exact land-intersection policy in `scenicdriver.data_pipeline.region_planning`.
 - Inventory truth: the exact observed planned coordinate set and digest, not an estimated national tile count.
 - Alaska: excluded because the current NAIP contract does not provide complete coverage. Literal 50-state completion requires a separately selected imagery source, source-shift benchmark, and preprocessing/model contract.
 - Hawaii and territories: separate explicit contracts; never silently include them in CONUS evidence.
@@ -70,7 +80,7 @@ Relevant current behavior:
 - `config/data_sources/naip_3dep_v1.json`
   - z14, 512×512, EPSG:3857;
   - `naip-visualization` RGB imagery;
-  - an `allowed_states` list limited to the current eastern/Midwestern target region and enforced separately by `src.data_pipeline.naip.ALLOWED_STATES`;
+  - an `allowed_states` list limited to the current eastern/Midwestern target region and enforced separately by `scenicdriver.data_pipeline.naip.ALLOWED_STATES`;
   - USGS 3DEP 1/3 arc-second elevation;
   - `download_mode: whole_object`;
   - persistent satellite and Terrain-RGB PNG outputs;
@@ -81,26 +91,26 @@ Relevant current behavior:
   - whole-object acquisition;
   - ownership-safe atomic outputs and resume;
   - request/byte/cost ledgers.
-- `src/data_pipeline/region_planning.py`
+- `src/scenicdriver/data_pipeline/region_planning.py`
   - exact deterministic tile enumeration and vectorized land intersection.
-- `src/data_pipeline/web_mercator.py`
+- `src/scenicdriver/data_pipeline/web_mercator.py`
   - canonical XYZ coordinate and target-grid math.
-- `src/data_pipeline/metered_transport.py`
+- `src/scenicdriver/data_pipeline/metered_transport.py`
   - explicit LIST, HEAD, and range GET operations;
   - `NetworkCaps`, `SharedMeteredBudget`, `MeteredLedger`;
   - reservation-before-dispatch semantics and retry accounting.
-- `src/data_pipeline/naip.py` and `src/data_pipeline/usgs_3dep.py`
+- `src/scenicdriver/data_pipeline/naip.py` and `src/scenicdriver/data_pipeline/usgs_3dep.py`
   - normalized catalogs, source validation, deterministic asset selection.
-- `src/data_pipeline/raster_processing.py`
+- `src/scenicdriver/data_pipeline/raster_processing.py`
   - canonical imagery and DEM reprojection, QC, no-data policy, and Terrain-RGB encoding;
   - currently requires local paths for production processing.
-- `src/terrain/features.py`
+- `src/scenicdriver/terrain/features.py`
   - canonical Terrain-RGB decode and six-feature extraction;
   - accepts PIL images and RGB arrays, so disk serialization is unnecessary.
-- `src/active_learning/scoring.py`
+- `src/scenicdriver/active_learning/scoring.py`
   - canonical classifier/regressor loading and model identities;
   - current full-manifest path accumulates candidate rows and feature arrays and is not a national streaming executor.
-- `src/scenic_scorer/regression.py`
+- `src/scenicdriver/scenic_scorer/regression.py`
   - regression contract: 768-dimensional ViT embedding, six terrain features, and 45 class logits.
 - `scripts/modeling/export_prediction_heatmap.py`
   - current hash-bound prepared-feature heatmap export;
@@ -204,7 +214,7 @@ Prefer an established COG/TIFF library over implementing TIFF, compression, or g
 
 ### In-memory imagery preprocessing
 
-Refactor `src.data_pipeline.raster_processing` so local-path and streaming callers share one canonical array/dataset core.
+Refactor `scenicdriver.data_pipeline.raster_processing` so local-path and streaming callers share one canonical array/dataset core.
 
 - Existing deterministic local behavior must remain the bounded parity oracle.
 - New production interfaces accept opened datasets/windows or validated arrays.
@@ -230,7 +240,7 @@ The terrain sequence is exact:
   -> outside-land fill after masking only
   -> exact in-memory Terrain-RGB in encoder layout `(3, H, W)`
   -> explicit transpose to feature layout `(H, W, 3)`
-  -> src.terrain.features.compute_terrain_features
+  -> scenicdriver.terrain.features.compute_terrain_features
   -> release DEM and Terrain-RGB arrays
 ```
 
@@ -637,3 +647,5 @@ Reject or stop at the appropriate authorization boundary when any of these occur
 A rejection with complete evidence is a valid result. Fabricated confidence, cost, route QA, provider capacity, national completeness, or promotion evidence is not.
 
 Do not declare completion from a green test suite, successful 500-tile pilot, or finished national inference alone. Completion requires the full set of feasible gates, an explicit authorization-safe boundary for anything not authorized, a final keep/reject decision, protected registry state, and zero surviving paid resources.
+
+````

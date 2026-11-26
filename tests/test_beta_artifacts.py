@@ -8,7 +8,16 @@ from typing import Any
 
 import pytest
 from scripts.routing import check_beta_artifacts as checker
-from src.route_planner.graph import RoadGraph, write_compact_graph
+from scenicdriver.route_planner.graph import RoadGraph, write_compact_graph
+
+RUN_NAME = "release-fixture"
+CHECKPOINT_PATH = Path("data/processed/regression/checkpoints/release-fixture.pt")
+PROBE_COORDINATES = {
+    "rutland_usps": (43.60784414, -72.98226538),
+    "lisbon_police": (44.02516775, -70.10003245),
+    "burlington": (44.475884, -73.214003),
+    "bangor": (44.801616, -68.771305),
+}
 
 BBOX = {
     "min_lat": 42.488301979602255,
@@ -22,7 +31,7 @@ PROBES = {
         "lon": coordinates[1],
         "distance_km": 0.25,
     }
-    for name, coordinates in checker._CANONICAL_PROBE_COORDINATES.items()
+    for name, coordinates in PROBE_COORDINATES.items()
 }
 
 
@@ -54,7 +63,7 @@ def _write_reports(report: Path) -> None:
     }), encoding="utf-8")
     metrics = {
         "request": {"start": [44, -70], "end": [44.1, -70.1],
-                    "scenic_weight": .5, "max_detour_factor": 1.5},
+                    "max_detour_factor": 1.5},
         "score_mapping": {"enabled": True},
         **{kind: {"route_kind": kind, "total_distance_km": 1,
                   "estimated_duration_minutes": 1, "raw_scenic_score": 5,
@@ -85,13 +94,15 @@ def _write_project(root: Path, *, graph: str) -> None:
     (root / "config/app_regions.json").write_text(
         json.dumps(
             {
+                "default_region": "new_england_north",
                 "regions": [
                     {
                         "region": "new_england_north",
                         "graph": graph,
-                        "run_name": checker.DEFAULT_RUN_NAME,
+                        "run_name": RUN_NAME,
                         "max_route_snap_km": 1.0,
                         "bbox": BBOX,
+                        "coverage_probes": PROBES,
                     }
                 ]
             }
@@ -99,16 +110,16 @@ def _write_project(root: Path, *, graph: str) -> None:
         encoding="utf-8",
     )
     report = (
-        root / "data/processed/heuristic_runs" / checker.DEFAULT_RUN_NAME / "report"
+        root / "data/processed/heuristic_runs" / RUN_NAME / "report"
     )
     _write_reports(report)
     registry = root / checker.REGISTRY_PATH
     registry.parent.mkdir(parents=True)
     registry.write_text(
-        json.dumps({"active": {"checkpoint": str(checker.DEFAULT_CHECKPOINT_PATH)}}),
+        json.dumps({"active": {"checkpoint": str(CHECKPOINT_PATH)}}),
         encoding="utf-8",
     )
-    checkpoint = root / checker.DEFAULT_CHECKPOINT_PATH
+    checkpoint = root / CHECKPOINT_PATH
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b"checkpoint")
 
@@ -159,7 +170,7 @@ def _write_sqlite_graph(
             "INSERT INTO nodes(id, lat, lon) VALUES (?, ?, ?)",
             [
                 (f"{name}_{end}", lat + end * .001, lon)
-                for name, (lat, lon) in checker._CANONICAL_PROBE_COORDINATES.items()
+                for name, (lat, lon) in PROBE_COORDINATES.items()
                 for end in (0, 1)
             ],
         )
@@ -169,7 +180,7 @@ def _write_sqlite_graph(
                 road_name, road_type, speed_limit_kmh, one_way
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [(name, f"{name}_0", f"{name}_1", .111, 5.0, "Road", "primary", 50.0, 0)
-             for name in checker._CANONICAL_PROBE_COORDINATES],
+             for name in PROBE_COORDINATES],
         )
         connection.executemany(
             "INSERT INTO metadata(key, value) VALUES (?, ?)",
@@ -541,6 +552,7 @@ def test_multiple_enabled_regions_pass(tmp_path: Path) -> None:
                         "run_name": "run_ne",
                         "max_route_snap_km": 1.0,
                         "bbox": BBOX,
+                        "coverage_probes": PROBES,
                     },
                     {
                         "region": "masswhites",
@@ -548,6 +560,7 @@ def test_multiple_enabled_regions_pass(tmp_path: Path) -> None:
                         "run_name": "run_mw",
                         "max_route_snap_km": 1.0,
                         "bbox": BBOX,
+                        "coverage_probes": PROBES,
                     },
                 ],
             }
@@ -563,10 +576,10 @@ def test_multiple_enabled_regions_pass(tmp_path: Path) -> None:
     registry = tmp_path / checker.REGISTRY_PATH
     registry.parent.mkdir(parents=True)
     registry.write_text(
-        json.dumps({"active": {"checkpoint": str(checker.DEFAULT_CHECKPOINT_PATH)}}),
+        json.dumps({"active": {"checkpoint": str(CHECKPOINT_PATH)}}),
         encoding="utf-8",
     )
-    checkpoint = tmp_path / checker.DEFAULT_CHECKPOINT_PATH
+    checkpoint = tmp_path / CHECKPOINT_PATH
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b"checkpoint")
 
@@ -587,6 +600,7 @@ def test_disabled_region_skipped(tmp_path: Path) -> None:
                         "run_name": "run_ne",
                         "max_route_snap_km": 1.0,
                         "bbox": BBOX,
+                        "coverage_probes": PROBES,
                     },
                     {
                         "region": "northeast_expanded",
@@ -607,10 +621,10 @@ def test_disabled_region_skipped(tmp_path: Path) -> None:
     registry = tmp_path / checker.REGISTRY_PATH
     registry.parent.mkdir(parents=True)
     registry.write_text(
-        json.dumps({"active": {"checkpoint": str(checker.DEFAULT_CHECKPOINT_PATH)}}),
+        json.dumps({"active": {"checkpoint": str(CHECKPOINT_PATH)}}),
         encoding="utf-8",
     )
-    checkpoint = tmp_path / checker.DEFAULT_CHECKPOINT_PATH
+    checkpoint = tmp_path / CHECKPOINT_PATH
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b"checkpoint")
 
@@ -634,6 +648,7 @@ def test_missing_second_region_artifact_rejected(
                         "run_name": "run_ne",
                         "max_route_snap_km": 1.0,
                         "bbox": BBOX,
+                        "coverage_probes": PROBES,
                     },
                     {
                         "region": "masswhites",
@@ -641,6 +656,7 @@ def test_missing_second_region_artifact_rejected(
                         "run_name": "run_mw",
                         "max_route_snap_km": 1.0,
                         "bbox": BBOX,
+                        "coverage_probes": PROBES,
                     },
                 ],
             }
@@ -661,10 +677,10 @@ def test_missing_second_region_artifact_rejected(
     registry = tmp_path / checker.REGISTRY_PATH
     registry.parent.mkdir(parents=True)
     registry.write_text(
-        json.dumps({"active": {"checkpoint": str(checker.DEFAULT_CHECKPOINT_PATH)}}),
+        json.dumps({"active": {"checkpoint": str(CHECKPOINT_PATH)}}),
         encoding="utf-8",
     )
-    checkpoint = tmp_path / checker.DEFAULT_CHECKPOINT_PATH
+    checkpoint = tmp_path / CHECKPOINT_PATH
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b"checkpoint")
 
@@ -690,6 +706,7 @@ def test_per_region_compact_validation_selection(tmp_path: Path) -> None:
                         "run_name": "run_ne",
                         "max_route_snap_km": 1.0,
                         "bbox": BBOX,
+                        "coverage_probes": PROBES,
                     },
                     {
                         "region": "masswhites",
@@ -697,6 +714,7 @@ def test_per_region_compact_validation_selection(tmp_path: Path) -> None:
                         "run_name": "run_mw",
                         "max_route_snap_km": 1.0,
                         "bbox": BBOX,
+                        "coverage_probes": PROBES,
                     },
                 ],
             }
@@ -720,10 +738,10 @@ def test_per_region_compact_validation_selection(tmp_path: Path) -> None:
     registry = tmp_path / checker.REGISTRY_PATH
     registry.parent.mkdir(parents=True)
     registry.write_text(
-        json.dumps({"active": {"checkpoint": str(checker.DEFAULT_CHECKPOINT_PATH)}}),
+        json.dumps({"active": {"checkpoint": str(CHECKPOINT_PATH)}}),
         encoding="utf-8",
     )
-    checkpoint = tmp_path / checker.DEFAULT_CHECKPOINT_PATH
+    checkpoint = tmp_path / CHECKPOINT_PATH
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b"checkpoint")
 
@@ -856,7 +874,7 @@ def test_forged_coverage_does_not_admit_distant_graph(tmp_path: Path) -> None:
 def test_unusable_or_unassociated_report_rejected(tmp_path: Path, mutation: str) -> None:
     _write_project(tmp_path, graph="candidate.sqlite3")
     _write_sqlite_graph(tmp_path / "candidate.sqlite3")
-    path = tmp_path / "data/processed/heuristic_runs" / checker.DEFAULT_RUN_NAME / "report/report.json"
+    path = tmp_path / "data/processed/heuristic_runs" / RUN_NAME / "report/report.json"
     report = json.loads(path.read_text())
     if mutation == "empty":
         report["tiles"] = []
@@ -887,7 +905,7 @@ def test_all_required_regions_admitted(tmp_path: Path, mutation: str) -> None:
         config["default_region"] = "absent"
     else:
         config["regions"].append({"region": "second", "route_planning": True,
-                                  "run_name": checker.DEFAULT_RUN_NAME})
+                                  "run_name": RUN_NAME})
     config_path.write_text(json.dumps(config))
     assert checker.check_artifacts(tmp_path) == 1
 
@@ -952,7 +970,7 @@ def test_region_model_association_not_assumed_active_registry(tmp_path: Path) ->
     config = json.loads(config_path.read_text())
     config["regions"][0]["model_checkpoint"] = "models/region.pt"
     config_path.write_text(json.dumps(config))
-    report_path = tmp_path / "data/processed/heuristic_runs" / checker.DEFAULT_RUN_NAME / "report/report.json"
+    report_path = tmp_path / "data/processed/heuristic_runs" / RUN_NAME / "report/report.json"
     assert checker.check_artifacts(tmp_path) == 1
     payload = json.loads(report_path.read_text())
     payload["run_info"]["regression_checkpoint_sha256"] = checker.hashlib.sha256(model.read_bytes()).hexdigest()
@@ -977,7 +995,7 @@ def test_supported_json_graph_formats_use_admitted_geometry(tmp_path: Path, suff
                 {"type": "Feature", "properties": {"id": name, "one_way": False},
                  "geometry": {"type": "LineString",
                               "coordinates": [[lon, lat], [lon, lat + .001]]}}
-                for name, (lat, lon) in checker._CANONICAL_PROBE_COORDINATES.items()
+                for name, (lat, lon) in PROBE_COORDINATES.items()
             ],
         }))
     _write_run_gate(graph_path)
@@ -995,7 +1013,7 @@ def test_supported_json_graph_formats_use_admitted_geometry(tmp_path: Path, suff
 def test_saved_route_must_be_usable(tmp_path: Path, name: str) -> None:
     _write_project(tmp_path, graph="candidate.sqlite3")
     _write_sqlite_graph(tmp_path / "candidate.sqlite3")
-    path = tmp_path / "data/processed/heuristic_runs" / checker.DEFAULT_RUN_NAME / "report" / name
+    path = tmp_path / "data/processed/heuristic_runs" / RUN_NAME / "report" / name
     path.write_text("{}")
     assert checker.check_artifacts(tmp_path) == 1
 

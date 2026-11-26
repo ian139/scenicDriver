@@ -5,8 +5,18 @@
 .venv/
 venv/
 
-# Python/tool caches
-__pycache__/
+# Operator workspaces and build outputs
+.worktrees/
+.todos/
+.omp/
+**/*.egg-info/
+**/build/
+**/dist/
+
+# Host-built native libraries and Python/tool caches
+**/*.so
+**/*.pyc
+**/__pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

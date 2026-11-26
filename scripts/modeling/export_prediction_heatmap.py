@@ -40,16 +40,17 @@ from typing import Any
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
 
-from src.heuristics.report import build_report  # noqa: E402
-from src.scenic_scorer.active_evaluation import (  # noqa: E402
+from scenicdriver.heuristics.report import build_report  # noqa: E402
+from scenicdriver.scenic_scorer.active_evaluation import (  # noqa: E402
     file_sha256,
     load_model_checkpoint,
     predict_dataset,
 )
-from src.scenic_scorer.regression import resolve_device  # noqa: E402
+from scenicdriver.scenic_scorer.regression import resolve_device  # noqa: E402
 
 IMAGE_PATH_RE = re.compile(r"^images/satellite/z(\d+)/([^/]+)/(\d+)_(\d+)\.png$")
 

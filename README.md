@@ -28,20 +28,28 @@ flowchart LR
 
 - Python 3.11+
 - [`uv`](https://docs.astral.sh/uv/)
-- A Mapbox access token for map tiles and address search
-- Node.js 20+ only for the viewer test
+- A Mapbox access token for address search; the basemap uses CARTO/OSM, not Mapbox tiles
+- Node.js 20+ for the viewer unit and browser tests
+- For hosted deployment, use the canonical [Compose recipe](docs/setup/deployment.md); `python3 -m http.server` is local-development only
 
 Install the locked development environment:
 
 ```bash
-uv sync --frozen --extra dev
+uv sync --frozen
 ```
+
+The default `dev` dependency group includes both `ml` and `ingest` extras
+alongside the test/lint tools; CI uses this same locked sync. `uv sync` installs
+the same development group for local work. For a lean API environment use
+`uv sync --frozen --no-dev`. Add `--extra ml` for model training, inference, and
+marimo notebooks, or `--extra ingest` for imagery/terrain ingest, S3 transport,
+and road-graph builds (both flags can be combined).
 
 Start the API:
 
 ```bash
 export MAPBOX_ACCESS_TOKEN=<your-token>
-uv run uvicorn src.app_api.main:app --host 0.0.0.0 --port 8080 --reload
+uv run uvicorn scenicdriver.app_api.main:app --host 0.0.0.0 --port 8080 --reload
 ```
 
 In another terminal, serve the static app:
@@ -51,6 +59,10 @@ cd apps/new_england_north
 python3 -m http.server 3000
 ```
 
+This local server is for development only. The canonical hosted topology —
+API + static frontend under Compose with read-only artifact mounts — is the
+recipe in the [deployment guide](docs/setup/deployment.md).
+
 Open <http://localhost:3000>. Useful API endpoints:
 
 - Health: <http://localhost:8080/v1/healthz>
@@ -58,25 +70,36 @@ Open <http://localhost:3000>. Useful API endpoints:
 
 A clean checkout can run the API and app shell. Heatmaps and route comparison require the ignored graph, report, registry, and model artifacts described in the [deployment guide](docs/setup/deployment.md).
 
+`uv run python scripts/routing/check_beta_artifacts.py` requires
+`config/app_regions.json` and the active model registry; graph, scenic run,
+coverage probes, and configured model identities come from those files.
+`--graph` overrides only the configured default region's graph; no embedded
+release defaults are used.
+
 
 ## Repository layout
 
 ```text
-apps/new_england_north/  Static MapLibre web app
-src/app_api/             FastAPI application and contributor endpoints
-src/route_planner/       Graph, cost, planning, cancellation, and service logic
-src/classifier/          Landscape classifier training and inference
-src/scenic_scorer/       Learned scenic regression
-src/terrain/             Terrain-RGB feature extraction
-src/heuristics/          Labeling and report generation
-src/data_pipeline/       Tile and S3 data access
-scripts/                 Grouped workflow CLIs
-notebooks/               Interactive marimo workflows
-config/                  Region and storage configuration
-deploy/                  Versioned beta artifact manifests
-docs/                    Architecture, setup, research, and roadmap
-archive/                 Curated historical material
+apps/new_england_north/               Static MapLibre web app
+src/scenicdriver/app_api/             FastAPI application and contributor endpoints
+src/scenicdriver/route_planner/       Graph, cost, planning, cancellation, and service logic
+src/scenicdriver/classifier/          Landscape classifier training and inference
+src/scenicdriver/scenic_scorer/       Learned scenic regression
+src/scenicdriver/terrain/             Terrain-RGB feature extraction
+src/scenicdriver/heuristics/          Labeling and report generation
+src/scenicdriver/data_pipeline/       Tile and S3 data access
+scripts/                            Grouped workflow CLIs
+notebooks/                          Interactive marimo workflows
+config/                             Region and storage configuration
+deploy/                             Versioned beta artifact manifests
+docs/                               Architecture, setup, research, and roadmap
+archive/                            Curated historical material
 ```
+
+Python imports use the installed `scenicdriver` namespace. Setuptools discovers
+only `scenicdriver*` packages under `src/`; `uv sync` installs this layout in
+editable mode. Runtime configuration and generated artifacts remain at the
+repository/deployment root, outside the Python package.
 
 ## Common workflows
 
@@ -113,6 +136,13 @@ uv run python scripts/ingest/plan_active_learning_region.py \
   --output-root data/processed/active_learning \
   --budget 370000
 ```
+
+Planning requires an explicit `--region-spec`; use
+`config/data_sources/regions_v1.json` for the pinned acquisition geometry.
+`config/app_regions.json` is the single source for app-region bounds, and the
+viewer reads those bounds from `/v1/regions`. No built-in planning geometry is
+selected when the flag is omitted. Execution and authorized discovery consume
+their frozen plans/requests and do not require this flag.
 
 When catalogs are absent, execute only the exact hash-bound `resume_command`
 written to `<run_name>/discovery_authorization_request.json`, and only after
@@ -282,7 +312,9 @@ uv run pytest -q
 node --test tests/test_new_england_north_viewer.mjs
 ```
 
-These are the same two gates run by GitHub Actions.
+CI also enforces Ruff, runs the browser lane in `tests/browser/` and native
+compact-search tests on macOS, and smoke-tests the installed wheel and beta API
+image. See [the workflow](.github/workflows/ci.yml) for the exact commands.
 
 ## Project boundaries
 

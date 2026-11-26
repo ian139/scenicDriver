@@ -399,7 +399,7 @@ deterministic ordering to improve the miss result.
 | Retained candidate | `86bbfde3` | Bounded scenic scalar Dijkstra traversal |
 | Main integration | `ba5cf73b` | No-conflict merge of the harness and retained candidate |
 
-The retained `src/route_planner/planner.py` SHA-256 at integration is `e4e514c0230f9b6b319f37746bf3906b38f3fbdbb691f895bd6bd51ade0c1a8c`.
+The retained `src/scenicdriver/route_planner/planner.py` SHA-256 at integration is `e4e514c0230f9b6b319f37746bf3906b38f3fbdbb691f895bd6bd51ade0c1a8c`.
 
 ## Hypothesis and implementation
 

@@ -36,7 +36,7 @@ from tests.naip3dep_fixtures import (
 
 @pytest.fixture(autouse=True)
 def _fast_region_planning(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Plan tests use a tiny planned dict instead of the full built-in region
+    """Plan tests use a tiny planned dict instead of the full configured region
     (which would enumerate tens of thousands of coordinates)."""
 
     def fake_parse(
@@ -99,7 +99,14 @@ def _plan_run(tmp_path: Path, **overrides) -> dict:
 def test_parse_args_exposes_canonical_flags_and_no_mapbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("sys.argv", ["plan_active_learning_region.py"])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "plan_active_learning_region.py",
+            "--region-spec",
+            "config/data_sources/regions_v1.json",
+        ],
+    )
     args = planner.parse_args()
     namespace = vars(args)
     for flag in (
@@ -132,6 +139,26 @@ def test_parse_args_exposes_canonical_flags_and_no_mapbox(
     assert args.imagery_source == "naip-visualization"
     assert args.terrain_source == "usgs-3dep-13as"
     assert args.budget == 370_000
+
+
+def test_planning_requires_explicit_region_spec_with_canonical_config_message(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv", ["plan_active_learning_region.py", "--run-name", "pilot"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        planner.parse_args()
+    assert exc.value.code == 2
+    message = capsys.readouterr().err
+    assert "--region-spec is required for planning" in message
+    assert "--region-spec config/data_sources/regions_v1.json" in message
+    assert "config/app_regions.json" in message
+
+
+def test_programmatic_planning_has_no_implicit_region_spec(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="config/app_regions.json"):
+        _plan_run(tmp_path, spec=None)
 
 
 def test_plan_only_writes_immutable_plan_and_authorization(tmp_path: Path) -> None:

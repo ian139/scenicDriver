@@ -1,5 +1,5 @@
 """
-Tests for src/data_pipeline/web_mercator.py
+Tests for src/scenicdriver/data_pipeline/web_mercator.py
 """
 
 from __future__ import annotations
@@ -7,7 +7,7 @@ from __future__ import annotations
 import math
 import pytest
 
-from src.data_pipeline.web_mercator import (
+from scenicdriver.data_pipeline.web_mercator import (
     EPSG3857_CRS,
     HALF_CIRCUMFERENCE,
     WEB_MERCATOR_MAX_LAT,
@@ -19,8 +19,8 @@ from src.data_pipeline.web_mercator import (
     tile_to_lat_lon_center,
     tile_transform_web_mercator,
 )
-from src.route_planner.graph import Edge, Node, RoadGraph
-from src.route_planner.service import apply_tile_scores_to_graph
+from scenicdriver.route_planner.graph import Edge, Node, RoadGraph
+from scenicdriver.route_planner.service import apply_tile_scores_to_graph
 
 
 def test_lat_lon_to_tile_known_values():

@@ -21,9 +21,13 @@ dist/
 !.env.beta.example
 !.env.example
 .secrets/
+*.pem
+*.key
 
 # Local env / tooling
 .claude/
+.todos/
+.worktrees/
 # Active CMUX lifecycle state.
 .cmux-vast/
 

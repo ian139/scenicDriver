@@ -6,10 +6,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.active_learning.common import sha256_bytes, sha256_file
-from src.active_learning.finalize import finalize_stage1
-from src.active_learning.scoring import SCORING_SCHEMA_VERSION
-from src.active_learning.selection import audit_geographic_leakage, select_candidates
+from scenicdriver.active_learning.common import sha256_bytes, sha256_file
+from scenicdriver.active_learning.finalize import finalize_stage1
+from scenicdriver.active_learning.scoring import SCORING_SCHEMA_VERSION
+from scenicdriver.active_learning.selection import audit_geographic_leakage, select_candidates
 
 
 def _candidates() -> pd.DataFrame:
@@ -223,6 +223,29 @@ def _write_complete_stage1(
         ),
         encoding="utf-8",
     )
+    split_registry = {
+        "schema": "scenic-geographic-split-registry/1",
+        "rule": {
+            "name": "sha256-physical-block-threshold/1",
+            "seed": 17,
+            "val_fraction": 0.15,
+            "test_fraction": 0.15,
+            "block_size": 32,
+            "block_degrees": 0.25,
+            "adjacency_radius": 1,
+            "adjacency_distance_km": 0.0,
+        },
+        "regions": {"fixture": {"z14|b0|3": "train"}},
+    }
+    split_registry_path = tmp_path / "geographic_split_registry.json"
+    split_registry_path.write_text(json.dumps(split_registry, sort_keys=True))
+    split_registry_record = {
+        "path": str(split_registry_path),
+        "sha256": sha256_file(split_registry_path),
+        "bytes": split_registry_path.stat().st_size,
+        "schema": split_registry["schema"],
+        "rule": split_registry["rule"],
+    }
     (tmp_path / "batch_manifest.json").write_text(
         json.dumps(
             {
@@ -231,11 +254,13 @@ def _write_complete_stage1(
                 "batch_id": batch_id,
                 "selection_contract": selection_contract,
                 "selection_contract_sha256": selection_digest,
+                "geographic_split_registry": split_registry_record,
                 "candidate_input": {
                     "path": "candidate_pool.csv",
                     "sha256": sha256_file(tmp_path / "candidate_pool.csv"),
                 },
                 "outputs": {
+                    "geographic_split_registry_json": split_registry_record,
                     "annotation_batch_csv": {
                         "path": str(tmp_path / "annotation_batch.csv"),
                         "sha256": sha256_file(tmp_path / "annotation_batch.csv"),
@@ -361,6 +386,34 @@ def _finalize_fixture(root: Path, inputs: dict[str, Path]) -> dict:
     )
 
 
+@pytest.mark.parametrize("corruption", ["missing", "missing_path", "missing_digest", "changed_snapshot"])
+def test_finalizer_requires_bound_geographic_split_registry(
+    tmp_path: Path, corruption: str,
+) -> None:
+    inputs = _write_complete_stage1(tmp_path)
+    manifest_path = tmp_path / "batch_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    if corruption == "missing":
+        manifest.pop("geographic_split_registry")
+    elif corruption == "missing_path":
+        manifest["geographic_split_registry"].pop("path")
+    elif corruption == "missing_digest":
+        manifest["geographic_split_registry"].pop("sha256")
+    else:
+        registry_path = tmp_path / "geographic_split_registry.json"
+        registry_path.write_bytes(registry_path.read_bytes() + b"\n")
+    manifest_path.write_text(json.dumps(manifest))
+
+    handoff = _finalize_fixture(tmp_path, inputs)
+
+    assert handoff["ready_for_stage2"] is False
+    assert handoff["splits_valid"] is False
+    assert any(
+        "geographic split registry" in blocker or "geographic_split_registry" in blocker
+        for blocker in handoff["blockers"]
+    )
+
+
 @pytest.mark.parametrize("corruption", ["missing", "nonfinite", "shape", "probabilities"])
 def test_finalizer_rejects_incomplete_consuming_arrays(tmp_path: Path, corruption: str) -> None:
     inputs = _write_complete_stage1(tmp_path)
@@ -476,6 +529,16 @@ def test_finalizer_accepts_complete_validated_fixture(tmp_path: Path) -> None:
         checkpoint_path=checkpoint,
     )
     handoff = finalize_stage1(tmp_path, **common)
+    split_registry_record = json.loads((tmp_path / "batch_manifest.json").read_text())[
+        "geographic_split_registry"
+    ]
+    assert handoff["geographic_split_registry"] == split_registry_record
+    assert handoff["artifacts"]["geographic_split_registry"]["path"] == (
+        "geographic_split_registry.json"
+    )
+    assert handoff["artifacts"]["geographic_split_registry"]["sha256"] == (
+        split_registry_record["sha256"]
+    )
     handoff_bytes = (tmp_path / "stage1_handoff.json").read_bytes()
     annotation_snapshot_bytes = (tmp_path / "absolute_annotations.csv").read_bytes()
     filtered_index_bytes = (tmp_path / "filtered_index.csv").read_bytes()
@@ -531,7 +594,7 @@ def test_finalizer_accepts_complete_validated_fixture(tmp_path: Path) -> None:
 
 
 def test_selection_rejects_invalid_run_names(tmp_path: Path) -> None:
-    from src.active_learning.selection import SelectionConfig, run_selection
+    from scenicdriver.active_learning.selection import SelectionConfig, run_selection
 
     candidates = _candidates()
     csv_path = tmp_path / "candidates.csv"
@@ -575,7 +638,7 @@ def test_selection_rejects_invalid_run_names(tmp_path: Path) -> None:
 def test_selection_rejects_changed_run_identity(tmp_path: Path, change: str) -> None:
     from dataclasses import replace
 
-    from src.active_learning.selection import SelectionConfig, run_selection
+    from scenicdriver.active_learning.selection import SelectionConfig, run_selection
 
     candidates = _candidates()
     source = tmp_path / "candidates.csv"
@@ -638,7 +701,7 @@ def test_selection_rejects_changed_run_identity(tmp_path: Path, change: str) -> 
 def test_selection_identical_rerun_preserves_fixed_artifacts(
     tmp_path: Path, prior_kind: str
 ) -> None:
-    from src.active_learning.selection import SelectionConfig, run_selection
+    from scenicdriver.active_learning.selection import SelectionConfig, run_selection
 
     source = tmp_path / "candidates.csv"
     _candidates().to_csv(source, index=False)
@@ -688,7 +751,7 @@ def test_selection_identical_rerun_preserves_fixed_artifacts(
 def test_selection_refuses_incomplete_existing_contract(
     tmp_path: Path, damage: str
 ) -> None:
-    from src.active_learning.selection import run_selection
+    from scenicdriver.active_learning.selection import run_selection
 
     source = tmp_path / "candidates.csv"
     _candidates().to_csv(source, index=False)
@@ -717,7 +780,7 @@ def test_selection_refuses_incomplete_existing_contract(
 def test_selection_allows_run_directory_without_selection_artifacts(
     tmp_path: Path,
 ) -> None:
-    from src.active_learning.selection import run_selection
+    from scenicdriver.active_learning.selection import run_selection
 
     output_dir = tmp_path / "runs"
     run_dir = output_dir / "fixed"
@@ -735,7 +798,7 @@ def test_selection_allows_run_directory_without_selection_artifacts(
 
 
 def test_prepare_for_selection_filters_scorer_columns_and_fails_closed() -> None:
-    from src.active_learning.selection import _prepare_for_selection
+    from scenicdriver.active_learning.selection import _prepare_for_selection
 
     df = pd.DataFrame(
         [
@@ -792,7 +855,7 @@ def test_prepare_for_selection_filters_scorer_columns_and_fails_closed() -> None
 def test_resolve_registry_checkpoint_prefers_existing_and_reports_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.active_learning.finalize import (
+    from scenicdriver.active_learning.finalize import (
         _resolve_registry_checkpoint,
     )
 
@@ -832,7 +895,7 @@ def test_resolve_registry_checkpoint_prefers_existing_and_reports_missing(
 def test_validate_registry_resolves_registry_relative_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.active_learning.finalize import _validate_registry
+    from scenicdriver.active_learning.finalize import _validate_registry
 
     monkeypatch.chdir(tmp_path)
     registry_dir = tmp_path / "data" / "processed" / "regression"
@@ -874,8 +937,8 @@ def test_validate_registry_resolves_registry_relative_checkpoint(
 def test_modifying_annotation_batch_content_preserving_row_count_and_batch_id_is_rejected(
     tmp_path: Path,
 ) -> None:
-    from src.active_learning.finalize import _validate_lineage
-    from src.active_learning.selection import run_selection
+    from scenicdriver.active_learning.finalize import _validate_lineage
+    from scenicdriver.active_learning.selection import run_selection
 
     candidates = _candidates()
     csv_path = tmp_path / "candidate_pool.csv"
@@ -1063,7 +1126,7 @@ def test_selection_all_water_failure() -> None:
 
 
 def test_stable_identity_parses_canonical_path_layouts() -> None:
-    from src.active_learning.finalize import _stable_identity
+    from scenicdriver.active_learning.finalize import _stable_identity
 
     assert (
         _stable_identity("images/satellite/z14/fixture/100_200.png")
@@ -1083,7 +1146,7 @@ def test_stable_identity_parses_canonical_path_layouts() -> None:
 def test_snapshot_matches_alternate_canonical_paths_by_stable_identity(
     tmp_path: Path,
 ) -> None:
-    from src.active_learning.finalize import ABSOLUTE_COLUMNS, _snapshot_annotations
+    from scenicdriver.active_learning.finalize import ABSOLUTE_COLUMNS, _snapshot_annotations
 
     batch_path = tmp_path / "annotation_batch.csv"
     pd.DataFrame(
@@ -1139,7 +1202,7 @@ def test_snapshot_matches_alternate_canonical_paths_by_stable_identity(
 
 
 def test_lineage_matches_batch_decisions_by_stable_identity(tmp_path: Path) -> None:
-    from src.active_learning.finalize import _validate_lineage
+    from scenicdriver.active_learning.finalize import _validate_lineage
 
     tile_path = tmp_path / "tile_manifest.csv"
     pd.DataFrame(
@@ -1279,6 +1342,7 @@ def test_lineage_matches_batch_decisions_by_stable_identity(tmp_path: Path) -> N
     [
         ("", False),
         ("unclear view", False),
+        ("[unusable: unsupported]", False),
         ("[unusable: missing_imagery]", True),
         ("[unusable: cloud_or_obstruction] heavy cloud cover", True),
         ("missing_imagery, duplicate", False),
@@ -1287,7 +1351,7 @@ def test_lineage_matches_batch_decisions_by_stable_identity(tmp_path: Path) -> N
 def test_skipped_decisions_require_one_supported_unusable_reason(
     tmp_path: Path, notes: str, accepted: bool
 ) -> None:
-    from src.active_learning.finalize import _validate_annotations
+    from scenicdriver.active_learning.finalize import _validate_annotations
 
     path = tmp_path / "annotations.csv"
     pd.DataFrame(
@@ -1322,7 +1386,7 @@ def test_skipped_decisions_require_one_supported_unusable_reason(
 def test_annotations_reject_duplicate_identity_for_same_annotator(
     tmp_path: Path,
 ) -> None:
-    from src.active_learning.finalize import _validate_annotations
+    from scenicdriver.active_learning.finalize import _validate_annotations
 
     path = tmp_path / "annotations.csv"
     pd.DataFrame(
@@ -1368,7 +1432,7 @@ def test_annotations_reject_duplicate_identity_for_same_annotator(
 def test_annotations_allow_same_identity_across_different_annotators(
     tmp_path: Path,
 ) -> None:
-    from src.active_learning.finalize import _validate_annotations
+    from scenicdriver.active_learning.finalize import _validate_annotations
 
     path = tmp_path / "annotations.csv"
     pd.DataFrame(
@@ -1551,7 +1615,7 @@ def _rewrite_benchmark_csv(path: Path, rows: list[dict[str, object]]) -> None:
 def test_benchmark_pre_dataset_rejects_invalid_contracts(
     tmp_path: Path, rows: list[dict[str, object]], blocker_fragment: str
 ) -> None:
-    from src.active_learning.finalize import _validate_benchmark_pre_dataset
+    from scenicdriver.active_learning.finalize import _validate_benchmark_pre_dataset
 
     path = tmp_path / "benchmark.csv"
     _rewrite_benchmark_csv(path, rows)
@@ -1563,7 +1627,7 @@ def test_benchmark_pre_dataset_rejects_invalid_contracts(
 def test_benchmark_pre_dataset_accepts_scenic_human_mean_target(
     tmp_path: Path,
 ) -> None:
-    from src.active_learning.finalize import (
+    from scenicdriver.active_learning.finalize import (
         _validate_benchmark_pre_dataset,
         _validate_human_table,
     )
@@ -1584,7 +1648,7 @@ def test_benchmark_pre_dataset_accepts_scenic_human_mean_target(
 
 
 def test_benchmark_test_overlap_uses_stable_identity(tmp_path: Path) -> None:
-    from src.active_learning.finalize import _validate_benchmark_test_overlap
+    from scenicdriver.active_learning.finalize import _validate_benchmark_test_overlap
 
     expanded = tmp_path / "benchmark.csv"
     control = tmp_path / "control_benchmark.csv"
@@ -1845,7 +1909,7 @@ def test_selection_overlap_fraction_stays_bounded_when_fresh_rows_are_blocked() 
 def test_geographic_splits_allocate_only_positive_fractions(
     val_fraction: float, test_fraction: float, expected_splits: set[str]
 ) -> None:
-    from src.active_learning.selection import build_geographic_splits
+    from scenicdriver.active_learning.selection import build_geographic_splits
 
     candidates = _spaced_selection_candidates(24)
     splits = build_geographic_splits(
@@ -1939,3 +2003,103 @@ def test_random_control_uses_full_pool_before_stratum_score_shortlist() -> None:
     assert selected.attrs["diagnostics"]["eligible_rows"] == 5_001
     assert selected.attrs["diagnostics"]["shortlist_rows"] == 5_000
     pd.testing.assert_frame_equal(selected, reordered)
+
+
+def test_geographic_registry_freezes_blocks_across_pool_changes() -> None:
+    from scenicdriver.active_learning.selection import build_geographic_splits
+
+    original = _spaced_selection_candidates(40)
+    kwargs = {"seed": 17, "adjacency_radius": 0}
+    initial = build_geographic_splits(original.iloc[:20], **kwargs)
+    registry = initial.attrs["geographic_split_registry"]
+    growing = build_geographic_splits(original, registry=registry, **kwargs)
+    shrinking = build_geographic_splits(
+        original.iloc[5:15], registry=growing.attrs["geographic_split_registry"],
+        seed=99, adjacency_radius=0,
+    )
+    initial_by_block = initial.set_index("geographic_block")["split"].to_dict()
+    growing_by_block = growing.set_index("geographic_block")["split"].to_dict()
+    shrinking_by_block = shrinking.set_index("geographic_block")["split"].to_dict()
+    assert all(growing_by_block[block] == split for block, split in initial_by_block.items())
+    assert all(growing_by_block[block] == split for block, split in shrinking_by_block.items())
+    # Independently introduced blocks get the same assignment; pool size is irrelevant.
+    new_only = build_geographic_splits(original.iloc[20:], **kwargs)
+    assert all(
+        growing_by_block[row.geographic_block] == row.split
+        for row in new_only.itertuples()
+    )
+    assert growing.attrs["geographic_split_registry"] == shrinking.attrs["geographic_split_registry"]
+    assert set(shrinking["split_seed"]) == {17}
+    assert registry["regions"] != growing.attrs["geographic_split_registry"]["regions"]
+
+
+def test_geographic_block_assignment_ignores_region_aliases() -> None:
+    from scenicdriver.active_learning.selection import build_geographic_splits
+
+    candidates = _spaced_selection_candidates(40)
+    first = build_geographic_splits(candidates, seed=7, adjacency_radius=0)
+    candidates["region"] = "neighboring-region"
+    candidates["tile_identity"] = [
+        f"neighboring-region/z{row.z}/x{row.x}/y{row.y}" for row in candidates.itertuples()
+    ]
+    candidates = candidates.drop(columns=["z", "x", "y"])
+    candidates["image_path"] = "alias-" + candidates["image_path"]
+    second = build_geographic_splits(candidates, seed=7, adjacency_radius=0)
+    assert first.set_index("geographic_block")["split"].to_dict() == second.set_index(
+        "geographic_block"
+    )["split"].to_dict()
+
+
+def test_selection_persists_registry_snapshot_for_historical_handoff(tmp_path: Path) -> None:
+    from scenicdriver.active_learning.selection import SelectionConfig, run_selection
+
+    source = tmp_path / "pool.csv"
+    candidates = _spaced_selection_candidates(40)
+    candidates.iloc[:20].to_csv(source, index=False)
+    output = tmp_path / "rounds"
+    first = run_selection(
+        source, output_dir=output, run_name="first",
+        config=SelectionConfig(batch_size=5, seed=17, adjacency_radius=0, run_name="first"),
+    )
+    snapshot = output / "first" / "geographic_split_registry.json"
+    frozen = snapshot.read_bytes()
+    record = first.batch_manifest["geographic_split_registry"]
+    assert record["sha256"] == sha256_file(snapshot)
+    assert record == first.batch_manifest["outputs"]["geographic_split_registry_json"]
+    assert first.batch_manifest["selection_contract"]["geographic_split_registry_sha256"] == record["sha256"]
+    candidates.to_csv(source, index=False)
+    second = run_selection(
+        source, output_dir=output, run_name="second",
+        config=SelectionConfig(batch_size=5, seed=99, adjacency_radius=0, run_name="second"),
+    )
+    assert snapshot.read_bytes() == frozen
+    assert record["sha256"] != second.batch_manifest["geographic_split_registry"]["sha256"]
+    first_blocks = first.geographic_splits.set_index("geographic_block")["split"].to_dict()
+    second_blocks = second.geographic_splits.set_index("geographic_block")["split"].to_dict()
+    assert all(second_blocks[block] == split for block, split in first_blocks.items())
+    # A prior round is reproducible even after the root registry grows.
+    candidates.iloc[:20].to_csv(source, index=False)
+    repeated = run_selection(
+        source, output_dir=output, run_name="first",
+        config=SelectionConfig(batch_size=5, seed=17, adjacency_radius=0, run_name="first"),
+    )
+    assert repeated.batch_manifest == first.batch_manifest
+    assert snapshot.read_bytes() == frozen
+
+
+def test_geographic_registry_rejects_assignment_and_rule_tampering() -> None:
+    from scenicdriver.active_learning.selection import build_geographic_splits
+
+    candidates = _spaced_selection_candidates(20)
+    initial = build_geographic_splits(candidates, seed=17, adjacency_radius=0)
+    registry = json.loads(json.dumps(initial.attrs["geographic_split_registry"]))
+    block = next(iter(registry["regions"]["fixture"]))
+    current = registry["regions"]["fixture"][block]
+    registry["regions"]["fixture"][block] = "train" if current != "train" else "test"
+    with pytest.raises(ValueError, match="assignment changed"):
+        build_geographic_splits(candidates, registry=registry, adjacency_radius=0)
+    with pytest.raises(ValueError, match="rule changed"):
+        build_geographic_splits(
+            candidates, registry=initial.attrs["geographic_split_registry"],
+            block_size=16, adjacency_radius=0,
+        )

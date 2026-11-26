@@ -38,7 +38,7 @@ from scripts.modeling.run_active_scenic_autoresearch import (
     validate_prepared_dataset_manifest,
     write_prepared_dataset_manifest,
 )
-from src.scenic_scorer.active_training import ActiveTrainingConfig
+from scenicdriver.scenic_scorer.active_training import ActiveTrainingConfig
 
 
 @pytest.fixture(autouse=True)
@@ -130,7 +130,7 @@ def _write_regression_checkpoint(
     """Write a loadable active regression checkpoint with the given capacity."""
     import torch
 
-    from src.scenic_scorer.regression import ScenicRegressionModel
+    from scenicdriver.scenic_scorer.regression import ScenicRegressionModel
 
     model = ScenicRegressionModel(
         vit_dim=4, terrain_dim=2, num_classes=3, hidden_dim=hidden_dim
@@ -1158,7 +1158,7 @@ def test_resume_generation_admission_survives_stale_sidecar(
     import dataclasses
     import numpy as np
 
-    from src.scenic_scorer.active_training import ActiveTrainingError, train_active_model
+    from scenicdriver.scenic_scorer.active_training import ActiveTrainingError, train_active_model
 
     dataset = tmp_path / "prepared.npz"
     splits = tmp_path / "splits.csv"
@@ -5261,35 +5261,42 @@ def _regression_export(tmp_path: Path, *, paths: list[str], splits: list[str] | 
 def test_baseline_excludes_benchmark_and_geographic_heldout_rows(
     tmp_path: Path, embedded_splits: bool
 ) -> None:
-    from scripts.modeling.train_regression_baseline import training_arrays
+    from scripts.modeling.regression_split import holdout_population_mask
 
-    paths = ["test", "train2", "val", "train1", "geo_val", "extra"]
+    names = ["test", "train2", "val", "train1", "geo_val", "extra"]
+    paths = [f"images/satellite/z14/region/{10 * (i + 1)}_{10 * (i + 1)}.png" for i in range(len(names))]
+    tile = dict(zip(names, paths, strict=True))
     dataset = _regression_export(
         tmp_path,
         paths=paths,
         splits=["test", "train", "val", "train", "val", "train"] if embedded_splits else None,
     )
+    labels = tmp_path / "labels.csv"
+    labels.write_text(
+        "image_path,scenic_score\n" + "".join(f"{path},9\n" for path in paths), encoding="utf-8"
+    )
     benchmark = tmp_path / "benchmark.csv"
-    benchmark.write_text("image_path,split\ntest,test\nval,val\ntrain1,train\n", encoding="utf-8")
-    arrays = training_arrays(dataset, benchmark)
+    benchmark.write_text(
+        f"image_path,split\n{tile['test']},test\n{tile['val']},val\n{tile['train1']},train\n",
+        encoding="utf-8",
+    )
+    mask = holdout_population_mask(dataset, labels, benchmark, holdout_buffer_tiles=1)
     positions = [1, 3, 5] if embedded_splits else [1, 3, 4, 5]
-    assert arrays["image_paths"].tolist() == [paths[index] for index in positions]
-    assert arrays["vit_embeddings"].flatten().tolist() == positions
-    assert arrays["sample_weights"].tolist() == [index + 1 for index in positions]
+    assert mask.nonzero()[0].tolist() == positions
 
     # An explicit conflicting assignment cannot quietly turn a heldout row
     # into a training row when the export and benchmark disagree.
     if embedded_splits:
-        benchmark.write_text("image_path,split\ntrain1,test\n", encoding="utf-8")
+        benchmark.write_text(f"image_path,split\n{tile['train1']},test\n", encoding="utf-8")
         with pytest.raises(ValueError, match="conflicts"):
-            training_arrays(dataset, benchmark)
+            holdout_population_mask(dataset, labels, benchmark, holdout_buffer_tiles=1)
 
 
 def test_regression_benchmark_joins_features_by_identity_and_human_targets(tmp_path: Path) -> None:
     import torch
 
     from scripts.modeling.compare_regression_on_benchmark import benchmark_dataset, _evaluate
-    from src.scenic_scorer.regression import ScenicRegressionModel
+    from scenicdriver.scenic_scorer.regression import ScenicRegressionModel
 
     dataset = _regression_export(tmp_path, paths=["second", "training", "first"])
     labels = tmp_path / "labels.csv"

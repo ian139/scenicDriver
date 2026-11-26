@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
+import os
+import threading
+import weakref
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 from PIL import Image
-from src.active_learning.common import sha256_file
-from src.active_learning.finalize import finalize_stage1
-from src.active_learning.scoring import (
+from scenicdriver.active_learning.common import sha256_file
+from scenicdriver.active_learning.finalize import finalize_stage1
+from scenicdriver.active_learning.scoring import (
     DEFAULT_SCORING_BATCH_SIZE,
     DEFAULT_SCORING_NUM_WORKERS,
+    SCORING_PREFETCH_FACTOR,
     ScoringDependencies,
     _call_classifier,
     _loader_options,
@@ -21,6 +26,42 @@ from src.active_learning.scoring import (
     run_active_learning_scoring,
     score_tile_manifest,
 )
+
+_WORKER_LOG_ENV = "SCENIC_SCORING_TEST_WORKER_LOG"
+_PRODUCER_THREAD_NAME = "scoring-source-producer"
+
+
+def _log_worker_event(kind: str) -> None:
+    """Record which process/DataLoader worker ran a preprocessing step."""
+    path = os.environ.get(_WORKER_LOG_ENV)
+    if not path:
+        return
+    from torch.utils.data import get_worker_info
+
+    info = get_worker_info()
+    worker = "main" if info is None else f"{info.id} {info.num_workers}"
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(f"{kind} {os.getpid()} {worker}\n")
+
+
+def _worker_transform(image: Image.Image) -> np.ndarray:
+    """Top-level, picklable classifier transform for spawn workers."""
+    _log_worker_event("transform")
+    return np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
+
+
+def _worker_terrain(
+    _terrain: Image.Image, _satellite: Image.Image, *, valid_mask: np.ndarray,
+    pixel_spacing_m: float,
+) -> dict[str, object]:
+    """Top-level, picklable terrain feature function for spawn workers."""
+    _log_worker_event("terrain")
+    return {
+        "features": np.asarray([0.2, 0.3, 0.4, 0.5, 0.0, 0.0], dtype=np.float32),
+        "relief": 100.0,
+        "roughness": 20.0,
+        "slope_mean": 4.0,
+    }
 
 
 def _png(path: Path, color: tuple[int, int, int]) -> None:
@@ -58,7 +99,10 @@ def _dependencies(counters: dict[str, int]) -> ScoringDependencies:
     def transform(image: Image.Image) -> np.ndarray:
         return np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
 
-    def terrain(_terrain: Image.Image, _satellite: Image.Image, *, valid_mask: np.ndarray) -> dict[str, object]:
+    def terrain(
+        _terrain: Image.Image, _satellite: Image.Image, *, valid_mask: np.ndarray,
+        pixel_spacing_m: float,
+    ) -> dict[str, object]:
         return {
             "features": np.asarray([0.2, 0.3, 0.4, 0.5, 0.0, 0.0], dtype=np.float32),
             "relief": 100.0,
@@ -89,8 +133,62 @@ def _dependencies(counters: dict[str, int]) -> ScoringDependencies:
         class_names=("forest", "mountain", "lake"),
         classifier_hash="classifier-fixture",
         regression_hash="regression-fixture",
+        classifier_preprocess_identity="fixture-transform:/255:v1",
+        terrain_feature_identity="fixture-terrain:v1",
         device="cpu",
     )
+
+
+def _row_frame(root: Path, count: int, prefix: str) -> pd.DataFrame:
+    """Rows whose sources live in ``root``; score with run_root=root / "run"."""
+    rows = []
+    for index in range(count):
+        satellite = root / f"{prefix}_sat_{index}.png"
+        terrain = root / f"{prefix}_ter_{index}.png"
+        _png(satellite, (40 + index % 20, 120, 70))
+        _png(terrain, (120, 120, 120))
+        rows.append(
+            {
+                "image_path": f"images/satellite/z14/{prefix}/{index}.png",
+                "provider": "mapbox_v1",
+                "region": "fixture",
+                "z": 14,
+                "x": index,
+                "y": 200,
+                "lat": 40.0,
+                "lon": -70.0,
+                "satellite_path": satellite.name,
+                "terrain_path": terrain.name,
+                "satellite_present": True,
+                "terrain_present": True,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _count_loaders(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """Spy DataLoader constructions; returns recorded constructor kwargs."""
+    import torch.utils.data as torch_data
+
+    created: list[dict[str, object]] = []
+    base = torch_data.DataLoader
+
+    class CountingLoader(base):  # type: ignore[misc, valid-type]
+        def __init__(self, dataset, *args, **kwargs) -> None:
+            created.append(dict(kwargs))
+            super().__init__(dataset, *args, **kwargs)
+
+    monkeypatch.setattr(torch_data, "DataLoader", CountingLoader)
+    return created
+
+
+def _producer_threads() -> list[threading.Thread]:
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == _PRODUCER_THREAD_NAME and thread.is_alive()
+    ]
+
 
 @pytest.mark.parametrize("changed_model", ["classifier", "regression_model"])
 def test_injected_same_class_state_changes_invalidate_cache(tmp_path, changed_model):
@@ -362,7 +460,10 @@ def test_scorer_flushes_pending_images_at_batch_size(tmp_path: Path) -> None:
     def transform(image: Image.Image) -> np.ndarray:
         return np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
 
-    def terrain(_terrain: Image.Image, _satellite: Image.Image, *, valid_mask: np.ndarray) -> dict[str, object]:
+    def terrain(
+        _terrain: Image.Image, _satellite: Image.Image, *, valid_mask: np.ndarray,
+        pixel_spacing_m: float,
+    ) -> dict[str, object]:
         return {
             "features": np.asarray([0.2, 0.3, 0.4, 0.5, 0.0, 0.0], dtype=np.float32),
             "relief": 100.0,
@@ -391,6 +492,8 @@ def test_scorer_flushes_pending_images_at_batch_size(tmp_path: Path) -> None:
         class_names=("forest", "mountain", "lake"),
         classifier_hash="classifier-fixture",
         regression_hash="regression-fixture",
+        classifier_preprocess_identity="fixture-transform:v1",
+        terrain_feature_identity="fixture-terrain:v1",
         device="cpu",
     )
     result = score_tile_manifest(
@@ -401,69 +504,102 @@ def test_scorer_flushes_pending_images_at_batch_size(tmp_path: Path) -> None:
     assert all(size <= 2 for size in recorded_batch_sizes)
 
 
-def test_uncached_pending_payload_high_water_is_bounded(
+def test_source_residency_is_bounded_by_queue_batch_and_producer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import src.active_learning.scoring as scoring_module
+    import scenicdriver.active_learning.scoring as scoring_module
 
-    total_rows = 9
-    batch_size = 2
-    rows = []
-    row_payload_bytes: list[int] = []
-    for index in range(total_rows):
-        satellite = tmp_path / f"bounded_sat_{index}.png"
-        terrain = tmp_path / f"bounded_ter_{index}.png"
-        _png(satellite, (50 + index, 150, 80))
-        _png(terrain, (120, 120, 120))
-        row_payload_bytes.append(satellite.stat().st_size + terrain.stat().st_size)
-        rows.append(
-            {
-                "image_path": f"images/satellite/z14/bounded/{index}.png",
-                "provider": "mapbox_v1",
-                "region": "fixture",
-                "z": 14,
-                "x": index,
-                "y": 200,
-                "lat": 40.0 + index,
-                "lon": -70.0,
-                "satellite_path": satellite.name,
-                "terrain_path": terrain.name,
-                "satellite_present": True,
-                "terrain_present": True,
-            }
+    total_rows, batch_size = 20, 2
+    # Injected predictors force effective workers=0, so the queue holds
+    # batch_size * max(1, 0) * prefetch rows; the producer may hold one more pair.
+    capacity = batch_size * 1 * SCORING_PREFETCH_FACTOR
+    row_bound = capacity + batch_size + 1
+    manifest = _row_frame(tmp_path, total_rows, "resident")
+    original_read = scoring_module._read_source
+    live_sources = [0]
+    satellite_reads = [0]
+
+    def release() -> None:
+        live_sources[0] -= 1
+
+    def tracked_read(**kwargs: object):
+        source = original_read(**kwargs)
+        live_sources[0] += 1
+        weakref.finalize(source, release)
+        if kwargs.get("style") == "satellite":
+            satellite_reads[0] += 1
+        return source
+
+    monkeypatch.setattr(scoring_module, "_read_source", tracked_read)
+    samples: list[tuple[int, int, int]] = []
+    consumed = [0]
+
+    def classifier(batch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        consumed[0] += len(batch)
+        gc.collect()
+        samples.append((satellite_reads[0], consumed[0], live_sources[0]))
+        size = len(batch)
+        return (
+            np.tile(np.asarray([[2.0, 0.0, -1.0]], dtype=np.float32), (size, 1)),
+            np.arange(size * 4, dtype=np.float32).reshape(size, 4) + 1.0,
         )
 
-    observed_payload_bytes: list[int] = []
-    original_dataset = scoring_module._ScoringDataset
-
-    class ObservedDataset(original_dataset):
-        def __init__(self, inputs: list[object], **kwargs: object) -> None:
-            observed_payload_bytes.append(
-                sum(
-                    len(source.payload or b"")
-                    for item in inputs
-                    for source in (item.satellite, item.terrain)
-                )
-            )
-            super().__init__(inputs, **kwargs)
-
-    monkeypatch.setattr(scoring_module, "_ScoringDataset", ObservedDataset)
+    deps = _dependencies({"classifier": 0, "regression": 0})
+    deps.classifier_predictor = classifier
     result = score_tile_manifest(
-        pd.DataFrame(rows),
-        run_root=tmp_path / "bounded-run",
-        dependencies=_dependencies({"classifier": 0, "regression": 0}),
+        manifest,
+        run_root=tmp_path / "run",
+        dependencies=deps,
         batch_size=batch_size,
     )
 
     assert result["counts"]["scored_rows"] == total_rows, result["errors"]
-    assert len(observed_payload_bytes) == (total_rows + batch_size - 1) // batch_size
-    largest_row_payload = max(observed_payload_bytes)
-    assert largest_row_payload < sum(row_payload_bytes)
-    assert largest_row_payload <= max(row_payload_bytes) * batch_size
+    assert len(samples) == total_rows // batch_size
+    first_reads = samples[0][0]
+    assert first_reads < total_rows, "full manifest was acquired before inference"
+    assert first_reads <= row_bound
+    for reads, consumed_rows, live in samples:
+        # Acquisition lead: queued rows plus one pair in the producer's hand.
+        assert reads - consumed_rows <= capacity + 1
+        assert live <= 2 * row_bound
+
+
+def test_loader_is_constructed_once_across_multiple_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scenicdriver.active_learning.scoring as scoring_module
+
+    created = _count_loaders(monkeypatch)
+    datasets: list[object] = []
+    original_dataset = scoring_module._ScoringDataset
+
+    class CountingDataset(original_dataset):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            datasets.append(self)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(scoring_module, "_ScoringDataset", CountingDataset)
+    counters = {"classifier": 0, "regression": 0}
+    result = score_tile_manifest(
+        _row_frame(tmp_path, 7, "once"),
+        run_root=tmp_path / "run",
+        dependencies=_dependencies(counters),
+        batch_size=2,
+        num_workers=3,
+    )
+
+    assert result["counts"]["scored_rows"] == 7, result["errors"]
+    assert counters == {"classifier": 4, "regression": 4}
+    assert len(created) == 1
+    assert len(datasets) == 1
+    # Injected CPU predictors keep the loader in-process.
+    assert created[0]["num_workers"] == 0
+    assert created[0]["batch_size"] == 2
+    assert not _producer_threads()
 
 
 def test_scoring_rejects_invalid_run_names(tmp_path: Path) -> None:
-    from src.active_learning.scoring import run_active_learning_scoring
+    from scenicdriver.active_learning.scoring import run_active_learning_scoring
 
     manifest = tmp_path / "manifest.csv"
     manifest.write_text("x,y\n1,1\n")
@@ -486,8 +622,8 @@ def test_scoring_rejects_invalid_run_names(tmp_path: Path) -> None:
 
 def test_validate_canonical_regression_checkpoint(tmp_path: Path) -> None:
     import torch
-    from src.active_learning.scoring import _validate_regression_checkpoint
-    from src.scenic_scorer.regression import ScenicRegressionModel
+    from scenicdriver.active_learning.scoring import _validate_regression_checkpoint
+    from scenicdriver.scenic_scorer.regression import ScenicRegressionModel
 
     # New canonical format: top-level dims + hidden_dim
     model_new = ScenicRegressionModel(
@@ -540,7 +676,7 @@ def test_validate_canonical_regression_checkpoint(tmp_path: Path) -> None:
 def test_resolve_active_regression_checkpoint_sha256_read_only_validation(
     tmp_path: Path,
 ) -> None:
-    from src.active_learning.scoring import resolve_active_regression_checkpoint
+    from scenicdriver.active_learning.scoring import resolve_active_regression_checkpoint
 
     ckpt = tmp_path / "model.pt"
     ckpt.write_bytes(b"dummy_checkpoint_data")
@@ -657,7 +793,10 @@ def test_water_scoring_classification_fresh_and_cache_hit(
 
     counters = {"classifier": 0, "regression": 0}
 
-    def terrain_fn(_terrain: Image.Image, satellite: Image.Image, *, valid_mask: np.ndarray) -> dict[str, object]:
+    def terrain_fn(
+        _terrain: Image.Image, satellite: Image.Image, *, valid_mask: np.ndarray,
+        pixel_spacing_m: float,
+    ) -> dict[str, object]:
         # Custom terrain function providing a 0.60 sea-level proxy for item 2.
         arr = np.asarray(satellite, dtype=np.float32)
         is_sat2 = tuple(arr[0, 0, :3]) == (41.0, 120.0, 70.0)
@@ -724,7 +863,7 @@ def test_water_scoring_classification_fresh_and_cache_hit(
 
     # Simulate a pre-filter cache containing embeddings for every row, then
     # prove resumed scoring reclassifies cached water rows fail-closed.
-    import src.active_learning.scoring as scoring_module
+    import scenicdriver.active_learning.scoring as scoring_module
 
     original_evaluate = scoring_module.evaluate_water_status
     original_is_excessive = scoring_module.is_excessive_water
@@ -872,7 +1011,7 @@ def test_old_active_data_readable_only_as_explicit_mapbox_v1_identities(
 
 
 def test_mixed_shoreline_water_is_not_gated_by_land_texture():
-    from src.active_learning.water import compute_satellite_water_fraction
+    from scenicdriver.active_learning.water import compute_satellite_water_fraction
 
     satellite = np.full((100, 100, 3), [15, 30, 100], dtype=np.uint8)
     land = np.indices((100, 40)).sum(axis=0) % 2
@@ -881,7 +1020,7 @@ def test_mixed_shoreline_water_is_not_gated_by_land_texture():
 
 
 def test_water_geometry_counts_canonical_black_sea_with_sparse_land():
-    from src.active_learning.water import compute_satellite_water_fraction
+    from scenicdriver.active_learning.water import compute_satellite_water_fraction
 
     satellite = np.zeros((10, 10, 3), dtype=np.uint8)
     land = np.zeros((10, 10), dtype=bool)
@@ -893,7 +1032,7 @@ def test_water_geometry_counts_canonical_black_sea_with_sparse_land():
 
 
 def test_flat_blue_water_with_clouds_retains_local_water_detection():
-    from src.active_learning.water import compute_satellite_water_fraction
+    from scenicdriver.active_learning.water import compute_satellite_water_fraction
 
     satellite = np.full((100, 100, 3), [15, 30, 100], dtype=np.uint8)
     satellite[30:70, 30:70] = 255
@@ -906,15 +1045,159 @@ def test_flat_blue_water_with_clouds_retains_local_water_detection():
     (np.ones((1, 2), dtype=bool), ValueError),
 ])
 def test_water_rejects_invalid_land_masks(mask, error):
-    from src.active_learning.water import compute_satellite_water_fraction
+    from scenicdriver.active_learning.water import compute_satellite_water_fraction
 
     with pytest.raises(error):
         compute_satellite_water_fraction(np.zeros((2, 2, 3)), land_mask=mask)
 
 
+def test_scoring_passes_tile_ground_spacing_and_requires_tile_xy(tmp_path):
+    from scenicdriver.data_pipeline.web_mercator import tile_pixel_ground_spacing_m
+
+    manifest = _manifest(tmp_path).iloc[:2].copy()
+    manifest.loc[1, "x"] = np.nan
+    deps = _dependencies({"classifier": 0, "regression": 0})
+    fake = deps.terrain_feature_fn
+    spacings = []
+
+    def spy(terrain, satellite, *, valid_mask, pixel_spacing_m):
+        spacings.append(pixel_spacing_m)
+        return fake(terrain, satellite, valid_mask=valid_mask, pixel_spacing_m=pixel_spacing_m)
+
+    deps.terrain_feature_fn = spy
+    result = score_tile_manifest(manifest, run_root=tmp_path / "run", dependencies=deps)
+    assert spacings == [pytest.approx(tile_pixel_ground_spacing_m(100, 200, 14, 4, 4))]
+    assert result["counts"]["scored_rows"] == 1
+    assert result["counts"]["error_rows"] == 1
+    row = pd.read_csv(tmp_path / "run" / "candidate_pool.csv").iloc[1]
+    assert "invalid_acquisition_tile" in row["error"]
+
+
+def _water_case(name: str) -> tuple[np.ndarray, np.ndarray]:
+    """(satellite, terrain) 16x16 canonical tiles for shared water-metric cases."""
+    satellite = np.full((16, 16, 3), [15, 30, 100], dtype=np.uint8)
+    terrain = np.full((16, 16, 3), [1, 138, 112], dtype=np.uint8)
+    if name == "textured_land":
+        # Smooth water left; high-texture land right. A whole-image texture
+        # gate would veto all water; local windows keep the water half.
+        checker = (np.indices((16, 8)).sum(axis=0) % 2).astype(bool)
+        satellite[:, 8:] = np.where(checker[..., None], 255, 0)
+    elif name == "sea_fill":
+        # Outside-land canonical black fill is known sea.
+        terrain[:, :8] = 0
+        satellite[:, :8] = 0
+        satellite[:, 8:] = [40, 120, 70]
+    elif name == "masked":
+        # Bright fill under a masked DEM column must not add texture evidence.
+        terrain[:, :3] = 0
+        satellite[:, :3] = 255
+    return satellite, terrain
+
+
+_WATER_CASES = {"textured_land": None, "sea_fill": 0.5, "masked": 1.0}
+
+
+def test_labeler_and_scorer_share_one_water_component(tmp_path, monkeypatch):
+    from scenicdriver.active_learning import scoring, water
+    from scenicdriver.heuristics import labeler
+    from scenicdriver.terrain.features import compute_terrain_features
+
+    assert labeler.compute_satellite_water_fraction is water.compute_satellite_water_fraction
+    assert scoring.compute_satellite_water_fraction is water.compute_satellite_water_fraction
+    assert labeler.weak_score_water_components is water.weak_score_water_components
+    assert scoring.weak_score_water_components is water.weak_score_water_components
+
+    monkeypatch.delenv("SCENIC_S3_BUCKET", raising=False)
+    raw = tmp_path / "raw"
+    sat_dir, terr_dir = raw / "images/satellite/z14", raw / "images/terrain/z14"
+    sat_dir.mkdir(parents=True)
+    terr_dir.mkdir(parents=True)
+    rows = []
+    for offset, name in enumerate(_WATER_CASES):
+        satellite, terrain = _water_case(name)
+        Image.fromarray(satellite).save(sat_dir / f"{100 + offset}_200.png")
+        Image.fromarray(terrain).save(terr_dir / f"{100 + offset}_200.png")
+        rows.append({
+            "image_path": f"images/satellite/z14/{100 + offset}_200.png",
+            "provider": "mapbox_v1", "region": "fixture",
+            "z": 14, "x": 100 + offset, "y": 200, "lat": 40.0, "lon": -70.0,
+            "satellite_path": str(sat_dir / f"{100 + offset}_200.png"),
+            "terrain_path": str(terr_dir / f"{100 + offset}_200.png"),
+            "satellite_present": True, "terrain_present": True,
+        })
+
+    _, tiles, _ = labeler.run_heuristic_labeling(
+        satellite_dir=sat_dir, terrain_dir=terr_dir, raw_dir=raw, max_tiles=None,
+        use_classifier=False, classifier_best_ckpt=tmp_path / "missing.pt",
+        default_lat=0.0, default_lon=0.0, seed=0, device="cpu",
+    )
+    deps = _dependencies({"classifier": 0, "regression": 0})
+    deps.terrain_feature_fn = compute_terrain_features
+    deps.terrain_feature_identity = None
+    score_tile_manifest(pd.DataFrame(rows), run_root=tmp_path / "run", dependencies=deps)
+    pool = pd.read_csv(tmp_path / "run" / "candidate_pool.csv")
+
+    by_x = {tile["x"]: tile for tile in tiles}
+    for offset, (name, expected) in enumerate(_WATER_CASES.items()):
+        tile = by_x[100 + offset]
+        assert tile["water_fraction"] == pytest.approx(pool.loc[offset, "water_fraction"]), name
+        if expected is not None:
+            assert tile["water_fraction"] == pytest.approx(expected), name
+        # Labeler weak score equals the scorer's heuristic for identical inputs.
+        components = scoring._heuristic_components(
+            tile["class_score"],
+            {
+                "relief": tile["relief"], "roughness": tile["roughness"],
+                "slope_mean": tile["slope_mean"], "water_proximity": tile["water_proxy"],
+                "vegetation_density": tile["veg_proxy"],
+            },
+            {"water_fraction": tile["water_fraction"]},
+        )
+        assert tile["scenic_score"] == pytest.approx(components["heuristic_score"]), name
+    # Local texture keeps the smooth water half despite textured land.
+    assert 0.4 <= by_x[100]["water_fraction"] <= 0.6
+
+
+def test_labeler_run_metadata_records_water_and_terrain_contracts(tmp_path, monkeypatch):
+    from scenicdriver.active_learning.scoring import TERRAIN_FEATURE_CONTRACT
+    from scenicdriver.active_learning.water import WATER_METRIC
+    from scenicdriver.heuristics import labeler
+
+    monkeypatch.delenv("SCENIC_S3_BUCKET", raising=False)
+    raw = tmp_path / "raw"
+    sat_dir, terr_dir = raw / "images/satellite/z16", raw / "images/terrain/z16"
+    sat_dir.mkdir(parents=True)
+    terr_dir.mkdir(parents=True)
+    satellite, terrain = _water_case("sea_fill")
+    Image.fromarray(satellite).save(sat_dir / "19073_24793.png")
+    Image.fromarray(terrain).save(terr_dir / "19073_24793.png")
+    kwargs = dict(
+        raw_dir=raw, max_tiles=None, use_classifier=False,
+        classifier_best_ckpt=tmp_path / "missing.pt", default_lat=0.0, default_lon=0.0,
+        seed=0, device="cpu",
+    )
+    _, _, run_info = labeler.run_heuristic_labeling(
+        satellite_dir=sat_dir, terrain_dir=terr_dir, **kwargs
+    )
+    assert run_info["water_metric"] == WATER_METRIC
+    assert run_info["terrain_feature_contract"] == TERRAIN_FEATURE_CONTRACT
+    assert TERRAIN_FEATURE_CONTRACT["version"] == 2
+    assert TERRAIN_FEATURE_CONTRACT["slope_units"] == "degrees"
+
+    flat_sat, flat_terr = raw / "flat/sat", raw / "flat/terr"
+    flat_sat.mkdir(parents=True)
+    flat_terr.mkdir(parents=True)
+    Image.fromarray(satellite).save(flat_sat / "tile.png")
+    Image.fromarray(terrain).save(flat_terr / "tile.png")
+    with pytest.raises(ValueError, match="pixel spacing"):
+        labeler.run_heuristic_labeling(
+            satellite_dir=flat_sat, terrain_dir=flat_terr, **kwargs
+        )
+
+
 @pytest.mark.parametrize("provider", [None, "", "  ", "mapbox_v1"])
 def test_scoring_coast_requires_attribution_and_uses_land_only_features(tmp_path, provider):
-    from src.terrain.features import compute_terrain_features
+    from scenicdriver.terrain.features import compute_terrain_features
 
     manifest = _manifest(tmp_path).iloc[:1].copy()
     if provider is None:
@@ -930,6 +1213,7 @@ def test_scoring_coast_requires_attribution_and_uses_land_only_features(tmp_path
     counters = {"classifier": 0, "regression": 0}
     deps = _dependencies(counters)
     deps.terrain_feature_fn = compute_terrain_features
+    deps.terrain_feature_identity = None
     captured = []
 
     def regression(embeddings, terrain_features, logits):
@@ -965,7 +1249,7 @@ def _acquisition_digest(value):
 
 
 def _bind_acquisition_identity(manifest):
-    from src.data_pipeline.source_contracts import compute_acquisition_tile_identity
+    from scenicdriver.data_pipeline.source_contracts import compute_acquisition_tile_identity
 
     row = manifest.iloc[0]
     manifest["acquisition_tile_identity_sha256"] = compute_acquisition_tile_identity(
@@ -1204,3 +1488,382 @@ def test_planner_inventory_without_matching_geometry_remains_unknown(tmp_path, g
     assert row["water_filter_status"] == "unknown"
     assert result["unknown"] == 1
     assert result["assessed"] == result["eligible"] == 0
+
+
+def test_cache_identity_binds_checkpoint_transform_config(tmp_path: Path) -> None:
+    from scenicdriver.active_learning.scoring import (
+        _preprocessing_contract,
+        classifier_preprocess_identity,
+    )
+    from scenicdriver.classifier.inference import PreprocessingContract
+
+    names = ("forest", "mountain", "lake")
+
+    def digest(preprocessing: PreprocessingContract) -> str:
+        deps = ScoringDependencies(
+            classifier_transform=lambda image: image,
+            classifier_preprocess_identity=classifier_preprocess_identity(preprocessing),
+            device="cpu",
+        )
+        return _preprocessing_contract(deps)["pipeline_sha256"]
+
+    resisc45 = PreprocessingContract.for_normalization("resisc45", class_names=names)
+    baseline = digest(resisc45)
+    assert digest(PreprocessingContract.for_normalization("resisc45", class_names=names)) == baseline
+    assert digest(PreprocessingContract.for_normalization("imagenet", class_names=names)) != baseline
+    assert digest(
+        PreprocessingContract.for_normalization("resisc45", class_names=names, image_size=256)
+    ) != baseline
+    assert digest(
+        PreprocessingContract.for_normalization("resisc45", class_names=names[::-1])
+    ) != baseline
+
+
+def test_cache_identity_requires_injected_preprocessor_identities() -> None:
+    from scenicdriver.active_learning.scoring import (
+        TERRAIN_FEATURE_CONTRACT,
+        _preprocessing_contract,
+    )
+
+    with pytest.raises(ValueError, match="classifier_preprocess_identity"):
+        _preprocessing_contract(
+            ScoringDependencies(classifier_transform=lambda image: image, device="cpu")
+        )
+    with pytest.raises(ValueError, match="terrain_feature_identity"):
+        _preprocessing_contract(
+            ScoringDependencies(terrain_feature_fn=lambda *a, **k: {}, device="cpu")
+        )
+    default = _preprocessing_contract(ScoringDependencies(device="cpu"))
+    assert json.loads(default["terrain_features"]) == TERRAIN_FEATURE_CONTRACT
+    injected = ScoringDependencies(
+        terrain_feature_fn=lambda *a, **k: {}, terrain_feature_identity="terrain:v1", device="cpu"
+    )
+    changed = ScoringDependencies(
+        terrain_feature_fn=lambda *a, **k: {}, terrain_feature_identity="terrain:v2", device="cpu"
+    )
+    assert (
+        _preprocessing_contract(injected)["pipeline_sha256"]
+        != _preprocessing_contract(changed)["pipeline_sha256"]
+        != default["pipeline_sha256"]
+    )
+
+
+def test_spawn_workers_persist_for_one_loader_with_production_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch = pytest.importorskip("torch")
+
+    class Classifier(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.eye(3))
+
+        def forward_with_features(self, batch):
+            features = batch.mean(dim=(2, 3))
+            return features @ self.weight, features
+
+    class Regression(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bias = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, embeddings, terrain, logits):
+            return embeddings.sum(1) + terrain.sum(1) + logits.sum(1) + self.bias
+
+    log_path = tmp_path / "workers.log"
+    monkeypatch.setenv(_WORKER_LOG_ENV, str(log_path))
+    created = _count_loaders(monkeypatch)
+    deps = ScoringDependencies(
+        classifier=Classifier(),
+        regression_model=Regression(),
+        classifier_transform=_worker_transform,
+        terrain_feature_fn=_worker_terrain,
+        class_names=("forest", "mountain", "lake"),
+        classifier_checkpoint=Path("classifier.pt"),
+        regression_checkpoint=Path("regression.pt"),
+        classifier_hash="spawn-classifier",
+        regression_hash="spawn-regression",
+        classifier_preprocess_identity="spawn-transform:v1",
+        terrain_feature_identity="spawn-terrain:v1",
+        device="cpu",
+    )
+    options, effective = _loader_options(device="cpu", num_workers=2, dependencies=deps)
+    assert effective == 2 and options["persistent_workers"] is True
+
+    total_rows = 8
+    result = score_tile_manifest(
+        _row_frame(tmp_path, total_rows, "spawn"),
+        run_root=tmp_path / "run",
+        dependencies=deps,
+        device="cpu",
+        batch_size=2,
+        num_workers=2,
+    )
+
+    assert result["counts"]["scored_rows"] == total_rows, result["errors"]
+    assert len(created) == 1
+    kwargs = created[0]
+    assert kwargs["num_workers"] == 2
+    assert kwargs["persistent_workers"] is True
+    assert kwargs["prefetch_factor"] == SCORING_PREFETCH_FACTOR
+    context = kwargs["multiprocessing_context"]
+    start_method = getattr(context, "get_start_method", lambda: context)()
+    assert start_method == "spawn"
+
+    events = [line.split() for line in log_path.read_text().splitlines()]
+    assert len([event for event in events if event[0] == "transform"]) == total_rows
+    assert len([event for event in events if event[0] == "terrain"]) == total_rows
+    assert all(event[2] != "main" for event in events), "decode ran in the parent"
+    pid_by_worker: dict[str, set[int]] = {}
+    for _kind, pid, worker_id, num_workers in events:
+        assert num_workers == "2"
+        pid_by_worker.setdefault(worker_id, set()).add(int(pid))
+    assert set(pid_by_worker) <= {"0", "1"}
+    # One process per worker id for the whole invocation: no per-batch respawn.
+    assert all(len(pids) == 1 for pids in pid_by_worker.values())
+    worker_pids = set().union(*pid_by_worker.values())
+    assert 1 <= len(worker_pids) <= 2
+    assert os.getpid() not in worker_pids
+    assert not _producer_threads()
+
+
+def test_acquisition_continues_while_classifier_infers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    import scenicdriver.active_learning.scoring as scoring_module
+
+    original_read = scoring_module._read_source
+    inference_started = threading.Event()
+    read_during_inference = threading.Event()
+    reader_threads: set[int] = set()
+
+    def slow_read(**kwargs: object):
+        # Lagging acquisition keeps the bounded queue below capacity, so the
+        # producer must still be reading when the first batch reaches inference.
+        time.sleep(0.02)
+        source = original_read(**kwargs)
+        reader_threads.add(threading.get_ident())
+        if inference_started.is_set():
+            read_during_inference.set()
+        return source
+
+    monkeypatch.setattr(scoring_module, "_read_source", slow_read)
+    overlap: list[bool] = []
+    inference_threads: set[int] = set()
+
+    def classifier(batch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        inference_threads.add(threading.get_ident())
+        if not overlap:
+            inference_started.set()
+            overlap.append(read_during_inference.wait(timeout=5.0))
+        size = len(batch)
+        return (
+            np.tile(np.asarray([[2.0, 0.0, -1.0]], dtype=np.float32), (size, 1)),
+            np.arange(size * 4, dtype=np.float32).reshape(size, 4) + 1.0,
+        )
+
+    deps = _dependencies({"classifier": 0, "regression": 0})
+    deps.classifier_predictor = classifier
+    result = score_tile_manifest(
+        _row_frame(tmp_path, 12, "overlap"),
+        run_root=tmp_path / "run",
+        dependencies=deps,
+        batch_size=2,
+    )
+
+    assert result["counts"]["scored_rows"] == 12, result["errors"]
+    assert overlap == [True], "source acquisition stalled during classifier inference"
+    assert reader_threads.isdisjoint(inference_threads)
+    assert not _producer_threads()
+
+
+def test_torch_heads_receive_identical_device_tensors_between_forwards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch = pytest.importorskip("torch")
+    window = {"open": False}
+    classifier_outputs: list[tuple[object, object]] = []
+    regression_inputs: list[tuple[object, object, object]] = []
+    transfers: list[tuple[str, tuple[int, ...]]] = []
+
+    class Classifier(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.eye(3))
+
+        def forward(self, _batch):
+            raise AssertionError("scoring should use the combined forward")
+
+        def forward_with_features(self, batch):
+            features = batch.mean(dim=(2, 3))
+            logits = features @ self.weight
+            classifier_outputs.append((logits, features))
+            window["open"] = True
+            return logits, features
+
+    class Regression(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bias = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, embeddings, terrain, logits):
+            window["open"] = False
+            regression_inputs.append((embeddings, terrain, logits))
+            return embeddings.sum(1) + terrain.sum(1) + logits.sum(1) + self.bias
+
+    def spy(name: str):
+        original = getattr(torch.Tensor, name)
+
+        def wrapper(self, *args, **kwargs):
+            if window["open"]:
+                transfers.append((name, tuple(self.shape)))
+            return original(self, *args, **kwargs)
+
+        return wrapper
+
+    for name in ("cpu", "to", "numpy"):
+        monkeypatch.setattr(torch.Tensor, name, spy(name))
+
+    deps = ScoringDependencies(
+        classifier=Classifier(),
+        regression_model=Regression(),
+        classifier_transform=lambda image: torch.as_tensor(
+            np.asarray(image, dtype=np.float32) / 255.0
+        ).permute(2, 0, 1),
+        terrain_feature_fn=_worker_terrain,
+        class_names=("forest", "mountain", "lake"),
+        classifier_hash="device-classifier",
+        regression_hash="device-regression",
+        classifier_preprocess_identity="device-transform:v1",
+        terrain_feature_identity="device-terrain:v1",
+        device="cpu",
+    )
+    result = score_tile_manifest(
+        _row_frame(tmp_path, 5, "device"),
+        run_root=tmp_path / "run",
+        dependencies=deps,
+        device="cpu",
+        batch_size=2,
+    )
+
+    assert result["counts"]["scored_rows"] == 5, result["errors"]
+    assert len(classifier_outputs) == len(regression_inputs) == 3
+    for (logits, features), (embeddings, terrain, head_logits) in zip(
+        classifier_outputs, regression_inputs
+    ):
+        assert embeddings is features
+        assert head_logits is logits
+        assert isinstance(terrain, torch.Tensor)
+        assert terrain.dtype == torch.float32
+        assert tuple(terrain.shape) == (len(features), 6)
+    # Only the terrain features may move to the device between forwards.
+    assert all(name == "to" and shape[-1] == 6 for name, shape in transfers), transfers
+    with np.load(tmp_path / "run" / "feature_embeddings.npz", allow_pickle=False) as arrays:
+        expected = np.concatenate(
+            [features.detach().numpy() for _logits, features in classifier_outputs]
+        )
+        assert arrays["embeddings"].dtype == np.float32
+        np.testing.assert_allclose(arrays["embeddings"], expected, rtol=1e-6)
+
+
+def test_injected_predictors_still_receive_numpy_batches(tmp_path: Path) -> None:
+    seen: list[tuple[str, type, object]] = []
+
+    def classifier(batch):
+        seen.append(("classifier", type(batch), batch.dtype))
+        size = len(batch)
+        return (
+            np.tile(np.asarray([[2.0, 0.0, -1.0]], dtype=np.float32), (size, 1)),
+            np.arange(size * 4, dtype=np.float32).reshape(size, 4) + 1.0,
+        )
+
+    def regression(embeddings, terrain_features, logits):
+        for name, value in (
+            ("embeddings", embeddings),
+            ("terrain", terrain_features),
+            ("logits", logits),
+        ):
+            seen.append((name, type(value), value.dtype))
+        return np.full(len(embeddings), 5.0, dtype=np.float32)
+
+    deps = _dependencies({"classifier": 0, "regression": 0})
+    deps.classifier_predictor = classifier
+    deps.regression_predictor = regression
+    result = score_tile_manifest(
+        _row_frame(tmp_path, 3, "numpy"),
+        run_root=tmp_path / "run",
+        dependencies=deps,
+        batch_size=2,
+    )
+
+    assert result["counts"]["scored_rows"] == 3, result["errors"]
+    assert len(seen) == 8
+    assert all(kind is np.ndarray and dtype == np.float32 for _, kind, dtype in seen)
+
+
+def test_per_row_and_batch_errors_do_not_stop_single_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = _count_loaders(monkeypatch)
+    manifest = _row_frame(tmp_path, 7, "errors")
+    (tmp_path / manifest.loc[1, "terrain_path"]).unlink()
+    (tmp_path / manifest.loc[3, "satellite_path"]).write_bytes(b"not a png")
+    calls = [0]
+
+    def classifier(batch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        calls[0] += 1
+        if calls[0] == 2:
+            raise RuntimeError("classifier batch failed")
+        size = len(batch)
+        return (
+            np.tile(np.asarray([[2.0, 0.0, -1.0]], dtype=np.float32), (size, 1)),
+            np.arange(size * 4, dtype=np.float32).reshape(size, 4) + 1.0,
+        )
+
+    deps = _dependencies({"classifier": 0, "regression": 0})
+    deps.classifier_predictor = classifier
+    result = score_tile_manifest(
+        manifest, run_root=tmp_path / "run", dependencies=deps, batch_size=2
+    )
+
+    assert len(created) == 1
+    assert calls[0] == 3
+    assert result["counts"]["scored_rows"] == 3
+    assert result["counts"]["missing_rows"] == 1
+    assert result["counts"]["error_rows"] == 3
+    candidates = pd.read_csv(tmp_path / "run" / "candidate_pool.csv")
+    assert candidates.loc[1, "score_status"] == "missing"
+    assert candidates.loc[3, "score_status"] != "scored"
+    batch_failures = candidates["error"].fillna("").str.contains("classifier batch failed")
+    assert int(batch_failures.sum()) == 2
+    assert not _producer_threads()
+
+
+def test_loader_failure_stops_and_joins_source_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scenicdriver.active_learning.scoring as scoring_module
+
+    original_collate = scoring_module._collate_scoring_items
+    collated = [0]
+
+    def failing_collate(items):
+        collated[0] += 1
+        if collated[0] == 2:
+            raise RuntimeError("collate boom")
+        return original_collate(items)
+
+    monkeypatch.setattr(scoring_module, "_collate_scoring_items", failing_collate)
+    with pytest.raises(RuntimeError, match="collate boom"):
+        score_tile_manifest(
+            _row_frame(tmp_path, 20, "cleanup"),
+            run_root=tmp_path / "run",
+            dependencies=_dependencies({"classifier": 0, "regression": 0}),
+            batch_size=2,
+        )
+    # The producer is blocked on a full bounded queue when the consumer fails;
+    # cancellation must release and join it before the error propagates.
+    assert not _producer_threads()
+    assert not (tmp_path / "run" / "candidate_pool.csv").exists()
